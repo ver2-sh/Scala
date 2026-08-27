@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ModelId, ServerState};
+use crate::{RegistryState, ServerState};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -12,8 +12,7 @@ pub enum LogLevel {
 
 #[derive(Debug, Clone)]
 pub enum AppEvent {
-    ModelDiscovered(ModelId),
-    RegistryRefreshed { model_count: usize },
+    RegistryChanged(RegistryState),
     ServerChanged(ServerState),
     Log { level: LogLevel, message: String },
 }

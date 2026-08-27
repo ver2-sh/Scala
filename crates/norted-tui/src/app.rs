@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use norted_core::{AppEvent, AppSnapshot, LogLevel};
+use norted_core::{AppEvent, AppSnapshot, LogLevel, RegistryState};
 
 use crate::commands::{self, CommandAction};
 
@@ -187,15 +187,36 @@ impl App {
     pub fn handle_core_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Log { level, message } => self.push_log(level, message),
-            AppEvent::RegistryRefreshed { model_count } => self.push_log(
-                LogLevel::Info,
-                format!("Model registry refreshed: {model_count} discovered"),
-            ),
+            AppEvent::RegistryChanged(state) => match state {
+                RegistryState::NotScanned => {}
+                RegistryState::Scanning => {
+                    self.push_log(LogLevel::Info, "Model registry scan started".into())
+                }
+                RegistryState::Ready => self.push_log(
+                    LogLevel::Info,
+                    format!(
+                        "Model registry ready: {} discovered",
+                        self.snapshot.models.len()
+                    ),
+                ),
+                RegistryState::ReadyWithWarnings { warning_count } => {
+                    self.push_log(
+                        LogLevel::Warning,
+                        format!("Model registry ready with {warning_count} warning(s)"),
+                    );
+                    for warning in self.snapshot.registry_warnings.clone() {
+                        self.push_log(LogLevel::Warning, warning);
+                    }
+                }
+                RegistryState::Failed { message } => self.push_log(
+                    LogLevel::Error,
+                    format!("Model registry scan failed: {message}"),
+                ),
+            },
             AppEvent::ServerChanged(state) => self.push_log(
                 LogLevel::Info,
                 format!("API server state changed to {}", state.label()),
             ),
-            AppEvent::ModelDiscovered(_) => {}
         }
     }
 

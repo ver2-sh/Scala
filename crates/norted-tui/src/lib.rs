@@ -18,6 +18,9 @@ use app::{App, Update};
 use terminal::TerminalSession;
 
 pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
+    let mut terminal = TerminalSession::enter()?;
+    let mut core_events = core.subscribe();
+    core.start_model_discovery().await;
     let snapshot = core.snapshot().await;
     let server_address = format!("{}:{}", core.config.server.host, core.config.server.port);
     let config_path = core.config_path.display().to_string();
@@ -36,11 +39,16 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
         config_path,
         model_paths,
     );
-    let mut terminal = TerminalSession::enter()?;
     let mut terminal_events = EventStream::new();
-    let mut core_events = core.subscribe();
-    let mut runtime_refresh = tokio::time::interval(Duration::from_secs(2));
-    runtime_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let observer_core = Arc::clone(&core);
+    let runtime_observer = tokio::spawn(async move {
+        let mut refresh = tokio::time::interval(Duration::from_secs(2));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            refresh.tick().await;
+            observer_core.refresh_server_state().await;
+        }
+    });
     let mut render = true;
 
     loop {
@@ -58,8 +66,8 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
             },
             event = core_events.recv() => match event {
                 Ok(event) => {
-                    app.handle_core_event(event);
                     app.snapshot = core.snapshot().await;
+                    app.handle_core_event(event);
                     Update::Render
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -68,18 +76,13 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => Update::None,
             },
-            _ = runtime_refresh.tick() => {
-                let previous = app.snapshot.server.clone();
-                core.refresh_server_state().await;
-                app.snapshot = core.snapshot().await;
-                if app.snapshot.server == previous { Update::None } else { Update::Render }
-            },
         };
         if update == Update::Quit {
             break;
         }
         render = update == Update::Render;
     }
+    runtime_observer.abort();
     terminal.leave()?;
     Ok(())
 }

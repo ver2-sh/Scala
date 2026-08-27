@@ -21,4 +21,4 @@ pub use provenance::{
     RuntimeProvenance, ToolchainProvenance,
 };
 pub use runtime::{RuntimeDescriptor, RuntimePublisher, observe_runtime};
-pub use state::{AppSnapshot, ApplicationCore, RuntimeStatus, ServerState};
+pub use state::{AppSnapshot, ApplicationCore, RegistryState, RuntimeStatus, ServerState};

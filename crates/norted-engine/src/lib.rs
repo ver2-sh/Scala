@@ -45,15 +45,33 @@ pub enum EngineFeature {
     Vision,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "decision")]
+pub enum CompatibilityDecision {
+    Supported,
+    Unsupported { reason: String },
+}
+
+impl CompatibilityDecision {
+    pub fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "selector")]
+pub enum ExactAcquisitionTarget {
+    Version { version: String },
+    Revision { revision: String },
+    VersionAndRevision { version: String, revision: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "target")]
 pub enum AcquisitionTarget {
     Stable,
     Latest,
-    Exact {
-        version: Option<String>,
-        revision: Option<String>,
-    },
+    Exact { selector: ExactAcquisitionTarget },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,6 +183,18 @@ pub enum RegistryError {
 pub trait EngineAdapter: Send + Sync {
     fn identity(&self) -> EngineIdentity;
     fn capabilities(&self) -> EngineCapabilities;
+    fn compatibility(&self, model: &ModelArtifact) -> CompatibilityDecision {
+        if self.capabilities().accepts(model.format) {
+            CompatibilityDecision::Supported
+        } else {
+            CompatibilityDecision::Unsupported {
+                reason: format!(
+                    "artifact format `{}` is not supported by this engine",
+                    model.format.as_str()
+                ),
+            }
+        }
+    }
     fn native_options(&self) -> Vec<NativeOption>;
     async fn probe(&self) -> Result<EngineProbe, EngineError>;
     async fn install(&self, request: AcquisitionRequest)
@@ -217,7 +247,7 @@ impl EngineRegistry {
     pub fn compatible_with(&self, artifact: &ModelArtifact) -> Vec<Arc<dyn EngineAdapter>> {
         self.adapters
             .values()
-            .filter(|adapter| adapter.capabilities().accepts(artifact.format))
+            .filter(|adapter| adapter.compatibility(artifact).is_supported())
             .cloned()
             .collect()
     }
@@ -228,5 +258,144 @@ impl EngineRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.adapters.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use norted_core::{ArtifactFormat, ModelArtifact, ModelId};
+
+    use super::{
+        AcquisitionRequest, CompatibilityDecision, EngineAdapter, EngineCapabilities, EngineError,
+        EngineIdentity, EngineInstallation, EngineProbe, EngineRegistry, LaunchRequest, LaunchSpec,
+        NativeOption, ProcessDescriptor,
+    };
+
+    struct ArchitectureAdapter {
+        id: &'static str,
+        architecture: &'static str,
+    }
+
+    #[async_trait]
+    impl EngineAdapter for ArchitectureAdapter {
+        fn identity(&self) -> EngineIdentity {
+            EngineIdentity {
+                id: self.id.to_owned(),
+                display_name: self.id.to_owned(),
+                upstream_repository: String::new(),
+            }
+        }
+
+        fn capabilities(&self) -> EngineCapabilities {
+            EngineCapabilities {
+                artifact_formats: vec![ArtifactFormat::Gguf],
+                ..EngineCapabilities::default()
+            }
+        }
+
+        fn compatibility(&self, model: &ModelArtifact) -> CompatibilityDecision {
+            let coarse = if self.capabilities().accepts(model.format) {
+                CompatibilityDecision::Supported
+            } else {
+                CompatibilityDecision::Unsupported {
+                    reason: "format is unsupported".to_owned(),
+                }
+            };
+            if !coarse.is_supported() {
+                return coarse;
+            }
+            match model.architecture.as_deref() {
+                Some(architecture) if architecture == self.architecture => {
+                    CompatibilityDecision::Supported
+                }
+                architecture => CompatibilityDecision::Unsupported {
+                    reason: format!(
+                        "requires architecture `{}`, found `{}`",
+                        self.architecture,
+                        architecture.unwrap_or("unknown")
+                    ),
+                },
+            }
+        }
+
+        fn native_options(&self) -> Vec<NativeOption> {
+            Vec::new()
+        }
+
+        async fn probe(&self) -> Result<EngineProbe, EngineError> {
+            unreachable!()
+        }
+
+        async fn install(
+            &self,
+            _request: AcquisitionRequest,
+        ) -> Result<EngineInstallation, EngineError> {
+            unreachable!()
+        }
+
+        async fn update(
+            &self,
+            _request: AcquisitionRequest,
+        ) -> Result<EngineInstallation, EngineError> {
+            unreachable!()
+        }
+
+        async fn build_launch_spec(
+            &self,
+            _request: LaunchRequest,
+        ) -> Result<LaunchSpec, EngineError> {
+            unreachable!()
+        }
+
+        async fn health(&self, _process: &ProcessDescriptor) -> Result<bool, EngineError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn registry_uses_adapter_model_compatibility_after_the_format_gate() {
+        let mut registry = EngineRegistry::default();
+        registry
+            .register(Arc::new(ArchitectureAdapter {
+                id: "architecture-a",
+                architecture: "architecture-a",
+            }))
+            .expect("register architecture-a adapter");
+        registry
+            .register(Arc::new(ArchitectureAdapter {
+                id: "architecture-b",
+                architecture: "architecture-b",
+            }))
+            .expect("register architecture-b adapter");
+
+        let model = ModelArtifact {
+            id: ModelId("fixture".to_owned()),
+            display_name: "Fixture".to_owned(),
+            path: PathBuf::from("fixture.gguf"),
+            format: ArtifactFormat::Gguf,
+            size_bytes: 0,
+            created: 0,
+            hash: None,
+            architecture: Some("architecture-b".to_owned()),
+            context_length: None,
+            provenance: None,
+        };
+        let compatible = registry.compatible_with(&model);
+
+        assert_eq!(compatible.len(), 1);
+        assert_eq!(compatible[0].identity().id, "architecture-b");
+        assert_eq!(
+            registry
+                .get("architecture-a")
+                .expect("architecture-a adapter")
+                .compatibility(&model),
+            CompatibilityDecision::Unsupported {
+                reason: "requires architecture `architecture-a`, found `architecture-b`".to_owned()
+            }
+        );
     }
 }

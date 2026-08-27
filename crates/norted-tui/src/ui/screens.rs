@@ -1,3 +1,4 @@
+use norted_core::RegistryState;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -51,37 +52,61 @@ fn render_overview(
         layout[0],
     );
     render_metrics(frame, layout[1], app, theme, glyphs, compact);
-    let body = if app.snapshot.models.is_empty() {
-        vec![
+    let body = match &app.snapshot.registry_state {
+        RegistryState::NotScanned | RegistryState::Scanning => vec![
             Line::from(Span::styled(
-                "No model artifacts discovered yet",
+                format!("{}  Discovering local models", glyphs.transitional),
                 theme.text,
             )),
             Line::default(),
             Line::from(Span::styled(
-                "Add one or more directories under [models].paths in your config.",
+                "The interface is ready while configured directories are scanned in the background.",
                 theme.muted,
             )),
             Line::from(Span::styled(
-                "Recognized formats: .gguf and .q27",
+                "Models will appear automatically when discovery completes.",
                 theme.hint,
             )),
+        ],
+        RegistryState::Failed { message } => vec![
+            Line::from(Span::styled("Model discovery failed", theme.error)),
             Line::default(),
-            Line::from(vec![
-                Span::styled("/models", theme.accent),
-                Span::styled("  inspect the registry    ", theme.muted),
-                Span::styled("?", theme.accent),
-                Span::styled("  open help", theme.muted),
-            ]),
-        ]
-    } else {
-        vec![
+            Line::from(Span::styled(message, theme.muted)),
+            Line::from(Span::styled("Open Logs for details.", theme.hint)),
+        ],
+        RegistryState::Ready | RegistryState::ReadyWithWarnings { .. }
+            if app.snapshot.models.is_empty() =>
+        {
+            vec![
+                Line::from(Span::styled(
+                    "No model artifacts discovered yet",
+                    theme.text,
+                )),
+                Line::default(),
+                Line::from(Span::styled(
+                    "Add one or more directories under [models].paths in your config.",
+                    theme.muted,
+                )),
+                Line::from(Span::styled(
+                    "Recognized formats: .gguf and .q27",
+                    theme.hint,
+                )),
+                Line::default(),
+                Line::from(vec![
+                    Span::styled("/models", theme.accent),
+                    Span::styled("  inspect the registry    ", theme.muted),
+                    Span::styled("?", theme.accent),
+                    Span::styled("  open help", theme.muted),
+                ]),
+            ]
+        }
+        RegistryState::Ready | RegistryState::ReadyWithWarnings { .. } => vec![
             Line::from(Span::styled("Ready to explore", theme.text)),
             Line::from(Span::styled(
                 "Open Models to inspect discovered local artifacts.",
                 theme.muted,
             )),
-        ]
+        ],
     };
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), layout[2]);
 }
@@ -94,9 +119,15 @@ fn render_metrics(
     glyphs: &Glyphs,
     compact: bool,
 ) {
+    let model_value = match &app.snapshot.registry_state {
+        RegistryState::Ready | RegistryState::ReadyWithWarnings { .. } => {
+            app.snapshot.models.len().to_string()
+        }
+        state => state.label().to_owned(),
+    };
     let values = [
         ("SERVER", app.snapshot.server.label().to_owned()),
-        ("MODELS", app.snapshot.models.len().to_string()),
+        ("MODELS", model_value),
         ("ENGINES", app.snapshot.installed_engine_count.to_string()),
         (
             "ACTIVE MODEL",
@@ -142,15 +173,36 @@ fn render_metrics(
 
 fn render_models(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, glyphs: &Glyphs) {
     let layout = content_layout(area);
-    let subtitle = if app.snapshot.registry_warnings.is_empty() {
-        "Local artifacts discovered from configured search paths".to_owned()
-    } else {
-        format!(
+    let subtitle = match &app.snapshot.registry_state {
+        RegistryState::NotScanned => "Model discovery has not started".to_owned(),
+        RegistryState::Scanning => "Scanning configured search paths in the background".to_owned(),
+        RegistryState::Failed { .. } => "Model discovery could not complete; see Logs".to_owned(),
+        RegistryState::Ready if app.snapshot.registry_warnings.is_empty() => {
+            "Local artifacts discovered from configured search paths".to_owned()
+        }
+        RegistryState::Ready | RegistryState::ReadyWithWarnings { .. } => format!(
             "Local artifacts discovered with {} warning(s); see Logs",
             app.snapshot.registry_warnings.len()
-        )
+        ),
     };
     frame.render_widget(section_title("Models", &subtitle, theme), layout[0]);
+    if matches!(
+        app.snapshot.registry_state,
+        RegistryState::NotScanned | RegistryState::Scanning
+    ) {
+        render_empty(
+            frame,
+            layout[1],
+            &format!("{}  Discovering local models", glyphs.transitional),
+            "The registry will update automatically. You can keep using the interface while it scans.",
+            theme,
+        );
+        return;
+    }
+    if let RegistryState::Failed { message } = &app.snapshot.registry_state {
+        render_empty(frame, layout[1], "Model discovery failed", message, theme);
+        return;
+    }
     if app.snapshot.models.is_empty() {
         render_empty(
             frame,

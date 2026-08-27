@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Notify, RwLock, broadcast};
 
 use crate::{
     AppConfig, AppEvent, AppPaths, CoreError, LoadedConfig, LogLevel, ModelArtifact, ModelRegistry,
@@ -47,9 +47,32 @@ impl ServerState {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum RegistryState {
+    NotScanned,
+    Scanning,
+    Ready,
+    ReadyWithWarnings { warning_count: usize },
+    Failed { message: String },
+}
+
+impl RegistryState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NotScanned => "Not scanned",
+            Self::Scanning => "Scanning",
+            Self::Ready => "Ready",
+            Self::ReadyWithWarnings { .. } => "Ready with warnings",
+            Self::Failed { .. } => "Failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSnapshot {
     pub server: ServerState,
+    pub registry_state: RegistryState,
     pub models: Vec<ModelArtifact>,
     pub registry_warnings: Vec<String>,
     pub installed_engine_count: usize,
@@ -60,6 +83,7 @@ pub struct AppSnapshot {
 #[derive(Debug)]
 struct MutableState {
     server: ServerState,
+    registry_state: RegistryState,
     registry: ModelRegistry,
 }
 
@@ -69,6 +93,7 @@ pub struct ApplicationCore {
     pub config_path: std::path::PathBuf,
     pub paths: AppPaths,
     state: RwLock<MutableState>,
+    registry_changed: Notify,
     events: broadcast::Sender<AppEvent>,
 }
 
@@ -81,14 +106,17 @@ impl ApplicationCore {
             path: config_path,
             ..
         } = LoadedConfig::load(&paths)?;
-        let registry = discover_models(config.models.paths.clone()).await?;
-        let server = observe_runtime(&paths).await;
         let (events, _) = broadcast::channel(256);
         Ok(Arc::new(Self {
             config,
             config_path,
             paths,
-            state: RwLock::new(MutableState { server, registry }),
+            state: RwLock::new(MutableState {
+                server: ServerState::Stopped,
+                registry_state: RegistryState::NotScanned,
+                registry: ModelRegistry::default(),
+            }),
+            registry_changed: Notify::new(),
             events,
         }))
     }
@@ -101,6 +129,7 @@ impl ApplicationCore {
         let state = self.state.read().await;
         AppSnapshot {
             server: state.server.clone(),
+            registry_state: state.registry_state.clone(),
             models: state.registry.artifacts().to_vec(),
             registry_warnings: state.registry.warnings().to_vec(),
             installed_engine_count: 0,
@@ -109,19 +138,41 @@ impl ApplicationCore {
         }
     }
 
-    pub async fn refresh_models(&self) -> Result<()> {
-        let registry = discover_models(self.config.models.paths.clone()).await?;
-        let model_count = registry.artifacts().len();
-        for artifact in registry.artifacts() {
-            let _ = self
-                .events
-                .send(AppEvent::ModelDiscovered(artifact.id.clone()));
+    pub async fn start_model_discovery(self: &Arc<Self>) {
+        if self.begin_model_discovery(false).await {
+            let core = Arc::clone(self);
+            tokio::spawn(async move {
+                let _ = core.complete_model_discovery().await;
+            });
         }
-        self.state.write().await.registry = registry;
-        let _ = self
-            .events
-            .send(AppEvent::RegistryRefreshed { model_count });
-        Ok(())
+    }
+
+    pub async fn ensure_model_discovery(&self) -> Result<()> {
+        loop {
+            let mut changed = std::pin::pin!(self.registry_changed.notified());
+            changed.as_mut().enable();
+            let state = self.state.read().await.registry_state.clone();
+            match state {
+                RegistryState::NotScanned => {
+                    if self.begin_model_discovery(false).await {
+                        return self.complete_model_discovery().await;
+                    }
+                }
+                RegistryState::Scanning => changed.await,
+                RegistryState::Ready | RegistryState::ReadyWithWarnings { .. } => return Ok(()),
+                RegistryState::Failed { message } => {
+                    return Err(CoreError::BlockingTask(message));
+                }
+            }
+        }
+    }
+
+    pub async fn refresh_models(&self) -> Result<()> {
+        if self.begin_model_discovery(true).await {
+            self.complete_model_discovery().await
+        } else {
+            self.ensure_model_discovery().await
+        }
     }
 
     pub async fn model_warnings(&self) -> Vec<String> {
@@ -147,6 +198,51 @@ impl ApplicationCore {
             level,
             message: message.into(),
         });
+    }
+
+    async fn begin_model_discovery(&self, force: bool) -> bool {
+        let mut state = self.state.write().await;
+        if matches!(state.registry_state, RegistryState::Scanning)
+            || (!force && !matches!(state.registry_state, RegistryState::NotScanned))
+        {
+            return false;
+        }
+        state.registry_state = RegistryState::Scanning;
+        drop(state);
+        let _ = self
+            .events
+            .send(AppEvent::RegistryChanged(RegistryState::Scanning));
+        true
+    }
+
+    async fn complete_model_discovery(&self) -> Result<()> {
+        match discover_models(self.config.models.paths.clone()).await {
+            Ok(registry) => {
+                let registry_state = if registry.warnings().is_empty() {
+                    RegistryState::Ready
+                } else {
+                    RegistryState::ReadyWithWarnings {
+                        warning_count: registry.warnings().len(),
+                    }
+                };
+                let mut state = self.state.write().await;
+                state.registry = registry;
+                state.registry_state = registry_state.clone();
+                drop(state);
+                self.registry_changed.notify_waiters();
+                let _ = self.events.send(AppEvent::RegistryChanged(registry_state));
+                Ok(())
+            }
+            Err(error) => {
+                let registry_state = RegistryState::Failed {
+                    message: error.to_string(),
+                };
+                self.state.write().await.registry_state = registry_state.clone();
+                self.registry_changed.notify_waiters();
+                let _ = self.events.send(AppEvent::RegistryChanged(registry_state));
+                Err(error)
+            }
+        }
     }
 }
 

@@ -10,7 +10,7 @@ The bootstrap currently provides:
 
 - a responsive Ratatui interface with Overview, Models, Engines, Server, Logs, Settings, and Help views;
 - a data-driven slash-command bar with completion, keyboard navigation, paste handling, reusable overlays, and compact/minimum-size modes;
-- non-blocking discovery of local `.gguf` and `.q27` artifacts from resolved search paths;
+- asynchronous discovery of local `.gguf` and `.q27` artifacts from resolved search paths, with explicit registry lifecycle state;
 - stable, readable model IDs derived from canonical artifact identity with SHA-256;
 - cross-process API runtime observation using atomic descriptors and identity-checked health probes;
 - explicit server, runtime, engine capability, and provenance types;
@@ -52,9 +52,9 @@ curl http://127.0.0.1:8742/health
 curl http://127.0.0.1:8742/v1/models
 ```
 
-The server defaults to loopback only (`127.0.0.1:8742`). A separately launched `status` command or TUI discovers it through runtime descriptors in the state directory and accepts a descriptor only when `/health` returns the matching random instance identity. Stale descriptors from an unclean exit therefore do not report a dead process as healthy.
+The server defaults to loopback only (`127.0.0.1:8742`). A separately launched `status` command or TUI discovers it through runtime descriptors in the state directory and accepts a descriptor only when `/health` returns the matching random instance identity. Probes run concurrently with per-request and whole-cycle bounds. Old descriptors are pruned conservatively after identity-checked failure and an age threshold; startup-grace descriptors and one-off timeouts are retained, while repeated long-lived timeout evidence can eventually retire an abandoned descriptor. Stale descriptors from an unclean exit therefore do not report a dead process as healthy.
 
-`GET /v1/models` returns the OpenAI-style list envelope and local model objects with `id`, `object`, `created`, `owned_by`, and nullable `shutdown_date`. `created` is the local artifact's last-modified Unix timestamp. The route is a narrow compatibility surface, not a claim of complete OpenAI API support.
+`GET /v1/models` returns the OpenAI-style list envelope and the fields in the current Model object: `id`, `object`, `created`, `owned_by`, and optional nullable `shutdown_date`. Norted emits `shutdown_date: null` because local artifacts do not announce a shutdown date. `created` is the local artifact's last-modified Unix timestamp. The route is a narrow compatibility surface, not a claim of complete OpenAI API support.
 
 ## Configuration
 
@@ -76,6 +76,8 @@ unicode = true
 ```
 
 Relative model paths resolve against the directory containing `config.toml`, independent of the launch shell's working directory. Absolute paths remain unchanged. The resolved paths are used by discovery, Doctor, CLI output, and TUI Settings.
+
+The TUI begins discovery only after the terminal is initialized and displays `Scanning` until the registry is ready. `models list` waits for a complete deterministic scan. `serve` also completes initial discovery before binding so `/v1/models` always observes a ready registry. `status`, `engines list`, and `config show` do not trigger model discovery; unknown model count is reported honestly.
 
 Configuration, application data, runtime state, cache, and logs use separate operating-system application directories. The supported schema version is currently `1`; unsupported versions and unknown structured keys are rejected. Arbitrary engine-native settings remain namespaced and extensible. `NO_COLOR` disables TUI colour independently of the configuration, while `tui.unicode = false` selects intentional ASCII glyphs.
 

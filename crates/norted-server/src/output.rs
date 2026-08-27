@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use color_eyre::Result;
-use norted_core::{ApplicationCore, ConfigSource, LoadedConfig};
+use norted_core::{ApplicationCore, ConfigSource, LoadedConfig, RegistryState};
 use norted_engine::EngineRegistry;
 use serde_json::json;
 
 use crate::doctor::DoctorCheck;
 
 pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
+    core.refresh_server_state().await;
     let snapshot = core.snapshot().await;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -17,7 +18,12 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
         if let Some(endpoint) = snapshot.server.endpoint() {
             println!("  Endpoint:        {endpoint}");
         }
-        println!("  Models:          {} discovered", snapshot.models.len());
+        match snapshot.registry_state {
+            RegistryState::Ready | RegistryState::ReadyWithWarnings { .. } => {
+                println!("  Models:          {} discovered", snapshot.models.len());
+            }
+            state => println!("  Models:          {}", state.label()),
+        }
         println!(
             "  Engines:         {} installed, {} running",
             snapshot.installed_engine_count, snapshot.running_engine_count
@@ -31,6 +37,7 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
 }
 
 pub async fn models(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
+    core.ensure_model_discovery().await?;
     let snapshot = core.snapshot().await;
     if json_output {
         println!(

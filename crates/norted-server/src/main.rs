@@ -45,6 +45,7 @@ async fn run() -> Result<ExitCode> {
             norted_tui::run(core).await?;
         }
         Command::Serve => {
+            core.ensure_model_discovery().await?;
             let server = ApiServer::bind(core).await?;
             if cli.json {
                 println!(
