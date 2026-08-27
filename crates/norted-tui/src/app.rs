@@ -131,13 +131,13 @@ impl App {
             suggestion_scroll: 0,
             notice: None,
             logs,
-            focus: FocusArea::Content,
+            focus: FocusArea::Navigation,
             nav_focus: Screen::Overview,
             hover: None,
             selected_model: None,
             model_scroll: 0,
             log_scroll: 0,
-            focus_before_command: FocusArea::Content,
+            focus_before_command: FocusArea::Navigation,
         }
     }
 
