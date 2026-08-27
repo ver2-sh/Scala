@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use norted_core::{ArtifactFormat, EngineInstallation, EngineRevision, ModelArtifact};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineIdentity {
@@ -58,12 +58,51 @@ impl CompatibilityDecision {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ExactAcquisitionValue(String);
+
+impl ExactAcquisitionValue {
+    pub fn new(value: impl Into<String>) -> Result<Self, ExactAcquisitionValueError> {
+        let value = value.into().trim().to_owned();
+        if value.is_empty() {
+            return Err(ExactAcquisitionValueError);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ExactAcquisitionValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+#[error("exact acquisition version or revision cannot be empty")]
+pub struct ExactAcquisitionValueError;
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "selector")]
 pub enum ExactAcquisitionTarget {
-    Version { version: String },
-    Revision { revision: String },
-    VersionAndRevision { version: String, revision: String },
+    Version {
+        version: ExactAcquisitionValue,
+    },
+    Revision {
+        revision: ExactAcquisitionValue,
+    },
+    VersionAndRevision {
+        version: ExactAcquisitionValue,
+        revision: ExactAcquisitionValue,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,9 +310,56 @@ mod tests {
 
     use super::{
         AcquisitionRequest, CompatibilityDecision, EngineAdapter, EngineCapabilities, EngineError,
-        EngineIdentity, EngineInstallation, EngineProbe, EngineRegistry, LaunchRequest, LaunchSpec,
-        NativeOption, ProcessDescriptor,
+        EngineIdentity, EngineInstallation, EngineProbe, EngineRegistry, ExactAcquisitionTarget,
+        ExactAcquisitionValue, LaunchRequest, LaunchSpec, NativeOption, ProcessDescriptor,
     };
+
+    #[test]
+    fn exact_acquisition_values_are_non_empty_and_normalized() {
+        assert!(ExactAcquisitionValue::new("").is_err());
+        assert!(ExactAcquisitionValue::new(" \t\r\n ").is_err());
+        assert_eq!(
+            ExactAcquisitionValue::new("  v1.2.3  ")
+                .expect("non-empty exact value")
+                .as_str(),
+            "v1.2.3"
+        );
+    }
+
+    #[test]
+    fn exact_acquisition_serde_rejects_empty_values_and_supports_all_selectors() {
+        for invalid in [
+            r#"{"selector":"version","version":""}"#,
+            r#"{"selector":"revision","revision":"   "}"#,
+            r#"{"selector":"version_and_revision","version":"1.0","revision":"\t"}"#,
+        ] {
+            assert!(serde_json::from_str::<ExactAcquisitionTarget>(invalid).is_err());
+        }
+
+        let version = serde_json::from_str::<ExactAcquisitionTarget>(
+            r#"{"selector":"version","version":" 1.0 "}"#,
+        )
+        .expect("version selector");
+        let revision = serde_json::from_str::<ExactAcquisitionTarget>(
+            r#"{"selector":"revision","revision":" abc123 "}"#,
+        )
+        .expect("revision selector");
+        let both = serde_json::from_str::<ExactAcquisitionTarget>(
+            r#"{"selector":"version_and_revision","version":" 1.0 ","revision":" abc123 "}"#,
+        )
+        .expect("version and revision selector");
+
+        assert!(matches!(version, ExactAcquisitionTarget::Version { .. }));
+        assert!(matches!(revision, ExactAcquisitionTarget::Revision { .. }));
+        assert!(matches!(
+            both,
+            ExactAcquisitionTarget::VersionAndRevision { .. }
+        ));
+        assert_eq!(
+            serde_json::to_value(version).expect("serialize normalized selector")["version"],
+            "1.0"
+        );
+    }
 
     struct ArchitectureAdapter {
         id: &'static str,

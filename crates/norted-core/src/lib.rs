@@ -20,5 +20,5 @@ pub use provenance::{
     EnvironmentVariableProvenance, ModelRuntimeIdentity, NativeArgumentProvenance, ProcessIdentity,
     RuntimeProvenance, ToolchainProvenance,
 };
-pub use runtime::{RuntimeDescriptor, RuntimePublisher, observe_runtime};
+pub use runtime::{RuntimeDescriptor, RuntimeObservationError, RuntimePublisher, observe_runtime};
 pub use state::{AppSnapshot, ApplicationCore, RegistryState, RuntimeStatus, ServerState};

@@ -9,3 +9,6 @@ async-trait.workspace = true
 norted-core = { path = "../norted-core" }
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

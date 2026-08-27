@@ -8,13 +8,23 @@ use serde_json::json;
 use crate::doctor::DoctorCheck;
 
 pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
-    core.refresh_server_state().await;
-    let snapshot = core.snapshot().await;
+    let observation_error = core
+        .refresh_server_state()
+        .await
+        .err()
+        .map(|error| error.to_string());
+    let mut snapshot = core.snapshot().await;
+    if let Some(message) = observation_error {
+        snapshot.server = norted_core::ServerState::Unknown { message };
+    }
     if json_output {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
     } else {
         println!("Norted Server");
         println!("  Server:          {}", snapshot.server.label());
+        if let norted_core::ServerState::Unknown { message } = &snapshot.server {
+            println!("  Observation:     unavailable: {message}");
+        }
         if let Some(endpoint) = snapshot.server.endpoint() {
             println!("  Endpoint:        {endpoint}");
         }

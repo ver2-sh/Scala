@@ -5,7 +5,7 @@ use tokio::sync::{Notify, RwLock, broadcast};
 
 use crate::{
     AppConfig, AppEvent, AppPaths, CoreError, LoadedConfig, LogLevel, ModelArtifact, ModelRegistry,
-    Result, observe_runtime,
+    Result, RuntimeObservationError, observe_runtime,
 };
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -21,6 +21,7 @@ pub enum RuntimeStatus {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum ServerState {
+    Unknown { message: String },
     Stopped,
     Starting,
     Running { endpoint: String },
@@ -31,6 +32,7 @@ pub enum ServerState {
 impl ServerState {
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Unknown { .. } => "Unknown",
             Self::Stopped => "Stopped",
             Self::Starting => "Starting",
             Self::Running { .. } => "Running",
@@ -83,6 +85,7 @@ pub struct AppSnapshot {
 #[derive(Debug)]
 struct MutableState {
     server: ServerState,
+    last_runtime_observation_error: Option<String>,
     registry_state: RegistryState,
     registry: ModelRegistry,
 }
@@ -112,7 +115,10 @@ impl ApplicationCore {
             config_path,
             paths,
             state: RwLock::new(MutableState {
-                server: ServerState::Stopped,
+                server: ServerState::Unknown {
+                    message: "runtime state has not been observed".to_owned(),
+                },
+                last_runtime_observation_error: None,
                 registry_state: RegistryState::NotScanned,
                 registry: ModelRegistry::default(),
             }),
@@ -184,12 +190,34 @@ impl ApplicationCore {
         let _ = self.events.send(AppEvent::ServerChanged(state));
     }
 
-    pub async fn refresh_server_state(&self) {
-        let observed = observe_runtime(&self.paths).await;
-        let mut state = self.state.write().await;
-        if state.server != observed {
-            state.server = observed.clone();
-            let _ = self.events.send(AppEvent::ServerChanged(observed));
+    pub async fn refresh_server_state(&self) -> std::result::Result<(), RuntimeObservationError> {
+        match observe_runtime(&self.paths).await {
+            Ok(observed) => {
+                let mut state = self.state.write().await;
+                state.last_runtime_observation_error = None;
+                if state.server != observed {
+                    state.server = observed.clone();
+                    let _ = self.events.send(AppEvent::ServerChanged(observed));
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let mut state = self.state.write().await;
+                apply_observation_failure(&mut state.server, &message);
+                let should_report =
+                    state.last_runtime_observation_error.as_deref() != Some(message.as_str());
+                state.last_runtime_observation_error = Some(message.clone());
+                drop(state);
+                if should_report {
+                    tracing::warn!(%error, "runtime observation failed");
+                    self.log(
+                        LogLevel::Warning,
+                        format!("Runtime observation unavailable: {message}"),
+                    );
+                }
+                Err(error)
+            }
         }
     }
 
@@ -246,8 +274,41 @@ impl ApplicationCore {
     }
 }
 
+fn apply_observation_failure(server: &mut ServerState, message: &str) {
+    if matches!(server, ServerState::Unknown { .. }) {
+        *server = ServerState::Unknown {
+            message: message.to_owned(),
+        };
+    }
+}
+
 async fn discover_models(paths: Vec<std::path::PathBuf>) -> Result<ModelRegistry> {
     tokio::task::spawn_blocking(move || ModelRegistry::discover(&paths))
         .await
         .map_err(|error| CoreError::BlockingTask(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServerState, apply_observation_failure};
+
+    #[test]
+    fn observation_failure_preserves_a_verified_running_state() {
+        let mut running = ServerState::Running {
+            endpoint: "http://127.0.0.1:8742".to_owned(),
+        };
+        apply_observation_failure(&mut running, "runtime observation timed out");
+        assert!(matches!(running, ServerState::Running { .. }));
+
+        let mut unknown = ServerState::Unknown {
+            message: "runtime state has not been observed".to_owned(),
+        };
+        apply_observation_failure(&mut unknown, "runtime observation timed out");
+        assert_eq!(
+            unknown,
+            ServerState::Unknown {
+                message: "runtime observation timed out".to_owned()
+            }
+        );
+    }
 }

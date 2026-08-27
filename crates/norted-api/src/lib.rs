@@ -155,7 +155,6 @@ struct ApiModel {
     object: &'static str,
     owned_by: &'static str,
     created: i64,
-    shutdown_date: Option<String>,
 }
 
 async fn models(State(state): State<ApiState>) -> Json<ModelList> {
@@ -170,8 +169,30 @@ async fn models(State(state): State<ApiState>) -> Json<ModelList> {
                 object: "model",
                 owned_by: "norted-local",
                 created: model.created,
-                shutdown_date: None,
             })
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiModel;
+
+    #[test]
+    fn model_object_contains_only_the_supported_openai_fields() {
+        let value = serde_json::to_value(ApiModel {
+            id: "example".to_owned(),
+            object: "model",
+            owned_by: "norted-local",
+            created: 1_234_567_890,
+        })
+        .expect("serialize API model");
+        let object = value.as_object().expect("API model object");
+
+        assert_eq!(object.len(), 4);
+        assert!(object.contains_key("id"));
+        assert!(object.contains_key("created"));
+        assert!(object.contains_key("object"));
+        assert!(object.contains_key("owned_by"));
+    }
 }

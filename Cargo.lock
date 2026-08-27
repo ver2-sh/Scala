@@ -1144,6 +1144,7 @@ dependencies = [
  "axum",
  "norted-core",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -1172,6 +1173,7 @@ dependencies = [
  "async-trait",
  "norted-core",
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
 ]
 

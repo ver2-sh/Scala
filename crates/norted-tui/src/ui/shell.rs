@@ -64,6 +64,7 @@ pub fn render_header(
         top[0],
     );
     let (marker, state_style) = match &app.snapshot.server {
+        norted_core::ServerState::Unknown { .. } => ("?", theme.warning),
         norted_core::ServerState::Running { .. } => (glyphs.running, theme.success),
         norted_core::ServerState::Failed { .. } => ("!", theme.error),
         norted_core::ServerState::Starting | norted_core::ServerState::Stopping => {

@@ -46,7 +46,7 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             refresh.tick().await;
-            observer_core.refresh_server_state().await;
+            let _ = observer_core.refresh_server_state().await;
         }
     });
     let mut render = true;

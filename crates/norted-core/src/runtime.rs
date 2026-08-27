@@ -16,6 +16,8 @@ const HEALTH_TIMEOUT: Duration = Duration::from_millis(800);
 const OBSERVATION_TIMEOUT: Duration = Duration::from_millis(1_500);
 const STARTUP_GRACE: Duration = Duration::from_secs(30);
 const UNREACHABLE_CLEANUP_AGE: Duration = Duration::from_secs(5 * 60);
+const UNREACHABLE_FAILURE_WINDOW: Duration = Duration::from_secs(30);
+const UNREACHABLE_FAILURES_REQUIRED: u32 = 3;
 const TIMEOUT_CLEANUP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const TIMEOUT_FAILURE_WINDOW: Duration = Duration::from_secs(60 * 60);
 const TIMEOUT_FAILURES_REQUIRED: u32 = 3;
@@ -130,21 +132,51 @@ impl Drop for RuntimePublisher {
     }
 }
 
-pub async fn observe_runtime(paths: &AppPaths) -> ServerState {
-    match tokio::time::timeout(OBSERVATION_TIMEOUT, observe_runtime_cycle(paths)).await {
-        Ok(state) => state,
-        Err(_) => ServerState::Failed {
-            message: "runtime observation timed out".to_owned(),
-        },
-    }
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeObservationError {
+    #[error("runtime observation timed out")]
+    TimedOut,
+    #[error("runtime observation task failed: {0}")]
+    TaskFailed(String),
+    #[error("could not read runtime descriptors from {path}: {source}")]
+    ReadDescriptors {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
-async fn observe_runtime_cycle(paths: &AppPaths) -> ServerState {
+pub async fn observe_runtime(
+    paths: &AppPaths,
+) -> std::result::Result<ServerState, RuntimeObservationError> {
+    observe_runtime_with_timeout(paths, OBSERVATION_TIMEOUT).await
+}
+
+async fn observe_runtime_with_timeout(
+    paths: &AppPaths,
+    timeout: Duration,
+) -> std::result::Result<ServerState, RuntimeObservationError> {
+    tokio::time::timeout(timeout, observe_runtime_cycle(paths))
+        .await
+        .map_err(|_| RuntimeObservationError::TimedOut)?
+}
+
+async fn observe_runtime_cycle(
+    paths: &AppPaths,
+) -> std::result::Result<ServerState, RuntimeObservationError> {
     let directory = runtime_directory(paths);
-    let candidates = match tokio::task::spawn_blocking(move || read_descriptors(&directory)).await {
-        Ok(candidates) => candidates,
-        Err(_) => return ServerState::Stopped,
-    };
+    let read_directory = directory.clone();
+    let candidates =
+        match tokio::task::spawn_blocking(move || read_descriptors(&read_directory)).await {
+            Ok(Ok(candidates)) => candidates,
+            Ok(Err(source)) => {
+                return Err(RuntimeObservationError::ReadDescriptors {
+                    path: directory,
+                    source,
+                });
+            }
+            Err(error) => return Err(RuntimeObservationError::TaskFailed(error.to_string())),
+        };
 
     let mut probes = tokio::task::JoinSet::new();
     for candidate in candidates {
@@ -156,8 +188,9 @@ async fn observe_runtime_cycle(paths: &AppPaths) -> ServerState {
 
     let mut observations = Vec::new();
     while let Some(result) = probes.join_next().await {
-        if let Ok(observation) = result {
-            observations.push(observation);
+        match result {
+            Ok(observation) => observations.push(observation),
+            Err(error) => return Err(RuntimeObservationError::TaskFailed(error.to_string())),
         }
     }
 
@@ -170,12 +203,12 @@ async fn observe_runtime_cycle(paths: &AppPaths) -> ServerState {
 
     let mut healthy = healthy;
     healthy.sort_by_key(|descriptor| std::cmp::Reverse(descriptor.started_at_unix));
-    healthy
+    Ok(healthy
         .into_iter()
         .next()
         .map_or(ServerState::Stopped, |descriptor| ServerState::Running {
             endpoint: descriptor.endpoint,
-        })
+        }))
 }
 
 fn runtime_directory(paths: &AppPaths) -> PathBuf {
@@ -195,9 +228,11 @@ impl DescriptorCandidate {
     }
 }
 
-fn read_descriptors(directory: &Path) -> Vec<DescriptorCandidate> {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return Vec::new();
+fn read_descriptors(directory: &Path) -> std::io::Result<Vec<DescriptorCandidate>> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
     };
     let mut candidates = entries
         .filter_map(std::result::Result::ok)
@@ -216,7 +251,7 @@ fn read_descriptors(directory: &Path) -> Vec<DescriptorCandidate> {
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.descriptor.started_at_unix));
-    candidates
+    Ok(candidates)
 }
 
 #[derive(Deserialize)]
@@ -308,10 +343,37 @@ fn cleanup_stale_descriptors(candidates: Vec<DescriptorCandidate>) {
 struct ProbeFailureEvidence {
     instance_id: String,
     descriptor_started_at_unix: i64,
+    failure_kind: ProbeFailureKind,
     first_failure_unix: i64,
     last_failure_unix: i64,
     failure_count: u32,
 }
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProbeFailureKind {
+    ConnectionFailed,
+    Unresponsive,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FailurePolicy {
+    minimum_descriptor_age: Duration,
+    minimum_failure_window: Duration,
+    failures_required: u32,
+}
+
+const CONNECTION_FAILURE_POLICY: FailurePolicy = FailurePolicy {
+    minimum_descriptor_age: UNREACHABLE_CLEANUP_AGE,
+    minimum_failure_window: UNREACHABLE_FAILURE_WINDOW,
+    failures_required: UNREACHABLE_FAILURES_REQUIRED,
+};
+
+const TIMEOUT_FAILURE_POLICY: FailurePolicy = FailurePolicy {
+    minimum_descriptor_age: TIMEOUT_CLEANUP_AGE,
+    minimum_failure_window: TIMEOUT_FAILURE_WINDOW,
+    failures_required: TIMEOUT_FAILURES_REQUIRED,
+};
 
 fn process_probe_evidence(observations: Vec<(DescriptorCandidate, ProbeOutcome)>) {
     let mut stale = Vec::new();
@@ -322,14 +384,24 @@ fn process_probe_evidence(observations: Vec<(DescriptorCandidate, ProbeOutcome)>
                 clear_failure_evidence(&candidate);
                 stale.push(candidate);
             }
-            ProbeOutcome::ConnectionFailed if candidate.age() >= UNREACHABLE_CLEANUP_AGE => {
-                clear_failure_evidence(&candidate);
-                stale.push(candidate);
+            ProbeOutcome::ConnectionFailed if candidate.age() >= STARTUP_GRACE => {
+                if record_probe_failure(
+                    &candidate,
+                    ProbeFailureKind::ConnectionFailed,
+                    CONNECTION_FAILURE_POLICY,
+                ) {
+                    clear_failure_evidence(&candidate);
+                    stale.push(candidate);
+                }
             }
             ProbeOutcome::InvalidHealth | ProbeOutcome::TimedOut
                 if candidate.age() >= STARTUP_GRACE =>
             {
-                if record_probe_failure(&candidate) {
+                if record_probe_failure(
+                    &candidate,
+                    ProbeFailureKind::Unresponsive,
+                    TIMEOUT_FAILURE_POLICY,
+                ) {
                     clear_failure_evidence(&candidate);
                     stale.push(candidate);
                 }
@@ -343,7 +415,11 @@ fn process_probe_evidence(observations: Vec<(DescriptorCandidate, ProbeOutcome)>
     cleanup_stale_descriptors(stale);
 }
 
-fn record_probe_failure(candidate: &DescriptorCandidate) -> bool {
+fn record_probe_failure(
+    candidate: &DescriptorCandidate,
+    failure_kind: ProbeFailureKind,
+    policy: FailurePolicy,
+) -> bool {
     let now = unix_timestamp();
     let path = failure_evidence_path(candidate);
     let previous = fs::read(&path)
@@ -352,11 +428,13 @@ fn record_probe_failure(candidate: &DescriptorCandidate) -> bool {
         .filter(|evidence| {
             evidence.instance_id == candidate.descriptor.instance_id
                 && evidence.descriptor_started_at_unix == candidate.descriptor.started_at_unix
+                && evidence.failure_kind == failure_kind
         });
     let evidence = previous.map_or_else(
         || ProbeFailureEvidence {
             instance_id: candidate.descriptor.instance_id.clone(),
             descriptor_started_at_unix: candidate.descriptor.started_at_unix,
+            failure_kind,
             first_failure_unix: now,
             last_failure_unix: now,
             failure_count: 1,
@@ -367,10 +445,10 @@ fn record_probe_failure(candidate: &DescriptorCandidate) -> bool {
             ..previous
         },
     );
-    let confirmed = candidate.age() >= TIMEOUT_CLEANUP_AGE
-        && evidence.failure_count >= TIMEOUT_FAILURES_REQUIRED
+    let confirmed = candidate.age() >= policy.minimum_descriptor_age
+        && evidence.failure_count >= policy.failures_required
         && now.saturating_sub(evidence.first_failure_unix)
-            >= i64::try_from(TIMEOUT_FAILURE_WINDOW.as_secs()).unwrap_or(i64::MAX);
+            >= i64::try_from(policy.minimum_failure_window.as_secs()).unwrap_or(i64::MAX);
     if !confirmed {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -420,7 +498,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ProbeFailureEvidence, RuntimeDescriptor, observe_runtime, runtime_directory, unix_timestamp,
+        DescriptorCandidate, ProbeFailureEvidence, ProbeFailureKind, ProbeOutcome,
+        RuntimeDescriptor, RuntimeObservationError, failure_evidence_path, observe_runtime,
+        observe_runtime_with_timeout, process_probe_evidence, runtime_directory, unix_timestamp,
     };
     use crate::{AppPaths, ServerState};
 
@@ -456,18 +536,19 @@ mod tests {
         let healthy_path = write_descriptor(&directory, &healthy_id, address, 60);
         let mismatch_path = write_descriptor(&directory, &Uuid::new_v4().to_string(), address, 60);
         let unused_address = unused_loopback_address();
-        let old_unreachable_id = Uuid::new_v4().to_string();
-        let old_unreachable_path = write_descriptor(
-            &directory,
-            &old_unreachable_id,
-            unused_address,
-            25 * 60 * 60,
-        );
-        write_prior_failure_evidence(&directory, &old_unreachable_id);
         let recent_unreachable_path =
             write_descriptor(&directory, &Uuid::new_v4().to_string(), unused_address, 5);
 
-        let state = observe_runtime(&paths).await;
+        let one_off_unreachable_path = write_descriptor(
+            &directory,
+            &Uuid::new_v4().to_string(),
+            unused_address,
+            25 * 60 * 60,
+        );
+
+        let state = observe_runtime(&paths)
+            .await
+            .expect("observe runtime state");
         assert_eq!(
             state,
             ServerState::Running {
@@ -477,7 +558,7 @@ mod tests {
         server.await.expect("health server task");
         assert!(healthy_path.exists());
         assert!(!mismatch_path.exists());
-        assert!(!old_unreachable_path.exists());
+        assert!(one_off_unreachable_path.exists());
         assert!(recent_unreachable_path.exists());
 
         fs::remove_dir_all(&paths.state_dir).expect("remove temporary state directory");
@@ -514,7 +595,9 @@ mod tests {
             .collect::<Vec<_>>();
 
         let started = Instant::now();
-        let state = observe_runtime(&paths).await;
+        let state = observe_runtime(&paths)
+            .await
+            .expect("observe bounded runtime state");
         let elapsed = started.elapsed();
         assert_eq!(state, ServerState::Stopped);
         assert!(
@@ -524,6 +607,66 @@ mod tests {
         assert!(descriptor_paths.iter().all(|path| path.exists()));
 
         server.abort();
+        fs::remove_dir_all(&paths.state_dir).expect("remove temporary state directory");
+    }
+
+    #[tokio::test]
+    async fn observation_timeout_is_an_observer_error_not_a_server_failure() {
+        let paths = temporary_paths("observer-timeout");
+        let result = observe_runtime_with_timeout(&paths, Duration::ZERO).await;
+
+        assert!(matches!(result, Err(RuntimeObservationError::TimedOut)));
+    }
+
+    #[test]
+    fn connection_failure_cleanup_requires_repeated_matching_evidence() {
+        let paths = temporary_paths("connection-evidence");
+        let directory = runtime_directory(&paths);
+        fs::create_dir_all(&directory).expect("create runtime directory");
+        let instance_id = Uuid::new_v4().to_string();
+        let descriptor_path = write_descriptor(
+            &directory,
+            &instance_id,
+            unused_loopback_address(),
+            25 * 60 * 60,
+        );
+
+        process_probe_evidence(vec![(
+            read_candidate(&descriptor_path),
+            ProbeOutcome::ConnectionFailed,
+        )]);
+        assert!(descriptor_path.exists());
+
+        write_prior_failure_evidence(&directory, &instance_id, ProbeFailureKind::ConnectionFailed);
+        process_probe_evidence(vec![(
+            read_candidate(&descriptor_path),
+            ProbeOutcome::ConnectionFailed,
+        )]);
+        assert!(!descriptor_path.exists());
+
+        fs::remove_dir_all(&paths.state_dir).expect("remove temporary state directory");
+    }
+
+    #[test]
+    fn healthy_observation_clears_matching_failure_evidence() {
+        let paths = temporary_paths("healthy-clears-evidence");
+        let directory = runtime_directory(&paths);
+        fs::create_dir_all(&directory).expect("create runtime directory");
+        let instance_id = Uuid::new_v4().to_string();
+        let descriptor_path = write_descriptor(
+            &directory,
+            &instance_id,
+            unused_loopback_address(),
+            25 * 60 * 60,
+        );
+        write_prior_failure_evidence(&directory, &instance_id, ProbeFailureKind::ConnectionFailed);
+        let candidate = read_candidate(&descriptor_path);
+        let evidence_path = failure_evidence_path(&candidate);
+
+        process_probe_evidence(vec![(candidate, ProbeOutcome::Healthy)]);
+        assert!(descriptor_path.exists());
+        assert!(!evidence_path.exists());
+
         fs::remove_dir_all(&paths.state_dir).expect("remove temporary state directory");
     }
 
@@ -569,7 +712,21 @@ mod tests {
         address
     }
 
-    fn write_prior_failure_evidence(servers_directory: &Path, instance_id: &str) {
+    fn read_candidate(path: &Path) -> DescriptorCandidate {
+        DescriptorCandidate {
+            path: path.to_owned(),
+            descriptor: serde_json::from_slice(
+                &fs::read(path).expect("read runtime descriptor candidate"),
+            )
+            .expect("deserialize runtime descriptor candidate"),
+        }
+    }
+
+    fn write_prior_failure_evidence(
+        servers_directory: &Path,
+        instance_id: &str,
+        failure_kind: ProbeFailureKind,
+    ) {
         let failures_directory = servers_directory
             .parent()
             .expect("runtime directory")
@@ -584,6 +741,7 @@ mod tests {
         let evidence = ProbeFailureEvidence {
             instance_id: instance_id.to_owned(),
             descriptor_started_at_unix: descriptor.started_at_unix,
+            failure_kind,
             first_failure_unix: now - 2 * 60 * 60,
             last_failure_unix: now - 60 * 60,
             failure_count: 2,
