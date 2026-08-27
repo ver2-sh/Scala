@@ -1,48 +1,32 @@
 mod command_palette;
 mod components;
+pub(crate) mod layout;
 mod screens;
 mod shell;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Margin};
 use ratatui::widgets::Block;
 
 use crate::app::App;
 use crate::theme::{Glyphs, Theme};
+use layout::UiLayout;
 
-pub fn render(frame: &mut Frame<'_>, app: &App) {
+pub fn render(frame: &mut Frame<'_>, app: &App) -> UiLayout {
     let area = frame.area();
+    let layout = UiLayout::calculate(area, app);
     let theme = Theme::current(app.no_color);
     let glyphs = Glyphs::current(app.unicode);
     frame.render_widget(Block::default().style(theme.text), area);
-    if area.width < shell::MIN_WIDTH || area.height < shell::MIN_HEIGHT {
+    if layout.too_small {
         shell::render_too_small(frame, area, &theme, &glyphs);
-        return;
+        return layout;
     }
 
-    let compact = area.width < shell::COMPACT_WIDTH || area.height < 23;
-    let shell_area = area.inner(Margin {
-        horizontal: if compact { 1 } else { 2 },
-        vertical: 0,
-    });
-    let regions = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(if compact { 3 } else { 4 }),
-            Constraint::Min(5),
-            Constraint::Length(3),
-            Constraint::Length(2),
-        ])
-        .split(shell_area);
-
-    shell::render_header(frame, regions[0], app, &theme, &glyphs, compact);
-    let content = regions[1].inner(Margin {
-        horizontal: if compact { 1 } else { 2 },
-        vertical: 1,
-    });
-    screens::render_screen(frame, content, app, &theme, &glyphs, compact);
-    shell::render_command_bar(frame, regions[2], app, &theme, &glyphs);
-    shell::render_footer(frame, regions[3], app, &theme, &glyphs);
-    command_palette::render_overlays(frame, app, &theme, &glyphs, regions[2]);
-    shell::set_command_cursor(frame, regions[2], app);
+    shell::render_header(frame, app, &theme, &glyphs, &layout);
+    screens::render_screen(frame, app, &theme, &glyphs, &layout);
+    shell::render_command_bar(frame, layout.command_bar, app, &theme, &glyphs);
+    shell::render_footer(frame, layout.footer, app, &theme, &glyphs);
+    command_palette::render_overlays(frame, app, &theme, &glyphs, &layout);
+    shell::set_command_cursor(frame, layout.command_bar, app);
+    layout
 }

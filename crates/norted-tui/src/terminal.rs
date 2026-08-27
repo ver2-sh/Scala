@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -22,6 +22,7 @@ struct TerminalState {
     raw_mode: bool,
     alternate_screen: bool,
     bracketed_paste: bool,
+    mouse_capture: bool,
     cursor_hidden: bool,
     enhanced_keys: bool,
 }
@@ -38,6 +39,9 @@ impl TerminalState {
         }
         if self.bracketed_paste {
             record(&mut first_error, execute!(stdout, DisableBracketedPaste));
+        }
+        if self.mouse_capture {
+            record(&mut first_error, execute!(stdout, DisableMouseCapture));
         }
         if self.cursor_hidden {
             record(&mut first_error, execute!(stdout, Show));
@@ -83,6 +87,11 @@ impl TerminalSession {
             return Err(error);
         }
         state.bracketed_paste = true;
+        if let Err(error) = execute!(stdout, EnableMouseCapture) {
+            let _ = state.restore();
+            return Err(error);
+        }
+        state.mouse_capture = true;
         if let Err(error) = execute!(stdout, Hide) {
             let _ = state.restore();
             return Err(error);

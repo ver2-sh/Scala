@@ -1,5 +1,4 @@
 use ratatui::Frame;
-use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
@@ -7,6 +6,7 @@ use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 use crate::app::{App, Overlay};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{centered_rect, popup_block};
+use crate::ui::layout::{HoverTarget, UiLayout};
 use crate::ui::screens::help_lines;
 
 pub fn render_overlays(
@@ -14,7 +14,7 @@ pub fn render_overlays(
     app: &App,
     theme: &Theme,
     glyphs: &Glyphs,
-    command_area: Rect,
+    layout: &UiLayout,
 ) {
     if app.overlay == Some(Overlay::Help) {
         let area = centered_rect(74, 72, frame.area());
@@ -34,14 +34,10 @@ pub fn render_overlays(
     if suggestions.is_empty() {
         return;
     }
-    let visible_count = suggestions.len().min(8);
-    let height = visible_count as u16 + 2;
-    let area = Rect::new(
-        command_area.x,
-        command_area.y.saturating_sub(height),
-        command_area.width,
-        height,
-    );
+    let Some(area) = layout.suggestion_popup else {
+        return;
+    };
+    let visible_count = layout.suggestion_rows.len();
     frame.render_widget(Clear, area);
     let end = (app.suggestion_scroll + visible_count).min(suggestions.len());
     let items = suggestions[app.suggestion_scroll..end]
@@ -49,11 +45,14 @@ pub fn render_overlays(
         .enumerate()
         .map(|(visible_index, command)| {
             let index = app.suggestion_scroll + visible_index;
-            let style = if index == app.suggestion_index {
+            let mut style = if index == app.suggestion_index {
                 theme.selected
             } else {
                 Style::default()
             };
+            if app.hover == Some(HoverTarget::CommandSuggestion(index)) {
+                style = style.patch(theme.hovered);
+            }
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{:<12}", command.name), theme.accent),
                 Span::styled(command.description, theme.muted),

@@ -19,12 +19,9 @@ pub struct Glyphs {
     pub stopped: &'static str,
     pub transitional: &'static str,
     pub empty: &'static str,
-    pub previous: &'static str,
-    pub next: &'static str,
     pub command: &'static str,
     pub dimensions: &'static str,
     pub up_down: &'static str,
-    pub right: &'static str,
     pub border: border::Set<'static>,
 }
 
@@ -37,12 +34,9 @@ impl Glyphs {
                 stopped: "○",
                 transitional: "◆",
                 empty: "◇",
-                previous: "‹",
-                next: "›",
                 command: "›",
                 dimensions: "×",
                 up_down: "↑↓",
-                right: "→",
                 border: border::PLAIN,
             }
         } else {
@@ -52,12 +46,9 @@ impl Glyphs {
                 stopped: "o",
                 transitional: "*",
                 empty: "-",
-                previous: "<",
-                next: ">",
                 command: ">",
                 dimensions: "x",
                 up_down: "Up/Dn",
-                right: "->",
                 border: ASCII_BORDER,
             }
         }
@@ -76,6 +67,8 @@ pub struct Theme {
     pub selected: Style,
     pub nav_active: Style,
     pub nav_inactive: Style,
+    pub hovered: Style,
+    pub focused: Style,
     pub command: Style,
     pub hint: Style,
     pub panel: Style,
@@ -94,8 +87,10 @@ impl Theme {
                 error: Style::default().add_modifier(Modifier::BOLD),
                 border: Style::default().add_modifier(Modifier::DIM),
                 selected: Style::default().add_modifier(Modifier::REVERSED),
-                nav_active: Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                nav_active: Style::default().add_modifier(Modifier::BOLD),
                 nav_inactive: Style::default().add_modifier(Modifier::DIM),
+                hovered: Style::default().add_modifier(Modifier::UNDERLINED),
+                focused: Style::default().add_modifier(Modifier::REVERSED),
                 command: Style::default().add_modifier(Modifier::BOLD),
                 hint: Style::default().add_modifier(Modifier::DIM),
                 panel: Style::default(),
@@ -117,8 +112,10 @@ impl Theme {
                 .add_modifier(Modifier::BOLD),
             nav_active: Style::default()
                 .fg(Color::Rgb(108, 205, 183))
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                .add_modifier(Modifier::BOLD),
             nav_inactive: Style::default().fg(Color::Rgb(126, 139, 157)),
+            hovered: Style::default().bg(Color::Rgb(35, 49, 58)),
+            focused: Style::default().add_modifier(Modifier::UNDERLINED),
             command: Style::default().fg(Color::Rgb(225, 231, 239)),
             hint: Style::default().fg(Color::Rgb(103, 116, 134)),
             panel: Style::default().bg(Color::Rgb(24, 29, 38)),

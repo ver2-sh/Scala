@@ -16,6 +16,7 @@ use norted_core::ApplicationCore;
 
 use app::{App, Update};
 use terminal::TerminalSession;
+use ui::layout::UiLayout;
 
 pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
     let mut terminal = TerminalSession::enter()?;
@@ -50,28 +51,33 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
         }
     });
     let mut render = true;
+    let mut layout = UiLayout::default();
 
     loop {
         if render {
-            terminal.draw(|frame| ui::render(frame, &app))?;
+            terminal.draw(|frame| layout = ui::render(frame, &app))?;
         }
         let update = tokio::select! {
             event = terminal_events.next() => match event {
-                Some(Ok(Event::Key(key))) => app.handle_key(key),
+                Some(Ok(Event::Key(key))) => app.handle_key(key, &layout),
+                Some(Ok(Event::Mouse(mouse))) => app.handle_mouse(mouse, &layout),
                 Some(Ok(Event::Paste(text))) => app.handle_paste(&text),
-                Some(Ok(Event::Resize(_, _))) => Update::Render,
+                Some(Ok(Event::Resize(_, _))) => {
+                    app.clear_hover();
+                    Update::Render
+                },
                 Some(Ok(_)) => Update::None,
                 Some(Err(error)) => return Err(error.into()),
                 None => Update::Quit,
             },
             event = core_events.recv() => match event {
                 Ok(event) => {
-                    app.snapshot = core.snapshot().await;
+                    app.replace_snapshot(core.snapshot().await);
                     app.handle_core_event(event);
                     Update::Render
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    app.snapshot = core.snapshot().await;
+                    app.replace_snapshot(core.snapshot().await);
                     Update::Render
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => Update::None,

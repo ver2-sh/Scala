@@ -7,21 +7,22 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap}
 use crate::app::{App, Screen};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{content_layout, format_bytes, key_value, render_empty, section_title};
+use crate::ui::layout::{HoverTarget, UiLayout};
 
 pub fn render_screen(
     frame: &mut Frame<'_>,
-    area: Rect,
     app: &App,
     theme: &Theme,
     glyphs: &Glyphs,
-    compact: bool,
+    ui_layout: &UiLayout,
 ) {
+    let area = ui_layout.content;
     match app.screen {
-        Screen::Overview => render_overview(frame, area, app, theme, glyphs, compact),
-        Screen::Models => render_models(frame, area, app, theme, glyphs),
+        Screen::Overview => render_overview(frame, area, app, theme, glyphs, ui_layout.compact),
+        Screen::Models => render_models(frame, area, app, theme, glyphs, ui_layout),
         Screen::Engines => render_engines(frame, area, theme, glyphs),
         Screen::Server => render_server(frame, area, app, theme),
-        Screen::Logs => render_logs(frame, area, app, theme),
+        Screen::Logs => render_logs(frame, area, app, theme, ui_layout),
         Screen::Settings => render_settings(frame, area, app, theme),
         Screen::Help => render_help_content(frame, area, theme, glyphs),
     }
@@ -171,7 +172,14 @@ fn render_metrics(
     }
 }
 
-fn render_models(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, glyphs: &Glyphs) {
+fn render_models(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    glyphs: &Glyphs,
+    ui_layout: &UiLayout,
+) {
     let layout = content_layout(area);
     let subtitle = match &app.snapshot.registry_state {
         RegistryState::NotScanned => "Model discovery has not started".to_owned(),
@@ -213,7 +221,16 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, gl
         );
         return;
     }
-    let items = app.snapshot.models.iter().map(|model| {
+    let items = ui_layout.model_rows.iter().map(|(index, _)| {
+        let model = &app.snapshot.models[*index];
+        let mut style = if app.selected_model == Some(*index) {
+            theme.selected
+        } else {
+            ratatui::style::Style::default()
+        };
+        if app.hover == Some(HoverTarget::Model(*index)) {
+            style = style.patch(theme.hovered);
+        }
         ListItem::new(vec![
             Line::from(vec![
                 Span::styled(&model.display_name, theme.text),
@@ -224,8 +241,9 @@ fn render_models(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, gl
                 Span::styled(format!("  {}", model.path.display()), theme.hint),
             ]),
         ])
+        .style(style)
     });
-    frame.render_widget(List::new(items).highlight_style(theme.selected), layout[1]);
+    frame.render_widget(List::new(items), layout[1]);
 }
 
 fn render_engines(frame: &mut Frame<'_>, area: Rect, theme: &Theme, glyphs: &Glyphs) {
@@ -277,15 +295,19 @@ fn render_server(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     );
 }
 
-fn render_logs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+fn render_logs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, ui_layout: &UiLayout) {
     let layout = content_layout(area);
     frame.render_widget(
         section_title("Logs", "Application and model-registry warnings", theme),
         layout[0],
     );
     let visible = layout[1].height as usize;
-    let start = app.logs.len().saturating_sub(visible);
-    let lines = app.logs[start..].iter().map(|entry| {
+    let offset = app
+        .log_scroll
+        .min(app.logs.len().saturating_sub(ui_layout.log_capacity()));
+    let end = app.logs.len().saturating_sub(offset);
+    let start = end.saturating_sub(visible);
+    let lines = app.logs[start..end].iter().map(|entry| {
         let (label, style) = match entry.level {
             norted_core::LogLevel::Info => ("INFO", theme.accent),
             norted_core::LogLevel::Warning => ("WARN", theme.warning),
@@ -347,13 +369,16 @@ fn render_help_content(frame: &mut Frame<'_>, area: Rect, theme: &Theme, glyphs:
 pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
     vec![
         Line::from(Span::styled("NAVIGATION", theme.hint)),
-        key_value("Tab", "next screen", theme),
-        key_value("Shift+Tab", "previous screen", theme),
-        key_value("j / k", "move between screens", theme),
-        Line::from(Span::styled(
-            format!("Right key ({}) also advances", glyphs.right),
-            theme.hint,
-        )),
+        key_value("Tab / Shift+Tab", "change focus", theme),
+        key_value("Left / Right", "move navigation focus", theme),
+        key_value("Enter", "activate focused navigation", theme),
+        key_value("Mouse", "click pages and interactive rows", theme),
+        Line::default(),
+        Line::from(Span::styled("CURRENT VIEW", theme.hint)),
+        key_value("Up/Down or j/k", "select or scroll", theme),
+        key_value("PageUp/PageDown", "scroll logs or model list", theme),
+        key_value("Wheel", "scroll the current view", theme),
+        key_value("End", "follow newest logs", theme),
         Line::default(),
         Line::from(Span::styled("COMMANDS", theme.hint)),
         key_value("/", "open slash-command suggestions", theme),
