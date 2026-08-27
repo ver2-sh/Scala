@@ -59,6 +59,7 @@ pub struct LogEntry {
 pub struct App {
     pub snapshot: AppSnapshot,
     pub no_color: bool,
+    pub unicode: bool,
     pub server_address: String,
     pub config_path: String,
     pub model_paths: Vec<String>,
@@ -68,6 +69,7 @@ pub struct App {
     pub command_input: String,
     pub command_cursor: usize,
     pub suggestion_index: usize,
+    pub suggestion_scroll: usize,
     pub notice: Option<String>,
     pub logs: Vec<LogEntry>,
 }
@@ -76,13 +78,29 @@ impl App {
     pub fn new(
         snapshot: AppSnapshot,
         no_color: bool,
+        unicode: bool,
         server_address: String,
         config_path: String,
         model_paths: Vec<String>,
     ) -> Self {
+        let mut logs = vec![LogEntry {
+            level: LogLevel::Info,
+            message: "Control core initialized".into(),
+        }];
+        logs.extend(
+            snapshot
+                .registry_warnings
+                .iter()
+                .cloned()
+                .map(|message| LogEntry {
+                    level: LogLevel::Warning,
+                    message,
+                }),
+        );
         Self {
             snapshot,
             no_color,
+            unicode,
             server_address,
             config_path,
             model_paths,
@@ -92,11 +110,9 @@ impl App {
             command_input: String::new(),
             command_cursor: 0,
             suggestion_index: 0,
+            suggestion_scroll: 0,
             notice: None,
-            logs: vec![LogEntry {
-                level: LogLevel::Info,
-                message: "Control core initialized".into(),
-            }],
+            logs,
         }
     }
 
@@ -129,6 +145,7 @@ impl App {
                 self.command_input = "/".into();
                 self.command_cursor = 1;
                 self.suggestion_index = 0;
+                self.suggestion_scroll = 0;
                 Update::Render
             }
             KeyCode::Char('?') => {
@@ -162,6 +179,8 @@ impl App {
         }
         let normalized = text.replace(['\r', '\n', '\t'], " ");
         self.insert_text(&normalized);
+        self.suggestion_index = 0;
+        self.suggestion_scroll = 0;
         Update::Render
     }
 
@@ -200,6 +219,7 @@ impl App {
                 let len = self.suggestions().len();
                 if len > 0 {
                     self.suggestion_index = self.suggestion_index.saturating_sub(1);
+                    self.ensure_suggestion_visible();
                 }
                 Update::Render
             }
@@ -207,11 +227,13 @@ impl App {
                 let len = self.suggestions().len();
                 if len > 0 {
                     self.suggestion_index = (self.suggestion_index + 1).min(len - 1);
+                    self.ensure_suggestion_visible();
                 }
                 Update::Render
             }
             KeyCode::BackTab => {
                 self.suggestion_index = self.suggestion_index.saturating_sub(1);
+                self.ensure_suggestion_visible();
                 Update::Render
             }
             KeyCode::Backspace => {
@@ -222,6 +244,7 @@ impl App {
                     self.command_input.replace_range(start..end, "");
                 }
                 self.suggestion_index = 0;
+                self.suggestion_scroll = 0;
                 Update::Render
             }
             KeyCode::Delete => {
@@ -230,6 +253,8 @@ impl App {
                     let end = byte_index(&self.command_input, self.command_cursor + 1);
                     self.command_input.replace_range(start..end, "");
                 }
+                self.suggestion_index = 0;
+                self.suggestion_scroll = 0;
                 Update::Render
             }
             KeyCode::Left => {
@@ -256,6 +281,7 @@ impl App {
             {
                 self.insert_text(&character.to_string());
                 self.suggestion_index = 0;
+                self.suggestion_scroll = 0;
                 Update::Render
             }
             _ => Update::None,
@@ -285,6 +311,7 @@ impl App {
         self.command_input.clear();
         self.command_cursor = 0;
         self.suggestion_index = 0;
+        self.suggestion_scroll = 0;
         self.notice = None;
         match command.action {
             CommandAction::Navigate(screen) => {
@@ -308,6 +335,15 @@ impl App {
         let next = (current + direction).rem_euclid(count) as usize;
         self.screen = Screen::ALL[next];
         self.notice = None;
+    }
+
+    fn ensure_suggestion_visible(&mut self) {
+        const VISIBLE_SUGGESTIONS: usize = 8;
+        if self.suggestion_index < self.suggestion_scroll {
+            self.suggestion_scroll = self.suggestion_index;
+        } else if self.suggestion_index >= self.suggestion_scroll + VISIBLE_SUGGESTIONS {
+            self.suggestion_scroll = self.suggestion_index + 1 - VISIBLE_SUGGESTIONS;
+        }
     }
 }
 

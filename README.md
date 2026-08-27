@@ -10,13 +10,15 @@ The bootstrap currently provides:
 
 - a responsive Ratatui interface with Overview, Models, Engines, Server, Logs, Settings, and Help views;
 - a data-driven slash-command bar with completion, keyboard navigation, paste handling, reusable overlays, and compact/minimum-size modes;
-- discovery of local `.gguf` and `.q27` artifacts from configured search paths;
+- non-blocking discovery of local `.gguf` and `.q27` artifacts from resolved search paths;
+- stable, readable model IDs derived from canonical artifact identity with SHA-256;
+- cross-process API runtime observation using atomic descriptors and identity-checked health probes;
 - explicit server, runtime, engine capability, and provenance types;
 - an engine adapter contract with native argument/environment escape hatches;
 - a real Axum server exposing `GET /health` and registry-backed `GET /v1/models`;
 - structured file logging and bootstrap diagnostics.
 
-Norted Server does **not yet download, build, install, or execute llama.cpp or Q27**. It does not expose inference endpoints yet and never inserts fake model or engine data.
+Norted Server has **no engine support yet**: it does not download, build, install, or execute inference engines. It exposes no inference endpoint and does not claim full OpenAI API compatibility.
 
 ## Run
 
@@ -50,7 +52,9 @@ curl http://127.0.0.1:8742/health
 curl http://127.0.0.1:8742/v1/models
 ```
 
-The server defaults to loopback only (`127.0.0.1:8742`).
+The server defaults to loopback only (`127.0.0.1:8742`). A separately launched `status` command or TUI discovers it through runtime descriptors in the state directory and accepts a descriptor only when `/health` returns the matching random instance identity. Stale descriptors from an unclean exit therefore do not report a dead process as healthy.
+
+`GET /v1/models` returns the OpenAI-style list envelope and local model objects with `id`, `object`, `created`, `owned_by`, and nullable `shutdown_date`. `created` is the local artifact's last-modified Unix timestamp. The route is a narrow compatibility surface, not a claim of complete OpenAI API support.
 
 ## Configuration
 
@@ -71,10 +75,14 @@ no_color = false
 unicode = true
 ```
 
-Configuration, application data, runtime state, cache, and logs use separate operating-system application directories. `NO_COLOR` disables TUI colour independently of the configuration.
+Relative model paths resolve against the directory containing `config.toml`, independent of the launch shell's working directory. Absolute paths remain unchanged. The resolved paths are used by discovery, Doctor, CLI output, and TUI Settings.
+
+Configuration, application data, runtime state, cache, and logs use separate operating-system application directories. The supported schema version is currently `1`; unsupported versions and unknown structured keys are rejected. Arbitrary engine-native settings remain namespaced and extensible. `NO_COLOR` disables TUI colour independently of the configuration, while `tui.unicode = false` selects intentional ASCII glyphs.
+
+Building requires Rust 1.88 or newer. `rust-toolchain.toml` pins 1.88.0 for reproducible local and CI behavior while the manifest declares the truthful MSRV.
 
 ## Next phases
 
-Planned adapters will manage upstream `llama-server` and `q27-server` binaries behind the engine boundary. The latest OpenAI Responses API will become the canonical public inference contract; Chat Completions compatibility will translate into that representation. Public API behavior remains separate from engine-native JSON, arguments, and environment variables.
+Future adapters will manage upstream runtimes behind the engine boundary. The OpenAI Responses API remains the planned primary public inference contract, but is not implemented. Public API behavior will remain separate from engine-native JSON, arguments, and environment variables.
 
 See [docs/architecture.md](docs/architecture.md) for boundaries and dependency direction.

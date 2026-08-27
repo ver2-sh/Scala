@@ -25,6 +25,16 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
+    if matches!(&cli.command, Some(Command::Doctor)) {
+        let checks = doctor::run();
+        let has_fatal = checks.iter().any(|check| check.fatal);
+        output::doctor(&checks, cli.json)?;
+        return Ok(if has_fatal {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
     let paths = AppPaths::discover()?;
     paths.ensure_required()?;
     let _log_guard = init_logging(&paths);
@@ -66,14 +76,7 @@ async fn run() -> Result<ExitCode> {
         Command::Config(args) => match args.command {
             ConfigCommand::Show => output::config(core, cli.json)?,
         },
-        Command::Doctor => {
-            let checks = doctor::run(core).await;
-            let has_fatal = checks.iter().any(|check| check.fatal);
-            output::doctor(&checks, cli.json)?;
-            if has_fatal {
-                return Ok(ExitCode::FAILURE);
-            }
-        }
+        Command::Doctor => unreachable!("doctor is dispatched before application startup"),
     }
     Ok(ExitCode::SUCCESS)
 }

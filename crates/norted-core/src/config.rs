@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CoreError, Result};
 
+pub const SUPPORTED_CONFIG_VERSION: u32 = 1;
+
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub config_dir: PathBuf,
@@ -54,7 +56,7 @@ impl AppPaths {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
     pub version: u32,
     pub server: ServerConfig,
@@ -67,7 +69,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: SUPPORTED_CONFIG_VERSION,
             server: ServerConfig::default(),
             models: ModelConfig::default(),
             tui: TuiConfig::default(),
@@ -76,10 +78,31 @@ impl Default for AppConfig {
     }
 }
 
+impl AppConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != SUPPORTED_CONFIG_VERSION {
+            return Err(CoreError::UnsupportedConfigVersion {
+                found: self.version,
+                supported: SUPPORTED_CONFIG_VERSION,
+            });
+        }
+        self.server.ip_addr()?;
+        Ok(())
+    }
+
+    pub fn resolve_model_paths(&mut self, config_dir: &Path) {
+        for path in &mut self.models.paths {
+            if path.is_relative() {
+                *path = config_dir.join(&*path);
+            }
+        }
+    }
+}
+
 /// Namespaced adapter configuration. Common settings stay normalized while
 /// native arguments and environment variables remain adapter-owned.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EngineConfig {
     pub enabled: bool,
     pub settings: BTreeMap<String, toml::Value>,
@@ -88,7 +111,7 @@ pub struct EngineConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -112,13 +135,13 @@ impl ServerConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ModelConfig {
     pub paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct TuiConfig {
     pub no_color: bool,
     pub unicode: bool,
@@ -160,10 +183,13 @@ impl LoadedConfig {
                 path: paths.config_file.clone(),
                 source,
             })?;
-        let config = toml::from_str(&text).map_err(|source| CoreError::ParseConfig {
-            path: paths.config_file.clone(),
-            source,
-        })?;
+        let mut config: AppConfig =
+            toml::from_str(&text).map_err(|source| CoreError::ParseConfig {
+                path: paths.config_file.clone(),
+                source,
+            })?;
+        config.validate()?;
+        config.resolve_model_paths(&paths.config_dir);
         Ok(Self {
             config,
             path: paths.config_file.clone(),

@@ -8,7 +8,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
-use norted_core::{ApplicationCore, ServerState};
+use norted_core::{ApplicationCore, RuntimePublisher, ServerState};
 use serde::Serialize;
 use tokio::net::TcpListener;
 
@@ -21,12 +21,15 @@ pub enum ApiError {
     },
     #[error("API server failed: {0}")]
     Serve(std::io::Error),
+    #[error("could not publish runtime state: {0}")]
+    Runtime(#[from] norted_core::CoreError),
 }
 
 pub struct ApiServer {
     core: Arc<ApplicationCore>,
     listener: TcpListener,
     address: SocketAddr,
+    publisher: RuntimePublisher,
 }
 
 impl ApiServer {
@@ -53,6 +56,7 @@ impl ApiServer {
             }
         };
         let address = listener.local_addr().map_err(ApiError::Serve)?;
+        let publisher = RuntimePublisher::publish(&core.paths, address)?;
         core.set_server_state(ServerState::Running {
             endpoint: format!("http://{address}"),
         })
@@ -61,6 +65,7 @@ impl ApiServer {
             core,
             listener,
             address,
+            publisher,
         })
     }
 
@@ -72,32 +77,47 @@ impl ApiServer {
         self,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> Result<(), ApiError> {
-        let app = routes(self.core.clone());
-        let result = axum::serve(self.listener, app)
+        let ApiServer {
+            core,
+            listener,
+            mut publisher,
+            ..
+        } = self;
+        let app = routes(ApiState {
+            core: core.clone(),
+            instance_id: publisher.instance_id().to_owned(),
+        });
+        let result = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown)
             .await;
+        publisher.cleanup();
         match result {
             Ok(()) => {
-                self.core.set_server_state(ServerState::Stopped).await;
+                core.set_server_state(ServerState::Stopped).await;
                 Ok(())
             }
             Err(error) => {
-                self.core
-                    .set_server_state(ServerState::Failed {
-                        message: error.to_string(),
-                    })
-                    .await;
+                core.set_server_state(ServerState::Failed {
+                    message: error.to_string(),
+                })
+                .await;
                 Err(ApiError::Serve(error))
             }
         }
     }
 }
 
-fn routes(core: Arc<ApplicationCore>) -> Router {
+#[derive(Clone)]
+struct ApiState {
+    core: Arc<ApplicationCore>,
+    instance_id: String,
+}
+
+fn routes(state: ApiState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
-        .with_state(core)
+        .with_state(state)
 }
 
 #[derive(Serialize)]
@@ -106,10 +126,11 @@ struct HealthResponse {
     server: &'static str,
     version: &'static str,
     model_count: usize,
+    instance_id: String,
 }
 
-async fn health(State(core): State<Arc<ApplicationCore>>) -> (StatusCode, Json<HealthResponse>) {
-    let snapshot = core.snapshot().await;
+async fn health(State(state): State<ApiState>) -> (StatusCode, Json<HealthResponse>) {
+    let snapshot = state.core.snapshot().await;
     (
         StatusCode::OK,
         Json(HealthResponse {
@@ -117,6 +138,7 @@ async fn health(State(core): State<Arc<ApplicationCore>>) -> (StatusCode, Json<H
             server: snapshot.server.label(),
             version: env!("CARGO_PKG_VERSION"),
             model_count: snapshot.models.len(),
+            instance_id: state.instance_id,
         }),
     )
 }
@@ -132,10 +154,12 @@ struct ApiModel {
     id: String,
     object: &'static str,
     owned_by: &'static str,
+    created: i64,
+    shutdown_date: Option<String>,
 }
 
-async fn models(State(core): State<Arc<ApplicationCore>>) -> Json<ModelList> {
-    let snapshot = core.snapshot().await;
+async fn models(State(state): State<ApiState>) -> Json<ModelList> {
+    let snapshot = state.core.snapshot().await;
     Json(ModelList {
         object: "list",
         data: snapshot
@@ -144,7 +168,9 @@ async fn models(State(core): State<Arc<ApplicationCore>>) -> Json<ModelList> {
             .map(|model| ApiModel {
                 id: model.id.0,
                 object: "model",
-                owned_by: "local",
+                owned_by: "norted-local",
+                created: model.created,
+                shutdown_date: None,
             })
             .collect(),
     })

@@ -31,6 +31,7 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
     let mut app = App::new(
         snapshot,
         core.config.tui.no_color,
+        core.config.tui.unicode,
         server_address,
         config_path,
         model_paths,
@@ -38,10 +39,14 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
     let mut terminal = TerminalSession::enter()?;
     let mut terminal_events = EventStream::new();
     let mut core_events = core.subscribe();
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut runtime_refresh = tokio::time::interval(Duration::from_secs(2));
+    runtime_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut render = true;
 
     loop {
-        terminal.draw(|frame| ui::render(frame, &app))?;
+        if render {
+            terminal.draw(|frame| ui::render(frame, &app))?;
+        }
         let update = tokio::select! {
             event = terminal_events.next() => match event {
                 Some(Ok(Event::Key(key))) => app.handle_key(key),
@@ -63,11 +68,17 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => Update::None,
             },
-            _ = tick.tick() => Update::Render,
+            _ = runtime_refresh.tick() => {
+                let previous = app.snapshot.server.clone();
+                core.refresh_server_state().await;
+                app.snapshot = core.snapshot().await;
+                if app.snapshot.server == previous { Update::None } else { Update::Render }
+            },
         };
         if update == Update::Quit {
             break;
         }
+        render = update == Update::Render;
     }
     terminal.leave()?;
     Ok(())

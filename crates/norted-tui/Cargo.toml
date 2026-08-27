@@ -11,3 +11,4 @@ futures-util.workspace = true
 norted-core = { path = "../norted-core" }
 ratatui.workspace = true
 tokio.workspace = true
+unicode-width.workspace = true

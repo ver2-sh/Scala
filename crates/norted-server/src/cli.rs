@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
     name = "norted-server",
     version,
     about = "Local language-model server and runtime manager",
-    long_about = "Manage local model artifacts, inference engines, and an OpenAI-compatible API from a polished terminal interface or deterministic CLI commands."
+    long_about = "Inspect local model artifacts and the Norted HTTP foundation from a polished terminal interface or deterministic CLI commands. No inference engine is implemented yet."
 )]
 pub struct Cli {
     /// Emit machine-readable JSON where supported

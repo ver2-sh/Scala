@@ -33,7 +33,13 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
 pub async fn models(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
     let snapshot = core.snapshot().await;
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&snapshot.models)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "data": snapshot.models,
+                "warnings": snapshot.registry_warnings,
+            }))?
+        );
     } else if snapshot.models.is_empty() {
         println!("No model artifacts discovered.");
         if core.config.models.paths.is_empty() {
@@ -54,6 +60,11 @@ pub async fn models(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
             );
         }
     }
+    if !json_output {
+        for warning in &snapshot.registry_warnings {
+            eprintln!("Warning: {warning}");
+        }
+    }
     Ok(())
 }
 
@@ -62,13 +73,11 @@ pub fn engines(json_output: bool) -> Result<()> {
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(
-                &json!({ "engines": [], "count": registry.adapters().len() })
-            )?
+            serde_json::to_string_pretty(&json!({ "engines": [], "count": registry.len() }))?
         );
     } else {
         println!("No engine adapters are installed.");
-        println!("llama.cpp and Q27 support is planned but not implemented in this bootstrap.");
+        println!("No inference engine support is implemented in this bootstrap.");
     }
     Ok(())
 }

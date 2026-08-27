@@ -1,4 +1,68 @@
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::border;
+
+const ASCII_BORDER: border::Set<'static> = border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+};
+
+#[derive(Debug, Clone, Copy)]
+pub struct Glyphs {
+    pub brand: &'static str,
+    pub running: &'static str,
+    pub stopped: &'static str,
+    pub transitional: &'static str,
+    pub empty: &'static str,
+    pub previous: &'static str,
+    pub next: &'static str,
+    pub command: &'static str,
+    pub dimensions: &'static str,
+    pub up_down: &'static str,
+    pub right: &'static str,
+    pub border: border::Set<'static>,
+}
+
+impl Glyphs {
+    pub fn current(unicode: bool) -> Self {
+        if unicode {
+            Self {
+                brand: "◆",
+                running: "●",
+                stopped: "○",
+                transitional: "◆",
+                empty: "◇",
+                previous: "‹",
+                next: "›",
+                command: "›",
+                dimensions: "×",
+                up_down: "↑↓",
+                right: "→",
+                border: border::PLAIN,
+            }
+        } else {
+            Self {
+                brand: "*",
+                running: "*",
+                stopped: "o",
+                transitional: "*",
+                empty: "-",
+                previous: "<",
+                next: ">",
+                command: ">",
+                dimensions: "x",
+                up_down: "Up/Dn",
+                right: "->",
+                border: ASCII_BORDER,
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Theme {

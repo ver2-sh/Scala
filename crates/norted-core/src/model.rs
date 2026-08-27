@@ -1,8 +1,10 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::collections::HashSet;
+use std::fs::Metadata;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -37,13 +39,13 @@ impl ArtifactFormat {
             Self::Q27 => "q27",
         }
     }
+}
 
-    pub fn compatible_engines(self) -> Vec<String> {
-        match self {
-            Self::Gguf => vec!["llama.cpp".into()],
-            Self::Q27 => vec!["q27".into()],
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelArtifactProvenance {
+    pub logical_id: Option<String>,
+    pub source: Option<String>,
+    pub revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,10 +55,12 @@ pub struct ModelArtifact {
     pub path: PathBuf,
     pub format: ArtifactFormat,
     pub size_bytes: u64,
+    /// Last-modified time of the local artifact, expressed as Unix seconds.
+    pub created: i64,
     pub hash: Option<String>,
     pub architecture: Option<String>,
     pub context_length: Option<u64>,
-    pub compatible_engines: Vec<String>,
+    pub provenance: Option<ModelArtifactProvenance>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -68,6 +72,7 @@ pub struct ModelRegistry {
 impl ModelRegistry {
     pub fn discover(search_paths: &[PathBuf]) -> Self {
         let mut registry = Self::default();
+        let mut seen = HashSet::new();
         for root in search_paths {
             if !root.exists() {
                 registry
@@ -90,21 +95,36 @@ impl ModelRegistry {
                 let Some(format) = ArtifactFormat::from_path(path) else {
                     continue;
                 };
+                let canonical_path = match path.canonicalize() {
+                    Ok(path) => path,
+                    Err(error) => {
+                        registry.warnings.push(format!(
+                            "could not resolve model path {}: {error}",
+                            path.display()
+                        ));
+                        continue;
+                    }
+                };
+                let identity = canonical_identity(&canonical_path);
+                if !seen.insert(identity.clone()) {
+                    continue;
+                }
                 match entry.metadata() {
                     Ok(metadata) => registry.artifacts.push(ModelArtifact {
-                        id: model_id(path, format),
+                        id: model_id(path, format, &identity, None),
                         display_name: path
                             .file_stem()
                             .and_then(|name| name.to_str())
                             .unwrap_or("Unnamed model")
                             .to_owned(),
-                        path: path.to_path_buf(),
+                        path: canonical_path,
                         format,
                         size_bytes: metadata.len(),
+                        created: artifact_timestamp(&metadata),
                         hash: None,
                         architecture: None,
                         context_length: None,
-                        compatible_engines: format.compatible_engines(),
+                        provenance: None,
                     }),
                     Err(error) => registry
                         .warnings
@@ -127,8 +147,71 @@ impl ModelRegistry {
     }
 }
 
-fn model_id(path: &Path, format: ArtifactFormat) -> ModelId {
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    ModelId(format!("{}-{:016x}", format.as_str(), hasher.finish()))
+fn model_id(
+    path: &Path,
+    format: ArtifactFormat,
+    canonical_identity: &str,
+    logical_identity: Option<&str>,
+) -> ModelId {
+    let readable = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(sanitize_id_part)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "model".to_owned());
+    let identity = logical_identity.unwrap_or(canonical_identity);
+    let digest = Sha256::digest(format!(
+        "norted-model-id-v1\0{}\0{identity}",
+        format.as_str()
+    ));
+    ModelId(format!("{readable}-{}", hex_prefix(&digest, 12)))
+}
+
+fn canonical_identity(path: &Path) -> String {
+    let identity = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        identity.to_lowercase()
+    } else {
+        identity
+    }
+}
+
+fn sanitize_id_part(value: &str) -> String {
+    let mut output = String::new();
+    let mut separator = false;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            output.push(character.to_ascii_lowercase());
+            separator = false;
+        } else if !separator && !output.is_empty() {
+            output.push('-');
+            separator = true;
+        }
+    }
+    output.trim_end_matches('-').to_owned()
+}
+
+fn hex_prefix(bytes: &[u8], length: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(length);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        if output.len() == length {
+            break;
+        }
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+        if output.len() == length {
+            break;
+        }
+    }
+    output
+}
+
+fn artifact_timestamp(metadata: &Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(0)
 }

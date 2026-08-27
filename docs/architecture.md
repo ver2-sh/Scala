@@ -1,47 +1,39 @@
 # Architecture
 
-Norted Server has two first-class interfaces over one application core. The interactive TUI and scriptable CLI both read the same model registry, configuration, and runtime state. The API gateway receives that same shared core when it starts.
+Norted Server is a set of engine-neutral foundations composed by the `norted-server` binary. A TUI or CLI invocation has its own in-memory `ApplicationCore`; only components inside that process share its `Arc<ApplicationCore>`. Separately launched processes observe a serving API through an explicit runtime-state boundary.
 
 ```text
-CLI / TUI ───────────────┐
-                         ▼
-                  norted-core
-             config · models · state
-                events · provenance
-                 ▲              ▲
-                 │              │
-          norted-engine     norted-api
-          adapter contract  public gateway
-                 │
-       future managed processes
+CLI / TUI process                         serve process
+┌────────────────────┐              ┌────────────────────┐
+│ own ApplicationCore│              │ own ApplicationCore│
+└─────────┬──────────┘              └─────────┬──────────┘
+          │ reads descriptors                  │ publishes descriptor
+          ▼                                    ▼
+   state/runtime/servers/<instance-id>.json (atomic, per instance)
+          │
+          └── GET /health ── verifies the same random instance identity
 ```
+
+The descriptor includes schema version, instance identity, PID, endpoint, probe address, and start timestamp. PID is informational and is never trusted as proof of liveness. Each server writes a uniquely named file by syncing a temporary file and atomically renaming it, and removes only its own file during graceful shutdown. After an unclean exit, the descriptor may remain, but a failed or identity-mismatched health probe makes it non-running. This directory is the narrow bootstrap seam for a future local control/admin channel.
 
 ## Crate boundaries
 
-`norted-server` is the composition root. It parses commands, initializes structured logging, constructs shared services, launches the TUI or API, handles shutdown, and translates failures into user-facing messages.
+`norted-server` is the composition root. It parses commands, initializes structured logging, constructs services, launches the TUI or API, handles shutdown, and translates failures. Doctor is dispatched before normal configuration loading and directory setup so it can diagnose failures in those steps itself.
 
-`norted-core` owns engine-neutral domain behavior: platform paths, versioned TOML configuration, artifact discovery, shared server state, application events, identifiers, and provenance. It has no terminal dependency. Model discovery recognizes format from `.gguf` and `.q27` extensions only; unknown artifacts are not runnable entries. Full metadata and content hashing are deliberately deferred and never performed during rendering.
+`norted-core` owns platform paths, version-1 TOML configuration, resolved model paths, artifact discovery, runtime observation, application events, stable identifiers, and provenance. Recursive discovery runs on Tokio's blocking pool and does not follow symlinks. Relative model roots resolve against the configuration directory. Overlapping roots deduplicate the same canonical artifact.
 
-`norted-engine` defines the adapter boundary. Identity, upstream origin, supported artifact/API capabilities, install/build provenance, native option metadata, launch specifications, process descriptors, health, and lifecycle operations are represented without importing llama.cpp- or Q27-specific concepts into the common contract. Adapter-specific configuration can remain namespaced, including arbitrary native arguments and environment variables. The registry is honestly empty in this bootstrap.
+Model IDs have the form `<sanitized-name>-<12-hex-digest>`. The digest is SHA-256 over a versioned identity namespace, artifact format, and normalized canonical path. This is deterministic across Rust releases, keeps same-named files in different directories distinct, and avoids hashing multi-gigabyte contents. The optional model-provenance seam can later supply a stronger logical identity without parsing Norted metadata today.
 
-`norted-api` owns the public protocol and server lifecycle. It currently implements only health and model listing. The future canonical path is OpenAI Responses request → Norted Responses/Item representation → capability and routing layer → selected adapter. Chat Completions can later translate into that canonical representation. Engine-native wire quirks do not belong in this crate.
+`norted-engine` owns engine contracts, not implementations. Artifact formats describe artifacts only. Registered adapters declare accepted formats and other capabilities; compatibility is the intersection of an artifact's format and registered capabilities. `EngineRegistry` registers, looks up, enumerates, rejects duplicate stable IDs, and queries compatible adapters. It is empty today.
 
-`norted-tui` owns terminal lifecycle, UI-local state, command definitions, event/update handling, design tokens, overlays, responsive layout, and rendering. Crossterm events and core events enter one update loop; screens receive an immutable application snapshot. Domain work is not performed by rendering components. A restoration guard owns raw mode, alternate screen, cursor visibility, bracketed paste, enhanced-key flags, ordinary exit, error exit, and panic cleanup.
+Acquisition requests explicitly carry stable/latest/exact intent plus installation, build, platform, architecture, and runtime-variant context. Installation provenance can retain source, acquisition method, exact revision, binary path and SHA-256, build options/toolchain, platform, architecture, runtime variant, and timestamp. Runtime provenance links model identity and optional hash to an exact engine revision, resolved settings, redacted native inputs, process identity, and launch time; unavailable facts remain optional.
 
-## Process supervision and provenance
+Adapters translate normalized requests into `LaunchSpec` and provide engine-specific probe semantics. A separate common `ProcessSupervisor` boundary owns future spawning, stdout/stderr, tracking, and termination. No process supervisor or engine adapter is implemented in this bootstrap.
 
-Future adapters will turn a normalized launch request plus namespaced native options into a process launch specification. A supervisor boundary will own child process lifetime and health. Runtime provenance can attribute a process to model identity and optional content hash, exact engine version/revision, build provenance, runtime profile, and process ID:
+`norted-api` owns the public HTTP protocol and server lifecycle. It implements only `GET /health` and `GET /v1/models`. Model listing uses the OpenAI-style list envelope and fields `id`, `object`, `created`, `owned_by`, and `shutdown_date`; `created` is the artifact's last-modified Unix timestamp. This is limited Models-list compatibility, not full OpenAI compatibility. The Responses API remains planned primary inference work and is not present.
 
-```text
-artifact → identity/hash → engine revision → profile → process
-```
-
-Neither adapter implementation nor process supervision is claimed by this bootstrap.
-
-## Event flow
-
-The core exposes a broadcast channel for model registry refreshes, server state changes, and application log events. The TUI consumes this channel alongside terminal events and redraw ticks. The same path can accept future engine, request, and process lifecycle events without coupling those producers to Ratatui.
+`norted-tui` owns terminal lifecycle, UI-local state, commands, responsive shell, screen modules, design tokens, and rendering. Centralized `Theme` and `Glyphs` select color/NO_COLOR and Unicode/ASCII presentation. Rendering is event-driven; a low-frequency runtime probe supplies cross-process changes. Model scanning and hashing never occur in render paths. The terminal guard tracks and restores every successfully enabled mode on clean exit, event errors, partial initialization, and panics while preserving the previous panic hook.
 
 ## Configuration and safety
 
-Configuration defaults to `127.0.0.1:8742`, never a public bind address. Platform-native config, data, state, cache, and log directories are distinct. Existing configuration is read but never overwritten automatically. No secrets are included in defaults or documentation.
+Configuration defaults to `127.0.0.1:8742`, never a public bind address. Platform-native config, data, state, cache, and log directories are distinct. Existing configuration is read but never overwritten. Schema version `1` is enforced and structured misspellings are rejected, while namespaced engine-native maps remain open-ended. Provenance environment entries retain names and optional value hashes rather than raw secrets.
