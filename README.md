@@ -81,7 +81,21 @@ The TUI begins discovery only after the terminal is initialized and displays `Sc
 
 Configuration, application data, runtime state, cache, and logs use separate operating-system application directories. The supported schema version is currently `1`; unsupported versions and unknown structured keys are rejected. Arbitrary engine-native settings remain namespaced and extensible. `NO_COLOR` disables TUI colour independently of the configuration, while `tui.unicode = false` selects intentional ASCII glyphs.
 
-Building requires Rust 1.88 or newer. `rust-toolchain.toml` pins 1.88.0 for reproducible local and CI behavior while the manifest declares the truthful MSRV.
+Building requires Rust 1.88 or newer. `rust-toolchain.toml` pins 1.88.0 for reproducible toolchain behavior while the manifest declares the truthful MSRV.
+
+## Development and validation
+
+Norted Server follows Norted's speed-first approach. New test code is not created by default, and extensive test suites, coverage targets, matrices, and broad integration harnesses are avoided unless explicitly requested or materially justified by risk. Automated tests are not forbidden or removed reflexively: focused tests are appropriate when needed to protect difficult invariants, destructive or security-sensitive behavior, provenance, process lifecycle, or similarly high-risk correctness.
+
+Normal validation uses compiler and linter checks:
+
+```console
+cargo fmt --all --check
+cargo check --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+Feature work should also receive proportionate manual or smoke validation relevant to the feature.
 
 ## Next phases
 
