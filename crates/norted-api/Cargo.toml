@@ -1,0 +1,13 @@
+[package]
+name = "norted-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum.workspace = true
+norted-core = { path = "../norted-core" }
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

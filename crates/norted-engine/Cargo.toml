@@ -1,0 +1,11 @@
+[package]
+name = "norted-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+norted-core = { path = "../norted-core" }
+serde.workspace = true
+thiserror.workspace = true

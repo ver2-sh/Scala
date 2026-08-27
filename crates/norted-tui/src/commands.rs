@@ -1,0 +1,74 @@
+use crate::app::Screen;
+
+#[derive(Debug, Clone, Copy)]
+pub enum CommandAction {
+    Navigate(Screen),
+    ShowHelp,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SlashCommand {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub action: CommandAction,
+}
+
+pub const COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "/help",
+        description: "Show commands and keyboard shortcuts",
+        action: CommandAction::ShowHelp,
+    },
+    SlashCommand {
+        name: "/models",
+        description: "Open the model registry",
+        action: CommandAction::Navigate(Screen::Models),
+    },
+    SlashCommand {
+        name: "/engines",
+        description: "Open engine management",
+        action: CommandAction::Navigate(Screen::Engines),
+    },
+    SlashCommand {
+        name: "/status",
+        description: "Return to the overview",
+        action: CommandAction::Navigate(Screen::Overview),
+    },
+    SlashCommand {
+        name: "/server",
+        description: "Open API server status",
+        action: CommandAction::Navigate(Screen::Server),
+    },
+    SlashCommand {
+        name: "/logs",
+        description: "Open application logs",
+        action: CommandAction::Navigate(Screen::Logs),
+    },
+    SlashCommand {
+        name: "/settings",
+        description: "Open resolved settings",
+        action: CommandAction::Navigate(Screen::Settings),
+    },
+    SlashCommand {
+        name: "/quit",
+        description: "Exit Norted Server",
+        action: CommandAction::Quit,
+    },
+];
+
+pub fn suggestions(input: &str) -> Vec<&'static SlashCommand> {
+    let query = input.trim().to_ascii_lowercase();
+    if !query.starts_with('/') {
+        return Vec::new();
+    }
+    COMMANDS
+        .iter()
+        .filter(|command| command.name.starts_with(&query))
+        .collect()
+}
+
+pub fn exact(input: &str) -> Option<&'static SlashCommand> {
+    let query = input.trim();
+    COMMANDS.iter().find(|command| command.name == query)
+}
