@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock, broadcast};
 
 use crate::catalog::{
-    CatalogError, RuntimeCatalog, RuntimeCatalogEntry, RuntimeCatalogProvider,
-    RuntimeCatalogSnapshot, compatibility_for, detect_host_capabilities,
+    CatalogError, GitHubComparisonStatus, RuntimeCatalog, RuntimeCatalogEntry,
+    RuntimeCatalogProvider, RuntimeCatalogSnapshot, compatibility_for, detect_host_capabilities,
 };
 use crate::installer::{RuntimeInstallError, RuntimeInstaller};
 use crate::store::{RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreSnapshot};
@@ -778,6 +778,7 @@ impl RuntimePackManager {
         Ok(ModelServingCapabilities {
             model_id: model.id.clone(),
             format: model.format,
+            native_identity: model.native_identity.clone(),
             compatible_engine_ids,
             compatible_installed_runtime_ids,
             selected_runtime_id,
@@ -812,6 +813,85 @@ impl RuntimePackManager {
                 .provider_errors
                 .iter()
                 .find(|error| error.provider_id == identity.package.provider_id);
+            if status.runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::SourceBuild {
+                let preference = list
+                    .selections
+                    .update_preferences
+                    .get(&status.runtime.manifest.runtime_id)
+                    .cloned()
+                    .unwrap_or(RuntimeUpdatePreference::Latest);
+                let update_line = catalog
+                    .results
+                    .iter()
+                    .filter(|result| result.entry.compatibility.is_usable())
+                    .filter(|result| same_update_line(identity, &result.entry.available))
+                    .filter(|result| result.entry.available.source_build().is_some())
+                    .collect::<Vec<_>>();
+                let channel_available = update_line.iter().any(|result| {
+                    update_channel_matches(&preference, None, &result.entry.available)
+                });
+                let candidate = update_line
+                    .iter()
+                    .copied()
+                    .filter(|result| {
+                        matches!(preference, RuntimeUpdatePreference::Pinned)
+                            || update_channel_matches(&preference, None, &result.entry.available)
+                    })
+                    .max_by_key(|result| result.entry.available.published_at_unix);
+                let state = if let Some(error) = provider_error {
+                    if error.using_stale_cache {
+                        RuntimeUpdateState::ProviderError(error.message.clone())
+                    } else {
+                        RuntimeUpdateState::CatalogUnavailable(error.message.clone())
+                    }
+                } else if !channel_available
+                    && !matches!(preference, RuntimeUpdatePreference::Pinned)
+                {
+                    RuntimeUpdateState::ChannelUnavailable {
+                        preference: preference.clone(),
+                    }
+                } else if let Some(candidate) = candidate {
+                    let installed_source = status
+                        .runtime
+                        .manifest
+                        .source_build
+                        .as_ref()
+                        .map(|source| &source.source);
+                    let candidate_source = candidate
+                        .entry
+                        .available
+                        .source_build()
+                        .map(|source| &source.source);
+                    match (installed_source, candidate_source) {
+                        (Some(installed), Some(candidate_source)) => {
+                            match self
+                                .catalog
+                                .compare_source_history(installed, candidate_source)
+                                .await
+                            {
+                                Ok(comparison) => source_history_update_state(
+                                    &preference,
+                                    &candidate.entry.available.runtime_id,
+                                    &candidate.entry.available.identity.version,
+                                    &comparison,
+                                ),
+                                Err(error) => RuntimeUpdateState::ProviderError(error.to_string()),
+                            }
+                        }
+                        _ => RuntimeUpdateState::ProviderError(
+                            "source-built runtime or update candidate is missing source provenance"
+                                .to_owned(),
+                        ),
+                    }
+                } else {
+                    RuntimeUpdateState::NoLongerPublished
+                };
+                checks.push(RuntimeUpdateCheck {
+                    runtime: status.runtime,
+                    state,
+                });
+                continue;
+            }
             let mut published = catalog
                 .results
                 .iter()
@@ -1222,11 +1302,13 @@ fn external_runtime(
             runtime_id,
             identity,
             supported_formats,
+            supported_native_identities: Vec::new(),
             requirements: Default::default(),
             acquisition_method: RuntimeAcquisitionMethod::ExternalBinary,
             source_url: None,
             downloaded_archive_sha256: None,
             additional_downloaded_archive_sha256: Vec::new(),
+            source_build: None,
             entrypoint: binary_path.clone(),
             entrypoint_sha256: binary_sha256,
             installed_at_unix: None,
@@ -1252,26 +1334,45 @@ fn ensure_catalog_provenance_matches(
     available: &AvailableRuntime,
 ) -> Result<(), RuntimePackError> {
     let manifest = &installed.manifest;
-    let primary_digest = available
-        .download
-        .digest
-        .as_ref()
-        .map(|digest| &digest.value);
-    let additional_digests = available
-        .additional_downloads
-        .iter()
-        .filter_map(|download| download.digest.as_ref().map(|digest| digest.value.clone()))
-        .collect::<Vec<_>>();
-    let all_additional_digests_present =
-        additional_digests.len() == available.additional_downloads.len();
-    let matches = manifest.runtime_id == available.runtime_id
+    let common_matches = manifest.runtime_id == available.runtime_id
         && manifest.identity == available.identity
         && manifest.supported_formats == available.supported_formats
         && manifest.requirements == available.requirements
-        && manifest.source_url.as_deref() == Some(available.source_url.as_str())
-        && manifest.downloaded_archive_sha256.as_ref() == primary_digest
-        && all_additional_digests_present
-        && manifest.additional_downloaded_archive_sha256 == additional_digests;
+        && manifest.source_url.as_deref() == Some(available.source_url.as_str());
+    let acquisition_matches = match &available.acquisition {
+        norted_core::RuntimeAcquisitionPlan::ReleaseAsset {
+            download,
+            additional_downloads,
+        } => {
+            let primary_digest = download.digest.as_ref().map(|digest| &digest.value);
+            let additional_digests = additional_downloads
+                .iter()
+                .filter_map(|download| download.digest.as_ref().map(|digest| digest.value.clone()))
+                .collect::<Vec<_>>();
+            matches!(
+                manifest.acquisition_method,
+                RuntimeAcquisitionMethod::OfficialReleaseAsset
+                    | RuntimeAcquisitionMethod::PreseededOfficialPack
+            ) && manifest.downloaded_archive_sha256.as_ref() == primary_digest
+                && additional_digests.len() == additional_downloads.len()
+                && manifest.additional_downloaded_archive_sha256 == additional_digests
+                && manifest.source_build.is_none()
+        }
+        norted_core::RuntimeAcquisitionPlan::SourceBuild(plan) => {
+            manifest.acquisition_method == RuntimeAcquisitionMethod::SourceBuild
+                && manifest.downloaded_archive_sha256.is_none()
+                && manifest.additional_downloaded_archive_sha256.is_empty()
+                && manifest.source_build.as_ref().is_some_and(|provenance| {
+                    provenance.source == plan.source
+                        && provenance.recipe_version == plan.recipe.recipe_version
+                        && provenance.cmake_configuration_arguments
+                            == plan.recipe.cmake_configuration_arguments
+                        && provenance.build_target == plan.recipe.build_target
+                        && provenance.accelerator_target == plan.recipe.accelerator_target
+                })
+        }
+    };
+    let matches = common_matches && acquisition_matches;
     if matches {
         return Ok(());
     }
@@ -1315,7 +1416,8 @@ fn selected_for(selections: &RuntimeSelections, runtime_id: &RuntimeId) -> Vec<S
 fn acquisition_rank(runtime: &InstalledRuntime) -> u8 {
     match runtime.manifest.acquisition_method {
         RuntimeAcquisitionMethod::OfficialReleaseAsset
-        | RuntimeAcquisitionMethod::PreseededOfficialPack => 0,
+        | RuntimeAcquisitionMethod::PreseededOfficialPack
+        | RuntimeAcquisitionMethod::SourceBuild => 0,
         RuntimeAcquisitionMethod::ExternalBinary => 1,
     }
 }
@@ -1329,6 +1431,45 @@ fn same_update_line(identity: &RuntimeIdentity, candidate: &AvailableRuntime) ->
         && candidate.accelerator == identity.accelerator
         && candidate.variant == identity.variant
         && candidate.package.provider_id == identity.package.provider_id
+}
+
+fn source_history_update_state(
+    preference: &RuntimeUpdatePreference,
+    candidate_runtime_id: &RuntimeId,
+    candidate_version: &str,
+    comparison: &crate::GitHubCompare,
+) -> RuntimeUpdateState {
+    match comparison.status {
+        GitHubComparisonStatus::Identical
+            if comparison.ahead_by == 0 && comparison.behind_by == 0 =>
+        {
+            if matches!(preference, RuntimeUpdatePreference::Pinned) {
+                RuntimeUpdateState::Pinned {
+                    newer_runtime_id: None,
+                    newer_version: None,
+                }
+            } else {
+                RuntimeUpdateState::Current
+            }
+        }
+        GitHubComparisonStatus::Ahead if comparison.ahead_by > 0 && comparison.behind_by == 0 => {
+            if matches!(preference, RuntimeUpdatePreference::Pinned) {
+                RuntimeUpdateState::Pinned {
+                    newer_runtime_id: Some(candidate_runtime_id.clone()),
+                    newer_version: Some(candidate_version.to_owned()),
+                }
+            } else {
+                RuntimeUpdateState::NewerCompatibleVersion {
+                    runtime_id: candidate_runtime_id.clone(),
+                    version: candidate_version.to_owned(),
+                }
+            }
+        }
+        _ => RuntimeUpdateState::ProviderError(format!(
+            "current source HEAD is not a strict descendant of the installed commit (GitHub comparison: {:?}, ahead {}, behind {})",
+            comparison.status, comparison.ahead_by, comparison.behind_by
+        )),
+    }
 }
 
 fn update_channel_matches(
@@ -1364,4 +1505,83 @@ fn version_parts(value: &str) -> Vec<u64> {
         .filter(|part| !part.is_empty())
         .filter_map(|part| part.parse().ok())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use norted_core::{RuntimeId, RuntimeUpdatePreference, RuntimeUpdateState};
+
+    use super::source_history_update_state;
+    use crate::{GitHubCompare, GitHubComparisonStatus};
+
+    #[test]
+    fn source_update_states_follow_git_ancestry_only() {
+        let candidate = RuntimeId::new("ninfer-candidate").expect("runtime ID");
+        assert_eq!(
+            source_history_update_state(
+                &RuntimeUpdatePreference::Latest,
+                &candidate,
+                "git-new",
+                &GitHubCompare {
+                    status: GitHubComparisonStatus::Identical,
+                    ahead_by: 0,
+                    behind_by: 0,
+                },
+            ),
+            RuntimeUpdateState::Current
+        );
+        assert!(matches!(
+            source_history_update_state(
+                &RuntimeUpdatePreference::Latest,
+                &candidate,
+                "git-new",
+                &GitHubCompare {
+                    status: GitHubComparisonStatus::Ahead,
+                    ahead_by: 3,
+                    behind_by: 0,
+                },
+            ),
+            RuntimeUpdateState::NewerCompatibleVersion { runtime_id, .. }
+                if runtime_id == candidate
+        ));
+        for status in [
+            GitHubComparisonStatus::Behind,
+            GitHubComparisonStatus::Diverged,
+        ] {
+            assert!(matches!(
+                source_history_update_state(
+                    &RuntimeUpdatePreference::Latest,
+                    &candidate,
+                    "git-new",
+                    &GitHubCompare {
+                        status,
+                        ahead_by: 0,
+                        behind_by: 1,
+                    },
+                ),
+                RuntimeUpdateState::ProviderError(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn pinned_source_selection_reports_but_does_not_apply_descendant() {
+        let candidate = RuntimeId::new("ninfer-candidate").expect("runtime ID");
+        assert!(matches!(
+            source_history_update_state(
+                &RuntimeUpdatePreference::Pinned,
+                &candidate,
+                "git-new",
+                &GitHubCompare {
+                    status: GitHubComparisonStatus::Ahead,
+                    ahead_by: 1,
+                    behind_by: 0,
+                },
+            ),
+            RuntimeUpdateState::Pinned {
+                newer_runtime_id: Some(runtime_id),
+                ..
+            } if runtime_id == candidate
+        ));
+    }
 }

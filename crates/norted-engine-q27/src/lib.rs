@@ -16,9 +16,9 @@ use norted_core::{
     ComputeCapability, EngineConfig, EngineInstallation, EngineRevision, HostCapabilities,
     InstalledRuntime, LoadSettingDefinition, LoadSettingId, LoadSettingKind, LoadSettingScope,
     LoadSettingValue, LoadSettingsSchema, ModelArtifact, RuntimeAcquisitionMethod,
-    RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest, RuntimeDownload, RuntimeId,
-    RuntimeIdentity, RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel,
-    RuntimeRequirements,
+    RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest,
+    RuntimeDownload, RuntimeId, RuntimeIdentity, RuntimePackageIdentity, RuntimeProbeObservation,
+    RuntimeReleaseChannel, RuntimeRequirements,
 };
 use norted_engine::{
     ApiCapability, CatalogError, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
@@ -29,6 +29,7 @@ use norted_engine::{
     NativeOption, OptionValueKind, PreparedAuxiliaryArtifact, PreparedModelInput,
     ProcessDescriptor, RuntimeCatalogProvider, UpdateState, capture_command,
     common_load_setting_definitions, compatibility_for, compatibility_for_nvidia_device,
+    isolated_cuda_environment, visible_nvidia_devices,
 };
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -258,14 +259,17 @@ fn catalog_runtimes(releases: &[GitHubRelease]) -> Result<Vec<AvailableRuntime>,
                 published_at_unix: qualified.published_at_unix,
                 channels,
                 prerelease: qualified.release.prerelease,
-                download: RuntimeDownload {
-                    url: qualified.asset.browser_download_url.clone(),
-                    size_bytes: qualified.asset.size,
-                    digest: Some(qualified.digest.clone()),
-                    archive_format: RuntimeArchiveFormat::TarGz,
-                    entrypoint_names: vec![variant.entrypoint.to_owned()],
+                acquisition: RuntimeAcquisitionPlan::ReleaseAsset {
+                    download: RuntimeDownload {
+                        url: qualified.asset.browser_download_url.clone(),
+                        size_bytes: qualified.asset.size,
+                        digest: Some(qualified.digest.clone()),
+                        archive_format: RuntimeArchiveFormat::TarGz,
+                        entrypoint_names: vec![variant.entrypoint.to_owned()],
+                    },
+                    additional_downloads: Vec::new(),
                 },
-                additional_downloads: Vec::new(),
+                supported_native_identities: Vec::new(),
                 requirements: requirements_for(&qualified.version, variant),
             };
             runtime.validate().map_err(|error| CatalogError::Provider {
@@ -434,6 +438,7 @@ fn requirements_for(version: &str, variant: &RuntimeVariant) -> RuntimeRequireme
         minimum_vram_class_gib: variant.minimum_vram_class_gib,
         minimum_vram_exclusive_class_gib: variant.minimum_vram_exclusive_class_gib,
         supported_cuda_compute_capabilities,
+        required_nvidia_device_names: Vec::new(),
         notes: Vec::new(),
         advisories,
         unverified_requirements,
@@ -566,61 +571,7 @@ fn q27_device_evaluation(
 fn q27_visible_devices(
     host: &HostCapabilities,
 ) -> Result<Vec<&AcceleratorDevice>, RuntimeCompatibility> {
-    let devices = host
-        .accelerators
-        .iter()
-        .filter(|device| device.accelerator.eq_ignore_ascii_case("cuda"))
-        .filter(|device| {
-            device
-                .stable_id
-                .as_deref()
-                .is_some_and(is_exact_nvidia_gpu_uuid)
-        })
-        .collect::<Vec<_>>();
-    let Some(visibility) = host.cuda_visible_devices.as_deref() else {
-        return if devices.is_empty() {
-            Err(RuntimeCompatibility::NeedsAttention(
-                "q27 requires a stable NVIDIA GPU UUID, but none was observed".to_owned(),
-            ))
-        } else {
-            Ok(devices)
-        };
-    };
-    let identifiers = visibility
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    if identifiers.len() != 1 {
-        return Err(RuntimeCompatibility::Incompatible(
-            "existing CUDA_VISIBLE_DEVICES is empty or selects multiple devices; q27 requires one resolvable GPU UUID"
-                .to_owned(),
-        ));
-    }
-    let identifier = identifiers[0];
-    if !identifier.starts_with("GPU-") {
-        return Err(RuntimeCompatibility::Incompatible(format!(
-            "existing CUDA_VISIBLE_DEVICES `{identifier}` is not a GPU UUID; Norted never assumes a CUDA/nvidia-smi numeric index mapping"
-        )));
-    }
-    let matching = devices
-        .into_iter()
-        .filter(|device| {
-            device
-                .stable_id
-                .as_deref()
-                .is_some_and(|stable_id| stable_id.starts_with(identifier))
-        })
-        .collect::<Vec<_>>();
-    match matching.as_slice() {
-        [device] => Ok(vec![*device]),
-        [] => Err(RuntimeCompatibility::Incompatible(format!(
-            "existing CUDA_VISIBLE_DEVICES `{identifier}` does not resolve to an observed NVIDIA GPU UUID"
-        ))),
-        _ => Err(RuntimeCompatibility::Incompatible(format!(
-            "existing CUDA_VISIBLE_DEVICES `{identifier}` is an ambiguous GPU UUID prefix"
-        ))),
-    }
+    visible_nvidia_devices(host, "q27")
 }
 
 fn combine_q27_compatibility(
@@ -1475,6 +1426,7 @@ impl EngineAdapter for Q27Adapter {
                 | RuntimeAcquisitionMethod::PreseededOfficialPack => {
                     AcquisitionMethod::OfficialBinary
                 }
+                RuntimeAcquisitionMethod::SourceBuild => AcquisitionMethod::SourceBuild,
                 RuntimeAcquisitionMethod::ExternalBinary => AcquisitionMethod::ExternalBinary,
             },
             binary_path: binary_path.clone(),
@@ -1515,6 +1467,7 @@ impl EngineAdapter for Q27Adapter {
             environment_remove,
             inherits_parent_environment: true,
             working_directory: None,
+            temporary_files: Vec::new(),
             endpoint: Some(http_endpoint(request.backend_address)),
             normalized_settings: BTreeMap::from([
                 ("temperature".to_owned(), json!(0.0)),
@@ -2366,38 +2319,8 @@ fn q27_launch_environment(
     configured: &BTreeMap<String, String>,
     accelerator: &AcceleratorDevice,
 ) -> Result<BTreeMap<String, String>, EngineError> {
-    if !accelerator.accelerator.eq_ignore_ascii_case("cuda") {
-        return Err(EngineError::InvalidConfiguration(
-            "q27 selected accelerator is not a CUDA device".to_owned(),
-        ));
-    }
-    let uuid = accelerator.stable_id.as_deref().ok_or_else(|| {
-        EngineError::InvalidConfiguration(
-            "q27 selected CUDA device has no stable GPU UUID".to_owned(),
-        )
-    })?;
-    if !is_exact_nvidia_gpu_uuid(uuid) {
-        return Err(EngineError::InvalidConfiguration(
-            "q27 selected CUDA device identity is not an exact NVIDIA GPU UUID".to_owned(),
-        ));
-    }
-    let mut environment = configured.clone();
-    environment.insert("CUDA_VISIBLE_DEVICES".to_owned(), uuid.to_owned());
-    Ok(environment)
-}
-
-fn is_exact_nvidia_gpu_uuid(value: &str) -> bool {
-    let Some(uuid) = value.strip_prefix("GPU-") else {
-        return false;
-    };
-    uuid.len() == 36
-        && uuid.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
+    isolated_cuda_environment(configured, accelerator, "q27")
+        .map_err(EngineError::InvalidConfiguration)
 }
 
 fn managed_environment_removals() -> Vec<OsString> {
@@ -2822,11 +2745,14 @@ mod tests {
         let runtimes = catalog_runtimes(&releases).expect("valid catalog");
         assert_eq!(runtimes.len(), 3);
         assert!(runtimes.iter().all(|runtime| {
+            let Some((download, _)) = runtime.release_assets() else {
+                return false;
+            };
             runtime.identity.version == "0.6.2"
                 && runtime.channels.contains(&RuntimeReleaseChannel::Stable)
                 && runtime.channels.contains(&RuntimeReleaseChannel::Latest)
-                && runtime.download.archive_format == RuntimeArchiveFormat::TarGz
-                && runtime.download.digest.is_some()
+                && download.archive_format == RuntimeArchiveFormat::TarGz
+                && download.digest.is_some()
         }));
         assert_eq!(
             runtimes
@@ -3641,6 +3567,7 @@ mod tests {
             architecture: None,
             context_length: None,
             provenance: None,
+            native_identity: None,
             auxiliary_artifacts: Vec::<AuxiliaryArtifact>::new(),
         }
     }

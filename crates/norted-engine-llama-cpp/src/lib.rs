@@ -758,6 +758,7 @@ impl EngineAdapter for LlamaCppAdapter {
                 | RuntimeAcquisitionMethod::PreseededOfficialPack => {
                     AcquisitionMethod::OfficialBinary
                 }
+                RuntimeAcquisitionMethod::SourceBuild => AcquisitionMethod::SourceBuild,
                 RuntimeAcquisitionMethod::ExternalBinary => AcquisitionMethod::ExternalBinary,
             },
             binary_path: binary_path.clone(),
@@ -792,6 +793,7 @@ impl EngineAdapter for LlamaCppAdapter {
             environment_remove,
             inherits_parent_environment: true,
             working_directory: None,
+            temporary_files: Vec::new(),
             endpoint: Some(http_endpoint(request.backend_address)),
             normalized_settings: BTreeMap::new(),
             load_settings: request.load_settings,

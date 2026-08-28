@@ -4,6 +4,7 @@ members = [
     "crates/norted-core",
     "crates/norted-engine",
     "crates/norted-engine-llama-cpp",
+    "crates/norted-engine-ninfer",
     "crates/norted-engine-q27",
     "crates/norted-server",
     "crates/norted-tui",

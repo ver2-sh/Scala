@@ -214,6 +214,7 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
                 hint("s", "search", theme),
                 hint("g", "GGUF default", theme),
                 hint("Q/2", "Q27 default", theme),
+                hint("N/3", "NInfer default", theme),
                 hint("u", "updates", theme),
                 hint("U", "update selected", theme),
                 hint("d d", "remove", theme),

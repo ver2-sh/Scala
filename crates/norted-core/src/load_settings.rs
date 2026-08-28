@@ -69,11 +69,19 @@ pub enum LoadSettingValue {
     FlagEnabled,
     Integer(i64),
     UnsignedInteger(u64),
+    UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue),
     Float(f64),
     String(String),
     Choice(String),
     Path(PathBuf),
     GpuOffload(GpuOffload),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum UnsignedIntegerOrChoiceValue {
+    UnsignedInteger(u64),
+    Choice(String),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -92,6 +100,12 @@ impl std::fmt::Display for LoadSettingValue {
             Self::FlagEnabled => formatter.write_str("enabled"),
             Self::Integer(value) => value.fmt(formatter),
             Self::UnsignedInteger(value) => value.fmt(formatter),
+            Self::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::UnsignedInteger(value)) => {
+                value.fmt(formatter)
+            }
+            Self::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(value)) => {
+                value.fmt(formatter)
+            }
             Self::Float(value) => value.fmt(formatter),
             Self::String(value) | Self::Choice(value) => value.fmt(formatter),
             Self::Path(value) => value.display().fmt(formatter),
@@ -119,6 +133,13 @@ pub enum LoadSettingKind {
         minimum: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         maximum: Option<u64>,
+    },
+    UnsignedIntegerOrChoice {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maximum: Option<u64>,
+        choices: Vec<String>,
     },
     Float {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,6 +192,27 @@ impl LoadSettingKind {
                     .map_err(|_| invalid("expected a non-negative integer".to_owned()))?;
                 validate_bounds(id, raw, value, *minimum, *maximum)?;
                 Ok(LoadSettingValue::UnsignedInteger(value))
+            }
+            Self::UnsignedIntegerOrChoice {
+                minimum,
+                maximum,
+                choices,
+            } => {
+                if choices.iter().any(|choice| choice == raw) {
+                    return Ok(LoadSettingValue::UnsignedIntegerOrChoice(
+                        UnsignedIntegerOrChoiceValue::Choice(raw.to_owned()),
+                    ));
+                }
+                let value = raw.parse::<u64>().map_err(|_| {
+                    invalid(format!(
+                        "expected a non-negative integer or one of: {}",
+                        choices.join(", ")
+                    ))
+                })?;
+                validate_bounds(id, raw, value, *minimum, *maximum)?;
+                Ok(LoadSettingValue::UnsignedIntegerOrChoice(
+                    UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
+                ))
             }
             Self::Float { minimum, maximum } => {
                 let value = raw
@@ -243,6 +285,23 @@ impl LoadSettingKind {
                 validate_bounds(id, &raw, *value, *minimum, *maximum)?;
                 true
             }
+            (
+                Self::UnsignedIntegerOrChoice {
+                    minimum, maximum, ..
+                },
+                LoadSettingValue::UnsignedIntegerOrChoice(
+                    UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
+                ),
+            ) => {
+                validate_bounds(id, &raw, *value, *minimum, *maximum)?;
+                true
+            }
+            (
+                Self::UnsignedIntegerOrChoice { choices, .. },
+                LoadSettingValue::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(
+                    value,
+                )),
+            ) => choices.contains(value),
             (Self::Float { minimum, maximum }, LoadSettingValue::Float(value)) => {
                 if !value.is_finite() {
                     false

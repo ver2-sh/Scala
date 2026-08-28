@@ -9,6 +9,9 @@ use norted_engine::{
 use norted_engine_llama_cpp::{
     ENGINE_ID as LLAMA_CPP_ENGINE_ID, LlamaCppAdapter, LlamaCppRuntimeCatalogProvider,
 };
+use norted_engine_ninfer::{
+    ENGINE_ID as NINFER_ENGINE_ID, NinferAdapter, NinferRuntimeCatalogProvider,
+};
 use norted_engine_q27::{ENGINE_ID as Q27_ENGINE_ID, Q27Adapter, Q27RuntimeCatalogProvider};
 
 pub async fn runtime_manager(core: Arc<ApplicationCore>) -> Result<Arc<RuntimeManager>> {
@@ -38,6 +41,10 @@ pub fn engine_registry(core: &ApplicationCore) -> Result<EngineRegistry> {
         core.config.engine.get(Q27_ENGINE_ID),
         config_directory,
     )))?;
+    registry.register(Arc::new(NinferAdapter::from_config(
+        core.config.engine.get(NINFER_ENGINE_ID),
+        config_directory,
+    )))?;
     Ok(registry)
 }
 
@@ -48,6 +55,7 @@ pub fn runtime_pack_manager(
     let providers: Vec<Arc<dyn RuntimeCatalogProvider>> = vec![
         Arc::new(LlamaCppRuntimeCatalogProvider::new()),
         Arc::new(Q27RuntimeCatalogProvider::new()),
+        Arc::new(NinferRuntimeCatalogProvider::new()),
     ];
     Ok(RuntimePackManager::new(&core.paths, registry, providers)?)
 }

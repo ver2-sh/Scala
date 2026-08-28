@@ -494,6 +494,7 @@ impl RuntimeManager {
             }
         };
         if self.load_cancelled(cancellation_epoch) {
+            cleanup_temporary_launch_files(&launch_spec.temporary_files).await;
             let detail = "model load was cancelled".to_owned();
             self.fail_loading(generation, detail.clone(), None).await;
             return Err(RuntimeError::Operation(detail));
@@ -511,6 +512,7 @@ impl RuntimeManager {
             &launch_spec.environment_remove,
             inherits_parent_environment,
         );
+        let temporary_files = launch_spec.temporary_files.clone();
         let process = match self
             .supervisor
             .spawn(launch_spec, installation.engine.clone(), model_id.clone())
@@ -518,6 +520,7 @@ impl RuntimeManager {
         {
             Ok(process) => process,
             Err(error) => {
+                cleanup_temporary_launch_files(&temporary_files).await;
                 self.fail_loading(generation, error.to_string(), None).await;
                 return Err(RuntimeError::StartupFailed(error.to_string()));
             }
@@ -1063,6 +1066,16 @@ impl RuntimeManager {
                 provenance: state.provenance.clone(),
             },
             recent_events: state.notices.iter().cloned().collect(),
+        }
+    }
+}
+
+async fn cleanup_temporary_launch_files(paths: &[std::path::PathBuf]) {
+    for path in paths {
+        if let Err(error) = tokio::fs::remove_file(path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %error, "could not remove temporary engine launch file");
         }
     }
 }

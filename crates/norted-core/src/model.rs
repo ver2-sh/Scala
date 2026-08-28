@@ -23,6 +23,7 @@ impl std::fmt::Display for ModelId {
 pub enum ArtifactFormat {
     Gguf,
     Q27,
+    Ninfer,
 }
 
 impl ArtifactFormat {
@@ -30,6 +31,7 @@ impl ArtifactFormat {
         match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
             "gguf" => Some(Self::Gguf),
             "q27" => Some(Self::Q27),
+            "ninfer" => Some(Self::Ninfer),
             _ => None,
         }
     }
@@ -38,8 +40,44 @@ impl ArtifactFormat {
         match self {
             Self::Gguf => "gguf",
             Self::Q27 => "q27",
+            Self::Ninfer => "ninfer",
         }
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "format", content = "identity")]
+pub enum ArtifactNativeIdentity {
+    Ninfer(NinferArtifactIdentity),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct NinferArtifactIdentity {
+    pub container_version: u32,
+    pub model_id: String,
+    pub weights_id: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NinferContainerMetadata {
+    pub identity: NinferArtifactIdentity,
+    pub metadata_bytes_read: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NinferContainerError {
+    #[error("could not read NInfer container metadata: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("NInfer container magic is not recognized")]
+    InvalidMagic,
+    #[error("NInfer container version {0} is unsupported; version 2 is required")]
+    UnsupportedVersion(u8),
+    #[error("NInfer directory length must be between 1 and {maximum} bytes; observed {observed}")]
+    InvalidDirectoryLength { observed: u64, maximum: u64 },
+    #[error("NInfer directory range is truncated or overflows the file")]
+    TruncatedDirectory,
+    #[error("NInfer directory JSON is invalid: {0}")]
+    InvalidDirectory(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +100,8 @@ pub struct ModelArtifact {
     pub architecture: Option<String>,
     pub context_length: Option<u64>,
     pub provenance: Option<ModelArtifactProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_identity: Option<ArtifactNativeIdentity>,
     #[serde(default)]
     pub auxiliary_artifacts: Vec<AuxiliaryArtifact>,
 }
@@ -79,8 +119,9 @@ impl std::str::FromStr for ArtifactFormat {
         match value.to_ascii_lowercase().as_str() {
             "gguf" => Ok(Self::Gguf),
             "q27" => Ok(Self::Q27),
+            "ninfer" => Ok(Self::Ninfer),
             _ => Err(format!(
-                "unsupported artifact format `{value}`; expected gguf or q27"
+                "unsupported artifact format `{value}`; expected gguf, q27, or ninfer"
             )),
         }
     }
@@ -149,6 +190,22 @@ impl ModelRegistry {
                 }
                 match entry.metadata() {
                     Ok(metadata) => {
+                        let native_identity = if format == ArtifactFormat::Ninfer {
+                            match inspect_ninfer_container(&canonical_path) {
+                                Ok(metadata) => {
+                                    Some(ArtifactNativeIdentity::Ninfer(metadata.identity))
+                                }
+                                Err(error) => {
+                                    registry.warnings.push(format!(
+                                        "NInfer artifact {} was rejected: {error}",
+                                        canonical_path.display()
+                                    ));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
                         let auxiliary_artifacts = discover_auxiliary_artifacts(
                             &canonical_path,
                             format,
@@ -169,6 +226,7 @@ impl ModelRegistry {
                             architecture: None,
                             context_length: None,
                             provenance: None,
+                            native_identity,
                             auxiliary_artifacts,
                         });
                     }
@@ -195,6 +253,194 @@ impl ModelRegistry {
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
+}
+
+const NINFER_V2_MAGIC: [u8; 8] = [b'N', b'I', b'N', b'F', b'E', b'R', 0, 2];
+const NINFER_PREFIX_BYTES: u64 = 16;
+const NINFER_PAYLOAD_ALIGNMENT: u64 = 4096;
+const MAX_NINFER_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
+
+pub fn inspect_ninfer_container(
+    path: &Path,
+) -> Result<NinferContainerMetadata, NinferContainerError> {
+    let mut file = std::fs::File::open(path)?;
+    let file_bytes = file.metadata()?.len();
+    inspect_ninfer_reader(&mut file, file_bytes)
+}
+
+fn inspect_ninfer_reader(
+    reader: &mut impl Read,
+    file_bytes: u64,
+) -> Result<NinferContainerMetadata, NinferContainerError> {
+    let mut prefix = [0_u8; NINFER_PREFIX_BYTES as usize];
+    reader.read_exact(&mut prefix)?;
+    if prefix[..8] != NINFER_V2_MAGIC {
+        if &prefix[..7] == b"NINFER\0" {
+            return Err(NinferContainerError::UnsupportedVersion(prefix[7]));
+        }
+        return Err(NinferContainerError::InvalidMagic);
+    }
+    let json_bytes = u64::from_le_bytes(
+        prefix[8..16]
+            .try_into()
+            .expect("the NInfer prefix contains an eight-byte directory length"),
+    );
+    if json_bytes == 0 || json_bytes > MAX_NINFER_DIRECTORY_BYTES {
+        return Err(NinferContainerError::InvalidDirectoryLength {
+            observed: json_bytes,
+            maximum: MAX_NINFER_DIRECTORY_BYTES,
+        });
+    }
+    let metadata_end = NINFER_PREFIX_BYTES
+        .checked_add(json_bytes)
+        .ok_or(NinferContainerError::TruncatedDirectory)?;
+    let payload_offset = metadata_end
+        .checked_add(NINFER_PAYLOAD_ALIGNMENT - 1)
+        .map(|value| value / NINFER_PAYLOAD_ALIGNMENT * NINFER_PAYLOAD_ALIGNMENT)
+        .ok_or(NinferContainerError::TruncatedDirectory)?;
+    if metadata_end > file_bytes || payload_offset > file_bytes {
+        return Err(NinferContainerError::TruncatedDirectory);
+    }
+    let json_length =
+        usize::try_from(json_bytes).map_err(|_| NinferContainerError::TruncatedDirectory)?;
+    let mut directory = vec![0_u8; json_length];
+    reader.read_exact(&mut directory)?;
+    let value: serde_json::Value = serde_json::from_slice(&directory)
+        .map_err(|error| NinferContainerError::InvalidDirectory(error.to_string()))?;
+    let identity = validate_ninfer_directory(&value, file_bytes - payload_offset)?;
+    Ok(NinferContainerMetadata {
+        identity,
+        metadata_bytes_read: NINFER_PREFIX_BYTES + json_bytes,
+    })
+}
+
+fn validate_ninfer_directory(
+    value: &serde_json::Value,
+    payload_bytes: u64,
+) -> Result<NinferArtifactIdentity, NinferContainerError> {
+    let root = value
+        .as_object()
+        .ok_or_else(|| invalid_ninfer_directory("root must be an object"))?;
+    require_exact_keys(root, &["identity", "objects"], "root")?;
+    let identity = root["identity"]
+        .as_object()
+        .ok_or_else(|| invalid_ninfer_directory("identity must be an object"))?;
+    require_exact_keys(identity, &["model_id", "weights_id"], "identity")?;
+    let model_id = nonempty_json_string(&identity["model_id"], "identity.model_id")?;
+    let weights_id = nonempty_json_string(&identity["weights_id"], "identity.weights_id")?;
+    let objects = root["objects"]
+        .as_array()
+        .filter(|objects| !objects.is_empty())
+        .ok_or_else(|| invalid_ninfer_directory("objects must be a non-empty array"))?;
+    let mut names = HashSet::with_capacity(objects.len());
+    let mut cursor = 0_u64;
+    for (index, object) in objects.iter().enumerate() {
+        let object = object.as_object().ok_or_else(|| {
+            invalid_ninfer_directory(format!("objects[{index}] must be an object"))
+        })?;
+        let kind = nonempty_json_string(
+            object.get("kind").ok_or_else(|| {
+                invalid_ninfer_directory(format!("objects[{index}].kind is missing"))
+            })?,
+            &format!("objects[{index}].kind"),
+        )?;
+        match kind.as_str() {
+            "tensor" => {
+                require_exact_keys(
+                    object,
+                    &[
+                        "name", "kind", "shape", "format", "layout", "offset", "bytes",
+                    ],
+                    &format!("objects[{index}]"),
+                )?;
+                let shape = object["shape"].as_array().ok_or_else(|| {
+                    invalid_ninfer_directory(format!("objects[{index}].shape must be an array"))
+                })?;
+                if shape
+                    .iter()
+                    .any(|dimension| dimension.as_u64().is_none_or(|value| value == 0))
+                {
+                    return Err(invalid_ninfer_directory(format!(
+                        "objects[{index}].shape dimensions must be positive integers"
+                    )));
+                }
+                nonempty_json_string(&object["format"], &format!("objects[{index}].format"))?;
+                nonempty_json_string(&object["layout"], &format!("objects[{index}].layout"))?;
+            }
+            "resource" => {
+                require_exact_keys(
+                    object,
+                    &["name", "kind", "encoding", "offset", "bytes"],
+                    &format!("objects[{index}]"),
+                )?;
+                nonempty_json_string(&object["encoding"], &format!("objects[{index}].encoding"))?;
+            }
+            _ => {
+                return Err(invalid_ninfer_directory(format!(
+                    "objects[{index}].kind must be `tensor` or `resource`"
+                )));
+            }
+        }
+        let name = nonempty_json_string(&object["name"], &format!("objects[{index}].name"))?;
+        if !names.insert(name) {
+            return Err(invalid_ninfer_directory(format!(
+                "objects[{index}].name is duplicated"
+            )));
+        }
+        let offset = object["offset"].as_u64().ok_or_else(|| {
+            invalid_ninfer_directory(format!("objects[{index}].offset must be an integer"))
+        })?;
+        let bytes = object["bytes"]
+            .as_u64()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                invalid_ninfer_directory(format!(
+                    "objects[{index}].bytes must be a positive integer"
+                ))
+            })?;
+        let end = offset.checked_add(bytes).ok_or_else(|| {
+            invalid_ninfer_directory(format!("objects[{index}] payload range overflows"))
+        })?;
+        if offset < cursor || end > payload_bytes {
+            return Err(invalid_ninfer_directory(format!(
+                "objects[{index}] payload range is unordered, overlapping, or outside the file"
+            )));
+        }
+        cursor = end;
+    }
+    Ok(NinferArtifactIdentity {
+        container_version: 2,
+        model_id,
+        weights_id,
+    })
+}
+
+fn require_exact_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+    label: &str,
+) -> Result<(), NinferContainerError> {
+    if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
+        return Err(invalid_ninfer_directory(format!(
+            "{label} has missing or unexpected members"
+        )));
+    }
+    Ok(())
+}
+
+fn nonempty_json_string(
+    value: &serde_json::Value,
+    label: &str,
+) -> Result<String, NinferContainerError> {
+    value
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| invalid_ninfer_directory(format!("{label} must be a non-empty string")))
+}
+
+fn invalid_ninfer_directory(message: impl Into<String>) -> NinferContainerError {
+    NinferContainerError::InvalidDirectory(message.into())
 }
 
 fn discover_auxiliary_artifacts(
@@ -390,7 +636,12 @@ fn artifact_timestamp(metadata: &Metadata) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactFormat, AuxiliaryArtifactRole, ModelRegistry};
+    use std::io::Write;
+
+    use super::{
+        ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifactRole, ModelRegistry,
+        NinferContainerError, inspect_ninfer_container,
+    };
 
     #[test]
     fn q27_primary_keeps_its_id_and_owns_the_tokenizer_companion() {
@@ -419,5 +670,127 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).expect("remove model fixture directory");
+    }
+
+    #[test]
+    fn ninfer_v2_admission_recovers_native_identity_without_reading_payload() {
+        let directory = serde_json::json!({
+            "identity": {
+                "model_id": "native/model-from-container",
+                "weights_id": "native-weights"
+            },
+            "objects": [{
+                "name": "frontend/tokenizer.json",
+                "kind": "resource",
+                "encoding": "raw-bytes-v1",
+                "offset": 0,
+                "bytes": 1
+            }]
+        });
+        let temporary = tempfile::tempdir().expect("temporary NInfer fixture directory");
+        let path = temporary.path().join("misleading-filename.ninfer");
+        write_ninfer_fixture(&path, &directory, 4 * 1024 * 1024 * 1024);
+
+        let metadata = inspect_ninfer_container(&path).expect("valid NInfer metadata");
+        assert_eq!(metadata.identity.container_version, 2);
+        assert_eq!(metadata.identity.model_id, "native/model-from-container");
+        assert_eq!(metadata.identity.weights_id, "native-weights");
+        assert!(metadata.metadata_bytes_read < 4096);
+
+        let registry = ModelRegistry::discover(&[temporary.path().to_path_buf()]);
+        assert_eq!(registry.artifacts().len(), 1);
+        assert!(matches!(
+            &registry.artifacts()[0].native_identity,
+            Some(ArtifactNativeIdentity::Ninfer(identity))
+                if identity.model_id == "native/model-from-container"
+                    && identity.weights_id == "native-weights"
+        ));
+    }
+
+    #[test]
+    fn ninfer_admission_fails_closed_for_bad_framing_and_directory_bounds() {
+        let temporary = tempfile::tempdir().expect("temporary NInfer fixture directory");
+        let valid_directory = serde_json::json!({
+            "identity": {"model_id": "model", "weights_id": "weights"},
+            "objects": [{
+                "name": "resource",
+                "kind": "resource",
+                "encoding": "raw-bytes-v1",
+                "offset": 0,
+                "bytes": 1
+            }]
+        });
+
+        let bad_magic = temporary.path().join("bad-magic.ninfer");
+        std::fs::write(&bad_magic, [0_u8; 16]).expect("bad magic fixture");
+        assert!(matches!(
+            inspect_ninfer_container(&bad_magic),
+            Err(NinferContainerError::InvalidMagic)
+        ));
+
+        let old_version = temporary.path().join("old-version.ninfer");
+        let mut old_prefix = *b"NINFER\0\x01";
+        old_prefix[7] = 1;
+        std::fs::write(&old_version, [old_prefix.as_slice(), &[0_u8; 8]].concat())
+            .expect("old version fixture");
+        assert!(matches!(
+            inspect_ninfer_container(&old_version),
+            Err(NinferContainerError::UnsupportedVersion(1))
+        ));
+
+        let truncated = temporary.path().join("truncated.ninfer");
+        let mut truncated_prefix = b"NINFER\0\x02".to_vec();
+        truncated_prefix.extend_from_slice(&1024_u64.to_le_bytes());
+        std::fs::write(&truncated, truncated_prefix).expect("truncated fixture");
+        assert!(matches!(
+            inspect_ninfer_container(&truncated),
+            Err(NinferContainerError::TruncatedDirectory | NinferContainerError::Io(_))
+        ));
+
+        let absurd = temporary.path().join("absurd.ninfer");
+        let mut absurd_prefix = b"NINFER\0\x02".to_vec();
+        absurd_prefix.extend_from_slice(&(17_u64 * 1024 * 1024).to_le_bytes());
+        std::fs::write(&absurd, absurd_prefix).expect("absurd fixture");
+        assert!(matches!(
+            inspect_ninfer_container(&absurd),
+            Err(NinferContainerError::InvalidDirectoryLength { .. })
+        ));
+
+        let malformed = temporary.path().join("malformed.ninfer");
+        write_ninfer_fixture(
+            &malformed,
+            &serde_json::json!({
+                "identity": valid_directory["identity"],
+                "objects": [{
+                    "name": "outside",
+                    "kind": "resource",
+                    "encoding": "raw-bytes-v1",
+                    "offset": 99,
+                    "bytes": 1
+                }]
+            }),
+            1,
+        );
+        assert!(matches!(
+            inspect_ninfer_container(&malformed),
+            Err(NinferContainerError::InvalidDirectory(_))
+        ));
+    }
+
+    fn write_ninfer_fixture(path: &std::path::Path, directory: &serde_json::Value, payload: u64) {
+        let json = serde_json::to_vec(directory).expect("serialize NInfer directory fixture");
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .expect("create NInfer fixture");
+        file.write_all(b"NINFER\0\x02").expect("write NInfer magic");
+        file.write_all(&(json.len() as u64).to_le_bytes())
+            .expect("write NInfer directory length");
+        file.write_all(&json).expect("write NInfer directory");
+        let metadata_end = 16_u64 + json.len() as u64;
+        let payload_offset = metadata_end.div_ceil(4096) * 4096;
+        file.set_len(payload_offset + payload)
+            .expect("size sparse NInfer payload");
     }
 }

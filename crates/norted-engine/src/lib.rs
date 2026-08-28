@@ -3,18 +3,18 @@
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::ffi::OsString;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::Stream;
 use norted_core::{
-    AcceleratorDevice, ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime, EngineInstallation,
-    EngineRevision, HostCapabilities, InstalledRuntime, LoadSettingDefinition, LoadSettingId,
-    LoadSettingsError, LoadSettingsPatch, LoadSettingsSchema, ModelArtifact, ModelId,
-    ModelRuntimeIdentity, ResolvedLoadSettings, RuntimeCompatibility, RuntimeId,
-    RuntimeProbeObservation,
+    AcceleratorDevice, ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifactRole,
+    AvailableRuntime, EngineInstallation, EngineRevision, HostCapabilities, InstalledRuntime,
+    LoadSettingDefinition, LoadSettingId, LoadSettingsError, LoadSettingsPatch, LoadSettingsSchema,
+    ModelArtifact, ModelId, ModelRuntimeIdentity, ResolvedLoadSettings, RuntimeCompatibility,
+    RuntimeId, RuntimeProbeObservation,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -28,10 +28,11 @@ mod store;
 mod supervisor;
 
 pub use catalog::{
-    CatalogError, GitHubRelease, GitHubReleaseAsset, GitHubReleaseClient, RuntimeCatalog,
-    RuntimeCatalogEntry, RuntimeCatalogProvider, RuntimeCatalogSnapshot, RuntimeProviderAuthority,
-    RuntimeProviderError, compatibility_for, compatibility_for_nvidia_device,
-    detect_host_capabilities,
+    CatalogError, GitHubCommit, GitHubCompare, GitHubComparisonStatus, GitHubRelease,
+    GitHubReleaseAsset, GitHubReleaseClient, GitHubRepository, RuntimeCatalog, RuntimeCatalogEntry,
+    RuntimeCatalogProvider, RuntimeCatalogSnapshot, RuntimeProviderAuthority, RuntimeProviderError,
+    compatibility_for, compatibility_for_nvidia_device, detect_host_capabilities,
+    is_exact_nvidia_gpu_uuid, isolated_cuda_environment, visible_nvidia_devices,
 };
 
 pub use control::{
@@ -201,6 +202,7 @@ impl PreparedModelInput {
             model_id: self.primary.id.clone(),
             artifact_path: self.primary.path.clone(),
             content_sha256: self.primary.hash.clone(),
+            native_identity: self.primary.native_identity.clone(),
             auxiliary: self
                 .auxiliary
                 .iter()
@@ -233,6 +235,9 @@ pub struct LaunchSpec {
     pub environment_remove: Vec<OsString>,
     pub inherits_parent_environment: bool,
     pub working_directory: Option<PathBuf>,
+    /// Adapter-created private files that the supervisor removes when the
+    /// process exits. Adapters may remove them earlier after observation.
+    pub temporary_files: Vec<PathBuf>,
     pub endpoint: Option<String>,
     pub normalized_settings: BTreeMap<String, serde_json::Value>,
     pub load_settings: ResolvedLoadSettings,
@@ -253,6 +258,8 @@ pub struct EffectiveGenerationSettings {
 pub struct ModelServingCapabilities {
     pub model_id: ModelId,
     pub format: ArtifactFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_identity: Option<ArtifactNativeIdentity>,
     pub compatible_engine_ids: Vec<String>,
     pub compatible_installed_runtime_ids: Vec<RuntimeId>,
     pub selected_runtime_id: Option<RuntimeId>,
@@ -535,6 +542,15 @@ pub trait EngineAdapter: Send + Sync {
         &self,
         runtime: &InstalledRuntime,
     ) -> Result<RuntimeProbeObservation, EngineError>;
+    /// Extracts exact native artifact identities from an already verified
+    /// source snapshot when the upstream registry has a stable declarative
+    /// representation. The default is truthful uncertainty.
+    fn source_native_identities(
+        &self,
+        _source_root: &Path,
+    ) -> Result<Vec<ArtifactNativeIdentity>, EngineError> {
+        Ok(Vec::new())
+    }
     async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError>;
     async fn health(&self, process: &ProcessDescriptor) -> Result<bool, EngineError>;
     async fn effective_generation_settings(
@@ -872,6 +888,7 @@ mod tests {
             architecture: Some("architecture-b".to_owned()),
             context_length: None,
             provenance: None,
+            native_identity: None,
             auxiliary_artifacts: Vec::new(),
         };
         let compatible = registry.compatible_with(&model);
@@ -962,6 +979,7 @@ mod tests {
             architecture: Some("fixture-architecture".to_owned()),
             context_length: None,
             provenance: None,
+            native_identity: None,
             auxiliary_artifacts: Vec::new(),
         };
 
@@ -1000,6 +1018,7 @@ mod tests {
             architecture: Some("qwen35".to_owned()),
             context_length: None,
             provenance: None,
+            native_identity: None,
             auxiliary_artifacts: Vec::new(),
         };
         let identity = RuntimeIdentity {
@@ -1029,15 +1048,18 @@ mod tests {
             published_at_unix: None,
             channels: vec![RuntimeReleaseChannel::Stable],
             prerelease: false,
-            download: RuntimeDownload {
-                url: "https://github.com/fixture/repository/releases/download/v1/runtime.zip"
-                    .to_owned(),
-                size_bytes: 1,
-                digest: Some(RuntimeDigest::sha256("a".repeat(64)).expect("digest")),
-                archive_format: RuntimeArchiveFormat::Zip,
-                entrypoint_names: vec!["server".to_owned()],
+            acquisition: norted_core::RuntimeAcquisitionPlan::ReleaseAsset {
+                download: RuntimeDownload {
+                    url: "https://github.com/fixture/repository/releases/download/v1/runtime.zip"
+                        .to_owned(),
+                    size_bytes: 1,
+                    digest: Some(RuntimeDigest::sha256("a".repeat(64)).expect("digest")),
+                    archive_format: RuntimeArchiveFormat::Zip,
+                    entrypoint_names: vec!["server".to_owned()],
+                },
+                additional_downloads: Vec::new(),
             },
-            additional_downloads: Vec::new(),
+            supported_native_identities: Vec::new(),
             requirements: RuntimeRequirements::default(),
         };
         assert!(matches!(
@@ -1064,6 +1086,7 @@ mod tests {
                 architecture: None,
                 context_length: None,
                 provenance: None,
+                native_identity: None,
                 auxiliary_artifacts: Vec::new(),
             },
             auxiliary: vec![PreparedAuxiliaryArtifact {

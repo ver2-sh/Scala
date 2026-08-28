@@ -695,12 +695,14 @@ fn repairable_runtime_manifest(existing: &RuntimeManifest, candidate: &RuntimeMa
         && existing.runtime_id == candidate.runtime_id
         && existing.identity == candidate.identity
         && existing.supported_formats == candidate.supported_formats
+        && existing.supported_native_identities == candidate.supported_native_identities
         && existing.requirements == candidate.requirements
         && existing.acquisition_method == candidate.acquisition_method
         && existing.source_url == candidate.source_url
         && existing.downloaded_archive_sha256 == candidate.downloaded_archive_sha256
         && existing.additional_downloaded_archive_sha256
             == candidate.additional_downloaded_archive_sha256
+        && existing.source_build == candidate.source_build
         && existing.entrypoint == candidate.entrypoint
         && existing.entrypoint_sha256 == candidate.entrypoint_sha256
 }
@@ -1073,11 +1075,13 @@ mod tests {
             runtime_id: norted_core::RuntimeId::from_identity(&identity),
             identity,
             supported_formats: vec![ArtifactFormat::Gguf],
+            supported_native_identities: Vec::new(),
             requirements: RuntimeRequirements::default(),
             acquisition_method: RuntimeAcquisitionMethod::OfficialReleaseAsset,
             source_url: Some("https://github.com/owner/repository/releases/tag/v1".to_owned()),
             downloaded_archive_sha256: Some("a".repeat(64)),
             additional_downloaded_archive_sha256: Vec::new(),
+            source_build: None,
             entrypoint: "server".into(),
             entrypoint_sha256: "b".repeat(64),
             installed_at_unix: Some(1),
@@ -1170,11 +1174,13 @@ mod tests {
             runtime_id: norted_core::RuntimeId::from_identity(&identity),
             identity,
             supported_formats: vec![ArtifactFormat::Gguf],
+            supported_native_identities: Vec::new(),
             requirements: RuntimeRequirements::default(),
             acquisition_method: RuntimeAcquisitionMethod::OfficialReleaseAsset,
             source_url: Some("https://github.com/owner/repository/releases/tag/v1".to_owned()),
             downloaded_archive_sha256: Some("a".repeat(64)),
             additional_downloaded_archive_sha256: Vec::new(),
+            source_build: None,
             entrypoint: "server".into(),
             entrypoint_sha256: super::hex_digest(Sha256::digest(b"original")),
             installed_at_unix: Some(1),

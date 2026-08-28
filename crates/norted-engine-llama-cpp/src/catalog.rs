@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use norted_core::{
-    ArtifactFormat, AvailableRuntime, RuntimeArchiveFormat, RuntimeDigest, RuntimeDownload,
-    RuntimeIdentity, RuntimePackageAssetIdentity, RuntimePackageIdentity, RuntimeReleaseChannel,
-    RuntimeRequirements,
+    ArtifactFormat, AvailableRuntime, RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeDigest,
+    RuntimeDownload, RuntimeIdentity, RuntimePackageAssetIdentity, RuntimePackageIdentity,
+    RuntimeReleaseChannel, RuntimeRequirements,
 };
 use norted_engine::{
     CatalogError, GitHubRelease, GitHubReleaseAsset, GitHubReleaseClient, RuntimeCatalogProvider,
@@ -147,12 +147,13 @@ fn runtimes_for_release(release: &GitHubRelease) -> Result<Vec<AvailableRuntime>
             None
         };
         let runtime = available_runtime(release, asset, companion, classification)?;
-        if runtime.download.digest.is_some()
-            && runtime
-                .additional_downloads
-                .iter()
-                .all(|download| download.digest.is_some())
-        {
+        let verified = runtime
+            .release_assets()
+            .is_some_and(|(download, additional)| {
+                download.digest.is_some()
+                    && additional.iter().all(|download| download.digest.is_some())
+            });
+        if verified {
             runtimes.push(runtime);
         }
     }
@@ -209,6 +210,7 @@ fn available_runtime(
         minimum_vram_class_gib: None,
         minimum_vram_exclusive_class_gib: None,
         supported_cuda_compute_capabilities: Vec::new(),
+        required_nvidia_device_names: Vec::new(),
         notes: Vec::new(),
         advisories: Vec::new(),
         unverified_requirements: companion
@@ -237,20 +239,23 @@ fn available_runtime(
             .and_then(parse_github_timestamp),
         channels: Vec::new(),
         prerelease: release.prerelease,
-        download: runtime_download(
-            asset,
-            classification.archive_format,
-            vec![entrypoint_name(classification.platform).to_owned()],
-        ),
-        additional_downloads: companion
-            .map(|companion| {
-                vec![runtime_download(
-                    companion,
-                    RuntimeArchiveFormat::Zip,
-                    Vec::new(),
-                )]
-            })
-            .unwrap_or_default(),
+        acquisition: RuntimeAcquisitionPlan::ReleaseAsset {
+            download: runtime_download(
+                asset,
+                classification.archive_format,
+                vec![entrypoint_name(classification.platform).to_owned()],
+            ),
+            additional_downloads: companion
+                .map(|companion| {
+                    vec![runtime_download(
+                        companion,
+                        RuntimeArchiveFormat::Zip,
+                        Vec::new(),
+                    )]
+                })
+                .unwrap_or_default(),
+        },
+        supported_native_identities: Vec::new(),
         requirements,
     };
     runtime.validate().map_err(|error| CatalogError::Provider {
@@ -681,17 +686,19 @@ mod tests {
         let runtimes = runtimes_for_release(&release).unwrap();
         assert_eq!(runtimes.len(), 1);
         let runtime = &runtimes[0];
+        let (download, additional_downloads) =
+            runtime.release_assets().expect("release acquisition");
         assert_eq!(runtime.identity.accelerator, "cuda");
         assert_eq!(runtime.identity.variant, "13.3");
-        assert_eq!(runtime.additional_downloads.len(), 1);
+        assert_eq!(additional_downloads.len(), 1);
         assert_eq!(runtime.identity.package.additional_assets.len(), 1);
         assert_eq!(
             runtime.identity.package.additional_assets[0].role,
             "cuda-runtime"
         );
-        assert_eq!(runtime.download.entrypoint_names, ["llama-server.exe"]);
-        assert!(runtime.additional_downloads[0].entrypoint_names.is_empty());
-        assert!(runtime.additional_downloads[0].digest.is_some());
+        assert_eq!(download.entrypoint_names, ["llama-server.exe"]);
+        assert!(additional_downloads[0].entrypoint_names.is_empty());
+        assert!(additional_downloads[0].digest.is_some());
     }
 
     #[test]

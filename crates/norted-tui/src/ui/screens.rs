@@ -105,7 +105,7 @@ fn render_overview(
                     theme.muted,
                 )),
                 Line::from(Span::styled(
-                    "Recognized formats: .gguf and .q27",
+                    "Recognized formats: .gguf, .q27, and .ninfer",
                     theme.hint,
                 )),
                 Line::default(),
@@ -345,11 +345,14 @@ fn render_runtimes(
                 Span::styled("not loaded", theme.muted),
                 Span::styled("    Q27  ", theme.hint),
                 Span::styled("not loaded", theme.muted),
+                Span::styled("    NINFER  ", theme.hint),
+                Span::styled("not loaded", theme.muted),
             ])]
         },
         |snapshot| {
             let gguf = selection_text(app, ArtifactFormat::Gguf);
             let q27 = selection_text(app, ArtifactFormat::Q27);
+            let ninfer = selection_text(app, ArtifactFormat::Ninfer);
             let accelerator = if snapshot.host.accelerators.is_empty() {
                 "CPU"
             } else {
@@ -361,6 +364,8 @@ fn render_runtimes(
                     Span::styled(gguf, theme.text),
                     Span::styled("    Q27  ", theme.hint),
                     Span::styled(q27, theme.text),
+                    Span::styled("    NINFER  ", theme.hint),
+                    Span::styled(ninfer, theme.text),
                 ]),
                 Line::from(vec![
                     Span::styled("HOST  ", theme.hint),
@@ -443,6 +448,19 @@ fn render_runtimes(
                 .get(&manifest.runtime_id)
                 .map(runtime_update_text)
                 .unwrap_or_default();
+            let source_build = manifest
+                .source_build
+                .as_ref()
+                .map_or_else(String::new, |build| {
+                    format!(
+                        "  source {} tree {} · {} · CMake {} · CUDA {}",
+                        &build.source.commit_sha[..8],
+                        &build.source.tree_sha[..8],
+                        build.recipe_version,
+                        build.toolchain.cmake_version,
+                        build.toolchain.nvcc_version,
+                    )
+                });
             let mut style = if app.selected_runtime == Some(*index) {
                 theme.selected
             } else {
@@ -465,6 +483,7 @@ fn render_runtimes(
                     ),
                     Span::styled(selected, theme.hint),
                     Span::styled(update, theme.warning),
+                    Span::styled(source_build, theme.hint),
                 ]),
             ])
             .style(style)
@@ -861,6 +880,9 @@ fn render_settings(
             norted_core::LoadSettingKind::Choice { choices } => {
                 format!("{} [{}]", definition.label, choices.join("|"))
             }
+            norted_core::LoadSettingKind::UnsignedIntegerOrChoice { choices, .. } => {
+                format!("{} [number|{}]", definition.label, choices.join("|"))
+            }
             _ => definition.label.clone(),
         };
         let lines = if ui_layout.compact {
@@ -926,7 +948,7 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         key_value("Wheel", "scroll the current view", theme),
         key_value("End", "follow newest logs", theme),
         key_value("s", "search available runtimes from Runtimes", theme),
-        key_value("g / Q", "select runtime for GGUF / Q27", theme),
+        key_value("g / Q / N", "select runtime for GGUF / Q27 / NInfer", theme),
         key_value("u", "check for runtime updates", theme),
         key_value(
             "Shift+U",

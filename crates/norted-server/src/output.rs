@@ -154,6 +154,13 @@ pub fn model_info(capabilities: &ModelServingCapabilities, json_output: bool) ->
     } else {
         println!("Model:                {}", capabilities.model_id);
         println!("Format:               {}", capabilities.format);
+        if let Some(norted_core::ArtifactNativeIdentity::Ninfer(identity)) =
+            &capabilities.native_identity
+        {
+            println!("Container version:    {}", identity.container_version);
+            println!("Native model:         {}", identity.model_id);
+            println!("Native weights:       {}", identity.weights_id);
+        }
         println!(
             "Compatible engines:   {}",
             comma_list(&capabilities.compatible_engine_ids)
@@ -537,7 +544,7 @@ pub fn runtimes_search(
     } else {
         println!(
             "{:<52} {:<11} {:<13} {:<10} {:>10}",
-            "RUNTIME ID", "ENGINE", "BACKEND", "VERSION", "DOWNLOAD"
+            "RUNTIME ID", "ENGINE", "BACKEND", "VERSION", "ACQUISITION"
         );
         for result in &snapshot.results {
             let runtime = &result.entry.available;
@@ -548,7 +555,10 @@ pub fn runtimes_search(
                 runtime.identity.engine_id,
                 runtime.identity.accelerator,
                 runtime.identity.version,
-                format_bytes(runtime.download_size_bytes()),
+                runtime
+                    .download_size_bytes()
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "source build".to_owned()),
                 installed
             );
             println!(

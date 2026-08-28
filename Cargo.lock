@@ -1499,6 +1499,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "norted-engine-ninfer"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "norted-core",
+ "norted-engine",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "walkdir",
+]
+
+[[package]]
 name = "norted-engine-q27"
 version = "0.1.0"
 dependencies = [
@@ -1526,6 +1544,7 @@ dependencies = [
  "norted-core",
  "norted-engine",
  "norted-engine-llama-cpp",
+ "norted-engine-ninfer",
  "norted-engine-q27",
  "norted-tui",
  "serde",

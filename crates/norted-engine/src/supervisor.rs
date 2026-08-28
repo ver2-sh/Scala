@@ -93,6 +93,7 @@ struct ChildActor {
     stdout_task: tokio::task::JoinHandle<()>,
     stderr_task: tokio::task::JoinHandle<()>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    temporary_files: Vec<std::path::PathBuf>,
     termination_timeout: Duration,
 }
 
@@ -146,12 +147,23 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         if let Some(directory) = &spec.working_directory {
             command.current_dir(directory);
         }
-        let mut child = command.spawn().map_err(|error| {
-            EngineError::Operation(format!("could not start managed engine process: {error}"))
-        })?;
-        let process_id = child.id().ok_or_else(|| {
-            EngineError::Operation("managed child did not expose a process ID".to_owned())
-        })?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                cleanup_temporary_files(&spec.temporary_files).await;
+                return Err(EngineError::Operation(format!(
+                    "could not start managed engine process: {error}"
+                )));
+            }
+        };
+        let Some(process_id) = child.id() else {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            cleanup_temporary_files(&spec.temporary_files).await;
+            return Err(EngineError::Operation(
+                "managed child did not expose a process ID".to_owned(),
+            ));
+        };
         let descriptor = ProcessDescriptor {
             supervisor_id: Uuid::new_v4().to_string(),
             process_id,
@@ -164,12 +176,14 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             endpoint: spec.endpoint,
             launched_at_unix: unix_timestamp(),
         };
-        let stdout = child.stdout.take().ok_or_else(|| {
-            EngineError::Operation("managed child stdout was not captured".to_owned())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            EngineError::Operation("managed child stderr was not captured".to_owned())
-        })?;
+        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            cleanup_temporary_files(&spec.temporary_files).await;
+            return Err(EngineError::Operation(
+                "managed child output streams were not captured".to_owned(),
+            ));
+        };
         let tail = Arc::new(Mutex::new(VecDeque::with_capacity(LOG_TAIL_LINES)));
         let stdout_task = tokio::spawn(drain_stream(stdout, descriptor.clone(), "stdout", None));
         let stderr_task = tokio::spawn(drain_stream(
@@ -196,6 +210,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             stdout_task,
             stderr_task,
             stderr_tail: tail,
+            temporary_files: spec.temporary_files,
             termination_timeout: self.termination_timeout,
         }));
         Ok(descriptor)
@@ -314,6 +329,7 @@ async fn run_child_actor(actor: ChildActor) {
         mut stdout_task,
         mut stderr_task,
         stderr_tail,
+        temporary_files,
         termination_timeout,
     } = actor;
     let mut termination_response = None;
@@ -391,6 +407,17 @@ async fn run_child_actor(actor: ChildActor) {
     exit_sender.send_replace(Some(exit));
     if let Some(response) = termination_response {
         let _ = response.send(termination_result);
+    }
+    cleanup_temporary_files(&temporary_files).await;
+}
+
+async fn cleanup_temporary_files(paths: &[std::path::PathBuf]) {
+    for path in paths {
+        if let Err(error) = tokio::fs::remove_file(path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %error, "could not remove temporary engine process file");
+        }
     }
 }
 

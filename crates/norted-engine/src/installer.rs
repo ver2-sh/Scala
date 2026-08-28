@@ -2,18 +2,20 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use norted_core::{
     AvailableRuntime, InstalledRuntime, RUNTIME_MANIFEST_SCHEMA_VERSION, RuntimeAcquisitionMethod,
-    RuntimeArchiveFormat, RuntimeManifest, RuntimeOperationPhase, RuntimeOperationProgress,
-    RuntimeProbeObservation, is_safe_relative_path,
+    RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeManifest, RuntimeOperationPhase,
+    RuntimeOperationProgress, RuntimeProbeObservation, RuntimeSourceBuildPlan,
+    RuntimeSourceBuildProvenance, RuntimeSourceBuildToolchain, is_safe_relative_path,
 };
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 
 use crate::catalog::{
@@ -39,6 +41,10 @@ pub enum RuntimeInstallError {
     Download(String),
     #[error("runtime release provenance changed or could not be verified: {0}")]
     SourceChanged(String),
+    #[error("runtime source-build prerequisite is not satisfied: {0}")]
+    Prerequisite(String),
+    #[error("runtime source build failed: {0}")]
+    SourceBuild(String),
     #[error("runtime package checksum mismatch: expected {expected}, observed {observed}")]
     ChecksumMismatch { expected: String, observed: String },
     #[error("runtime archive is unsafe or invalid: {0}")]
@@ -112,11 +118,24 @@ impl RuntimeInstaller {
         authority
             .validate(available)
             .map_err(|error| RuntimeInstallError::InvalidMetadata(error.to_string()))?;
+        if let RuntimeAcquisitionPlan::SourceBuild(plan) = &available.acquisition {
+            return self.install_source_build(available, authority, plan).await;
+        }
+        let (download, additional_downloads) = available.release_assets().ok_or_else(|| {
+            RuntimeInstallError::InvalidMetadata(
+                "release runtime is missing its release acquisition plan".to_owned(),
+            )
+        })?;
+        let total_package_size = available.download_size_bytes().ok_or_else(|| {
+            RuntimeInstallError::InvalidMetadata(
+                "release runtime is missing a package size".to_owned(),
+            )
+        })?;
         let repository = authority.repository.clone();
-        let expected =
-            available.download.digest.as_ref().ok_or_else(|| {
-                RuntimeInstallError::MissingDigest(available.runtime_id.to_string())
-            })?;
+        let expected = download
+            .digest
+            .as_ref()
+            .ok_or_else(|| RuntimeInstallError::MissingDigest(available.runtime_id.to_string()))?;
         if !expected.algorithm.eq_ignore_ascii_case("sha256") {
             return Err(RuntimeInstallError::MissingDigest(
                 available.runtime_id.to_string(),
@@ -132,7 +151,7 @@ impl RuntimeInstaller {
             .ok_or_else(|| {
                 RuntimeInstallError::InvalidMetadata("primary asset name is missing".to_owned())
             })?;
-        validate_release_asset_url(available, primary_asset_name, &available.download)?;
+        validate_release_asset_url(available, primary_asset_name, download)?;
         let primary_asset_id = parse_asset_id(
             available.identity.package.asset_id.as_deref(),
             primary_asset_name,
@@ -144,11 +163,11 @@ impl RuntimeInstaller {
         let archive = self
             .download(
                 available,
-                &available.download,
+                download,
                 &repository,
                 primary_asset_id,
                 &expected.value,
-                available.download_size_bytes(),
+                total_package_size,
             )
             .await?;
         let mut additional_archives = Vec::new();
@@ -158,7 +177,7 @@ impl RuntimeInstaller {
             .package
             .additional_assets
             .iter()
-            .zip(&available.additional_downloads)
+            .zip(additional_downloads)
         {
             let digest = download.digest.as_ref().ok_or_else(|| {
                 RuntimeInstallError::MissingDigest(available.runtime_id.to_string())
@@ -177,7 +196,7 @@ impl RuntimeInstaller {
                     &repository,
                     asset_id,
                     &digest.value,
-                    available.download_size_bytes(),
+                    total_package_size,
                 )
                 .await?,
             );
@@ -187,24 +206,20 @@ impl RuntimeInstaller {
             available,
             RuntimeOperationPhase::Extracting,
             None,
-            Some(available.download_size_bytes()),
+            Some(total_package_size),
             "Extracting verified package",
         );
         let staging = self.store.create_staging().await?;
         let result = async {
             let archive_path = archive.clone();
             let staging_path = staging.clone();
-            let format = available.download.archive_format;
+            let format = download.archive_format;
             tokio::task::spawn_blocking(move || {
                 extract_archive(&archive_path, &staging_path, format)
             })
             .await
             .map_err(|error| RuntimeInstallError::Task(error.to_string()))??;
-            for (download, archive) in available
-                .additional_downloads
-                .iter()
-                .zip(&additional_archives)
-            {
+            for (download, archive) in additional_downloads.iter().zip(&additional_archives) {
                 let archive_path = archive.clone();
                 let staging_path = staging.clone();
                 let format = download.archive_format;
@@ -214,7 +229,7 @@ impl RuntimeInstaller {
                 .await
                 .map_err(|error| RuntimeInstallError::Task(error.to_string()))??;
             }
-            let entrypoint = locate_entrypoint(&staging, &available.download.entrypoint_names)
+            let entrypoint = locate_entrypoint(&staging, &download.entrypoint_names)
                 .map_err(RuntimeInstallError::Entrypoint)?;
             let relative_entrypoint = entrypoint
                 .strip_prefix(&staging)
@@ -237,11 +252,13 @@ impl RuntimeInstaller {
                 runtime_id: available.runtime_id.clone(),
                 identity: available.identity.clone(),
                 supported_formats: available.supported_formats.clone(),
+                supported_native_identities: available.supported_native_identities.clone(),
                 requirements: available.requirements.clone(),
                 acquisition_method: RuntimeAcquisitionMethod::OfficialReleaseAsset,
                 source_url: Some(available.source_url.clone()),
                 downloaded_archive_sha256: Some(expected.value.clone()),
                 additional_downloaded_archive_sha256: additional_digests.clone(),
+                source_build: None,
                 entrypoint: relative_entrypoint,
                 entrypoint_sha256,
                 installed_at_unix: Some(unix_timestamp()),
@@ -313,8 +330,8 @@ impl RuntimeInstaller {
                 self.emit(
                     available,
                     RuntimeOperationPhase::Installed,
-                    Some(available.download_size_bytes()),
-                    Some(available.download_size_bytes()),
+                    Some(total_package_size),
+                    Some(total_package_size),
                     "Runtime installed",
                 );
                 Ok(runtime)
@@ -335,10 +352,344 @@ impl RuntimeInstaller {
         }
     }
 
+    async fn install_source_build(
+        &self,
+        available: &AvailableRuntime,
+        authority: &RuntimeProviderAuthority,
+        plan: &RuntimeSourceBuildPlan,
+    ) -> Result<InstalledRuntime, RuntimeInstallError> {
+        let result = self
+            .install_source_build_inner(available, authority, plan)
+            .await;
+        if let Err(error) = &result {
+            self.emit(
+                available,
+                RuntimeOperationPhase::Failed,
+                None,
+                None,
+                &error.to_string(),
+            );
+        }
+        result
+    }
+
+    async fn install_source_build_inner(
+        &self,
+        available: &AvailableRuntime,
+        authority: &RuntimeProviderAuthority,
+        plan: &RuntimeSourceBuildPlan,
+    ) -> Result<InstalledRuntime, RuntimeInstallError> {
+        self.emit(
+            available,
+            RuntimeOperationPhase::CheckingPrerequisites,
+            None,
+            None,
+            "Checking source-build prerequisites",
+        );
+        let toolchain = check_source_build_prerequisites(plan).await?;
+
+        let repository = self
+            .github
+            .repository(&authority.repository)
+            .await
+            .map_err(|error| RuntimeInstallError::SourceChanged(error.to_string()))?;
+        if repository.full_name != plan.source.repository
+            || repository.html_url != format!("https://github.com/{}", plan.source.repository)
+        {
+            return Err(RuntimeInstallError::SourceChanged(
+                "canonical repository no longer matches the selected source candidate".to_owned(),
+            ));
+        }
+        let live_commit = self
+            .github
+            .commit(&authority.repository, &plan.source.commit_sha)
+            .await
+            .map_err(|error| RuntimeInstallError::SourceChanged(error.to_string()))?;
+        if live_commit.sha != plan.source.commit_sha
+            || live_commit.commit.tree.sha != plan.source.tree_sha
+            || live_commit.html_url != available.source_url
+        {
+            return Err(RuntimeInstallError::SourceChanged(
+                "selected commit or Git tree no longer matches the catalog candidate".to_owned(),
+            ));
+        }
+
+        let adapter = self
+            .registry
+            .get(&available.identity.engine_id)
+            .ok_or_else(|| RuntimeInstallError::Adapter(available.identity.engine_id.clone()))?;
+        let staging = self.store.create_staging().await?;
+        let result = async {
+            let source_root = staging.join("source");
+            tokio::fs::create_dir_all(&source_root)
+                .await
+                .map_err(|error| RuntimeInstallError::SourceBuild(error.to_string()))?;
+            self.emit(
+                available,
+                RuntimeOperationPhase::FetchingSource,
+                None,
+                None,
+                "Fetching the exact upstream commit",
+            );
+            run_source_command(
+                "git init",
+                "git",
+                &["init", "--quiet"],
+                Some(&source_root),
+                &[],
+            )
+            .await?;
+            run_source_command(
+                "git remote configuration",
+                "git",
+                &["remote", "add", "origin", &plan.source.repository_url],
+                Some(&source_root),
+                &[],
+            )
+            .await?;
+            run_source_command(
+                "git fetch",
+                "git",
+                &[
+                    "fetch",
+                    "--quiet",
+                    "--depth=1",
+                    "origin",
+                    &plan.source.commit_sha,
+                ],
+                Some(&source_root),
+                &[],
+            )
+            .await?;
+            run_source_command(
+                "git checkout",
+                "git",
+                &["checkout", "--quiet", "--detach", "FETCH_HEAD"],
+                Some(&source_root),
+                &[],
+            )
+            .await?;
+
+            self.emit(
+                available,
+                RuntimeOperationPhase::VerifyingSource,
+                None,
+                None,
+                "Verifying exact source commit and Git tree",
+            );
+            let observed_commit =
+                command_text("git", &["rev-parse", "HEAD"], Some(&source_root)).await?;
+            let observed_tree =
+                command_text("git", &["rev-parse", "HEAD^{tree}"], Some(&source_root)).await?;
+            verify_source_checkout(
+                &plan.source.commit_sha,
+                &plan.source.tree_sha,
+                &observed_commit,
+                &observed_tree,
+            )?;
+            let audit_root = source_root.clone();
+            tokio::task::spawn_blocking(move || inspect_build_dependency_contract(&audit_root))
+                .await
+                .map_err(|error| RuntimeInstallError::Task(error.to_string()))??;
+            let supported_native_identities = adapter.source_native_identities(&source_root)?;
+
+            let build_root = source_root.join("build");
+            let rejected_environment = plan
+                .recipe
+                .rejected_build_environment
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            self.emit(
+                available,
+                RuntimeOperationPhase::Configuring,
+                None,
+                None,
+                "Configuring the fixed Norted source-build recipe",
+            );
+            let source_text = source_root.to_string_lossy().into_owned();
+            let build_text = build_root.to_string_lossy().into_owned();
+            let mut configure_arguments = vec![
+                "-S".to_owned(),
+                source_text,
+                "-B".to_owned(),
+                build_text.clone(),
+            ];
+            configure_arguments.extend(plan.recipe.cmake_configuration_arguments.clone());
+            let configure_refs = configure_arguments
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            run_source_command(
+                "CMake configure",
+                "cmake",
+                &configure_refs,
+                None,
+                &rejected_environment,
+            )
+            .await?;
+
+            self.emit(
+                available,
+                RuntimeOperationPhase::Building,
+                None,
+                None,
+                "Building the required runtime target",
+            );
+            run_source_command(
+                "CMake build",
+                "cmake",
+                &[
+                    "--build",
+                    &build_text,
+                    "--target",
+                    &plan.recipe.build_target,
+                ],
+                None,
+                &rejected_environment,
+            )
+            .await?;
+
+            let relative_entrypoint = PathBuf::from("source").join(&plan.recipe.entrypoint);
+            let entrypoint = staging.join(&relative_entrypoint);
+            let metadata = tokio::fs::metadata(&entrypoint).await.map_err(|error| {
+                RuntimeInstallError::Entrypoint(format!(
+                    "expected source-built entrypoint `{}` is unavailable: {error}",
+                    relative_entrypoint.display()
+                ))
+            })?;
+            if !metadata.is_file() {
+                return Err(RuntimeInstallError::Entrypoint(format!(
+                    "expected source-built entrypoint `{}` is not a regular file",
+                    relative_entrypoint.display()
+                )));
+            }
+            let entrypoint_sha256 = hash_file(&entrypoint)
+                .await
+                .map_err(|error| RuntimeInstallError::Entrypoint(error.to_string()))?;
+            let installed_at = unix_timestamp();
+            let source_build = RuntimeSourceBuildProvenance {
+                source: plan.source.clone(),
+                recipe_version: plan.recipe.recipe_version.clone(),
+                cmake_configuration_arguments: plan.recipe.cmake_configuration_arguments.clone(),
+                build_target: plan.recipe.build_target.clone(),
+                toolchain,
+                build_platform: available.identity.platform.clone(),
+                build_architecture: available.identity.architecture.clone(),
+                accelerator_target: plan.recipe.accelerator_target.clone(),
+                built_at_unix: installed_at,
+                entrypoint: relative_entrypoint.clone(),
+                entrypoint_sha256: entrypoint_sha256.clone(),
+            };
+            let mut manifest = RuntimeManifest {
+                schema_version: RUNTIME_MANIFEST_SCHEMA_VERSION,
+                runtime_id: available.runtime_id.clone(),
+                identity: available.identity.clone(),
+                supported_formats: available.supported_formats.clone(),
+                supported_native_identities,
+                requirements: available.requirements.clone(),
+                acquisition_method: RuntimeAcquisitionMethod::SourceBuild,
+                source_url: Some(available.source_url.clone()),
+                downloaded_archive_sha256: None,
+                additional_downloaded_archive_sha256: Vec::new(),
+                source_build: Some(source_build),
+                entrypoint: relative_entrypoint,
+                entrypoint_sha256,
+                installed_at_unix: Some(installed_at),
+                probe: RuntimeProbeObservation {
+                    compatible: false,
+                    observed_engine_id: available.identity.engine_id.clone(),
+                    observed_version: None,
+                    observed_revision: None,
+                    detail: "probe pending".to_owned(),
+                    observed_at_unix: installed_at,
+                },
+            };
+            let candidate = InstalledRuntime {
+                manifest: manifest.clone(),
+                installation_root: staging.clone(),
+            };
+            self.emit(
+                available,
+                RuntimeOperationPhase::Probing,
+                None,
+                None,
+                "Validating source-built executable through the engine adapter",
+            );
+            let observation = adapter.probe_runtime(&candidate).await?;
+            if !observation.compatible
+                || observation.observed_engine_id != available.identity.engine_id
+            {
+                return Err(RuntimeInstallError::Probe(
+                    EngineError::InvalidConfiguration(format!(
+                        "runtime probe reported engine `{}` with compatible={}",
+                        observation.observed_engine_id, observation.compatible
+                    )),
+                ));
+            }
+            if hash_file(&entrypoint)
+                .await
+                .map_err(|error| RuntimeInstallError::Entrypoint(error.to_string()))?
+                != manifest.entrypoint_sha256
+            {
+                return Err(RuntimeInstallError::Probe(
+                    EngineError::InvalidConfiguration(
+                        "runtime entrypoint changed while its adapter probe was executing"
+                            .to_owned(),
+                    ),
+                ));
+            }
+            manifest.probe = observation;
+            manifest
+                .validate()
+                .map_err(|error| RuntimeInstallError::InvalidMetadata(error.to_string()))?;
+            write_manifest(&staging.join(RUNTIME_MANIFEST_FILE), &manifest).await?;
+            self.emit(
+                available,
+                RuntimeOperationPhase::Installing,
+                None,
+                None,
+                "Atomically activating immutable source-built runtime",
+            );
+            self.store
+                .activate(&staging, &manifest)
+                .await
+                .map_err(Into::into)
+        }
+        .await;
+
+        match result {
+            Ok(runtime) => {
+                if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
+                    let _ = tokio::fs::remove_dir_all(&staging).await;
+                }
+                self.emit(
+                    available,
+                    RuntimeOperationPhase::Installed,
+                    None,
+                    None,
+                    "Source-built runtime installed",
+                );
+                Ok(runtime)
+            }
+            Err(error) => {
+                if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
+                    let _ = tokio::fs::remove_dir_all(&staging).await;
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn verify_published_assets(
         &self,
         available: &AvailableRuntime,
     ) -> Result<(), RuntimeInstallError> {
+        let (download, additional_downloads) = available.release_assets().ok_or_else(|| {
+            RuntimeInstallError::InvalidMetadata(
+                "release verification requires a release acquisition plan".to_owned(),
+            )
+        })?;
         let package = &available.identity.package;
         let repository = package.repository.as_deref().ok_or_else(|| {
             RuntimeInstallError::InvalidMetadata(
@@ -379,13 +730,9 @@ impl RuntimeInstaller {
             &release.assets,
             package.asset_id.as_deref(),
             primary_name,
-            &available.download,
+            download,
         )?;
-        for (asset, download) in package
-            .additional_assets
-            .iter()
-            .zip(&available.additional_downloads)
-        {
+        for (asset, download) in package.additional_assets.iter().zip(additional_downloads) {
             verify_release_asset(
                 &release.assets,
                 Some(&asset.asset_id),
@@ -559,6 +906,440 @@ impl RuntimeInstaller {
             detail: detail.to_owned(),
         });
     }
+}
+
+const MAX_PROBE_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_BUILD_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+const SOURCE_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_CMAKE_CONTRACT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CMAKE_CONTRACT_FILES: usize = 4_096;
+
+async fn check_source_build_prerequisites(
+    plan: &RuntimeSourceBuildPlan,
+) -> Result<RuntimeSourceBuildToolchain, RuntimeInstallError> {
+    if !cfg!(target_os = "linux") {
+        return Err(RuntimeInstallError::Prerequisite(
+            "the selected official source recipe requires Linux".to_owned(),
+        ));
+    }
+    if std::env::consts::ARCH != "x86_64" {
+        return Err(RuntimeInstallError::Prerequisite(format!(
+            "the selected official source recipe requires x86_64, observed {}",
+            std::env::consts::ARCH
+        )));
+    }
+
+    command_text("git", &["--version"], None).await?;
+    let cmake_identity = command_text("cmake", &["--version"], None).await?;
+    let cmake_version = first_version(&cmake_identity).ok_or_else(|| {
+        RuntimeInstallError::Prerequisite("could not parse `cmake --version`".to_owned())
+    })?;
+    require_minimum_version(
+        "CMake",
+        &cmake_version,
+        &plan.prerequisites.minimum_cmake_version,
+    )?;
+
+    let ninja_identity = if plan.prerequisites.requires_ninja {
+        command_text("ninja", &["--version"], None).await?
+    } else {
+        "not required".to_owned()
+    };
+    let compiler_identity = if plan.prerequisites.requires_cpp20_compiler {
+        let identity = command_text("c++", &["--version"], None).await?;
+        probe_cpp20_compiler().await?;
+        identity
+    } else {
+        "not required".to_owned()
+    };
+    let nvcc_identity = command_text("nvcc", &["--version"], None).await?;
+    let nvcc_version = version_after(&nvcc_identity, "release")
+        .or_else(|| first_version(&nvcc_identity))
+        .ok_or_else(|| {
+            RuntimeInstallError::Prerequisite("could not parse `nvcc --version`".to_owned())
+        })?;
+    require_minimum_version(
+        "CUDA Toolkit",
+        &nvcc_version,
+        &plan.prerequisites.minimum_cuda_version,
+    )?;
+
+    let pkg_config_identity = if plan.prerequisites.requires_pkg_config {
+        command_text("pkg-config", &["--version"], None).await?
+    } else {
+        "not required".to_owned()
+    };
+    let mut system_dependencies = BTreeMap::new();
+    for (module, minimum) in &plan.prerequisites.pkg_config_modules {
+        let constraint = format!("--atleast-version={minimum}");
+        probe_status("pkg-config", &[constraint.as_str(), module])
+            .await
+            .map_err(|_| {
+                RuntimeInstallError::Prerequisite(format!(
+                    "pkg-config module `{module}` >= {minimum} is required"
+                ))
+            })?;
+        let observed = command_text("pkg-config", &["--modversion", module], None).await?;
+        system_dependencies.insert(module.clone(), observed);
+    }
+
+    Ok(RuntimeSourceBuildToolchain {
+        cmake_version,
+        ninja_version: first_line(&ninja_identity),
+        cpp_compiler: compact_identity(&compiler_identity),
+        nvcc_version,
+        pkg_config_version: first_line(&pkg_config_identity),
+        system_dependencies,
+    })
+}
+
+async fn probe_cpp20_compiler() -> Result<(), RuntimeInstallError> {
+    let mut command = tokio::process::Command::new("c++");
+    command
+        .args(["-std=c++20", "-x", "c++", "-fsyntax-only", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|error| {
+        RuntimeInstallError::Prerequisite(format!("could not start C++20 compiler probe: {error}"))
+    })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(b"#include <span>\nint main(){int x[1]{}; std::span<int> s{x}; return int(s.size())-1;}\n")
+            .await
+            .map_err(|error| RuntimeInstallError::Prerequisite(error.to_string()))?;
+    }
+    let status = tokio::time::timeout(SOURCE_PROBE_TIMEOUT, child.wait())
+        .await
+        .map_err(|_| {
+            RuntimeInstallError::Prerequisite("C++20 compiler probe timed out".to_owned())
+        })?
+        .map_err(|error| RuntimeInstallError::Prerequisite(error.to_string()))?;
+    if !status.success() {
+        return Err(RuntimeInstallError::Prerequisite(
+            "the host C++ compiler did not accept a C++20 probe".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn command_text(
+    program: &str,
+    arguments: &[&str],
+    current_dir: Option<&Path>,
+) -> Result<String, RuntimeInstallError> {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        RuntimeInstallError::Prerequisite(format!("could not execute `{program}`: {error}"))
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        RuntimeInstallError::Prerequisite(format!("`{program}` stdout is unavailable"))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        RuntimeInstallError::Prerequisite(format!("`{program}` stderr is unavailable"))
+    })?;
+    let stdout_task = tokio::spawn(read_bounded_probe_output(stdout));
+    let stderr_task = tokio::spawn(read_bounded_probe_output(stderr));
+    let status = tokio::time::timeout(SOURCE_PROBE_TIMEOUT, child.wait())
+        .await
+        .map_err(|_| RuntimeInstallError::Prerequisite(format!("`{program}` probe timed out")))?
+        .map_err(|error| {
+            RuntimeInstallError::Prerequisite(format!("could not execute `{program}`: {error}"))
+        })?;
+    let (stdout, stdout_exceeded) = stdout_task
+        .await
+        .map_err(|error| RuntimeInstallError::Task(error.to_string()))?
+        .map_err(|error| RuntimeInstallError::Prerequisite(error.to_string()))?;
+    let (stderr, stderr_exceeded) = stderr_task
+        .await
+        .map_err(|error| RuntimeInstallError::Task(error.to_string()))?
+        .map_err(|error| RuntimeInstallError::Prerequisite(error.to_string()))?;
+    if stdout_exceeded
+        || stderr_exceeded
+        || stdout.len().saturating_add(stderr.len()) > MAX_PROBE_OUTPUT_BYTES
+    {
+        return Err(RuntimeInstallError::Prerequisite(format!(
+            "`{program}` probe output exceeded {MAX_PROBE_OUTPUT_BYTES} bytes"
+        )));
+    }
+    if !status.success() {
+        return Err(RuntimeInstallError::Prerequisite(format!(
+            "`{program} {}` exited unsuccessfully: {}",
+            arguments.join(" "),
+            compact_identity(&String::from_utf8_lossy(&stderr))
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
+    let text = if stdout.trim().is_empty() {
+        stderr.trim()
+    } else {
+        stdout.trim()
+    };
+    if text.is_empty() {
+        return Err(RuntimeInstallError::Prerequisite(format!(
+            "`{program}` returned no observable identity"
+        )));
+    }
+    Ok(text.to_owned())
+}
+
+async fn read_bounded_probe_output<R>(mut reader: R) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::with_capacity(MAX_PROBE_OUTPUT_BYTES);
+    let mut exceeded = false;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let retained = MAX_PROBE_OUTPUT_BYTES
+            .saturating_sub(output.len())
+            .min(read);
+        output.extend_from_slice(&buffer[..retained]);
+        exceeded |= retained != read;
+    }
+    Ok((output, exceeded))
+}
+
+async fn probe_status(program: &str, arguments: &[&str]) -> Result<(), RuntimeInstallError> {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(SOURCE_PROBE_TIMEOUT, command.status())
+        .await
+        .map_err(|_| RuntimeInstallError::Prerequisite(format!("`{program}` probe timed out")))?
+        .map_err(|error| RuntimeInstallError::Prerequisite(error.to_string()))?;
+    status.success().then_some(()).ok_or_else(|| {
+        RuntimeInstallError::Prerequisite(format!("`{program}` probe exited unsuccessfully"))
+    })
+}
+
+async fn run_source_command(
+    label: &str,
+    program: &str,
+    arguments: &[&str],
+    current_dir: Option<&Path>,
+    rejected_environment: &[&str],
+) -> Result<(), RuntimeInstallError> {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+    for name in rejected_environment {
+        command.env_remove(name);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        RuntimeInstallError::SourceBuild(format!("{label} could not start: {error}"))
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RuntimeInstallError::SourceBuild(format!("{label} stdout unavailable")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| RuntimeInstallError::SourceBuild(format!("{label} stderr unavailable")))?;
+    let stdout_task = tokio::spawn(read_bounded_tail(stdout));
+    let stderr_task = tokio::spawn(read_bounded_tail(stderr));
+    let status = child.wait().await.map_err(|error| {
+        RuntimeInstallError::SourceBuild(format!("{label} could not be observed: {error}"))
+    })?;
+    let stdout = stdout_task
+        .await
+        .map_err(|error| RuntimeInstallError::Task(error.to_string()))?
+        .map_err(|error| RuntimeInstallError::SourceBuild(error.to_string()))?;
+    let stderr = stderr_task
+        .await
+        .map_err(|error| RuntimeInstallError::Task(error.to_string()))?
+        .map_err(|error| RuntimeInstallError::SourceBuild(error.to_string()))?;
+    if !status.success() {
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        let detail = compact_identity(&String::from_utf8_lossy(&detail));
+        return Err(RuntimeInstallError::SourceBuild(format!(
+            "{label} exited with {status}: {detail}"
+        )));
+    }
+    Ok(())
+}
+
+async fn read_bounded_tail<R>(mut reader: R) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut tail = Vec::with_capacity(MAX_BUILD_DIAGNOSTIC_BYTES);
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        if read >= MAX_BUILD_DIAGNOSTIC_BYTES {
+            tail.clear();
+            tail.extend_from_slice(&buffer[read - MAX_BUILD_DIAGNOSTIC_BYTES..read]);
+            continue;
+        }
+        let overflow = tail
+            .len()
+            .saturating_add(read)
+            .saturating_sub(MAX_BUILD_DIAGNOSTIC_BYTES);
+        if overflow > 0 {
+            tail.drain(..overflow);
+        }
+        tail.extend_from_slice(&buffer[..read]);
+    }
+    Ok(tail)
+}
+
+fn verify_source_checkout(
+    expected_commit: &str,
+    expected_tree: &str,
+    observed_commit: &str,
+    observed_tree: &str,
+) -> Result<(), RuntimeInstallError> {
+    if observed_commit != expected_commit {
+        return Err(RuntimeInstallError::SourceChanged(format!(
+            "source checkout revision mismatch: expected {expected_commit}, observed {observed_commit}"
+        )));
+    }
+    if observed_tree != expected_tree {
+        return Err(RuntimeInstallError::SourceChanged(format!(
+            "source checkout tree mismatch: expected {expected_tree}, observed {observed_tree}"
+        )));
+    }
+    Ok(())
+}
+
+fn inspect_build_dependency_contract(source_root: &Path) -> Result<(), RuntimeInstallError> {
+    let mut files = 0_usize;
+    let mut bytes = 0_u64;
+    for entry in walkdir::WalkDir::new(source_root).follow_links(false) {
+        let entry = entry.map_err(|error| RuntimeInstallError::SourceBuild(error.to_string()))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let selected = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "CMakeLists.txt" || name.ends_with(".cmake"));
+        if !selected {
+            continue;
+        }
+        files = files.saturating_add(1);
+        if files > MAX_CMAKE_CONTRACT_FILES {
+            return Err(RuntimeInstallError::SourceBuild(
+                "source CMake tree exceeds the bounded dependency audit file count".to_owned(),
+            ));
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|error| RuntimeInstallError::SourceBuild(error.to_string()))?;
+        bytes = bytes.saturating_add(metadata.len());
+        if bytes > MAX_CMAKE_CONTRACT_BYTES || metadata.len() > MAX_CMAKE_CONTRACT_BYTES {
+            return Err(RuntimeInstallError::SourceBuild(
+                "source CMake tree exceeds the bounded dependency audit size".to_owned(),
+            ));
+        }
+        let contents = std::fs::read_to_string(path)
+            .map_err(|error| RuntimeInstallError::SourceBuild(error.to_string()))?;
+        let normalized = contents.to_ascii_lowercase();
+        let forbidden = [
+            "fetchcontent",
+            "externalproject",
+            "file(download",
+            "git clone",
+            "http://",
+            "https://",
+        ];
+        if let Some(directive) = forbidden
+            .iter()
+            .find(|directive| normalized.contains(**directive))
+        {
+            return Err(RuntimeInstallError::SourceBuild(format!(
+                "source build dependency audit rejected `{}` in {}",
+                directive,
+                path.strip_prefix(source_root).unwrap_or(path).display()
+            )));
+        }
+    }
+    if files == 0 {
+        return Err(RuntimeInstallError::SourceBuild(
+            "source snapshot contains no CMake build definition".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_minimum_version(
+    name: &str,
+    observed: &str,
+    minimum: &str,
+) -> Result<(), RuntimeInstallError> {
+    let observed_parts = numeric_version(observed);
+    let minimum_parts = numeric_version(minimum);
+    if observed_parts.is_empty() || minimum_parts.is_empty() || observed_parts < minimum_parts {
+        return Err(RuntimeInstallError::Prerequisite(format!(
+            "{name} >= {minimum} is required; observed {observed}"
+        )));
+    }
+    Ok(())
+}
+
+fn numeric_version(value: &str) -> Vec<u64> {
+    value
+        .split('.')
+        .map(|component| {
+            component
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .take_while(|component| !component.is_empty())
+        .filter_map(|component| component.parse().ok())
+        .collect()
+}
+
+fn first_version(value: &str) -> Option<String> {
+    value.split_whitespace().find_map(|token| {
+        let trimmed = token.trim_matches(|character: char| !character.is_ascii_digit());
+        (trimmed.contains('.') && !numeric_version(trimmed).is_empty()).then(|| trimmed.to_owned())
+    })
+}
+
+fn version_after(value: &str, marker: &str) -> Option<String> {
+    let (_, tail) = value.split_once(marker)?;
+    first_version(tail)
+}
+
+fn first_line(value: &str) -> String {
+    value.lines().next().unwrap_or(value).trim().to_owned()
+}
+
+fn compact_identity(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn extract_archive(
@@ -1133,7 +1914,9 @@ mod tests {
     use norted_core::RuntimeArchiveFormat;
 
     use super::{
-        RuntimeInstallError, extract_archive, validate_relative_link_target, verify_package_digest,
+        RuntimeInstallError, extract_archive, inspect_build_dependency_contract,
+        run_source_command, validate_relative_link_target, verify_package_digest,
+        verify_source_checkout,
     };
 
     #[test]
@@ -1200,5 +1983,60 @@ mod tests {
             validate_relative_link_target(Path::new("bin/link"), Path::new("../../escape"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn source_checkout_requires_both_exact_commit_and_tree() {
+        let commit = "a".repeat(40);
+        let tree = "b".repeat(40);
+        assert!(verify_source_checkout(&commit, &tree, &commit, &tree).is_ok());
+        assert!(matches!(
+            verify_source_checkout(&commit, &tree, &"c".repeat(40), &tree),
+            Err(RuntimeInstallError::SourceChanged(message)) if message.contains("revision mismatch")
+        ));
+        assert!(matches!(
+            verify_source_checkout(&commit, &tree, &commit, &"d".repeat(40)),
+            Err(RuntimeInstallError::SourceChanged(message)) if message.contains("tree mismatch")
+        ));
+    }
+
+    #[test]
+    fn source_dependency_audit_rejects_networked_cmake() {
+        let safe = tempfile::tempdir().expect("safe CMake fixture");
+        std::fs::write(
+            safe.path().join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.28)\nproject(local LANGUAGES CXX)\n",
+        )
+        .expect("safe CMake fixture");
+        inspect_build_dependency_contract(safe.path()).expect("local-only CMake tree");
+
+        let networked = tempfile::tempdir().expect("networked CMake fixture");
+        std::fs::write(
+            networked.path().join("CMakeLists.txt"),
+            "include(FetchContent)\nFetchContent_Declare(dep URL https://example.invalid/dep.tar.gz)\n",
+        )
+        .expect("networked CMake fixture");
+        assert!(matches!(
+            inspect_build_dependency_contract(networked.path()),
+            Err(RuntimeInstallError::SourceBuild(message)) if message.contains("dependency audit rejected")
+        ));
+    }
+
+    #[tokio::test]
+    async fn source_commands_are_owned_and_report_bounded_failure_output() {
+        run_source_command("Rust compiler probe", "rustc", &["--version"], None, &[])
+            .await
+            .expect("successful direct source command");
+        let error = run_source_command(
+            "failing Rust compiler probe",
+            "rustc",
+            &["--definitely-not-a-rustc-option"],
+            None,
+            &[],
+        )
+        .await
+        .expect_err("failing direct source command");
+        assert!(error.to_string().contains("failing Rust compiler probe"));
+        assert!(error.to_string().contains("definitely-not-a-rustc-option"));
     }
 }

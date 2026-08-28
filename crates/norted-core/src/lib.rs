@@ -26,11 +26,12 @@ pub use load_settings::{
     GpuOffload, LOAD_PROFILES_SCHEMA_VERSION, LoadProfile, LoadProfileName, LoadProfilesError,
     LoadProfilesState, LoadProfilesStore, LoadSettingDefinition, LoadSettingId, LoadSettingKind,
     LoadSettingScope, LoadSettingSource, LoadSettingValue, LoadSettingsError, LoadSettingsPatch,
-    LoadSettingsSchema, ResolvedLoadSetting, ResolvedLoadSettings,
+    LoadSettingsSchema, ResolvedLoadSetting, ResolvedLoadSettings, UnsignedIntegerOrChoiceValue,
 };
 pub use model::{
-    ArtifactFormat, AuxiliaryArtifact, AuxiliaryArtifactRole, ModelArtifact,
-    ModelArtifactProvenance, ModelId, ModelRegistry,
+    ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifact, AuxiliaryArtifactRole,
+    ModelArtifact, ModelArtifactProvenance, ModelId, ModelRegistry, NinferArtifactIdentity,
+    NinferContainerError, NinferContainerMetadata, inspect_ninfer_container,
 };
 pub use provenance::{
     AcquisitionMethod, AuxiliaryRuntimeIdentity, BuildProvenance, EngineInstallation,
@@ -43,12 +44,15 @@ pub use runtime::{
 };
 pub use runtime_pack::{
     AcceleratorDevice, AvailableRuntime, ComputeCapability, HostCapabilities, InstalledRuntime,
-    RUNTIME_MANIFEST_SCHEMA_VERSION, RUNTIME_SELECTIONS_SCHEMA_VERSION, RuntimeAcquisitionMethod,
+    MINIMUM_RUNTIME_MANIFEST_SCHEMA_VERSION, RUNTIME_MANIFEST_SCHEMA_VERSION,
+    RUNTIME_SELECTIONS_SCHEMA_VERSION, RuntimeAcquisitionMethod, RuntimeAcquisitionPlan,
     RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest, RuntimeDigestError, RuntimeDownload,
     RuntimeId, RuntimeIdentity, RuntimeIdentityError, RuntimeManifest, RuntimeManifestError,
     RuntimeOperationPhase, RuntimeOperationProgress, RuntimePackageAssetIdentity,
     RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel, RuntimeRequirements,
-    RuntimeSelection, RuntimeSelectionSource, RuntimeSelections, RuntimeUpdatePreference,
-    RuntimeUpdateState, is_safe_relative_path,
+    RuntimeSelection, RuntimeSelectionSource, RuntimeSelections, RuntimeSourceBuildPlan,
+    RuntimeSourceBuildPrerequisites, RuntimeSourceBuildProvenance, RuntimeSourceBuildRecipe,
+    RuntimeSourceBuildToolchain, RuntimeSourceSnapshot, RuntimeUpdatePreference,
+    RuntimeUpdateState, is_full_git_sha, is_safe_relative_path,
 };
 pub use state::{AppSnapshot, ApplicationCore, RegistryState, ServerState};

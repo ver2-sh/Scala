@@ -1421,6 +1421,9 @@ impl App {
                 KeyCode::Char('Q') | KeyCode::Char('2') => {
                     self.request_runtime_selection(ArtifactFormat::Q27)
                 }
+                KeyCode::Char('N') | KeyCode::Char('3') => {
+                    self.request_runtime_selection(ArtifactFormat::Ninfer)
+                }
                 _ => Update::None,
             },
             Screen::Settings => self.handle_settings_key(key, layout),

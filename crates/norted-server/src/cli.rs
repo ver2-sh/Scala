@@ -84,7 +84,7 @@ pub struct ModelsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ModelsCommand {
-    /// List recognized .gguf and .q27 artifacts
+    /// List recognized .gguf, .q27, and .ninfer artifacts
     List,
     /// Show private serving capabilities for one discovered model
     Info { model_id: String },
@@ -146,7 +146,7 @@ pub struct RuntimesArgs {
 pub enum RuntimesCommand {
     /// List installed managed and configured external runtimes
     List,
-    /// Search authoritative upstream runtime releases
+    /// Search authoritative upstream runtime candidates
     Search {
         /// Engine, backend, format, version, or other search text
         query: Option<String>,

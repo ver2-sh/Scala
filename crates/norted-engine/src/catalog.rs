@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use norted_core::{
     AcceleratorDevice, AvailableRuntime, ComputeCapability, HostCapabilities, RuntimeCompatibility,
-    RuntimeId, RuntimeRequirements,
+    RuntimeId, RuntimeRequirements, RuntimeSourceSnapshot,
 };
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,21 @@ pub trait RuntimeCatalogProvider: Send + Sync {
         _reference: &str,
     ) -> Result<Vec<AvailableRuntime>, CatalogError> {
         Ok(Vec::new())
+    }
+
+    /// Revalidates one selected candidate against its live provider authority.
+    /// Release providers retain exact-reference lookup; source providers can
+    /// instead prove the immutable commit/tree carried by the candidate.
+    async fn verify_candidate(
+        &self,
+        github: &GitHubReleaseClient,
+        candidate: &AvailableRuntime,
+    ) -> Result<Option<AvailableRuntime>, CatalogError> {
+        Ok(self
+            .fetch_reference(github, candidate.runtime_id.as_str())
+            .await?
+            .into_iter()
+            .find(|runtime| runtime.runtime_id == candidate.runtime_id))
     }
 }
 
@@ -179,6 +194,10 @@ impl RuntimeCatalog {
                             schema_version: CATALOG_CACHE_SCHEMA_VERSION,
                             provider_id: provider_id.clone(),
                             fetched_at_unix: fetched_at,
+                            historical_source_runtimes: historical_source_candidates(
+                                cached.as_ref(),
+                                &runtimes,
+                            ),
                             runtimes: runtimes.clone(),
                         };
                         if let Err(error) = self.write_cache(provider_id, &cache).await {
@@ -295,6 +314,33 @@ impl RuntimeCatalog {
         host: &HostCapabilities,
         force_refresh: bool,
     ) -> Result<RuntimeCatalogEntry, CatalogError> {
+        if !force_refresh {
+            for (provider_id, provider) in &self.providers {
+                let authority = RuntimeProviderAuthority::from_provider(provider.as_ref());
+                if let Some(cache) = self
+                    .read_cache(provider_id, &authority)
+                    .await
+                    .ok()
+                    .flatten()
+                    && let Some(available) = cache
+                        .runtimes
+                        .into_iter()
+                        .chain(cache.historical_source_runtimes)
+                        .find(|available| &available.runtime_id == runtime_id)
+                {
+                    return Ok(RuntimeCatalogEntry {
+                        compatibility: compatibility_for(
+                            &available.identity.platform,
+                            &available.identity.architecture,
+                            &available.identity.accelerator,
+                            &available.requirements,
+                            host,
+                        ),
+                        available,
+                    });
+                }
+            }
+        }
         let snapshot = self.search(runtime_id.as_str(), host, force_refresh).await;
         snapshot
             .entries
@@ -320,11 +366,8 @@ impl RuntimeCatalog {
             })?;
         let authority = RuntimeProviderAuthority::from_provider(provider.as_ref());
         let live = provider
-            .fetch_reference(&self.github, candidate.runtime_id.as_str())
-            .await
-            .and_then(|runtimes| validate_provider_runtimes(&authority, runtimes))?
-            .into_iter()
-            .find(|runtime| runtime.runtime_id == candidate.runtime_id)
+            .verify_candidate(&self.github, candidate)
+            .await?
             .ok_or_else(|| CatalogError::Provider {
                 provider: provider_id.clone(),
                 message: format!(
@@ -332,6 +375,7 @@ impl RuntimeCatalog {
                     candidate.runtime_id
                 ),
             })?;
+        authority.validate(&live)?;
         if !same_install_candidate(&live, candidate) {
             return Err(CatalogError::Provider {
                 provider: provider_id.clone(),
@@ -342,6 +386,43 @@ impl RuntimeCatalog {
             });
         }
         Ok(live)
+    }
+
+    pub async fn compare_source_history(
+        &self,
+        installed: &RuntimeSourceSnapshot,
+        candidate: &RuntimeSourceSnapshot,
+    ) -> Result<GitHubCompare, CatalogError> {
+        if installed.repository != candidate.repository
+            || installed.source_provider != candidate.source_provider
+        {
+            return Err(CatalogError::Provider {
+                provider: candidate.source_provider.clone(),
+                message: "source update candidates do not share one repository/provider history"
+                    .to_owned(),
+            });
+        }
+        let provider = self
+            .providers
+            .get(&candidate.source_provider)
+            .ok_or_else(|| CatalogError::Provider {
+                provider: candidate.source_provider.clone(),
+                message: "source update names an unregistered provider authority".to_owned(),
+            })?;
+        let authority = RuntimeProviderAuthority::from_provider(provider.as_ref());
+        if authority.repository != candidate.repository {
+            return Err(CatalogError::Provider {
+                provider: candidate.source_provider.clone(),
+                message: "source update repository does not match provider authority".to_owned(),
+            });
+        }
+        self.github
+            .compare_commits(
+                &candidate.repository,
+                &installed.commit_sha,
+                &candidate.commit_sha,
+            )
+            .await
     }
 
     pub async fn find_reference(
@@ -404,6 +485,10 @@ impl RuntimeCatalog {
             return Ok(None);
         }
         if validate_provider_runtimes(authority, cache.runtimes.clone()).is_err() {
+            return Ok(None);
+        }
+        if validate_provider_runtimes(authority, cache.historical_source_runtimes.clone()).is_err()
+        {
             return Ok(None);
         }
         Ok(Some(cache))
@@ -522,6 +607,95 @@ impl GitHubReleaseClient {
                         .and_then(|value| value.as_str())
                         .map(str::to_owned)
                 })
+                .unwrap_or_else(|| {
+                    status
+                        .canonical_reason()
+                        .unwrap_or("request failed")
+                        .to_owned()
+                });
+            return Err(CatalogError::Http {
+                status: status.as_u16(),
+                detail,
+            });
+        }
+        serde_json::from_slice(&body).map_err(|error| CatalogError::Request(error.to_string()))
+    }
+
+    pub async fn repository(&self, repository: &str) -> Result<GitHubRepository, CatalogError> {
+        self.get_api_json(repository, &["repos", repository]).await
+    }
+
+    pub async fn commit(
+        &self,
+        repository: &str,
+        reference: &str,
+    ) -> Result<GitHubCommit, CatalogError> {
+        if reference.is_empty() || reference.contains('\0') {
+            return Err(CatalogError::Request(
+                "invalid configured GitHub commit reference".to_owned(),
+            ));
+        }
+        self.get_api_json(repository, &["repos", repository, "commits", reference])
+            .await
+    }
+
+    pub async fn compare_commits(
+        &self,
+        repository: &str,
+        base: &str,
+        head: &str,
+    ) -> Result<GitHubCompare, CatalogError> {
+        if !norted_core::is_full_git_sha(base) || !norted_core::is_full_git_sha(head) {
+            return Err(CatalogError::Request(
+                "GitHub comparison requires full hexadecimal commit SHAs".to_owned(),
+            ));
+        }
+        let comparison = format!("{base}...{head}");
+        self.get_api_json(repository, &["repos", repository, "compare", &comparison])
+            .await
+    }
+
+    async fn get_api_json<T>(&self, repository: &str, path: &[&str]) -> Result<T, CatalogError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        if !valid_repository(repository) {
+            return Err(CatalogError::Request(format!(
+                "invalid configured GitHub repository `{repository}`"
+            )));
+        }
+        let mut url = reqwest::Url::parse("https://api.github.com/")
+            .map_err(|error| CatalogError::Request(error.to_string()))?;
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                CatalogError::Request("GitHub API URL cannot contain path segments".to_owned())
+            })?;
+            segments.clear();
+            for component in path {
+                if *component == repository {
+                    for repository_component in repository.split('/') {
+                        segments.push(repository_component);
+                    }
+                } else {
+                    segments.push(component);
+                }
+            }
+        }
+        let response = self
+            .api_client
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| CatalogError::Request(error.to_string()))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| CatalogError::Request(error.to_string()))?;
+        if !status.is_success() {
+            let detail = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| value.get("message")?.as_str().map(str::to_owned))
                 .unwrap_or_else(|| {
                     status
                         .canonical_reason()
@@ -675,12 +849,95 @@ pub struct GitHubReleaseAsset {
     pub state: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubRepository {
+    pub full_name: String,
+    pub default_branch: String,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubCommit {
+    pub sha: String,
+    pub html_url: String,
+    pub commit: GitHubCommitDetails,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubCommitDetails {
+    pub committer: GitHubCommitter,
+    pub tree: GitHubGitTree,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubCommitter {
+    pub date: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubGitTree {
+    pub sha: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitHubComparisonStatus {
+    Identical,
+    Ahead,
+    Behind,
+    Diverged,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubCompare {
+    pub status: GitHubComparisonStatus,
+    pub ahead_by: u64,
+    pub behind_by: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProviderCache {
     schema_version: u32,
     provider_id: String,
     fetched_at_unix: i64,
     runtimes: Vec<AvailableRuntime>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    historical_source_runtimes: Vec<AvailableRuntime>,
+}
+
+fn historical_source_candidates(
+    previous: Option<&ProviderCache>,
+    current: &[AvailableRuntime],
+) -> Vec<AvailableRuntime> {
+    const MAX_HISTORICAL_SOURCE_CANDIDATES: usize = 64;
+
+    let current_ids = current
+        .iter()
+        .map(|runtime| runtime.runtime_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut unique = BTreeMap::new();
+    if let Some(previous) = previous {
+        for runtime in previous
+            .runtimes
+            .iter()
+            .chain(&previous.historical_source_runtimes)
+            .filter(|runtime| runtime.source_build().is_some())
+            .filter(|runtime| !current_ids.contains(&runtime.runtime_id))
+        {
+            unique
+                .entry(runtime.runtime_id.clone())
+                .or_insert_with(|| runtime.clone());
+        }
+    }
+    let mut historical = unique.into_values().collect::<Vec<_>>();
+    historical.sort_by(|left, right| {
+        right
+            .published_at_unix
+            .cmp(&left.published_at_unix)
+            .then_with(|| left.runtime_id.cmp(&right.runtime_id))
+    });
+    historical.truncate(MAX_HISTORICAL_SOURCE_CANDIDATES);
+    historical
 }
 
 fn validate_provider_runtimes(
@@ -701,8 +958,8 @@ fn same_install_candidate(left: &AvailableRuntime, right: &AvailableRuntime) -> 
         && left.source_url == right.source_url
         && left.published_at_unix == right.published_at_unix
         && left.prerelease == right.prerelease
-        && left.download == right.download
-        && left.additional_downloads == right.additional_downloads
+        && left.acquisition == right.acquisition
+        && left.supported_native_identities == right.supported_native_identities
         && left.requirements == right.requirements
 }
 
@@ -890,6 +1147,24 @@ pub fn compatibility_for_nvidia_device(
             ));
         }
     }
+    if !requirements.required_nvidia_device_names.is_empty() {
+        let Some(observed) = nvidia.name.as_deref() else {
+            return RuntimeCompatibility::NeedsAttention(format!(
+                "runtime requires one of these exact NVIDIA products: {}; nvidia-smi did not report this GPU's name",
+                requirements.required_nvidia_device_names.join(", ")
+            ));
+        };
+        if !requirements
+            .required_nvidia_device_names
+            .iter()
+            .any(|required| required.eq_ignore_ascii_case(observed))
+        {
+            return RuntimeCompatibility::Incompatible(format!(
+                "runtime requires one of these exact NVIDIA products: {}; observed {observed}",
+                requirements.required_nvidia_device_names.join(", ")
+            ));
+        }
+    }
     if (requirements.minimum_vram_bytes.is_some()
         || requirements.minimum_vram_class_gib.is_some()
         || requirements.minimum_vram_exclusive_class_gib.is_some())
@@ -964,6 +1239,104 @@ pub fn compatibility_for_nvidia_device(
     RuntimeCompatibility::Recommended
 }
 
+pub fn visible_nvidia_devices<'a>(
+    host: &'a HostCapabilities,
+    consumer: &str,
+) -> Result<Vec<&'a AcceleratorDevice>, RuntimeCompatibility> {
+    let devices = host
+        .accelerators
+        .iter()
+        .filter(|device| device.accelerator.eq_ignore_ascii_case("cuda"))
+        .filter(|device| {
+            device
+                .stable_id
+                .as_deref()
+                .is_some_and(is_exact_nvidia_gpu_uuid)
+        })
+        .collect::<Vec<_>>();
+    let Some(visibility) = host.cuda_visible_devices.as_deref() else {
+        return if devices.is_empty() {
+            Err(RuntimeCompatibility::NeedsAttention(format!(
+                "{consumer} requires a stable NVIDIA GPU UUID, but none was observed"
+            )))
+        } else {
+            Ok(devices)
+        };
+    };
+    let identifiers = visibility
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if identifiers.len() != 1 {
+        return Err(RuntimeCompatibility::Incompatible(format!(
+            "existing CUDA_VISIBLE_DEVICES is empty or selects multiple devices; {consumer} requires one resolvable GPU UUID"
+        )));
+    }
+    let identifier = identifiers[0];
+    if !identifier.starts_with("GPU-") {
+        return Err(RuntimeCompatibility::Incompatible(format!(
+            "existing CUDA_VISIBLE_DEVICES `{identifier}` is not a GPU UUID; Norted never assumes a CUDA/nvidia-smi numeric index mapping"
+        )));
+    }
+    let matching = devices
+        .into_iter()
+        .filter(|device| {
+            device
+                .stable_id
+                .as_deref()
+                .is_some_and(|stable_id| stable_id.starts_with(identifier))
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [device] => Ok(vec![*device]),
+        [] => Err(RuntimeCompatibility::Incompatible(format!(
+            "existing CUDA_VISIBLE_DEVICES `{identifier}` does not resolve to an observed NVIDIA GPU UUID"
+        ))),
+        _ => Err(RuntimeCompatibility::Incompatible(format!(
+            "existing CUDA_VISIBLE_DEVICES `{identifier}` is an ambiguous GPU UUID prefix"
+        ))),
+    }
+}
+
+pub fn is_exact_nvidia_gpu_uuid(value: &str) -> bool {
+    let Some(uuid) = value.strip_prefix("GPU-") else {
+        return false;
+    };
+    uuid.len() == 36
+        && uuid.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+pub fn isolated_cuda_environment(
+    configured: &BTreeMap<String, String>,
+    accelerator: &AcceleratorDevice,
+    consumer: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    if !accelerator.accelerator.eq_ignore_ascii_case("cuda") {
+        return Err(format!(
+            "{consumer} selected accelerator is not a CUDA device"
+        ));
+    }
+    let uuid = accelerator
+        .stable_id
+        .as_deref()
+        .ok_or_else(|| format!("{consumer} selected CUDA device has no stable GPU UUID"))?;
+    if !is_exact_nvidia_gpu_uuid(uuid) {
+        return Err(format!(
+            "{consumer} selected CUDA device identity is not an exact NVIDIA GPU UUID"
+        ));
+    }
+    let mut environment = configured.clone();
+    environment.insert("CUDA_VISIBLE_DEVICES".to_owned(), uuid.to_owned());
+    Ok(environment)
+}
+
 fn format_compute_capabilities(capabilities: &[ComputeCapability]) -> String {
     capabilities
         .iter()
@@ -1031,11 +1404,12 @@ fn runtime_matches(runtime: &AvailableRuntime, query: &str) -> bool {
     ]
     .join(" ")
     .to_ascii_lowercase();
+    let format_query = query.strip_prefix('.').unwrap_or(query);
     searchable.contains(query)
         || runtime
             .supported_formats
             .iter()
-            .any(|format| format.as_str().contains(query))
+            .any(|format| format.as_str().contains(format_query))
 }
 
 fn cache_age(timestamp: i64) -> Duration {
@@ -1120,15 +1494,20 @@ fn unix_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use norted_core::{
         AcceleratorDevice, ArtifactFormat, AvailableRuntime, ComputeCapability, HostCapabilities,
-        RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest, RuntimeDownload,
-        RuntimeIdentity, RuntimePackageIdentity, RuntimeReleaseChannel, RuntimeRequirements,
+        RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest,
+        RuntimeDownload, RuntimeIdentity, RuntimePackageIdentity, RuntimeReleaseChannel,
+        RuntimeRequirements, RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites,
+        RuntimeSourceBuildRecipe, RuntimeSourceSnapshot,
     };
 
     use super::{
-        RuntimeProviderAuthority, compatibility_for, compute_cap_query_is_unsupported,
-        is_allowed_github_host, parse_nvidia_smi_devices, same_install_candidate,
+        ProviderCache, RuntimeProviderAuthority, compatibility_for,
+        compute_cap_query_is_unsupported, historical_source_candidates, is_allowed_github_host,
+        parse_nvidia_smi_devices, same_install_candidate,
     };
 
     #[test]
@@ -1275,15 +1654,18 @@ mod tests {
             published_at_unix: Some(1),
             channels: vec![RuntimeReleaseChannel::Stable, RuntimeReleaseChannel::Latest],
             prerelease: false,
-            download: RuntimeDownload {
-                url: "https://github.com/owner/repository/releases/download/v1/fixture.zip"
-                    .to_owned(),
-                size_bytes: 1,
-                digest: Some(RuntimeDigest::sha256("a".repeat(64)).expect("digest")),
-                archive_format: RuntimeArchiveFormat::Zip,
-                entrypoint_names: vec!["server".to_owned()],
+            acquisition: norted_core::RuntimeAcquisitionPlan::ReleaseAsset {
+                download: RuntimeDownload {
+                    url: "https://github.com/owner/repository/releases/download/v1/fixture.zip"
+                        .to_owned(),
+                    size_bytes: 1,
+                    digest: Some(RuntimeDigest::sha256("a".repeat(64)).expect("digest")),
+                    archive_format: RuntimeArchiveFormat::Zip,
+                    entrypoint_names: vec!["server".to_owned()],
+                },
+                additional_downloads: Vec::new(),
             },
-            additional_downloads: Vec::new(),
+            supported_native_identities: Vec::new(),
             requirements: RuntimeRequirements::default(),
         };
         let authority = RuntimeProviderAuthority {
@@ -1297,5 +1679,84 @@ mod tests {
         assert!(same_install_candidate(&broad, &exact));
         exact.identity.package.repository = Some("attacker/repository".to_owned());
         assert!(authority.validate(&exact).is_err());
+    }
+
+    #[test]
+    fn refreshed_catalog_retains_the_previously_selected_source_candidate() {
+        let previous_runtime = source_candidate('a', 1);
+        let current_runtime = source_candidate('b', 2);
+        let previous = ProviderCache {
+            schema_version: 1,
+            provider_id: "fixture-source".to_owned(),
+            fetched_at_unix: 1,
+            runtimes: vec![previous_runtime.clone()],
+            historical_source_runtimes: Vec::new(),
+        };
+        let historical = historical_source_candidates(Some(&previous), &[current_runtime]);
+        assert_eq!(historical, [previous_runtime]);
+    }
+
+    fn source_candidate(revision: char, published_at_unix: i64) -> AvailableRuntime {
+        let commit_sha = revision.to_string().repeat(40);
+        let tree_sha = if revision == 'a' { 'c' } else { 'd' }
+            .to_string()
+            .repeat(40);
+        let identity = RuntimeIdentity {
+            engine_id: "fixture".to_owned(),
+            package_family: "fixture-source".to_owned(),
+            version: format!("git-{revision}"),
+            upstream_revision: Some(commit_sha.clone()),
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            accelerator: "cuda".to_owned(),
+            variant: "recipe-v1".to_owned(),
+            package: RuntimePackageIdentity {
+                provider_id: "fixture-source".to_owned(),
+                repository: Some("owner/repository".to_owned()),
+                release_tag: None,
+                asset_id: None,
+                asset_name: None,
+                additional_assets: Vec::new(),
+            },
+        };
+        AvailableRuntime {
+            runtime_id: norted_core::RuntimeId::from_identity(&identity),
+            identity,
+            display_name: "Fixture source".to_owned(),
+            supported_formats: vec![ArtifactFormat::Ninfer],
+            source_url: format!("https://github.com/owner/repository/commit/{commit_sha}"),
+            published_at_unix: Some(published_at_unix),
+            channels: vec![RuntimeReleaseChannel::Latest],
+            prerelease: false,
+            acquisition: RuntimeAcquisitionPlan::SourceBuild(Box::new(RuntimeSourceBuildPlan {
+                source: RuntimeSourceSnapshot {
+                    repository: "owner/repository".to_owned(),
+                    repository_url: "https://github.com/owner/repository.git".to_owned(),
+                    source_branch: "master".to_owned(),
+                    commit_sha,
+                    tree_sha,
+                    commit_timestamp_unix: published_at_unix,
+                    source_provider: "fixture-source".to_owned(),
+                },
+                recipe: RuntimeSourceBuildRecipe {
+                    recipe_version: "recipe-v1".to_owned(),
+                    cmake_configuration_arguments: vec!["-G".to_owned(), "Ninja".to_owned()],
+                    build_target: "server".to_owned(),
+                    entrypoint: "build/server".into(),
+                    accelerator_target: "sm_test".to_owned(),
+                    rejected_build_environment: Vec::new(),
+                },
+                prerequisites: RuntimeSourceBuildPrerequisites {
+                    minimum_cmake_version: "3.28".to_owned(),
+                    minimum_cuda_version: "13.1".to_owned(),
+                    requires_ninja: true,
+                    requires_cpp20_compiler: true,
+                    requires_pkg_config: true,
+                    pkg_config_modules: BTreeMap::new(),
+                },
+            })),
+            supported_native_identities: Vec::new(),
+            requirements: RuntimeRequirements::default(),
+        }
     }
 }

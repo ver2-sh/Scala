@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceleratorDevice, AuxiliaryArtifactRole, LoadSettingId, ModelId, ResolvedLoadSetting,
-    RuntimeManifest, RuntimeSelectionSource,
+    AcceleratorDevice, ArtifactNativeIdentity, AuxiliaryArtifactRole, LoadSettingId, ModelId,
+    ResolvedLoadSetting, RuntimeManifest, RuntimeSelectionSource,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +58,8 @@ pub struct ModelRuntimeIdentity {
     pub model_id: ModelId,
     pub artifact_path: PathBuf,
     pub content_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_identity: Option<ArtifactNativeIdentity>,
     #[serde(default)]
     pub auxiliary: Vec<AuxiliaryRuntimeIdentity>,
 }

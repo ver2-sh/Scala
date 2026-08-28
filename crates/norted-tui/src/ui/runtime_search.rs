@@ -223,7 +223,10 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
         .unwrap_or(available.source_url.as_str());
     let target = format!("{} / {}", identity.platform, identity.architecture);
     let backend = format!("{} / {}", identity.accelerator, identity.variant);
-    let size = format_bytes(available.download_size_bytes());
+    let (acquisition, size) = match available.download_size_bytes() {
+        Some(bytes) => ("verified release download", format_bytes(bytes)),
+        None => ("managed source build", "local build".to_owned()),
+    };
     let selected_for = result.selected_for.join(", ");
     let mut lines = vec![
         Line::from(Span::styled(&available.display_name, theme.text)),
@@ -232,6 +235,7 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
         key_value("TARGET", &target, theme),
         key_value("BACKEND", &backend, theme),
         key_value("FORMATS", &formats, theme),
+        key_value("ACQUIRE", acquisition, theme),
         key_value("SIZE", &size, theme),
         key_value("PROVIDER", provider, theme),
         key_value("SOURCE", source, theme),
@@ -240,6 +244,30 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
             Span::styled(compatibility, compatibility_style),
         ]),
     ];
+    if let Some(source_build) = available.source_build() {
+        lines.push(key_value(
+            "REVISION",
+            &source_build.source.commit_sha,
+            theme,
+        ));
+        lines.push(key_value("GIT TREE", &source_build.source.tree_sha, theme));
+        lines.push(key_value(
+            "RECIPE",
+            &source_build.recipe.recipe_version,
+            theme,
+        ));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<12}", "BUILD NEEDS"), theme.hint),
+            Span::styled(
+                format!(
+                    "CMake >= {}, CUDA >= {}, Ninja, C++20, pkg-config",
+                    source_build.prerequisites.minimum_cmake_version,
+                    source_build.prerequisites.minimum_cuda_version
+                ),
+                theme.text,
+            ),
+        ]));
+    }
     match &result.entry.compatibility {
         RuntimeCompatibility::NeedsAttention(reason)
         | RuntimeCompatibility::Incompatible(reason) => {
@@ -324,6 +352,11 @@ fn render_action(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLay
 
 pub(crate) fn progress_text(progress: &norted_core::RuntimeOperationProgress) -> String {
     let phase = match progress.phase {
+        RuntimeOperationPhase::CheckingPrerequisites => "Checking prerequisites",
+        RuntimeOperationPhase::FetchingSource => "Fetching source",
+        RuntimeOperationPhase::VerifyingSource => "Verifying source",
+        RuntimeOperationPhase::Configuring => "Configuring",
+        RuntimeOperationPhase::Building => "Building",
         RuntimeOperationPhase::Downloading => "Downloading",
         RuntimeOperationPhase::Verifying => "Verifying",
         RuntimeOperationPhase::Extracting => "Extracting",
@@ -351,6 +384,11 @@ fn phase_style(phase: RuntimeOperationPhase, theme: &Theme) -> ratatui::style::S
         RuntimeOperationPhase::Installed => theme.success,
         RuntimeOperationPhase::Failed => theme.error,
         RuntimeOperationPhase::Downloading
+        | RuntimeOperationPhase::CheckingPrerequisites
+        | RuntimeOperationPhase::FetchingSource
+        | RuntimeOperationPhase::VerifyingSource
+        | RuntimeOperationPhase::Configuring
+        | RuntimeOperationPhase::Building
         | RuntimeOperationPhase::Verifying
         | RuntimeOperationPhase::Extracting
         | RuntimeOperationPhase::Probing
