@@ -91,6 +91,7 @@ pub enum RuntimeAction {
     Search {
         query: String,
         force_refresh: bool,
+        model: Option<Box<ModelArtifact>>,
     },
     Install(RuntimeId),
     CheckUpdates,
@@ -193,6 +194,7 @@ pub struct App {
     pub selected_runtime_search_result: Option<usize>,
     pub runtime_search_scroll: usize,
     pub runtime_search_context: Option<String>,
+    pub runtime_search_model: Option<Box<ModelArtifact>>,
     pub runtime_operation: Option<RuntimeOperationProgress>,
     pub runtime_updates: BTreeMap<RuntimeId, RuntimeUpdateState>,
     pub runtime_update_loading: bool,
@@ -272,6 +274,7 @@ impl App {
             selected_runtime_search_result: None,
             runtime_search_scroll: 0,
             runtime_search_context: None,
+            runtime_search_model: None,
             runtime_operation: None,
             runtime_updates: BTreeMap::new(),
             runtime_update_loading: false,
@@ -1546,6 +1549,7 @@ impl App {
         if self.runtime_search_context.take().is_some() {
             self.runtime_search_query.clear();
         }
+        self.runtime_search_model = None;
         self.overlay = Some(Overlay::RuntimeSearch);
         self.pending_runtime_remove_confirmation = None;
         self.hover = None;
@@ -1563,6 +1567,7 @@ impl App {
         let Some(model) = self
             .selected_model
             .and_then(|index| self.snapshot.models.get(index))
+            .cloned()
         else {
             self.notice = Some("The selected model is no longer available".to_owned());
             return Update::Render;
@@ -1573,6 +1578,7 @@ impl App {
             format.to_ascii_uppercase(),
             model.display_name
         ));
+        self.runtime_search_model = Some(Box::new(model));
         self.runtime_search_query = format;
         self.runtime_search_cursor = self.runtime_search_query.chars().count();
         self.reconcile_runtime_search_selection();
@@ -1716,6 +1722,7 @@ impl App {
         self.pending_runtime_action = Some(RuntimeAction::Search {
             query: self.runtime_search_query.clone(),
             force_refresh,
+            model: self.runtime_search_model.clone(),
         });
         Update::Render
     }

@@ -641,6 +641,7 @@ impl EngineAdapter for LlamaCppAdapter {
             installation: (*installation).clone(),
             runtime: request.runtime,
             model: request.model,
+            accelerator: request.accelerator,
         })
     }
 

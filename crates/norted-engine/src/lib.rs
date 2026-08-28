@@ -10,9 +10,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::Stream;
 use norted_core::{
-    ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime, EngineInstallation, EngineRevision,
-    HostCapabilities, InstalledRuntime, ModelArtifact, ModelRuntimeIdentity, RuntimeCompatibility,
-    RuntimeProbeObservation,
+    AcceleratorDevice, ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime, EngineInstallation,
+    EngineRevision, HostCapabilities, InstalledRuntime, ModelArtifact, ModelRuntimeIdentity,
+    RuntimeCompatibility, RuntimeProbeObservation,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -28,7 +28,8 @@ mod supervisor;
 pub use catalog::{
     CatalogError, GitHubRelease, GitHubReleaseAsset, GitHubReleaseClient, RuntimeCatalog,
     RuntimeCatalogEntry, RuntimeCatalogProvider, RuntimeCatalogSnapshot, RuntimeProviderAuthority,
-    RuntimeProviderError, compatibility_for, detect_host_capabilities,
+    RuntimeProviderError, compatibility_for, compatibility_for_nvidia_device,
+    detect_host_capabilities,
 };
 
 pub use control::{
@@ -181,6 +182,7 @@ impl PreparedModelInput {
 pub struct LaunchRequest {
     pub model: PreparedModelInput,
     pub runtime: InstalledRuntime,
+    pub accelerator: Option<AcceleratorDevice>,
     pub backend_address: SocketAddr,
 }
 
@@ -198,6 +200,7 @@ pub struct LaunchSpec {
     pub installation: EngineInstallation,
     pub runtime: InstalledRuntime,
     pub model: PreparedModelInput,
+    pub accelerator: Option<AcceleratorDevice>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -379,6 +382,40 @@ pub trait EngineAdapter: Send + Sync {
     ) -> u16 {
         100
     }
+    /// Evaluates a catalog runtime against a concrete model without installing
+    /// it. Ordinary engines inherit the same coarse model gate as installed
+    /// runtimes.
+    fn available_runtime_model_compatibility(
+        &self,
+        _runtime: &AvailableRuntime,
+        model: &ModelArtifact,
+        _host: &HostCapabilities,
+    ) -> RuntimeCompatibility {
+        match self.compatibility(model) {
+            CompatibilityDecision::Supported => RuntimeCompatibility::Compatible,
+            CompatibilityDecision::Unsupported { reason } => {
+                RuntimeCompatibility::Incompatible(reason)
+            }
+        }
+    }
+    fn available_runtime_model_preference(
+        &self,
+        _runtime: &AvailableRuntime,
+        _model: &ModelArtifact,
+        _host: &HostCapabilities,
+    ) -> u16 {
+        100
+    }
+    /// Returns the exact accelerator selected by the same policy used for
+    /// model/runtime compatibility. `None` means the engine does not bind one.
+    fn runtime_model_accelerator(
+        &self,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _host: &HostCapabilities,
+    ) -> Option<AcceleratorDevice> {
+        None
+    }
     async fn prepare_model_input(
         &self,
         model: &ModelArtifact,
@@ -484,7 +521,11 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use norted_core::{ArtifactFormat, AuxiliaryArtifactRole, ModelArtifact, ModelId};
+    use norted_core::{
+        ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime, HostCapabilities, ModelArtifact,
+        ModelId, RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest, RuntimeDownload,
+        RuntimeIdentity, RuntimePackageIdentity, RuntimeReleaseChannel, RuntimeRequirements,
+    };
 
     use super::{
         CompatibilityDecision, EngineAdapter, EngineCapabilities, EngineError, EngineIdentity,
@@ -495,6 +536,7 @@ mod tests {
     struct ArchitectureAdapter {
         id: &'static str,
         architecture: &'static str,
+        format: ArtifactFormat,
     }
 
     #[async_trait]
@@ -509,7 +551,7 @@ mod tests {
 
         fn capabilities(&self) -> EngineCapabilities {
             EngineCapabilities {
-                artifact_formats: vec![ArtifactFormat::Gguf],
+                artifact_formats: vec![self.format],
                 ..EngineCapabilities::default()
             }
         }
@@ -596,12 +638,14 @@ mod tests {
             .register(Arc::new(ArchitectureAdapter {
                 id: "architecture-a",
                 architecture: "architecture-a",
+                format: ArtifactFormat::Gguf,
             }))
             .expect("register architecture-a adapter");
         registry
             .register(Arc::new(ArchitectureAdapter {
                 id: "architecture-b",
                 architecture: "architecture-b",
+                format: ArtifactFormat::Gguf,
             }))
             .expect("register architecture-b adapter");
 
@@ -631,6 +675,74 @@ mod tests {
                 reason: "requires architecture `architecture-a`, found `architecture-b`".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn available_model_compatibility_defaults_preserve_other_engines_for_the_format() {
+        let adapter = ArchitectureAdapter {
+            id: "second-q27-engine",
+            architecture: "qwen35",
+            format: ArtifactFormat::Q27,
+        };
+        let model = ModelArtifact {
+            id: ModelId("fixture-q27".to_owned()),
+            display_name: "Fixture Q27".to_owned(),
+            path: PathBuf::from("fixture.q27"),
+            format: ArtifactFormat::Q27,
+            size_bytes: 0,
+            created: 0,
+            hash: None,
+            architecture: Some("qwen35".to_owned()),
+            context_length: None,
+            provenance: None,
+            auxiliary_artifacts: Vec::new(),
+        };
+        let identity = RuntimeIdentity {
+            engine_id: "second-q27-engine".to_owned(),
+            package_family: "fixture".to_owned(),
+            version: "1".to_owned(),
+            upstream_revision: None,
+            platform: std::env::consts::OS.to_owned(),
+            architecture: std::env::consts::ARCH.to_owned(),
+            accelerator: "cpu".to_owned(),
+            variant: "default".to_owned(),
+            package: RuntimePackageIdentity {
+                provider_id: "fixture".to_owned(),
+                repository: Some("fixture/repository".to_owned()),
+                release_tag: Some("v1".to_owned()),
+                asset_id: Some("1".to_owned()),
+                asset_name: Some("runtime.zip".to_owned()),
+                additional_assets: Vec::new(),
+            },
+        };
+        let runtime = AvailableRuntime {
+            runtime_id: norted_core::RuntimeId::from_identity(&identity),
+            identity,
+            display_name: "Second Q27 engine".to_owned(),
+            supported_formats: vec![ArtifactFormat::Q27],
+            source_url: "https://github.com/fixture/repository/releases/tag/v1".to_owned(),
+            published_at_unix: None,
+            channels: vec![RuntimeReleaseChannel::Stable],
+            prerelease: false,
+            download: RuntimeDownload {
+                url: "https://github.com/fixture/repository/releases/download/v1/runtime.zip"
+                    .to_owned(),
+                size_bytes: 1,
+                digest: Some(RuntimeDigest::sha256("a".repeat(64)).expect("digest")),
+                archive_format: RuntimeArchiveFormat::Zip,
+                entrypoint_names: vec!["server".to_owned()],
+            },
+            additional_downloads: Vec::new(),
+            requirements: RuntimeRequirements::default(),
+        };
+        assert!(matches!(
+            adapter.available_runtime_model_compatibility(
+                &runtime,
+                &model,
+                &HostCapabilities::current_without_accelerator_probe(),
+            ),
+            RuntimeCompatibility::Compatible
+        ));
     }
 
     #[test]

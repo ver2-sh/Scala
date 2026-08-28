@@ -350,7 +350,11 @@ fn render_runtimes(
         |snapshot| {
             let gguf = selection_text(app, ArtifactFormat::Gguf);
             let q27 = selection_text(app, ArtifactFormat::Q27);
-            let accelerator = snapshot.host.nvidia.as_ref().map_or("CPU", |_| "NVIDIA");
+            let accelerator = if snapshot.host.accelerators.is_empty() {
+                "CPU"
+            } else {
+                "NVIDIA"
+            };
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled("GGUF  ", theme.hint),

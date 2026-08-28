@@ -29,7 +29,7 @@ pub use runtime::{
     observe_runtime_descriptor,
 };
 pub use runtime_pack::{
-    AvailableRuntime, HostCapabilities, InstalledRuntime, NvidiaCapability,
+    AcceleratorDevice, AvailableRuntime, HostCapabilities, InstalledRuntime,
     RUNTIME_MANIFEST_SCHEMA_VERSION, RUNTIME_SELECTIONS_SCHEMA_VERSION, RuntimeAcquisitionMethod,
     RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest, RuntimeDigestError, RuntimeDownload,
     RuntimeId, RuntimeIdentity, RuntimeIdentityError, RuntimeManifest, RuntimeManifestError,

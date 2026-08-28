@@ -207,6 +207,7 @@ fn available_runtime(
         minimum_nvidia_driver: None,
         minimum_vram_bytes: None,
         minimum_vram_class_gib: None,
+        minimum_vram_exclusive_class_gib: None,
         notes: Vec::new(),
         advisories: Vec::new(),
         unverified_requirements: companion

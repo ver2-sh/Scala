@@ -188,14 +188,18 @@ async fn execute_runtime_action(
         RuntimeAction::Search {
             query,
             force_refresh,
+            model,
         } => {
             runtime_packs.refresh_host_capabilities().await;
-            RuntimeTaskResult::Searched(
-                runtime_packs
-                    .search(&query, force_refresh)
-                    .await
-                    .map_err(|error| error.to_string()),
-            )
+            let result = match model {
+                Some(model) => {
+                    runtime_packs
+                        .search_for_model(&query, &model, force_refresh)
+                        .await
+                }
+                None => runtime_packs.search(&query, force_refresh).await,
+            };
+            RuntimeTaskResult::Searched(result.map_err(|error| error.to_string()))
         }
         RuntimeAction::Install(runtime_id) => {
             let result = match runtime_packs.install(&runtime_id).await {

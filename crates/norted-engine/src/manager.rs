@@ -419,6 +419,7 @@ impl RuntimeManager {
             .build_launch_spec(LaunchRequest {
                 model: prepared_model,
                 runtime: selection.runtime.clone(),
+                accelerator: selection.accelerator.clone(),
                 backend_address,
             })
             .await
@@ -436,6 +437,7 @@ impl RuntimeManager {
         }
         let installation = launch_spec.installation.clone();
         let selected_runtime = launch_spec.runtime.clone();
+        let selected_accelerator = launch_spec.accelerator.clone();
         let model_identity = launch_spec.model.runtime_identity();
         let normalized_settings = launch_spec.normalized_settings.clone();
         let native_arguments = launch_spec.native_arguments.clone();
@@ -491,6 +493,7 @@ impl RuntimeManager {
             runtime: selected_runtime.manifest.clone(),
             runtime_entrypoint: selected_runtime.entrypoint_path(),
             selection_source: selection.source,
+            accelerator: selected_accelerator,
             installation,
             profile: None,
             normalized_settings,

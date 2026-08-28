@@ -239,18 +239,59 @@ impl RuntimePackManager {
         query: &str,
         force_refresh: bool,
     ) -> Result<RuntimeSearchSnapshot, RuntimePackError> {
+        self.search_internal(query, force_refresh, None).await
+    }
+
+    pub async fn search_for_model(
+        &self,
+        query: &str,
+        model: &ModelArtifact,
+        force_refresh: bool,
+    ) -> Result<RuntimeSearchSnapshot, RuntimePackError> {
+        self.search_internal(query, force_refresh, Some(model))
+            .await
+    }
+
+    async fn search_internal(
+        &self,
+        query: &str,
+        force_refresh: bool,
+        model: Option<&ModelArtifact>,
+    ) -> Result<RuntimeSearchSnapshot, RuntimePackError> {
         let host = self.host.read().await.clone();
         let RuntimeCatalogSnapshot {
             mut entries,
             provider_errors,
             fetched_at_unix,
         } = self.catalog.search(query, &host, force_refresh).await;
+        let mut preferences = std::collections::BTreeMap::new();
         for entry in &mut entries {
             entry.compatibility = match self.registry.get(&entry.available.identity.engine_id) {
                 Some(adapter) => match adapter.runtime_management_compatibility() {
                     CompatibilityDecision::Supported => {
                         match adapter.available_runtime_compatibility(&entry.available) {
-                            CompatibilityDecision::Supported => entry.compatibility.clone(),
+                            CompatibilityDecision::Supported => {
+                                if let Some(model) = model {
+                                    preferences.insert(
+                                        entry.available.runtime_id.clone(),
+                                        adapter.available_runtime_model_preference(
+                                            &entry.available,
+                                            model,
+                                            &host,
+                                        ),
+                                    );
+                                    combine_compatibility(
+                                        entry.compatibility.clone(),
+                                        adapter.available_runtime_model_compatibility(
+                                            &entry.available,
+                                            model,
+                                            &host,
+                                        ),
+                                    )
+                                } else {
+                                    entry.compatibility.clone()
+                                }
+                            }
                             CompatibilityDecision::Unsupported { reason } => {
                                 RuntimeCompatibility::Incompatible(reason)
                             }
@@ -264,6 +305,41 @@ impl RuntimePackManager {
                     "engine adapter is not registered".to_owned(),
                 ),
             };
+        }
+        if model.is_some() {
+            entries.sort_by(|left, right| {
+                left.compatibility
+                    .preference_rank()
+                    .cmp(&right.compatibility.preference_rank())
+                    .then_with(|| {
+                        preferences
+                            .get(&left.available.runtime_id)
+                            .unwrap_or(&u16::MAX)
+                            .cmp(
+                                preferences
+                                    .get(&right.available.runtime_id)
+                                    .unwrap_or(&u16::MAX),
+                            )
+                    })
+                    .then_with(|| {
+                        left.available
+                            .identity
+                            .engine_id
+                            .cmp(&right.available.identity.engine_id)
+                    })
+                    .then_with(|| {
+                        left.available
+                            .identity
+                            .variant
+                            .cmp(&right.available.identity.variant)
+                    })
+                    .then_with(|| {
+                        right
+                            .available
+                            .published_at_unix
+                            .cmp(&left.available.published_at_unix)
+                    })
+            });
         }
         let list = self.list().await?;
         let installed = list
@@ -510,6 +586,7 @@ impl RuntimePackManager {
                 runtime: status.runtime.clone(),
                 source: RuntimeSelectionSource::Invocation,
                 notices: Vec::new(),
+                accelerator: self.model_candidate_accelerator(&status.runtime, model, &host),
             });
         }
         let mut notices = Vec::new();
@@ -517,6 +594,7 @@ impl RuntimePackManager {
             match self.selected_candidate(&list, runtime_id, model) {
                 Ok(runtime) => {
                     return Ok(RuntimeSelection {
+                        accelerator: self.model_candidate_accelerator(&runtime, model, &list.host),
                         runtime,
                         source: RuntimeSelectionSource::ModelOverride,
                         notices,
@@ -531,6 +609,7 @@ impl RuntimePackManager {
             match self.selected_candidate(&list, runtime_id, model) {
                 Ok(runtime) => {
                     return Ok(RuntimeSelection {
+                        accelerator: self.model_candidate_accelerator(&runtime, model, &list.host),
                         runtime,
                         source: RuntimeSelectionSource::FormatDefault,
                         notices,
@@ -609,6 +688,7 @@ impl RuntimePackManager {
                 ))
             })?;
         Ok(RuntimeSelection {
+            accelerator: self.model_candidate_accelerator(&runtime, model, &host),
             runtime,
             source: RuntimeSelectionSource::Fallback,
             notices,
@@ -964,6 +1044,17 @@ impl RuntimePackManager {
             .map_or(u16::MAX, |adapter| {
                 adapter.runtime_model_preference(runtime, model, host)
             })
+    }
+
+    fn model_candidate_accelerator(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        host: &HostCapabilities,
+    ) -> Option<norted_core::AcceleratorDevice> {
+        self.registry
+            .get(&runtime.manifest.identity.engine_id)
+            .and_then(|adapter| adapter.runtime_model_accelerator(runtime, model, host))
     }
 }
 

@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use norted_core::{
-    AvailableRuntime, HostCapabilities, NvidiaCapability, RuntimeCompatibility, RuntimeId,
+    AcceleratorDevice, AvailableRuntime, HostCapabilities, RuntimeCompatibility, RuntimeId,
     RuntimeRequirements,
 };
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
@@ -711,7 +711,7 @@ pub async fn detect_host_capabilities() -> HostCapabilities {
     let mut command = Command::new("nvidia-smi");
     command
         .args([
-            "--query-gpu=name,memory.total,driver_version",
+            "--query-gpu=uuid,name,memory.total,driver_version",
             "--format=csv,noheader,nounits",
         ])
         .kill_on_drop(true);
@@ -722,20 +722,24 @@ pub async fn detect_host_capabilities() -> HostCapabilities {
                 .lines()
                 .filter_map(|line| {
                     let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
-                    (fields.len() >= 3).then(|| NvidiaCapability {
-                        model: nonempty(fields[0]),
-                        vram_bytes: fields[1]
+                    (fields.len() >= 4).then(|| AcceleratorDevice {
+                        accelerator: "cuda".to_owned(),
+                        stable_id: nonempty(fields[0]).filter(|uuid| uuid.starts_with("GPU-")),
+                        name: nonempty(fields[1]),
+                        vram_bytes: fields[2]
                             .parse::<u64>()
                             .ok()
                             .and_then(|mib| mib.checked_mul(1024 * 1024)),
-                        driver_version: nonempty(fields[2]),
+                        driver_version: nonempty(fields[3]),
                     })
                 })
-                .max_by_key(|capability| capability.vram_bytes.unwrap_or(0));
-            if let Some(observed) = observed {
-                host.nvidia = Some(observed);
-                host.observations
-                    .push("best available NVIDIA GPU observed through nvidia-smi".to_owned());
+                .collect::<Vec<_>>();
+            if !observed.is_empty() {
+                let count = observed.len();
+                host.accelerators = observed;
+                host.observations.push(format!(
+                    "observed {count} NVIDIA GPU device(s) with stable UUID queries through nvidia-smi"
+                ));
             } else {
                 host.observations
                     .push("nvidia-smi returned an unexpected result".to_owned());
@@ -775,73 +779,21 @@ pub fn compatibility_for(
     }
     let accelerator = accelerator.to_ascii_lowercase();
     if requirements.requires_nvidia_gpu || accelerator.starts_with("cuda") {
-        let Some(nvidia) = &host.nvidia else {
+        let nvidia = host
+            .accelerators
+            .iter()
+            .filter(|device| device.accelerator.eq_ignore_ascii_case("cuda"))
+            .collect::<Vec<_>>();
+        if nvidia.is_empty() {
             return RuntimeCompatibility::NeedsAttention(
                 "requires an NVIDIA GPU; nvidia-smi did not confirm one".to_owned(),
             );
-        };
-        if (requirements.minimum_vram_bytes.is_some()
-            || requirements.minimum_vram_class_gib.is_some())
-            && nvidia.vram_bytes.is_none()
-        {
-            return RuntimeCompatibility::NeedsAttention(
-                "minimum VRAM is known, but nvidia-smi did not report usable VRAM".to_owned(),
-            );
         }
-        if requirements.minimum_nvidia_driver.is_some() && nvidia.driver_version.is_none() {
-            return RuntimeCompatibility::NeedsAttention(
-                "minimum NVIDIA driver is known, but its installed version could not be read"
-                    .to_owned(),
-            );
-        }
-        if let (Some(minimum), Some(observed)) =
-            (requirements.minimum_vram_bytes, nvidia.vram_bytes)
-            && observed < minimum
-        {
-            return RuntimeCompatibility::Incompatible(format!(
-                "requires at least {} MiB VRAM; observed {} MiB",
-                minimum / (1024 * 1024),
-                observed / (1024 * 1024)
-            ));
-        }
-        if let (Some(class_gib), Some(observed)) =
-            (requirements.minimum_vram_class_gib, nvidia.vram_bytes)
-        {
-            match vram_class_compatibility(class_gib, observed) {
-                VramClassCompatibility::Meets => {}
-                VramClassCompatibility::Near => {
-                    return RuntimeCompatibility::NeedsAttention(format!(
-                        "requires a {class_gib} GiB-class GPU; observed {} MiB, which is close but below the normal reporting allowance",
-                        observed / (1024 * 1024)
-                    ));
-                }
-                VramClassCompatibility::Below => {
-                    return RuntimeCompatibility::Incompatible(format!(
-                        "requires a {class_gib} GiB-class GPU; observed {} MiB, clearly below that class",
-                        observed / (1024 * 1024)
-                    ));
-                }
-            }
-        }
-        if let (Some(minimum), Some(observed)) = (
-            requirements.minimum_nvidia_driver.as_deref(),
-            nvidia.driver_version.as_deref(),
-        ) && version_components(observed) < version_components(minimum)
-        {
-            return RuntimeCompatibility::Incompatible(format!(
-                "requires NVIDIA driver {minimum} or newer; observed {observed}"
-            ));
-        }
-        if let Some(requirement) = requirements
-            .unverified_requirements
-            .first()
-            .or_else(|| requirements.notes.first())
-        {
-            return RuntimeCompatibility::NeedsAttention(format!(
-                "additional upstream requirement was not fully probed: {requirement}"
-            ));
-        }
-        return RuntimeCompatibility::Recommended;
+        return nvidia
+            .into_iter()
+            .map(|device| compatibility_for_nvidia_device(requirements, device))
+            .min_by_key(RuntimeCompatibility::preference_rank)
+            .expect("non-empty NVIDIA device list");
     }
     if accelerator == "vulkan" {
         return RuntimeCompatibility::NeedsAttention(
@@ -853,6 +805,84 @@ pub fn compatibility_for(
     } else {
         RuntimeCompatibility::Compatible
     }
+}
+
+pub fn compatibility_for_nvidia_device(
+    requirements: &RuntimeRequirements,
+    nvidia: &AcceleratorDevice,
+) -> RuntimeCompatibility {
+    if (requirements.minimum_vram_bytes.is_some()
+        || requirements.minimum_vram_class_gib.is_some()
+        || requirements.minimum_vram_exclusive_class_gib.is_some())
+        && nvidia.vram_bytes.is_none()
+    {
+        return RuntimeCompatibility::NeedsAttention(
+            "minimum VRAM is known, but nvidia-smi did not report usable VRAM".to_owned(),
+        );
+    }
+    if requirements.minimum_nvidia_driver.is_some() && nvidia.driver_version.is_none() {
+        return RuntimeCompatibility::NeedsAttention(
+            "minimum NVIDIA driver is known, but its installed version could not be read"
+                .to_owned(),
+        );
+    }
+    if let (Some(minimum), Some(observed)) = (requirements.minimum_vram_bytes, nvidia.vram_bytes)
+        && observed < minimum
+    {
+        return RuntimeCompatibility::Incompatible(format!(
+            "requires at least {} MiB VRAM; observed {} MiB",
+            minimum / (1024 * 1024),
+            observed / (1024 * 1024)
+        ));
+    }
+    if let (Some(class_gib), Some(observed)) = (
+        requirements.minimum_vram_exclusive_class_gib,
+        nvidia.vram_bytes,
+    ) && observed <= u64::from(class_gib).saturating_mul(GIB)
+    {
+        return RuntimeCompatibility::Incompatible(format!(
+            "requires more than a {class_gib} GiB-class GPU; observed {} MiB, while the exact larger requirement is not published",
+            observed / (1024 * 1024)
+        ));
+    }
+    if let (Some(class_gib), Some(observed)) =
+        (requirements.minimum_vram_class_gib, nvidia.vram_bytes)
+    {
+        match vram_class_compatibility(class_gib, observed) {
+            VramClassCompatibility::Meets => {}
+            VramClassCompatibility::Near => {
+                return RuntimeCompatibility::NeedsAttention(format!(
+                    "requires a {class_gib} GiB-class GPU; observed {} MiB, which is close but below the normal reporting allowance",
+                    observed / (1024 * 1024)
+                ));
+            }
+            VramClassCompatibility::Below => {
+                return RuntimeCompatibility::Incompatible(format!(
+                    "requires a {class_gib} GiB-class GPU; observed {} MiB, clearly below that class",
+                    observed / (1024 * 1024)
+                ));
+            }
+        }
+    }
+    if let (Some(minimum), Some(observed)) = (
+        requirements.minimum_nvidia_driver.as_deref(),
+        nvidia.driver_version.as_deref(),
+    ) && version_components(observed) < version_components(minimum)
+    {
+        return RuntimeCompatibility::Incompatible(format!(
+            "requires NVIDIA driver {minimum} or newer; observed {observed}"
+        ));
+    }
+    if let Some(requirement) = requirements
+        .unverified_requirements
+        .first()
+        .or_else(|| requirements.notes.first())
+    {
+        return RuntimeCompatibility::NeedsAttention(format!(
+            "additional upstream requirement was not fully probed: {requirement}"
+        ));
+    }
+    RuntimeCompatibility::Recommended
 }
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -1004,9 +1034,9 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use norted_core::{
-        ArtifactFormat, AvailableRuntime, HostCapabilities, NvidiaCapability, RuntimeArchiveFormat,
-        RuntimeCompatibility, RuntimeDigest, RuntimeDownload, RuntimeIdentity,
-        RuntimePackageIdentity, RuntimeReleaseChannel, RuntimeRequirements,
+        AcceleratorDevice, ArtifactFormat, AvailableRuntime, HostCapabilities,
+        RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest, RuntimeDownload,
+        RuntimeIdentity, RuntimePackageIdentity, RuntimeReleaseChannel, RuntimeRequirements,
     };
 
     use super::{
@@ -1022,11 +1052,14 @@ mod tests {
         let host = HostCapabilities {
             platform: "linux".to_owned(),
             architecture: "x86_64".to_owned(),
-            nvidia: Some(NvidiaCapability {
-                model: None,
+            accelerators: vec![AcceleratorDevice {
+                accelerator: "cuda".to_owned(),
+                stable_id: Some("GPU-fixture".to_owned()),
+                name: None,
                 vram_bytes: Some(24 * 1024 * 1024 * 1024),
                 driver_version: None,
-            }),
+            }],
+            cuda_visible_devices: None,
             observations: Vec::new(),
         };
         assert_eq!(
@@ -1054,11 +1087,14 @@ mod tests {
         let host = |gib: u64| HostCapabilities {
             platform: "linux".to_owned(),
             architecture: "x86_64".to_owned(),
-            nvidia: Some(NvidiaCapability {
-                model: None,
+            accelerators: vec![AcceleratorDevice {
+                accelerator: "cuda".to_owned(),
+                stable_id: Some("GPU-fixture".to_owned()),
+                name: None,
                 vram_bytes: Some(gib * 1024 * 1024 * 1024),
                 driver_version: None,
-            }),
+            }],
+            cuda_visible_devices: None,
             observations: Vec::new(),
         };
         assert!(matches!(

@@ -208,6 +208,11 @@ pub struct RuntimeRequirements {
     /// reservation allowance rather than comparing this directly to bytes.
     #[serde(default)]
     pub minimum_vram_class_gib: Option<u16>,
+    /// A nominal VRAM class known to be insufficient, without claiming the
+    /// next exact usable class. Devices at or below this class are rejected;
+    /// larger devices still depend on any unverified requirement below.
+    #[serde(default)]
+    pub minimum_vram_exclusive_class_gib: Option<u16>,
     /// Legacy schema-v1 unverified compatibility conditions. New manifests
     /// should use `unverified_requirements`; preserving this meaning keeps old
     /// manifests fail-closed.
@@ -472,8 +477,12 @@ impl RuntimeCompatibility {
 }
 
 #[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NvidiaCapability {
-    pub model: Option<String>,
+pub struct AcceleratorDevice {
+    /// Runtime-facing accelerator family, currently `cuda` for NVIDIA GPUs.
+    pub accelerator: String,
+    /// Stable physical device identity reported by the vendor, when available.
+    pub stable_id: Option<String>,
+    pub name: Option<String>,
     pub vram_bytes: Option<u64>,
     pub driver_version: Option<String>,
 }
@@ -482,7 +491,10 @@ pub struct NvidiaCapability {
 pub struct HostCapabilities {
     pub platform: String,
     pub architecture: String,
-    pub nvidia: Option<NvidiaCapability>,
+    pub accelerators: Vec<AcceleratorDevice>,
+    /// Parent CUDA visibility captured with the hardware observation. Engines
+    /// that bind CUDA devices must reconcile this deliberately.
+    pub cuda_visible_devices: Option<String>,
     pub observations: Vec<String>,
 }
 
@@ -491,7 +503,8 @@ impl HostCapabilities {
         Self {
             platform: std::env::consts::OS.to_owned(),
             architecture: std::env::consts::ARCH.to_owned(),
-            nvidia: None,
+            accelerators: Vec::new(),
+            cuda_visible_devices: std::env::var("CUDA_VISIBLE_DEVICES").ok(),
             observations: Vec::new(),
         }
     }
@@ -538,6 +551,8 @@ pub struct RuntimeSelection {
     pub runtime: InstalledRuntime,
     pub source: RuntimeSelectionSource,
     pub notices: Vec<String>,
+    /// Exact physical accelerator selected while evaluating this runtime.
+    pub accelerator: Option<AcceleratorDevice>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

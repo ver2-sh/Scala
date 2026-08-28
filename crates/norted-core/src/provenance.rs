@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AuxiliaryArtifactRole, ModelId, RuntimeManifest, RuntimeSelectionSource};
+use crate::{
+    AcceleratorDevice, AuxiliaryArtifactRole, ModelId, RuntimeManifest, RuntimeSelectionSource,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineRevision {
@@ -97,6 +99,7 @@ pub struct RuntimeProvenance {
     pub runtime: RuntimeManifest,
     pub runtime_entrypoint: PathBuf,
     pub selection_source: RuntimeSelectionSource,
+    pub accelerator: Option<AcceleratorDevice>,
     pub installation: EngineInstallation,
     pub profile: Option<String>,
     pub normalized_settings: BTreeMap<String, serde_json::Value>,
