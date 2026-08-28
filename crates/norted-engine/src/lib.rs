@@ -270,6 +270,8 @@ pub struct InferenceUsage {
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub cached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

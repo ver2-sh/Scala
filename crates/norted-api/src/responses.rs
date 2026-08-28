@@ -403,8 +403,8 @@ fn response_document(
     if status == "completed" {
         response.insert("completed_at".to_owned(), json!(unix_timestamp()));
     }
-    if let Some(usage) = usage {
-        response.insert("usage".to_owned(), usage_document(usage));
+    if let Some(usage) = usage.and_then(usage_document) {
+        response.insert("usage".to_owned(), usage);
     }
     document
 }
@@ -423,19 +423,22 @@ fn message_item(context: &ResponseContext, status: &str, text: &str) -> Value {
     })
 }
 
-fn usage_document(usage: &InferenceUsage) -> Value {
-    json!({
+fn usage_document(usage: &InferenceUsage) -> Option<Value> {
+    let cached_tokens = usage.cached_input_tokens?;
+    let cache_write_tokens = usage.cache_write_input_tokens?;
+    let reasoning_tokens = usage.reasoning_output_tokens?;
+    Some(json!({
         "input_tokens": usage.input_tokens,
         "input_tokens_details": {
-            "cached_tokens": usage.cached_input_tokens.unwrap_or(0),
-            "cache_write_tokens": 0,
+            "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens,
         },
         "output_tokens": usage.output_tokens,
         "output_tokens_details": {
-            "reasoning_tokens": 0,
+            "reasoning_tokens": reasoning_tokens,
         },
         "total_tokens": usage.total_tokens,
-    })
+    }))
 }
 
 struct PublicStreamState {

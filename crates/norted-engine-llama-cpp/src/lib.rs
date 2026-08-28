@@ -59,6 +59,7 @@ const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &[
     "LLAMA_ARG_MODELS_MAX",
     "LLAMA_ARG_MODELS_AUTOLOAD",
     "LLAMA_ARG_NO_MODELS_AUTOLOAD",
+    "LLAMA_ARG_ENDPOINT_PROPS",
     "LLAMA_SERVER_ROUTER_PORT",
     "LLAMA_SERVER_CHILD_MODE",
 ];
@@ -94,6 +95,7 @@ const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "--models-max",
     "--models-autoload",
     "--no-models-autoload",
+    "--props",
     // Current llama-server convenience presets assign a different primary model
     // (and some also replace the managed port or generation mode).
     "--embd-gemma-default",
@@ -658,6 +660,8 @@ impl From<ChatUsage> for InferenceUsage {
             cached_input_tokens: usage
                 .prompt_tokens_details
                 .and_then(|details| details.cached_tokens),
+            cache_write_input_tokens: None,
+            reasoning_output_tokens: None,
         }
     }
 }
