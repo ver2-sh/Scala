@@ -55,7 +55,22 @@ fn render_overview(
     );
     render_metrics(frame, layout[1], app, theme, glyphs, compact);
     let body = match &app.snapshot.registry_state {
-        RegistryState::NotScanned | RegistryState::Scanning => vec![
+        RegistryState::NotScanned => vec![
+            Line::from(Span::styled(
+                format!("{}  Preparing model discovery", glyphs.transitional),
+                theme.text,
+            )),
+            Line::default(),
+            Line::from(Span::styled(
+                "The interface is ready; configured directories have not been scanned yet.",
+                theme.muted,
+            )),
+            Line::from(Span::styled(
+                "Discovery will start in the background after this first frame.",
+                theme.hint,
+            )),
+        ],
+        RegistryState::Scanning => vec![
             Line::from(Span::styled(
                 format!("{}  Discovering local models", glyphs.transitional),
                 theme.text,
@@ -128,11 +143,23 @@ fn render_metrics(
         state => state.label().to_owned(),
     };
     let engine_value = app.control.as_ref().map_or_else(
-        || "Unavailable".to_owned(),
+        || {
+            if app.control_observation_pending() {
+                "Observing".to_owned()
+            } else {
+                "Unavailable".to_owned()
+            }
+        },
         |control| control.installed_engine_count.to_string(),
     );
     let active_model = app.control.as_ref().map_or_else(
-        || "Unavailable".to_owned(),
+        || {
+            if app.control_observation_pending() {
+                "Observing".to_owned()
+            } else {
+                "Unavailable".to_owned()
+            }
+        },
         |control| {
             control
                 .backend
@@ -203,10 +230,17 @@ fn render_models(
         ),
     };
     frame.render_widget(section_title("Models", &subtitle, theme), layout[0]);
-    if matches!(
-        app.snapshot.registry_state,
-        RegistryState::NotScanned | RegistryState::Scanning
-    ) {
+    if matches!(app.snapshot.registry_state, RegistryState::NotScanned) {
+        render_empty(
+            frame,
+            layout[1],
+            &format!("{}  Preparing model discovery", glyphs.transitional),
+            "The registry has not been scanned yet; background discovery starts after the first frame.",
+            theme,
+        );
+        return;
+    }
+    if matches!(app.snapshot.registry_state, RegistryState::Scanning) {
         render_empty(
             frame,
             layout[1],
@@ -280,15 +314,21 @@ fn render_engines(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, g
         layout[0],
     );
     let Some(control) = &app.control else {
-        render_empty(
-            frame,
-            layout[1],
-            &format!("{}  Server control unavailable", glyphs.stopped),
-            app.control_observation_error
-                .as_deref()
-                .unwrap_or("Start `norted-server serve` to inspect registered engines."),
-            theme,
+        let (title, detail) = app.control_observation_error.as_deref().map_or_else(
+            || {
+                (
+                    format!("{}  Observing server control", glyphs.transitional),
+                    "Runtime status will appear when the initial control observation completes.",
+                )
+            },
+            |error| {
+                (
+                    format!("{}  Server control unavailable", glyphs.stopped),
+                    error,
+                )
+            },
         );
+        render_empty(frame, layout[1], &title, detail, theme);
         return;
     };
     if control.engines.is_empty() {
@@ -347,33 +387,40 @@ fn render_server(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         ),
         layout[0],
     );
+    let pending = app.control_observation_pending();
     let endpoint = app
         .control
         .as_ref()
         .and_then(|control| control.public_endpoint.as_deref())
         .or_else(|| app.snapshot.server.endpoint())
-        .unwrap_or("Not serving");
+        .unwrap_or(if pending { "Observing" } else { "Not serving" });
     let lifecycle = app
         .control
         .as_ref()
         .map(|control| format!("{:?}", control.backend.lifecycle))
-        .unwrap_or_else(|| "Unavailable".to_owned());
+        .unwrap_or_else(|| {
+            if pending {
+                "Observing".to_owned()
+            } else {
+                "Unavailable".to_owned()
+            }
+        });
     let active_model = app
         .control
         .as_ref()
         .and_then(|control| control.backend.model_id.as_ref())
         .map(ToString::to_string)
-        .unwrap_or_else(|| "None".to_owned());
+        .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
     let active_engine = app
         .control
         .as_ref()
         .and_then(|control| control.backend.engine_id.clone())
-        .unwrap_or_else(|| "None".to_owned());
+        .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
     let private_backend = app
         .control
         .as_ref()
         .and_then(|control| control.backend.private_endpoint.clone())
-        .unwrap_or_else(|| "None".to_owned());
+        .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
     frame.render_widget(
         Paragraph::new(vec![
             key_value("STATE", app.snapshot.server.label(), theme),

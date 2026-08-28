@@ -301,6 +301,10 @@ impl App {
         self.control_observation_error = observation_error;
     }
 
+    pub fn control_observation_pending(&self) -> bool {
+        self.control.is_none() && self.control_observation_error.is_none()
+    }
+
     pub fn take_control_action(&mut self) -> Option<ControlAction> {
         self.pending_control_action.take()
     }
@@ -702,7 +706,11 @@ impl App {
             return Update::Render;
         };
         let Some(control) = &self.control else {
-            self.notice = Some("No running Norted Server control instance is available".to_owned());
+            self.notice = Some(if self.control_observation_pending() {
+                "Server control observation is still in progress".to_owned()
+            } else {
+                "No running Norted Server control instance is available".to_owned()
+            });
             return Update::Render;
         };
         if control.backend.lifecycle == BackendLifecycle::Running
@@ -723,7 +731,11 @@ impl App {
             return Update::Render;
         }
         let Some(control) = &self.control else {
-            self.notice = Some("No running Norted Server control instance is available".to_owned());
+            self.notice = Some(if self.control_observation_pending() {
+                "Server control observation is still in progress".to_owned()
+            } else {
+                "No running Norted Server control instance is available".to_owned()
+            });
             return Update::Render;
         };
         if matches!(control.backend.lifecycle, BackendLifecycle::Stopped) {

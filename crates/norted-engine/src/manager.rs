@@ -13,9 +13,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    CompatibilityDecision, EngineAdapter, EngineError, EngineIdentity, EngineProbe, EngineRegistry,
-    InferenceOutput, InferenceRequest, InferenceStream, InstallationState, LaunchRequest,
-    ProcessDescriptor, ProcessExit, ProcessSupervisor,
+    CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter, EngineError, EngineIdentity,
+    EngineProbe, EngineRegistry, InferenceRequest, InstallationState, LaunchRequest,
+    ProcessDescriptor, ProcessExit, ProcessSupervisor, RoutedInferenceOutput,
+    RoutedInferenceStream,
 };
 
 const NOTICE_LIMIT: usize = 64;
@@ -131,6 +132,7 @@ struct ActiveBackend {
     model_id: ModelId,
     engine_id: String,
     endpoint: String,
+    effective_generation_settings: EffectiveGenerationSettings,
 }
 
 struct ManagerState {
@@ -460,6 +462,19 @@ impl RuntimeManager {
                 .await;
             return Err(error);
         }
+        let effective_generation_settings =
+            match adapter.effective_generation_settings(&process).await {
+                Ok(settings) => settings,
+                Err(error) => {
+                    let detail = format!(
+                        "could not obtain effective generation settings from the engine: {error}"
+                    );
+                    let retained = self.terminate_or_retain(&process).await;
+                    self.fail_loading(generation, detail.clone(), retained.as_ref())
+                        .await;
+                    return Err(RuntimeError::StartupFailed(detail));
+                }
+            };
 
         {
             let mut state = self.state.write().await;
@@ -491,6 +506,7 @@ impl RuntimeManager {
                 model_id: model_id.clone(),
                 engine_id: engine_id.clone(),
                 endpoint,
+                effective_generation_settings,
             });
             push_notice(
                 &mut state,
@@ -570,23 +586,36 @@ impl RuntimeManager {
         Ok(self.status_from_state(&state))
     }
 
-    pub async fn infer(&self, request: InferenceRequest) -> Result<InferenceOutput, RuntimeError> {
-        let (adapter, endpoint) = self.inference_target(&request.model_id).await?;
-        adapter
+    pub async fn infer(
+        &self,
+        request: InferenceRequest,
+    ) -> Result<RoutedInferenceOutput, RuntimeError> {
+        let (adapter, endpoint, effective_generation_settings) =
+            self.inference_target(&request.model_id).await?;
+        let output = adapter
             .infer(&endpoint, request)
             .await
-            .map_err(map_inference_error)
+            .map_err(map_inference_error)?;
+        Ok(RoutedInferenceOutput {
+            output,
+            effective_generation_settings,
+        })
     }
 
     pub async fn infer_stream(
         &self,
         request: InferenceRequest,
-    ) -> Result<InferenceStream, RuntimeError> {
-        let (adapter, endpoint) = self.inference_target(&request.model_id).await?;
-        adapter
+    ) -> Result<RoutedInferenceStream, RuntimeError> {
+        let (adapter, endpoint, effective_generation_settings) =
+            self.inference_target(&request.model_id).await?;
+        let stream = adapter
             .infer_stream(&endpoint, request)
             .await
-            .map_err(map_inference_error)
+            .map_err(map_inference_error)?;
+        Ok(RoutedInferenceStream {
+            stream,
+            effective_generation_settings,
+        })
     }
 
     pub async fn shutdown(&self) {
@@ -777,15 +806,17 @@ impl RuntimeManager {
     async fn inference_target(
         &self,
         model_id: &ModelId,
-    ) -> Result<(Arc<dyn EngineAdapter>, String), RuntimeError> {
+    ) -> Result<(Arc<dyn EngineAdapter>, String, EffectiveGenerationSettings), RuntimeError> {
         if self.core.model(model_id).await.is_none() {
             return Err(RuntimeError::ModelNotFound(model_id.clone()));
         }
         let state = self.state.read().await;
         match (&state.lifecycle, &state.active) {
-            (BackendLifecycle::Running, Some(active)) if &active.model_id == model_id => {
-                Ok((Arc::clone(&active.adapter), active.endpoint.clone()))
-            }
+            (BackendLifecycle::Running, Some(active)) if &active.model_id == model_id => Ok((
+                Arc::clone(&active.adapter),
+                active.endpoint.clone(),
+                active.effective_generation_settings,
+            )),
             (BackendLifecycle::Failed, _) => Err(RuntimeError::BackendCrashed(
                 state
                     .failure

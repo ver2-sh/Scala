@@ -15,11 +15,11 @@ use norted_core::{
     ModelArtifact,
 };
 use norted_engine::{
-    AcquisitionRequest, ApiCapability, CompatibilityDecision, EngineAdapter, EngineCapabilities,
-    EngineError, EngineFeature, EngineIdentity, EngineProbe, InferenceEvent, InferenceFinishReason,
-    InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
-    InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind,
-    ProcessDescriptor, UpdateState, capture_command,
+    AcquisitionRequest, ApiCapability, CompatibilityDecision, EffectiveGenerationSettings,
+    EngineAdapter, EngineCapabilities, EngineError, EngineFeature, EngineIdentity, EngineProbe,
+    InferenceEvent, InferenceFinishReason, InferenceMessage, InferenceOutput, InferenceRequest,
+    InferenceRole, InferenceStream, InferenceUsage, InstallationState, LaunchRequest, LaunchSpec,
+    NativeOption, OptionValueKind, ProcessDescriptor, UpdateState, capture_command,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -31,8 +31,83 @@ pub const UPSTREAM_REPOSITORY: &str = "https://github.com/ggml-org/llama.cpp";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+const PROPS_TIMEOUT: Duration = Duration::from_secs(2);
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SSE_FRAME_LIMIT: usize = 1024 * 1024;
+
+// These variables select semantics that Norted must own for its private backend.
+// Keep ordinary llama.cpp tuning variables inherited and available to users.
+const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &[
+    "LLAMA_ARG_MODEL",
+    "LLAMA_ARG_MODEL_URL",
+    "LLAMA_ARG_DOCKER_REPO",
+    "LLAMA_ARG_HF_REPO",
+    "LLAMA_ARG_HF_FILE",
+    "LLAMA_ARG_ALIAS",
+    "LLAMA_ARG_HOST",
+    "LLAMA_ARG_PORT",
+    "LLAMA_ARG_REUSE_PORT",
+    "LLAMA_ARG_API_PREFIX",
+    "LLAMA_API_KEY",
+    "LLAMA_ARG_API_KEY_FILE",
+    "LLAMA_ARG_SSL_KEY_FILE",
+    "LLAMA_ARG_SSL_CERT_FILE",
+    "LLAMA_ARG_EMBEDDINGS",
+    "LLAMA_ARG_RERANKING",
+    "LLAMA_ARG_MODELS_DIR",
+    "LLAMA_ARG_MODELS_PRESET",
+    "LLAMA_ARG_MODELS_MAX",
+    "LLAMA_ARG_MODELS_AUTOLOAD",
+    "LLAMA_ARG_NO_MODELS_AUTOLOAD",
+    "LLAMA_SERVER_ROUTER_PORT",
+    "LLAMA_SERVER_CHILD_MODE",
+];
+
+const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
+    "-m",
+    "--model",
+    "-mu",
+    "--model-url",
+    "-dr",
+    "--docker-repo",
+    "-hf",
+    "-hfr",
+    "--hf-repo",
+    "-hff",
+    "--hf-file",
+    "-a",
+    "--alias",
+    "--host",
+    "--port",
+    "--reuse-port",
+    "--api-prefix",
+    "--api-key",
+    "--api-key-file",
+    "--ssl-key-file",
+    "--ssl-cert-file",
+    "--embedding",
+    "--embeddings",
+    "--rerank",
+    "--reranking",
+    "--models-dir",
+    "--models-preset",
+    "--models-max",
+    "--models-autoload",
+    "--no-models-autoload",
+    // Current llama-server convenience presets assign a different primary model
+    // (and some also replace the managed port or generation mode).
+    "--embd-gemma-default",
+    "--fim-qwen-1.5b-default",
+    "--fim-qwen-3b-default",
+    "--fim-qwen-7b-default",
+    "--fim-qwen-7b-spec",
+    "--fim-qwen-14b-spec",
+    "--fim-qwen-30b-default",
+    "--gpt-oss-20b-default",
+    "--gpt-oss-120b-default",
+    "--vision-gemma-4b-default",
+    "--vision-gemma-12b-default",
+];
 
 pub struct LlamaCppAdapter {
     enabled: bool,
@@ -54,14 +129,12 @@ impl LlamaCppAdapter {
         if let Some(config) = config {
             enabled = config.enabled;
             environment = config.env.clone();
-            if let Some(name) = environment.keys().find(|name| {
-                matches!(
-                    name.to_ascii_uppercase().as_str(),
-                    "LLAMA_ARG_MODEL" | "LLAMA_ARG_HOST" | "LLAMA_ARG_PORT"
-                )
-            }) {
+            if let Some(name) = environment
+                .keys()
+                .find(|name| conflicts_with_managed_environment(name))
+            {
                 configuration_error = Some(format!(
-                    "environment variable `{name}` conflicts with Norted-managed model or loopback binding"
+                    "environment variable `{name}` conflicts with the Norted-managed llama.cpp backend contract"
                 ));
             }
             for key in config.settings.keys() {
@@ -128,7 +201,7 @@ impl LlamaCppAdapter {
                     .find(|argument| conflicts_with_managed_argument(argument))
             {
                 configuration_error = Some(format!(
-                    "native argument `{argument}` conflicts with Norted-managed model or loopback binding"
+                    "native argument `{argument}` conflicts with the Norted-managed llama.cpp backend contract"
                 ));
             }
         }
@@ -186,6 +259,7 @@ impl LlamaCppAdapter {
             &binary_path,
             &["--version"],
             &self.environment,
+            &managed_environment_removals(),
             PROBE_TIMEOUT,
         )
         .await
@@ -204,6 +278,7 @@ impl LlamaCppAdapter {
             &binary_path,
             &["--help"],
             &self.environment,
+            &managed_environment_removals(),
             PROBE_TIMEOUT,
         )
         .await
@@ -219,7 +294,7 @@ impl LlamaCppAdapter {
             Err(error) => return invalid_probe(error.to_string()),
         };
         let help = format!("{}\n{}", help_output.stdout, help_output.stderr);
-        for required in ["--model", "--host", "--port"] {
+        for required in ["--model", "--alias", "--host", "--port"] {
             if !help.contains(required) {
                 return invalid_probe(format!(
                     "configured binary does not advertise required llama-server flag `{required}`"
@@ -244,7 +319,7 @@ impl LlamaCppAdapter {
                         version,
                         revision,
                     },
-                    source_repository: Some(UPSTREAM_REPOSITORY.to_owned()),
+                    source_repository: None,
                     acquisition_method: AcquisitionMethod::ExternalBinary,
                     binary_path,
                     binary_sha256,
@@ -366,6 +441,8 @@ impl EngineAdapter for LlamaCppAdapter {
         let arguments = vec![
             OsString::from("--model"),
             request.model.path.as_os_str().to_owned(),
+            OsString::from("--alias"),
+            OsString::from(request.model.id.0.clone()),
             OsString::from("--host"),
             OsString::from(request.backend_address.ip().to_string()),
             OsString::from("--port"),
@@ -378,6 +455,7 @@ impl EngineAdapter for LlamaCppAdapter {
             executable: installation.binary_path.clone(),
             arguments,
             environment: self.environment.clone(),
+            environment_remove: managed_environment_removals(),
             inherits_parent_environment: true,
             working_directory: None,
             endpoint: Some(http_endpoint(request.backend_address)),
@@ -412,6 +490,49 @@ impl EngineAdapter for LlamaCppAdapter {
             .await
             .map_err(|error| EngineError::Operation(format!("invalid health response: {error}")))?;
         Ok(health.status == "ok")
+    }
+
+    async fn effective_generation_settings(
+        &self,
+        process: &ProcessDescriptor,
+    ) -> Result<EffectiveGenerationSettings, EngineError> {
+        let endpoint = process.endpoint.as_deref().ok_or_else(|| {
+            EngineError::Operation("llama.cpp process has no backend endpoint".to_owned())
+        })?;
+        let response = self
+            .client
+            .get(format!("{endpoint}/props"))
+            .timeout(PROPS_TIMEOUT)
+            .send()
+            .await
+            .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
+        if !status.is_success() {
+            return Err(backend_http_error(status, &body));
+        }
+        let props: PropsResponse = serde_json::from_slice(&body).map_err(|error| {
+            EngineError::Operation(format!(
+                "invalid llama.cpp /props effective generation settings: {error}"
+            ))
+        })?;
+        let params = props.default_generation_settings.params;
+        if !params.temperature.is_finite()
+            || !(0.0..=2.0).contains(&params.temperature)
+            || !params.top_p.is_finite()
+            || !(0.0..=1.0).contains(&params.top_p)
+        {
+            return Err(EngineError::Operation(
+                "llama.cpp /props returned effective generation settings outside the supported Response ranges (temperature 0..=2, top_p 0..=1)".to_owned(),
+            ));
+        }
+        Ok(EffectiveGenerationSettings {
+            temperature: params.temperature,
+            top_p: params.top_p,
+        })
     }
 
     async fn infer(
@@ -480,6 +601,22 @@ impl EngineAdapter for LlamaCppAdapter {
 #[derive(Deserialize)]
 struct HealthResponse {
     status: String,
+}
+
+#[derive(Deserialize)]
+struct PropsResponse {
+    default_generation_settings: DefaultGenerationSettings,
+}
+
+#[derive(Deserialize)]
+struct DefaultGenerationSettings {
+    params: PropsGenerationParams,
+}
+
+#[derive(Deserialize)]
+struct PropsGenerationParams {
+    temperature: f64,
+    top_p: f64,
 }
 
 #[derive(Deserialize)]
@@ -723,14 +860,26 @@ fn invalid_probe(reason: String) -> EngineProbe {
 }
 
 fn conflicts_with_managed_argument(argument: &str) -> bool {
-    let argument = argument.to_ascii_lowercase();
-    argument == "-m"
-        || argument == "--model"
-        || argument.starts_with("--model=")
-        || argument == "--host"
-        || argument.starts_with("--host=")
-        || argument == "--port"
-        || argument.starts_with("--port=")
+    let argument = argument.to_ascii_lowercase().replace('_', "-");
+    MANAGED_NATIVE_ARGUMENTS.iter().any(|managed| {
+        argument == *managed
+            || argument
+                .strip_prefix(managed)
+                .is_some_and(|suffix| suffix.starts_with('='))
+    })
+}
+
+fn conflicts_with_managed_environment(name: &str) -> bool {
+    MANAGED_ENVIRONMENT_VARIABLES
+        .iter()
+        .any(|managed| name.eq_ignore_ascii_case(managed))
+}
+
+fn managed_environment_removals() -> Vec<OsString> {
+    MANAGED_ENVIRONMENT_VARIABLES
+        .iter()
+        .map(OsString::from)
+        .collect()
 }
 
 fn parse_version(output: &str) -> (Option<String>, Option<String>) {

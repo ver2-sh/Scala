@@ -8,7 +8,6 @@ use serde_json::json;
 use crate::doctor::DoctorCheck;
 
 pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
-    core.ensure_model_discovery().await?;
     let observation_error = core
         .refresh_server_state()
         .await

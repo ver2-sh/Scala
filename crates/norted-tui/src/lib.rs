@@ -20,10 +20,8 @@ use terminal::TerminalSession;
 use ui::layout::UiLayout;
 
 pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
-    let initial_control = observe_control(&core.paths).await;
     let mut terminal = TerminalSession::enter()?;
     let mut core_events = core.subscribe();
-    core.start_model_discovery().await;
     let snapshot = core.snapshot().await;
     let server_address = format!("{}:{}", core.config.server.host, core.config.server.port);
     let config_path = core.config_path.display().to_string();
@@ -42,7 +40,10 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
         config_path,
         model_paths,
     );
-    app.replace_control(initial_control.status, initial_control.error);
+    let mut layout = UiLayout::default();
+    terminal.draw(|frame| layout = ui::render(frame, &app))?;
+
+    core.start_model_discovery().await;
     let mut terminal_events = EventStream::new();
     let (control_updates, mut control_update_receiver) = tokio::sync::mpsc::channel(2);
     let (control_results, mut control_result_receiver) = tokio::sync::mpsc::channel(2);
@@ -53,18 +54,16 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             refresh.tick().await;
-            let _ = observer_core.refresh_server_state().await;
-            if control_updates
-                .send(observe_control(&observer_paths).await)
-                .await
-                .is_err()
-            {
+            let (_, observation) = tokio::join!(
+                observer_core.refresh_server_state(),
+                observe_control(&observer_paths)
+            );
+            if control_updates.send(observation).await.is_err() {
                 break;
             }
         }
     });
-    let mut render = true;
-    let mut layout = UiLayout::default();
+    let mut render = false;
 
     loop {
         if render {

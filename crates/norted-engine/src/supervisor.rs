@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -32,9 +33,13 @@ pub async fn capture_command(
     executable: &Path,
     arguments: &[&str],
     environment: &BTreeMap<String, String>,
+    environment_remove: &[OsString],
     timeout: Duration,
 ) -> Result<CapturedCommand, EngineError> {
     let mut command = Command::new(executable);
+    for name in environment_remove {
+        command.env_remove(name);
+    }
     command
         .args(arguments)
         .envs(environment)
@@ -127,6 +132,9 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         let mut command = Command::new(&spec.executable);
         if !spec.inherits_parent_environment {
             command.env_clear();
+        }
+        for name in &spec.environment_remove {
+            command.env_remove(name);
         }
         command
             .args(&spec.arguments)

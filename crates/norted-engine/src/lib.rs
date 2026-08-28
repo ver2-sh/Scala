@@ -206,12 +206,19 @@ pub struct LaunchSpec {
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
     pub environment: BTreeMap<String, String>,
+    pub environment_remove: Vec<OsString>,
     pub inherits_parent_environment: bool,
     pub working_directory: Option<PathBuf>,
     pub endpoint: Option<String>,
     pub normalized_settings: BTreeMap<String, serde_json::Value>,
     pub native_arguments: Vec<String>,
     pub installation: EngineInstallation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EffectiveGenerationSettings {
+    pub temperature: f64,
+    pub top_p: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +277,16 @@ pub struct InferenceOutput {
     pub text: String,
     pub usage: Option<InferenceUsage>,
     pub finish_reason: InferenceFinishReason,
+}
+
+pub struct RoutedInferenceOutput {
+    pub output: InferenceOutput,
+    pub effective_generation_settings: EffectiveGenerationSettings,
+}
+
+pub struct RoutedInferenceStream {
+    pub stream: InferenceStream,
+    pub effective_generation_settings: EffectiveGenerationSettings,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -341,6 +358,10 @@ pub trait EngineAdapter: Send + Sync {
     async fn update(&self, request: AcquisitionRequest) -> Result<EngineInstallation, EngineError>;
     async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError>;
     async fn health(&self, process: &ProcessDescriptor) -> Result<bool, EngineError>;
+    async fn effective_generation_settings(
+        &self,
+        process: &ProcessDescriptor,
+    ) -> Result<EffectiveGenerationSettings, EngineError>;
     async fn infer(
         &self,
         endpoint: &str,
@@ -553,6 +574,13 @@ mod tests {
         }
 
         async fn health(&self, _process: &ProcessDescriptor) -> Result<bool, EngineError> {
+            unreachable!()
+        }
+
+        async fn effective_generation_settings(
+            &self,
+            _process: &ProcessDescriptor,
+        ) -> Result<super::EffectiveGenerationSettings, EngineError> {
             unreachable!()
         }
 

@@ -10,8 +10,8 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use norted_core::ModelId;
 use norted_engine::{
-    InferenceEvent, InferenceFinishReason, InferenceMessage, InferenceRequest, InferenceRole,
-    InferenceStream, InferenceUsage, RuntimeError,
+    EffectiveGenerationSettings, InferenceEvent, InferenceFinishReason, InferenceMessage,
+    InferenceRequest, InferenceRole, InferenceStream, InferenceUsage, RuntimeError,
 };
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -38,14 +38,10 @@ pub(super) async fn create(
         )
     })?;
     let parsed = parse_request(value)?;
-    let context = ResponseContext {
-        response_id: format!("resp_{}", Uuid::new_v4().simple()),
-        message_id: format!("msg_{}", Uuid::new_v4().simple()),
-        created_at: unix_timestamp(),
-        model: parsed.model.clone(),
-        instructions: parsed.instructions.clone(),
-        max_output_tokens: parsed.max_output_tokens,
-    };
+    let response_id = format!("resp_{}", Uuid::new_v4().simple());
+    let message_id = format!("msg_{}", Uuid::new_v4().simple());
+    let created_at = unix_timestamp();
+    let public_model = parsed.model.clone();
     let inference = InferenceRequest {
         model_id: ModelId(parsed.model),
         messages: parsed.messages,
@@ -53,18 +49,37 @@ pub(super) async fn create(
         stream: parsed.stream,
     };
     if parsed.stream {
-        let backend = state
+        let routed = state
             .runtime
             .infer_stream(inference)
             .await
             .map_err(runtime_error)?;
-        Ok(streaming_response(context, backend))
+        let context = ResponseContext {
+            response_id,
+            message_id,
+            created_at,
+            model: public_model,
+            instructions: parsed.instructions,
+            max_output_tokens: parsed.max_output_tokens,
+            effective_generation_settings: routed.effective_generation_settings,
+        };
+        Ok(streaming_response(context, routed.stream))
     } else {
-        let output = state
+        let routed = state
             .runtime
             .infer(inference)
             .await
             .map_err(runtime_error)?;
+        let output = routed.output;
+        let context = ResponseContext {
+            response_id,
+            message_id,
+            created_at,
+            model: public_model,
+            instructions: parsed.instructions,
+            max_output_tokens: parsed.max_output_tokens,
+            effective_generation_settings: routed.effective_generation_settings,
+        };
         let status = if output.finish_reason == InferenceFinishReason::MaxOutputTokens {
             "incomplete"
         } else {
@@ -333,6 +348,7 @@ struct ResponseContext {
     model: String,
     instructions: Option<String>,
     max_output_tokens: Option<u32>,
+    effective_generation_settings: EffectiveGenerationSettings,
 }
 
 fn response_document(
@@ -353,16 +369,11 @@ fn response_document(
             text,
         )]
     });
-    json!({
+    let mut document = json!({
         "id": context.response_id,
         "object": "response",
         "created_at": context.created_at,
         "status": status,
-        "completed_at": if status == "completed" {
-            Some(unix_timestamp())
-        } else {
-            None
-        },
         "error": error,
         "incomplete_details": if status == "incomplete" {
             json!({ "reason": "max_output_tokens" })
@@ -374,10 +385,10 @@ fn response_document(
         "model": context.model,
         "output": output,
         "parallel_tool_calls": false,
-        "temperature": Value::Null,
+        "temperature": context.effective_generation_settings.temperature,
         "tool_choice": "none",
         "tools": [],
-        "top_p": Value::Null,
+        "top_p": context.effective_generation_settings.top_p,
         "background": false,
         "max_output_tokens": context.max_output_tokens,
         "previous_response_id": Value::Null,
@@ -385,8 +396,17 @@ fn response_document(
         "store": false,
         "text": { "format": { "type": "text" } },
         "truncation": "disabled",
-        "usage": usage.map(usage_document),
-    })
+    });
+    let response = document
+        .as_object_mut()
+        .expect("Response document is constructed as an object");
+    if status == "completed" {
+        response.insert("completed_at".to_owned(), json!(unix_timestamp()));
+    }
+    if let Some(usage) = usage {
+        response.insert("usage".to_owned(), usage_document(usage));
+    }
+    document
 }
 
 fn message_item(context: &ResponseContext, status: &str, text: &str) -> Value {
@@ -399,7 +419,6 @@ fn message_item(context: &ResponseContext, status: &str, text: &str) -> Value {
             "type": "output_text",
             "text": text,
             "annotations": [],
-            "logprobs": [],
         }],
     })
 }
@@ -464,7 +483,6 @@ fn streaming_response(context: ResponseContext, backend: InferenceStream) -> Res
                 "type": "output_text",
                 "text": "",
                 "annotations": [],
-                "logprobs": [],
             },
         }),
     );
@@ -557,7 +575,6 @@ impl PublicStreamState {
                     "type": "output_text",
                     "text": text,
                     "annotations": [],
-                    "logprobs": [],
                 },
             }),
         );
