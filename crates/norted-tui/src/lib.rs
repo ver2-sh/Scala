@@ -327,7 +327,13 @@ async fn execute_settings_action(
                     ))?;
                 let engine_id = &selection.runtime.manifest.identity.engine_id;
                 let resolved = profiles
-                    .resolve(&model.id, engine_id, None, &LoadSettingsPatch::default())
+                    .resolve(
+                        &model.id,
+                        engine_id,
+                        None,
+                        &LoadSettingsPatch::default(),
+                        &paths.data_dir,
+                    )
                     .map_err(|error| error.to_string())?;
                 Ok(ModelSettingsInspection {
                     profiles,

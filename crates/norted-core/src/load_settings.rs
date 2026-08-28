@@ -483,6 +483,7 @@ impl LoadProfilesState {
         engine_id: &str,
         invocation_profile: Option<&LoadProfileName>,
         invocation: &LoadSettingsPatch,
+        structured_path_base: &Path,
     ) -> Result<ResolvedLoadSettings, LoadSettingsError> {
         let selected_profile = invocation_profile
             .cloned()
@@ -534,6 +535,7 @@ impl LoadProfilesState {
             engine_id,
             LoadSettingSource::Invocation,
         );
+        resolve_structured_paths(&mut effective, structured_path_base)?;
         Ok(ResolvedLoadSettings {
             engine_id: engine_id.to_owned(),
             selected_profile,
@@ -583,6 +585,64 @@ impl LoadProfilesState {
         }
         Ok(())
     }
+}
+
+fn resolve_structured_paths(
+    effective: &mut BTreeMap<LoadSettingId, ResolvedLoadSetting>,
+    base: &Path,
+) -> Result<(), LoadSettingsError> {
+    for (id, setting) in effective.iter_mut() {
+        let LoadSettingValue::Path(path) = &mut setting.value else {
+            continue;
+        };
+        if path.is_absolute() {
+            continue;
+        }
+        if !base.is_absolute() {
+            return Err(LoadSettingsError::InvalidValue {
+                setting_id: id.clone(),
+                value: path.display().to_string(),
+                reason: "Norted's structured-path base is not absolute".to_owned(),
+            });
+        }
+
+        let original = path.clone();
+        let mut resolved = base.to_path_buf();
+        let mut relative_depth = 0_usize;
+        for component in original.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::Normal(part) => {
+                    resolved.push(part);
+                    relative_depth += 1;
+                }
+                std::path::Component::ParentDir if relative_depth > 0 => {
+                    resolved.pop();
+                    relative_depth -= 1;
+                }
+                std::path::Component::ParentDir => {
+                    return Err(LoadSettingsError::InvalidValue {
+                        setting_id: id.clone(),
+                        value: original.display().to_string(),
+                        reason: format!(
+                            "relative structured paths resolve beneath {} and cannot escape it with `..`; use an absolute path for another location",
+                            base.display()
+                        ),
+                    });
+                }
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                    return Err(LoadSettingsError::InvalidValue {
+                        setting_id: id.clone(),
+                        value: original.display().to_string(),
+                        reason: "structured paths must be fully absolute or relative without a root/drive prefix"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+        *path = resolved;
+    }
+    Ok(())
 }
 
 fn apply_layer(
@@ -977,7 +1037,13 @@ mod tests {
         )]));
 
         let resolved = state
-            .resolve(&model_id, "llama.cpp", None, &invocation)
+            .resolve(
+                &model_id,
+                "llama.cpp",
+                None,
+                &invocation,
+                &std::env::temp_dir(),
+            )
             .expect("resolve");
         assert_eq!(
             resolved.value("context_length"),
@@ -1012,7 +1078,13 @@ mod tests {
         model.remove(&id("parallel_requests"));
 
         let resolved = state
-            .resolve(&model_id, "llama.cpp", None, &LoadSettingsPatch::default())
+            .resolve(
+                &model_id,
+                "llama.cpp",
+                None,
+                &LoadSettingsPatch::default(),
+                &std::env::temp_dir(),
+            )
             .expect("resolve");
         assert_eq!(
             resolved.value("parallel_requests"),
@@ -1047,9 +1119,68 @@ mod tests {
             LoadSettingValue::UnsignedInteger(8192),
         )]));
         let _ = state
-            .resolve(&ModelId("model".to_owned()), "llama.cpp", None, &invocation)
+            .resolve(
+                &ModelId("model".to_owned()),
+                "llama.cpp",
+                None,
+                &invocation,
+                &std::env::temp_dir(),
+            )
             .expect("resolve invocation");
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn relative_structured_paths_resolve_beneath_the_stable_data_directory() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let data_dir = temporary.path().join("data");
+        let model = ModelId("model".to_owned());
+        let mut state = LoadProfilesState::default();
+        state
+            .model_defaults
+            .entry(model.clone())
+            .or_default()
+            .insert(
+                id("q27.prefix_cache_path"),
+                LoadSettingValue::Path(PathBuf::from("cache/q27")),
+            );
+
+        let resolved = state
+            .resolve(
+                &model,
+                "q27",
+                None,
+                &LoadSettingsPatch::default(),
+                &data_dir,
+            )
+            .expect("resolve relative path");
+        assert_eq!(
+            resolved.value("q27.prefix_cache_path"),
+            Some(&LoadSettingValue::Path(data_dir.join("cache/q27")))
+        );
+        assert_eq!(
+            state.model_defaults[&model].0[&id("q27.prefix_cache_path")],
+            LoadSettingValue::Path(PathBuf::from("cache/q27"))
+        );
+    }
+
+    #[test]
+    fn relative_structured_paths_cannot_escape_the_data_directory() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let invocation = LoadSettingsPatch(BTreeMap::from([(
+            id("q27.prefix_cache_path"),
+            LoadSettingValue::Path(PathBuf::from("../outside")),
+        )]));
+        let error = LoadProfilesState::default()
+            .resolve(
+                &ModelId("model".to_owned()),
+                "q27",
+                None,
+                &invocation,
+                temporary.path(),
+            )
+            .expect_err("path escape");
+        assert!(error.to_string().contains("cannot escape"));
     }
 
     #[test]

@@ -1281,18 +1281,8 @@ impl EngineAdapter for Q27Adapter {
         let version = runtime.manifest.identity.version.as_str();
         let usage = usage.to_ascii_lowercase();
         let mut definitions = q27_load_setting_definitions();
+        apply_q27_runtime_bounds(&mut definitions, managed, version);
         for definition in &mut definitions {
-            if definition.id.as_str() == "context_length" {
-                definition.kind = LoadSettingKind::UnsignedInteger {
-                    minimum: Some(32),
-                    maximum: None,
-                };
-            } else if definition.id.as_str() == "parallel_requests" {
-                definition.kind = LoadSettingKind::UnsignedInteger {
-                    minimum: Some(1),
-                    maximum: Some(8),
-                };
-            }
             let option = q27_setting_option(definition.id.as_str());
             let unavailable_by_version =
                 q27_setting_unavailable_by_version(managed, version, option);
@@ -2122,6 +2112,29 @@ fn q27_setting_unavailable_by_version(managed: bool, version: &str, option: &str
             || (option.starts_with("--prefix-cache") && !version_at_least(version, 0, 6, 0)))
 }
 
+fn apply_q27_runtime_bounds(
+    definitions: &mut [LoadSettingDefinition],
+    managed: bool,
+    version: &str,
+) {
+    let maximum = managed.then(|| {
+        if version_at_least(version, 0, 3, 1) {
+            8
+        } else {
+            4
+        }
+    });
+    if let Some(definition) = definitions
+        .iter_mut()
+        .find(|definition| definition.id.as_str() == "parallel_requests")
+    {
+        definition.kind = LoadSettingKind::UnsignedInteger {
+            minimum: Some(1),
+            maximum,
+        };
+    }
+}
+
 #[derive(Debug)]
 struct Q27StructuredArguments {
     arguments: Vec<OsString>,
@@ -2466,8 +2479,8 @@ mod tests {
     use std::path::Path;
 
     use norted_core::{
-        AcceleratorDevice, ArtifactFormat, AuxiliaryArtifact, LoadSettingSource, ModelArtifact,
-        ModelId, ResolvedLoadSetting, ResolvedLoadSettings,
+        AcceleratorDevice, ArtifactFormat, AuxiliaryArtifact, LoadSettingSource,
+        LoadSettingsProvenance, ModelArtifact, ModelId, ResolvedLoadSetting, ResolvedLoadSettings,
     };
     use serde_json::json;
 
@@ -2526,6 +2539,105 @@ mod tests {
             ["--ctx", "65536", "--slots", "2", "--kv-fp16"]
         );
         assert_eq!(translated.environment_remove, [OsString::from("Q27_KV")]);
+    }
+
+    fn q27_schema_with_bounds(managed: bool, version: &str) -> LoadSettingsSchema {
+        let mut definitions = q27_load_setting_definitions();
+        apply_q27_runtime_bounds(&mut definitions, managed, version);
+        LoadSettingsSchema {
+            engine_id: ENGINE_ID.to_owned(),
+            runtime_id: None,
+            definitions,
+        }
+    }
+
+    #[test]
+    fn managed_parallel_request_bound_changes_at_v031() {
+        for (version, expected) in [("0.2.0", 4), ("0.3.0", 4), ("0.3.1", 8), ("0.6.2", 8)] {
+            let schema = q27_schema_with_bounds(true, version);
+            let definition = schema
+                .definitions
+                .iter()
+                .find(|definition| definition.id.as_str() == "parallel_requests")
+                .expect("parallel definition");
+            assert_eq!(
+                definition.kind,
+                LoadSettingKind::UnsignedInteger {
+                    minimum: Some(1),
+                    maximum: Some(expected),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn managed_v030_rejects_eight_slots_before_translation() {
+        let schema = q27_schema_with_bounds(true, "0.3.0");
+        let settings =
+            resolved_load_settings(&[("parallel_requests", LoadSettingValue::UnsignedInteger(8))]);
+        assert!(schema.validate(&settings).is_err());
+    }
+
+    #[test]
+    fn managed_v031_accepts_eight_slots() {
+        let schema = q27_schema_with_bounds(true, "0.3.1");
+        let settings =
+            resolved_load_settings(&[("parallel_requests", LoadSettingValue::UnsignedInteger(8))]);
+        schema.validate(&settings).expect("v0.3.1 eight slots");
+    }
+
+    #[test]
+    fn external_parallel_requests_has_no_invented_maximum() {
+        let schema = q27_schema_with_bounds(false, "external");
+        let settings =
+            resolved_load_settings(&[("parallel_requests", LoadSettingValue::UnsignedInteger(64))]);
+        schema
+            .validate(&settings)
+            .expect("external usage does not prove a maximum");
+        let translated =
+            translate_q27_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
+        assert_eq!(argument_strings(translated.arguments), ["--slots", "64"]);
+    }
+
+    #[test]
+    fn explicit_positive_context_below_32_remains_valid() {
+        let schema = q27_schema_with_bounds(true, "0.6.2");
+        let settings =
+            resolved_load_settings(&[("context_length", LoadSettingValue::UnsignedInteger(8))]);
+        schema
+            .validate(&settings)
+            .expect("explicit positive q27 context");
+        let translated =
+            translate_q27_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
+        assert_eq!(argument_strings(translated.arguments), ["--ctx", "8"]);
+    }
+
+    #[test]
+    fn prefix_cache_launch_argument_matches_the_effective_path() {
+        let path = std::env::temp_dir().join("norted-data/cache/q27");
+        let settings = resolved_load_settings(&[(
+            "q27.prefix_cache_path",
+            LoadSettingValue::Path(path.clone()),
+        )]);
+        let translated =
+            translate_q27_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
+        assert_eq!(
+            translated.arguments,
+            [
+                OsString::from("--prefix-cache"),
+                path.clone().into_os_string()
+            ]
+        );
+        let provenance = LoadSettingsProvenance {
+            effective: settings.effective.clone(),
+        };
+        assert_eq!(
+            provenance
+                .effective
+                .get(&LoadSettingId::new("q27.prefix_cache_path").expect("setting ID"))
+                .map(|setting| &setting.value),
+            Some(&LoadSettingValue::Path(path))
+        );
     }
 
     #[test]

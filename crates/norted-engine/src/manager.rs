@@ -408,6 +408,7 @@ impl RuntimeManager {
             &engine_id,
             profile.as_ref(),
             &invocation_settings,
+            &self.core.paths.data_dir,
         ) {
             Ok(settings) => settings,
             Err(error) => {

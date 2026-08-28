@@ -413,6 +413,7 @@ async fn exact_settings_context(
         &engine_id,
         profile,
         &LoadSettingsPatch::default(),
+        &core.paths.data_dir,
     )?;
     Ok((runtime_id, schema, resolved))
 }

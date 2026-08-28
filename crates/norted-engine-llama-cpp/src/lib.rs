@@ -541,6 +541,18 @@ impl EngineAdapter for LlamaCppAdapter {
                         definition.kind = LoadSettingKind::Choice { choices };
                     }
                 }
+                "llama.cpp.load_mode" => {
+                    let choices = advertised_llama_load_modes(&help);
+                    if choices.is_empty() {
+                        definition.supported = false;
+                        definition.unsupported_reason = Some(
+                            "the exact llama-server does not advertise any Norted-understood load modes"
+                                .to_owned(),
+                        );
+                    } else {
+                        definition.kind = LoadSettingKind::Choice { choices };
+                    }
+                }
                 _ => {}
             }
         }
@@ -1248,18 +1260,13 @@ fn llama_load_setting_definitions() -> Vec<LoadSettingDefinition> {
             Some("runtime-selected"),
         ),
         llama_definition(
-            "llama.cpp.mmap",
-            "Memory mapping",
-            "Explicitly enable or disable memory-mapped model loading",
-            LoadSettingKind::Toggle,
-            Some("runtime-selected"),
-        ),
-        llama_definition(
-            "llama.cpp.mlock",
-            "Lock model memory",
-            "Explicitly request that model memory is kept resident",
-            LoadSettingKind::OneWayFlag,
-            Some("disabled in current runtimes"),
+            "llama.cpp.load_mode",
+            "Model load mode",
+            "One unambiguous llama.cpp model-loading mode",
+            LoadSettingKind::Choice {
+                choices: llama_load_modes(),
+            },
+            Some("runtime-selected; omission preserves the exact runtime default"),
         ),
     ]);
     definitions
@@ -1297,6 +1304,13 @@ fn llama_cache_types() -> Vec<String> {
     .collect()
 }
 
+fn llama_load_modes() -> Vec<String> {
+    ["auto", "none", "mmap", "mlock", "mmap+mlock", "dio"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
 fn llama_setting_contract(id: &str) -> &'static [&'static str] {
     match id {
         "context_length" => &["--ctx-size"],
@@ -1308,29 +1322,79 @@ fn llama_setting_contract(id: &str) -> &'static [&'static str] {
         "llama.cpp.flash_attention" => &["--flash-attn"],
         "llama.cpp.kv_cache_k" => &["--cache-type-k"],
         "llama.cpp.kv_cache_v" => &["--cache-type-v"],
-        "llama.cpp.mmap" => &["--mmap", "--no-mmap"],
-        "llama.cpp.mlock" => &["--mlock"],
+        "llama.cpp.load_mode" => &["--load-mode"],
         _ => &[],
     }
 }
 
 fn help_has_option(help: &str, option: &str) -> bool {
-    help.split_whitespace().any(|token| {
-        token.trim_matches(|character: char| {
-            matches!(
-                character,
-                ',' | '[' | ']' | '(' | ')' | '{' | '}' | '<' | '>' | ':' | ';' | '`'
-            )
-        }) == option
+    help.lines()
+        .any(|line| help_line_has_option_header(line, option))
+}
+
+fn help_line_has_option_header(line: &str, option: &str) -> bool {
+    line.match_indices(option).any(|(index, _)| {
+        let prefix = &line[..index];
+        let suffix = &line[index + option.len()..];
+        let boundary_before = prefix
+            .chars()
+            .next_back()
+            .is_none_or(|character| character.is_whitespace() || character == ',');
+        let boundary_after = suffix
+            .chars()
+            .next()
+            .is_none_or(|character| character.is_whitespace() || matches!(character, ',' | '='));
+        let only_aliases_before = prefix
+            .split(|character: char| character.is_whitespace() || character == ',')
+            .filter(|token| !token.is_empty())
+            .all(|token| token.starts_with('-'));
+        boundary_before && boundary_after && only_aliases_before
     })
 }
 
 fn help_option_context(help: &str, option: &str) -> String {
     let lines = help.lines().collect::<Vec<_>>();
-    let Some(index) = lines.iter().position(|line| line.contains(option)) else {
+    let Some(index) = lines
+        .iter()
+        .position(|line| help_line_has_option_header(line, option))
+    else {
         return String::new();
     };
     lines[index..lines.len().min(index + 4)].join(" ")
+}
+
+fn help_option_block(help: &str, option: &str) -> String {
+    let lines = help.lines().collect::<Vec<_>>();
+    let Some(start) = lines
+        .iter()
+        .position(|line| help_line_has_option_header(line, option))
+    else {
+        return String::new();
+    };
+    let start_indent = lines[start]
+        .chars()
+        .take_while(|character| character.is_whitespace())
+        .count();
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(index, line)| {
+            let trimmed = line.trim_start();
+            let indent = line.len() - trimmed.len();
+            (!trimmed.is_empty() && indent <= start_indent && trimmed.starts_with('-'))
+                .then_some(index)
+        })
+        .unwrap_or(lines.len());
+    lines[start..end].join(" ")
+}
+
+fn advertised_llama_load_modes(help: &str) -> Vec<String> {
+    let contract = help_option_block(help, "--load-mode");
+    llama_load_modes()
+        .into_iter()
+        .filter(|choice| text_has_value(&contract, choice))
+        .collect()
 }
 
 fn text_has_value(text: &str, expected: &str) -> bool {
@@ -1358,21 +1422,22 @@ fn translate_llama_load_settings(
     let mut arguments = Vec::new();
     let mut environment_remove = Vec::new();
     for (id, resolved) in &settings.effective {
-        let (aliases, environment_name) = llama_setting_collision_contract(id.as_str());
+        let (aliases, environment_names) = llama_setting_collision_contract(id.as_str());
         if let Some(argument) = find_native_option(native_arguments, aliases) {
             return Err(EngineError::InvalidConfiguration(format!(
                 "structured load setting `{id}` conflicts with native llama.cpp argument `{argument}`"
             )));
         }
-        if let Some(name) = configured_environment
-            .keys()
-            .find(|name| name.eq_ignore_ascii_case(environment_name))
-        {
+        if let Some(name) = configured_environment.keys().find(|name| {
+            environment_names
+                .iter()
+                .any(|owned| name.eq_ignore_ascii_case(owned))
+        }) {
             return Err(EngineError::InvalidConfiguration(format!(
                 "structured load setting `{id}` conflicts with configured llama.cpp environment variable `{name}`"
             )));
         }
-        environment_remove.push(OsString::from(environment_name));
+        environment_remove.extend(environment_names.iter().map(OsString::from));
         match (id.as_str(), &resolved.value) {
             ("context_length", LoadSettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--ctx-size", *value);
@@ -1407,11 +1472,9 @@ fn translate_llama_load_settings(
             ("llama.cpp.kv_cache_v", LoadSettingValue::Choice(value)) => {
                 push_value_argument(&mut arguments, "--cache-type-v", value);
             }
-            ("llama.cpp.mmap", LoadSettingValue::Toggle(value)) => {
-                arguments.push(OsString::from(if *value { "--mmap" } else { "--no-mmap" }));
-            }
-            ("llama.cpp.mlock", LoadSettingValue::FlagEnabled) => {
-                arguments.push(OsString::from("--mlock"));
+            ("llama.cpp.load_mode", LoadSettingValue::Choice(value)) => {
+                arguments.push(OsString::from("--load-mode"));
+                arguments.push(OsString::from(value));
             }
             _ => {
                 return Err(EngineError::InvalidConfiguration(format!(
@@ -1426,23 +1489,44 @@ fn translate_llama_load_settings(
     })
 }
 
-fn llama_setting_collision_contract(id: &str) -> (&'static [&'static str], &'static str) {
+fn llama_setting_collision_contract(
+    id: &str,
+) -> (&'static [&'static str], &'static [&'static str]) {
     match id {
-        "context_length" => (&["-c", "--ctx-size"], "LLAMA_ARG_CTX_SIZE"),
-        "parallel_requests" => (&["-np", "--parallel"], "LLAMA_ARG_N_PARALLEL"),
-        "llama.cpp.threads" => (&["-t", "--threads"], "LLAMA_ARG_THREADS"),
-        "llama.cpp.batch_size" => (&["-b", "--batch-size"], "LLAMA_ARG_BATCH"),
-        "llama.cpp.micro_batch_size" => (&["-ub", "--ubatch-size"], "LLAMA_ARG_UBATCH"),
+        "context_length" => (&["-c", "--ctx-size"], &["LLAMA_ARG_CTX_SIZE"]),
+        "parallel_requests" => (&["-np", "--parallel"], &["LLAMA_ARG_N_PARALLEL"]),
+        "llama.cpp.threads" => (&["-t", "--threads"], &["LLAMA_ARG_THREADS"]),
+        "llama.cpp.batch_size" => (&["-b", "--batch-size"], &["LLAMA_ARG_BATCH"]),
+        "llama.cpp.micro_batch_size" => (&["-ub", "--ubatch-size"], &["LLAMA_ARG_UBATCH"]),
         "llama.cpp.gpu_offload" => (
             &["-ngl", "--gpu-layers", "--n-gpu-layers"],
-            "LLAMA_ARG_N_GPU_LAYERS",
+            &["LLAMA_ARG_N_GPU_LAYERS"],
         ),
-        "llama.cpp.flash_attention" => (&["-fa", "--flash-attn"], "LLAMA_ARG_FLASH_ATTN"),
-        "llama.cpp.kv_cache_k" => (&["-ctk", "--cache-type-k"], "LLAMA_ARG_CACHE_TYPE_K"),
-        "llama.cpp.kv_cache_v" => (&["-ctv", "--cache-type-v"], "LLAMA_ARG_CACHE_TYPE_V"),
-        "llama.cpp.mmap" => (&["--mmap", "--no-mmap"], "LLAMA_ARG_MMAP"),
-        "llama.cpp.mlock" => (&["--mlock"], "LLAMA_ARG_MLOCK"),
-        _ => (&[], ""),
+        "llama.cpp.flash_attention" => (&["-fa", "--flash-attn"], &["LLAMA_ARG_FLASH_ATTN"]),
+        "llama.cpp.kv_cache_k" => (&["-ctk", "--cache-type-k"], &["LLAMA_ARG_CACHE_TYPE_K"]),
+        "llama.cpp.kv_cache_v" => (&["-ctv", "--cache-type-v"], &["LLAMA_ARG_CACHE_TYPE_V"]),
+        "llama.cpp.load_mode" => (
+            &[
+                "-lm",
+                "--load-mode",
+                "--mmap",
+                "--no-mmap",
+                "--mlock",
+                "-dio",
+                "--direct-io",
+                "-ndio",
+                "--no-direct-io",
+            ],
+            &[
+                "LLAMA_ARG_LOAD_MODE",
+                "LLAMA_ARG_MMAP",
+                "LLAMA_ARG_NO_MMAP",
+                "LLAMA_ARG_MLOCK",
+                "LLAMA_ARG_DIO",
+                "LLAMA_ARG_NO_DIO",
+            ],
+        ),
+        _ => (&[], &[]),
     }
 }
 
@@ -1686,6 +1770,98 @@ mod load_settings_tests {
                 "3",
             ]
         );
+    }
+
+    #[test]
+    fn exact_advertised_load_modes_translate_once() {
+        let help = "  --mlock  DEPRECATED in favor of --load-mode mlock\n\
+                    \x20\x20-lm, --load-mode MODE  model loading mode\n\
+                    \x20\x20\x20\x20- auto: automatic\n\
+                    \x20\x20\x20\x20- none: ordinary reads\n\
+                    \x20\x20\x20\x20- mmap: memory map\n\
+                    \x20\x20\x20\x20- mlock: lock memory\n\
+                    \x20\x20\x20\x20- mmap+mlock: map and lock\n\
+                    \x20\x20\x20\x20- dio: direct I/O\n\
+                    \x20\x20--next-option VALUE  unrelated";
+        assert_eq!(advertised_llama_load_modes(help), llama_load_modes());
+        assert!(help_has_option(help, "--load-mode"));
+
+        let translated = translate_llama_load_settings(
+            &resolved(&[(
+                "llama.cpp.load_mode",
+                LoadSettingValue::Choice("mmap+mlock".to_owned()),
+            )]),
+            &[],
+            &BTreeMap::new(),
+        )
+        .expect("load-mode translation");
+        assert_eq!(strings(translated.arguments), ["--load-mode", "mmap+mlock"]);
+    }
+
+    #[test]
+    fn structured_load_mode_owns_every_equivalent_native_argument() {
+        let settings = resolved(&[(
+            "llama.cpp.load_mode",
+            LoadSettingValue::Choice("mmap".to_owned()),
+        )]);
+        for argument in [
+            "-lm",
+            "--load-mode=none",
+            "--mmap",
+            "--mmap=false",
+            "--no-mmap",
+            "--mlock",
+            "-dio",
+            "--direct-io",
+            "-ndio",
+            "--no-direct-io=true",
+        ] {
+            let error =
+                translate_llama_load_settings(&settings, &[argument.to_owned()], &BTreeMap::new())
+                    .expect_err("native load-mode collision");
+            assert!(error.to_string().contains(argument), "{error}");
+        }
+    }
+
+    #[test]
+    fn structured_load_mode_owns_equivalent_environment_only_when_active() {
+        let settings = resolved(&[(
+            "llama.cpp.load_mode",
+            LoadSettingValue::Choice("dio".to_owned()),
+        )]);
+        let equivalent = [
+            "LLAMA_ARG_LOAD_MODE",
+            "LLAMA_ARG_MMAP",
+            "LLAMA_ARG_NO_MMAP",
+            "LLAMA_ARG_MLOCK",
+            "LLAMA_ARG_DIO",
+            "LLAMA_ARG_NO_DIO",
+        ];
+        for name in equivalent {
+            let error = translate_llama_load_settings(
+                &settings,
+                &[],
+                &BTreeMap::from([(name.to_owned(), "1".to_owned())]),
+            )
+            .expect_err("configured environment collision");
+            assert!(error.to_string().contains(name), "{error}");
+        }
+
+        let translated =
+            translate_llama_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
+        assert_eq!(
+            translated.environment_remove,
+            equivalent.map(OsString::from)
+        );
+
+        let absent = translate_llama_load_settings(
+            &resolved(&[]),
+            &["--load-mode=none".to_owned()],
+            &BTreeMap::from([("LLAMA_ARG_MMAP".to_owned(), "0".to_owned())]),
+        )
+        .expect("native controls remain available without structured ownership");
+        assert!(absent.arguments.is_empty());
+        assert!(absent.environment_remove.is_empty());
     }
 
     #[test]
