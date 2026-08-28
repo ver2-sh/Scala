@@ -12,33 +12,32 @@ use std::time::Duration;
 use color_eyre::Result;
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
-use norted_core::{AppPaths, ApplicationCore};
+use norted_core::{
+    AppPaths, ApplicationCore, LoadProfilesStore, LoadSettingDefinition, LoadSettingsError,
+    LoadSettingsPatch,
+};
 use norted_engine::{ControlClient, ControlClientError, ControlStatus, RuntimePackManager};
 
-use app::{App, ControlAction, RuntimeAction, RuntimeTaskResult, Update};
+use app::{
+    App, ControlAction, ModelSettingsInspection, RuntimeAction, RuntimeTaskResult, SettingsAction,
+    SettingsScope, SettingsTaskResult, Update,
+};
 use terminal::TerminalSession;
 use ui::layout::UiLayout;
 
-pub async fn run(core: Arc<ApplicationCore>, runtime_packs: Arc<RuntimePackManager>) -> Result<()> {
+pub async fn run(
+    core: Arc<ApplicationCore>,
+    runtime_packs: Arc<RuntimePackManager>,
+    load_setting_definitions: Vec<LoadSettingDefinition>,
+) -> Result<()> {
     let mut terminal = TerminalSession::enter()?;
     let mut core_events = core.subscribe();
     let snapshot = core.snapshot().await;
-    let server_address = format!("{}:{}", core.config.server.host, core.config.server.port);
-    let config_path = core.config_path.display().to_string();
-    let model_paths = core
-        .config
-        .models
-        .paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect();
     let mut app = App::new(
         snapshot,
         core.config.tui.no_color,
         core.config.tui.unicode,
-        server_address,
-        config_path,
-        model_paths,
+        load_setting_definitions,
     );
     let mut layout = UiLayout::default();
     terminal.draw(|frame| layout = ui::render(frame, &app))?;
@@ -48,12 +47,19 @@ pub async fn run(core: Arc<ApplicationCore>, runtime_packs: Arc<RuntimePackManag
     let (control_updates, mut control_update_receiver) = tokio::sync::mpsc::channel(2);
     let (control_results, mut control_result_receiver) = tokio::sync::mpsc::channel(2);
     let (runtime_results, mut runtime_result_receiver) = tokio::sync::mpsc::channel(4);
+    let (settings_results, mut settings_result_receiver) = tokio::sync::mpsc::channel(4);
     let mut runtime_progress = runtime_packs.progress();
     spawn_runtime_action(
         Arc::clone(&runtime_packs),
         core.paths.clone(),
         runtime_results.clone(),
         RuntimeAction::RefreshList,
+    );
+    spawn_settings_action(
+        Arc::clone(&runtime_packs),
+        core.paths.clone(),
+        settings_results.clone(),
+        SettingsAction::Refresh,
     );
     let observer_core = Arc::clone(&core);
     let observer_paths = core.paths.clone();
@@ -123,6 +129,13 @@ pub async fn run(core: Arc<ApplicationCore>, runtime_packs: Arc<RuntimePackManag
                 }
                 None => Update::None,
             },
+            result = settings_result_receiver.recv() => match result {
+                Some(result) => {
+                    app.handle_settings_task_result(result);
+                    Update::Render
+                }
+                None => Update::None,
+            },
             progress = runtime_progress.recv() => match progress {
                 Ok(progress) => {
                     app.handle_runtime_progress(progress);
@@ -151,11 +164,182 @@ pub async fn run(core: Arc<ApplicationCore>, runtime_packs: Arc<RuntimePackManag
                 action,
             );
         }
+        if let Some(action) = app.take_settings_action() {
+            spawn_settings_action(
+                Arc::clone(&runtime_packs),
+                core.paths.clone(),
+                settings_results.clone(),
+                action,
+            );
+        }
         render = update == Update::Render;
     }
     runtime_observer.abort();
     terminal.leave()?;
     Ok(())
+}
+
+fn spawn_settings_action(
+    runtime_packs: Arc<RuntimePackManager>,
+    paths: AppPaths,
+    results: tokio::sync::mpsc::Sender<SettingsTaskResult>,
+    action: SettingsAction,
+) {
+    tokio::spawn(async move {
+        let result = execute_settings_action(runtime_packs, &paths, action).await;
+        let _ = results.send(result).await;
+    });
+}
+
+async fn execute_settings_action(
+    runtime_packs: Arc<RuntimePackManager>,
+    paths: &AppPaths,
+    action: SettingsAction,
+) -> SettingsTaskResult {
+    let store = LoadProfilesStore::new(paths);
+    match action {
+        SettingsAction::Refresh => {
+            SettingsTaskResult::Loaded(store.read().await.map_err(|error| error.to_string()))
+        }
+        SettingsAction::Set { scope, id, value } => {
+            let result = store
+                .update(move |state| {
+                    match scope {
+                        SettingsScope::Global => {
+                            if id.namespace().is_some() {
+                                return Err(LoadSettingsError::InvalidGlobalSetting(id));
+                            }
+                            state.global_defaults.insert(id, value);
+                        }
+                        SettingsScope::Engine(engine_id) => {
+                            if !id.applies_to_engine(&engine_id) {
+                                return Err(LoadSettingsError::WrongEngineScope {
+                                    setting_id: id,
+                                    engine_id,
+                                });
+                            }
+                            state
+                                .engine_defaults
+                                .entry(engine_id)
+                                .or_default()
+                                .insert(id, value);
+                        }
+                        SettingsScope::Profile(profile) => {
+                            state
+                                .profiles
+                                .get_mut(&profile)
+                                .ok_or_else(|| LoadSettingsError::ProfileNotFound(profile.clone()))?
+                                .settings
+                                .insert(id, value);
+                        }
+                        SettingsScope::Model(model) => {
+                            state
+                                .model_defaults
+                                .entry(model)
+                                .or_default()
+                                .insert(id, value);
+                        }
+                    }
+                    Ok(state.clone())
+                })
+                .await
+                .map_err(|error| error.to_string());
+            SettingsTaskResult::Stored(result)
+        }
+        SettingsAction::Unset { scope, id } => {
+            let result = store
+                .update(move |state| {
+                    let cleanup_scope = scope.clone();
+                    let patch = match scope {
+                        SettingsScope::Global => &mut state.global_defaults,
+                        SettingsScope::Engine(engine) => {
+                            state.engine_defaults.entry(engine).or_default()
+                        }
+                        SettingsScope::Profile(profile) => {
+                            &mut state
+                                .profiles
+                                .get_mut(&profile)
+                                .ok_or_else(|| LoadSettingsError::ProfileNotFound(profile.clone()))?
+                                .settings
+                        }
+                        SettingsScope::Model(model) => {
+                            state.model_defaults.entry(model).or_default()
+                        }
+                    };
+                    patch.remove(&id);
+                    if patch.is_empty() {
+                        match cleanup_scope {
+                            SettingsScope::Engine(engine) => {
+                                state.engine_defaults.remove(&engine);
+                            }
+                            SettingsScope::Model(model) => {
+                                state.model_defaults.remove(&model);
+                            }
+                            SettingsScope::Global | SettingsScope::Profile(_) => {}
+                        }
+                    }
+                    Ok(state.clone())
+                })
+                .await
+                .map_err(|error| error.to_string());
+            SettingsTaskResult::Stored(result)
+        }
+        SettingsAction::CreateProfile(profile) => {
+            let result = store
+                .update(move |state| {
+                    state.create_profile(profile)?;
+                    Ok(state.clone())
+                })
+                .await
+                .map_err(|error| error.to_string());
+            SettingsTaskResult::Stored(result)
+        }
+        SettingsAction::DeleteProfile(profile) => {
+            let result = store
+                .update(move |state| {
+                    state.delete_profile(&profile)?;
+                    Ok(state.clone())
+                })
+                .await
+                .map_err(|error| error.to_string());
+            SettingsTaskResult::Stored(result)
+        }
+        SettingsAction::AssignProfile { model_id, profile } => {
+            let result = store
+                .update(move |state| {
+                    state.assign_profile(model_id, profile)?;
+                    Ok(state.clone())
+                })
+                .await
+                .map_err(|error| error.to_string());
+            SettingsTaskResult::Stored(result)
+        }
+        SettingsAction::InspectModel(model) => {
+            let model_id = model.id.clone();
+            let result = async {
+                let profiles = store.read().await.map_err(|error| error.to_string())?;
+                runtime_packs.refresh_host_capabilities().await;
+                let (selection, schema) = runtime_packs
+                    .load_settings_schema_for_model(&model, None)
+                    .await
+                    .map_err(|error| format!(
+                        "No compatible installed runtime is available to validate these settings. Open Runtimes search to install one: {error}"
+                    ))?;
+                let engine_id = &selection.runtime.manifest.identity.engine_id;
+                let resolved = profiles
+                    .resolve(&model.id, engine_id, None, &LoadSettingsPatch::default())
+                    .map_err(|error| error.to_string())?;
+                Ok(ModelSettingsInspection {
+                    profiles,
+                    runtime_id: selection.runtime.manifest.runtime_id,
+                    schema,
+                    resolved,
+                })
+            }
+            .await;
+            SettingsTaskResult::Inspected { model_id, result }
+        }
+    }
 }
 
 fn spawn_runtime_action(

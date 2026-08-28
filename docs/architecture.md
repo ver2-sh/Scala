@@ -54,15 +54,25 @@ The public listener is configurable and defaults to `127.0.0.1:8742`. Backend an
 
 ## Crate responsibilities
 
-- `norted-core` owns platform paths, schema-version-1 configuration, model/auxiliary-artifact discovery, stable IDs, runtime identity/manifest/preferences data, host-independent provenance, application state, and process descriptors.
+- `norted-core` owns platform paths, schema-version-1 configuration, the typed load-setting/profile domain and five-layer resolver, the versioned atomic profile store, model/auxiliary-artifact discovery, stable IDs, runtime identity/manifest/preferences data, host-independent provenance, application state, and process descriptors.
 - `norted-engine` owns `EngineAdapter`, `EngineRegistry`, the provider/catalog/cache, secure installer, runtime store and resolver, runtime/backend manager, generic process supervisor, control client, and normalized inference types.
 - `norted-engine-llama-cpp` owns official llama.cpp asset classification, binary probes, flags/environment policy, readiness and `/props`, and Chat Completions JSON/SSE translation.
 - `norted-engine-q27` owns official q27 asset/variant classification, tokenizer requirements, usage-signature probes, flags/environment policy, readiness, provable sampler settings, and Chat Completions JSON/SSE translation.
 - `norted-api` owns the public Responses subset and private authenticated control HTTP surfaces. It does not construct upstream flags or expose backend-native bytes.
-- `norted-tui` owns terminal lifecycle, responsive rendering, runtime search/install/selection interaction, and normalized control observation.
+- `norted-tui` owns terminal lifecycle, responsive rendering, runtime search/install/selection interaction, the generic schema-driven load-settings editor, and normalized control observation.
 - `norted-server` is the composition root and scriptable CLI.
 
 Adapter registration and provider registration are separate. A built-in engine can be enabled even when no runtime is installed; conversely, every installed manifest still requires its corresponding registered adapter before it can launch.
+
+## Load-setting resolution
+
+`Engine`, `Runtime`, `LoadProfile`, and request-time generation settings are distinct domains. `LoadSettingDefinition` describes a stable common or engine-namespaced ID, typed value kind, constraints/choices, documentation, and exact-runtime support. `LoadProfilesState` schema 1 lives at `<data>/load-profiles.json`; it is mutable user state, uses a dedicated cross-process lock plus atomic replacement, and is never written into TOML or a runtime manifest.
+
+One core resolver applies global, selected-engine, model, named-profile, then invocation patches. It filters unrelated engine namespaces while retaining them in model/profile state, records the winning source for every value, and produces no entry for an upstream default. An invocation profile replaces the model assignment for that load. Invocation values are never written back.
+
+Runtime selection still happens first. The selected adapter observes the exact executable interface, returns an exact `LoadSettingsSchema`, validates resolved values, detects native argument/environment collisions, and translates only explicit values into arguments/removals. llama.cpp help observations are keyed by exact runtime ID and entrypoint hash. q27 combines exact usage observation with its known version gates. `LaunchRequest` carries the prepared model, exact runtime, selected accelerator, private address, resolved settings, and exact schema; adapters do not read profile files.
+
+`RuntimeProvenance.profile` remains the selected profile name. The separate `load_settings.effective` snapshot stores stable typed values and precedence sources. Existing normalized adapter/generation facts and redacted native arguments keep their prior meanings.
 
 ## Runtime identity and store
 

@@ -14,9 +14,11 @@ use futures_util::{StreamExt, stream};
 use norted_core::{
     AcceleratorDevice, AcquisitionMethod, ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime,
     ComputeCapability, EngineConfig, EngineInstallation, EngineRevision, HostCapabilities,
-    InstalledRuntime, ModelArtifact, RuntimeAcquisitionMethod, RuntimeArchiveFormat,
-    RuntimeCompatibility, RuntimeDigest, RuntimeDownload, RuntimeId, RuntimeIdentity,
-    RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel, RuntimeRequirements,
+    InstalledRuntime, LoadSettingDefinition, LoadSettingId, LoadSettingKind, LoadSettingScope,
+    LoadSettingValue, LoadSettingsSchema, ModelArtifact, RuntimeAcquisitionMethod,
+    RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest, RuntimeDownload, RuntimeId,
+    RuntimeIdentity, RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel,
+    RuntimeRequirements,
 };
 use norted_engine::{
     ApiCapability, CatalogError, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
@@ -25,7 +27,8 @@ use norted_engine::{
     InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
     InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind,
     PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
-    UpdateState, capture_command, compatibility_for, compatibility_for_nvidia_device,
+    UpdateState, capture_command, common_load_setting_definitions, compatibility_for,
+    compatibility_for_nvidia_device,
 };
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -729,6 +732,7 @@ pub struct Q27Adapter {
     environment: BTreeMap<String, String>,
     configuration_error: Option<String>,
     client: reqwest::Client,
+    capability_cache: tokio::sync::RwLock<BTreeMap<String, String>>,
 }
 
 impl Q27Adapter {
@@ -848,6 +852,7 @@ impl Q27Adapter {
             environment,
             configuration_error,
             client,
+            capability_cache: tokio::sync::RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -963,6 +968,10 @@ impl Q27Adapter {
                 })
             )));
         }
+        self.capability_cache
+            .write()
+            .await
+            .insert(binary_sha256.clone(), usage.clone());
         let observed_at_unix = unix_timestamp();
         Ok((
             binary_path,
@@ -1245,6 +1254,67 @@ impl EngineAdapter for Q27Adapter {
         }]
     }
 
+    fn load_setting_definitions(&self) -> Vec<LoadSettingDefinition> {
+        q27_load_setting_definitions()
+    }
+
+    async fn load_settings_schema(
+        &self,
+        runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _host: &HostCapabilities,
+    ) -> Result<LoadSettingsSchema, EngineError> {
+        self.probe_runtime(runtime).await?;
+        let usage = self
+            .capability_cache
+            .read()
+            .await
+            .get(&runtime.manifest.entrypoint_sha256.to_ascii_lowercase())
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Operation("q27 usage observation was not cached".to_owned())
+            })?;
+        let managed = !matches!(
+            runtime.manifest.acquisition_method,
+            RuntimeAcquisitionMethod::ExternalBinary
+        );
+        let version = runtime.manifest.identity.version.as_str();
+        let usage = usage.to_ascii_lowercase();
+        let mut definitions = q27_load_setting_definitions();
+        for definition in &mut definitions {
+            if definition.id.as_str() == "context_length" {
+                definition.kind = LoadSettingKind::UnsignedInteger {
+                    minimum: Some(32),
+                    maximum: None,
+                };
+            } else if definition.id.as_str() == "parallel_requests" {
+                definition.kind = LoadSettingKind::UnsignedInteger {
+                    minimum: Some(1),
+                    maximum: Some(8),
+                };
+            }
+            let option = q27_setting_option(definition.id.as_str());
+            let unavailable_by_version =
+                q27_setting_unavailable_by_version(managed, version, option);
+            let missing_from_contract = !usage_has_token(&usage, option)
+                || (definition.id.as_str() == "q27.fast_head"
+                    && !usage_has_token(&usage, "--no-fast-head"));
+            if unavailable_by_version || missing_from_contract {
+                definition.supported = false;
+                definition.unsupported_reason = Some(if unavailable_by_version {
+                    format!("q27 runtime {version} predates `{option}`")
+                } else {
+                    format!("the exact q27-server usage contract does not advertise `{option}`")
+                });
+            }
+        }
+        Ok(LoadSettingsSchema {
+            engine_id: ENGINE_ID.to_owned(),
+            runtime_id: Some(runtime.manifest.runtime_id.clone()),
+            definitions,
+        })
+    }
+
     async fn probe(&self) -> Result<EngineProbe, EngineError> {
         Ok(self.probe_uncached().await)
     }
@@ -1331,6 +1401,15 @@ impl EngineAdapter for Q27Adapter {
                 "q27 can only launch Q27 model artifacts".to_owned(),
             ));
         }
+        request
+            .load_settings_schema
+            .validate(&request.load_settings)
+            .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
+        let structured = translate_q27_load_settings(
+            &request.load_settings,
+            &self.native_arguments,
+            &self.environment,
+        )?;
         if !matches!(
             request.runtime.manifest.acquisition_method,
             RuntimeAcquisitionMethod::ExternalBinary
@@ -1397,6 +1476,7 @@ impl EngineAdapter for Q27Adapter {
             OsString::from("--no-think"),
         ]
         .into_iter()
+        .chain(structured.arguments)
         .chain(self.native_arguments.iter().map(OsString::from))
         .collect();
         let accelerator = request.accelerator.ok_or_else(|| {
@@ -1406,11 +1486,13 @@ impl EngineAdapter for Q27Adapter {
             )
         })?;
         let environment = q27_launch_environment(&self.environment, &accelerator)?;
+        let mut environment_remove = managed_environment_removals();
+        environment_remove.extend(structured.environment_remove);
         Ok(LaunchSpec {
             executable: binary_path,
             arguments,
             environment,
-            environment_remove: managed_environment_removals(),
+            environment_remove,
             inherits_parent_environment: true,
             working_directory: None,
             endpoint: Some(http_endpoint(request.backend_address)),
@@ -1419,6 +1501,7 @@ impl EngineAdapter for Q27Adapter {
                 ("top_p".to_owned(), json!(1.0)),
                 ("thinking".to_owned(), json!(false)),
             ]),
+            load_settings: request.load_settings,
             native_arguments: self.native_arguments.clone(),
             installation,
             runtime: request.runtime,
@@ -1916,6 +1999,243 @@ fn invalid_probe(reason: String) -> EngineProbe {
     }
 }
 
+fn q27_load_setting_definitions() -> Vec<LoadSettingDefinition> {
+    let mut definitions = common_load_setting_definitions();
+    definitions.extend([
+        q27_definition(
+            "q27.kv_fp16",
+            "FP16 KV cache",
+            "Opt in to q27's FP16 KV cache",
+            LoadSettingKind::OneWayFlag,
+            Some("runtime/profile-selected KV format"),
+        ),
+        q27_definition(
+            "q27.fast_head",
+            "Fast head",
+            "Explicitly enable or disable q27 fast-head behavior",
+            LoadSettingKind::Toggle,
+            Some("runtime profile-selected"),
+        ),
+        q27_definition(
+            "q27.prefix_cache_path",
+            "Prefix cache path",
+            "Directory for q27's persistent prefix cache",
+            LoadSettingKind::Path,
+            Some("disabled"),
+        ),
+        q27_definition(
+            "q27.prefix_cache_max_gb",
+            "Prefix cache disk budget",
+            "Persistent prefix-cache LRU disk budget",
+            LoadSettingKind::Float {
+                minimum: Some(0.0),
+                maximum: None,
+            },
+            Some("20 GB in current runtimes"),
+        ),
+        q27_definition(
+            "q27.prefix_cache_min_tokens",
+            "Prefix cache minimum",
+            "Shortest prefix eligible for persistence",
+            LoadSettingKind::UnsignedInteger {
+                minimum: Some(1),
+                maximum: None,
+            },
+            Some("4096 tokens in current runtimes"),
+        ),
+        q27_definition(
+            "q27.prefix_cache_max_tokens",
+            "Prefix cache maximum",
+            "Largest prefix staged for persistence",
+            LoadSettingKind::UnsignedInteger {
+                minimum: Some(1),
+                maximum: None,
+            },
+            Some("32768 tokens in current runtimes"),
+        ),
+        q27_definition(
+            "q27.prefix_cache_step_tokens",
+            "Prefix cache step",
+            "Token growth required before re-persisting a conversation",
+            LoadSettingKind::UnsignedInteger {
+                minimum: Some(1),
+                maximum: None,
+            },
+            Some("8192 tokens in current runtimes"),
+        ),
+        q27_definition(
+            "q27.prefix_cache_ram_gb",
+            "Prefix cache RAM budget",
+            "Pinned host-RAM prefix-cache tier budget",
+            LoadSettingKind::Float {
+                minimum: Some(0.0),
+                maximum: None,
+            },
+            Some("disabled"),
+        ),
+    ]);
+    definitions
+}
+
+fn q27_definition(
+    id: &str,
+    label: &str,
+    description: &str,
+    kind: LoadSettingKind,
+    upstream_default: Option<&str>,
+) -> LoadSettingDefinition {
+    LoadSettingDefinition {
+        id: LoadSettingId::new(id).expect("static q27 setting ID"),
+        label: label.to_owned(),
+        description: description.to_owned(),
+        kind,
+        scope: LoadSettingScope::Engine {
+            engine_id: ENGINE_ID.to_owned(),
+        },
+        supported: true,
+        unsupported_reason: None,
+        unit: None,
+        upstream_default: upstream_default.map(str::to_owned),
+        recommendation: None,
+    }
+}
+
+fn q27_setting_option(id: &str) -> &'static str {
+    match id {
+        "context_length" => "--ctx",
+        "parallel_requests" => "--slots",
+        "q27.kv_fp16" => "--kv-fp16",
+        "q27.fast_head" => "--fast-head",
+        "q27.prefix_cache_path" => "--prefix-cache",
+        "q27.prefix_cache_max_gb" => "--prefix-cache-max-gb",
+        "q27.prefix_cache_min_tokens" => "--prefix-cache-min",
+        "q27.prefix_cache_max_tokens" => "--prefix-cache-max-tokens",
+        "q27.prefix_cache_step_tokens" => "--prefix-cache-step",
+        "q27.prefix_cache_ram_gb" => "--prefix-cache-ram-gb",
+        _ => "",
+    }
+}
+
+fn q27_setting_unavailable_by_version(managed: bool, version: &str, option: &str) -> bool {
+    managed
+        && ((option == "--prefix-cache-ram-gb" && !version_at_least(version, 0, 6, 1))
+            || (option.starts_with("--prefix-cache") && !version_at_least(version, 0, 6, 0)))
+}
+
+#[derive(Debug)]
+struct Q27StructuredArguments {
+    arguments: Vec<OsString>,
+    environment_remove: Vec<OsString>,
+}
+
+fn translate_q27_load_settings(
+    settings: &norted_core::ResolvedLoadSettings,
+    native_arguments: &[String],
+    configured_environment: &BTreeMap<String, String>,
+) -> Result<Q27StructuredArguments, EngineError> {
+    let has_prefix_path = settings.value("q27.prefix_cache_path").is_some();
+    if !has_prefix_path
+        && settings.effective.keys().any(|id| {
+            id.as_str().starts_with("q27.prefix_cache_") && id.as_str() != "q27.prefix_cache_path"
+        })
+    {
+        return Err(EngineError::InvalidConfiguration(
+            "q27 prefix-cache tuning settings require `q27.prefix_cache_path` so the runtime cannot silently ignore them"
+                .to_owned(),
+        ));
+    }
+
+    let mut arguments = Vec::new();
+    let mut environment_remove = Vec::new();
+    for (id, resolved) in &settings.effective {
+        let aliases = match id.as_str() {
+            "q27.fast_head" => vec!["--fast-head", "--no-fast-head"],
+            value => vec![q27_setting_option(value)],
+        };
+        if let Some(argument) = find_q27_native_option(native_arguments, &aliases) {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "structured load setting `{id}` conflicts with native q27 argument `{argument}`"
+            )));
+        }
+        if id.as_str() == "q27.kv_fp16" {
+            if let Some(name) = configured_environment
+                .keys()
+                .find(|name| name.eq_ignore_ascii_case("Q27_KV"))
+            {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "structured load setting `{id}` conflicts with configured q27 environment variable `{name}`"
+                )));
+            }
+            environment_remove.push(OsString::from("Q27_KV"));
+        }
+        match (id.as_str(), &resolved.value) {
+            ("context_length", LoadSettingValue::UnsignedInteger(value)) => {
+                push_q27_value_argument(&mut arguments, "--ctx", value);
+            }
+            ("parallel_requests", LoadSettingValue::UnsignedInteger(value)) => {
+                push_q27_value_argument(&mut arguments, "--slots", value);
+            }
+            ("q27.kv_fp16", LoadSettingValue::FlagEnabled) => {
+                arguments.push(OsString::from("--kv-fp16"));
+            }
+            ("q27.fast_head", LoadSettingValue::Toggle(value)) => {
+                arguments.push(OsString::from(if *value {
+                    "--fast-head"
+                } else {
+                    "--no-fast-head"
+                }));
+            }
+            ("q27.prefix_cache_path", LoadSettingValue::Path(value)) => {
+                arguments.push(OsString::from("--prefix-cache"));
+                arguments.push(value.as_os_str().to_owned());
+            }
+            ("q27.prefix_cache_max_gb", LoadSettingValue::Float(value)) => {
+                push_q27_value_argument(&mut arguments, "--prefix-cache-max-gb", value);
+            }
+            ("q27.prefix_cache_min_tokens", LoadSettingValue::UnsignedInteger(value)) => {
+                push_q27_value_argument(&mut arguments, "--prefix-cache-min", value);
+            }
+            ("q27.prefix_cache_max_tokens", LoadSettingValue::UnsignedInteger(value)) => {
+                push_q27_value_argument(&mut arguments, "--prefix-cache-max-tokens", value);
+            }
+            ("q27.prefix_cache_step_tokens", LoadSettingValue::UnsignedInteger(value)) => {
+                push_q27_value_argument(&mut arguments, "--prefix-cache-step", value);
+            }
+            ("q27.prefix_cache_ram_gb", LoadSettingValue::Float(value)) => {
+                push_q27_value_argument(&mut arguments, "--prefix-cache-ram-gb", value);
+            }
+            _ => {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "load setting `{id}` has an invalid value for q27"
+                )));
+            }
+        }
+    }
+    Ok(Q27StructuredArguments {
+        arguments,
+        environment_remove,
+    })
+}
+
+fn find_q27_native_option<'a>(arguments: &'a [String], aliases: &[&str]) -> Option<&'a str> {
+    arguments.iter().find_map(|argument| {
+        aliases
+            .iter()
+            .any(|alias| {
+                argument == alias
+                    || argument
+                        .strip_prefix(alias)
+                        .is_some_and(|suffix| suffix.starts_with('='))
+            })
+            .then_some(argument.as_str())
+    })
+}
+
+fn push_q27_value_argument(arguments: &mut Vec<OsString>, option: &str, value: impl ToString) {
+    arguments.push(OsString::from(option));
+    arguments.push(OsString::from(value.to_string()));
+}
+
 fn q27_usage_contract_error(output: &str, native_arguments: &[String]) -> Option<String> {
     let output = output.to_ascii_lowercase();
     let positional_contract = output.contains("usage:")
@@ -2146,11 +2466,128 @@ mod tests {
     use std::path::Path;
 
     use norted_core::{
-        AcceleratorDevice, ArtifactFormat, AuxiliaryArtifact, ModelArtifact, ModelId,
+        AcceleratorDevice, ArtifactFormat, AuxiliaryArtifact, LoadSettingSource, ModelArtifact,
+        ModelId, ResolvedLoadSetting, ResolvedLoadSettings,
     };
     use serde_json::json;
 
     use super::*;
+
+    fn resolved_load_settings(values: &[(&str, LoadSettingValue)]) -> ResolvedLoadSettings {
+        let effective = values
+            .iter()
+            .map(|(id, value)| {
+                (
+                    LoadSettingId::new(*id).expect("setting ID"),
+                    ResolvedLoadSetting {
+                        value: value.clone(),
+                        source: LoadSettingSource::Invocation,
+                    },
+                )
+            })
+            .collect();
+        ResolvedLoadSettings {
+            engine_id: ENGINE_ID.to_owned(),
+            selected_profile: None,
+            effective,
+        }
+    }
+
+    fn argument_strings(arguments: Vec<OsString>) -> Vec<String> {
+        arguments
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn omitted_settings_emit_no_q27_arguments() {
+        let translated =
+            translate_q27_load_settings(&resolved_load_settings(&[]), &[], &BTreeMap::new())
+                .expect("empty translation");
+        assert!(translated.arguments.is_empty());
+        assert!(translated.environment_remove.is_empty());
+    }
+
+    #[test]
+    fn q27_common_settings_translate_to_ctx_and_slots() {
+        let translated = translate_q27_load_settings(
+            &resolved_load_settings(&[
+                ("context_length", LoadSettingValue::UnsignedInteger(65_536)),
+                ("parallel_requests", LoadSettingValue::UnsignedInteger(2)),
+                ("q27.kv_fp16", LoadSettingValue::FlagEnabled),
+            ]),
+            &[],
+            &BTreeMap::new(),
+        )
+        .expect("q27 translation");
+        assert_eq!(
+            argument_strings(translated.arguments),
+            ["--ctx", "65536", "--slots", "2", "--kv-fp16"]
+        );
+        assert_eq!(translated.environment_remove, [OsString::from("Q27_KV")]);
+    }
+
+    #[test]
+    fn q27_structured_native_and_environment_conflicts_are_rejected() {
+        let context =
+            resolved_load_settings(&[("context_length", LoadSettingValue::UnsignedInteger(8192))]);
+        assert!(
+            translate_q27_load_settings(&context, &["--ctx=4096".to_owned()], &BTreeMap::new())
+                .expect_err("native collision")
+                .to_string()
+                .contains("conflicts")
+        );
+        let kv = resolved_load_settings(&[("q27.kv_fp16", LoadSettingValue::FlagEnabled)]);
+        assert!(
+            translate_q27_load_settings(
+                &kv,
+                &[],
+                &BTreeMap::from([("Q27_KV".to_owned(), "turbo5k".to_owned())])
+            )
+            .expect_err("environment collision")
+            .to_string()
+            .contains("Q27_KV")
+        );
+    }
+
+    #[test]
+    fn q27_prefix_tuning_without_a_cache_path_is_rejected() {
+        let settings = resolved_load_settings(&[(
+            "q27.prefix_cache_min_tokens",
+            LoadSettingValue::UnsignedInteger(4096),
+        )]);
+        assert!(
+            translate_q27_load_settings(&settings, &[], &BTreeMap::new())
+                .expect_err("ignored prefix tuning")
+                .to_string()
+                .contains("require `q27.prefix_cache_path`")
+        );
+    }
+
+    #[test]
+    fn structured_prefix_cache_settings_keep_the_q27_version_gates() {
+        assert!(q27_setting_unavailable_by_version(
+            true,
+            "0.5.9",
+            "--prefix-cache"
+        ));
+        assert!(q27_setting_unavailable_by_version(
+            true,
+            "0.6.0",
+            "--prefix-cache-ram-gb"
+        ));
+        assert!(!q27_setting_unavailable_by_version(
+            true,
+            "0.6.1",
+            "--prefix-cache-ram-gb"
+        ));
+        assert!(!q27_setting_unavailable_by_version(
+            false,
+            "external",
+            "--prefix-cache-ram-gb"
+        ));
+    }
 
     #[test]
     fn exact_q27_reference_is_recovered_from_ids_and_queries() {

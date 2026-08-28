@@ -16,7 +16,9 @@ use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use norted_core::{
     AcquisitionMethod, ArtifactFormat, EngineConfig, EngineInstallation, EngineRevision,
-    InstalledRuntime, ModelArtifact, RuntimeAcquisitionMethod, RuntimeId, RuntimeProbeObservation,
+    GpuOffload, HostCapabilities, InstalledRuntime, LoadSettingDefinition, LoadSettingId,
+    LoadSettingKind, LoadSettingScope, LoadSettingValue, LoadSettingsSchema, ModelArtifact,
+    RuntimeAcquisitionMethod, RuntimeId, RuntimeProbeObservation,
 };
 use norted_engine::{
     ApiCapability, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
@@ -24,6 +26,7 @@ use norted_engine::{
     InferenceFinishReason, InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole,
     InferenceStream, InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, NativeOption,
     OptionValueKind, ProcessDescriptor, UpdateState, capture_command,
+    common_load_setting_definitions,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -130,6 +133,7 @@ pub struct LlamaCppAdapter {
     environment: BTreeMap<String, String>,
     configuration_error: Option<String>,
     client: reqwest::Client,
+    capability_cache: tokio::sync::RwLock<BTreeMap<String, String>>,
 }
 
 impl LlamaCppAdapter {
@@ -227,7 +231,43 @@ impl LlamaCppAdapter {
             environment,
             configuration_error,
             client: reqwest::Client::new(),
+            capability_cache: tokio::sync::RwLock::new(BTreeMap::new()),
         }
+    }
+
+    fn capability_key(runtime: &InstalledRuntime) -> String {
+        format!(
+            "{}:{}",
+            runtime.manifest.runtime_id, runtime.manifest.entrypoint_sha256
+        )
+    }
+
+    async fn cached_runtime_help(&self, runtime: &InstalledRuntime) -> Result<String, EngineError> {
+        let key = Self::capability_key(runtime);
+        if let Some(help) = self.capability_cache.read().await.get(&key).cloned() {
+            return Ok(help);
+        }
+        let output = capture_command(
+            &runtime.entrypoint_path(),
+            &["--help"],
+            &self.environment,
+            &managed_environment_removals(),
+            PROBE_TIMEOUT,
+        )
+        .await?;
+        if !output.success {
+            return Err(EngineError::Operation(format!(
+                "llama-server --help exited with {:?}: {}",
+                output.code,
+                command_detail(&output.stdout, &output.stderr)
+            )));
+        }
+        let help = format!("{}\n{}", output.stdout, output.stderr);
+        self.capability_cache
+            .write()
+            .await
+            .insert(key, help.clone());
+        Ok(help)
     }
 
     async fn probe_uncached(&self) -> EngineProbe {
@@ -431,6 +471,86 @@ impl EngineAdapter for LlamaCppAdapter {
         }]
     }
 
+    fn load_setting_definitions(&self) -> Vec<LoadSettingDefinition> {
+        llama_load_setting_definitions()
+    }
+
+    async fn load_settings_schema(
+        &self,
+        runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _host: &HostCapabilities,
+    ) -> Result<LoadSettingsSchema, EngineError> {
+        self.probe_runtime(runtime).await?;
+        let help = self.cached_runtime_help(runtime).await?;
+        let mut definitions = llama_load_setting_definitions();
+        for definition in &mut definitions {
+            let requirements = llama_setting_contract(definition.id.as_str());
+            let missing = requirements
+                .iter()
+                .copied()
+                .filter(|required| !help_has_option(&help, required))
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                definition.supported = false;
+                definition.unsupported_reason = Some(format!(
+                    "the exact llama-server does not advertise {}",
+                    missing.join(", ")
+                ));
+                continue;
+            }
+            let contract = requirements
+                .first()
+                .map(|option| help_option_context(&help, option))
+                .unwrap_or_default();
+            match definition.id.as_str() {
+                "llama.cpp.flash_attention"
+                    if !["auto", "on", "off"]
+                        .into_iter()
+                        .all(|choice| text_has_value(&contract, choice)) =>
+                {
+                    definition.supported = false;
+                    definition.unsupported_reason = Some(
+                        "the exact llama-server does not advertise the on/off/auto Flash Attention contract"
+                            .to_owned(),
+                    );
+                }
+                "llama.cpp.gpu_offload"
+                    if !["auto", "all"]
+                        .into_iter()
+                        .all(|choice| text_has_value(&contract, choice)) =>
+                {
+                    definition.supported = false;
+                    definition.unsupported_reason = Some(
+                        "the exact llama-server does not advertise auto/all GPU-layer semantics"
+                            .to_owned(),
+                    );
+                }
+                "llama.cpp.kv_cache_k" | "llama.cpp.kv_cache_v" => {
+                    let choices = llama_cache_types()
+                        .into_iter()
+                        .filter(|choice| text_has_value(&contract, choice))
+                        .collect::<Vec<_>>();
+                    if choices.is_empty() {
+                        definition.supported = false;
+                        definition.unsupported_reason = Some(
+                            "the exact llama-server does not advertise any Norted-understood cache types"
+                                .to_owned(),
+                        );
+                    } else {
+                        definition.kind = LoadSettingKind::Choice { choices };
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(LoadSettingsSchema {
+            engine_id: ENGINE_ID.to_owned(),
+            runtime_id: Some(runtime.manifest.runtime_id.clone()),
+            definitions,
+        })
+    }
+
     async fn probe(&self) -> Result<EngineProbe, EngineError> {
         Ok(self.probe_uncached().await)
     }
@@ -515,22 +635,7 @@ impl EngineAdapter for LlamaCppAdapter {
                 command_detail(&version_output.stdout, &version_output.stderr)
             )));
         }
-        let help_output = capture_command(
-            &binary_path,
-            &["--help"],
-            &self.environment,
-            &managed_environment_removals(),
-            PROBE_TIMEOUT,
-        )
-        .await?;
-        if !help_output.success {
-            return Err(EngineError::Operation(format!(
-                "llama-server --help exited with {:?}: {}",
-                help_output.code,
-                command_detail(&help_output.stdout, &help_output.stderr)
-            )));
-        }
-        let help = format!("{}\n{}", help_output.stdout, help_output.stderr);
+        let help = self.cached_runtime_help(runtime).await?;
         for required in ["--model", "--alias", "--host", "--port"] {
             if !help.contains(required) {
                 return Err(EngineError::InvalidConfiguration(format!(
@@ -589,6 +694,15 @@ impl EngineAdapter for LlamaCppAdapter {
                 "llama.cpp backend address must be loopback".to_owned(),
             ));
         }
+        request
+            .load_settings_schema
+            .validate(&request.load_settings)
+            .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
+        let structured = translate_llama_load_settings(
+            &request.load_settings,
+            &self.native_arguments,
+            &self.environment,
+        )?;
         let observation = self.probe_runtime(&request.runtime).await?;
         let binary_path = request.runtime.entrypoint_path();
         let manifest = &request.runtime.manifest;
@@ -626,17 +740,21 @@ impl EngineAdapter for LlamaCppAdapter {
             OsString::from(request.backend_address.port().to_string()),
         ]
         .into_iter()
+        .chain(structured.arguments)
         .chain(self.native_arguments.iter().map(OsString::from))
         .collect();
+        let mut environment_remove = managed_environment_removals();
+        environment_remove.extend(structured.environment_remove);
         Ok(LaunchSpec {
             executable: binary_path,
             arguments,
             environment: self.environment.clone(),
-            environment_remove: managed_environment_removals(),
+            environment_remove,
             inherits_parent_environment: true,
             working_directory: None,
             endpoint: Some(http_endpoint(request.backend_address)),
             normalized_settings: BTreeMap::new(),
+            load_settings: request.load_settings,
             native_arguments: self.native_arguments.clone(),
             installation: (*installation).clone(),
             runtime: request.runtime,
@@ -1062,6 +1180,292 @@ fn invalid_probe(reason: String) -> EngineProbe {
     }
 }
 
+fn llama_load_setting_definitions() -> Vec<LoadSettingDefinition> {
+    let mut definitions = common_load_setting_definitions();
+    definitions.extend([
+        llama_definition(
+            "llama.cpp.threads",
+            "CPU threads",
+            "CPU threads used during token generation",
+            LoadSettingKind::UnsignedInteger {
+                minimum: Some(1),
+                maximum: None,
+            },
+            Some("runtime-selected"),
+        ),
+        llama_definition(
+            "llama.cpp.batch_size",
+            "Batch size",
+            "Logical maximum prompt-processing batch size",
+            LoadSettingKind::UnsignedInteger {
+                minimum: Some(1),
+                maximum: None,
+            },
+            Some("runtime-selected"),
+        ),
+        llama_definition(
+            "llama.cpp.micro_batch_size",
+            "Micro-batch size",
+            "Physical maximum prompt-processing batch size",
+            LoadSettingKind::UnsignedInteger {
+                minimum: Some(1),
+                maximum: None,
+            },
+            Some("runtime-selected"),
+        ),
+        llama_definition(
+            "llama.cpp.gpu_offload",
+            "GPU offload",
+            "Weight layers placed in VRAM: none, auto, all, or an exact count",
+            LoadSettingKind::GpuOffload,
+            Some("auto in current runtimes"),
+        ),
+        llama_definition(
+            "llama.cpp.flash_attention",
+            "Flash attention",
+            "Explicit llama.cpp Flash Attention mode",
+            LoadSettingKind::Choice {
+                choices: vec!["auto".to_owned(), "on".to_owned(), "off".to_owned()],
+            },
+            Some("auto in current runtimes"),
+        ),
+        llama_definition(
+            "llama.cpp.kv_cache_k",
+            "K-cache type",
+            "Key cache storage type",
+            LoadSettingKind::Choice {
+                choices: llama_cache_types(),
+            },
+            Some("runtime-selected"),
+        ),
+        llama_definition(
+            "llama.cpp.kv_cache_v",
+            "V-cache type",
+            "Value cache storage type",
+            LoadSettingKind::Choice {
+                choices: llama_cache_types(),
+            },
+            Some("runtime-selected"),
+        ),
+        llama_definition(
+            "llama.cpp.mmap",
+            "Memory mapping",
+            "Explicitly enable or disable memory-mapped model loading",
+            LoadSettingKind::Toggle,
+            Some("runtime-selected"),
+        ),
+        llama_definition(
+            "llama.cpp.mlock",
+            "Lock model memory",
+            "Explicitly request that model memory is kept resident",
+            LoadSettingKind::OneWayFlag,
+            Some("disabled in current runtimes"),
+        ),
+    ]);
+    definitions
+}
+
+fn llama_definition(
+    id: &str,
+    label: &str,
+    description: &str,
+    kind: LoadSettingKind,
+    upstream_default: Option<&str>,
+) -> LoadSettingDefinition {
+    LoadSettingDefinition {
+        id: LoadSettingId::new(id).expect("static llama.cpp setting ID"),
+        label: label.to_owned(),
+        description: description.to_owned(),
+        kind,
+        scope: LoadSettingScope::Engine {
+            engine_id: ENGINE_ID.to_owned(),
+        },
+        supported: true,
+        unsupported_reason: None,
+        unit: None,
+        upstream_default: upstream_default.map(str::to_owned),
+        recommendation: None,
+    }
+}
+
+fn llama_cache_types() -> Vec<String> {
+    [
+        "f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn llama_setting_contract(id: &str) -> &'static [&'static str] {
+    match id {
+        "context_length" => &["--ctx-size"],
+        "parallel_requests" => &["--parallel"],
+        "llama.cpp.threads" => &["--threads"],
+        "llama.cpp.batch_size" => &["--batch-size"],
+        "llama.cpp.micro_batch_size" => &["--ubatch-size"],
+        "llama.cpp.gpu_offload" => &["--n-gpu-layers"],
+        "llama.cpp.flash_attention" => &["--flash-attn"],
+        "llama.cpp.kv_cache_k" => &["--cache-type-k"],
+        "llama.cpp.kv_cache_v" => &["--cache-type-v"],
+        "llama.cpp.mmap" => &["--mmap", "--no-mmap"],
+        "llama.cpp.mlock" => &["--mlock"],
+        _ => &[],
+    }
+}
+
+fn help_has_option(help: &str, option: &str) -> bool {
+    help.split_whitespace().any(|token| {
+        token.trim_matches(|character: char| {
+            matches!(
+                character,
+                ',' | '[' | ']' | '(' | ')' | '{' | '}' | '<' | '>' | ':' | ';' | '`'
+            )
+        }) == option
+    })
+}
+
+fn help_option_context(help: &str, option: &str) -> String {
+    let lines = help.lines().collect::<Vec<_>>();
+    let Some(index) = lines.iter().position(|line| line.contains(option)) else {
+        return String::new();
+    };
+    lines[index..lines.len().min(index + 4)].join(" ")
+}
+
+fn text_has_value(text: &str, expected: &str) -> bool {
+    text.split(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                ',' | '|' | '[' | ']' | '(' | ')' | '{' | '}' | '<' | '>' | ':' | ';' | '\'' | '"'
+            )
+    })
+    .any(|value| value == expected)
+}
+
+#[derive(Debug)]
+struct LlamaStructuredArguments {
+    arguments: Vec<OsString>,
+    environment_remove: Vec<OsString>,
+}
+
+fn translate_llama_load_settings(
+    settings: &norted_core::ResolvedLoadSettings,
+    native_arguments: &[String],
+    configured_environment: &BTreeMap<String, String>,
+) -> Result<LlamaStructuredArguments, EngineError> {
+    let mut arguments = Vec::new();
+    let mut environment_remove = Vec::new();
+    for (id, resolved) in &settings.effective {
+        let (aliases, environment_name) = llama_setting_collision_contract(id.as_str());
+        if let Some(argument) = find_native_option(native_arguments, aliases) {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "structured load setting `{id}` conflicts with native llama.cpp argument `{argument}`"
+            )));
+        }
+        if let Some(name) = configured_environment
+            .keys()
+            .find(|name| name.eq_ignore_ascii_case(environment_name))
+        {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "structured load setting `{id}` conflicts with configured llama.cpp environment variable `{name}`"
+            )));
+        }
+        environment_remove.push(OsString::from(environment_name));
+        match (id.as_str(), &resolved.value) {
+            ("context_length", LoadSettingValue::UnsignedInteger(value)) => {
+                push_value_argument(&mut arguments, "--ctx-size", *value);
+            }
+            ("parallel_requests", LoadSettingValue::UnsignedInteger(value)) => {
+                push_value_argument(&mut arguments, "--parallel", *value);
+            }
+            ("llama.cpp.threads", LoadSettingValue::UnsignedInteger(value)) => {
+                push_value_argument(&mut arguments, "--threads", *value);
+            }
+            ("llama.cpp.batch_size", LoadSettingValue::UnsignedInteger(value)) => {
+                push_value_argument(&mut arguments, "--batch-size", *value);
+            }
+            ("llama.cpp.micro_batch_size", LoadSettingValue::UnsignedInteger(value)) => {
+                push_value_argument(&mut arguments, "--ubatch-size", *value);
+            }
+            ("llama.cpp.gpu_offload", LoadSettingValue::GpuOffload(value)) => {
+                arguments.push(OsString::from("--n-gpu-layers"));
+                arguments.push(OsString::from(match value {
+                    GpuOffload::None => "0".to_owned(),
+                    GpuOffload::Auto => "auto".to_owned(),
+                    GpuOffload::All => "all".to_owned(),
+                    GpuOffload::Layers(value) => value.to_string(),
+                }));
+            }
+            ("llama.cpp.flash_attention", LoadSettingValue::Choice(value)) => {
+                push_value_argument(&mut arguments, "--flash-attn", value);
+            }
+            ("llama.cpp.kv_cache_k", LoadSettingValue::Choice(value)) => {
+                push_value_argument(&mut arguments, "--cache-type-k", value);
+            }
+            ("llama.cpp.kv_cache_v", LoadSettingValue::Choice(value)) => {
+                push_value_argument(&mut arguments, "--cache-type-v", value);
+            }
+            ("llama.cpp.mmap", LoadSettingValue::Toggle(value)) => {
+                arguments.push(OsString::from(if *value { "--mmap" } else { "--no-mmap" }));
+            }
+            ("llama.cpp.mlock", LoadSettingValue::FlagEnabled) => {
+                arguments.push(OsString::from("--mlock"));
+            }
+            _ => {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "load setting `{id}` has an invalid value for llama.cpp"
+                )));
+            }
+        }
+    }
+    Ok(LlamaStructuredArguments {
+        arguments,
+        environment_remove,
+    })
+}
+
+fn llama_setting_collision_contract(id: &str) -> (&'static [&'static str], &'static str) {
+    match id {
+        "context_length" => (&["-c", "--ctx-size"], "LLAMA_ARG_CTX_SIZE"),
+        "parallel_requests" => (&["-np", "--parallel"], "LLAMA_ARG_N_PARALLEL"),
+        "llama.cpp.threads" => (&["-t", "--threads"], "LLAMA_ARG_THREADS"),
+        "llama.cpp.batch_size" => (&["-b", "--batch-size"], "LLAMA_ARG_BATCH"),
+        "llama.cpp.micro_batch_size" => (&["-ub", "--ubatch-size"], "LLAMA_ARG_UBATCH"),
+        "llama.cpp.gpu_offload" => (
+            &["-ngl", "--gpu-layers", "--n-gpu-layers"],
+            "LLAMA_ARG_N_GPU_LAYERS",
+        ),
+        "llama.cpp.flash_attention" => (&["-fa", "--flash-attn"], "LLAMA_ARG_FLASH_ATTN"),
+        "llama.cpp.kv_cache_k" => (&["-ctk", "--cache-type-k"], "LLAMA_ARG_CACHE_TYPE_K"),
+        "llama.cpp.kv_cache_v" => (&["-ctv", "--cache-type-v"], "LLAMA_ARG_CACHE_TYPE_V"),
+        "llama.cpp.mmap" => (&["--mmap", "--no-mmap"], "LLAMA_ARG_MMAP"),
+        "llama.cpp.mlock" => (&["--mlock"], "LLAMA_ARG_MLOCK"),
+        _ => (&[], ""),
+    }
+}
+
+fn find_native_option<'a>(arguments: &'a [String], aliases: &[&str]) -> Option<&'a str> {
+    arguments.iter().find_map(|argument| {
+        let normalized = argument.to_ascii_lowercase().replace('_', "-");
+        aliases
+            .iter()
+            .any(|alias| {
+                normalized == *alias
+                    || normalized
+                        .strip_prefix(alias)
+                        .is_some_and(|suffix| suffix.starts_with('='))
+            })
+            .then_some(argument.as_str())
+    })
+}
+
+fn push_value_argument(arguments: &mut Vec<OsString>, option: &str, value: impl ToString) {
+    arguments.push(OsString::from(option));
+    arguments.push(OsString::from(value.to_string()));
+}
+
 fn conflicts_with_managed_argument(argument: &str) -> bool {
     let argument = argument.to_ascii_lowercase().replace('_', "-");
     MANAGED_NATIVE_ARGUMENTS.iter().any(|managed| {
@@ -1215,4 +1619,95 @@ fn unix_timestamp() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod load_settings_tests {
+    use norted_core::{LoadSettingSource, ResolvedLoadSetting, ResolvedLoadSettings};
+
+    use super::*;
+
+    fn resolved(values: &[(&str, LoadSettingValue)]) -> ResolvedLoadSettings {
+        let mut effective = BTreeMap::new();
+        for (id, value) in values {
+            effective.insert(
+                LoadSettingId::new(*id).expect("setting ID"),
+                ResolvedLoadSetting {
+                    value: value.clone(),
+                    source: LoadSettingSource::Invocation,
+                },
+            );
+        }
+        ResolvedLoadSettings {
+            engine_id: ENGINE_ID.to_owned(),
+            selected_profile: None,
+            effective,
+        }
+    }
+
+    fn strings(arguments: Vec<OsString>) -> Vec<String> {
+        arguments
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn omitted_settings_emit_no_llama_arguments() {
+        let translated = translate_llama_load_settings(&resolved(&[]), &[], &BTreeMap::new())
+            .expect("empty translation");
+        assert!(translated.arguments.is_empty());
+        assert!(translated.environment_remove.is_empty());
+    }
+
+    #[test]
+    fn common_and_kv_settings_translate_independently() {
+        let translated = translate_llama_load_settings(
+            &resolved(&[
+                ("context_length", LoadSettingValue::UnsignedInteger(131_072)),
+                ("parallel_requests", LoadSettingValue::UnsignedInteger(3)),
+                (
+                    "llama.cpp.kv_cache_k",
+                    LoadSettingValue::Choice("q8_0".to_owned()),
+                ),
+            ]),
+            &[],
+            &BTreeMap::new(),
+        )
+        .expect("structured translation");
+        assert_eq!(
+            strings(translated.arguments),
+            [
+                "--ctx-size",
+                "131072",
+                "--cache-type-k",
+                "q8_0",
+                "--parallel",
+                "3",
+            ]
+        );
+    }
+
+    #[test]
+    fn structured_llama_setting_rejects_both_native_argument_forms() {
+        let settings = resolved(&[("context_length", LoadSettingValue::UnsignedInteger(8192))]);
+        for native in [
+            vec!["--ctx-size=4096".to_owned()],
+            vec!["-c".to_owned(), "4096".to_owned()],
+        ] {
+            let error = translate_llama_load_settings(&settings, &native, &BTreeMap::new())
+                .expect_err("native collision");
+            assert!(error.to_string().contains("conflicts"));
+        }
+    }
+
+    #[test]
+    fn malformed_values_are_rejected_by_the_definition() {
+        let definition = llama_load_setting_definitions()
+            .into_iter()
+            .find(|definition| definition.id.as_str() == "context_length")
+            .expect("context definition");
+        assert!(definition.parse("0").is_err());
+        assert!(definition.parse("many").is_err());
+    }
 }

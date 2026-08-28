@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 pub enum RuntimeUpdateTrack {
@@ -49,6 +49,12 @@ pub enum Command {
         /// Exact installed runtime ID; overrides model and format selections
         #[arg(long)]
         runtime: Option<String>,
+        /// Named load profile for this invocation; replaces the model assignment
+        #[arg(long)]
+        profile: Option<String>,
+        /// Ephemeral structured load override (repeatable SETTING_ID=VALUE)
+        #[arg(long = "set", value_name = "SETTING_ID=VALUE")]
+        settings: Vec<String>,
     },
     /// Unload the active model from the running Norted Server instance
     Unload,
@@ -58,6 +64,10 @@ pub enum Command {
     Engines(EnginesArgs),
     /// Search, install, select, update, and remove concrete runtime packs
     Runtimes(RuntimesArgs),
+    /// Create, edit, assign, and inspect reusable load profiles
+    Profiles(ProfilesArgs),
+    /// Manage defaults and inspect exact-runtime load settings
+    Settings(SettingsArgs),
     /// Inspect resolved application configuration
     Config(ConfigArgs),
     /// Check configuration, paths, networking, and terminal environment
@@ -146,4 +156,111 @@ pub struct ConfigArgs {
 pub enum ConfigCommand {
     /// Print the resolved configuration and its platform path
     Show,
+}
+
+#[derive(Debug, Args)]
+pub struct ProfilesArgs {
+    #[command(subcommand)]
+    pub command: ProfilesCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProfilesCommand {
+    /// List named profiles and model assignments
+    List,
+    /// Show one named profile
+    Show { name: String },
+    /// Create an empty named profile
+    Create { name: String },
+    /// Delete an unassigned named profile
+    Delete { name: String },
+    /// Set one or more values in a named profile
+    Set {
+        name: String,
+        #[arg(required = true, value_name = "SETTING_ID=VALUE")]
+        settings: Vec<String>,
+    },
+    /// Remove values from a named profile so they inherit again
+    Unset {
+        name: String,
+        #[arg(required = true, value_name = "SETTING_ID")]
+        settings: Vec<String>,
+    },
+    /// Persist one named profile assignment for a model
+    Assign {
+        #[arg(long)]
+        model: String,
+        name: String,
+    },
+    /// Clear a model's named profile assignment
+    ClearAssignment {
+        #[arg(long)]
+        model: String,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct SettingsArgs {
+    #[command(subcommand)]
+    pub command: SettingsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SettingsCommand {
+    /// Show effective values and their precedence sources for an exact runtime
+    Show {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        runtime: Option<String>,
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Show the exact selected runtime's structured setting schema
+    Schema {
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        runtime: Option<String>,
+    },
+    /// Set one or more persisted defaults
+    Set(SettingsMutationArgs),
+    /// Remove persisted defaults so lower layers inherit again
+    Unset(SettingsUnsetArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("scope")
+        .required(true)
+        .multiple(false)
+        .args(["global", "engine", "model"])
+))]
+pub struct SettingsMutationArgs {
+    #[arg(long)]
+    pub global: bool,
+    #[arg(long)]
+    pub engine: Option<String>,
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(required = true, value_name = "SETTING_ID=VALUE")]
+    pub settings: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("scope")
+        .required(true)
+        .multiple(false)
+        .args(["global", "engine", "model"])
+))]
+pub struct SettingsUnsetArgs {
+    #[arg(long)]
+    pub global: bool,
+    #[arg(long)]
+    pub engine: Option<String>,
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(required = true, value_name = "SETTING_ID")]
+    pub settings: Vec<String>,
 }

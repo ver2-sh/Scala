@@ -19,6 +19,8 @@ pub enum HoverTarget {
     RuntimeInstall,
     RuntimePickerResult(usize),
     RuntimePickerApply,
+    SettingsScope(usize),
+    Setting(usize),
     CommandSuggestion(usize),
     CommandBar,
 }
@@ -46,6 +48,10 @@ pub struct UiLayout {
     pub runtime_operation_status: Rect,
     pub runtime_picker_active: bool,
     pub logs: Rect,
+    pub settings_scopes: Rect,
+    pub settings_list: Rect,
+    pub settings_scope_rows: Vec<(usize, Rect)>,
+    pub settings_rows: Vec<(usize, Rect)>,
     pub command_bar: Rect,
     pub suggestion_popup: Option<Rect>,
     pub suggestion_rows: Vec<(usize, Rect)>,
@@ -306,6 +312,51 @@ impl UiLayout {
             (None, Vec::new())
         };
 
+        let mut settings_scopes = Rect::default();
+        let mut settings_list = Rect::default();
+        let mut settings_scope_rows = Vec::new();
+        let mut settings_rows = Vec::new();
+        if app.screen == Screen::Settings {
+            settings_scopes = Rect::new(screen_body.x, screen_body.y, screen_body.width, 2);
+            settings_list = Rect::new(
+                screen_body.x,
+                screen_body.y.saturating_add(4),
+                screen_body.width,
+                screen_body.height.saturating_sub(4),
+            );
+            let scopes = app.settings_scopes();
+            let mut x = settings_scopes.x;
+            for (index, scope) in scopes.iter().enumerate() {
+                let label = match scope {
+                    crate::app::SettingsScope::Global => "Global".to_owned(),
+                    crate::app::SettingsScope::Engine(engine) => engine.clone(),
+                    crate::app::SettingsScope::Profile(profile) => profile.to_string(),
+                    crate::app::SettingsScope::Model(_) => "Selected model".to_owned(),
+                };
+                let width = (label.chars().count() as u16 + 2)
+                    .min(settings_scopes.right().saturating_sub(x));
+                if width == 0 {
+                    break;
+                }
+                settings_scope_rows.push((index, Rect::new(x, settings_scopes.y, width, 1)));
+                x = x.saturating_add(width);
+            }
+            let definitions = app.settings_definitions();
+            let capacity = (settings_list.height / 2) as usize;
+            let end = (app.settings_scroll + capacity).min(definitions.len());
+            for index in app.settings_scroll..end {
+                settings_rows.push((
+                    index,
+                    Rect::new(
+                        settings_list.x,
+                        settings_list.y + ((index - app.settings_scroll) as u16 * 2),
+                        settings_list.width,
+                        2,
+                    ),
+                ));
+            }
+        }
+
         Self {
             too_small: false,
             compact,
@@ -332,6 +383,10 @@ impl UiLayout {
             } else {
                 Rect::default()
             },
+            settings_scopes,
+            settings_list,
+            settings_scope_rows,
+            settings_rows,
             command_bar: regions[2],
             suggestion_popup,
             suggestion_rows,
@@ -396,6 +451,20 @@ impl UiLayout {
         {
             return Some(HoverTarget::Runtime(*index));
         }
+        if let Some((index, _)) = self
+            .settings_scope_rows
+            .iter()
+            .find(|(_, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::SettingsScope(*index));
+        }
+        if let Some((index, _)) = self
+            .settings_rows
+            .iter()
+            .find(|(_, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::Setting(*index));
+        }
         if contains(self.runtime_search_action, position) {
             return Some(HoverTarget::RuntimeSearchAction);
         }
@@ -419,6 +488,10 @@ impl UiLayout {
 
     pub fn runtime_search_capacity(&self) -> usize {
         (self.runtime_search_results.height / 2) as usize
+    }
+
+    pub fn settings_capacity(&self) -> usize {
+        (self.settings_list.height / 2) as usize
     }
 
     pub fn contains_content(&self, position: Position) -> bool {

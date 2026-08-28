@@ -3,6 +3,7 @@
 mod config;
 mod error;
 mod event;
+mod load_settings;
 mod model;
 mod provenance;
 mod runtime;
@@ -15,14 +16,20 @@ pub use config::{
 };
 pub use error::{CoreError, Result};
 pub use event::{AppEvent, LogLevel};
+pub use load_settings::{
+    GpuOffload, LOAD_PROFILES_SCHEMA_VERSION, LoadProfile, LoadProfileName, LoadProfilesError,
+    LoadProfilesState, LoadProfilesStore, LoadSettingDefinition, LoadSettingId, LoadSettingKind,
+    LoadSettingScope, LoadSettingSource, LoadSettingValue, LoadSettingsError, LoadSettingsPatch,
+    LoadSettingsSchema, ResolvedLoadSetting, ResolvedLoadSettings,
+};
 pub use model::{
     ArtifactFormat, AuxiliaryArtifact, AuxiliaryArtifactRole, ModelArtifact,
     ModelArtifactProvenance, ModelId, ModelRegistry,
 };
 pub use provenance::{
     AcquisitionMethod, AuxiliaryRuntimeIdentity, BuildProvenance, EngineInstallation,
-    EngineRevision, EnvironmentVariableProvenance, ModelRuntimeIdentity, NativeArgumentProvenance,
-    ProcessIdentity, RuntimeProvenance, ToolchainProvenance,
+    EngineRevision, EnvironmentVariableProvenance, LoadSettingsProvenance, ModelRuntimeIdentity,
+    NativeArgumentProvenance, ProcessIdentity, RuntimeProvenance, ToolchainProvenance,
 };
 pub use runtime::{
     RuntimeDescriptor, RuntimeObservationError, RuntimePublisher, observe_runtime,

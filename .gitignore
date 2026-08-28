@@ -30,6 +30,8 @@ llama-server.exe
 /config.toml
 /config.local.toml
 /runtime-selections.json
+/load-profiles.json
+/.load-profiles.lock
 /runtime.json
 /.env
 /.env.local

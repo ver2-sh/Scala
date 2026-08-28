@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use norted_core::{AppPaths, ModelId, RuntimeId, observe_runtime_descriptor};
+use norted_core::{
+    AppPaths, LoadProfileName, LoadSettingsPatch, ModelId, RuntimeId, observe_runtime_descriptor,
+};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -18,6 +20,10 @@ pub struct ControlLoadRequest {
     pub model_id: ModelId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<RuntimeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<LoadProfileName>,
+    #[serde(default, skip_serializing_if = "LoadSettingsPatch::is_empty")]
+    pub settings: LoadSettingsPatch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +100,17 @@ impl ControlClient {
         model_id: ModelId,
         runtime_id: Option<RuntimeId>,
     ) -> Result<ControlStatus, ControlClientError> {
+        self.load_with_settings(model_id, runtime_id, None, LoadSettingsPatch::default())
+            .await
+    }
+
+    pub async fn load_with_settings(
+        &self,
+        model_id: ModelId,
+        runtime_id: Option<RuntimeId>,
+        profile: Option<LoadProfileName>,
+        settings: LoadSettingsPatch,
+    ) -> Result<ControlStatus, ControlClientError> {
         self.send(
             self.client
                 .post(format!("{}{}", self.endpoint, CONTROL_LOAD_PATH))
@@ -101,6 +118,8 @@ impl ControlClient {
                 .json(&ControlLoadRequest {
                     model_id,
                     runtime_id,
+                    profile,
+                    settings,
                 }),
         )
         .await

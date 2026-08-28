@@ -24,7 +24,7 @@ pub fn render_screen(
         Screen::Runtimes => render_runtimes(frame, area, app, theme, glyphs, ui_layout),
         Screen::Server => render_server(frame, area, app, theme),
         Screen::Logs => render_logs(frame, area, app, theme, ui_layout),
-        Screen::Settings => render_settings(frame, area, app, theme),
+        Screen::Settings => render_settings(frame, area, app, theme, ui_layout),
         Screen::Help => render_help_content(frame, area, theme, glyphs),
     }
 }
@@ -679,39 +679,192 @@ fn render_logs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, ui_l
     frame.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), layout[1]);
 }
 
-fn render_settings(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+fn render_settings(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    ui_layout: &UiLayout,
+) {
     let layout = content_layout(area);
     frame.render_widget(
         section_title(
             "Settings",
-            "Resolved configuration and platform paths",
+            "Load defaults, reusable profiles, and exact-runtime validation",
             theme,
         ),
         layout[0],
     );
-    let model_paths = if app.model_paths.is_empty() {
-        "None configured".to_owned()
-    } else {
-        app.model_paths.join(", ")
-    };
-    frame.render_widget(
-        Paragraph::new(vec![
-            key_value("SERVER", &app.server_address, theme),
-            key_value("CONFIG", &app.config_path, theme),
-            key_value("MODELS", &model_paths, theme),
-            Line::default(),
-            Line::from(Span::styled(
-                "Relative model paths resolve against the configuration directory.",
-                theme.muted,
-            )),
-            Line::from(Span::styled(
-                "NO_COLOR is honored for monochrome output.",
-                theme.hint,
-            )),
-        ])
-        .wrap(Wrap { trim: true }),
-        layout[1],
+    let settings_scopes = app.settings_scopes();
+    for (index, rect) in &ui_layout.settings_scope_rows {
+        let Some(scope) = settings_scopes.get(*index) else {
+            continue;
+        };
+        let label = match scope {
+            crate::app::SettingsScope::Global => "Global".to_owned(),
+            crate::app::SettingsScope::Engine(engine) => engine.clone(),
+            crate::app::SettingsScope::Profile(profile) => profile.to_string(),
+            crate::app::SettingsScope::Model(_) => "Selected model".to_owned(),
+        };
+        let style = if app.settings_scope_index == *index {
+            theme.selected
+        } else if app.hover == Some(HoverTarget::SettingsScope(*index)) {
+            theme.hovered
+        } else {
+            theme.muted
+        };
+        frame.render_widget(Paragraph::new(format!(" {label} ")).style(style), *rect);
+    }
+
+    let info_area = Rect::new(
+        ui_layout.settings_scopes.x,
+        ui_layout.settings_scopes.y.saturating_add(1),
+        ui_layout.settings_scopes.width,
+        3,
     );
+    let mut info = Vec::new();
+    if let Some(input) = &app.settings_input {
+        let prompt = match input.kind {
+            crate::app::SettingsInputKind::ProfileName => "New profile",
+            crate::app::SettingsInputKind::SettingValue => "Value",
+        };
+        info.push(Line::from(vec![
+            Span::styled(format!("{prompt}: "), theme.hint),
+            Span::styled(&input.text, theme.text),
+            Span::styled("_", theme.accent),
+        ]));
+        info.push(Line::from(Span::styled(
+            "Enter saves · Esc cancels",
+            theme.muted,
+        )));
+    } else if let Some(model) = &app.settings_model {
+        info.push(Line::from(vec![
+            Span::styled(format!("Model {model}"), theme.text),
+            Span::styled(
+                format!(
+                    "  profile: {}",
+                    app.assigned_profile_for_settings_model()
+                        .map(ToString::to_string)
+                        .as_deref()
+                        .unwrap_or("none")
+                ),
+                theme.accent,
+            ),
+            Span::styled(
+                format!(
+                    "  runtime: {}",
+                    app.settings_runtime_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref()
+                        .unwrap_or("not validated")
+                ),
+                theme.muted,
+            ),
+        ]));
+        if let Some(error) = &app.settings_validation_error {
+            info.push(Line::from(Span::styled(error, theme.warning)));
+        } else {
+            info.push(Line::from(Span::styled(
+                "p cycles/clears the assigned profile · r revalidates the exact runtime",
+                theme.hint,
+            )));
+        }
+    } else {
+        info.push(Line::from(Span::styled(
+            "Left/Right scope · Enter edit/cycle · Delete inherit · n new profile · d delete",
+            theme.hint,
+        )));
+    }
+    let running = app.control.as_ref().is_some_and(|control| {
+        control.backend.lifecycle == norted_engine::BackendLifecycle::Running
+    });
+    if running {
+        info.push(Line::from(Span::styled(
+            "A model is running; edits apply only on its next load.",
+            theme.warning,
+        )));
+    }
+    frame.render_widget(Paragraph::new(info).wrap(Wrap { trim: true }), info_area);
+
+    if app.load_profiles_loading {
+        frame.render_widget(
+            Paragraph::new("Loading load-profile state…").style(theme.muted),
+            ui_layout.settings_list,
+        );
+        return;
+    }
+    if let Some(error) = &app.load_profiles_error {
+        frame.render_widget(
+            Paragraph::new(error.as_str())
+                .style(theme.error)
+                .wrap(Wrap { trim: true }),
+            ui_layout.settings_list,
+        );
+        return;
+    }
+    let definitions = app.settings_definitions();
+    if definitions.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No settings are available in this scope.").style(theme.muted),
+            ui_layout.settings_list,
+        );
+        return;
+    }
+    for (index, rect) in &ui_layout.settings_rows {
+        let Some(definition) = definitions.get(*index) else {
+            continue;
+        };
+        let (value, source, set_here) = app.settings_value_display(&definition.id);
+        let mut style = if app.settings_setting_index == *index {
+            theme.selected
+        } else {
+            ratatui::style::Style::default()
+        };
+        if app.hover == Some(HoverTarget::Setting(*index)) {
+            style = style.patch(theme.hovered);
+        }
+        let support = if definition.supported {
+            if set_here { "override" } else { "inherited" }
+        } else {
+            "unsupported"
+        };
+        let label = match &definition.kind {
+            norted_core::LoadSettingKind::Choice { choices } => {
+                format!("{} [{}]", definition.label, choices.join("|"))
+            }
+            _ => definition.label.clone(),
+        };
+        let lines = if ui_layout.compact {
+            vec![
+                Line::from(Span::styled(definition.id.to_string(), theme.text)),
+                Line::from(vec![
+                    Span::styled(value, theme.accent),
+                    Span::styled(format!(" · {source} · {support}"), theme.muted),
+                ]),
+            ]
+        } else {
+            vec![
+                Line::from(vec![
+                    Span::styled(format!("{:<38}", definition.id), theme.text),
+                    Span::styled(format!("{value:<18}"), theme.accent),
+                    Span::styled(source, theme.muted),
+                ]),
+                Line::from(vec![
+                    Span::styled(format!("  {label}"), theme.muted),
+                    Span::styled(
+                        format!("  {support}"),
+                        if definition.supported {
+                            theme.hint
+                        } else {
+                            theme.warning
+                        },
+                    ),
+                ]),
+            ]
+        };
+        frame.render_widget(Paragraph::new(lines).style(style), *rect);
+    }
 }
 
 fn render_help_content(frame: &mut Frame<'_>, area: Rect, theme: &Theme, glyphs: &Glyphs) {
@@ -731,6 +884,7 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         key_value("Enter", "open navigation or load selected model", theme),
         key_value("u", "unload the active model from Models", theme),
         key_value("v", "choose a model-specific runtime override", theme),
+        key_value("p", "open model load settings/profile management", theme),
         key_value(
             "x / Delete",
             "clear an override from the model runtime picker",

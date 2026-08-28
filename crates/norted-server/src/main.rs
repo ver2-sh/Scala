@@ -7,11 +7,17 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use cli::{Cli, Command, ConfigCommand, EnginesCommand, ModelsCommand, RuntimesCommand};
+use cli::{
+    Cli, Command, ConfigCommand, EnginesCommand, ModelsCommand, ProfilesCommand, RuntimesCommand,
+    SettingsCommand, SettingsMutationArgs, SettingsUnsetArgs,
+};
 use color_eyre::Result;
 use norted_api::ApiServer;
-use norted_core::{AppPaths, ApplicationCore, ModelId, RuntimeId};
-use norted_engine::{ControlClient, ControlClientError};
+use norted_core::{
+    AppPaths, ApplicationCore, LoadProfileName, LoadProfilesStore, LoadSettingId, LoadSettingScope,
+    LoadSettingsError, LoadSettingsPatch, ModelId, RuntimeId,
+};
+use norted_engine::{ControlClient, ControlClientError, EngineRegistry};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -58,8 +64,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command.unwrap_or(Command::Tui) {
         Command::Tui => {
             let registry = composition::engine_registry(&core)?;
+            let definitions = registry.load_setting_definitions()?;
             let packs = composition::runtime_pack_manager(&core, registry)?;
-            norted_tui::run(core, packs).await?;
+            norted_tui::run(core, packs, definitions).await?;
         }
         Command::Serve => {
             core.ensure_model_discovery().await?;
@@ -80,10 +87,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             server.run(shutdown_signal()).await?;
         }
         Command::Status => output::status(core, cli.json).await?,
-        Command::Load { model_id, runtime } => {
+        Command::Load {
+            model_id,
+            runtime,
+            profile,
+            settings,
+        } => {
+            let registry = composition::engine_registry(&core)?;
+            let settings = registry.parse_load_settings(&settings)?;
             let client = ControlClient::discover(&core.paths).await?;
             let runtime = runtime.map(RuntimeId::new).transpose()?;
-            let status = client.load_with_runtime(ModelId(model_id), runtime).await?;
+            let profile = profile.map(LoadProfileName::new).transpose()?;
+            let status = client
+                .load_with_settings(ModelId(model_id), runtime, profile, settings)
+                .await?;
             output::control_operation("load", &status, cli.json)?;
         }
         Command::Unload => {
@@ -209,12 +226,375 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
             }
         }
+        Command::Profiles(args) => {
+            handle_profiles(Arc::clone(&core), args.command, cli.json).await?;
+        }
+        Command::Settings(args) => {
+            handle_settings(Arc::clone(&core), args.command, cli.json).await?;
+        }
         Command::Config(args) => match args.command {
             ConfigCommand::Show => output::config(core, cli.json)?,
         },
         Command::Doctor => unreachable!("doctor is dispatched before application startup"),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+async fn handle_profiles(
+    core: Arc<ApplicationCore>,
+    command: ProfilesCommand,
+    json_output: bool,
+) -> Result<()> {
+    let store = LoadProfilesStore::new(&core.paths);
+    match command {
+        ProfilesCommand::List => output::profiles("list", &store.read().await?, None, json_output)?,
+        ProfilesCommand::Show { name } => {
+            let name = LoadProfileName::new(name)?;
+            let state = store.read().await?;
+            if !state.profiles.contains_key(&name) {
+                return Err(LoadSettingsError::ProfileNotFound(name).into());
+            }
+            output::profiles("show", &state, Some(&name), json_output)?;
+        }
+        ProfilesCommand::Create { name } => {
+            let name = LoadProfileName::new(name)?;
+            let selected = name.clone();
+            let state = store
+                .update(move |state| {
+                    state.create_profile(name)?;
+                    Ok(state.clone())
+                })
+                .await?;
+            output::profiles("create", &state, Some(&selected), json_output)?;
+        }
+        ProfilesCommand::Delete { name } => {
+            let name = LoadProfileName::new(name)?;
+            let state = store
+                .update(move |state| {
+                    state.delete_profile(&name)?;
+                    Ok(state.clone())
+                })
+                .await?;
+            output::profiles("delete", &state, None, json_output)?;
+        }
+        ProfilesCommand::Set { name, settings } => {
+            let name = LoadProfileName::new(name)?;
+            let registry = composition::engine_registry(&core)?;
+            let patch = registry.parse_load_settings(&settings)?;
+            let selected = name.clone();
+            let state = store
+                .update(move |state| {
+                    let profile = state
+                        .profiles
+                        .get_mut(&name)
+                        .ok_or_else(|| LoadSettingsError::ProfileNotFound(name.clone()))?;
+                    profile.settings.0.extend(patch.0);
+                    Ok(state.clone())
+                })
+                .await?;
+            output::profiles("set", &state, Some(&selected), json_output)?;
+        }
+        ProfilesCommand::Unset { name, settings } => {
+            let name = LoadProfileName::new(name)?;
+            let registry = composition::engine_registry(&core)?;
+            let ids = parse_known_setting_ids(&registry, &settings)?;
+            let selected = name.clone();
+            let state = store
+                .update(move |state| {
+                    let profile = state
+                        .profiles
+                        .get_mut(&name)
+                        .ok_or_else(|| LoadSettingsError::ProfileNotFound(name.clone()))?;
+                    for id in &ids {
+                        profile.settings.remove(id);
+                    }
+                    Ok(state.clone())
+                })
+                .await?;
+            output::profiles("unset", &state, Some(&selected), json_output)?;
+        }
+        ProfilesCommand::Assign { model, name } => {
+            core.ensure_model_discovery().await?;
+            let model = ModelId(model);
+            ensure_model(&core, &model).await?;
+            let name = LoadProfileName::new(name)?;
+            let selected = name.clone();
+            let state = store
+                .update(move |state| {
+                    state.assign_profile(model, Some(name))?;
+                    Ok(state.clone())
+                })
+                .await?;
+            output::profiles("assign", &state, Some(&selected), json_output)?;
+        }
+        ProfilesCommand::ClearAssignment { model } => {
+            let model = ModelId(model);
+            let state = store
+                .update(move |state| {
+                    state.assign_profile(model, None)?;
+                    Ok(state.clone())
+                })
+                .await?;
+            output::profiles("clear_assignment", &state, None, json_output)?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_settings(
+    core: Arc<ApplicationCore>,
+    command: SettingsCommand,
+    json_output: bool,
+) -> Result<()> {
+    match command {
+        SettingsCommand::Show {
+            model,
+            runtime,
+            profile,
+        } => {
+            let profile = profile.map(LoadProfileName::new).transpose()?;
+            let (runtime_id, schema, resolved) =
+                exact_settings_context(&core, ModelId(model), runtime, profile.as_ref()).await?;
+            output::effective_settings(&runtime_id, &schema, &resolved, json_output)?;
+        }
+        SettingsCommand::Schema { model, runtime } => {
+            let (_, schema, _) =
+                exact_settings_context(&core, ModelId(model), runtime, None).await?;
+            output::settings_schema(&schema, json_output)?;
+        }
+        SettingsCommand::Set(args) => {
+            mutate_defaults(&core, args, json_output).await?;
+        }
+        SettingsCommand::Unset(args) => {
+            unset_defaults(&core, args, json_output).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn exact_settings_context(
+    core: &Arc<ApplicationCore>,
+    model_id: ModelId,
+    runtime: Option<String>,
+    profile: Option<&LoadProfileName>,
+) -> Result<(
+    RuntimeId,
+    norted_core::LoadSettingsSchema,
+    norted_core::ResolvedLoadSettings,
+)> {
+    core.ensure_model_discovery().await?;
+    let model = core.model(&model_id).await.ok_or_else(|| {
+        color_eyre::eyre::eyre!("model `{model_id}` does not exist in the discovered registry")
+    })?;
+    let registry = composition::engine_registry(core)?;
+    let packs = composition::runtime_pack_manager(core, registry.clone())?;
+    packs.refresh_host_capabilities().await;
+    let runtime = runtime.map(RuntimeId::new).transpose()?;
+    let selection = packs
+        .resolve(&model, runtime.as_ref())
+        .await
+        .map_err(|error| {
+            color_eyre::eyre::eyre!(
+                "no compatible installed runtime is available to validate these settings: {error}"
+            )
+        })?;
+    let runtime_id = selection.runtime.manifest.runtime_id.clone();
+    let engine_id = selection.runtime.manifest.identity.engine_id.clone();
+    let adapter = registry.get(&engine_id).ok_or_else(|| {
+        color_eyre::eyre::eyre!("selected runtime uses unregistered engine `{engine_id}`")
+    })?;
+    let host = packs.host_capabilities().await;
+    let schema = adapter
+        .load_settings_schema(&selection.runtime, &model, &host)
+        .await?;
+    let state = LoadProfilesStore::new(&core.paths).read().await?;
+    let resolved = state.resolve(
+        &model_id,
+        &engine_id,
+        profile,
+        &LoadSettingsPatch::default(),
+    )?;
+    Ok((runtime_id, schema, resolved))
+}
+
+#[derive(Clone)]
+enum DefaultsScope {
+    Global,
+    Engine(String),
+    Model(ModelId),
+}
+
+impl std::fmt::Display for DefaultsScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Global => formatter.write_str("global defaults"),
+            Self::Engine(engine) => write!(formatter, "engine defaults:{engine}"),
+            Self::Model(model) => write!(formatter, "model defaults:{model}"),
+        }
+    }
+}
+
+async fn mutate_defaults(
+    core: &Arc<ApplicationCore>,
+    args: SettingsMutationArgs,
+    json_output: bool,
+) -> Result<()> {
+    let registry = composition::engine_registry(core)?;
+    let patch = registry.parse_load_settings(&args.settings)?;
+    let scope = defaults_scope(args.global, args.engine, args.model);
+    validate_default_scope(core, &registry, &scope, &patch).await?;
+    let label = scope.to_string();
+    let state = LoadProfilesStore::new(&core.paths)
+        .update(move |state| {
+            default_patch_mut(state, &scope).0.extend(patch.0);
+            Ok(state.clone())
+        })
+        .await?;
+    output::settings_mutation("set", &label, &state, json_output)?;
+    Ok(())
+}
+
+async fn unset_defaults(
+    core: &Arc<ApplicationCore>,
+    args: SettingsUnsetArgs,
+    json_output: bool,
+) -> Result<()> {
+    let registry = composition::engine_registry(core)?;
+    let ids = parse_known_setting_ids(&registry, &args.settings)?;
+    let scope = defaults_scope(args.global, args.engine, args.model);
+    let patch = LoadSettingsPatch(
+        ids.iter()
+            .cloned()
+            .map(|id| (id, norted_core::LoadSettingValue::FlagEnabled))
+            .collect(),
+    );
+    validate_default_scope(core, &registry, &scope, &patch).await?;
+    let label = scope.to_string();
+    let state = LoadProfilesStore::new(&core.paths)
+        .update(move |state| {
+            let target = default_patch_mut(state, &scope);
+            for id in &ids {
+                target.remove(id);
+            }
+            match &scope {
+                DefaultsScope::Engine(engine)
+                    if state
+                        .engine_defaults
+                        .get(engine)
+                        .is_some_and(LoadSettingsPatch::is_empty) =>
+                {
+                    state.engine_defaults.remove(engine);
+                }
+                DefaultsScope::Model(model)
+                    if state
+                        .model_defaults
+                        .get(model)
+                        .is_some_and(LoadSettingsPatch::is_empty) =>
+                {
+                    state.model_defaults.remove(model);
+                }
+                _ => {}
+            }
+            Ok(state.clone())
+        })
+        .await?;
+    output::settings_mutation("unset", &label, &state, json_output)?;
+    Ok(())
+}
+
+fn defaults_scope(global: bool, engine: Option<String>, model: Option<String>) -> DefaultsScope {
+    if global {
+        DefaultsScope::Global
+    } else if let Some(engine) = engine {
+        DefaultsScope::Engine(engine)
+    } else {
+        DefaultsScope::Model(ModelId(model.expect("clap requires one settings scope")))
+    }
+}
+
+fn default_patch_mut<'a>(
+    state: &'a mut norted_core::LoadProfilesState,
+    scope: &DefaultsScope,
+) -> &'a mut LoadSettingsPatch {
+    match scope {
+        DefaultsScope::Global => &mut state.global_defaults,
+        DefaultsScope::Engine(engine) => state.engine_defaults.entry(engine.clone()).or_default(),
+        DefaultsScope::Model(model) => state.model_defaults.entry(model.clone()).or_default(),
+    }
+}
+
+async fn validate_default_scope(
+    core: &Arc<ApplicationCore>,
+    registry: &EngineRegistry,
+    scope: &DefaultsScope,
+    patch: &LoadSettingsPatch,
+) -> Result<()> {
+    let definitions = registry
+        .load_setting_definitions()?
+        .into_iter()
+        .map(|definition| (definition.id.clone(), definition))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    match scope {
+        DefaultsScope::Global => {
+            if let Some(id) = patch.0.keys().find(|id| id.namespace().is_some()) {
+                return Err(LoadSettingsError::InvalidGlobalSetting(id.clone()).into());
+            }
+        }
+        DefaultsScope::Engine(engine) => {
+            if registry.get(engine).is_none() {
+                return Err(color_eyre::eyre::eyre!("unknown engine `{engine}`"));
+            }
+            for id in patch.0.keys() {
+                let definition = &definitions[id];
+                if matches!(
+                    &definition.scope,
+                    LoadSettingScope::Engine { engine_id } if engine_id != engine
+                ) {
+                    return Err(LoadSettingsError::WrongEngineScope {
+                        setting_id: id.clone(),
+                        engine_id: engine.clone(),
+                    }
+                    .into());
+                }
+            }
+        }
+        DefaultsScope::Model(model) => {
+            core.ensure_model_discovery().await?;
+            ensure_model(core, model).await?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_known_setting_ids(
+    registry: &EngineRegistry,
+    values: &[String],
+) -> Result<Vec<LoadSettingId>> {
+    let known = registry
+        .load_setting_definitions()?
+        .into_iter()
+        .map(|definition| definition.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    values
+        .iter()
+        .map(|value| {
+            let id = LoadSettingId::new(value.clone())?;
+            if !known.contains(&id) {
+                return Err(LoadSettingsError::UnknownSetting(id));
+            }
+            Ok(id)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+async fn ensure_model(core: &ApplicationCore, model: &ModelId) -> Result<()> {
+    if core.model(model).await.is_none() {
+        return Err(color_eyre::eyre::eyre!(
+            "model `{model}` does not exist in the discovered registry"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

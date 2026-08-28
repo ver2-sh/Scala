@@ -6,8 +6,9 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use norted_core::{
-    ApplicationCore, EnvironmentVariableProvenance, ModelId, NativeArgumentProvenance,
-    ProcessIdentity, RuntimeId, RuntimeProvenance, RuntimeSelection,
+    ApplicationCore, EnvironmentVariableProvenance, LoadProfileName, LoadProfilesStore,
+    LoadSettingsPatch, LoadSettingsProvenance, ModelId, NativeArgumentProvenance, ProcessIdentity,
+    RuntimeId, RuntimeProvenance, RuntimeSelection,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -164,6 +165,7 @@ pub struct RuntimeManager {
     operation: Mutex<()>,
     cancellation_epoch: AtomicU64,
     shutting_down: AtomicBool,
+    load_profiles: LoadProfilesStore,
 }
 
 impl RuntimeManager {
@@ -174,6 +176,7 @@ impl RuntimeManager {
         supervisor: Arc<dyn ProcessSupervisor>,
         options: RuntimeManagerOptions,
     ) -> Arc<Self> {
+        let load_profiles = LoadProfilesStore::new(&core.paths);
         let manager = Arc::new(Self {
             core,
             registry,
@@ -199,6 +202,7 @@ impl RuntimeManager {
             operation: Mutex::new(()),
             cancellation_epoch: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
+            load_profiles,
         });
         manager.refresh_engine_probes().await;
         manager
@@ -299,6 +303,17 @@ impl RuntimeManager {
         model_id: ModelId,
         runtime_id: Option<RuntimeId>,
     ) -> Result<ControlStatus, RuntimeError> {
+        self.load_with_settings(model_id, runtime_id, None, LoadSettingsPatch::default())
+            .await
+    }
+
+    pub async fn load_with_settings(
+        self: &Arc<Self>,
+        model_id: ModelId,
+        runtime_id: Option<RuntimeId>,
+        profile: Option<LoadProfileName>,
+        settings: LoadSettingsPatch,
+    ) -> Result<ControlStatus, RuntimeError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(RuntimeError::Operation(
                 "the runtime is shutting down".to_owned(),
@@ -308,7 +323,7 @@ impl RuntimeManager {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             manager
-                .load_inner(model_id, runtime_id, cancellation_epoch)
+                .load_inner(model_id, runtime_id, profile, settings, cancellation_epoch)
                 .await
         })
         .await
@@ -319,6 +334,8 @@ impl RuntimeManager {
         self: &Arc<Self>,
         model_id: ModelId,
         runtime_id: Option<RuntimeId>,
+        profile: Option<LoadProfileName>,
+        invocation_settings: LoadSettingsPatch,
         cancellation_epoch: u64,
     ) -> Result<ControlStatus, RuntimeError> {
         let _operation = self.operation.lock().await;
@@ -368,6 +385,47 @@ impl RuntimeManager {
             }
         };
         let engine_id = adapter.identity().id;
+        if let Some(id) = invocation_settings
+            .0
+            .keys()
+            .find(|id| !id.applies_to_engine(&engine_id))
+        {
+            let error = RuntimeError::Operation(format!(
+                "invocation load setting `{id}` does not apply to selected engine `{engine_id}`"
+            ));
+            self.fail_loading(generation, error.to_string(), None).await;
+            return Err(error);
+        }
+        let profile_state = match self.load_profiles.read().await {
+            Ok(state) => state,
+            Err(error) => {
+                self.fail_loading(generation, error.to_string(), None).await;
+                return Err(RuntimeError::Operation(error.to_string()));
+            }
+        };
+        let resolved_load_settings = match profile_state.resolve(
+            &model_id,
+            &engine_id,
+            profile.as_ref(),
+            &invocation_settings,
+        ) {
+            Ok(settings) => settings,
+            Err(error) => {
+                self.fail_loading(generation, error.to_string(), None).await;
+                return Err(RuntimeError::Operation(error.to_string()));
+            }
+        };
+        let host = self.packs.host_capabilities().await;
+        let load_settings_schema = match adapter
+            .load_settings_schema(&selection.runtime, &model, &host)
+            .await
+        {
+            Ok(schema) => schema,
+            Err(error) => {
+                self.fail_loading(generation, error.to_string(), None).await;
+                return Err(RuntimeError::StartupFailed(error.to_string()));
+            }
+        };
         let selected_runtime_id = selection.runtime.manifest.runtime_id.clone();
         let runtime_lease = match self.packs.acquire_runtime_lease(&selected_runtime_id).await {
             Ok(lease) => lease,
@@ -421,6 +479,8 @@ impl RuntimeManager {
                 runtime: selection.runtime.clone(),
                 accelerator: selection.accelerator.clone(),
                 backend_address,
+                load_settings: resolved_load_settings,
+                load_settings_schema,
             })
             .await
         {
@@ -440,6 +500,7 @@ impl RuntimeManager {
         let selected_accelerator = launch_spec.accelerator.clone();
         let model_identity = launch_spec.model.runtime_identity();
         let normalized_settings = launch_spec.normalized_settings.clone();
+        let load_settings = launch_spec.load_settings.clone();
         let native_arguments = launch_spec.native_arguments.clone();
         let inherits_parent_environment = launch_spec.inherits_parent_environment;
         let native_environment = environment_provenance(
@@ -495,7 +556,13 @@ impl RuntimeManager {
             selection_source: selection.source,
             accelerator: selected_accelerator,
             installation,
-            profile: None,
+            profile: load_settings
+                .selected_profile
+                .as_ref()
+                .map(ToString::to_string),
+            load_settings: LoadSettingsProvenance {
+                effective: load_settings.effective,
+            },
             normalized_settings,
             native_arguments: native_argument_provenance(native_arguments),
             native_environment,

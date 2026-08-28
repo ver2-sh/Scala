@@ -520,3 +520,194 @@ fn truncate(value: &str, width: usize) -> String {
             + "…"
     }
 }
+
+pub fn profiles(
+    operation: &str,
+    state: &norted_core::LoadProfilesState,
+    selected: Option<&norted_core::LoadProfileName>,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        let profile = selected.and_then(|name| state.profiles.get(name).map(|value| (name, value)));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "operation": operation,
+                "state_version": state.version,
+                "profile": profile.map(|(name, value)| json!({"name": name, "settings": value.settings})),
+                "profiles": state.profiles,
+                "model_assignments": state.model_assignments,
+            }))?
+        );
+        return Ok(());
+    }
+    if let Some(name) = selected {
+        let profile = &state.profiles[name];
+        println!("Profile {name}");
+        if profile.settings.is_empty() {
+            println!("  No overrides; all values inherit.");
+        } else {
+            for (id, value) in profile.settings.iter() {
+                println!("  {id:<38} {value}");
+            }
+        }
+        let models = state
+            .model_assignments
+            .iter()
+            .filter_map(|(model, assigned)| (assigned == name).then_some(model))
+            .collect::<Vec<_>>();
+        if !models.is_empty() {
+            println!(
+                "  Assigned models: {}",
+                models
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    } else if state.profiles.is_empty() {
+        println!("No load profiles exist.");
+    } else {
+        println!("{:<32} {:>9}  ASSIGNED MODELS", "PROFILE", "SETTINGS");
+        for (name, profile) in &state.profiles {
+            let assigned = state
+                .model_assignments
+                .values()
+                .filter(|candidate| *candidate == name)
+                .count();
+            println!("{name:<32} {:>9}  {assigned}", profile.settings.0.len());
+        }
+    }
+    Ok(())
+}
+
+pub fn settings_schema(schema: &norted_core::LoadSettingsSchema, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(schema)?);
+    } else {
+        println!(
+            "Load settings for {} / {}",
+            schema.engine_id,
+            schema
+                .runtime_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("no exact runtime")
+        );
+        for definition in &schema.definitions {
+            let support = if definition.supported {
+                "supported".to_owned()
+            } else {
+                format!(
+                    "unsupported: {}",
+                    definition
+                        .unsupported_reason
+                        .as_deref()
+                        .unwrap_or("unknown reason")
+                )
+            };
+            println!(
+                "  {:<38} {:<11} {}",
+                definition.id, support, definition.label
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn effective_settings(
+    runtime_id: &norted_core::RuntimeId,
+    schema: &norted_core::LoadSettingsSchema,
+    resolved: &norted_core::ResolvedLoadSettings,
+    json_output: bool,
+) -> Result<()> {
+    let rows = schema
+        .definitions
+        .iter()
+        .map(|definition| {
+            let effective = resolved.effective.get(&definition.id);
+            json!({
+                "id": definition.id,
+                "label": definition.label,
+                "value": effective.map(|setting| &setting.value),
+                "source": effective.map(|setting| &setting.source),
+                "state": if effective.is_some() { "configured" } else { "upstream_default" },
+                "supported": definition.supported,
+                "unsupported_reason": definition.unsupported_reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "runtime_id": runtime_id,
+                "engine_id": schema.engine_id,
+                "selected_profile": resolved.selected_profile,
+                "settings": rows,
+            }))?
+        );
+    } else {
+        println!("Runtime: {runtime_id}");
+        println!("Engine:  {}", schema.engine_id);
+        println!(
+            "Profile: {}",
+            resolved
+                .selected_profile
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("none")
+        );
+        println!("{:<38} {:<20} SOURCE", "SETTING", "VALUE");
+        for definition in &schema.definitions {
+            if let Some(setting) = resolved.effective.get(&definition.id) {
+                let suffix = if definition.supported {
+                    String::new()
+                } else {
+                    format!(
+                        " [incompatible: {}]",
+                        definition
+                            .unsupported_reason
+                            .as_deref()
+                            .unwrap_or("unsupported")
+                    )
+                };
+                println!(
+                    "{:<38} {:<20} {}{}",
+                    definition.id, setting.value, setting.source, suffix
+                );
+            } else {
+                println!(
+                    "{:<38} {:<20} upstream",
+                    definition.id, "<upstream default>"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn settings_mutation(
+    operation: &str,
+    scope: &str,
+    state: &norted_core::LoadProfilesState,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "operation": operation,
+                "scope": scope,
+                "state": state,
+            }))?
+        );
+    } else {
+        println!("Load settings {operation}: {scope}");
+        println!("Changes apply on the next model load.");
+    }
+    Ok(())
+}

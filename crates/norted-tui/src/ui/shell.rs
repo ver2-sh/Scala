@@ -198,6 +198,7 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
                 hint("Enter", "load", theme),
                 hint("u", "unload", theme),
                 hint("v", "runtime override", theme),
+                hint("p", "load settings", theme),
                 hint("wheel", "scroll", theme),
                 hint("Tab", "focus", theme),
                 hint("/", "commands", theme),
@@ -218,6 +219,14 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
                 hint("d d", "remove", theme),
                 hint("r", "refresh", theme),
                 hint("wheel", "scroll", theme),
+            ],
+            (FocusArea::Content, crate::app::Screen::Settings) => vec![
+                hint("Left/Right", "scope", theme),
+                hint(glyphs.up_down, "setting", theme),
+                hint("Enter", "edit/cycle", theme),
+                hint("Delete", "inherit", theme),
+                hint("n", "new profile", theme),
+                hint("d", "delete profile", theme),
             ],
             _ => vec![
                 hint("Tab", "change focus", theme),

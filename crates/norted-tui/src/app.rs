@@ -4,7 +4,9 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use norted_core::{
-    AppEvent, AppSnapshot, ArtifactFormat, LogLevel, ModelArtifact, ModelId, RegistryState,
+    AppEvent, AppSnapshot, ArtifactFormat, LoadProfileName, LoadProfilesState,
+    LoadSettingDefinition, LoadSettingId, LoadSettingScope, LoadSettingSource, LoadSettingValue,
+    LoadSettingsSchema, LogLevel, ModelArtifact, ModelId, RegistryState, ResolvedLoadSettings,
     RuntimeCompatibility, RuntimeId, RuntimeOperationPhase, RuntimeOperationProgress,
     RuntimeUpdateState,
 };
@@ -150,6 +152,67 @@ pub enum RuntimeTaskResult {
     },
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum SettingsScope {
+    Global,
+    Engine(String),
+    Profile(LoadProfileName),
+    Model(ModelId),
+}
+
+#[derive(Debug, Clone)]
+pub enum SettingsAction {
+    Refresh,
+    Set {
+        scope: SettingsScope,
+        id: LoadSettingId,
+        value: LoadSettingValue,
+    },
+    Unset {
+        scope: SettingsScope,
+        id: LoadSettingId,
+    },
+    CreateProfile(LoadProfileName),
+    DeleteProfile(LoadProfileName),
+    AssignProfile {
+        model_id: ModelId,
+        profile: Option<LoadProfileName>,
+    },
+    InspectModel(Box<ModelArtifact>),
+}
+
+#[derive(Debug)]
+pub struct ModelSettingsInspection {
+    pub profiles: LoadProfilesState,
+    pub runtime_id: RuntimeId,
+    pub schema: LoadSettingsSchema,
+    pub resolved: ResolvedLoadSettings,
+}
+
+#[derive(Debug)]
+pub enum SettingsTaskResult {
+    Loaded(Result<LoadProfilesState, String>),
+    Stored(Result<LoadProfilesState, String>),
+    Inspected {
+        model_id: ModelId,
+        result: Result<ModelSettingsInspection, String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SettingsInputKind {
+    ProfileName,
+    SettingValue,
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingsInput {
+    pub kind: SettingsInputKind,
+    pub text: String,
+    pub cursor: usize,
+    setting_id: Option<LoadSettingId>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub level: LogLevel,
@@ -162,9 +225,6 @@ pub struct App {
     pub control_observation_error: Option<String>,
     pub no_color: bool,
     pub unicode: bool,
-    pub server_address: String,
-    pub config_path: String,
-    pub model_paths: Vec<String>,
     pub screen: Screen,
     pub overlay: Option<Overlay>,
     pub command_active: bool,
@@ -204,12 +264,27 @@ pub struct App {
     pub runtime_picker_candidates: Vec<RuntimeModelCandidate>,
     pub runtime_picker_loading: bool,
     pub runtime_picker_error: Option<String>,
+    pub load_profiles: Option<LoadProfilesState>,
+    pub load_profiles_error: Option<String>,
+    pub load_profiles_loading: bool,
+    pub load_setting_definitions: Vec<LoadSettingDefinition>,
+    pub settings_scope_index: usize,
+    pub settings_setting_index: usize,
+    pub settings_scroll: usize,
+    pub settings_model: Option<ModelId>,
+    pub settings_schema: Option<LoadSettingsSchema>,
+    pub settings_resolved: Option<ResolvedLoadSettings>,
+    pub settings_runtime_id: Option<RuntimeId>,
+    pub settings_validation_error: Option<String>,
+    pub settings_input: Option<SettingsInput>,
     focus_before_command: FocusArea,
     pending_control_action: Option<ControlAction>,
     control_busy: bool,
     pending_runtime_action: Option<RuntimeAction>,
     runtime_mutation_busy: bool,
     pending_runtime_remove_confirmation: Option<RuntimeId>,
+    pending_settings_action: Option<SettingsAction>,
+    settings_busy: bool,
     seen_runtime_events: BTreeSet<(i64, u8, String)>,
 }
 
@@ -218,9 +293,7 @@ impl App {
         snapshot: AppSnapshot,
         no_color: bool,
         unicode: bool,
-        server_address: String,
-        config_path: String,
-        model_paths: Vec<String>,
+        load_setting_definitions: Vec<LoadSettingDefinition>,
     ) -> Self {
         let mut logs = vec![LogEntry {
             level: LogLevel::Info,
@@ -242,9 +315,6 @@ impl App {
             control_observation_error: None,
             no_color,
             unicode,
-            server_address,
-            config_path,
-            model_paths,
             screen: Screen::Overview,
             overlay: None,
             command_active: false,
@@ -284,12 +354,27 @@ impl App {
             runtime_picker_candidates: Vec::new(),
             runtime_picker_loading: false,
             runtime_picker_error: None,
+            load_profiles: None,
+            load_profiles_error: None,
+            load_profiles_loading: true,
+            load_setting_definitions,
+            settings_scope_index: 0,
+            settings_setting_index: 0,
+            settings_scroll: 0,
+            settings_model: None,
+            settings_schema: None,
+            settings_resolved: None,
+            settings_runtime_id: None,
+            settings_validation_error: None,
+            settings_input: None,
             focus_before_command: FocusArea::Navigation,
             pending_control_action: None,
             control_busy: false,
             pending_runtime_action: None,
             runtime_mutation_busy: false,
             pending_runtime_remove_confirmation: None,
+            pending_settings_action: None,
+            settings_busy: false,
             seen_runtime_events: BTreeSet::new(),
         }
     }
@@ -304,6 +389,9 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Update::Quit;
+        }
+        if self.settings_input.is_some() {
+            return self.handle_settings_input_key(key);
         }
         if let Some(overlay) = self.overlay {
             return match overlay {
@@ -416,6 +504,12 @@ impl App {
 
     pub fn handle_paste(&mut self, text: &str) -> Update {
         let normalized = text.replace(['\r', '\n', '\t'], " ");
+        if let Some(input) = &mut self.settings_input {
+            let index = byte_index(&input.text, input.cursor);
+            input.text.insert_str(index, &normalized);
+            input.cursor += normalized.chars().count();
+            return Update::Render;
+        }
         if self.overlay == Some(Overlay::RuntimeSearch)
             && self.runtime_search_focus == RuntimeSearchFocus::Query
         {
@@ -526,6 +620,188 @@ impl App {
 
     pub fn take_runtime_action(&mut self) -> Option<RuntimeAction> {
         self.pending_runtime_action.take()
+    }
+
+    pub fn take_settings_action(&mut self) -> Option<SettingsAction> {
+        self.pending_settings_action.take()
+    }
+
+    pub fn handle_settings_task_result(&mut self, result: SettingsTaskResult) {
+        self.settings_busy = false;
+        self.load_profiles_loading = false;
+        match result {
+            SettingsTaskResult::Loaded(result) => match result {
+                Ok(state) => {
+                    self.load_profiles = Some(state);
+                    self.load_profiles_error = None;
+                    self.reconcile_settings_selection();
+                }
+                Err(error) => {
+                    self.load_profiles_error = Some(error.clone());
+                    self.notice = Some(error);
+                }
+            },
+            SettingsTaskResult::Stored(result) => match result {
+                Ok(state) => {
+                    self.load_profiles = Some(state);
+                    self.load_profiles_error = None;
+                    self.notice =
+                        Some("Load settings saved; changes apply on the next load".to_owned());
+                    self.reconcile_settings_selection();
+                    if self.settings_model.is_some() {
+                        let _ = self.refresh_model_settings();
+                    }
+                }
+                Err(error) => {
+                    self.load_profiles_error = Some(error.clone());
+                    self.notice = Some(error);
+                }
+            },
+            SettingsTaskResult::Inspected { model_id, result } => {
+                if self.settings_model.as_ref() != Some(&model_id) {
+                    return;
+                }
+                match result {
+                    Ok(inspection) => {
+                        self.load_profiles = Some(inspection.profiles);
+                        self.load_profiles_error = None;
+                        self.settings_runtime_id = Some(inspection.runtime_id);
+                        self.settings_schema = Some(inspection.schema);
+                        self.settings_resolved = Some(inspection.resolved);
+                        self.settings_validation_error = None;
+                    }
+                    Err(error) => {
+                        self.settings_schema = None;
+                        self.settings_resolved = None;
+                        self.settings_runtime_id = None;
+                        self.settings_validation_error = Some(error.clone());
+                        self.notice = Some(error);
+                    }
+                }
+                self.reconcile_settings_selection();
+            }
+        }
+    }
+
+    pub fn settings_scopes(&self) -> Vec<SettingsScope> {
+        let mut scopes = vec![SettingsScope::Global];
+        let engines = self
+            .load_setting_definitions
+            .iter()
+            .filter_map(|definition| match &definition.scope {
+                LoadSettingScope::Common => None,
+                LoadSettingScope::Engine { engine_id } => Some(engine_id.clone()),
+            })
+            .collect::<BTreeSet<_>>();
+        scopes.extend(engines.into_iter().map(SettingsScope::Engine));
+        if let Some(state) = &self.load_profiles {
+            scopes.extend(state.profiles.keys().cloned().map(SettingsScope::Profile));
+        }
+        if let Some(model) = &self.settings_model {
+            scopes.push(SettingsScope::Model(model.clone()));
+        }
+        scopes
+    }
+
+    pub fn selected_settings_scope(&self) -> Option<SettingsScope> {
+        self.settings_scopes()
+            .get(self.settings_scope_index)
+            .cloned()
+    }
+
+    pub fn settings_definitions(&self) -> Vec<&LoadSettingDefinition> {
+        let scope = self.selected_settings_scope();
+        let source = if matches!(scope, Some(SettingsScope::Model(_))) {
+            self.settings_schema
+                .as_ref()
+                .map(|schema| schema.definitions.as_slice())
+                .unwrap_or(&self.load_setting_definitions)
+        } else {
+            &self.load_setting_definitions
+        };
+        source
+            .iter()
+            .filter(|definition| match &scope {
+                Some(SettingsScope::Global) => definition.scope == LoadSettingScope::Common,
+                Some(SettingsScope::Engine(selected)) => match &definition.scope {
+                    LoadSettingScope::Common => true,
+                    LoadSettingScope::Engine { engine_id } => engine_id == selected,
+                },
+                Some(SettingsScope::Profile(_) | SettingsScope::Model(_)) => true,
+                None => false,
+            })
+            .collect()
+    }
+
+    pub fn settings_value_display(&self, id: &LoadSettingId) -> (String, String, bool) {
+        let Some(state) = &self.load_profiles else {
+            return ("loading".to_owned(), "state".to_owned(), false);
+        };
+        let Some(scope) = self.selected_settings_scope() else {
+            return (
+                "<upstream default>".to_owned(),
+                "upstream".to_owned(),
+                false,
+            );
+        };
+        let current = match &scope {
+            SettingsScope::Global => state.global_defaults.0.get(id),
+            SettingsScope::Engine(engine) => state
+                .engine_defaults
+                .get(engine)
+                .and_then(|patch| patch.0.get(id)),
+            SettingsScope::Profile(profile) => state
+                .profiles
+                .get(profile)
+                .and_then(|profile| profile.settings.0.get(id)),
+            SettingsScope::Model(model) => state
+                .model_defaults
+                .get(model)
+                .and_then(|patch| patch.0.get(id)),
+        };
+        if let SettingsScope::Model(_) = scope
+            && let Some(setting) = self
+                .settings_resolved
+                .as_ref()
+                .and_then(|resolved| resolved.effective.get(id))
+        {
+            let set_here = matches!(setting.source, LoadSettingSource::ModelDefault { .. });
+            return (
+                setting.value.to_string(),
+                setting.source.to_string(),
+                set_here,
+            );
+        }
+        if let Some(value) = current {
+            return (value.to_string(), "set here".to_owned(), true);
+        }
+        let inherited = match id.namespace() {
+            Some(engine) => state
+                .engine_defaults
+                .get(engine)
+                .and_then(|patch| patch.0.get(id))
+                .map(|value| (value, format!("engine-default:{engine}"))),
+            None => state
+                .global_defaults
+                .0
+                .get(id)
+                .map(|value| (value, "global-default".to_owned())),
+        };
+        inherited.map_or_else(
+            || {
+                (
+                    "<upstream default>".to_owned(),
+                    "upstream".to_owned(),
+                    false,
+                )
+            },
+            |(value, source)| (value.to_string(), source, false),
+        )
+    }
+
+    pub fn assigned_profile_for_settings_model(&self) -> Option<&LoadProfileName> {
+        let model = self.settings_model.as_ref()?;
+        self.load_profiles.as_ref()?.model_assignments.get(model)
     }
 
     pub fn runtime_mutation_busy(&self) -> bool {
@@ -1080,6 +1356,7 @@ impl App {
                 KeyCode::Enter => self.request_load(),
                 KeyCode::Char('u') => self.request_unload(),
                 KeyCode::Char('v') => self.open_model_runtime_picker(),
+                KeyCode::Char('p') => self.open_model_load_settings(),
                 _ => Update::None,
             },
             Screen::Logs => match key.code {
@@ -1128,8 +1405,364 @@ impl App {
                 }
                 _ => Update::None,
             },
+            Screen::Settings => self.handle_settings_key(key, layout),
             _ => Update::None,
         }
+    }
+
+    fn handle_settings_key(&mut self, key: KeyEvent, layout: &UiLayout) -> Update {
+        if self.settings_busy {
+            return Update::None;
+        }
+        match key.code {
+            KeyCode::Left => self.move_settings_scope(-1),
+            KeyCode::Right | KeyCode::Tab => self.move_settings_scope(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_settings_selection(-1, layout),
+            KeyCode::Down | KeyCode::Char('j') => self.move_settings_selection(1, layout),
+            KeyCode::PageUp => self.scroll_settings(-(layout.settings_capacity() as isize), layout),
+            KeyCode::PageDown => self.scroll_settings(layout.settings_capacity() as isize, layout),
+            KeyCode::Enter => self.edit_selected_setting(),
+            KeyCode::Backspace | KeyCode::Delete => self.clear_selected_setting(),
+            KeyCode::Char('n') => {
+                self.settings_input = Some(SettingsInput {
+                    kind: SettingsInputKind::ProfileName,
+                    text: String::new(),
+                    cursor: 0,
+                    setting_id: None,
+                });
+                Update::Render
+            }
+            KeyCode::Char('d') => self.delete_selected_profile(),
+            KeyCode::Char('p') => self.cycle_model_profile(),
+            KeyCode::Char('r') => self.refresh_model_settings(),
+            _ => Update::None,
+        }
+    }
+
+    fn handle_settings_input_key(&mut self, key: KeyEvent) -> Update {
+        match key.code {
+            KeyCode::Esc => {
+                self.settings_input = None;
+                Update::Render
+            }
+            KeyCode::Enter => self.submit_settings_input(),
+            KeyCode::Backspace => {
+                let input = self.settings_input.as_mut().expect("checked by caller");
+                if input.cursor > 0 {
+                    input.cursor -= 1;
+                    let start = byte_index(&input.text, input.cursor);
+                    let end = byte_index(&input.text, input.cursor + 1);
+                    input.text.replace_range(start..end, "");
+                }
+                Update::Render
+            }
+            KeyCode::Delete => {
+                let input = self.settings_input.as_mut().expect("checked by caller");
+                if input.cursor < input.text.chars().count() {
+                    let start = byte_index(&input.text, input.cursor);
+                    let end = byte_index(&input.text, input.cursor + 1);
+                    input.text.replace_range(start..end, "");
+                }
+                Update::Render
+            }
+            KeyCode::Left => {
+                let input = self.settings_input.as_mut().expect("checked by caller");
+                input.cursor = input.cursor.saturating_sub(1);
+                Update::Render
+            }
+            KeyCode::Right => {
+                let input = self.settings_input.as_mut().expect("checked by caller");
+                input.cursor = (input.cursor + 1).min(input.text.chars().count());
+                Update::Render
+            }
+            KeyCode::Home => {
+                self.settings_input
+                    .as_mut()
+                    .expect("checked by caller")
+                    .cursor = 0;
+                Update::Render
+            }
+            KeyCode::End => {
+                let input = self.settings_input.as_mut().expect("checked by caller");
+                input.cursor = input.text.chars().count();
+                Update::Render
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let input = self.settings_input.as_mut().expect("checked by caller");
+                let index = byte_index(&input.text, input.cursor);
+                input.text.insert(index, character);
+                input.cursor += 1;
+                Update::Render
+            }
+            _ => Update::None,
+        }
+    }
+
+    fn submit_settings_input(&mut self) -> Update {
+        let Some(input) = self.settings_input.take() else {
+            return Update::None;
+        };
+        match input.kind {
+            SettingsInputKind::ProfileName => match LoadProfileName::new(input.text) {
+                Ok(name) => self.queue_settings_action(SettingsAction::CreateProfile(name)),
+                Err(error) => {
+                    self.notice = Some(error.to_string());
+                    Update::Render
+                }
+            },
+            SettingsInputKind::SettingValue => {
+                let Some(id) = input.setting_id else {
+                    return Update::None;
+                };
+                let definition = self
+                    .settings_definitions()
+                    .into_iter()
+                    .find(|definition| definition.id == id)
+                    .cloned();
+                let Some(definition) = definition else {
+                    self.notice = Some("The selected setting is no longer available".to_owned());
+                    return Update::Render;
+                };
+                match definition.parse(&input.text) {
+                    Ok(value) => self.set_selected_setting(id, value),
+                    Err(error) => {
+                        self.notice = Some(error.to_string());
+                        Update::Render
+                    }
+                }
+            }
+        }
+    }
+
+    fn edit_selected_setting(&mut self) -> Update {
+        let definition = self
+            .settings_definitions()
+            .get(self.settings_setting_index)
+            .copied()
+            .cloned();
+        let Some(definition) = definition else {
+            return Update::None;
+        };
+        if !definition.supported {
+            self.notice =
+                Some(definition.unsupported_reason.unwrap_or_else(|| {
+                    "The exact runtime does not support this setting".to_owned()
+                }));
+            return Update::Render;
+        }
+        let current = self.current_layer_value(&definition.id).cloned();
+        match &definition.kind {
+            norted_core::LoadSettingKind::Toggle => {
+                let value = !matches!(current, Some(LoadSettingValue::Toggle(true)));
+                self.set_selected_setting(definition.id, LoadSettingValue::Toggle(value))
+            }
+            norted_core::LoadSettingKind::OneWayFlag => {
+                self.set_selected_setting(definition.id, LoadSettingValue::FlagEnabled)
+            }
+            norted_core::LoadSettingKind::Choice { choices } => {
+                let current = match current {
+                    Some(LoadSettingValue::Choice(value)) => choices
+                        .iter()
+                        .position(|choice| choice == &value)
+                        .map(|index| (index + 1) % choices.len()),
+                    _ => None,
+                }
+                .unwrap_or(0);
+                let Some(value) = choices.get(current).cloned() else {
+                    self.notice = Some("This enum has no available choices".to_owned());
+                    return Update::Render;
+                };
+                self.set_selected_setting(definition.id, LoadSettingValue::Choice(value))
+            }
+            _ => {
+                let text = current.map(|value| value.to_string()).unwrap_or_default();
+                let cursor = text.chars().count();
+                self.settings_input = Some(SettingsInput {
+                    kind: SettingsInputKind::SettingValue,
+                    text,
+                    cursor,
+                    setting_id: Some(definition.id),
+                });
+                Update::Render
+            }
+        }
+    }
+
+    fn set_selected_setting(&mut self, id: LoadSettingId, value: LoadSettingValue) -> Update {
+        let Some(scope) = self.selected_settings_scope() else {
+            return Update::None;
+        };
+        self.queue_settings_action(SettingsAction::Set { scope, id, value })
+    }
+
+    fn clear_selected_setting(&mut self) -> Update {
+        let id = self
+            .settings_definitions()
+            .get(self.settings_setting_index)
+            .map(|definition| definition.id.clone());
+        let (Some(scope), Some(id)) = (self.selected_settings_scope(), id) else {
+            return Update::None;
+        };
+        if self.current_layer_value(&id).is_none() {
+            self.notice =
+                Some("This layer has no override; the value is already inherited".to_owned());
+            return Update::Render;
+        }
+        self.queue_settings_action(SettingsAction::Unset { scope, id })
+    }
+
+    fn current_layer_value(&self, id: &LoadSettingId) -> Option<&LoadSettingValue> {
+        let state = self.load_profiles.as_ref()?;
+        match self.selected_settings_scope()? {
+            SettingsScope::Global => state.global_defaults.0.get(id),
+            SettingsScope::Engine(engine) => state.engine_defaults.get(&engine)?.0.get(id),
+            SettingsScope::Profile(profile) => state.profiles.get(&profile)?.settings.0.get(id),
+            SettingsScope::Model(model) => state.model_defaults.get(&model)?.0.get(id),
+        }
+    }
+
+    fn queue_settings_action(&mut self, action: SettingsAction) -> Update {
+        self.pending_settings_action = Some(action);
+        self.settings_busy = true;
+        self.notice = Some("Saving load settings…".to_owned());
+        Update::Render
+    }
+
+    fn move_settings_scope(&mut self, direction: isize) -> Update {
+        let scopes = self.settings_scopes();
+        if scopes.is_empty() {
+            return Update::None;
+        }
+        self.settings_scope_index = (self.settings_scope_index as isize + direction)
+            .rem_euclid(scopes.len() as isize) as usize;
+        self.settings_setting_index = 0;
+        self.settings_scroll = 0;
+        if matches!(
+            self.selected_settings_scope(),
+            Some(SettingsScope::Model(_))
+        ) {
+            return self.refresh_model_settings();
+        }
+        Update::Render
+    }
+
+    fn move_settings_selection(&mut self, direction: isize, layout: &UiLayout) -> Update {
+        let len = self.settings_definitions().len();
+        if len == 0 {
+            return Update::None;
+        }
+        self.settings_setting_index =
+            (self.settings_setting_index as isize + direction).clamp(0, len as isize - 1) as usize;
+        let capacity = layout.settings_capacity().max(1);
+        if self.settings_setting_index < self.settings_scroll {
+            self.settings_scroll = self.settings_setting_index;
+        } else if self.settings_setting_index >= self.settings_scroll + capacity {
+            self.settings_scroll = self.settings_setting_index + 1 - capacity;
+        }
+        Update::Render
+    }
+
+    fn scroll_settings(&mut self, amount: isize, layout: &UiLayout) -> Update {
+        let max_scroll = self
+            .settings_definitions()
+            .len()
+            .saturating_sub(layout.settings_capacity().max(1));
+        self.settings_scroll = if amount < 0 {
+            self.settings_scroll.saturating_sub(amount.unsigned_abs())
+        } else {
+            self.settings_scroll
+                .saturating_add(amount as usize)
+                .min(max_scroll)
+        };
+        Update::Render
+    }
+
+    fn delete_selected_profile(&mut self) -> Update {
+        let Some(SettingsScope::Profile(profile)) = self.selected_settings_scope() else {
+            self.notice = Some("Select a named profile before deleting it".to_owned());
+            return Update::Render;
+        };
+        self.queue_settings_action(SettingsAction::DeleteProfile(profile))
+    }
+
+    fn cycle_model_profile(&mut self) -> Update {
+        let Some(model_id) = self.settings_model.clone() else {
+            self.notice = Some("Open load settings from a selected model first".to_owned());
+            return Update::Render;
+        };
+        let Some(state) = &self.load_profiles else {
+            return Update::None;
+        };
+        let profiles = state.profiles.keys().cloned().collect::<Vec<_>>();
+        if profiles.is_empty() {
+            self.notice = Some("Create a named profile first".to_owned());
+            return Update::Render;
+        }
+        let current = state.model_assignments.get(&model_id);
+        let next = current
+            .and_then(|current| profiles.iter().position(|profile| profile == current))
+            .and_then(|index| profiles.get(index + 1).cloned())
+            .or_else(|| current.is_none().then(|| profiles[0].clone()));
+        self.queue_settings_action(SettingsAction::AssignProfile {
+            model_id,
+            profile: next,
+        })
+    }
+
+    fn refresh_model_settings(&mut self) -> Update {
+        let model = self.settings_model.as_ref().and_then(|model_id| {
+            self.snapshot
+                .models
+                .iter()
+                .find(|model| &model.id == model_id)
+                .cloned()
+        });
+        let Some(model) = model else {
+            return Update::Render;
+        };
+        self.pending_settings_action = Some(SettingsAction::InspectModel(Box::new(model)));
+        self.settings_busy = true;
+        self.settings_validation_error = None;
+        Update::Render
+    }
+
+    fn open_model_load_settings(&mut self) -> Update {
+        let Some(model) = self
+            .selected_model
+            .and_then(|index| self.snapshot.models.get(index))
+            .cloned()
+        else {
+            self.notice = Some("Select a model before opening load settings".to_owned());
+            return Update::Render;
+        };
+        self.settings_model = Some(model.id.clone());
+        self.screen = Screen::Settings;
+        self.nav_focus = Screen::Settings;
+        let scopes = self.settings_scopes();
+        self.settings_scope_index = scopes
+            .iter()
+            .position(|scope| scope == &SettingsScope::Model(model.id.clone()))
+            .unwrap_or(0);
+        self.settings_setting_index = 0;
+        self.settings_scroll = 0;
+        self.pending_settings_action = Some(SettingsAction::InspectModel(Box::new(model)));
+        self.settings_busy = true;
+        self.notice = Some("Inspecting exact-runtime load settings…".to_owned());
+        Update::Render
+    }
+
+    fn reconcile_settings_selection(&mut self) {
+        let scope_len = self.settings_scopes().len();
+        self.settings_scope_index = self.settings_scope_index.min(scope_len.saturating_sub(1));
+        let setting_len = self.settings_definitions().len();
+        self.settings_setting_index = self
+            .settings_setting_index
+            .min(setting_len.saturating_sub(1));
+        self.settings_scroll = self.settings_scroll.min(setting_len.saturating_sub(1));
     }
 
     fn handle_click(&mut self, position: Position, layout: &UiLayout) -> Update {
@@ -1168,6 +1801,29 @@ impl App {
             Some(HoverTarget::RuntimeUpdateAction) => {
                 self.focus = FocusArea::Content;
                 self.request_runtime_updates()
+            }
+            Some(HoverTarget::SettingsScope(index)) => {
+                self.focus = FocusArea::Content;
+                self.settings_scope_index =
+                    index.min(self.settings_scopes().len().saturating_sub(1));
+                self.settings_setting_index = 0;
+                self.settings_scroll = 0;
+                if matches!(
+                    self.selected_settings_scope(),
+                    Some(SettingsScope::Model(_))
+                ) {
+                    self.refresh_model_settings()
+                } else {
+                    Update::Render
+                }
+            }
+            Some(HoverTarget::Setting(index)) => {
+                self.focus = FocusArea::Content;
+                if self.settings_setting_index == index {
+                    return self.edit_selected_setting();
+                }
+                self.settings_setting_index = index;
+                Update::Render
             }
             Some(HoverTarget::CommandSuggestion(index)) => {
                 self.suggestion_index = index;
@@ -1218,6 +1874,7 @@ impl App {
             Screen::Models => self.scroll_models(direction * 3, layout),
             Screen::Logs => self.scroll_logs(direction * -3, layout),
             Screen::Runtimes => self.scroll_runtimes(direction * 3, layout),
+            Screen::Settings => self.scroll_settings(direction * 3, layout),
             _ => Update::None,
         }
     }

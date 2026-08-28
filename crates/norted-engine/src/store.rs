@@ -1042,6 +1042,8 @@ mod tests {
             runtimes_dir: temporary.path().join("data/runtimes"),
             runtime_cache_dir: temporary.path().join("cache/runtime-packs"),
             runtime_selections_file: temporary.path().join("data/runtime-selections.json"),
+            load_profiles_file: temporary.path().join("data/load-profiles.json"),
+            load_profiles_lock_file: temporary.path().join("data/.load-profiles.lock"),
         };
         let store = RuntimeStore::new(&paths);
         let staging = store.create_staging().await.expect("staging directory");
@@ -1111,6 +1113,8 @@ mod tests {
             runtimes_dir: temporary.path().join("data/runtimes"),
             runtime_cache_dir: temporary.path().join("cache/runtime-packs"),
             runtime_selections_file: temporary.path().join("data/runtime-selections.json"),
+            load_profiles_file: temporary.path().join("data/load-profiles.json"),
+            load_profiles_lock_file: temporary.path().join("data/.load-profiles.lock"),
         };
         let store = RuntimeStore::new(&paths);
         let runtime_id = norted_core::RuntimeId::new("leased-runtime").expect("runtime ID");
@@ -1139,6 +1143,8 @@ mod tests {
             runtimes_dir: temporary.path().join("data/runtimes"),
             runtime_cache_dir: temporary.path().join("cache/runtime-packs"),
             runtime_selections_file: temporary.path().join("data/runtime-selections.json"),
+            load_profiles_file: temporary.path().join("data/load-profiles.json"),
+            load_profiles_lock_file: temporary.path().join("data/.load-profiles.lock"),
         };
         let store = RuntimeStore::new(&paths);
         let identity = RuntimeIdentity {

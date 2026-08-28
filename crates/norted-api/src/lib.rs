@@ -312,7 +312,12 @@ async fn control_load(
     })?;
     state
         .runtime
-        .load_with_runtime(request.model_id, request.runtime_id)
+        .load_with_settings(
+            request.model_id,
+            request.runtime_id,
+            request.profile,
+            request.settings,
+        )
         .await
         .map(Json)
         .map_err(|error| ControlApiError {

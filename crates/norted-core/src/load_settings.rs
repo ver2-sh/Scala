@@ -1,0 +1,1156 @@
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+
+use crate::{AppPaths, ModelId};
+
+pub const LOAD_PROFILES_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct LoadSettingId(String);
+
+impl LoadSettingId {
+    pub fn new(value: impl Into<String>) -> Result<Self, LoadSettingsError> {
+        let value = value.into();
+        validate_setting_id(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn namespace(&self) -> Option<&str> {
+        self.0.rsplit_once('.').map(|(namespace, _)| namespace)
+    }
+
+    pub fn applies_to_engine(&self, engine_id: &str) -> bool {
+        self.namespace()
+            .is_none_or(|namespace| namespace == engine_id)
+    }
+}
+
+impl std::fmt::Display for LoadSettingId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for LoadSettingId {
+    type Err = LoadSettingsError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for LoadSettingId {
+    type Error = LoadSettingsError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<LoadSettingId> for String {
+    fn from(value: LoadSettingId) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum LoadSettingValue {
+    Toggle(bool),
+    FlagEnabled,
+    Integer(i64),
+    UnsignedInteger(u64),
+    Float(f64),
+    String(String),
+    Choice(String),
+    Path(PathBuf),
+    GpuOffload(GpuOffload),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode", content = "layers")]
+pub enum GpuOffload {
+    None,
+    Auto,
+    All,
+    Layers(u64),
+}
+
+impl std::fmt::Display for LoadSettingValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Toggle(value) => value.fmt(formatter),
+            Self::FlagEnabled => formatter.write_str("enabled"),
+            Self::Integer(value) => value.fmt(formatter),
+            Self::UnsignedInteger(value) => value.fmt(formatter),
+            Self::Float(value) => value.fmt(formatter),
+            Self::String(value) | Self::Choice(value) => value.fmt(formatter),
+            Self::Path(value) => value.display().fmt(formatter),
+            Self::GpuOffload(GpuOffload::None) => formatter.write_str("none"),
+            Self::GpuOffload(GpuOffload::Auto) => formatter.write_str("auto"),
+            Self::GpuOffload(GpuOffload::All) => formatter.write_str("all"),
+            Self::GpuOffload(GpuOffload::Layers(value)) => value.fmt(formatter),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum LoadSettingKind {
+    Toggle,
+    OneWayFlag,
+    Integer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maximum: Option<i64>,
+    },
+    UnsignedInteger {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maximum: Option<u64>,
+    },
+    Float {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maximum: Option<f64>,
+    },
+    String,
+    Choice {
+        choices: Vec<String>,
+    },
+    Path,
+    GpuOffload,
+}
+
+impl LoadSettingKind {
+    pub fn parse(
+        &self,
+        id: &LoadSettingId,
+        raw: &str,
+    ) -> Result<LoadSettingValue, LoadSettingsError> {
+        let invalid = |reason: String| LoadSettingsError::InvalidValue {
+            setting_id: id.clone(),
+            value: raw.to_owned(),
+            reason,
+        };
+        match self {
+            Self::Toggle => match raw {
+                "true" | "on" | "enabled" => Ok(LoadSettingValue::Toggle(true)),
+                "false" | "off" | "disabled" => Ok(LoadSettingValue::Toggle(false)),
+                _ => Err(invalid("expected true/false or on/off".to_owned())),
+            },
+            Self::OneWayFlag => match raw {
+                "true" | "on" | "enabled" => Ok(LoadSettingValue::FlagEnabled),
+                _ => Err(invalid(
+                    "this is a one-way flag; set it to true/on or unset it to restore the upstream default"
+                        .to_owned(),
+                )),
+            },
+            Self::Integer { minimum, maximum } => {
+                let value = raw
+                    .parse::<i64>()
+                    .map_err(|_| invalid("expected a signed integer".to_owned()))?;
+                validate_bounds(id, raw, value, *minimum, *maximum)?;
+                Ok(LoadSettingValue::Integer(value))
+            }
+            Self::UnsignedInteger { minimum, maximum } => {
+                let value = raw
+                    .parse::<u64>()
+                    .map_err(|_| invalid("expected a non-negative integer".to_owned()))?;
+                validate_bounds(id, raw, value, *minimum, *maximum)?;
+                Ok(LoadSettingValue::UnsignedInteger(value))
+            }
+            Self::Float { minimum, maximum } => {
+                let value = raw
+                    .parse::<f64>()
+                    .map_err(|_| invalid("expected a finite number".to_owned()))?;
+                if !value.is_finite() {
+                    return Err(invalid("expected a finite number".to_owned()));
+                }
+                validate_bounds(id, raw, value, *minimum, *maximum)?;
+                Ok(LoadSettingValue::Float(value))
+            }
+            Self::String => {
+                if raw.is_empty() || raw.contains('\0') {
+                    Err(invalid("expected a non-empty string without NUL bytes".to_owned()))
+                } else {
+                    Ok(LoadSettingValue::String(raw.to_owned()))
+                }
+            }
+            Self::Choice { choices } => {
+                if choices.iter().any(|choice| choice == raw) {
+                    Ok(LoadSettingValue::Choice(raw.to_owned()))
+                } else {
+                    Err(invalid(format!("expected one of: {}", choices.join(", "))))
+                }
+            }
+            Self::Path => {
+                if raw.is_empty() || raw.contains('\0') {
+                    Err(invalid("expected a non-empty path without NUL bytes".to_owned()))
+                } else {
+                    Ok(LoadSettingValue::Path(PathBuf::from(raw)))
+                }
+            }
+            Self::GpuOffload => match raw {
+                "none" => Ok(LoadSettingValue::GpuOffload(GpuOffload::None)),
+                "auto" => Ok(LoadSettingValue::GpuOffload(GpuOffload::Auto)),
+                "all" => Ok(LoadSettingValue::GpuOffload(GpuOffload::All)),
+                _ => raw
+                    .parse::<u64>()
+                    .map(|value| LoadSettingValue::GpuOffload(GpuOffload::Layers(value)))
+                    .map_err(|_| invalid("expected none, auto, all, or an exact layer count".to_owned())),
+            },
+        }
+    }
+
+    pub fn accepts(
+        &self,
+        id: &LoadSettingId,
+        value: &LoadSettingValue,
+    ) -> Result<(), LoadSettingsError> {
+        let raw = value.to_string();
+        let valid = match (self, value) {
+            (Self::Toggle, LoadSettingValue::Toggle(_))
+            | (Self::OneWayFlag, LoadSettingValue::FlagEnabled) => true,
+            (Self::String, LoadSettingValue::String(value)) => {
+                !value.is_empty() && !value.contains('\0')
+            }
+            (Self::Path, LoadSettingValue::Path(value)) => {
+                let value = value.to_string_lossy();
+                !value.is_empty() && !value.contains('\0')
+            }
+            (Self::GpuOffload, LoadSettingValue::GpuOffload(_)) => true,
+            (Self::Integer { minimum, maximum }, LoadSettingValue::Integer(value)) => {
+                validate_bounds(id, &raw, *value, *minimum, *maximum)?;
+                true
+            }
+            (
+                Self::UnsignedInteger { minimum, maximum },
+                LoadSettingValue::UnsignedInteger(value),
+            ) => {
+                validate_bounds(id, &raw, *value, *minimum, *maximum)?;
+                true
+            }
+            (Self::Float { minimum, maximum }, LoadSettingValue::Float(value)) => {
+                if !value.is_finite() {
+                    false
+                } else {
+                    validate_bounds(id, &raw, *value, *minimum, *maximum)?;
+                    true
+                }
+            }
+            (Self::Choice { choices }, LoadSettingValue::Choice(value)) => choices.contains(value),
+            _ => false,
+        };
+        valid
+            .then_some(())
+            .ok_or_else(|| LoadSettingsError::InvalidValue {
+                setting_id: id.clone(),
+                value: raw,
+                reason: "value does not match the setting definition".to_owned(),
+            })
+    }
+}
+
+fn validate_bounds<T>(
+    id: &LoadSettingId,
+    raw: &str,
+    value: T,
+    minimum: Option<T>,
+    maximum: Option<T>,
+) -> Result<(), LoadSettingsError>
+where
+    T: PartialOrd + std::fmt::Display + Copy,
+{
+    if minimum.is_some_and(|minimum| value < minimum) {
+        return Err(LoadSettingsError::InvalidValue {
+            setting_id: id.clone(),
+            value: raw.to_owned(),
+            reason: format!("must be at least {}", minimum.expect("checked")),
+        });
+    }
+    if maximum.is_some_and(|maximum| value > maximum) {
+        return Err(LoadSettingsError::InvalidValue {
+            setting_id: id.clone(),
+            value: raw.to_owned(),
+            reason: format!("must be at most {}", maximum.expect("checked")),
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "scope")]
+pub enum LoadSettingScope {
+    Common,
+    Engine { engine_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LoadSettingDefinition {
+    pub id: LoadSettingId,
+    pub label: String,
+    pub description: String,
+    pub kind: LoadSettingKind,
+    pub scope: LoadSettingScope,
+    #[serde(default = "default_true")]
+    pub supported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsupported_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_default: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl LoadSettingDefinition {
+    pub fn parse(&self, raw: &str) -> Result<LoadSettingValue, LoadSettingsError> {
+        self.kind.parse(&self.id, raw)
+    }
+
+    pub fn validate_value(&self, value: &LoadSettingValue) -> Result<(), LoadSettingsError> {
+        self.kind.accepts(&self.id, value)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LoadSettingsPatch(pub BTreeMap<LoadSettingId, LoadSettingValue>);
+
+impl LoadSettingsPatch {
+    pub fn insert(&mut self, id: LoadSettingId, value: LoadSettingValue) {
+        self.0.insert(id, value);
+    }
+
+    pub fn remove(&mut self, id: &LoadSettingId) -> Option<LoadSettingValue> {
+        self.0.remove(id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&LoadSettingId, &LoadSettingValue)> {
+        self.0.iter()
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct LoadProfileName(String);
+
+impl LoadProfileName {
+    pub fn new(value: impl Into<String>) -> Result<Self, LoadSettingsError> {
+        let value = value.into();
+        validate_profile_name(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for LoadProfileName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for LoadProfileName {
+    type Err = LoadSettingsError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for LoadProfileName {
+    type Error = LoadSettingsError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<LoadProfileName> for String {
+    fn from(value: LoadProfileName) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LoadProfile {
+    #[serde(default)]
+    pub settings: LoadSettingsPatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoadProfilesState {
+    pub version: u32,
+    pub global_defaults: LoadSettingsPatch,
+    pub engine_defaults: BTreeMap<String, LoadSettingsPatch>,
+    pub model_defaults: BTreeMap<ModelId, LoadSettingsPatch>,
+    pub profiles: BTreeMap<LoadProfileName, LoadProfile>,
+    pub model_assignments: BTreeMap<ModelId, LoadProfileName>,
+}
+
+impl Default for LoadProfilesState {
+    fn default() -> Self {
+        Self {
+            version: LOAD_PROFILES_SCHEMA_VERSION,
+            global_defaults: LoadSettingsPatch::default(),
+            engine_defaults: BTreeMap::new(),
+            model_defaults: BTreeMap::new(),
+            profiles: BTreeMap::new(),
+            model_assignments: BTreeMap::new(),
+        }
+    }
+}
+
+impl LoadProfilesState {
+    pub fn validate(&self) -> Result<(), LoadSettingsError> {
+        if self.version != LOAD_PROFILES_SCHEMA_VERSION {
+            return Err(LoadSettingsError::UnsupportedStateVersion {
+                found: self.version,
+                supported: LOAD_PROFILES_SCHEMA_VERSION,
+            });
+        }
+        for id in self.global_defaults.0.keys() {
+            validate_setting_id(id.as_str())?;
+            if id.namespace().is_some() {
+                return Err(LoadSettingsError::InvalidGlobalSetting(id.clone()));
+            }
+        }
+        for (engine_id, patch) in &self.engine_defaults {
+            validate_engine_id(engine_id)?;
+            for id in patch.0.keys() {
+                validate_setting_id(id.as_str())?;
+                if !id.applies_to_engine(engine_id) {
+                    return Err(LoadSettingsError::WrongEngineScope {
+                        setting_id: id.clone(),
+                        engine_id: engine_id.clone(),
+                    });
+                }
+            }
+        }
+        for name in self.profiles.keys() {
+            validate_profile_name(name.as_str())?;
+        }
+        for patch in self.model_defaults.values() {
+            for id in patch.0.keys() {
+                validate_setting_id(id.as_str())?;
+            }
+        }
+        for profile in self.profiles.values() {
+            for id in profile.settings.0.keys() {
+                validate_setting_id(id.as_str())?;
+            }
+        }
+        for (model_id, profile) in &self.model_assignments {
+            if !self.profiles.contains_key(profile) {
+                return Err(LoadSettingsError::MissingAssignedProfile {
+                    model_id: model_id.clone(),
+                    profile: profile.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn resolve(
+        &self,
+        model_id: &ModelId,
+        engine_id: &str,
+        invocation_profile: Option<&LoadProfileName>,
+        invocation: &LoadSettingsPatch,
+    ) -> Result<ResolvedLoadSettings, LoadSettingsError> {
+        let selected_profile = invocation_profile
+            .cloned()
+            .or_else(|| self.model_assignments.get(model_id).cloned());
+        let mut effective = BTreeMap::new();
+        apply_layer(
+            &mut effective,
+            &self.global_defaults,
+            engine_id,
+            LoadSettingSource::GlobalDefault,
+        );
+        if let Some(settings) = self.engine_defaults.get(engine_id) {
+            apply_layer(
+                &mut effective,
+                settings,
+                engine_id,
+                LoadSettingSource::EngineDefault {
+                    engine_id: engine_id.to_owned(),
+                },
+            );
+        }
+        if let Some(settings) = self.model_defaults.get(model_id) {
+            apply_layer(
+                &mut effective,
+                settings,
+                engine_id,
+                LoadSettingSource::ModelDefault {
+                    model_id: model_id.clone(),
+                },
+            );
+        }
+        if let Some(profile_name) = &selected_profile {
+            let profile = self
+                .profiles
+                .get(profile_name)
+                .ok_or_else(|| LoadSettingsError::ProfileNotFound(profile_name.clone()))?;
+            apply_layer(
+                &mut effective,
+                &profile.settings,
+                engine_id,
+                LoadSettingSource::NamedProfile {
+                    profile: profile_name.clone(),
+                },
+            );
+        }
+        apply_layer(
+            &mut effective,
+            invocation,
+            engine_id,
+            LoadSettingSource::Invocation,
+        );
+        Ok(ResolvedLoadSettings {
+            engine_id: engine_id.to_owned(),
+            selected_profile,
+            effective,
+        })
+    }
+
+    pub fn create_profile(&mut self, name: LoadProfileName) -> Result<(), LoadSettingsError> {
+        if self.profiles.contains_key(&name) {
+            return Err(LoadSettingsError::ProfileAlreadyExists(name));
+        }
+        self.profiles.insert(name, LoadProfile::default());
+        Ok(())
+    }
+
+    pub fn delete_profile(&mut self, name: &LoadProfileName) -> Result<(), LoadSettingsError> {
+        if !self.profiles.contains_key(name) {
+            return Err(LoadSettingsError::ProfileNotFound(name.clone()));
+        }
+        let models = self
+            .model_assignments
+            .iter()
+            .filter_map(|(model, profile)| (profile == name).then_some(model.clone()))
+            .collect::<Vec<_>>();
+        if !models.is_empty() {
+            return Err(LoadSettingsError::ProfileAssigned {
+                profile: name.clone(),
+                models,
+            });
+        }
+        self.profiles.remove(name);
+        Ok(())
+    }
+
+    pub fn assign_profile(
+        &mut self,
+        model_id: ModelId,
+        profile: Option<LoadProfileName>,
+    ) -> Result<(), LoadSettingsError> {
+        if let Some(profile) = profile {
+            if !self.profiles.contains_key(&profile) {
+                return Err(LoadSettingsError::ProfileNotFound(profile));
+            }
+            self.model_assignments.insert(model_id, profile);
+        } else {
+            self.model_assignments.remove(&model_id);
+        }
+        Ok(())
+    }
+}
+
+fn apply_layer(
+    effective: &mut BTreeMap<LoadSettingId, ResolvedLoadSetting>,
+    patch: &LoadSettingsPatch,
+    engine_id: &str,
+    source: LoadSettingSource,
+) {
+    for (id, value) in patch.iter() {
+        if id.applies_to_engine(engine_id) {
+            effective.insert(
+                id.clone(),
+                ResolvedLoadSetting {
+                    value: value.clone(),
+                    source: source.clone(),
+                },
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "source")]
+pub enum LoadSettingSource {
+    GlobalDefault,
+    EngineDefault { engine_id: String },
+    ModelDefault { model_id: ModelId },
+    NamedProfile { profile: LoadProfileName },
+    Invocation,
+}
+
+impl std::fmt::Display for LoadSettingSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GlobalDefault => formatter.write_str("global-default"),
+            Self::EngineDefault { engine_id } => write!(formatter, "engine-default:{engine_id}"),
+            Self::ModelDefault { model_id } => write!(formatter, "model-default:{model_id}"),
+            Self::NamedProfile { profile } => write!(formatter, "profile:{profile}"),
+            Self::Invocation => formatter.write_str("invocation"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedLoadSetting {
+    pub value: LoadSettingValue,
+    pub source: LoadSettingSource,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedLoadSettings {
+    pub engine_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_profile: Option<LoadProfileName>,
+    #[serde(default)]
+    pub effective: BTreeMap<LoadSettingId, ResolvedLoadSetting>,
+}
+
+impl ResolvedLoadSettings {
+    pub fn is_empty(&self) -> bool {
+        self.effective.is_empty()
+    }
+
+    pub fn value(&self, id: &str) -> Option<&LoadSettingValue> {
+        self.effective
+            .iter()
+            .find_map(|(candidate, setting)| (candidate.as_str() == id).then_some(&setting.value))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LoadSettingsSchema {
+    pub engine_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<crate::RuntimeId>,
+    pub definitions: Vec<LoadSettingDefinition>,
+}
+
+impl LoadSettingsSchema {
+    pub fn definition(&self, id: &LoadSettingId) -> Option<&LoadSettingDefinition> {
+        self.definitions
+            .iter()
+            .find(|definition| &definition.id == id)
+    }
+
+    pub fn validate(&self, settings: &ResolvedLoadSettings) -> Result<(), LoadSettingsError> {
+        for (id, setting) in &settings.effective {
+            let definition = self
+                .definition(id)
+                .ok_or_else(|| LoadSettingsError::UnknownSetting(id.clone()))?;
+            if !definition.supported {
+                return Err(LoadSettingsError::UnsupportedSetting {
+                    setting_id: id.clone(),
+                    reason: definition.unsupported_reason.clone().unwrap_or_else(|| {
+                        "the exact runtime does not advertise this setting".to_owned()
+                    }),
+                });
+            }
+            definition.validate_value(&setting.value)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadProfilesStore {
+    path: PathBuf,
+    lock_path: PathBuf,
+}
+
+impl LoadProfilesStore {
+    pub fn new(paths: &AppPaths) -> Self {
+        Self {
+            path: paths.load_profiles_file.clone(),
+            lock_path: paths.load_profiles_lock_file.clone(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub async fn read(&self) -> Result<LoadProfilesState, LoadProfilesError> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || read_state(&path))
+            .await
+            .map_err(|error| LoadProfilesError::Task(error.to_string()))?
+    }
+
+    pub async fn update<F, T>(&self, update: F) -> Result<T, LoadProfilesError>
+    where
+        F: FnOnce(&mut LoadProfilesState) -> Result<T, LoadSettingsError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let path = self.path.clone();
+        let lock_path = self.lock_path.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = lock_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|source| LoadProfilesError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|source| LoadProfilesError::Io {
+                    path: lock_path.clone(),
+                    source,
+                })?;
+            lock.lock_exclusive()
+                .map_err(|source| LoadProfilesError::Io {
+                    path: lock_path,
+                    source,
+                })?;
+            let mut state = read_state(&path)?;
+            let result = update(&mut state)?;
+            state.validate()?;
+            write_state(&path, &state)?;
+            Ok(result)
+        })
+        .await
+        .map_err(|error| LoadProfilesError::Task(error.to_string()))?
+    }
+}
+
+fn read_state(path: &Path) -> Result<LoadProfilesState, LoadProfilesError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LoadProfilesState::default());
+        }
+        Err(source) => {
+            return Err(LoadProfilesError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let state: LoadProfilesState =
+        serde_json::from_slice(&bytes).map_err(|source| LoadProfilesError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    state.validate()?;
+    Ok(state)
+}
+
+fn write_state(path: &Path, state: &LoadProfilesState) -> Result<(), LoadProfilesError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|source| LoadProfilesError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let bytes = serde_json::to_vec_pretty(state).map_err(LoadProfilesError::Serialize)?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|source| LoadProfilesError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    temporary
+        .write_all(&bytes)
+        .and_then(|_| temporary.write_all(b"\n"))
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|source| LoadProfilesError::Io {
+            path: temporary.path().to_path_buf(),
+            source,
+        })?;
+    temporary
+        .persist(path)
+        .map_err(|error| LoadProfilesError::Io {
+            path: path.to_path_buf(),
+            source: error.error,
+        })?;
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+fn validate_setting_id(value: &str) -> Result<(), LoadSettingsError> {
+    if value.is_empty() || value.len() > 128 {
+        return Err(LoadSettingsError::InvalidSettingId(value.to_owned()));
+    }
+    if value.split('.').any(|part| !valid_id_component(part)) {
+        return Err(LoadSettingsError::InvalidSettingId(value.to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_engine_id(value: &str) -> Result<(), LoadSettingsError> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+        })
+    {
+        return Err(LoadSettingsError::InvalidEngineId(value.to_owned()));
+    }
+    Ok(())
+}
+
+fn valid_id_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn validate_profile_name(value: &str) -> Result<(), LoadSettingsError> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+    {
+        return Err(LoadSettingsError::InvalidProfileName(value.to_owned()));
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LoadSettingsError {
+    #[error("load setting ID `{0}` is invalid; use lowercase dot-separated identifiers")]
+    InvalidSettingId(String),
+    #[error("engine ID `{0}` is invalid")]
+    InvalidEngineId(String),
+    #[error("profile name `{0}` is invalid; use 1-64 lowercase letters, digits, '-' or '_'")]
+    InvalidProfileName(String),
+    #[error("load setting `{setting_id}` value `{value}` is invalid: {reason}")]
+    InvalidValue {
+        setting_id: LoadSettingId,
+        value: String,
+        reason: String,
+    },
+    #[error("unknown load setting `{0}`")]
+    UnknownSetting(LoadSettingId),
+    #[error("load setting `{setting_id}` is unsupported: {reason}")]
+    UnsupportedSetting {
+        setting_id: LoadSettingId,
+        reason: String,
+    },
+    #[error("global defaults cannot contain engine-specific setting `{0}`")]
+    InvalidGlobalSetting(LoadSettingId),
+    #[error("setting `{setting_id}` does not belong in defaults for engine `{engine_id}`")]
+    WrongEngineScope {
+        setting_id: LoadSettingId,
+        engine_id: String,
+    },
+    #[error("profile `{0}` does not exist")]
+    ProfileNotFound(LoadProfileName),
+    #[error("profile `{0}` already exists")]
+    ProfileAlreadyExists(LoadProfileName),
+    #[error(
+        "profile `{profile}` is assigned to model(s): {models:?}; clear those assignments before deleting it"
+    )]
+    ProfileAssigned {
+        profile: LoadProfileName,
+        models: Vec<ModelId>,
+    },
+    #[error("profile `{profile}` is assigned to model `{model_id}` but does not exist")]
+    MissingAssignedProfile {
+        model_id: ModelId,
+        profile: LoadProfileName,
+    },
+    #[error(
+        "load profile state schema version {found} is unsupported; this build supports {supported}"
+    )]
+    UnsupportedStateVersion { found: u32, supported: u32 },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LoadProfilesError {
+    #[error("load profile state I/O failed at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("load profile state at {path} is invalid JSON: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("could not serialize load profile state: {0}")]
+    Serialize(serde_json::Error),
+    #[error(transparent)]
+    Invalid(#[from] LoadSettingsError),
+    #[error("load profile state task failed: {0}")]
+    Task(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(value: &str) -> LoadSettingId {
+        LoadSettingId::new(value).expect("setting ID")
+    }
+
+    #[test]
+    fn setting_id_preserves_a_dotted_engine_namespace() {
+        let setting = id("llama.cpp.threads");
+        assert_eq!(setting.namespace(), Some("llama.cpp"));
+        assert!(setting.applies_to_engine("llama.cpp"));
+        assert!(!setting.applies_to_engine("q27"));
+    }
+
+    #[test]
+    fn resolver_uses_the_required_precedence_and_filters_other_engines() {
+        let model_id = ModelId("model".to_owned());
+        let profile = LoadProfileName::new("coding").expect("profile name");
+        let mut state = LoadProfilesState::default();
+        state
+            .global_defaults
+            .insert(id("context_length"), LoadSettingValue::UnsignedInteger(1));
+        state
+            .engine_defaults
+            .entry("llama.cpp".to_owned())
+            .or_default()
+            .insert(id("context_length"), LoadSettingValue::UnsignedInteger(2));
+        state
+            .model_defaults
+            .entry(model_id.clone())
+            .or_default()
+            .insert(id("context_length"), LoadSettingValue::UnsignedInteger(3));
+        state.profiles.insert(
+            profile.clone(),
+            LoadProfile {
+                settings: LoadSettingsPatch(BTreeMap::from([
+                    (id("context_length"), LoadSettingValue::UnsignedInteger(4)),
+                    (id("q27.kv_fp16"), LoadSettingValue::FlagEnabled),
+                ])),
+            },
+        );
+        state.model_assignments.insert(model_id.clone(), profile);
+        let invocation = LoadSettingsPatch(BTreeMap::from([(
+            id("context_length"),
+            LoadSettingValue::UnsignedInteger(5),
+        )]));
+
+        let resolved = state
+            .resolve(&model_id, "llama.cpp", None, &invocation)
+            .expect("resolve");
+        assert_eq!(
+            resolved.value("context_length"),
+            Some(&LoadSettingValue::UnsignedInteger(5))
+        );
+        assert_eq!(
+            resolved.effective[&id("context_length")].source,
+            LoadSettingSource::Invocation
+        );
+        assert!(!resolved.effective.contains_key(&id("q27.kv_fp16")));
+        assert!(
+            state.profiles[&LoadProfileName::new("coding").expect("name")]
+                .settings
+                .0
+                .contains_key(&id("q27.kv_fp16"))
+        );
+    }
+
+    #[test]
+    fn removing_a_higher_layer_value_falls_through() {
+        let model_id = ModelId("model".to_owned());
+        let mut state = LoadProfilesState::default();
+        state.global_defaults.insert(
+            id("parallel_requests"),
+            LoadSettingValue::UnsignedInteger(2),
+        );
+        let model = state.model_defaults.entry(model_id.clone()).or_default();
+        model.insert(
+            id("parallel_requests"),
+            LoadSettingValue::UnsignedInteger(8),
+        );
+        model.remove(&id("parallel_requests"));
+
+        let resolved = state
+            .resolve(&model_id, "llama.cpp", None, &LoadSettingsPatch::default())
+            .expect("resolve");
+        assert_eq!(
+            resolved.value("parallel_requests"),
+            Some(&LoadSettingValue::UnsignedInteger(2))
+        );
+    }
+
+    #[test]
+    fn assigned_profile_cannot_be_deleted() {
+        let model = ModelId("model".to_owned());
+        let profile = LoadProfileName::new("coding").expect("profile name");
+        let mut state = LoadProfilesState::default();
+        state
+            .create_profile(profile.clone())
+            .expect("create profile");
+        state
+            .assign_profile(model.clone(), Some(profile.clone()))
+            .expect("assign profile");
+        assert!(matches!(
+            state.delete_profile(&profile),
+            Err(LoadSettingsError::ProfileAssigned { models, .. }) if models == vec![model]
+        ));
+        assert!(state.profiles.contains_key(&profile));
+    }
+
+    #[test]
+    fn invocation_overrides_do_not_mutate_persisted_state() {
+        let state = LoadProfilesState::default();
+        let before = state.clone();
+        let invocation = LoadSettingsPatch(BTreeMap::from([(
+            id("context_length"),
+            LoadSettingValue::UnsignedInteger(8192),
+        )]));
+        let _ = state
+            .resolve(&ModelId("model".to_owned()), "llama.cpp", None, &invocation)
+            .expect("resolve invocation");
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn exact_schema_rejects_a_configured_unsupported_setting() {
+        let setting_id = id("llama.cpp.flash_attention");
+        let schema = LoadSettingsSchema {
+            engine_id: "llama.cpp".to_owned(),
+            runtime_id: None,
+            definitions: vec![LoadSettingDefinition {
+                id: setting_id.clone(),
+                label: "Flash attention".to_owned(),
+                description: String::new(),
+                kind: LoadSettingKind::Choice {
+                    choices: vec!["auto".to_owned(), "on".to_owned(), "off".to_owned()],
+                },
+                scope: LoadSettingScope::Engine {
+                    engine_id: "llama.cpp".to_owned(),
+                },
+                supported: false,
+                unsupported_reason: Some("not advertised by this executable".to_owned()),
+                unit: None,
+                upstream_default: None,
+                recommendation: None,
+            }],
+        };
+        let settings = ResolvedLoadSettings {
+            engine_id: "llama.cpp".to_owned(),
+            selected_profile: None,
+            effective: BTreeMap::from([(
+                setting_id,
+                ResolvedLoadSetting {
+                    value: LoadSettingValue::Choice("on".to_owned()),
+                    source: LoadSettingSource::Invocation,
+                },
+            )]),
+        };
+
+        assert!(matches!(
+            schema.validate(&settings),
+            Err(LoadSettingsError::UnsupportedSetting { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn profile_store_round_trips_an_atomic_update() {
+        let temporary = tempfile::tempdir().expect("temporary profile state");
+        let root = temporary.path();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.toml"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            runtimes_dir: root.join("data/runtimes"),
+            runtime_cache_dir: root.join("cache/runtime-packs"),
+            runtime_selections_file: root.join("data/runtime-selections.json"),
+            load_profiles_file: root.join("data/load-profiles.json"),
+            load_profiles_lock_file: root.join("data/.load-profiles.lock"),
+        };
+        let store = LoadProfilesStore::new(&paths);
+        let profile = LoadProfileName::new("long-context").expect("profile name");
+        let written = profile.clone();
+        store
+            .update(move |state| {
+                state.create_profile(written.clone())?;
+                state
+                    .profiles
+                    .get_mut(&written)
+                    .expect("created profile")
+                    .settings
+                    .insert(
+                        id("context_length"),
+                        LoadSettingValue::UnsignedInteger(131_072),
+                    );
+                Ok(())
+            })
+            .await
+            .expect("atomic update");
+        store
+            .update(|state| {
+                state.global_defaults.insert(
+                    id("parallel_requests"),
+                    LoadSettingValue::UnsignedInteger(2),
+                );
+                Ok(())
+            })
+            .await
+            .expect("replace existing state atomically");
+        let state = store.read().await.expect("read stored state");
+        assert_eq!(
+            state.profiles[&profile]
+                .settings
+                .0
+                .get(&id("context_length")),
+            Some(&LoadSettingValue::UnsignedInteger(131_072))
+        );
+        assert_eq!(
+            state.global_defaults.0[&id("parallel_requests")],
+            LoadSettingValue::UnsignedInteger(2)
+        );
+        assert!(paths.load_profiles_file.is_file());
+    }
+}

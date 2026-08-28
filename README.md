@@ -7,9 +7,53 @@ The central distinction is:
 ```text
 engine   = adapter, compatibility rules, launch semantics, health, protocol translation
 runtime  = one concrete executable package: version + platform + architecture + backend
+profile  = reusable structured load-setting overrides; it never selects a runtime
+load settings = process-start configuration for loading/serving a model
+generation settings = request-time sampling/output behavior
 ```
 
 A GGUF model is not permanently tied to llama.cpp, and a Q27 model is not permanently tied to q27. Selection happens among all installed runtimes whose registered engine can actually use the artifact. Today Norted ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp) and [q27](https://github.com/signalnine/q27).
+
+## Load settings and profiles
+
+Load settings are typed, stable Norted IDs. Common settings such as `context_length` and `parallel_requests` are engine-neutral; adapter-owned settings use namespaces such as `llama.cpp.kv_cache_k` and `q27.kv_fp16`. Raw upstream flag spellings remain adapter details. Load profiles never contain a runtime ID or request-time generation controls such as temperature and `top_p`.
+
+Mutable state is schema-versioned at `<data>/load-profiles.json`, outside `config.toml` and immutable runtime manifests. Writes use an inter-process lock and atomic replacement. One model may be assigned one profile. Resolution is:
+
+```text
+global defaults
+  → selected-engine defaults
+  → model defaults
+  → assigned or invocation-selected named profile
+  → invocation --set overrides
+```
+
+Global defaults accept only common IDs. Engine defaults accept common IDs and that engine's namespace. Model defaults and profiles retain settings for multiple engines; only common settings and the selected engine's namespace apply to one launch. `--profile` replaces the persisted model assignment for that load, and repeated `--set` values are ephemeral.
+
+Omission is significant: if no layer sets a value, Norted emits no corresponding argument and the exact upstream runtime uses its own current default. Clearing a value removes it from that layer and falls through. Known upstream defaults are descriptions, not Norted launch values.
+
+Before launch, the adapter validates the resolved values against the exact executable. llama.cpp observations come from that runtime's `--help` and are cached by runtime ID plus entrypoint SHA-256. q27 uses its exact usage signature plus managed-version gates. A structured setting conflicts explicitly with an equivalent native argument (`--flag value` or `--flag=value`) or environment variable rather than relying on ordering. Native arguments remain available when no structured setting owns the same option.
+
+Initial llama.cpp settings are `context_length`, `parallel_requests`, `llama.cpp.threads`, `llama.cpp.batch_size`, `llama.cpp.micro_batch_size`, `llama.cpp.gpu_offload` (`none`, `auto`, `all`, or an exact layer count), `llama.cpp.flash_attention`, separate `llama.cpp.kv_cache_k`/`llama.cpp.kv_cache_v`, `llama.cpp.mmap`, and one-way `llama.cpp.mlock`. Initial q27 settings are `context_length`, `parallel_requests`, one-way `q27.kv_fp16`, two-sided `q27.fast_head`, and the current persistent prefix-cache path/disk/token-step/RAM controls. Unsupported exact-runtime contracts remain visible but fail validation rather than being ignored.
+
+All commands honor global `--json`. The scriptable management surface is:
+
+```console
+norted-server profiles list
+norted-server profiles show|create|delete <NAME>
+norted-server profiles set <NAME> <ID=VALUE>...
+norted-server profiles unset <NAME> <ID>...
+norted-server profiles assign --model <MODEL_ID> <NAME>
+norted-server profiles clear-assignment --model <MODEL_ID>
+norted-server settings set --global <ID=VALUE>...
+norted-server settings unset --global <ID>...
+norted-server settings set --engine llama.cpp <ID=VALUE>...
+norted-server settings unset --engine llama.cpp <ID>...
+norted-server settings set --model <MODEL_ID> <ID=VALUE>...
+norted-server settings unset --model <MODEL_ID> <ID>...
+norted-server settings schema --model <MODEL_ID> [--runtime <RUNTIME_ID>]
+norted-server settings show --model <MODEL_ID> [--runtime <RUNTIME_ID>] [--profile <NAME>]
+```
 
 ## Runtime packs
 
@@ -113,10 +157,12 @@ norted-server
 ├── tui
 ├── serve
 ├── status
-├── load <MODEL_ID> [--runtime <RUNTIME_ID>]
+├── load <MODEL_ID> [--runtime <RUNTIME_ID>] [--profile <NAME>] [--set <ID=VALUE>]...
 ├── unload
 ├── models list
 ├── runtimes ...
+├── profiles list|show|create|delete|set|unset|assign|clear-assignment
+├── settings show|schema|set|unset
 ├── engines list       # low-level adapter diagnostics
 ├── config show
 └── doctor
@@ -136,6 +182,11 @@ Then, in another terminal:
 
 ```console
 cargo run -p norted-server -- load <MODEL_ID>
+cargo run -p norted-server -- profiles create coding-large-context
+cargo run -p norted-server -- profiles set coding-large-context context_length=131072 llama.cpp.kv_cache_k=q8_0
+cargo run -p norted-server -- profiles assign --model <MODEL_ID> coding-large-context
+cargo run -p norted-server -- settings show --model <MODEL_ID>
+cargo run -p norted-server -- load <MODEL_ID> --set parallel_requests=2
 cargo run -p norted-server -- status
 cargo run -p norted-server -- unload
 ```
@@ -153,7 +204,7 @@ cargo run -p norted-server -- tui
 
 Its top-level pages are Overview, Models, Runtimes, Server, Logs, Settings, and Help. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Downloads and extraction run asynchronously and expose Downloading, Verifying, Extracting, Probing, Installed, or Failed state with real byte counts when available.
 
-The TUI draws its pending first frame before model/runtime scans and never performs catalog network I/O merely to start. Existing keyboard focus, mouse/wheel navigation, responsive layout, `NO_COLOR`, and configured ASCII mode remain supported. Model loading remains an explicit action; selecting a model does not silently change its runtime.
+The TUI draws its pending first frame before model/runtime scans and never performs catalog network I/O merely to start. Settings is a generic schema-driven editor for global/engine defaults and named profiles; Enter edits or cycles, Delete clears the current layer, and profile creation/deletion is explicit. From Models, `p` opens model defaults, assignment selection, exact-runtime support, and effective value/source inspection. Runtime help/usage probing runs in the background. Keyboard, mouse/wheel navigation, narrow layout, `NO_COLOR`, and configured ASCII mode remain supported. Edits never hot-mutate a running backend and apply on its next load.
 
 ## External runtimes and configuration
 
@@ -180,7 +231,7 @@ An external q27 executable can use the same setting under `[engine.q27]`. Relati
 
 External binaries participate in the same resolver as managed packs. Norted canonicalizes and probes the executable, records its SHA-256 and observed facts, labels acquisition as `ExternalBinary`, leaves the repository unverified, and treats updates as unmanaged. External runtime manifests are synthesized in memory and are never mistaken for Norted-owned installations.
 
-Both adapters accept an engine-namespaced native `arguments` array and environment map for ordinary tuning, while rejecting flags or variables that can replace Norted-owned model inputs, identity, loopback host/port, authentication, API behavior, or provable generation settings. Because q27 uses a hand-written positional parser, its custom arguments are limited to the known, non-conflicting q27 v0.6.2 tuning options with their exact separate-token arity (for example, `"--ctx", "8192", "--kv-fp16"`). Raw environment values are never placed in provenance.
+Both adapters accept an engine-namespaced native `arguments` array and environment map for ordinary tuning, while rejecting flags or variables that can replace Norted-owned model inputs, identity, loopback host/port, authentication, API behavior, or provable generation settings. A native tuning option remains usable until a resolved structured setting owns the same option; that load then fails with the stable setting ID and conflicting native option. Because q27 uses a hand-written positional parser, its custom arguments are limited to the known, non-conflicting q27 v0.6.2 tuning options with their exact separate-token arity (for example, `"--ctx", "8192", "--kv-fp16"`). Raw environment values are never placed in provenance.
 
 ## Models and q27 companions
 
@@ -218,7 +269,7 @@ Streaming emits Norted-generated Responses SSE events and ends in completed, inc
 
 The common runtime manager resolves a concrete runtime before asking its engine adapter for a launch specification. The common supervisor owns process creation, stdout/stderr draining, crash observation, cancellation, bounded shutdown, and cleanup. Load still transitions through Stopped, Loading, Running, Stopping, and Failed; unloading during startup cancels and cleans up the child.
 
-Private control status identifies the model, engine, exact runtime ID/version/variant, executable SHA-256, process, and private endpoint. Launch provenance additionally retains the immutable runtime manifest, selection source, the exact selected accelerator UUID and observations when one is bound, model path/hash when already known, every materially used auxiliary artifact's role/canonical path/size/SHA-256 (including q27's exact tokenizer), upstream release/revision/assets and verified digests, acquisition method, entrypoint/install time, option-associated hashes for redacted native values, every effective explicit/inherited environment variable name with a value hash, authoritative sampler settings, process identity, and launch time. External and managed acquisition are never blurred. Public `/v1/models` deliberately retains its four OpenAI-style model fields and receives no Norted-specific runtime fields.
+Private control status identifies the model, engine, exact runtime ID/version/variant, executable SHA-256, process, and private endpoint. Launch provenance additionally snapshots the selected profile and every explicitly resolved structured load value with its global/engine/model/profile/invocation source. Absent upstream-default settings are not recorded as configured. This is separate from existing adapter/generation `normalized_settings` and redacted native argument provenance. Provenance also retains the immutable runtime manifest, selection source, accelerator UUID and observations, model/tokenizer identity, upstream release and verified digests, environment names/value hashes, process identity, endpoint, and launch time. External and managed acquisition are never blurred. Public `/v1/models` and Responses objects receive no profile metadata.
 
 ## Development
 

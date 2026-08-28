@@ -145,6 +145,32 @@ impl RuntimePackManager {
         self.host.read().await.clone()
     }
 
+    pub async fn load_settings_schema_for_model(
+        &self,
+        model: &norted_core::ModelArtifact,
+        explicit_runtime: Option<&norted_core::RuntimeId>,
+    ) -> Result<
+        (
+            norted_core::RuntimeSelection,
+            norted_core::LoadSettingsSchema,
+        ),
+        RuntimePackError,
+    > {
+        let selection = self.resolve(model, explicit_runtime).await?;
+        let engine_id = &selection.runtime.manifest.identity.engine_id;
+        let adapter = self.registry.get(engine_id).ok_or_else(|| {
+            RuntimePackError::Selection(format!(
+                "selected runtime uses unregistered engine `{engine_id}`"
+            ))
+        })?;
+        let host = self.host_capabilities().await;
+        let schema = adapter
+            .load_settings_schema(&selection.runtime, model, &host)
+            .await
+            .map_err(RuntimePackError::Adapter)?;
+        Ok((selection, schema))
+    }
+
     pub async fn list(&self) -> Result<RuntimeListSnapshot, RuntimePackError> {
         let RuntimeStoreSnapshot {
             mut runtimes,

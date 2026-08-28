@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use futures_util::Stream;
 use norted_core::{
     AcceleratorDevice, ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime, EngineInstallation,
-    EngineRevision, HostCapabilities, InstalledRuntime, ModelArtifact, ModelRuntimeIdentity,
-    RuntimeCompatibility, RuntimeProbeObservation,
+    EngineRevision, HostCapabilities, InstalledRuntime, LoadSettingDefinition, LoadSettingId,
+    LoadSettingsError, LoadSettingsPatch, LoadSettingsSchema, ModelArtifact, ModelRuntimeIdentity,
+    ResolvedLoadSettings, RuntimeCompatibility, RuntimeProbeObservation,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -144,6 +145,41 @@ pub enum OptionValueKind {
     Path,
 }
 
+pub fn common_load_setting_definitions() -> Vec<LoadSettingDefinition> {
+    vec![
+        LoadSettingDefinition {
+            id: LoadSettingId::new("context_length").expect("static setting ID"),
+            label: "Context length".to_owned(),
+            description: "Explicit context window requested from the selected runtime".to_owned(),
+            kind: norted_core::LoadSettingKind::UnsignedInteger {
+                minimum: Some(1),
+                maximum: None,
+            },
+            scope: norted_core::LoadSettingScope::Common,
+            supported: true,
+            unsupported_reason: None,
+            unit: Some("tokens".to_owned()),
+            upstream_default: Some("runtime/model automatic behavior".to_owned()),
+            recommendation: None,
+        },
+        LoadSettingDefinition {
+            id: LoadSettingId::new("parallel_requests").expect("static setting ID"),
+            label: "Parallel requests".to_owned(),
+            description: "Number of concurrent server slots".to_owned(),
+            kind: norted_core::LoadSettingKind::UnsignedInteger {
+                minimum: Some(1),
+                maximum: None,
+            },
+            scope: norted_core::LoadSettingScope::Common,
+            supported: true,
+            unsupported_reason: None,
+            unit: Some("slots".to_owned()),
+            upstream_default: Some("runtime-selected".to_owned()),
+            recommendation: None,
+        },
+    ]
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedAuxiliaryArtifact {
     pub role: AuxiliaryArtifactRole,
@@ -184,6 +220,8 @@ pub struct LaunchRequest {
     pub runtime: InstalledRuntime,
     pub accelerator: Option<AcceleratorDevice>,
     pub backend_address: SocketAddr,
+    pub load_settings: ResolvedLoadSettings,
+    pub load_settings_schema: LoadSettingsSchema,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +234,7 @@ pub struct LaunchSpec {
     pub working_directory: Option<PathBuf>,
     pub endpoint: Option<String>,
     pub normalized_settings: BTreeMap<String, serde_json::Value>,
+    pub load_settings: ResolvedLoadSettings,
     pub native_arguments: Vec<String>,
     pub installation: EngineInstallation,
     pub runtime: InstalledRuntime,
@@ -426,6 +465,24 @@ pub trait EngineAdapter: Send + Sync {
         })
     }
     fn native_options(&self) -> Vec<NativeOption>;
+    /// Returns every stable setting this adapter understands, independent of
+    /// whether one exact installed runtime currently supports it.
+    fn load_setting_definitions(&self) -> Vec<LoadSettingDefinition> {
+        Vec::new()
+    }
+    /// Gates the curated semantic settings against one exact runtime contract.
+    async fn load_settings_schema(
+        &self,
+        runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _host: &HostCapabilities,
+    ) -> Result<LoadSettingsSchema, EngineError> {
+        Ok(LoadSettingsSchema {
+            engine_id: self.identity().id,
+            runtime_id: Some(runtime.manifest.runtime_id.clone()),
+            definitions: self.load_setting_definitions(),
+        })
+    }
     /// Reports the legacy/flexible-entry runtime configured directly for this
     /// adapter. Managed packs are discovered by the shared runtime store.
     async fn probe(&self) -> Result<EngineProbe, EngineError>;
@@ -504,6 +561,58 @@ impl EngineRegistry {
             .filter(|adapter| adapter.compatibility(artifact).is_supported())
             .cloned()
             .collect()
+    }
+
+    pub fn load_setting_definitions(&self) -> Result<Vec<LoadSettingDefinition>, EngineError> {
+        let mut definitions = BTreeMap::<LoadSettingId, LoadSettingDefinition>::new();
+        for adapter in self.adapters.values() {
+            for definition in adapter.load_setting_definitions() {
+                match definitions.entry(definition.id.clone()) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(definition);
+                    }
+                    Entry::Occupied(entry) if entry.get() == &definition => {}
+                    Entry::Occupied(entry) => {
+                        return Err(EngineError::InvalidConfiguration(format!(
+                            "load setting `{}` has conflicting adapter definitions",
+                            entry.key()
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(definitions.into_values().collect())
+    }
+
+    pub fn parse_load_settings(
+        &self,
+        assignments: &[String],
+    ) -> Result<LoadSettingsPatch, EngineError> {
+        let definitions = self
+            .load_setting_definitions()?
+            .into_iter()
+            .map(|definition| (definition.id.clone(), definition))
+            .collect::<BTreeMap<_, _>>();
+        let mut patch = LoadSettingsPatch::default();
+        for assignment in assignments {
+            let (raw_id, raw_value) = assignment.split_once('=').ok_or_else(|| {
+                EngineError::InvalidConfiguration(format!(
+                    "load setting `{assignment}` must use SETTING_ID=VALUE"
+                ))
+            })?;
+            let id = LoadSettingId::new(raw_id.to_owned())
+                .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
+            let definition = definitions.get(&id).ok_or_else(|| {
+                EngineError::InvalidConfiguration(
+                    LoadSettingsError::UnknownSetting(id.clone()).to_string(),
+                )
+            })?;
+            let value = definition
+                .parse(raw_value)
+                .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
+            patch.insert(id, value);
+        }
+        Ok(patch)
     }
 
     pub fn len(&self) -> usize {

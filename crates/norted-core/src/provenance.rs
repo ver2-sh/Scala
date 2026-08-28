@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceleratorDevice, AuxiliaryArtifactRole, ModelId, RuntimeManifest, RuntimeSelectionSource,
+    AcceleratorDevice, AuxiliaryArtifactRole, LoadSettingId, ModelId, ResolvedLoadSetting,
+    RuntimeManifest, RuntimeSelectionSource,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +94,14 @@ pub struct ProcessIdentity {
     pub process_start_identity: Option<String>,
 }
 
+/// Immutable snapshot of the structured Norted load settings used for one
+/// launch. Absent entries were deliberately left to the upstream runtime.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LoadSettingsProvenance {
+    #[serde(default)]
+    pub effective: BTreeMap<LoadSettingId, ResolvedLoadSetting>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeProvenance {
     pub model: ModelRuntimeIdentity,
@@ -102,6 +111,10 @@ pub struct RuntimeProvenance {
     pub accelerator: Option<AcceleratorDevice>,
     pub installation: EngineInstallation,
     pub profile: Option<String>,
+    #[serde(default)]
+    pub load_settings: LoadSettingsProvenance,
+    /// Adapter/runtime and generation facts retained for compatibility. This
+    /// is intentionally distinct from structured load-setting provenance.
     pub normalized_settings: BTreeMap<String, serde_json::Value>,
     pub native_arguments: Vec<NativeArgumentProvenance>,
     pub native_environment: Vec<EnvironmentVariableProvenance>,
