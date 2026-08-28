@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use norted_core::{
@@ -25,6 +26,8 @@ pub enum RuntimeStoreError {
     NotInstalled(RuntimeId),
     #[error("runtime `{0}` is leased by a loading or running backend")]
     RuntimeInUse(RuntimeId),
+    #[error("runtime `{0}` installation is already in progress")]
+    InstallationInProgress(RuntimeId),
     #[error("runtime `{runtime_id}` is selected for {selection}")]
     RuntimeSelected {
         runtime_id: RuntimeId,
@@ -63,6 +66,53 @@ pub struct RuntimeLease {
 #[derive(Debug)]
 pub struct RuntimeStoreTransaction {
     _file: std::fs::File,
+}
+
+#[derive(Debug)]
+pub struct RuntimeInstallationLease {
+    _file: std::fs::File,
+}
+
+#[derive(Debug)]
+pub struct RuntimeStaging {
+    path: Option<PathBuf>,
+}
+
+impl RuntimeStaging {
+    pub fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("owned runtime staging is always armed while accessible")
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Deref for RuntimeStaging {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.path()
+    }
+}
+
+impl AsRef<Path> for RuntimeStaging {
+    fn as_ref(&self) -> &Path {
+        self.path()
+    }
+}
+
+impl Drop for RuntimeStaging {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        if let Err(error) = remove_staging_tree(&path) {
+            tracing::warn!(path = %path.display(), %error, "failed to clean owned runtime staging");
+        }
+    }
 }
 
 impl RuntimeStore {
@@ -141,7 +191,7 @@ impl RuntimeStore {
         installation_path_for(&self.root, manifest)
     }
 
-    pub async fn create_staging(&self) -> Result<PathBuf, RuntimeStoreError> {
+    pub async fn create_staging(&self) -> Result<RuntimeStaging, RuntimeStoreError> {
         self.ensure().await?;
         let path = self
             .root
@@ -153,12 +203,12 @@ impl RuntimeStore {
                 path: path.clone(),
                 source,
             })?;
-        Ok(path)
+        Ok(RuntimeStaging { path: Some(path) })
     }
 
     pub async fn activate(
         &self,
-        staging: &Path,
+        staging: &mut RuntimeStaging,
         manifest: &RuntimeManifest,
     ) -> Result<InstalledRuntime, RuntimeStoreError> {
         manifest
@@ -197,13 +247,13 @@ impl RuntimeStore {
             });
         }
         let root = self.root.clone();
-        let staging = staging.to_path_buf();
+        let staging_path = staging.path().to_path_buf();
         let activation_destination = destination.clone();
         let activation_manifest = manifest.clone();
         tokio::task::spawn_blocking(move || {
             activate_blocking(
                 &root,
-                &staging,
+                &staging_path,
                 &activation_destination,
                 &activation_manifest,
             )
@@ -213,6 +263,7 @@ impl RuntimeStore {
             path: destination.clone(),
             source: std::io::Error::other(source),
         })??;
+        staging.disarm();
         Ok(InstalledRuntime {
             manifest: manifest.clone(),
             installation_root: destination,
@@ -263,6 +314,39 @@ impl RuntimeStore {
         runtime_id: &RuntimeId,
     ) -> Result<RuntimeLease, RuntimeStoreError> {
         self.acquire_lease(runtime_id, false).await
+    }
+
+    pub async fn acquire_installation_lease(
+        &self,
+        runtime_id: &RuntimeId,
+    ) -> Result<RuntimeInstallationLease, RuntimeStoreError> {
+        self.ensure().await?;
+        let lock_path = self
+            .root
+            .join(".locks")
+            .join("installations")
+            .join(format!("{}.lock", runtime_id.as_str()));
+        let runtime_id = runtime_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|source| RuntimeStoreError::Io {
+                    path: lock_path,
+                    source,
+                })?;
+            fs2::FileExt::try_lock_exclusive(&file)
+                .map(|()| RuntimeInstallationLease { _file: file })
+                .map_err(|_| RuntimeStoreError::InstallationInProgress(runtime_id))
+        })
+        .await
+        .map_err(|source| RuntimeStoreError::Io {
+            path: self.root.clone(),
+            source: std::io::Error::other(source),
+        })?
     }
 
     async fn acquire_lease(
@@ -378,7 +462,43 @@ fn ensure_store_layout_blocking(root: &Path) -> Result<(), RuntimeStoreError> {
             return Err(RuntimeStoreError::UnsafePath(canonical));
         }
     }
+    let installation_locks = root.join(".locks").join("installations");
+    match std::fs::create_dir(&installation_locks) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return Err(RuntimeStoreError::Io {
+                path: installation_locks,
+                source,
+            });
+        }
+    }
+    verify_real_directory(&installation_locks)?;
+    let canonical_installation_locks = canonical_directory(&installation_locks)?;
+    let canonical_locks = canonical_directory(&root.join(".locks"))?;
+    if canonical_installation_locks == canonical_locks
+        || !canonical_installation_locks.starts_with(&canonical_locks)
+    {
+        return Err(RuntimeStoreError::UnsafePath(canonical_installation_locks));
+    }
     Ok(())
+}
+
+fn remove_staging_tree(path: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if is_link_or_reparse(&metadata) && metadata.is_dir() {
+        std::fs::remove_dir(path)
+    } else if is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        std::fs::remove_file(path)
+    } else {
+        // remove_dir_all does not follow directory symlinks, so cleanup cannot
+        // escape through a link planted inside the owned staging tree.
+        std::fs::remove_dir_all(path)
+    }
 }
 
 fn activate_blocking(
@@ -1011,13 +1131,13 @@ mod tests {
         RuntimeIdentity, RuntimePackageIdentity, RuntimeProbeObservation, RuntimeRequirements,
     };
 
-    use super::{RuntimeStore, RuntimeStoreError};
+    use super::{RuntimeStaging, RuntimeStore, RuntimeStoreError};
 
     async fn stage_runtime(
         store: &RuntimeStore,
         manifest: &norted_core::RuntimeManifest,
         entrypoint: &[u8],
-    ) -> std::path::PathBuf {
+    ) -> RuntimeStaging {
         let staging = store.create_staging().await.expect("staging directory");
         tokio::fs::write(staging.join("server"), entrypoint)
             .await
@@ -1048,7 +1168,7 @@ mod tests {
             load_profiles_lock_file: temporary.path().join("data/.load-profiles.lock"),
         };
         let store = RuntimeStore::new(&paths);
-        let staging = store.create_staging().await.expect("staging directory");
+        let mut staging = store.create_staging().await.expect("staging directory");
         tokio::fs::write(staging.join("server"), b"not executable")
             .await
             .expect("fixture entrypoint");
@@ -1096,7 +1216,7 @@ mod tests {
         };
         let destination = store.installation_path(&manifest);
         let error = store
-            .activate(&staging, &manifest)
+            .activate(&mut staging, &manifest)
             .await
             .expect_err("failed probe must prevent activation");
         assert!(matches!(error, RuntimeStoreError::InvalidManifest { .. }));
@@ -1130,6 +1250,71 @@ mod tests {
             store.acquire_lease(&runtime_id, true).await,
             Err(RuntimeStoreError::RuntimeInUse(observed)) if observed == runtime_id
         ));
+    }
+
+    #[tokio::test]
+    async fn staging_is_removed_when_ownership_is_dropped() {
+        let temporary = tempfile::tempdir().expect("temporary runtime root");
+        let paths = AppPaths {
+            config_dir: temporary.path().join("config"),
+            config_file: temporary.path().join("config/config.toml"),
+            data_dir: temporary.path().join("data"),
+            state_dir: temporary.path().join("state"),
+            cache_dir: temporary.path().join("cache"),
+            log_dir: temporary.path().join("logs"),
+            runtimes_dir: temporary.path().join("data/runtimes"),
+            runtime_cache_dir: temporary.path().join("cache/runtime-packs"),
+            runtime_selections_file: temporary.path().join("data/runtime-selections.json"),
+            load_profiles_file: temporary.path().join("data/load-profiles.json"),
+            load_profiles_lock_file: temporary.path().join("data/.load-profiles.lock"),
+        };
+        let store = RuntimeStore::new(&paths);
+        let staging = store.create_staging().await.expect("staging directory");
+        let staging_path = staging.path().to_path_buf();
+        assert!(staging_path.is_dir());
+        drop(staging);
+        assert!(!staging_path.exists());
+    }
+
+    #[tokio::test]
+    async fn installation_lease_is_exclusive_per_exact_runtime() {
+        let temporary = tempfile::tempdir().expect("temporary runtime root");
+        let paths = AppPaths {
+            config_dir: temporary.path().join("config"),
+            config_file: temporary.path().join("config/config.toml"),
+            data_dir: temporary.path().join("data"),
+            state_dir: temporary.path().join("state"),
+            cache_dir: temporary.path().join("cache"),
+            log_dir: temporary.path().join("logs"),
+            runtimes_dir: temporary.path().join("data/runtimes"),
+            runtime_cache_dir: temporary.path().join("cache/runtime-packs"),
+            runtime_selections_file: temporary.path().join("data/runtime-selections.json"),
+            load_profiles_file: temporary.path().join("data/load-profiles.json"),
+            load_profiles_lock_file: temporary.path().join("data/.load-profiles.lock"),
+        };
+        let first_store = RuntimeStore::new(&paths);
+        let second_store = RuntimeStore::new(&paths);
+        let first_id = norted_core::RuntimeId::new("first-runtime").expect("runtime ID");
+        let second_id = norted_core::RuntimeId::new("second-runtime").expect("runtime ID");
+
+        let first_lease = first_store
+            .acquire_installation_lease(&first_id)
+            .await
+            .expect("first installation lease");
+        assert!(matches!(
+            second_store.acquire_installation_lease(&first_id).await,
+            Err(RuntimeStoreError::InstallationInProgress(observed)) if observed == first_id
+        ));
+        let independent_lease = second_store
+            .acquire_installation_lease(&second_id)
+            .await
+            .expect("independent installation lease");
+        drop(independent_lease);
+        drop(first_lease);
+        second_store
+            .acquire_installation_lease(&first_id)
+            .await
+            .expect("released installation lease");
     }
 
     #[tokio::test]
@@ -1194,11 +1379,13 @@ mod tests {
             },
         };
 
-        let staging = stage_runtime(&store, &manifest, b"original").await;
+        let mut staging = stage_runtime(&store, &manifest, b"original").await;
         let installed = store
-            .activate(&staging, &manifest)
+            .activate(&mut staging, &manifest)
             .await
             .expect("initial activation");
+        drop(staging);
+        assert!(installed.installation_root.is_dir());
         tokio::fs::write(installed.entrypoint_path(), b"corrupt")
             .await
             .expect("corrupt entrypoint");
@@ -1211,9 +1398,9 @@ mod tests {
                 .any(|warning| warning.contains("SHA-256"))
         );
 
-        let repair_staging = stage_runtime(&store, &manifest, b"original").await;
+        let mut repair_staging = stage_runtime(&store, &manifest, b"original").await;
         store
-            .activate(&repair_staging, &manifest)
+            .activate(&mut repair_staging, &manifest)
             .await
             .expect("transactional repair");
         assert_eq!(store.scan().await.expect("scan repaired").runtimes.len(), 1);

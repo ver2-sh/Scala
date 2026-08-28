@@ -334,7 +334,7 @@ fn render_runtimes(
     let subtitle = if app.runtime_list_loading {
         "Refreshing installed packs in the background"
     } else {
-        "Installed packs, persisted format defaults, and official releases"
+        "Installed packs, persisted format defaults, and upstream runtimes"
     };
     frame.render_widget(section_title("Runtimes", subtitle, theme), layout[0]);
 
@@ -414,9 +414,9 @@ fn render_runtimes(
         .is_some_and(|snapshot| snapshot.installed.is_empty())
     {
         let guidance = if app.snapshot.models.is_empty() {
-            "Search official releases to install a compatible runtime pack."
+            "Search upstream runtimes to install a compatible runtime pack."
         } else {
-            "Models detected: press s to see host-compatible official packs, recommended first. Installation stays explicit."
+            "Models detected: press s to see compatible upstream runtimes, recommended first. Installation stays explicit."
         };
         render_empty(
             frame,

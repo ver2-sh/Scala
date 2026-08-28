@@ -215,12 +215,7 @@ impl RuntimePackManager {
                         .variant
                         .cmp(&right.manifest.identity.variant)
                 })
-                .then_with(|| {
-                    compare_versions(
-                        &right.manifest.identity.version,
-                        &left.manifest.identity.version,
-                    )
-                })
+                .then_with(|| compare_installed_recency(right, left))
         });
         let selections = self.store.selections().await?;
         let host = self.host.read().await.clone();
@@ -427,6 +422,15 @@ impl RuntimePackManager {
                 reason,
             });
         }
+        if let Some(runtime) = self.store.get(runtime_id).await? {
+            ensure_catalog_provenance_matches(&runtime, &entry.available)?;
+            return Ok(runtime);
+        }
+        // This per-runtime cross-process lease is intentionally separate from
+        // both the store transaction lock and running-runtime leases. It is
+        // held across acquisition/build, then activate takes its short-lived
+        // locks in the existing order without any reverse dependency.
+        let _installation_lease = self.store.acquire_installation_lease(runtime_id).await?;
         if let Some(runtime) = self.store.get(runtime_id).await? {
             ensure_catalog_provenance_matches(&runtime, &entry.available)?;
             return Ok(runtime);
@@ -695,12 +699,7 @@ impl RuntimePackManager {
                 .then_with(|| {
                     acquisition_rank(&left.0.runtime).cmp(&acquisition_rank(&right.0.runtime))
                 })
-                .then_with(|| {
-                    compare_versions(
-                        &right.0.runtime.manifest.identity.version,
-                        &left.0.runtime.manifest.identity.version,
-                    )
-                })
+                .then_with(|| compare_installed_recency(&right.0.runtime, &left.0.runtime))
                 .then_with(|| {
                     left.0
                         .runtime
@@ -1066,12 +1065,7 @@ impl RuntimePackManager {
                 .then_with(|| {
                     acquisition_rank(&left.0.runtime).cmp(&acquisition_rank(&right.0.runtime))
                 })
-                .then_with(|| {
-                    compare_versions(
-                        &right.0.runtime.manifest.identity.version,
-                        &left.0.runtime.manifest.identity.version,
-                    )
-                })
+                .then_with(|| compare_installed_recency(&right.0.runtime, &left.0.runtime))
                 .then_with(|| {
                     left.0
                         .runtime
@@ -1493,6 +1487,44 @@ fn update_channel_matches(
     candidate.channels.contains(&channel)
 }
 
+fn compare_installed_recency(left: &InstalledRuntime, right: &InstalledRuntime) -> Ordering {
+    let left_manifest = &left.manifest;
+    let right_manifest = &right.manifest;
+    let same_update_line = left_manifest.identity.engine_id == right_manifest.identity.engine_id
+        && left_manifest.identity.package_family == right_manifest.identity.package_family
+        && left_manifest.identity.platform == right_manifest.identity.platform
+        && left_manifest.identity.architecture == right_manifest.identity.architecture
+        && left_manifest.identity.accelerator == right_manifest.identity.accelerator
+        && left_manifest.identity.variant == right_manifest.identity.variant
+        && left_manifest.identity.package.provider_id
+            == right_manifest.identity.package.provider_id;
+    if same_update_line
+        && let (Some(left_source), Some(right_source)) = (
+            left_manifest.source_build.as_ref(),
+            right_manifest.source_build.as_ref(),
+        )
+    {
+        // Commit time provides deterministic offline recency for installed
+        // snapshots only. It is not ancestry evidence; update availability is
+        // decided separately by source_history_update_state using Git history.
+        return left_source
+            .source
+            .commit_timestamp_unix
+            .cmp(&right_source.source.commit_timestamp_unix)
+            .then_with(|| {
+                left_source
+                    .source
+                    .commit_sha
+                    .cmp(&right_source.source.commit_sha)
+            })
+            .then_with(|| left_manifest.runtime_id.cmp(&right_manifest.runtime_id));
+    }
+    compare_versions(
+        &left_manifest.identity.version,
+        &right_manifest.identity.version,
+    )
+}
+
 fn compare_versions(left: &str, right: &str) -> Ordering {
     let left_parts = version_parts(left);
     let right_parts = version_parts(right);
@@ -1509,9 +1541,17 @@ fn version_parts(value: &str) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
-    use norted_core::{RuntimeId, RuntimeUpdatePreference, RuntimeUpdateState};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
-    use super::source_history_update_state;
+    use norted_core::{
+        InstalledRuntime, RUNTIME_MANIFEST_SCHEMA_VERSION, RuntimeAcquisitionMethod, RuntimeId,
+        RuntimeIdentity, RuntimeManifest, RuntimePackageIdentity, RuntimeProbeObservation,
+        RuntimeRequirements, RuntimeSourceBuildProvenance, RuntimeSourceBuildToolchain,
+        RuntimeSourceSnapshot, RuntimeUpdatePreference, RuntimeUpdateState,
+    };
+
+    use super::{compare_installed_recency, source_history_update_state};
     use crate::{GitHubCompare, GitHubComparisonStatus};
 
     #[test]
@@ -1583,5 +1623,123 @@ mod tests {
                 ..
             } if runtime_id == candidate
         ));
+    }
+
+    #[test]
+    fn same_day_source_fallback_uses_commit_recency_not_sha_digits() {
+        let older = installed_fixture(
+            "git-20260828-99999999",
+            Some((1_787_961_600, "9999999999999999999999999999999999999999")),
+        );
+        let newer = installed_fixture(
+            "git-20260828-aaaaaaaa",
+            Some((1_787_965_200, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+        );
+        assert_eq!(
+            super::compare_versions(
+                &older.manifest.identity.version,
+                &newer.manifest.identity.version
+            ),
+            std::cmp::Ordering::Greater,
+            "the legacy numeric comparator demonstrates the SHA-fragment bug"
+        );
+
+        let mut fallback_candidates = [older, newer.clone()];
+        fallback_candidates.sort_by(|left, right| compare_installed_recency(right, left));
+        assert_eq!(
+            fallback_candidates[0].manifest.runtime_id,
+            newer.manifest.runtime_id
+        );
+
+        let release_v1 = installed_fixture("v1.9.0", None);
+        let release_v2 = installed_fixture("v2.0.0", None);
+        assert_eq!(
+            compare_installed_recency(&release_v2, &release_v1),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    fn installed_fixture(version: &str, source: Option<(i64, &str)>) -> InstalledRuntime {
+        let identity = RuntimeIdentity {
+            engine_id: "fixture-engine".to_owned(),
+            package_family: "fixture-family".to_owned(),
+            version: version.to_owned(),
+            upstream_revision: source.map(|(_, commit)| commit.to_owned()),
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            accelerator: "cuda-sm120".to_owned(),
+            variant: "default".to_owned(),
+            package: RuntimePackageIdentity {
+                provider_id: "fixture-provider".to_owned(),
+                repository: Some("owner/repository".to_owned()),
+                release_tag: source.is_none().then(|| version.to_owned()),
+                asset_id: source.is_none().then(|| "1".to_owned()),
+                asset_name: source.is_none().then(|| "runtime.tar.gz".to_owned()),
+                additional_assets: Vec::new(),
+            },
+        };
+        let runtime_id = RuntimeId::from_identity(&identity);
+        let source_build =
+            source.map(
+                |(commit_timestamp_unix, commit_sha)| RuntimeSourceBuildProvenance {
+                    source: RuntimeSourceSnapshot {
+                        repository: "owner/repository".to_owned(),
+                        repository_url: "https://github.com/owner/repository.git".to_owned(),
+                        source_branch: "main".to_owned(),
+                        commit_sha: commit_sha.to_owned(),
+                        tree_sha: "b".repeat(40),
+                        commit_timestamp_unix,
+                        source_provider: "github".to_owned(),
+                    },
+                    recipe_version: "fixture-v1".to_owned(),
+                    cmake_configuration_arguments: Vec::new(),
+                    build_target: "fixture".to_owned(),
+                    toolchain: RuntimeSourceBuildToolchain {
+                        cmake_version: "4.0".to_owned(),
+                        ninja_version: "1.12".to_owned(),
+                        cpp_compiler: "fixture-c++".to_owned(),
+                        nvcc_version: "13.0".to_owned(),
+                        pkg_config_version: "2.0".to_owned(),
+                        system_dependencies: BTreeMap::new(),
+                    },
+                    build_platform: "linux".to_owned(),
+                    build_architecture: "x86_64".to_owned(),
+                    accelerator_target: "sm_120".to_owned(),
+                    built_at_unix: commit_timestamp_unix,
+                    entrypoint: PathBuf::from("server"),
+                    entrypoint_sha256: "c".repeat(64),
+                },
+            );
+        InstalledRuntime {
+            manifest: RuntimeManifest {
+                schema_version: RUNTIME_MANIFEST_SCHEMA_VERSION,
+                runtime_id,
+                identity,
+                supported_formats: Vec::new(),
+                supported_native_identities: Vec::new(),
+                requirements: RuntimeRequirements::default(),
+                acquisition_method: if source_build.is_some() {
+                    RuntimeAcquisitionMethod::SourceBuild
+                } else {
+                    RuntimeAcquisitionMethod::OfficialReleaseAsset
+                },
+                source_url: None,
+                downloaded_archive_sha256: source_build.is_none().then(|| "d".repeat(64)),
+                additional_downloaded_archive_sha256: Vec::new(),
+                source_build,
+                entrypoint: PathBuf::from("server"),
+                entrypoint_sha256: "c".repeat(64),
+                installed_at_unix: Some(1),
+                probe: RuntimeProbeObservation {
+                    compatible: true,
+                    observed_engine_id: "fixture-engine".to_owned(),
+                    observed_version: Some(version.to_owned()),
+                    observed_revision: None,
+                    detail: "fixture".to_owned(),
+                    observed_at_unix: 1,
+                },
+            },
+            installation_root: PathBuf::new(),
+        }
     }
 }

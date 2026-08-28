@@ -110,7 +110,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
                 Line::from(Span::styled("Recommended next step", theme.hint)),
                 Line::from(Span::styled(
                     format!(
-                        "Search official {format} runtime releases compatible with this host."
+                        "Search upstream {format} runtimes compatible with this host."
                     ),
                     theme.text,
                 )),

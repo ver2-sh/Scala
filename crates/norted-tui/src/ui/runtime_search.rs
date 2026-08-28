@@ -92,7 +92,7 @@ fn render_results(
             ("Runtime search failed", error.as_str(), theme.error)
         } else {
             (
-                "Search official releases",
+                "Search upstream runtimes",
                 "Results are fetched only when this dialog is opened or Search is activated.",
                 theme.text,
             )
@@ -109,7 +109,7 @@ fn render_results(
     };
     if result_count == 0 {
         let detail = if app.runtime_search_query.is_empty() {
-            "No compatible release assets were returned by the configured providers."
+            "No compatible runtime candidates were returned by the configured providers."
         } else {
             "No fetched runtime matches this filter. Press Enter to search providers with it."
         };

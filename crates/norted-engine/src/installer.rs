@@ -209,10 +209,10 @@ impl RuntimeInstaller {
             Some(total_package_size),
             "Extracting verified package",
         );
-        let staging = self.store.create_staging().await?;
+        let mut staging = self.store.create_staging().await?;
         let result = async {
             let archive_path = archive.clone();
-            let staging_path = staging.clone();
+            let staging_path = staging.path().to_path_buf();
             let format = download.archive_format;
             tokio::task::spawn_blocking(move || {
                 extract_archive(&archive_path, &staging_path, format)
@@ -221,7 +221,7 @@ impl RuntimeInstaller {
             .map_err(|error| RuntimeInstallError::Task(error.to_string()))??;
             for (download, archive) in additional_downloads.iter().zip(&additional_archives) {
                 let archive_path = archive.clone();
-                let staging_path = staging.clone();
+                let staging_path = staging.path().to_path_buf();
                 let format = download.archive_format;
                 tokio::task::spawn_blocking(move || {
                     extract_archive(&archive_path, &staging_path, format)
@@ -273,7 +273,7 @@ impl RuntimeInstaller {
             };
             let candidate = InstalledRuntime {
                 manifest: manifest.clone(),
-                installation_root: staging.clone(),
+                installation_root: staging.path().to_path_buf(),
             };
             self.emit(
                 available,
@@ -317,16 +317,13 @@ impl RuntimeInstaller {
                 "Atomically activating immutable runtime",
             );
             self.store
-                .activate(&staging, &manifest)
+                .activate(&mut staging, &manifest)
                 .await
                 .map_err(Into::into)
         }
         .await;
         match result {
             Ok(runtime) => {
-                if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
-                    let _ = tokio::fs::remove_dir_all(&staging).await;
-                }
                 self.emit(
                     available,
                     RuntimeOperationPhase::Installed,
@@ -337,9 +334,6 @@ impl RuntimeInstaller {
                 Ok(runtime)
             }
             Err(error) => {
-                if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
-                    let _ = tokio::fs::remove_dir_all(&staging).await;
-                }
                 self.emit(
                     available,
                     RuntimeOperationPhase::Failed,
@@ -418,7 +412,7 @@ impl RuntimeInstaller {
             .registry
             .get(&available.identity.engine_id)
             .ok_or_else(|| RuntimeInstallError::Adapter(available.identity.engine_id.clone()))?;
-        let staging = self.store.create_staging().await?;
+        let mut staging = self.store.create_staging().await?;
         let result = async {
             let source_root = staging.join("source");
             tokio::fs::create_dir_all(&source_root)
@@ -607,7 +601,7 @@ impl RuntimeInstaller {
             };
             let candidate = InstalledRuntime {
                 manifest: manifest.clone(),
-                installation_root: staging.clone(),
+                installation_root: staging.path().to_path_buf(),
             };
             self.emit(
                 available,
@@ -652,7 +646,7 @@ impl RuntimeInstaller {
                 "Atomically activating immutable source-built runtime",
             );
             self.store
-                .activate(&staging, &manifest)
+                .activate(&mut staging, &manifest)
                 .await
                 .map_err(Into::into)
         }
@@ -660,9 +654,6 @@ impl RuntimeInstaller {
 
         match result {
             Ok(runtime) => {
-                if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
-                    let _ = tokio::fs::remove_dir_all(&staging).await;
-                }
                 self.emit(
                     available,
                     RuntimeOperationPhase::Installed,
@@ -672,12 +663,7 @@ impl RuntimeInstaller {
                 );
                 Ok(runtime)
             }
-            Err(error) => {
-                if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
-                    let _ = tokio::fs::remove_dir_all(&staging).await;
-                }
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -911,6 +897,61 @@ impl RuntimeInstaller {
 const MAX_PROBE_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_BUILD_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const SOURCE_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct SourceProcessGroup {
+    process_group_id: Option<libc::pid_t>,
+}
+
+#[cfg(unix)]
+impl SourceProcessGroup {
+    fn for_child(child: &tokio::process::Child) -> Result<Self, RuntimeInstallError> {
+        let process_group_id = child
+            .id()
+            .and_then(|id| libc::pid_t::try_from(id).ok())
+            .ok_or_else(|| {
+                RuntimeInstallError::SourceBuild(
+                    "source command did not expose a valid process-group ID".to_owned(),
+                )
+            })?;
+        Ok(Self {
+            process_group_id: Some(process_group_id),
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.process_group_id = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SourceProcessGroup {
+    fn drop(&mut self) {
+        let Some(process_group_id) = self.process_group_id.take() else {
+            return;
+        };
+        // The child is created as its own process-group leader. A negative PID
+        // targets that group only, never Norted's process group.
+        let result = unsafe { libc::kill(-process_group_id, libc::SIGKILL) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                tracing::warn!(process_group_id, %error, "failed to kill owned source process group");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn configure_source_process_group(command: &mut tokio::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.as_std_mut().process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_source_process_group(_command: &mut tokio::process::Command) {}
 const MAX_CMAKE_CONTRACT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CMAKE_CONTRACT_FILES: usize = 4_096;
 
@@ -1145,6 +1186,7 @@ async fn run_source_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    configure_source_process_group(&mut command);
     if let Some(current_dir) = current_dir {
         command.current_dir(current_dir);
     }
@@ -1154,6 +1196,8 @@ async fn run_source_command(
     let mut child = command.spawn().map_err(|error| {
         RuntimeInstallError::SourceBuild(format!("{label} could not start: {error}"))
     })?;
+    #[cfg(unix)]
+    let mut process_group = SourceProcessGroup::for_child(&child)?;
     let stdout = child
         .stdout
         .take()
@@ -1167,6 +1211,10 @@ async fn run_source_command(
     let status = child.wait().await.map_err(|error| {
         RuntimeInstallError::SourceBuild(format!("{label} could not be observed: {error}"))
     })?;
+    // Once the leader is fully reaped, disarm immediately so a recycled PID
+    // can never cause an unrelated process group to be targeted.
+    #[cfg(unix)]
+    process_group.disarm();
     let stdout = stdout_task
         .await
         .map_err(|error| RuntimeInstallError::Task(error.to_string()))?
@@ -1910,6 +1958,8 @@ fn unix_timestamp() -> i64 {
 mod tests {
     use std::io::Write;
     use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use std::time::Duration;
 
     use norted_core::RuntimeArchiveFormat;
 
@@ -2038,5 +2088,66 @@ mod tests {
         .expect_err("failing direct source command");
         assert!(error.to_string().contains("failing Rust compiler probe"));
         assert!(error.to_string().contains("definitely-not-a-rustc-option"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_source_command_kills_its_entire_process_group() {
+        let workspace = tempfile::tempdir().expect("temporary process fixture");
+        let direct_pid_path = workspace.path().join("direct.pid");
+        let descendant_pid_path = workspace.path().join("descendant.pid");
+        let working_directory = workspace.path().to_path_buf();
+        let command = tokio::spawn(async move {
+            run_source_command(
+                "test compiler process tree",
+                "sh",
+                &[
+                    "-c",
+                    "sleep 30 & child=$!; printf '%s\\n' \"$$\" > direct.pid; printf '%s\\n' \"$child\" > descendant.pid; wait",
+                ],
+                Some(&working_directory),
+                &[],
+            )
+            .await
+        });
+
+        let direct_pid = wait_for_fixture_pid(&direct_pid_path).await;
+        let descendant_pid = wait_for_fixture_pid(&descendant_pid_path).await;
+        assert!(linux_process_is_running(direct_pid));
+        assert!(linux_process_is_running(descendant_pid));
+
+        command.abort();
+        let _ = command.await;
+        for _ in 0..100 {
+            if !linux_process_is_running(direct_pid) && !linux_process_is_running(descendant_pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!linux_process_is_running(direct_pid));
+        assert!(!linux_process_is_running(descendant_pid));
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_fixture_pid(path: &Path) -> libc::pid_t {
+        for _ in 0..100 {
+            if let Ok(text) = tokio::fs::read_to_string(path).await
+                && let Ok(pid) = text.trim().parse()
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("fixture PID was not written to {}", path.display());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_process_is_running(pid: libc::pid_t) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit_once(") ")
+            .and_then(|(_, fields)| fields.split_whitespace().next())
+            .is_some_and(|state| state != "Z")
     }
 }

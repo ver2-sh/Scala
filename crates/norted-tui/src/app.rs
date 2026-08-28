@@ -2291,7 +2291,7 @@ impl App {
         self.runtime_update_loading = true;
         self.runtime_update_error = None;
         self.pending_runtime_action = Some(RuntimeAction::CheckUpdates);
-        self.notice = Some("Checking upstream runtime releases…".to_owned());
+        self.notice = Some("Checking upstream runtime candidates…".to_owned());
         Update::Render
     }
 
