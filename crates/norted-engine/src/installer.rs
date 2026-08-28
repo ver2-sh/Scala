@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use crate::catalog::{
     GitHubReleaseAsset, GitHubReleaseClient, RuntimeProviderAuthority, is_allowed_github_host,
 };
-use crate::store::{RUNTIME_MANIFEST_FILE, RuntimeStore, RuntimeStoreError};
+use crate::store::{RUNTIME_MANIFEST_FILE, RuntimeStaging, RuntimeStore, RuntimeStoreError};
 use crate::{EngineError, EngineRegistry};
 
 const MAX_ARCHIVE_ENTRIES: usize = 100_000;
@@ -209,25 +209,15 @@ impl RuntimeInstaller {
             Some(total_package_size),
             "Extracting verified package",
         );
-        let mut staging = self.store.create_staging().await?;
+        let staging = self.store.create_staging().await?;
         let result = async {
             let archive_path = archive.clone();
-            let staging_path = staging.path().to_path_buf();
             let format = download.archive_format;
-            tokio::task::spawn_blocking(move || {
-                extract_archive(&archive_path, &staging_path, format)
-            })
-            .await
-            .map_err(|error| RuntimeInstallError::Task(error.to_string()))??;
+            let mut staging = extract_archive_owned(staging, archive_path, format).await?;
             for (download, archive) in additional_downloads.iter().zip(&additional_archives) {
                 let archive_path = archive.clone();
-                let staging_path = staging.path().to_path_buf();
                 let format = download.archive_format;
-                tokio::task::spawn_blocking(move || {
-                    extract_archive(&archive_path, &staging_path, format)
-                })
-                .await
-                .map_err(|error| RuntimeInstallError::Task(error.to_string()))??;
+                staging = extract_archive_owned(staging, archive_path, format).await?;
             }
             let entrypoint = locate_entrypoint(&staging, &download.entrypoint_names)
                 .map_err(RuntimeInstallError::Entrypoint)?;
@@ -1042,9 +1032,12 @@ async fn probe_cpp20_compiler() -> Result<(), RuntimeInstallError> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    configure_source_process_group(&mut command);
     let mut child = command.spawn().map_err(|error| {
         RuntimeInstallError::Prerequisite(format!("could not start C++20 compiler probe: {error}"))
     })?;
+    #[cfg(unix)]
+    let mut process_group = SourceProcessGroup::for_child(&child)?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(b"#include <span>\nint main(){int x[1]{}; std::span<int> s{x}; return int(s.size())-1;}\n")
@@ -1057,6 +1050,10 @@ async fn probe_cpp20_compiler() -> Result<(), RuntimeInstallError> {
             RuntimeInstallError::Prerequisite("C++20 compiler probe timed out".to_owned())
         })?
         .map_err(|error| RuntimeInstallError::Prerequisite(error.to_string()))?;
+    // Once the compiler driver is fully reaped, disarm immediately so a
+    // recycled PID can never cause an unrelated process group to be targeted.
+    #[cfg(unix)]
+    process_group.disarm();
     if !status.success() {
         return Err(RuntimeInstallError::Prerequisite(
             "the host C++ compiler did not accept a C++20 probe".to_owned(),
@@ -1400,6 +1397,32 @@ fn extract_archive(
         RuntimeArchiveFormat::TarGz => extract_tar_gz(archive_path, staging),
     }?;
     validate_staging_limits(staging)
+}
+
+async fn extract_archive_owned(
+    staging: RuntimeStaging,
+    archive_path: PathBuf,
+    format: RuntimeArchiveFormat,
+) -> Result<RuntimeStaging, RuntimeInstallError> {
+    run_owned_staging_operation(staging, move |staging_path| {
+        extract_archive(&archive_path, staging_path, format)
+    })
+    .await
+}
+
+async fn run_owned_staging_operation<F>(
+    staging: RuntimeStaging,
+    operation: F,
+) -> Result<RuntimeStaging, RuntimeInstallError>
+where
+    F: FnOnce(&Path) -> Result<(), RuntimeInstallError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        operation(staging.path())?;
+        Ok(staging)
+    })
+    .await
+    .map_err(|error| RuntimeInstallError::Task(error.to_string()))?
 }
 
 fn validate_staging_limits(staging: &Path) -> Result<(), RuntimeInstallError> {
@@ -1958,16 +1981,73 @@ fn unix_timestamp() -> i64 {
 mod tests {
     use std::io::Write;
     use std::path::Path;
-    #[cfg(target_os = "linux")]
     use std::time::Duration;
 
-    use norted_core::RuntimeArchiveFormat;
+    use norted_core::{AppPaths, RuntimeArchiveFormat};
+    use tokio::sync::oneshot;
+
+    use crate::store::RuntimeStore;
 
     use super::{
         RuntimeInstallError, extract_archive, inspect_build_dependency_contract,
-        run_source_command, validate_relative_link_target, verify_package_digest,
-        verify_source_checkout,
+        run_owned_staging_operation, run_source_command, validate_relative_link_target,
+        verify_package_digest, verify_source_checkout,
     };
+
+    #[tokio::test]
+    async fn blocking_staging_writer_retains_cleanup_ownership_after_caller_cancellation() {
+        let workspace = tempfile::tempdir().expect("temporary runtime store");
+        let paths = AppPaths {
+            config_dir: workspace.path().join("config"),
+            config_file: workspace.path().join("config/config.toml"),
+            data_dir: workspace.path().join("data"),
+            state_dir: workspace.path().join("state"),
+            cache_dir: workspace.path().join("cache"),
+            log_dir: workspace.path().join("logs"),
+            runtimes_dir: workspace.path().join("data/runtimes"),
+            runtime_cache_dir: workspace.path().join("cache/runtime-packs"),
+            runtime_selections_file: workspace.path().join("data/runtime-selections.json"),
+            load_profiles_file: workspace.path().join("data/load-profiles.json"),
+            load_profiles_lock_file: workspace.path().join("data/.load-profiles.lock"),
+        };
+        let store = RuntimeStore::new(&paths);
+        let staging = store.create_staging().await.expect("staging directory");
+        let staging_path = staging.path().to_path_buf();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (finished_tx, finished_rx) = oneshot::channel();
+        let writer = tokio::spawn(async move {
+            run_owned_staging_operation(staging, move |path| {
+                started_tx.send(()).expect("signal writer start");
+                release_rx.blocking_recv().expect("release staging writer");
+                std::fs::create_dir_all(path.join("late"))
+                    .expect("write staging after caller cancellation");
+                std::fs::write(path.join("late/entry"), b"complete").expect("finish staging write");
+                finished_tx.send(()).expect("signal writer completion");
+                Ok(())
+            })
+            .await
+        });
+
+        started_rx.await.expect("blocking writer started");
+        writer.abort();
+        let _ = writer.await;
+        assert!(
+            staging_path.exists(),
+            "blocking writer must retain the staging guard after its caller is dropped"
+        );
+
+        release_tx.send(()).expect("release blocking writer");
+        finished_rx.await.expect("blocking writer finished");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while staging_path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached blocking writer must ultimately drop and clean staging");
+        assert!(!staging_path.exists());
+    }
 
     #[test]
     fn zip_and_tar_traversal_are_rejected() {
