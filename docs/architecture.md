@@ -117,7 +117,7 @@ The provider accepts only exact uploaded `q27-v<version>-linux-x86_64.tar.gz` as
 
 ## Compatibility and selection
 
-`HostCapabilities` records OS/architecture and optional NVIDIA model, VRAM, and driver observations from bounded `nvidia-smi` execution. Compatibility has four states: Recommended, Compatible, NeedsAttention(reason), and Incompatible(reason). Unknown accelerator evidence is not treated as certainty; known platform or upstream minimum mismatches are.
+`HostCapabilities` records OS/architecture and optional NVIDIA model, VRAM, and driver observations from bounded `nvidia-smi` execution. Compatibility has four states: Recommended, Compatible, NeedsAttention(reason), and Incompatible(reason). Unknown accelerator evidence is not treated as certainty; known platform or upstream minimum mismatches are. `RuntimeRequirements` separates informational advisories from unverified conditions while retaining schema-v1 `notes` as a legacy unresolved-condition field. It also separates exact byte floors from nominal VRAM classes; class matching allows a 2 GiB reporting/ECC/reservation shortfall, treats the next 1 GiB as uncertain, and rejects larger shortfalls. This matches q27's documented 22.6 GiB A10 result without presenting a clearly lower class as compatible.
 
 For a model, resolution proceeds over all installed runtimes whose registered adapter declares the artifact format and accepts the concrete model:
 
@@ -128,7 +128,7 @@ invocation RuntimeId
   → deterministic best compatible fallback
 ```
 
-The selected ID does not bypass manifest, host, adapter, or model validation. A stale stored preference emits a runtime notice before fallback. Fallback ranks compatibility first, then managed provenance and current versions deterministically. Selection source is carried into launch provenance.
+The selected ID does not bypass manifest, host, adapter, or model validation. Each adapter supplies an engine-neutral model+runtime+host compatibility result and an optional semantic preference. Explicit invocation, model overrides, format defaults, compatible-runtime listing, fallback, the model picker, and load admission all use that contract. A stale stored preference emits a runtime notice before fallback. Fallback ranks actual compatibility, engine preference, managed provenance, current version, and finally runtime ID. For q27, W8 leads on confirmed 24 GiB-class hosts, W12 leads where 32 GiB-class hardware is appropriate, and W16 is a valid explicit specialist choice but never wins fallback accidentally. Selection source is carried into launch provenance.
 
 A direct selection always writes an exact ID and defaults to a pinned update preference. CLI callers may instead track the provider-defined Stable or Latest channel without weakening the concrete selection: checks consider only that channel, installs remain explicit and side by side, and `update` does not rewrite selection. Missing truthful channel candidates, catalog outages, provider errors, unpublished exact assets, pins, and newer compatible packs remain distinct states. Users switch only through an explicit select action.
 
@@ -147,6 +147,8 @@ Activation refuses an existing different runtime ID and also scans for a differe
 ## Model artifacts and q27 tokenizers
 
 `ModelArtifact` retains the primary artifact and stable ID while adding engine-neutral `AuxiliaryArtifact` values with roles. Q27 discovery prefers `model.q27` + `model.tok`; for quantized names it may use the unique longest boundary-safe prefix tokenizer. Candidates must be beside the model and contain `Q27T` magic with supported header version 1. `.tok` is never a primary model. Missing, invalid, or ambiguous companions are expressed by q27's model compatibility result and prevent launch.
+
+Q27 model inspection reads a fixed 16-byte `Q27F` v1 header, rejects metadata lengths above 1 MiB before allocation, reads only that JSON blob, and never maps/hashes tensor payloads. The q27 adapter validates the current `qwen35` 65-block/MTP architecture constants. Exact published tiers come from `quant_policy` plus the presence/value of `q4_head` and `q8_extra`, never the filename. Qwen3.6 default/q4s/q5f map to 24 GiB-class, q6/q6f/q6k to 32 GiB-class, and q8 to 48 GiB-class; Qwen3.8 v2 q4s/default/q6 map to 24 GiB-class and q6k to 32 GiB-class. Unknown recipe tuples remain NeedsAttention.
 
 ## Adapter launch contracts
 
@@ -175,7 +177,7 @@ q27-server <canonical-model.q27> <canonical-tokenizer.tok>
            [allowed native arguments]
 ```
 
-Norted rejects q27 options/environment that could replace positional inputs, binding/authentication, thinking semantics, or sampling truth. It strips conflicting inherited q27 variables and sends explicit `temperature: 0.0` and `top_p: 1.0` on every Chat Completions request; those values are therefore the reported effective settings. Readiness requires `/health` status `ok`. JSON and SSE are translated through the same normalized inference types as llama.cpp.
+Norted rejects q27 options/environment that could replace positional inputs, binding/authentication, thinking semantics, or sampling truth. Before launch, q27 prepares the already-discovered tokenizer as an engine-neutral auxiliary identity containing role, canonical path, size, and SHA-256. The launch spec uses that exact path and rechecks size/hash immediately before process creation; q27 never rediscovers a companion at launch. It strips conflicting inherited q27 variables and sends explicit `temperature: 0.0` and `top_p: 1.0` on every Chat Completions request; those values are therefore the reported effective settings. Readiness requires `/health` status `ok`. JSON and SSE are translated through the same normalized inference types as llama.cpp.
 
 ## Process, control, and provenance
 
@@ -189,7 +191,7 @@ Cross-process CLI/TUI control uses schema-version-2 descriptors under:
 
 The serving process atomically writes its random identity, PID, public probe address, private loopback endpoint, and random bearer token. Observers prove identity through public health before sending authenticated `status`, `load`, or `unload` requests. Tokens are redacted and absent from public/status/provenance output.
 
-Private backend status carries model ID, engine ID, runtime ID/version/variant, executable SHA-256, PID, and private endpoint. `RuntimeProvenance` retains the exact immutable runtime manifest and selection source alongside model facts, sanitized native arguments with option/value association and value hashes, every effective explicit/inherited environment variable name with a value hash, inheritance policy, authoritative effective sampler settings, process identity, endpoint, and launch time. Missing facts stay optional; external acquisition never gains invented release provenance.
+Private backend status carries model ID, engine ID, runtime ID/version/variant, executable SHA-256, PID, and private endpoint. `RuntimeProvenance` retains the exact immutable runtime manifest and selection source alongside primary model facts and every materially used auxiliary artifact's role/canonical path/size/SHA-256, sanitized native arguments with option/value association and value hashes, every effective explicit/inherited environment variable name with a value hash, inheritance policy, authoritative effective sampler settings, process identity, endpoint, and launch time. Missing facts stay optional; external acquisition never gains invented release provenance.
 
 ## Public protocol
 

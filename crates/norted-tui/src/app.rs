@@ -9,8 +9,8 @@ use norted_core::{
     RuntimeUpdateState,
 };
 use norted_engine::{
-    BackendLifecycle, ControlStatus, RuntimeListSnapshot, RuntimeNoticeLevel,
-    RuntimeSearchSnapshot, RuntimeUpdateCheck,
+    BackendLifecycle, ControlStatus, RuntimeListSnapshot, RuntimeModelCandidate,
+    RuntimeNoticeLevel, RuntimeSearchSnapshot, RuntimeUpdateCheck,
 };
 use ratatui::layout::Position;
 
@@ -141,7 +141,7 @@ pub enum RuntimeTaskResult {
     },
     ModelCandidates {
         model_id: ModelId,
-        result: Result<Vec<RuntimeId>, String>,
+        result: Result<Vec<RuntimeModelCandidate>, String>,
     },
     Removed {
         runtime_id: RuntimeId,
@@ -199,7 +199,7 @@ pub struct App {
     pub runtime_update_error: Option<String>,
     pub runtime_picker_selection: Option<usize>,
     pub runtime_picker_scroll: usize,
-    pub runtime_picker_candidates: Vec<RuntimeId>,
+    pub runtime_picker_candidates: Vec<RuntimeModelCandidate>,
     pub runtime_picker_loading: bool,
     pub runtime_picker_error: Option<String>,
     focus_before_command: FocusArea,
@@ -799,16 +799,25 @@ impl App {
         let Some(snapshot) = &self.runtime_list else {
             return Vec::new();
         };
-        snapshot
-            .installed
+        self.runtime_picker_candidates
             .iter()
-            .enumerate()
-            .filter(|(_, status)| {
-                self.runtime_picker_candidates
-                    .contains(&status.runtime.manifest.runtime_id)
+            .filter_map(|candidate| {
+                snapshot
+                    .installed
+                    .iter()
+                    .position(|status| status.runtime.manifest.runtime_id == candidate.runtime_id)
             })
-            .map(|(index, _)| index)
             .collect()
+    }
+
+    pub fn runtime_picker_compatibility(
+        &self,
+        runtime_id: &RuntimeId,
+    ) -> Option<&RuntimeCompatibility> {
+        self.runtime_picker_candidates
+            .iter()
+            .find(|candidate| &candidate.runtime_id == runtime_id)
+            .map(|candidate| &candidate.compatibility)
     }
 
     pub fn selected_model_has_runtime_override(&self) -> bool {

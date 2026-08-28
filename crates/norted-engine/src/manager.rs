@@ -6,8 +6,8 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use norted_core::{
-    ApplicationCore, EnvironmentVariableProvenance, ModelId, ModelRuntimeIdentity,
-    NativeArgumentProvenance, ProcessIdentity, RuntimeId, RuntimeProvenance, RuntimeSelection,
+    ApplicationCore, EnvironmentVariableProvenance, ModelId, NativeArgumentProvenance,
+    ProcessIdentity, RuntimeId, RuntimeProvenance, RuntimeSelection,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -408,9 +408,16 @@ impl RuntimeManager {
                 return Err(RuntimeError::Operation(detail));
             }
         };
+        let prepared_model = match adapter.prepare_model_input(&model).await {
+            Ok(model) => model,
+            Err(error) => {
+                self.fail_loading(generation, error.to_string(), None).await;
+                return Err(RuntimeError::StartupFailed(error.to_string()));
+            }
+        };
         let launch_spec = match adapter
             .build_launch_spec(LaunchRequest {
-                model: model.clone(),
+                model: prepared_model,
                 runtime: selection.runtime.clone(),
                 backend_address,
             })
@@ -429,6 +436,7 @@ impl RuntimeManager {
         }
         let installation = launch_spec.installation.clone();
         let selected_runtime = launch_spec.runtime.clone();
+        let model_identity = launch_spec.model.runtime_identity();
         let normalized_settings = launch_spec.normalized_settings.clone();
         let native_arguments = launch_spec.native_arguments.clone();
         let inherits_parent_environment = launch_spec.inherits_parent_environment;
@@ -479,11 +487,7 @@ impl RuntimeManager {
             }
         };
         let provenance = RuntimeProvenance {
-            model: ModelRuntimeIdentity {
-                model_id: model_id.clone(),
-                artifact_path: model.path.clone(),
-                content_sha256: model.hash.clone(),
-            },
+            model: model_identity,
             runtime: selected_runtime.manifest.clone(),
             runtime_entrypoint: selected_runtime.entrypoint_path(),
             selection_source: selection.source,

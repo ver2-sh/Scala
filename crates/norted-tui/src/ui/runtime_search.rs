@@ -247,6 +247,13 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
         }
         RuntimeCompatibility::Recommended | RuntimeCompatibility::Compatible => {}
     }
+    lines.extend(
+        available
+            .requirements
+            .advisories
+            .iter()
+            .map(|note| Line::from(Span::styled(note, theme.muted))),
+    );
     if !result.selected_for.is_empty() {
         lines.push(key_value("DEFAULT", &selected_for, theme));
     }

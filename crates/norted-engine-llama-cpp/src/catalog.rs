@@ -206,7 +206,10 @@ fn available_runtime(
         requires_nvidia_gpu: classification.accelerator == "cuda",
         minimum_nvidia_driver: None,
         minimum_vram_bytes: None,
-        notes: companion
+        minimum_vram_class_gib: None,
+        notes: Vec::new(),
+        advisories: Vec::new(),
+        unverified_requirements: companion
             .map(|_| {
                 vec![
                     "Matching official CUDA runtime companion is included, but this host's exact GPU/toolkit compatibility has not been proven"

@@ -13,9 +13,10 @@ use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use norted_core::{
     AcquisitionMethod, ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime, EngineConfig,
-    EngineInstallation, EngineRevision, InstalledRuntime, ModelArtifact, RuntimeAcquisitionMethod,
-    RuntimeArchiveFormat, RuntimeDigest, RuntimeDownload, RuntimeId, RuntimeIdentity,
-    RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel, RuntimeRequirements,
+    EngineInstallation, EngineRevision, HostCapabilities, InstalledRuntime, ModelArtifact,
+    RuntimeAcquisitionMethod, RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest,
+    RuntimeDownload, RuntimeId, RuntimeIdentity, RuntimePackageIdentity, RuntimeProbeObservation,
+    RuntimeReleaseChannel, RuntimeRequirements,
 };
 use norted_engine::{
     ApiCapability, CatalogError, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
@@ -23,7 +24,8 @@ use norted_engine::{
     GitHubReleaseAsset, GitHubReleaseClient, InferenceEvent, InferenceFinishReason,
     InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
     InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind,
-    ProcessDescriptor, RuntimeCatalogProvider, UpdateState, capture_command,
+    PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
+    UpdateState, capture_command, compatibility_for,
 };
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -37,11 +39,14 @@ pub const GITHUB_REPOSITORY: &str = "signalnine/q27";
 pub const PROVIDER_ID: &str = "q27-official-github";
 pub const PACKAGE_FAMILY: &str = "q27-official-release";
 
+mod model;
+
+use model::{Q27Tier, inspect_q27_model};
+
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SSE_FRAME_LIMIT: usize = 1024 * 1024;
-const GIB: u64 = 1024 * 1024 * 1024;
 
 // These values can change authentication, sampling, or prompt semantics behind
 // Norted's back. They are removed from the inherited environment and rejected
@@ -343,7 +348,7 @@ struct RuntimeVariant {
     id: &'static str,
     label: &'static str,
     entrypoint: &'static str,
-    minimum_vram_bytes: u64,
+    minimum_vram_class_gib: u16,
 }
 
 const Q27_VARIANTS: &[RuntimeVariant] = &[
@@ -351,13 +356,13 @@ const Q27_VARIANTS: &[RuntimeVariant] = &[
         id: "w8",
         label: "W8",
         entrypoint: "q27-server-w8",
-        minimum_vram_bytes: 24 * GIB,
+        minimum_vram_class_gib: 24,
     },
     RuntimeVariant {
         id: "w12",
         label: "W12",
         entrypoint: "q27-server",
-        minimum_vram_bytes: 32 * GIB,
+        minimum_vram_class_gib: 32,
     },
     RuntimeVariant {
         id: "w16",
@@ -365,7 +370,7 @@ const Q27_VARIANTS: &[RuntimeVariant] = &[
         entrypoint: "q27-server-w16",
         // Upstream publishes no separate W16 memory floor. Preserve q27's
         // general 24 GiB minimum and describe this specialist build below.
-        minimum_vram_bytes: 24 * GIB,
+        minimum_vram_class_gib: 24,
     },
 ];
 
@@ -383,8 +388,7 @@ fn requirements_for(version: &str, variant: &RuntimeVariant) -> RuntimeRequireme
     } else {
         "Official fat binary targets NVIDIA compute capabilities 8.6 and 12.0".to_owned()
     };
-    let mut notes = vec![
-        architecture_note,
+    let mut advisories = vec![
         match variant.id {
             "w8" => "W8 is the q27 build intended for 24 GiB cards".to_owned(),
             "w12" => {
@@ -394,25 +398,68 @@ fn requirements_for(version: &str, variant: &RuntimeVariant) -> RuntimeRequireme
             _ => "W16 is a specialist repetition-heavy/file-re-emission build, not q27's recommended live-traffic default; upstream publishes no separate W16 VRAM floor"
                 .to_owned(),
         },
-        "Model tier also matters: q6/q6f/q6k need 32 GiB and q8 needs 48 GiB"
-            .to_owned(),
+        "Model-tier VRAM is checked separately from Q27 metadata before selection".to_owned(),
     ];
+    let mut unverified_requirements = vec![architecture_note];
     if tri_arch {
-        notes.push(
+        advisories.push(
             "Prebuilt binaries statically link CUDA 13.2; q27 documents NVIDIA driver branch r580 or newer"
                 .to_owned(),
         );
     }
     if version == "0.6.2" {
-        notes.push(
+        unverified_requirements.push(
             "The v0.6.2 ELF requires glibc 2.38 and libstdc++ with GLIBCXX_3.4.32".to_owned(),
         );
     }
     RuntimeRequirements {
         requires_nvidia_gpu: true,
         minimum_nvidia_driver: tri_arch.then(|| "580".to_owned()),
-        minimum_vram_bytes: Some(variant.minimum_vram_bytes),
-        notes,
+        minimum_vram_bytes: None,
+        minimum_vram_class_gib: Some(variant.minimum_vram_class_gib),
+        notes: Vec::new(),
+        advisories,
+        unverified_requirements,
+    }
+}
+
+fn q27_tier_compatibility(tier: Q27Tier, host: &HostCapabilities) -> RuntimeCompatibility {
+    compatibility_for(
+        &host.platform,
+        &host.architecture,
+        "cuda",
+        &RuntimeRequirements {
+            requires_nvidia_gpu: true,
+            minimum_vram_class_gib: Some(tier.minimum_vram_class_gib()),
+            ..RuntimeRequirements::default()
+        },
+        host,
+    )
+}
+
+fn q27_runtime_preference(variant: &str, host: &HostCapabilities) -> u16 {
+    if variant == "w16" {
+        return 1000;
+    }
+    let class_32 = RuntimeRequirements {
+        requires_nvidia_gpu: true,
+        minimum_vram_class_gib: Some(32),
+        ..RuntimeRequirements::default()
+    };
+    let host_is_confirmed_below_32 = host
+        .nvidia
+        .as_ref()
+        .and_then(|gpu| gpu.vram_bytes)
+        .is_some()
+        && !matches!(
+            compatibility_for(&host.platform, &host.architecture, "cuda", &class_32, host,),
+            RuntimeCompatibility::Recommended | RuntimeCompatibility::Compatible
+        );
+    match variant {
+        "w8" if host_is_confirmed_below_32 => 0,
+        "w12" if !host_is_confirmed_below_32 => 0,
+        "w8" | "w12" => 10,
+        _ => 100,
     }
 }
 
@@ -836,6 +883,9 @@ impl EngineAdapter for Q27Adapter {
                 ),
             };
         }
+        if let Err(reason) = inspect_q27_model(&model.path) {
+            return CompatibilityDecision::Unsupported { reason };
+        }
         match tokenizer_candidate(model) {
             Ok(path) => match validate_tokenizer_sync(&path) {
                 Ok(()) => CompatibilityDecision::Supported,
@@ -843,6 +893,82 @@ impl EngineAdapter for Q27Adapter {
             },
             Err(reason) => CompatibilityDecision::Unsupported { reason },
         }
+    }
+
+    fn runtime_model_compatibility(
+        &self,
+        _runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        host: &HostCapabilities,
+    ) -> RuntimeCompatibility {
+        let facts = match inspect_q27_model(&model.path) {
+            Ok(facts) => facts,
+            Err(reason) => return RuntimeCompatibility::Incompatible(reason),
+        };
+        let Some(tier) = facts.tier else {
+            return RuntimeCompatibility::NeedsAttention(
+                "Q27 architecture is supported, but the exact published model tier cannot be proven from quant_policy/q4_head/q8_extra metadata"
+                    .to_owned(),
+            );
+        };
+        match q27_tier_compatibility(tier, host) {
+            RuntimeCompatibility::Recommended | RuntimeCompatibility::Compatible => {
+                RuntimeCompatibility::Recommended
+            }
+            RuntimeCompatibility::NeedsAttention(reason) => RuntimeCompatibility::NeedsAttention(
+                format!("{} tier requirement is uncertain: {reason}", tier.label()),
+            ),
+            RuntimeCompatibility::Incompatible(reason) => RuntimeCompatibility::Incompatible(
+                format!("{} tier is incompatible: {reason}", tier.label()),
+            ),
+        }
+    }
+
+    fn runtime_model_preference(
+        &self,
+        runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        host: &HostCapabilities,
+    ) -> u16 {
+        q27_runtime_preference(&runtime.manifest.identity.variant, host)
+    }
+
+    async fn prepare_model_input(
+        &self,
+        model: &ModelArtifact,
+    ) -> Result<PreparedModelInput, EngineError> {
+        if model.format != ArtifactFormat::Q27 {
+            return Err(EngineError::InvalidConfiguration(
+                "q27 can only prepare Q27 model artifacts".to_owned(),
+            ));
+        }
+        inspect_q27_model(&model.path).map_err(EngineError::InvalidConfiguration)?;
+        let mut primary = model.clone();
+        primary.path = canonical_regular_file(&model.path, "q27 model").await?;
+        let candidate = tokenizer_candidate(model).map_err(EngineError::InvalidConfiguration)?;
+        let tokenizer = canonical_regular_file(&candidate, "q27 tokenizer companion").await?;
+        validate_tokenizer_path(&tokenizer).await?;
+        let metadata = tokio::fs::metadata(&tokenizer).await.map_err(|error| {
+            EngineError::InvalidConfiguration(format!(
+                "could not inspect q27 tokenizer {}: {error}",
+                tokenizer.display()
+            ))
+        })?;
+        let content_sha256 = hash_file(&tokenizer).await.map_err(|error| {
+            EngineError::InvalidConfiguration(format!(
+                "could not hash q27 tokenizer {}: {error}",
+                tokenizer.display()
+            ))
+        })?;
+        Ok(PreparedModelInput {
+            primary,
+            auxiliary: vec![PreparedAuxiliaryArtifact {
+                role: AuxiliaryArtifactRole::Tokenizer,
+                path: tokenizer,
+                size_bytes: metadata.len(),
+                content_sha256,
+            }],
+        })
     }
 
     fn native_options(&self) -> Vec<NativeOption> {
@@ -936,7 +1062,7 @@ impl EngineAdapter for Q27Adapter {
                 "q27 backend address must be loopback".to_owned(),
             ));
         }
-        if request.model.format != ArtifactFormat::Q27 {
+        if request.model.primary.format != ArtifactFormat::Q27 {
             return Err(EngineError::InvalidConfiguration(
                 "q27 can only launch Q27 model artifacts".to_owned(),
             ));
@@ -955,8 +1081,22 @@ impl EngineAdapter for Q27Adapter {
                 )));
             }
         }
-        let model_path = canonical_regular_file(&request.model.path, "q27 model").await?;
-        let tokenizer_path = resolve_tokenizer(&request.model).await?;
+        let model_path = canonical_regular_file(&request.model.primary.path, "q27 model").await?;
+        if model_path != request.model.primary.path {
+            return Err(EngineError::InvalidConfiguration(
+                "prepared q27 model path changed before launch".to_owned(),
+            ));
+        }
+        inspect_q27_model(&model_path).map_err(EngineError::InvalidConfiguration)?;
+        let tokenizer = match request.model.auxiliary.as_slice() {
+            [tokenizer] if tokenizer.role == AuxiliaryArtifactRole::Tokenizer => tokenizer,
+            _ => {
+                return Err(EngineError::InvalidConfiguration(
+                    "prepared q27 input must contain exactly one tokenizer".to_owned(),
+                ));
+            }
+        };
+        let tokenizer_path = revalidate_prepared_tokenizer(tokenizer).await?;
         let observation = self.probe_runtime(&request.runtime).await?;
         let binary_path = request.runtime.entrypoint_path();
         let manifest = &request.runtime.manifest;
@@ -1011,6 +1151,7 @@ impl EngineAdapter for Q27Adapter {
             native_arguments: self.native_arguments.clone(),
             installation,
             runtime: request.runtime,
+            model: request.model,
         })
     }
 
@@ -1136,9 +1277,7 @@ async fn canonical_regular_file(path: &Path, description: &str) -> Result<PathBu
     Ok(canonical)
 }
 
-async fn resolve_tokenizer(model: &ModelArtifact) -> Result<PathBuf, EngineError> {
-    let candidate = tokenizer_candidate(model).map_err(EngineError::InvalidConfiguration)?;
-    let tokenizer = canonical_regular_file(&candidate, "q27 tokenizer companion").await?;
+async fn validate_tokenizer_path(tokenizer: &Path) -> Result<(), EngineError> {
     if tokenizer
         .extension()
         .and_then(|value| value.to_str())
@@ -1149,8 +1288,40 @@ async fn resolve_tokenizer(model: &ModelArtifact) -> Result<PathBuf, EngineError
             "q27 tokenizer companion must use the `.tok` extension".to_owned(),
         ));
     }
-    validate_tokenizer(&tokenizer).await?;
-    Ok(tokenizer)
+    validate_tokenizer(tokenizer).await
+}
+
+async fn revalidate_prepared_tokenizer(
+    tokenizer: &PreparedAuxiliaryArtifact,
+) -> Result<PathBuf, EngineError> {
+    let tokenizer_path = canonical_regular_file(&tokenizer.path, "q27 tokenizer companion").await?;
+    if tokenizer_path != tokenizer.path {
+        return Err(EngineError::InvalidConfiguration(
+            "prepared q27 tokenizer path changed before launch".to_owned(),
+        ));
+    }
+    validate_tokenizer_path(&tokenizer_path).await?;
+    let tokenizer_size = tokio::fs::metadata(&tokenizer_path)
+        .await
+        .map_err(|error| {
+            EngineError::InvalidConfiguration(format!(
+                "could not inspect q27 tokenizer {} before launch: {error}",
+                tokenizer_path.display()
+            ))
+        })?
+        .len();
+    let tokenizer_sha256 = hash_file(&tokenizer_path).await.map_err(|error| {
+        EngineError::InvalidConfiguration(format!(
+            "could not revalidate q27 tokenizer {} before launch: {error}",
+            tokenizer_path.display()
+        ))
+    })?;
+    if tokenizer_size != tokenizer.size_bytes || tokenizer_sha256 != tokenizer.content_sha256 {
+        return Err(EngineError::InvalidConfiguration(
+            "q27 tokenizer changed after prepared-input provenance was recorded".to_owned(),
+        ));
+    }
+    Ok(tokenizer_path)
 }
 
 fn tokenizer_candidate(model: &ModelArtifact) -> Result<PathBuf, String> {
@@ -1160,79 +1331,16 @@ fn tokenizer_candidate(model: &ModelArtifact) -> Result<PathBuf, String> {
         .filter(|artifact| artifact.role == AuxiliaryArtifactRole::Tokenizer)
         .collect::<Vec<_>>();
     match declared.as_slice() {
-        [tokenizer] => return Ok(tokenizer.path.clone()),
-        [] => {}
-        _ => {
-            return Err(format!(
-                "q27 model {} has multiple tokenizer companions; exactly one is required",
-                model.path.display()
-            ));
-        }
+        [tokenizer] => Ok(tokenizer.path.clone()),
+        [] => Err(format!(
+            "q27 model {} has no declared tokenizer companion; rediscover models before loading",
+            model.path.display()
+        )),
+        _ => Err(format!(
+            "q27 model {} has multiple tokenizer companions; exactly one is required",
+            model.path.display()
+        )),
     }
-    discover_tokenizer_beside(&model.path)
-}
-
-fn discover_tokenizer_beside(model_path: &Path) -> Result<PathBuf, String> {
-    let exact = model_path.with_extension("tok");
-    if exact.is_file() {
-        return Ok(exact);
-    }
-    let model_stem = model_path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            format!(
-                "q27 model path has no UTF-8 file stem: {}",
-                model_path.display()
-            )
-        })?;
-    let parent = model_path.parent().ok_or_else(|| {
-        format!(
-            "q27 model path has no parent directory: {}",
-            model_path.display()
-        )
-    })?;
-    let entries = std::fs::read_dir(parent).map_err(|error| {
-        format!(
-            "could not inspect tokenizer companions beside {}: {error}",
-            model_path.display()
-        )
-    })?;
-    let mut candidates = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("tok"))
-        })
-        .filter_map(|path| {
-            let stem = path.file_stem()?.to_str()?;
-            model_stem
-                .strip_prefix(stem)
-                .is_some_and(|suffix| suffix.starts_with('-'))
-                .then_some((stem.len(), path))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    let Some(longest) = candidates.first().map(|candidate| candidate.0) else {
-        return Err(format!(
-            "q27 model {} requires a companion `.tok` tokenizer",
-            model_path.display()
-        ));
-    };
-    let mut longest_candidates = candidates
-        .into_iter()
-        .take_while(|candidate| candidate.0 == longest)
-        .map(|candidate| candidate.1);
-    let candidate = longest_candidates.next().expect("candidate was present");
-    if longest_candidates.next().is_some() {
-        return Err(format!(
-            "q27 tokenizer companion is ambiguous for {}",
-            model_path.display()
-        ));
-    }
-    Ok(candidate)
 }
 
 async fn validate_tokenizer(path: &Path) -> Result<(), EngineError> {
@@ -1727,7 +1835,9 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use norted_core::{ArtifactFormat, AuxiliaryArtifact, ModelArtifact, ModelId};
+    use norted_core::{
+        ArtifactFormat, AuxiliaryArtifact, ModelArtifact, ModelId, NvidiaCapability,
+    };
 
     use super::*;
 
@@ -1847,13 +1957,13 @@ mod tests {
             .iter()
             .find(|runtime| runtime.identity.variant == "w16")
             .expect("W16");
-        assert_eq!(w8.requirements.minimum_vram_bytes, Some(24 * GIB));
-        assert_eq!(w12.requirements.minimum_vram_bytes, Some(32 * GIB));
+        assert_eq!(w8.requirements.minimum_vram_class_gib, Some(24));
+        assert_eq!(w12.requirements.minimum_vram_class_gib, Some(32));
         assert_eq!(
             w8.requirements.minimum_nvidia_driver.as_deref(),
             Some("580")
         );
-        assert!(w16.requirements.notes.iter().any(|note| {
+        assert!(w16.requirements.advisories.iter().any(|note| {
             note.contains("specialist") && note.contains("no separate W16 VRAM floor")
         }));
     }
@@ -1969,16 +2079,90 @@ mod tests {
     }
 
     #[test]
-    fn generic_quant_suffix_uses_the_longest_unambiguous_tokenizer_stem() {
+    fn adapter_requires_the_tokenizer_discovered_by_the_model_registry() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let model_path = directory.path().join("example-family-q4s.q27");
         fs::write(&model_path, b"model").expect("model");
-        fs::write(directory.path().join("example.tok"), b"Q27T\x01\0\0\0")
-            .expect("short tokenizer");
         let expected = directory.path().join("example-family.tok");
         fs::write(&expected, b"Q27T\x01\0\0\0").expect("tokenizer");
-        let model = model_artifact(model_path);
+        let mut model = model_artifact(model_path);
+        assert!(tokenizer_candidate(&model).is_err());
+        model.auxiliary_artifacts.push(AuxiliaryArtifact {
+            role: AuxiliaryArtifactRole::Tokenizer,
+            path: expected.clone(),
+            size_bytes: 8,
+            hash: None,
+        });
         assert_eq!(tokenizer_candidate(&model).expect("candidate"), expected);
+    }
+
+    fn host_with_vram(gib: u64) -> HostCapabilities {
+        HostCapabilities {
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            nvidia: Some(NvidiaCapability {
+                model: Some("fixture".to_owned()),
+                vram_bytes: Some(gib * 1024 * 1024 * 1024),
+                driver_version: Some("600".to_owned()),
+            }),
+            observations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn model_tiers_reject_clearly_insufficient_vram_classes() {
+        let host_24 = host_with_vram(24);
+        assert!(matches!(
+            q27_tier_compatibility(Q27Tier::Qwen36Q6, &host_24),
+            RuntimeCompatibility::Incompatible(_)
+        ));
+        assert!(matches!(
+            q27_tier_compatibility(Q27Tier::Qwen36Q8, &host_24),
+            RuntimeCompatibility::Incompatible(_)
+        ));
+        assert!(matches!(
+            q27_tier_compatibility(Q27Tier::Qwen38Q6, &host_24),
+            RuntimeCompatibility::Recommended
+        ));
+    }
+
+    #[test]
+    fn w8_and_w12_are_semantically_preferred_while_w16_is_specialist() {
+        let host_24 = host_with_vram(24);
+        assert!(q27_runtime_preference("w8", &host_24) < q27_runtime_preference("w12", &host_24));
+        assert!(q27_runtime_preference("w8", &host_24) < q27_runtime_preference("w16", &host_24));
+
+        let host_32 = host_with_vram(32);
+        assert!(q27_runtime_preference("w12", &host_32) < q27_runtime_preference("w8", &host_32));
+        assert!(q27_runtime_preference("w12", &host_32) < q27_runtime_preference("w16", &host_32));
+    }
+
+    #[tokio::test]
+    async fn changed_tokenizer_is_rejected_before_launch() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("model.tok");
+        fs::write(&path, b"Q27T\x01\0\0\0original").expect("tokenizer");
+        let canonical = path.canonicalize().expect("canonical tokenizer");
+        let prepared = PreparedAuxiliaryArtifact {
+            role: AuxiliaryArtifactRole::Tokenizer,
+            path: canonical.clone(),
+            size_bytes: fs::metadata(&canonical).expect("metadata").len(),
+            content_sha256: hash_file(&canonical).await.expect("hash"),
+        };
+        assert_eq!(
+            revalidate_prepared_tokenizer(&prepared)
+                .await
+                .expect("unchanged tokenizer"),
+            canonical
+        );
+        fs::write(&prepared.path, b"Q27T\x01\0\0\0changed!").expect("changed tokenizer");
+        assert!(
+            revalidate_prepared_tokenizer(&prepared)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("changed")
+        );
     }
 
     #[test]

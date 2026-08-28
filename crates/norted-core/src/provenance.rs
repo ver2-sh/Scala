@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ModelId, RuntimeManifest, RuntimeSelectionSource};
+use crate::{AuxiliaryArtifactRole, ModelId, RuntimeManifest, RuntimeSelectionSource};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineRevision {
@@ -55,6 +55,16 @@ pub struct ModelRuntimeIdentity {
     pub model_id: ModelId,
     pub artifact_path: PathBuf,
     pub content_sha256: Option<String>,
+    #[serde(default)]
+    pub auxiliary: Vec<AuxiliaryRuntimeIdentity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuxiliaryRuntimeIdentity {
+    pub role: AuxiliaryArtifactRole,
+    pub artifact_path: PathBuf,
+    pub size_bytes: u64,
+    pub content_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

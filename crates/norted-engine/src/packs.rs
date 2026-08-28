@@ -82,6 +82,12 @@ pub struct RuntimeSearchSnapshot {
     pub fetched_at_unix: Option<i64>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeModelCandidate {
+    pub runtime_id: RuntimeId,
+    pub compatibility: RuntimeCompatibility,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeUpdateCheck {
     pub runtime: InstalledRuntime,
@@ -551,34 +557,44 @@ impl RuntimePackManager {
                 rejected.push(format!("{}: {reason}", status.runtime.manifest.runtime_id));
                 continue;
             }
-            match self.validate_model_candidate(&status.runtime, model, &host) {
-                Ok(()) => compatible.push(status),
+            match self.model_candidate_compatibility(&status.runtime, model, &host) {
+                Ok(compatibility) if compatibility.is_usable() => compatible.push((
+                    status,
+                    compatibility,
+                    self.model_candidate_preference(&status.runtime, model, &host),
+                )),
+                Ok(RuntimeCompatibility::Incompatible(reason)) => {
+                    rejected.push(format!("{}: {reason}", status.runtime.manifest.runtime_id))
+                }
+                Ok(_) => unreachable!("all non-incompatible states are usable"),
                 Err(error) => rejected.push(error.to_string()),
             }
         }
         compatible.sort_by(|left, right| {
-            left.compatibility
+            left.1
                 .preference_rank()
-                .cmp(&right.compatibility.preference_rank())
+                .cmp(&right.1.preference_rank())
+                .then_with(|| left.2.cmp(&right.2))
                 .then_with(|| {
-                    acquisition_rank(&left.runtime).cmp(&acquisition_rank(&right.runtime))
+                    acquisition_rank(&left.0.runtime).cmp(&acquisition_rank(&right.0.runtime))
                 })
                 .then_with(|| {
                     compare_versions(
-                        &right.runtime.manifest.identity.version,
-                        &left.runtime.manifest.identity.version,
+                        &right.0.runtime.manifest.identity.version,
+                        &left.0.runtime.manifest.identity.version,
                     )
                 })
                 .then_with(|| {
-                    left.runtime
+                    left.0
+                        .runtime
                         .manifest
                         .runtime_id
-                        .cmp(&right.runtime.manifest.runtime_id)
+                        .cmp(&right.0.runtime.manifest.runtime_id)
                 })
         });
         let runtime = compatible
             .first()
-            .map(|status| status.runtime.clone())
+            .map(|(status, _, _)| status.runtime.clone())
             .ok_or_else(|| {
                 let detail = if rejected.is_empty() {
                     String::new()
@@ -756,7 +772,7 @@ impl RuntimePackManager {
     pub async fn compatible_installed_for_model(
         &self,
         model: &ModelArtifact,
-    ) -> Result<Vec<RuntimeId>, RuntimePackError> {
+    ) -> Result<Vec<RuntimeModelCandidate>, RuntimePackError> {
         let host = self.refresh_host_capabilities().await;
         let list = self.list().await?;
         let mut compatible = Vec::new();
@@ -770,17 +786,42 @@ impl RuntimePackManager {
             {
                 continue;
             }
-            match self.validate_model_candidate(&status.runtime, model, &host) {
-                Ok(()) if status.compatibility.is_usable() => {
-                    compatible.push(status.runtime.manifest.runtime_id.clone());
-                }
-                Ok(()) => rejected.push(format!(
-                    "runtime `{}` is host-incompatible",
+            match self.model_candidate_compatibility(&status.runtime, model, &host) {
+                Ok(compatibility) if compatibility.is_usable() => compatible.push((
+                    status,
+                    compatibility,
+                    self.model_candidate_preference(&status.runtime, model, &host),
+                )),
+                Ok(RuntimeCompatibility::Incompatible(reason)) => rejected.push(format!(
+                    "runtime `{}` is incompatible: {reason}",
                     status.runtime.manifest.runtime_id
                 )),
+                Ok(_) => unreachable!("all non-incompatible states are usable"),
                 Err(error) => rejected.push(error.to_string()),
             }
         }
+        compatible.sort_by(|left, right| {
+            left.1
+                .preference_rank()
+                .cmp(&right.1.preference_rank())
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| {
+                    acquisition_rank(&left.0.runtime).cmp(&acquisition_rank(&right.0.runtime))
+                })
+                .then_with(|| {
+                    compare_versions(
+                        &right.0.runtime.manifest.identity.version,
+                        &left.0.runtime.manifest.identity.version,
+                    )
+                })
+                .then_with(|| {
+                    left.0
+                        .runtime
+                        .manifest
+                        .runtime_id
+                        .cmp(&right.0.runtime.manifest.runtime_id)
+                })
+        });
         if compatible.is_empty() {
             let detail = if rejected.is_empty() {
                 String::new()
@@ -792,7 +833,13 @@ impl RuntimePackManager {
                 model.id
             )));
         }
-        Ok(compatible)
+        Ok(compatible
+            .into_iter()
+            .map(|(status, compatibility, _)| RuntimeModelCandidate {
+                runtime_id: status.runtime.manifest.runtime_id.clone(),
+                compatibility,
+            })
+            .collect())
     }
 
     fn selected_candidate(
@@ -873,6 +920,22 @@ impl RuntimePackManager {
         model: &ModelArtifact,
         host: &HostCapabilities,
     ) -> Result<(), RuntimePackError> {
+        let compatibility = self.model_candidate_compatibility(runtime, model, host)?;
+        if let RuntimeCompatibility::Incompatible(reason) = compatibility {
+            return Err(RuntimePackError::Incompatible {
+                runtime_id: runtime.manifest.runtime_id.clone(),
+                reason,
+            });
+        }
+        Ok(())
+    }
+
+    fn model_candidate_compatibility(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        host: &HostCapabilities,
+    ) -> Result<RuntimeCompatibility, RuntimePackError> {
         self.validate_format_candidate(runtime, model.format, host)?;
         let adapter = self
             .registry
@@ -881,13 +944,46 @@ impl RuntimePackManager {
                 runtime_id: runtime.manifest.runtime_id.clone(),
                 reason: "engine adapter is not registered".to_owned(),
             })?;
-        match adapter.compatibility(model) {
-            CompatibilityDecision::Supported => Ok(()),
-            CompatibilityDecision::Unsupported { reason } => Err(RuntimePackError::Incompatible {
-                runtime_id: runtime.manifest.runtime_id.clone(),
-                reason,
-            }),
+        if let CompatibilityDecision::Unsupported { reason } = adapter.compatibility(model) {
+            return Ok(RuntimeCompatibility::Incompatible(reason));
         }
+        Ok(combine_compatibility(
+            compatibility_for_installed(runtime, host),
+            adapter.runtime_model_compatibility(runtime, model, host),
+        ))
+    }
+
+    fn model_candidate_preference(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        host: &HostCapabilities,
+    ) -> u16 {
+        self.registry
+            .get(&runtime.manifest.identity.engine_id)
+            .map_or(u16::MAX, |adapter| {
+                adapter.runtime_model_preference(runtime, model, host)
+            })
+    }
+}
+
+fn combine_compatibility(
+    host: RuntimeCompatibility,
+    model: RuntimeCompatibility,
+) -> RuntimeCompatibility {
+    match (host, model) {
+        (RuntimeCompatibility::Incompatible(reason), _)
+        | (_, RuntimeCompatibility::Incompatible(reason)) => {
+            RuntimeCompatibility::Incompatible(reason)
+        }
+        (RuntimeCompatibility::NeedsAttention(reason), _)
+        | (_, RuntimeCompatibility::NeedsAttention(reason)) => {
+            RuntimeCompatibility::NeedsAttention(reason)
+        }
+        (RuntimeCompatibility::Recommended, RuntimeCompatibility::Recommended) => {
+            RuntimeCompatibility::Recommended
+        }
+        _ => RuntimeCompatibility::Compatible,
     }
 }
 

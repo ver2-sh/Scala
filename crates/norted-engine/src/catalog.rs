@@ -780,7 +780,10 @@ pub fn compatibility_for(
                 "requires an NVIDIA GPU; nvidia-smi did not confirm one".to_owned(),
             );
         };
-        if requirements.minimum_vram_bytes.is_some() && nvidia.vram_bytes.is_none() {
+        if (requirements.minimum_vram_bytes.is_some()
+            || requirements.minimum_vram_class_gib.is_some())
+            && nvidia.vram_bytes.is_none()
+        {
             return RuntimeCompatibility::NeedsAttention(
                 "minimum VRAM is known, but nvidia-smi did not report usable VRAM".to_owned(),
             );
@@ -801,6 +804,25 @@ pub fn compatibility_for(
                 observed / (1024 * 1024)
             ));
         }
+        if let (Some(class_gib), Some(observed)) =
+            (requirements.minimum_vram_class_gib, nvidia.vram_bytes)
+        {
+            match vram_class_compatibility(class_gib, observed) {
+                VramClassCompatibility::Meets => {}
+                VramClassCompatibility::Near => {
+                    return RuntimeCompatibility::NeedsAttention(format!(
+                        "requires a {class_gib} GiB-class GPU; observed {} MiB, which is close but below the normal reporting allowance",
+                        observed / (1024 * 1024)
+                    ));
+                }
+                VramClassCompatibility::Below => {
+                    return RuntimeCompatibility::Incompatible(format!(
+                        "requires a {class_gib} GiB-class GPU; observed {} MiB, clearly below that class",
+                        observed / (1024 * 1024)
+                    ));
+                }
+            }
+        }
         if let (Some(minimum), Some(observed)) = (
             requirements.minimum_nvidia_driver.as_deref(),
             nvidia.driver_version.as_deref(),
@@ -810,7 +832,11 @@ pub fn compatibility_for(
                 "requires NVIDIA driver {minimum} or newer; observed {observed}"
             ));
         }
-        if let Some(requirement) = requirements.notes.first() {
+        if let Some(requirement) = requirements
+            .unverified_requirements
+            .first()
+            .or_else(|| requirements.notes.first())
+        {
             return RuntimeCompatibility::NeedsAttention(format!(
                 "additional upstream requirement was not fully probed: {requirement}"
             ));
@@ -826,6 +852,35 @@ pub fn compatibility_for(
         RuntimeCompatibility::Recommended
     } else {
         RuntimeCompatibility::Compatible
+    }
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+const VRAM_CLASS_REPORTING_ALLOWANCE: u64 = 2 * GIB;
+const VRAM_CLASS_NEAR_BAND: u64 = GIB;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum VramClassCompatibility {
+    Meets,
+    Near,
+    Below,
+}
+
+/// Upstream GPU sizes are nominal classes, while `nvidia-smi` may report less
+/// after vendor rounding or reserved/ECC memory. q27 documents a working 22.6
+/// GiB A10 as 24 GiB-class hardware, so up to 2 GiB of reporting/reservation
+/// shortfall still counts as the class. The next 1 GiB remains uncertain;
+/// larger shortfalls are clearly a lower hardware class.
+fn vram_class_compatibility(class_gib: u16, observed: u64) -> VramClassCompatibility {
+    let nominal = u64::from(class_gib).saturating_mul(GIB);
+    let meets_floor = nominal.saturating_sub(VRAM_CLASS_REPORTING_ALLOWANCE);
+    let near_floor = meets_floor.saturating_sub(VRAM_CLASS_NEAR_BAND);
+    if observed >= meets_floor {
+        VramClassCompatibility::Meets
+    } else if observed >= near_floor {
+        VramClassCompatibility::Near
+    } else {
+        VramClassCompatibility::Below
     }
 }
 
@@ -949,11 +1004,76 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use norted_core::{
-        ArtifactFormat, AvailableRuntime, RuntimeArchiveFormat, RuntimeDigest, RuntimeDownload,
-        RuntimeIdentity, RuntimePackageIdentity, RuntimeReleaseChannel, RuntimeRequirements,
+        ArtifactFormat, AvailableRuntime, HostCapabilities, NvidiaCapability, RuntimeArchiveFormat,
+        RuntimeCompatibility, RuntimeDigest, RuntimeDownload, RuntimeIdentity,
+        RuntimePackageIdentity, RuntimeReleaseChannel, RuntimeRequirements,
     };
 
-    use super::{RuntimeProviderAuthority, is_allowed_github_host, same_install_candidate};
+    use super::{
+        RuntimeProviderAuthority, compatibility_for, is_allowed_github_host, same_install_candidate,
+    };
+
+    #[test]
+    fn advisory_notes_do_not_downgrade_verified_compatibility() {
+        let requirements = RuntimeRequirements {
+            advisories: vec!["informational guidance".to_owned()],
+            ..RuntimeRequirements::default()
+        };
+        let host = HostCapabilities {
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            nvidia: Some(NvidiaCapability {
+                model: None,
+                vram_bytes: Some(24 * 1024 * 1024 * 1024),
+                driver_version: None,
+            }),
+            observations: Vec::new(),
+        };
+        assert_eq!(
+            compatibility_for("linux", "x86_64", "cuda", &requirements, &host),
+            RuntimeCompatibility::Recommended
+        );
+
+        let legacy = RuntimeRequirements {
+            notes: vec!["legacy unverified condition".to_owned()],
+            ..RuntimeRequirements::default()
+        };
+        assert!(matches!(
+            compatibility_for("linux", "x86_64", "cuda", &legacy, &host),
+            RuntimeCompatibility::NeedsAttention(_)
+        ));
+    }
+
+    #[test]
+    fn nominal_vram_classes_allow_reporting_shortfall_but_reject_lower_classes() {
+        let requirements = RuntimeRequirements {
+            requires_nvidia_gpu: true,
+            minimum_vram_class_gib: Some(32),
+            ..RuntimeRequirements::default()
+        };
+        let host = |gib: u64| HostCapabilities {
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            nvidia: Some(NvidiaCapability {
+                model: None,
+                vram_bytes: Some(gib * 1024 * 1024 * 1024),
+                driver_version: None,
+            }),
+            observations: Vec::new(),
+        };
+        assert!(matches!(
+            compatibility_for("linux", "x86_64", "cuda", &requirements, &host(30)),
+            RuntimeCompatibility::Recommended
+        ));
+        assert!(matches!(
+            compatibility_for("linux", "x86_64", "cuda", &requirements, &host(29)),
+            RuntimeCompatibility::NeedsAttention(_)
+        ));
+        assert!(matches!(
+            compatibility_for("linux", "x86_64", "cuda", &requirements, &host(24)),
+            RuntimeCompatibility::Incompatible(_)
+        ));
+    }
 
     #[test]
     fn github_redirect_hosts_are_restricted() {

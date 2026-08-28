@@ -45,8 +45,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             let status = &snapshot.installed[*index];
             let manifest = &status.runtime.manifest;
             let identity = &manifest.identity;
+            let model_compatibility = app
+                .runtime_picker_compatibility(&manifest.runtime_id)
+                .unwrap_or(&status.compatibility);
             let (compatibility, compatibility_style) =
-                compatibility_label(&status.compatibility, theme);
+                compatibility_label(model_compatibility, theme);
             let is_override = model.is_some_and(|model| {
                 snapshot.selections.model_overrides.get(&model.id) == Some(&manifest.runtime_id)
             });
@@ -136,22 +139,36 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             .join(", ");
         let target = format!("{} / {}", identity.platform, identity.architecture);
         let backend = format!("{} / {}", identity.accelerator, identity.variant);
-        let (compatibility, compatibility_style) =
-            compatibility_label(&status.compatibility, theme);
+        let model_compatibility = app
+            .runtime_picker_compatibility(&manifest.runtime_id)
+            .unwrap_or(&status.compatibility);
+        let (compatibility, compatibility_style) = compatibility_label(model_compatibility, theme);
+        let mut lines = vec![
+            Line::from(Span::styled("Selected runtime", theme.hint)),
+            key_value("ENGINE", &identity.engine_id, theme),
+            key_value("VERSION", &identity.version, theme),
+            key_value("TARGET", &target, theme),
+            key_value("BACKEND", &backend, theme),
+            key_value("FORMATS", &formats, theme),
+            Line::from(vec![
+                Span::styled(format!("{:<12}", "FIT"), theme.hint),
+                Span::styled(compatibility, compatibility_style),
+            ]),
+        ];
+        if let norted_core::RuntimeCompatibility::NeedsAttention(reason)
+        | norted_core::RuntimeCompatibility::Incompatible(reason) = model_compatibility
+        {
+            lines.push(Line::from(Span::styled(reason, compatibility_style)));
+        }
+        lines.extend(
+            manifest
+                .requirements
+                .advisories
+                .iter()
+                .map(|note| Line::from(Span::styled(note, theme.muted))),
+        );
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(Span::styled("Selected runtime", theme.hint)),
-                key_value("ENGINE", &identity.engine_id, theme),
-                key_value("VERSION", &identity.version, theme),
-                key_value("TARGET", &target, theme),
-                key_value("BACKEND", &backend, theme),
-                key_value("FORMATS", &formats, theme),
-                Line::from(vec![
-                    Span::styled(format!("{:<12}", "FIT"), theme.hint),
-                    Span::styled(compatibility, compatibility_style),
-                ]),
-            ])
-            .wrap(Wrap { trim: true }),
+            Paragraph::new(lines).wrap(Wrap { trim: true }),
             layout.runtime_search_details,
         );
     }

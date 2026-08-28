@@ -617,9 +617,9 @@ impl EngineAdapter for LlamaCppAdapter {
         });
         let arguments = vec![
             OsString::from("--model"),
-            request.model.path.as_os_str().to_owned(),
+            request.model.primary.path.as_os_str().to_owned(),
             OsString::from("--alias"),
-            OsString::from(request.model.id.0.clone()),
+            OsString::from(request.model.primary.id.0.clone()),
             OsString::from("--host"),
             OsString::from(request.backend_address.ip().to_string()),
             OsString::from("--port"),
@@ -640,6 +640,7 @@ impl EngineAdapter for LlamaCppAdapter {
             native_arguments: self.native_arguments.clone(),
             installation: (*installation).clone(),
             runtime: request.runtime,
+            model: request.model,
         })
     }
 

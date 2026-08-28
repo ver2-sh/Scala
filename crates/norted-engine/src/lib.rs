@@ -10,8 +10,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures_util::Stream;
 use norted_core::{
-    ArtifactFormat, AvailableRuntime, EngineInstallation, EngineRevision, InstalledRuntime,
-    ModelArtifact, RuntimeProbeObservation,
+    ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime, EngineInstallation, EngineRevision,
+    HostCapabilities, InstalledRuntime, ModelArtifact, ModelRuntimeIdentity, RuntimeCompatibility,
+    RuntimeProbeObservation,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -39,8 +40,8 @@ pub use manager::{
     RuntimeManagerOptions, RuntimeNotice, RuntimeNoticeLevel,
 };
 pub use packs::{
-    InstalledRuntimeStatus, RuntimeListSnapshot, RuntimePackError, RuntimePackManager,
-    RuntimeSearchResult, RuntimeSearchSnapshot, RuntimeUpdateCheck,
+    InstalledRuntimeStatus, RuntimeListSnapshot, RuntimeModelCandidate, RuntimePackError,
+    RuntimePackManager, RuntimeSearchResult, RuntimeSearchSnapshot, RuntimeUpdateCheck,
 };
 pub use store::{RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreSnapshot};
 pub use supervisor::{CapturedCommand, TokioProcessSupervisor, capture_command};
@@ -143,8 +144,42 @@ pub enum OptionValueKind {
 }
 
 #[derive(Debug, Clone)]
+pub struct PreparedAuxiliaryArtifact {
+    pub role: AuxiliaryArtifactRole,
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub content_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedModelInput {
+    pub primary: ModelArtifact,
+    pub auxiliary: Vec<PreparedAuxiliaryArtifact>,
+}
+
+impl PreparedModelInput {
+    pub fn runtime_identity(&self) -> ModelRuntimeIdentity {
+        ModelRuntimeIdentity {
+            model_id: self.primary.id.clone(),
+            artifact_path: self.primary.path.clone(),
+            content_sha256: self.primary.hash.clone(),
+            auxiliary: self
+                .auxiliary
+                .iter()
+                .map(|artifact| norted_core::AuxiliaryRuntimeIdentity {
+                    role: artifact.role.clone(),
+                    artifact_path: artifact.path.clone(),
+                    size_bytes: artifact.size_bytes,
+                    content_sha256: artifact.content_sha256.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct LaunchRequest {
-    pub model: ModelArtifact,
+    pub model: PreparedModelInput,
     pub runtime: InstalledRuntime,
     pub backend_address: SocketAddr,
 }
@@ -162,6 +197,7 @@ pub struct LaunchSpec {
     pub native_arguments: Vec<String>,
     pub installation: EngineInstallation,
     pub runtime: InstalledRuntime,
+    pub model: PreparedModelInput,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -318,6 +354,40 @@ pub trait EngineAdapter: Send + Sync {
             }
         }
     }
+    /// Evaluates requirements that depend on this concrete runtime, model, and
+    /// host. The shared resolver uses this for every model-specific path.
+    fn runtime_model_compatibility(
+        &self,
+        _runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        _host: &HostCapabilities,
+    ) -> RuntimeCompatibility {
+        match self.compatibility(model) {
+            CompatibilityDecision::Supported => RuntimeCompatibility::Compatible,
+            CompatibilityDecision::Unsupported { reason } => {
+                RuntimeCompatibility::Incompatible(reason)
+            }
+        }
+    }
+    /// Lower values are preferred after compatibility. Engines own the
+    /// semantic ordering of their runtime variants.
+    fn runtime_model_preference(
+        &self,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _host: &HostCapabilities,
+    ) -> u16 {
+        100
+    }
+    async fn prepare_model_input(
+        &self,
+        model: &ModelArtifact,
+    ) -> Result<PreparedModelInput, EngineError> {
+        Ok(PreparedModelInput {
+            primary: model.clone(),
+            auxiliary: Vec::new(),
+        })
+    }
     fn native_options(&self) -> Vec<NativeOption>;
     /// Reports the legacy/flexible-entry runtime configured directly for this
     /// adapter. Managed packs are discovered by the shared runtime store.
@@ -414,11 +484,12 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use norted_core::{ArtifactFormat, ModelArtifact, ModelId};
+    use norted_core::{ArtifactFormat, AuxiliaryArtifactRole, ModelArtifact, ModelId};
 
     use super::{
         CompatibilityDecision, EngineAdapter, EngineCapabilities, EngineError, EngineIdentity,
-        EngineProbe, EngineRegistry, LaunchRequest, LaunchSpec, NativeOption, ProcessDescriptor,
+        EngineProbe, EngineRegistry, LaunchRequest, LaunchSpec, NativeOption,
+        PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor,
     };
 
     struct ArchitectureAdapter {
@@ -560,5 +631,35 @@ mod tests {
                 reason: "requires architecture `architecture-a`, found `architecture-b`".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn prepared_auxiliary_identity_is_preserved_for_launch_provenance() {
+        let prepared = PreparedModelInput {
+            primary: ModelArtifact {
+                id: ModelId("fixture".to_owned()),
+                display_name: "Fixture".to_owned(),
+                path: PathBuf::from("model.q27"),
+                format: ArtifactFormat::Q27,
+                size_bytes: 100,
+                created: 0,
+                hash: None,
+                architecture: None,
+                context_length: None,
+                provenance: None,
+                auxiliary_artifacts: Vec::new(),
+            },
+            auxiliary: vec![PreparedAuxiliaryArtifact {
+                role: AuxiliaryArtifactRole::Tokenizer,
+                path: PathBuf::from("model.tok"),
+                size_bytes: 8,
+                content_sha256: "a".repeat(64),
+            }],
+        };
+        let identity = prepared.runtime_identity();
+        assert_eq!(identity.auxiliary.len(), 1);
+        assert_eq!(identity.auxiliary[0].role, AuxiliaryArtifactRole::Tokenizer);
+        assert_eq!(identity.auxiliary[0].size_bytes, 8);
+        assert_eq!(identity.auxiliary[0].content_sha256, "a".repeat(64));
     }
 }

@@ -20,9 +20,9 @@ pub use model::{
     ModelArtifactProvenance, ModelId, ModelRegistry,
 };
 pub use provenance::{
-    AcquisitionMethod, BuildProvenance, EngineInstallation, EngineRevision,
-    EnvironmentVariableProvenance, ModelRuntimeIdentity, NativeArgumentProvenance, ProcessIdentity,
-    RuntimeProvenance, ToolchainProvenance,
+    AcquisitionMethod, AuxiliaryRuntimeIdentity, BuildProvenance, EngineInstallation,
+    EngineRevision, EnvironmentVariableProvenance, ModelRuntimeIdentity, NativeArgumentProvenance,
+    ProcessIdentity, RuntimeProvenance, ToolchainProvenance,
 };
 pub use runtime::{
     RuntimeDescriptor, RuntimeObservationError, RuntimePublisher, observe_runtime,

@@ -391,6 +391,9 @@ pub fn runtimes_search(
                 runtime.identity.variant,
                 result.entry.compatibility
             );
+            for note in &runtime.requirements.advisories {
+                println!("  Note: {note}");
+            }
         }
     }
     for error in &snapshot.provider_errors {

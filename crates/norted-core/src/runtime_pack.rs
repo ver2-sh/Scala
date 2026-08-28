@@ -203,7 +203,22 @@ pub struct RuntimeRequirements {
     pub requires_nvidia_gpu: bool,
     pub minimum_nvidia_driver: Option<String>,
     pub minimum_vram_bytes: Option<u64>,
+    /// A nominal upstream hardware class (for example, "24 GiB-class"), not
+    /// an exact byte floor. Host detection applies a documented reporting and
+    /// reservation allowance rather than comparing this directly to bytes.
+    #[serde(default)]
+    pub minimum_vram_class_gib: Option<u16>,
+    /// Legacy schema-v1 unverified compatibility conditions. New manifests
+    /// should use `unverified_requirements`; preserving this meaning keeps old
+    /// manifests fail-closed.
+    #[serde(default)]
     pub notes: Vec<String>,
+    /// Informational upstream guidance that does not affect compatibility.
+    #[serde(default)]
+    pub advisories: Vec<String>,
+    /// Compatibility conditions that the current host probe cannot verify.
+    #[serde(default)]
+    pub unverified_requirements: Vec<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
