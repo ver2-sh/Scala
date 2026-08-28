@@ -125,11 +125,11 @@ pub(crate) struct ParsedRequest {
 pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> {
     let object = object(&value)?;
     reject_unknown_fields(object, ALLOWED_TOP_LEVEL_FIELDS, "Responses")?;
-    validate_identity_fields(object)?;
+    let stream = optional_bool(object, "stream", false)?;
+    validate_identity_fields(object, stream)?;
 
     let model = required_string(object, "model")?;
     let instructions = optional_string(object, "instructions")?;
-    let stream = optional_bool(object, "stream", false)?;
     let max_output_tokens = optional_positive_u32(object, "max_output_tokens")?;
     let generation_settings = generation_settings(object)?;
     let input = object.get("input").ok_or_else(|| {
@@ -214,7 +214,10 @@ fn parse_message(value: &Value, index: usize) -> Result<InferenceMessage, OpenAi
     Ok(InferenceMessage { role, text })
 }
 
-fn validate_identity_fields(object: &serde_json::Map<String, Value>) -> Result<(), OpenAiError> {
+fn validate_identity_fields(
+    object: &serde_json::Map<String, Value>,
+    stream: bool,
+) -> Result<(), OpenAiError> {
     require_null_or(object, "store", |value| value == false, "`false`")?;
     require_null_or(object, "background", |value| value == false, "`false`")?;
     require_null_or(
@@ -279,7 +282,7 @@ fn validate_identity_fields(object: &serde_json::Map<String, Value>) -> Result<(
         require_null_or(object, field, Value::is_string, "a string")?;
     }
     validate_text_format(object.get("text"))?;
-    validate_stream_options(object.get("stream_options"))
+    validate_stream_options(object.get("stream_options"), stream)
 }
 
 fn validate_text_format(value: Option<&Value>) -> Result<(), OpenAiError> {
@@ -310,10 +313,17 @@ fn validate_text_format(value: Option<&Value>) -> Result<(), OpenAiError> {
     Ok(())
 }
 
-fn validate_stream_options(value: Option<&Value>) -> Result<(), OpenAiError> {
+fn validate_stream_options(value: Option<&Value>, stream: bool) -> Result<(), OpenAiError> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(());
     };
+    if !stream {
+        return Err(OpenAiError::invalid(
+            "`stream_options` requires `stream = true`.",
+            Some("stream_options"),
+            "invalid_value",
+        ));
+    }
     let options = value.as_object().ok_or_else(|| {
         OpenAiError::invalid(
             "`stream_options` must be an object.",
@@ -353,6 +363,21 @@ enum ResponseStatus {
     Failed,
 }
 
+#[derive(Clone, Copy)]
+enum OutputMessageStatus {
+    Completed,
+    Incomplete,
+}
+
+impl OutputMessageStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
 impl ResponseStatus {
     fn as_str(self) -> &'static str {
         match self {
@@ -371,7 +396,16 @@ fn response_document(
     usage: Option<&InferenceUsage>,
     error: Option<Value>,
 ) -> Value {
-    let output = text.map_or_else(Vec::new, |text| vec![message_item(context, status, text)]);
+    let message_status = match status {
+        ResponseStatus::Completed => Some(OutputMessageStatus::Completed),
+        ResponseStatus::Incomplete => Some(OutputMessageStatus::Incomplete),
+        ResponseStatus::InProgress | ResponseStatus::Failed => None,
+    };
+    let output = text
+        .zip(message_status)
+        .map_or_else(Vec::new, |(text, status)| {
+            vec![message_item(context, status, text)]
+        });
     let completed_at = if status == ResponseStatus::Completed {
         json!(unix_timestamp())
     } else {
@@ -415,7 +449,7 @@ fn response_document(
     document
 }
 
-fn message_item(context: &ResponseContext, status: ResponseStatus, text: &str) -> Value {
+fn message_item(context: &ResponseContext, status: OutputMessageStatus, text: &str) -> Value {
     json!({
         "id": context.message_id,
         "type": "message",
@@ -557,11 +591,20 @@ impl PublicStreamState {
     }
 
     fn complete(&mut self, usage: Option<&InferenceUsage>, finish_reason: InferenceFinishReason) {
-        let (status, terminal_event) = if finish_reason == InferenceFinishReason::MaxOutputTokens {
-            (ResponseStatus::Incomplete, "response.incomplete")
-        } else {
-            (ResponseStatus::Completed, "response.completed")
-        };
+        let (status, message_status, terminal_event) =
+            if finish_reason == InferenceFinishReason::MaxOutputTokens {
+                (
+                    ResponseStatus::Incomplete,
+                    OutputMessageStatus::Incomplete,
+                    "response.incomplete",
+                )
+            } else {
+                (
+                    ResponseStatus::Completed,
+                    OutputMessageStatus::Completed,
+                    "response.completed",
+                )
+            };
         let text = self.text.clone();
         self.push_event(
             "response.output_text.done",
@@ -590,7 +633,7 @@ impl PublicStreamState {
             "response.output_item.done",
             json!({
                 "output_index": 0,
-                "item": message_item(&self.context, status, &text),
+                "item": message_item(&self.context, message_status, &text),
             }),
         );
         let response = response_document(&self.context, status, Some(&text), usage, None);
@@ -600,14 +643,13 @@ impl PublicStreamState {
 
     fn fail(&mut self) {
         let error = json!({
-            "code": "backend_inference_error",
-            "message": "The local inference backend failed while generating this response.",
+            "code": "server_error",
+            "message": "The model failed to generate a response.",
         });
-        let text = self.text.clone();
         let response = response_document(
             &self.context,
             ResponseStatus::Failed,
-            (!text.is_empty()).then_some(text.as_str()),
+            None,
             None,
             Some(error),
         );
@@ -624,10 +666,10 @@ mod tests {
     use axum::body::to_bytes;
     use futures_util::stream;
     use norted_engine::{
-        EffectiveGenerationSettings, InferenceEvent, InferenceFinishReason, InferenceRole,
-        InferenceStream, InferenceUsage,
+        EffectiveGenerationSettings, EngineError, InferenceEvent, InferenceFinishReason,
+        InferenceRole, InferenceStream, InferenceUsage,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
         ResponseContext, ResponseStatus, parse_request, response_document, streaming_response,
@@ -692,6 +734,39 @@ mod tests {
     }
 
     #[test]
+    fn stream_options_are_stream_only_and_obfuscation_must_be_disabled() {
+        parse_request(json!({
+            "model": "m",
+            "input": "hello",
+            "stream": true,
+            "stream_options": {"include_obfuscation": false}
+        }))
+        .expect("disabled obfuscation on a stream is compatible");
+        parse_request(json!({
+            "model": "m",
+            "input": "hello",
+            "stream_options": null
+        }))
+        .expect("null stream options are harmless");
+
+        for invalid in [
+            json!({
+                "model": "m",
+                "input": "hello",
+                "stream_options": {"include_obfuscation": false}
+            }),
+            json!({
+                "model": "m",
+                "input": "hello",
+                "stream": true,
+                "stream_options": {"include_obfuscation": true}
+            }),
+        ] {
+            assert!(parse_request(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn non_stream_documents_report_completion_and_max_output_truthfully() {
         let completed = response_document(
             &context(),
@@ -703,6 +778,7 @@ mod tests {
         assert_eq!(completed["object"], "response");
         assert_eq!(completed["status"], "completed");
         assert_eq!(completed["output"][0]["content"][0]["text"], "done");
+        assert_eq!(completed["output"][0]["status"], "completed");
         assert!(completed.get("usage").is_none());
 
         let incomplete = response_document(
@@ -722,6 +798,7 @@ mod tests {
             incomplete["incomplete_details"]["reason"],
             "max_output_tokens"
         );
+        assert_eq!(incomplete["output"][0]["status"], "incomplete");
         assert!(incomplete.get("usage").is_none());
     }
 
@@ -759,6 +836,51 @@ mod tests {
         assert_eq!(events, expected);
         assert!(body.contains("resp_stable"));
         assert!(body.contains("msg_stable"));
+    }
+
+    #[tokio::test]
+    async fn backend_stream_failure_emits_one_schema_valid_sanitized_failed_response() {
+        let backend: InferenceStream = Box::pin(stream::iter([
+            Ok(InferenceEvent::TextDelta {
+                delta: "partial".to_owned(),
+            }),
+            Err(EngineError::Operation(
+                "failed at C:\\private\\model against http://127.0.0.1:54321".to_owned(),
+            )),
+        ]));
+        let response = streaming_response(context(), backend);
+        let bytes = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .expect("failed stream body");
+        let body = String::from_utf8(bytes.to_vec()).expect("UTF-8 SSE");
+        let events = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str::<Value>(line).expect("JSON event"))
+            .collect::<Vec<_>>();
+        let event_types = events
+            .iter()
+            .map(|event| event["type"].as_str().expect("event type"))
+            .collect::<Vec<_>>();
+        assert_eq!(event_types.last(), Some(&"response.failed"));
+        assert!(!event_types.contains(&"response.completed"));
+
+        let failed = events.last().expect("terminal failed event");
+        assert_eq!(failed["response"]["status"], "failed");
+        assert_eq!(failed["response"]["error"]["code"], "server_error");
+        assert_eq!(
+            failed["response"]["error"]["message"],
+            "The model failed to generate a response."
+        );
+        assert_eq!(failed["response"]["output"], json!([]));
+        assert!(!body.contains("C:\\private"));
+        assert!(!body.contains("127.0.0.1:54321"));
+
+        let sequences = events
+            .iter()
+            .map(|event| event["sequence_number"].as_u64().expect("sequence"))
+            .collect::<Vec<_>>();
+        assert!(sequences.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     struct DropSignal(Arc<AtomicBool>);

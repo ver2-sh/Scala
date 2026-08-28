@@ -1029,6 +1029,7 @@ impl EngineAdapter for Q27Adapter {
     fn validate_generation_settings(
         &self,
         settings: &GenerationSettingsPatch,
+        backend_defaults: &EffectiveGenerationSettings,
     ) -> Result<(), EngineError> {
         if let Some(temperature) = settings.temperature
             && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
@@ -1042,6 +1043,13 @@ impl EngineAdapter for Q27Adapter {
         {
             return Err(EngineError::InvalidGenerationSettings(
                 "q27 top_p must be finite and in the range 0 < top_p <= 1; q27 reinterprets other values as 1"
+                    .to_owned(),
+            ));
+        }
+        let effective_temperature = settings.temperature.unwrap_or(backend_defaults.temperature);
+        if settings.top_p.is_some_and(|top_p| top_p < 1.0) && effective_temperature <= 0.0 {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 top_p below 1 requires a positive effective temperature; q27 uses greedy decoding otherwise"
                     .to_owned(),
             ));
         }
@@ -3440,36 +3448,68 @@ mod tests {
         assert_eq!(temperature["temperature"], 0.6);
         assert_eq!(temperature["top_p"], 1.0);
 
-        let top_p = adapter.backend_request(
+        let sampled = adapter.backend_request(
             &request(GenerationSettingsPatch {
-                temperature: None,
+                temperature: Some(0.6),
                 top_p: Some(0.75),
             }),
             false,
         );
-        assert_eq!(top_p["temperature"], 0.0);
-        assert_eq!(top_p["top_p"], 0.75);
+        assert_eq!(sampled["temperature"], 0.6);
+        assert_eq!(sampled["top_p"], 0.75);
     }
 
     #[test]
-    fn sampler_validation_rejects_values_q27_would_reinterpret() {
+    fn sampler_validation_requires_sampling_before_restricting_top_p() {
         let adapter = Q27Adapter::from_config(None, Path::new("."));
-        assert!(
+        let defaults = EffectiveGenerationSettings {
+            temperature: 0.0,
+            top_p: 1.0,
+        };
+        for valid in [
+            GenerationSettingsPatch::default(),
+            GenerationSettingsPatch {
+                temperature: Some(0.0),
+                top_p: None,
+            },
+            GenerationSettingsPatch {
+                temperature: Some(0.6),
+                top_p: None,
+            },
+            GenerationSettingsPatch {
+                temperature: None,
+                top_p: Some(1.0),
+            },
+            GenerationSettingsPatch {
+                temperature: Some(0.0),
+                top_p: Some(1.0),
+            },
+            GenerationSettingsPatch {
+                temperature: Some(0.6),
+                top_p: Some(0.75),
+            },
+        ] {
             adapter
-                .validate_generation_settings(&GenerationSettingsPatch {
-                    temperature: Some(0.0),
-                    top_p: Some(1.0),
-                })
-                .is_ok()
-        );
-        assert!(
-            adapter
-                .validate_generation_settings(&GenerationSettingsPatch {
-                    temperature: Some(2.0),
-                    top_p: Some(0.1),
-                })
-                .is_ok()
-        );
+                .validate_generation_settings(&valid, &defaults)
+                .expect("q27 can honor sampler patch");
+        }
+
+        for ignored_top_p in [
+            GenerationSettingsPatch {
+                temperature: None,
+                top_p: Some(0.75),
+            },
+            GenerationSettingsPatch {
+                temperature: Some(0.0),
+                top_p: Some(0.75),
+            },
+        ] {
+            assert!(matches!(
+                adapter.validate_generation_settings(&ignored_top_p, &defaults),
+                Err(EngineError::InvalidGenerationSettings(_))
+            ));
+        }
+
         for invalid in [
             GenerationSettingsPatch {
                 temperature: Some(-0.1),
@@ -3493,9 +3533,45 @@ mod tests {
             },
         ] {
             assert!(matches!(
-                adapter.validate_generation_settings(&invalid),
+                adapter.validate_generation_settings(&invalid, &defaults),
                 Err(EngineError::InvalidGenerationSettings(_))
             ));
+        }
+    }
+
+    #[test]
+    fn accepted_sampler_patch_matches_q27_execution_and_public_effective_values() {
+        let adapter = Q27Adapter::from_config(None, Path::new("."));
+        let defaults = EffectiveGenerationSettings {
+            temperature: 0.0,
+            top_p: 1.0,
+        };
+        let request = |generation_settings| InferenceRequest {
+            model_id: ModelId("model".to_owned()),
+            messages: Vec::new(),
+            generation_settings,
+            max_output_tokens: None,
+            stream: false,
+        };
+
+        for patch in [
+            GenerationSettingsPatch::default(),
+            GenerationSettingsPatch {
+                temperature: None,
+                top_p: Some(1.0),
+            },
+            GenerationSettingsPatch {
+                temperature: Some(0.6),
+                top_p: Some(0.75),
+            },
+        ] {
+            adapter
+                .validate_generation_settings(&patch, &defaults)
+                .expect("q27 can honor sampler patch");
+            let effective = defaults.merged(&patch);
+            let body = adapter.backend_request(&request(patch), false);
+            assert_eq!(body["temperature"], effective.temperature);
+            assert_eq!(body["top_p"], effective.top_p);
         }
     }
 

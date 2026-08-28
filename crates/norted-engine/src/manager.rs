@@ -749,7 +749,10 @@ impl RuntimeManager {
         let (adapter, endpoint, backend_generation_settings) =
             self.inference_target(&request.model_id).await?;
         adapter
-            .validate_generation_settings(&request.generation_settings)
+            .validate_generation_settings(
+                &request.generation_settings,
+                &backend_generation_settings,
+            )
             .map_err(map_inference_error)?;
         let effective_generation_settings =
             backend_generation_settings.merged(&request.generation_settings);
@@ -770,7 +773,10 @@ impl RuntimeManager {
         let (adapter, endpoint, backend_generation_settings) =
             self.inference_target(&request.model_id).await?;
         adapter
-            .validate_generation_settings(&request.generation_settings)
+            .validate_generation_settings(
+                &request.generation_settings,
+                &backend_generation_settings,
+            )
             .map_err(map_inference_error)?;
         let effective_generation_settings =
             backend_generation_settings.merged(&request.generation_settings);

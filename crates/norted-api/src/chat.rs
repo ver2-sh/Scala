@@ -353,7 +353,17 @@ fn validate_stream_options(value: Option<&Value>, stream: bool) -> Result<bool, 
             "invalid_type",
         )
     })?;
-    reject_unknown_fields(options, &["include_usage"], "Chat stream_options")?;
+    reject_unknown_fields(
+        options,
+        &["include_usage", "include_obfuscation"],
+        "Chat stream_options",
+    )?;
+    require_null_or(
+        options,
+        "include_obfuscation",
+        |value| value == false,
+        "`false`",
+    )?;
     optional_bool(options, "include_usage", false)
 }
 
@@ -619,6 +629,37 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn stream_options_accept_disabled_obfuscation_and_reject_unimplemented_behavior() {
+        let parsed = parse_request(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+            "stream_options": {
+                "include_usage": true,
+                "include_obfuscation": false
+            }
+        }))
+        .expect("compatible Chat stream options");
+        assert!(parsed.include_usage);
+
+        for invalid in [
+            json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream_options": {"include_obfuscation": false}
+            }),
+            json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+                "stream_options": {"include_obfuscation": true}
+            }),
+        ] {
+            assert!(parse_request(invalid).is_err());
+        }
     }
 
     #[test]

@@ -438,6 +438,7 @@ impl EngineAdapter for LlamaCppAdapter {
     fn validate_generation_settings(
         &self,
         settings: &GenerationSettingsPatch,
+        _backend_defaults: &EffectiveGenerationSettings,
     ) -> Result<(), EngineError> {
         if let Some(temperature) = settings.temperature
             && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
@@ -1776,10 +1777,16 @@ mod generation_settings_tests {
         let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
         assert!(
             adapter
-                .validate_generation_settings(&GenerationSettingsPatch {
-                    temperature: Some(2.0),
-                    top_p: Some(0.0),
-                })
+                .validate_generation_settings(
+                    &GenerationSettingsPatch {
+                        temperature: Some(2.0),
+                        top_p: Some(0.0),
+                    },
+                    &EffectiveGenerationSettings {
+                        temperature: 0.8,
+                        top_p: 0.95,
+                    },
+                )
                 .is_ok()
         );
         for invalid in [
@@ -1801,7 +1808,13 @@ mod generation_settings_tests {
             },
         ] {
             assert!(matches!(
-                adapter.validate_generation_settings(&invalid),
+                adapter.validate_generation_settings(
+                    &invalid,
+                    &EffectiveGenerationSettings {
+                        temperature: 0.8,
+                        top_p: 0.95,
+                    },
+                ),
                 Err(EngineError::InvalidGenerationSettings(_))
             ));
         }

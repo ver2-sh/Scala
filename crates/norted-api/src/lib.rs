@@ -465,8 +465,7 @@ mod tests {
             "model": "model",
             "input": [{"role": "user", "content": "hello"}],
             "max_output_tokens": 32,
-            "temperature": 0.3,
-            "top_p": 0.8,
+            "top_p": 0.75,
             "stream": true
         }))
         .expect("Responses request")
@@ -476,8 +475,7 @@ mod tests {
             "model": "model",
             "messages": [{"role": "user", "content": "hello"}],
             "max_completion_tokens": 32,
-            "temperature": 0.3,
-            "top_p": 0.8,
+            "top_p": 0.75,
             "stream": true
         }))
         .expect("Chat request")
@@ -490,6 +488,8 @@ mod tests {
         assert_eq!(responses.messages[0].text, chat.messages[0].text);
         assert_eq!(responses.max_output_tokens, chat.max_output_tokens);
         assert_eq!(responses.generation_settings, chat.generation_settings);
+        assert_eq!(responses.generation_settings.temperature, None);
+        assert_eq!(responses.generation_settings.top_p, Some(0.75));
         assert_eq!(responses.stream, chat.stream);
     }
 }

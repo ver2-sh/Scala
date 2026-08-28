@@ -544,6 +544,7 @@ pub trait EngineAdapter: Send + Sync {
     fn validate_generation_settings(
         &self,
         settings: &GenerationSettingsPatch,
+        _backend_defaults: &EffectiveGenerationSettings,
     ) -> Result<(), EngineError> {
         if settings.is_empty() {
             Ok(())
@@ -897,14 +898,26 @@ mod tests {
         };
         assert!(
             adapter
-                .validate_generation_settings(&GenerationSettingsPatch::default())
+                .validate_generation_settings(
+                    &GenerationSettingsPatch::default(),
+                    &EffectiveGenerationSettings {
+                        temperature: 0.0,
+                        top_p: 1.0,
+                    },
+                )
                 .is_ok()
         );
         assert!(matches!(
-            adapter.validate_generation_settings(&GenerationSettingsPatch {
-                temperature: Some(0.5),
-                top_p: None,
-            }),
+            adapter.validate_generation_settings(
+                &GenerationSettingsPatch {
+                    temperature: Some(0.5),
+                    top_p: None,
+                },
+                &EffectiveGenerationSettings {
+                    temperature: 0.0,
+                    top_p: 1.0,
+                },
+            ),
             Err(EngineError::InvalidGenerationSettings(_))
         ));
     }
