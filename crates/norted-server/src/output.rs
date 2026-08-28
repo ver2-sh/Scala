@@ -55,7 +55,7 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
         }
         if let Some(control) = &control {
             println!(
-                "  Engines:         {} available, {} installed, {} running",
+                "  Adapters:        {} registered, {} external binaries, {} backend running",
                 control.available_engine_count,
                 control.installed_engine_count,
                 control.running_engine_count
@@ -74,8 +74,20 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
             if let Some(engine) = &control.backend.engine_id {
                 println!("  Active engine:   {engine}");
             }
+            if let Some(runtime) = &control.backend.runtime_id {
+                println!("  Active runtime:  {runtime}");
+            }
+            if let Some(version) = &control.backend.runtime_version {
+                println!("  Runtime version: {version}");
+            }
+            if let Some(variant) = &control.backend.runtime_variant {
+                println!("  Runtime variant: {variant}");
+            }
+            if let Some(digest) = &control.backend.runtime_executable_sha256 {
+                println!("  Runtime SHA-256: {digest}");
+            }
         } else {
-            println!("  Engines:         unavailable (no private control observation)");
+            println!("  Adapters:        unavailable (no private control observation)");
             println!("  Active model:    unavailable");
         }
     }
@@ -216,6 +228,29 @@ pub fn control_operation(operation: &str, status: &ControlStatus, json_output: b
         if let Some(engine) = &status.backend.engine_id {
             println!("  Engine:  {engine}");
         }
+        if let Some(runtime) = &status.backend.runtime_id {
+            println!("  Runtime: {runtime}");
+        }
+        if let Some(version) = &status.backend.runtime_version {
+            println!(
+                "  Version: {version}{}",
+                status
+                    .backend
+                    .runtime_variant
+                    .as_deref()
+                    .map(|variant| format!(" / {variant}"))
+                    .unwrap_or_default()
+            );
+        }
+        for event in status.recent_events.iter().filter(|event| {
+            matches!(
+                event.level,
+                norted_engine::RuntimeNoticeLevel::Warning
+                    | norted_engine::RuntimeNoticeLevel::Error
+            )
+        }) {
+            eprintln!("  {:?}: {}", event.level, event.message);
+        }
     }
     Ok(())
 }
@@ -281,5 +316,204 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} MiB", bytes / MIB)
     } else {
         format!("{:.1} KiB", bytes / 1024.0)
+    }
+}
+
+pub fn runtimes_list(
+    snapshot: &norted_engine::RuntimeListSnapshot,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    if snapshot.installed.is_empty() {
+        println!("No runtime packs are installed or configured.");
+    } else {
+        println!(
+            "{:<52} {:<12} {:<14} {:<12} VERSION",
+            "RUNTIME ID", "ENGINE", "BACKEND", "STATE"
+        );
+        for status in &snapshot.installed {
+            let runtime = &status.runtime.manifest;
+            let state = if status.selected_for.is_empty() {
+                format!("{:?}", status.compatibility)
+            } else {
+                format!("selected: {}", status.selected_for.join(", "))
+            };
+            println!(
+                "{:<52} {:<12} {:<14} {:<12} {}",
+                runtime.runtime_id,
+                runtime.identity.engine_id,
+                runtime.identity.accelerator,
+                truncate(&state, 12),
+                runtime.identity.version
+            );
+        }
+    }
+    for warning in &snapshot.warnings {
+        eprintln!("Warning: {warning}");
+    }
+    Ok(())
+}
+
+pub fn runtimes_search(
+    snapshot: &norted_engine::RuntimeSearchSnapshot,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(snapshot)?);
+        return Ok(());
+    }
+    if snapshot.results.is_empty() {
+        println!("No upstream runtime packs matched the query.");
+    } else {
+        println!(
+            "{:<52} {:<11} {:<13} {:<10} {:>10}",
+            "RUNTIME ID", "ENGINE", "BACKEND", "VERSION", "DOWNLOAD"
+        );
+        for result in &snapshot.results {
+            let runtime = &result.entry.available;
+            let installed = if result.installed { " installed" } else { "" };
+            println!(
+                "{:<52} {:<11} {:<13} {:<10} {:>10}{}",
+                runtime.runtime_id,
+                runtime.identity.engine_id,
+                runtime.identity.accelerator,
+                runtime.identity.version,
+                format_bytes(runtime.download_size_bytes()),
+                installed
+            );
+            println!(
+                "  {} {} / {}  {:?}",
+                runtime.identity.platform,
+                runtime.identity.architecture,
+                runtime.identity.variant,
+                result.entry.compatibility
+            );
+        }
+    }
+    for error in &snapshot.provider_errors {
+        eprintln!(
+            "Warning: {}: {}{}",
+            error.provider_id,
+            error.message,
+            if error.using_stale_cache {
+                " (showing stale cache)"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+pub fn runtime_info(value: &serde_json::Value, _json_output: bool) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+pub fn runtime_operation(
+    operation: &str,
+    runtime: &norted_core::InstalledRuntime,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "operation": operation,
+                "runtime": runtime,
+            }))?
+        );
+    } else {
+        println!("Runtime {operation} complete.");
+        println!("  ID:       {}", runtime.manifest.runtime_id);
+        println!("  Engine:   {}", runtime.manifest.identity.engine_id);
+        println!("  Version:  {}", runtime.manifest.identity.version);
+        println!("  Variant:  {}", runtime.manifest.identity.variant);
+        println!("  Binary:   {}", runtime.entrypoint_path().display());
+        println!("  SHA-256:  {}", runtime.manifest.entrypoint_sha256);
+    }
+    Ok(())
+}
+
+pub fn runtime_removed(runtime_id: &norted_core::RuntimeId, json_output: bool) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "operation": "remove",
+                "runtime_id": runtime_id,
+                "removed": true,
+            }))?
+        );
+    } else {
+        println!("Removed runtime {runtime_id}.");
+    }
+    Ok(())
+}
+
+pub fn runtime_selections(
+    operation: &str,
+    selections: &norted_core::RuntimeSelections,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "operation": operation,
+                "selections": selections,
+            }))?
+        );
+    } else {
+        println!("Runtime selection {operation} complete.");
+        for (format, runtime) in &selections.format_defaults {
+            println!(
+                "  {} default: {runtime}",
+                format.as_str().to_ascii_uppercase()
+            );
+        }
+        for (model, runtime) in &selections.model_overrides {
+            println!("  Model {model}: {runtime}");
+        }
+    }
+    Ok(())
+}
+
+pub fn runtime_updates(
+    checks: &[norted_engine::RuntimeUpdateCheck],
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "data": checks }))?
+        );
+    } else if checks.is_empty() {
+        println!("No managed runtimes are installed.");
+    } else {
+        for check in checks {
+            println!(
+                "  {} {}: {:?}",
+                check.runtime.manifest.identity.engine_id,
+                check.runtime.manifest.identity.version,
+                check.state
+            );
+        }
+    }
+    Ok(())
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        value.to_owned()
+    } else {
+        value
+            .chars()
+            .take(width.saturating_sub(1))
+            .collect::<String>()
+            + "…"
     }
 }

@@ -3,6 +3,8 @@
 
 # Local model and engine artifacts
 *.gguf
+*.q27
+*.tok
 llama-server
 llama-server.exe
 *.exe
@@ -27,6 +29,8 @@ llama-server.exe
 /state/
 /config.toml
 /config.local.toml
+/runtime-selections.json
+/runtime.json
 /.env
 /.env.local
 

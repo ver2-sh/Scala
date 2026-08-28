@@ -1,7 +1,7 @@
 use norted_core::RegistryState;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 
-use crate::app::{App, Screen};
+use crate::app::{App, Overlay, Screen};
 
 use super::components::content_layout;
 use super::shell::{COMPACT_WIDTH, MIN_HEIGHT, MIN_WIDTH};
@@ -10,6 +10,15 @@ use super::shell::{COMPACT_WIDTH, MIN_HEIGHT, MIN_WIDTH};
 pub enum HoverTarget {
     Navigation(Screen),
     Model(usize),
+    Runtime(usize),
+    RuntimeSearchAction,
+    RuntimeUpdateAction,
+    RuntimeSearchInput,
+    RuntimeSearchResult(usize),
+    RuntimeSearchSubmit,
+    RuntimeInstall,
+    RuntimePickerResult(usize),
+    RuntimePickerApply,
     CommandSuggestion(usize),
     CommandBar,
 }
@@ -21,6 +30,21 @@ pub struct UiLayout {
     pub nav_items: Vec<(Screen, Rect)>,
     pub content: Rect,
     pub model_rows: Vec<(usize, Rect)>,
+    pub runtime_summary: Rect,
+    pub runtime_list: Rect,
+    pub runtime_rows: Vec<(usize, Rect)>,
+    pub runtime_actions: Rect,
+    pub runtime_search_action: Rect,
+    pub runtime_update_action: Rect,
+    pub runtime_search_popup: Option<Rect>,
+    pub runtime_search_input: Rect,
+    pub runtime_search_results: Rect,
+    pub runtime_search_rows: Vec<(usize, Rect)>,
+    pub runtime_search_details: Rect,
+    pub runtime_search_submit: Rect,
+    pub runtime_install_action: Rect,
+    pub runtime_operation_status: Rect,
+    pub runtime_picker_active: bool,
     pub logs: Rect,
     pub command_bar: Rect,
     pub suggestion_popup: Option<Rect>,
@@ -82,6 +106,177 @@ impl UiLayout {
             }
         }
 
+        let mut runtime_summary = Rect::default();
+        let mut runtime_list = Rect::default();
+        let mut runtime_actions = Rect::default();
+        let mut runtime_search_action = Rect::default();
+        let mut runtime_update_action = Rect::default();
+        let mut runtime_rows = Vec::new();
+        if app.screen == Screen::Runtimes {
+            let summary_height = screen_body.height.min(if compact { 3 } else { 4 });
+            let action_height = u16::from(screen_body.height > summary_height);
+            runtime_summary = Rect::new(
+                screen_body.x,
+                screen_body.y,
+                screen_body.width,
+                summary_height,
+            );
+            runtime_actions = Rect::new(
+                screen_body.x,
+                screen_body.bottom().saturating_sub(action_height),
+                screen_body.width,
+                action_height,
+            );
+            runtime_list = Rect::new(
+                screen_body.x,
+                runtime_summary.bottom(),
+                screen_body.width,
+                runtime_actions.y.saturating_sub(runtime_summary.bottom()),
+            );
+            if action_height > 0 {
+                runtime_search_action = Rect::new(
+                    runtime_actions.x,
+                    runtime_actions.y,
+                    runtime_actions.width.min(20),
+                    1,
+                );
+                runtime_update_action = Rect::new(
+                    runtime_search_action.right().saturating_add(1),
+                    runtime_actions.y,
+                    runtime_actions
+                        .right()
+                        .saturating_sub(runtime_search_action.right().saturating_add(1))
+                        .min(18),
+                    1,
+                );
+            }
+            if let Some(snapshot) = &app.runtime_list {
+                let capacity = (runtime_list.height / 2) as usize;
+                let end = (app.runtime_scroll + capacity).min(snapshot.installed.len());
+                for index in app.runtime_scroll..end {
+                    runtime_rows.push((
+                        index,
+                        Rect::new(
+                            runtime_list.x,
+                            runtime_list.y + ((index - app.runtime_scroll) as u16 * 2),
+                            runtime_list.width,
+                            2,
+                        ),
+                    ));
+                }
+            }
+        }
+
+        let mut runtime_search_popup = None;
+        let mut runtime_search_input = Rect::default();
+        let mut runtime_search_results = Rect::default();
+        let mut runtime_search_details = Rect::default();
+        let mut runtime_search_submit = Rect::default();
+        let mut runtime_install_action = Rect::default();
+        let mut runtime_operation_status = Rect::default();
+        let mut runtime_search_rows = Vec::new();
+        let runtime_picker_active = app.overlay == Some(Overlay::ModelRuntime);
+        if matches!(
+            app.overlay,
+            Some(Overlay::RuntimeSearch | Overlay::ModelRuntime)
+        ) {
+            let horizontal_margin = if area.width < COMPACT_WIDTH {
+                1
+            } else {
+                (area.width / 16).max(2)
+            };
+            let vertical_margin = if area.height < 20 { 1 } else { 2 };
+            let popup = area.inner(Margin {
+                horizontal: horizontal_margin,
+                vertical: vertical_margin,
+            });
+            runtime_search_popup = Some(popup);
+            let inner = popup.inner(Margin {
+                horizontal: 2,
+                vertical: 1,
+            });
+            if runtime_picker_active {
+                runtime_search_input =
+                    Rect::new(inner.x, inner.y, inner.width, u16::from(inner.height > 0));
+            } else {
+                let submit_width = inner.width.min(12);
+                runtime_search_input = Rect::new(
+                    inner.x,
+                    inner.y,
+                    inner.width.saturating_sub(submit_width.saturating_add(1)),
+                    u16::from(inner.height > 0),
+                );
+                runtime_search_submit = Rect::new(
+                    runtime_search_input.right().saturating_add(1),
+                    inner.y,
+                    submit_width,
+                    u16::from(inner.height > 0),
+                );
+            }
+            let body = Rect::new(
+                inner.x,
+                inner.y.saturating_add(2),
+                inner.width,
+                inner.height.saturating_sub(3),
+            );
+            if inner.width >= COMPACT_WIDTH {
+                let result_width = body.width.saturating_mul(3) / 5;
+                runtime_search_results = Rect::new(body.x, body.y, result_width, body.height);
+                runtime_search_details = Rect::new(
+                    body.x.saturating_add(result_width).saturating_add(2),
+                    body.y,
+                    body.width.saturating_sub(result_width.saturating_add(2)),
+                    body.height,
+                );
+            } else {
+                let result_height = body.height.saturating_mul(3) / 5;
+                runtime_search_results = Rect::new(body.x, body.y, body.width, result_height);
+                runtime_search_details = Rect::new(
+                    body.x,
+                    body.y.saturating_add(result_height),
+                    body.width,
+                    body.height.saturating_sub(result_height),
+                );
+            }
+            runtime_install_action = Rect::new(
+                inner.x,
+                inner.bottom().saturating_sub(1),
+                inner.width.min(22),
+                u16::from(inner.height > 0),
+            );
+            runtime_operation_status = Rect::new(
+                runtime_install_action.right().saturating_add(1),
+                runtime_install_action.y,
+                inner
+                    .right()
+                    .saturating_sub(runtime_install_action.right().saturating_add(1)),
+                runtime_install_action.height,
+            );
+            let (indices, scroll) = if runtime_picker_active {
+                (app.runtime_picker_indices(), app.runtime_picker_scroll)
+            } else {
+                (app.runtime_search_indices(), app.runtime_search_scroll)
+            };
+            let capacity = (runtime_search_results.height / 2) as usize;
+            let end = (scroll + capacity).min(indices.len());
+            for (visible_position, index) in indices
+                .iter()
+                .enumerate()
+                .skip(scroll)
+                .take(end.saturating_sub(scroll))
+            {
+                runtime_search_rows.push((
+                    *index,
+                    Rect::new(
+                        runtime_search_results.x,
+                        runtime_search_results.y + ((visible_position - scroll) as u16 * 2),
+                        runtime_search_results.width,
+                        2,
+                    ),
+                ));
+            }
+        }
+
         let suggestions = app.suggestions();
         let (suggestion_popup, suggestion_rows) = if app.command_active && !suggestions.is_empty() {
             let visible_count = suggestions.len().min(8);
@@ -117,6 +312,21 @@ impl UiLayout {
             nav_items,
             content,
             model_rows,
+            runtime_summary,
+            runtime_list,
+            runtime_rows,
+            runtime_actions,
+            runtime_search_action,
+            runtime_update_action,
+            runtime_search_popup,
+            runtime_search_input,
+            runtime_search_results,
+            runtime_search_rows,
+            runtime_search_details,
+            runtime_search_submit,
+            runtime_install_action,
+            runtime_operation_status,
+            runtime_picker_active,
             logs: if app.screen == Screen::Logs {
                 screen_body
             } else {
@@ -131,6 +341,33 @@ impl UiLayout {
     }
 
     pub fn hit_test(&self, position: Position) -> Option<HoverTarget> {
+        if self.runtime_search_popup.is_some() {
+            if !self.runtime_picker_active && contains(self.runtime_search_input, position) {
+                return Some(HoverTarget::RuntimeSearchInput);
+            }
+            if !self.runtime_picker_active && contains(self.runtime_search_submit, position) {
+                return Some(HoverTarget::RuntimeSearchSubmit);
+            }
+            if contains(self.runtime_install_action, position) {
+                return Some(if self.runtime_picker_active {
+                    HoverTarget::RuntimePickerApply
+                } else {
+                    HoverTarget::RuntimeInstall
+                });
+            }
+            if let Some((index, _)) = self
+                .runtime_search_rows
+                .iter()
+                .find(|(_, area)| contains(*area, position))
+            {
+                return Some(if self.runtime_picker_active {
+                    HoverTarget::RuntimePickerResult(*index)
+                } else {
+                    HoverTarget::RuntimeSearchResult(*index)
+                });
+            }
+            return None;
+        }
         if let Some((index, _)) = self
             .suggestion_rows
             .iter()
@@ -152,6 +389,19 @@ impl UiLayout {
         {
             return Some(HoverTarget::Model(*index));
         }
+        if let Some((index, _)) = self
+            .runtime_rows
+            .iter()
+            .find(|(_, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::Runtime(*index));
+        }
+        if contains(self.runtime_search_action, position) {
+            return Some(HoverTarget::RuntimeSearchAction);
+        }
+        if contains(self.runtime_update_action, position) {
+            return Some(HoverTarget::RuntimeUpdateAction);
+        }
         contains(self.command_bar, position).then_some(HoverTarget::CommandBar)
     }
 
@@ -161,6 +411,14 @@ impl UiLayout {
 
     pub fn log_capacity(&self) -> usize {
         self.logs.height as usize
+    }
+
+    pub fn runtime_capacity(&self) -> usize {
+        (self.runtime_list.height / 2) as usize
+    }
+
+    pub fn runtime_search_capacity(&self) -> usize {
+        (self.runtime_search_results.height / 2) as usize
     }
 
     pub fn contains_content(&self, position: Position) -> bool {

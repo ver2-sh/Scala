@@ -157,7 +157,23 @@ pub fn render_command_bar(
 }
 
 pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, glyphs: &Glyphs) {
-    let line = if app.command_active {
+    let line = if app.overlay == Some(crate::app::Overlay::ModelRuntime) {
+        vec![
+            hint(glyphs.up_down, "select", theme),
+            hint("Enter", "apply / search", theme),
+            hint("s", "search available", theme),
+            hint("x/Del", "clear override", theme),
+            hint("wheel", "scroll", theme),
+            hint("Esc", "cancel", theme),
+        ]
+    } else if app.overlay == Some(crate::app::Overlay::RuntimeSearch) {
+        vec![
+            hint("Tab", "query/results", theme),
+            hint(glyphs.up_down, "select", theme),
+            hint("Enter/i", "install", theme),
+            hint("Esc", "close", theme),
+        ]
+    } else if app.command_active {
         vec![
             hint(glyphs.up_down, "select", theme),
             hint("Enter", "run", theme),
@@ -181,6 +197,7 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
                 hint(glyphs.up_down, "select", theme),
                 hint("Enter", "load", theme),
                 hint("u", "unload", theme),
+                hint("v", "runtime override", theme),
                 hint("wheel", "scroll", theme),
                 hint("Tab", "focus", theme),
                 hint("/", "commands", theme),
@@ -190,6 +207,17 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
                 hint("End", "follow", theme),
                 hint("Tab", "focus", theme),
                 hint("/", "commands", theme),
+            ],
+            (FocusArea::Content, crate::app::Screen::Runtimes) => vec![
+                hint(glyphs.up_down, "select", theme),
+                hint("s", "search", theme),
+                hint("g", "GGUF default", theme),
+                hint("Q/2", "Q27 default", theme),
+                hint("u", "updates", theme),
+                hint("U", "update selected", theme),
+                hint("d d", "remove", theme),
+                hint("r", "refresh", theme),
+                hint("wheel", "scroll", theme),
             ],
             _ => vec![
                 hint("Tab", "change focus", theme),

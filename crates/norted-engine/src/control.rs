@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use norted_core::{AppPaths, ModelId, observe_runtime_descriptor};
+use norted_core::{AppPaths, ModelId, RuntimeId, observe_runtime_descriptor};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -16,6 +16,8 @@ const UNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlLoadRequest {
     pub model_id: ModelId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<RuntimeId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,11 +86,22 @@ impl ControlClient {
     }
 
     pub async fn load(&self, model_id: ModelId) -> Result<ControlStatus, ControlClientError> {
+        self.load_with_runtime(model_id, None).await
+    }
+
+    pub async fn load_with_runtime(
+        &self,
+        model_id: ModelId,
+        runtime_id: Option<RuntimeId>,
+    ) -> Result<ControlStatus, ControlClientError> {
         self.send(
             self.client
                 .post(format!("{}{}", self.endpoint, CONTROL_LOAD_PATH))
                 .timeout(LOAD_TIMEOUT)
-                .json(&ControlLoadRequest { model_id }),
+                .json(&ControlLoadRequest {
+                    model_id,
+                    runtime_id,
+                }),
         )
         .await
     }

@@ -1,5 +1,9 @@
 //! llama.cpp-specific launch, probe, health, and inference translation.
 
+mod catalog;
+
+pub use catalog::{LLAMA_CPP_RUNTIME_PROVIDER_ID, LlamaCppRuntimeCatalogProvider};
+
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::net::SocketAddr;
@@ -12,14 +16,14 @@ use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use norted_core::{
     AcquisitionMethod, ArtifactFormat, EngineConfig, EngineInstallation, EngineRevision,
-    ModelArtifact,
+    InstalledRuntime, ModelArtifact, RuntimeAcquisitionMethod, RuntimeId, RuntimeProbeObservation,
 };
 use norted_engine::{
-    AcquisitionRequest, ApiCapability, CompatibilityDecision, EffectiveGenerationSettings,
-    EngineAdapter, EngineCapabilities, EngineError, EngineFeature, EngineIdentity, EngineProbe,
-    InferenceEvent, InferenceFinishReason, InferenceMessage, InferenceOutput, InferenceRequest,
-    InferenceRole, InferenceStream, InferenceUsage, InstallationState, LaunchRequest, LaunchSpec,
-    NativeOption, OptionValueKind, ProcessDescriptor, UpdateState, capture_command,
+    ApiCapability, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
+    EngineCapabilities, EngineError, EngineFeature, EngineIdentity, EngineProbe, InferenceEvent,
+    InferenceFinishReason, InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole,
+    InferenceStream, InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, NativeOption,
+    OptionValueKind, ProcessDescriptor, UpdateState, capture_command,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -62,6 +66,9 @@ const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &[
     "LLAMA_ARG_ENDPOINT_PROPS",
     "LLAMA_SERVER_ROUTER_PORT",
     "LLAMA_SERVER_CHILD_MODE",
+    "LLAMA_ARG_AGENT",
+    "LLAMA_ARG_TOOLS",
+    "LLAMA_ARG_MCP_CONFIG",
 ];
 
 const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
@@ -96,6 +103,11 @@ const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "--models-autoload",
     "--no-models-autoload",
     "--props",
+    "--agent",
+    "--tools",
+    "--tools-file",
+    "--mcp-config",
+    "--mcp-config-file",
     // Current llama-server convenience presets assign a different primary model
     // (and some also replace the managed port or generation mode).
     "--embd-gemma-default",
@@ -122,7 +134,7 @@ pub struct LlamaCppAdapter {
 
 impl LlamaCppAdapter {
     pub fn from_config(config: Option<&EngineConfig>, config_directory: &Path) -> Self {
-        let mut enabled = false;
+        let mut enabled = config.is_none();
         let mut binary_path = None;
         let mut native_arguments = Vec::new();
         let mut environment = BTreeMap::new();
@@ -377,7 +389,26 @@ impl EngineAdapter for LlamaCppAdapter {
         }
     }
 
+    fn runtime_management_compatibility(&self) -> CompatibilityDecision {
+        if !self.enabled {
+            CompatibilityDecision::Unsupported {
+                reason: "llama.cpp adapter is disabled in configuration".to_owned(),
+            }
+        } else if let Some(error) = &self.configuration_error {
+            CompatibilityDecision::Unsupported {
+                reason: error.clone(),
+            }
+        } else {
+            CompatibilityDecision::Supported
+        }
+    }
+
     fn compatibility(&self, model: &ModelArtifact) -> CompatibilityDecision {
+        if let CompatibilityDecision::Unsupported { reason } =
+            self.runtime_management_compatibility()
+        {
+            return CompatibilityDecision::Unsupported { reason };
+        }
         if model.format == ArtifactFormat::Gguf {
             CompatibilityDecision::Supported
         } else {
@@ -404,23 +435,152 @@ impl EngineAdapter for LlamaCppAdapter {
         Ok(self.probe_uncached().await)
     }
 
-    async fn install(
+    async fn probe_runtime(
         &self,
-        _request: AcquisitionRequest,
-    ) -> Result<EngineInstallation, EngineError> {
-        Err(EngineError::Unsupported(
-            "managed llama.cpp installation is intentionally deferred; configure an existing llama-server binary"
-                .to_owned(),
-        ))
-    }
-
-    async fn update(
-        &self,
-        _request: AcquisitionRequest,
-    ) -> Result<EngineInstallation, EngineError> {
-        Err(EngineError::Unsupported(
-            "managed llama.cpp updates are intentionally deferred".to_owned(),
-        ))
+        runtime: &InstalledRuntime,
+    ) -> Result<RuntimeProbeObservation, EngineError> {
+        if let Some(error) = &self.configuration_error {
+            return Err(EngineError::InvalidConfiguration(error.clone()));
+        }
+        if !self.enabled {
+            return Err(EngineError::InvalidConfiguration(
+                "llama.cpp adapter is disabled in configuration".to_owned(),
+            ));
+        }
+        if runtime.manifest.identity.engine_id != ENGINE_ID {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "runtime `{}` belongs to engine `{}`, not `{ENGINE_ID}`",
+                runtime.manifest.runtime_id, runtime.manifest.identity.engine_id
+            )));
+        }
+        runtime
+            .manifest
+            .identity
+            .validate()
+            .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
+        if runtime.manifest.runtime_id != RuntimeId::from_identity(&runtime.manifest.identity) {
+            return Err(EngineError::InvalidConfiguration(
+                "runtime ID does not match its structured identity".to_owned(),
+            ));
+        }
+        let configured_path = runtime.entrypoint_path();
+        let binary_path = tokio::fs::canonicalize(&configured_path)
+            .await
+            .map_err(|error| {
+                EngineError::InvalidConfiguration(format!(
+                    "runtime entrypoint {} could not be resolved: {error}",
+                    configured_path.display()
+                ))
+            })?;
+        let metadata = tokio::fs::metadata(&binary_path).await.map_err(|error| {
+            EngineError::InvalidConfiguration(format!(
+                "runtime entrypoint {} could not be inspected: {error}",
+                binary_path.display()
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(EngineError::InvalidConfiguration(
+                "runtime entrypoint is not a regular file".to_owned(),
+            ));
+        }
+        if !matches!(
+            runtime.manifest.acquisition_method,
+            RuntimeAcquisitionMethod::ExternalBinary
+        ) {
+            let root = tokio::fs::canonicalize(&runtime.installation_root)
+                .await
+                .map_err(|error| {
+                    EngineError::InvalidConfiguration(format!(
+                        "runtime installation root could not be resolved: {error}"
+                    ))
+                })?;
+            if !binary_path.starts_with(&root) {
+                return Err(EngineError::InvalidConfiguration(
+                    "managed runtime entrypoint escapes its installation root".to_owned(),
+                ));
+            }
+        }
+        let version_output = capture_command(
+            &binary_path,
+            &["--version"],
+            &self.environment,
+            &managed_environment_removals(),
+            PROBE_TIMEOUT,
+        )
+        .await?;
+        if !version_output.success {
+            return Err(EngineError::Operation(format!(
+                "llama-server --version exited with {:?}: {}",
+                version_output.code,
+                command_detail(&version_output.stdout, &version_output.stderr)
+            )));
+        }
+        let help_output = capture_command(
+            &binary_path,
+            &["--help"],
+            &self.environment,
+            &managed_environment_removals(),
+            PROBE_TIMEOUT,
+        )
+        .await?;
+        if !help_output.success {
+            return Err(EngineError::Operation(format!(
+                "llama-server --help exited with {:?}: {}",
+                help_output.code,
+                command_detail(&help_output.stdout, &help_output.stderr)
+            )));
+        }
+        let help = format!("{}\n{}", help_output.stdout, help_output.stderr);
+        for required in ["--model", "--alias", "--host", "--port"] {
+            if !help.contains(required) {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "runtime entrypoint does not advertise required llama-server flag `{required}`"
+                )));
+            }
+        }
+        let entrypoint_sha256 = hash_file(&binary_path).await.map_err(|error| {
+            EngineError::Operation(format!("could not hash entrypoint: {error}"))
+        })?;
+        if entrypoint_sha256 != runtime.manifest.entrypoint_sha256 {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "runtime entrypoint SHA-256 mismatch: expected {}, observed {entrypoint_sha256}",
+                runtime.manifest.entrypoint_sha256
+            )));
+        }
+        let version_text = command_detail(&version_output.stdout, &version_output.stderr);
+        let (version, revision) = parse_version(&version_text);
+        if !matches!(
+            runtime.manifest.acquisition_method,
+            RuntimeAcquisitionMethod::ExternalBinary
+        ) {
+            if let Some(build) = runtime.manifest.identity.version.strip_prefix('b')
+                && build.bytes().all(|byte| byte.is_ascii_digit())
+                && !version_text.contains(&format!("build {build}"))
+            {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "runtime reports a different llama.cpp build than managed identity {}",
+                    runtime.manifest.identity.version
+                )));
+            }
+            if let (Some(expected), Some(observed)) = (
+                runtime.manifest.identity.upstream_revision.as_deref(),
+                revision.as_deref(),
+            ) && !expected.starts_with(observed)
+                && !observed.starts_with(expected)
+            {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "runtime revision `{observed}` does not match package revision `{expected}`"
+                )));
+            }
+        }
+        Ok(RuntimeProbeObservation {
+            compatible: true,
+            observed_engine_id: ENGINE_ID.to_owned(),
+            observed_version: version,
+            observed_revision: revision,
+            detail: first_line(&version_text).to_owned(),
+            observed_at_unix: unix_timestamp(),
+        })
     }
 
     async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError> {
@@ -429,17 +589,32 @@ impl EngineAdapter for LlamaCppAdapter {
                 "llama.cpp backend address must be loopback".to_owned(),
             ));
         }
-        let probe = self.probe().await?;
-        let installation = match probe.installation {
-            InstallationState::Installed { installation } if probe.healthy => installation,
-            InstallationState::NotInstalled => return Err(EngineError::NotInstalled),
-            InstallationState::Invalid { reason } => {
-                return Err(EngineError::InvalidConfiguration(reason));
-            }
-            InstallationState::Installed { .. } => {
-                return Err(EngineError::Operation(probe.detail));
-            }
-        };
+        let observation = self.probe_runtime(&request.runtime).await?;
+        let binary_path = request.runtime.entrypoint_path();
+        let manifest = &request.runtime.manifest;
+        let installation = Box::new(EngineInstallation {
+            engine: EngineRevision {
+                engine_id: ENGINE_ID.to_owned(),
+                version: observation.observed_version.clone(),
+                revision: observation.observed_revision.clone(),
+            },
+            source_repository: manifest.identity.package.repository.clone(),
+            acquisition_method: match manifest.acquisition_method {
+                RuntimeAcquisitionMethod::OfficialReleaseAsset
+                | RuntimeAcquisitionMethod::PreseededOfficialPack => {
+                    AcquisitionMethod::OfficialBinary
+                }
+                RuntimeAcquisitionMethod::ExternalBinary => AcquisitionMethod::ExternalBinary,
+            },
+            binary_path: binary_path.clone(),
+            binary_sha256: Some(manifest.entrypoint_sha256.clone()),
+            build: None,
+            platform: manifest.identity.platform.clone(),
+            architecture: manifest.identity.architecture.clone(),
+            runtime_variant: Some(manifest.identity.variant.clone()),
+            acquired_at_unix: manifest.installed_at_unix,
+            observed_at_unix: observation.observed_at_unix,
+        });
         let arguments = vec![
             OsString::from("--model"),
             request.model.path.as_os_str().to_owned(),
@@ -454,7 +629,7 @@ impl EngineAdapter for LlamaCppAdapter {
         .chain(self.native_arguments.iter().map(OsString::from))
         .collect();
         Ok(LaunchSpec {
-            executable: installation.binary_path.clone(),
+            executable: binary_path,
             arguments,
             environment: self.environment.clone(),
             environment_remove: managed_environment_removals(),
@@ -464,6 +639,7 @@ impl EngineAdapter for LlamaCppAdapter {
             normalized_settings: BTreeMap::new(),
             native_arguments: self.native_arguments.clone(),
             installation: (*installation).clone(),
+            runtime: request.runtime,
         })
     }
 
@@ -564,7 +740,7 @@ impl EngineAdapter for LlamaCppAdapter {
         let choice = response.choices.into_iter().next().ok_or_else(|| {
             EngineError::Operation("llama.cpp response contained no completion choice".to_owned())
         })?;
-        let finish_reason = map_finish_reason(choice.finish_reason.as_deref());
+        let finish_reason = map_finish_reason(choice.finish_reason.as_deref())?;
         let text = choice.message.content.ok_or_else(|| {
             EngineError::Operation("llama.cpp response contained no assistant text".to_owned())
         })?;
@@ -671,7 +847,7 @@ struct SseState {
     buffer: Vec<u8>,
     queued: VecDeque<Result<InferenceEvent, EngineError>>,
     usage: Option<InferenceUsage>,
-    finish_reason: InferenceFinishReason,
+    finish_reason: Option<InferenceFinishReason>,
     finished: bool,
 }
 
@@ -681,7 +857,7 @@ fn llama_sse_stream(source: BoxStream<'static, Result<Bytes, reqwest::Error>>) -
         buffer: Vec::new(),
         queued: VecDeque::new(),
         usage: None,
-        finish_reason: InferenceFinishReason::Stop,
+        finish_reason: None,
         finished: false,
     };
     Box::pin(stream::unfold(state, |mut state| async move {
@@ -737,10 +913,17 @@ fn parse_sse_frames(state: &mut SseState) {
             continue;
         }
         if data == "[DONE]" {
-            state.queued.push_back(Ok(InferenceEvent::Completed {
-                usage: state.usage.take(),
-                finish_reason: state.finish_reason,
-            }));
+            match state.finish_reason.take() {
+                Some(finish_reason) => {
+                    state.queued.push_back(Ok(InferenceEvent::Completed {
+                        usage: state.usage.take(),
+                        finish_reason,
+                    }));
+                }
+                None => state.queued.push_back(Err(EngineError::BackendUnavailable(
+                    "llama.cpp stream reached [DONE] without a terminal finish reason".to_owned(),
+                ))),
+            }
             state.finished = true;
             return;
         }
@@ -779,9 +962,23 @@ fn parse_sse_frames(state: &mut SseState) {
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
             .and_then(|choice| choice.get("finish_reason"))
-            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_null())
         {
-            state.finish_reason = map_finish_reason(Some(finish_reason));
+            let Some(finish_reason) = finish_reason.as_str() else {
+                state.queued.push_back(Err(EngineError::Operation(
+                    "llama.cpp stream returned a non-string finish reason".to_owned(),
+                )));
+                state.finished = true;
+                return;
+            };
+            match map_finish_reason(Some(finish_reason)) {
+                Ok(finish_reason) => state.finish_reason = Some(finish_reason),
+                Err(error) => {
+                    state.queued.push_back(Err(error));
+                    state.finished = true;
+                    return;
+                }
+            }
         }
         if let Some(delta) = value
             .get("choices")
@@ -918,11 +1115,16 @@ fn parse_version(output: &str) -> (Option<String>, Option<String>) {
     (version, revision)
 }
 
-fn map_finish_reason(reason: Option<&str>) -> InferenceFinishReason {
-    if reason == Some("length") {
-        InferenceFinishReason::MaxOutputTokens
-    } else {
-        InferenceFinishReason::Stop
+fn map_finish_reason(reason: Option<&str>) -> Result<InferenceFinishReason, EngineError> {
+    match reason {
+        Some("stop") => Ok(InferenceFinishReason::Stop),
+        Some("length") => Ok(InferenceFinishReason::MaxOutputTokens),
+        Some(reason) => Err(EngineError::Operation(format!(
+            "llama.cpp returned unsupported finish reason `{reason}`"
+        ))),
+        None => Err(EngineError::Operation(
+            "llama.cpp response omitted its terminal finish reason".to_owned(),
+        )),
     }
 }
 

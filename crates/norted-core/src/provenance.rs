@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ModelId;
+use crate::{ModelId, RuntimeManifest, RuntimeSelectionSource};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineRevision {
@@ -61,12 +61,16 @@ pub struct ModelRuntimeIdentity {
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum NativeArgumentProvenance {
     Value(String),
-    Redacted { argument: String },
+    Redacted {
+        argument: String,
+        value_sha256: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentVariableProvenance {
     pub name: String,
+    pub inherited: bool,
     /// Optional hash of the value for comparison without retaining the secret.
     pub value_sha256: Option<String>,
 }
@@ -80,6 +84,9 @@ pub struct ProcessIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeProvenance {
     pub model: ModelRuntimeIdentity,
+    pub runtime: RuntimeManifest,
+    pub runtime_entrypoint: PathBuf,
+    pub selection_source: RuntimeSelectionSource,
     pub installation: EngineInstallation,
     pub profile: Option<String>,
     pub normalized_settings: BTreeMap<String, serde_json::Value>,

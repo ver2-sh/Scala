@@ -9,13 +9,26 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::Stream;
-use norted_core::{ArtifactFormat, EngineInstallation, EngineRevision, ModelArtifact};
-use serde::{Deserialize, Deserializer, Serialize};
+use norted_core::{
+    ArtifactFormat, AvailableRuntime, EngineInstallation, EngineRevision, InstalledRuntime,
+    ModelArtifact, RuntimeProbeObservation,
+};
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
+mod catalog;
 mod control;
+mod installer;
 mod manager;
+mod packs;
+mod store;
 mod supervisor;
+
+pub use catalog::{
+    CatalogError, GitHubRelease, GitHubReleaseAsset, GitHubReleaseClient, RuntimeCatalog,
+    RuntimeCatalogEntry, RuntimeCatalogProvider, RuntimeCatalogSnapshot, RuntimeProviderAuthority,
+    RuntimeProviderError, compatibility_for, detect_host_capabilities,
+};
 
 pub use control::{
     CONTROL_LOAD_PATH, CONTROL_STATUS_PATH, CONTROL_UNLOAD_PATH, ControlClient, ControlClientError,
@@ -25,6 +38,11 @@ pub use manager::{
     BackendLifecycle, BackendStatus, ControlStatus, EngineStatus, RuntimeError, RuntimeManager,
     RuntimeManagerOptions, RuntimeNotice, RuntimeNoticeLevel,
 };
+pub use packs::{
+    InstalledRuntimeStatus, RuntimeListSnapshot, RuntimePackError, RuntimePackManager,
+    RuntimeSearchResult, RuntimeSearchSnapshot, RuntimeUpdateCheck,
+};
+pub use store::{RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreSnapshot};
 pub use supervisor::{CapturedCommand, TokioProcessSupervisor, capture_command};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,77 +95,6 @@ impl CompatibilityDecision {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-#[serde(transparent)]
-pub struct ExactAcquisitionValue(String);
-
-impl ExactAcquisitionValue {
-    pub fn new(value: impl Into<String>) -> Result<Self, ExactAcquisitionValueError> {
-        let value = value.into().trim().to_owned();
-        if value.is_empty() {
-            return Err(ExactAcquisitionValueError);
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for ExactAcquisitionValue {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
-#[error("exact acquisition version or revision cannot be empty")]
-pub struct ExactAcquisitionValueError;
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "selector")]
-pub enum ExactAcquisitionTarget {
-    Version {
-        version: ExactAcquisitionValue,
-    },
-    Revision {
-        revision: ExactAcquisitionValue,
-    },
-    VersionAndRevision {
-        version: ExactAcquisitionValue,
-        revision: ExactAcquisitionValue,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "target")]
-pub enum AcquisitionTarget {
-    Stable,
-    Latest,
-    Exact { selector: ExactAcquisitionTarget },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InstallationContext {
-    pub install_root: PathBuf,
-    pub cache_root: PathBuf,
-    pub platform: String,
-    pub architecture: String,
-    pub build_options: BTreeMap<String, String>,
-    pub runtime_variant: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AcquisitionRequest {
-    pub target: AcquisitionTarget,
-    pub context: InstallationContext,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum InstallationState {
@@ -198,6 +145,7 @@ pub enum OptionValueKind {
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
     pub model: ModelArtifact,
+    pub runtime: InstalledRuntime,
     pub backend_address: SocketAddr,
 }
 
@@ -213,6 +161,7 @@ pub struct LaunchSpec {
     pub normalized_settings: BTreeMap<String, serde_json::Value>,
     pub native_arguments: Vec<String>,
     pub installation: EngineInstallation,
+    pub runtime: InstalledRuntime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -226,6 +175,10 @@ pub struct ProcessDescriptor {
     pub supervisor_id: String,
     pub process_id: u32,
     pub engine: EngineRevision,
+    pub runtime_id: norted_core::RuntimeId,
+    pub runtime_version: String,
+    pub runtime_variant: String,
+    pub runtime_executable_sha256: String,
     pub model_id: norted_core::ModelId,
     pub endpoint: Option<String>,
     pub launched_at_unix: i64,
@@ -341,6 +294,18 @@ pub enum RegistryError {
 pub trait EngineAdapter: Send + Sync {
     fn identity(&self) -> EngineIdentity;
     fn capabilities(&self) -> EngineCapabilities;
+    fn runtime_management_compatibility(&self) -> CompatibilityDecision {
+        CompatibilityDecision::Supported
+    }
+    fn available_runtime_compatibility(
+        &self,
+        _runtime: &AvailableRuntime,
+    ) -> CompatibilityDecision {
+        CompatibilityDecision::Supported
+    }
+    fn runtime_compatibility(&self, _runtime: &InstalledRuntime) -> CompatibilityDecision {
+        CompatibilityDecision::Supported
+    }
     fn compatibility(&self, model: &ModelArtifact) -> CompatibilityDecision {
         if self.capabilities().accepts(model.format) {
             CompatibilityDecision::Supported
@@ -354,10 +319,15 @@ pub trait EngineAdapter: Send + Sync {
         }
     }
     fn native_options(&self) -> Vec<NativeOption>;
+    /// Reports the legacy/flexible-entry runtime configured directly for this
+    /// adapter. Managed packs are discovered by the shared runtime store.
     async fn probe(&self) -> Result<EngineProbe, EngineError>;
-    async fn install(&self, request: AcquisitionRequest)
-    -> Result<EngineInstallation, EngineError>;
-    async fn update(&self, request: AcquisitionRequest) -> Result<EngineInstallation, EngineError>;
+    /// Validates one exact runtime instance and records what the executable
+    /// itself reported. Install activation and launch both use this boundary.
+    async fn probe_runtime(
+        &self,
+        runtime: &InstalledRuntime,
+    ) -> Result<RuntimeProbeObservation, EngineError>;
     async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError>;
     async fn health(&self, process: &ProcessDescriptor) -> Result<bool, EngineError>;
     async fn effective_generation_settings(
@@ -447,57 +417,9 @@ mod tests {
     use norted_core::{ArtifactFormat, ModelArtifact, ModelId};
 
     use super::{
-        AcquisitionRequest, CompatibilityDecision, EngineAdapter, EngineCapabilities, EngineError,
-        EngineIdentity, EngineInstallation, EngineProbe, EngineRegistry, ExactAcquisitionTarget,
-        ExactAcquisitionValue, LaunchRequest, LaunchSpec, NativeOption, ProcessDescriptor,
+        CompatibilityDecision, EngineAdapter, EngineCapabilities, EngineError, EngineIdentity,
+        EngineProbe, EngineRegistry, LaunchRequest, LaunchSpec, NativeOption, ProcessDescriptor,
     };
-
-    #[test]
-    fn exact_acquisition_values_are_non_empty_and_normalized() {
-        assert!(ExactAcquisitionValue::new("").is_err());
-        assert!(ExactAcquisitionValue::new(" \t\r\n ").is_err());
-        assert_eq!(
-            ExactAcquisitionValue::new("  v1.2.3  ")
-                .expect("non-empty exact value")
-                .as_str(),
-            "v1.2.3"
-        );
-    }
-
-    #[test]
-    fn exact_acquisition_serde_rejects_empty_values_and_supports_all_selectors() {
-        for invalid in [
-            r#"{"selector":"version","version":""}"#,
-            r#"{"selector":"revision","revision":"   "}"#,
-            r#"{"selector":"version_and_revision","version":"1.0","revision":"\t"}"#,
-        ] {
-            assert!(serde_json::from_str::<ExactAcquisitionTarget>(invalid).is_err());
-        }
-
-        let version = serde_json::from_str::<ExactAcquisitionTarget>(
-            r#"{"selector":"version","version":" 1.0 "}"#,
-        )
-        .expect("version selector");
-        let revision = serde_json::from_str::<ExactAcquisitionTarget>(
-            r#"{"selector":"revision","revision":" abc123 "}"#,
-        )
-        .expect("revision selector");
-        let both = serde_json::from_str::<ExactAcquisitionTarget>(
-            r#"{"selector":"version_and_revision","version":" 1.0 ","revision":" abc123 "}"#,
-        )
-        .expect("version and revision selector");
-
-        assert!(matches!(version, ExactAcquisitionTarget::Version { .. }));
-        assert!(matches!(revision, ExactAcquisitionTarget::Revision { .. }));
-        assert!(matches!(
-            both,
-            ExactAcquisitionTarget::VersionAndRevision { .. }
-        ));
-        assert_eq!(
-            serde_json::to_value(version).expect("serialize normalized selector")["version"],
-            "1.0"
-        );
-    }
 
     struct ArchitectureAdapter {
         id: &'static str,
@@ -554,17 +476,10 @@ mod tests {
             unreachable!()
         }
 
-        async fn install(
+        async fn probe_runtime(
             &self,
-            _request: AcquisitionRequest,
-        ) -> Result<EngineInstallation, EngineError> {
-            unreachable!()
-        }
-
-        async fn update(
-            &self,
-            _request: AcquisitionRequest,
-        ) -> Result<EngineInstallation, EngineError> {
+            _runtime: &norted_core::InstalledRuntime,
+        ) -> Result<norted_core::RuntimeProbeObservation, EngineError> {
             unreachable!()
         }
 
@@ -630,6 +545,7 @@ mod tests {
             architecture: Some("architecture-b".to_owned()),
             context_length: None,
             provenance: None,
+            auxiliary_artifacts: Vec::new(),
         };
         let compatible = registry.compatible_with(&model);
 

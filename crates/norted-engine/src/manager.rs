@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -6,17 +7,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use norted_core::{
     ApplicationCore, EnvironmentVariableProvenance, ModelId, ModelRuntimeIdentity,
-    NativeArgumentProvenance, ProcessIdentity, RuntimeProvenance,
+    NativeArgumentProvenance, ProcessIdentity, RuntimeId, RuntimeProvenance, RuntimeSelection,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter, EngineError, EngineIdentity,
-    EngineProbe, EngineRegistry, InferenceRequest, InstallationState, LaunchRequest,
-    ProcessDescriptor, ProcessExit, ProcessSupervisor, RoutedInferenceOutput,
-    RoutedInferenceStream,
+    EffectiveGenerationSettings, EngineAdapter, EngineError, EngineIdentity, EngineProbe,
+    EngineRegistry, InferenceRequest, InstallationState, LaunchRequest, ProcessDescriptor,
+    ProcessExit, ProcessSupervisor, RoutedInferenceOutput, RoutedInferenceStream, RuntimeLease,
+    RuntimePackError, RuntimePackManager,
 };
 
 const NOTICE_LIMIT: usize = 64;
@@ -42,6 +43,10 @@ pub struct BackendStatus {
     pub lifecycle: BackendLifecycle,
     pub model_id: Option<ModelId>,
     pub engine_id: Option<String>,
+    pub runtime_id: Option<RuntimeId>,
+    pub runtime_version: Option<String>,
+    pub runtime_variant: Option<String>,
+    pub runtime_executable_sha256: Option<String>,
     pub process_id: Option<u32>,
     pub private_endpoint: Option<String>,
     pub failure: Option<String>,
@@ -106,10 +111,6 @@ pub enum RuntimeError {
     Incompatible { model_id: ModelId, reason: String },
     #[error("no compatible installed engine is available: {0}")]
     EngineUnavailable(String),
-    #[error(
-        "multiple compatible installed engines are available; explicit engine selection is required: {0}"
-    )]
-    AmbiguousEngine(String),
     #[error("engine failed during startup: {0}")]
     StartupFailed(String),
     #[error("engine startup timed out after {0:?}")]
@@ -133,6 +134,7 @@ struct ActiveBackend {
     engine_id: String,
     endpoint: String,
     effective_generation_settings: EffectiveGenerationSettings,
+    _runtime_lease: RuntimeLease,
 }
 
 struct ManagerState {
@@ -141,8 +143,10 @@ struct ManagerState {
     lifecycle: BackendLifecycle,
     model_id: Option<ModelId>,
     engine_id: Option<String>,
+    runtime_id: Option<RuntimeId>,
     active: Option<ActiveBackend>,
     loading_process: Option<ProcessDescriptor>,
+    loading_runtime_lease: Option<RuntimeLease>,
     cancel_loading: bool,
     failure: Option<String>,
     provenance: Option<RuntimeProvenance>,
@@ -153,6 +157,7 @@ struct ManagerState {
 pub struct RuntimeManager {
     core: Arc<ApplicationCore>,
     registry: EngineRegistry,
+    packs: Arc<RuntimePackManager>,
     supervisor: Arc<dyn ProcessSupervisor>,
     options: RuntimeManagerOptions,
     state: RwLock<ManagerState>,
@@ -165,12 +170,14 @@ impl RuntimeManager {
     pub async fn initialize(
         core: Arc<ApplicationCore>,
         registry: EngineRegistry,
+        packs: Arc<RuntimePackManager>,
         supervisor: Arc<dyn ProcessSupervisor>,
         options: RuntimeManagerOptions,
     ) -> Arc<Self> {
         let manager = Arc::new(Self {
             core,
             registry,
+            packs,
             supervisor,
             options,
             state: RwLock::new(ManagerState {
@@ -179,8 +186,10 @@ impl RuntimeManager {
                 lifecycle: BackendLifecycle::Stopped,
                 model_id: None,
                 engine_id: None,
+                runtime_id: None,
                 active: None,
                 loading_process: None,
+                loading_runtime_lease: None,
                 cancel_loading: false,
                 failure: None,
                 provenance: None,
@@ -247,6 +256,22 @@ impl RuntimeManager {
                 lifecycle: state.lifecycle,
                 model_id: state.model_id.clone(),
                 engine_id: state.engine_id.clone(),
+                runtime_id: state.runtime_id.clone(),
+                runtime_version: state
+                    .runtime_id
+                    .as_ref()
+                    .and(state.provenance.as_ref())
+                    .map(|provenance| provenance.runtime.identity.version.clone()),
+                runtime_variant: state
+                    .runtime_id
+                    .as_ref()
+                    .and(state.provenance.as_ref())
+                    .map(|provenance| provenance.runtime.identity.variant.clone()),
+                runtime_executable_sha256: state
+                    .runtime_id
+                    .as_ref()
+                    .and(state.provenance.as_ref())
+                    .map(|provenance| provenance.runtime.entrypoint_sha256.clone()),
                 process_id,
                 private_endpoint: if state.lifecycle == BackendLifecycle::Stopped {
                     None
@@ -266,6 +291,14 @@ impl RuntimeManager {
     }
 
     pub async fn load(self: &Arc<Self>, model_id: ModelId) -> Result<ControlStatus, RuntimeError> {
+        self.load_with_runtime(model_id, None).await
+    }
+
+    pub async fn load_with_runtime(
+        self: &Arc<Self>,
+        model_id: ModelId,
+        runtime_id: Option<RuntimeId>,
+    ) -> Result<ControlStatus, RuntimeError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(RuntimeError::Operation(
                 "the runtime is shutting down".to_owned(),
@@ -273,14 +306,19 @@ impl RuntimeManager {
         }
         let cancellation_epoch = self.cancellation_epoch.load(Ordering::Acquire);
         let manager = Arc::clone(self);
-        tokio::spawn(async move { manager.load_inner(model_id, cancellation_epoch).await })
-            .await
-            .map_err(|error| RuntimeError::Operation(format!("load task failed: {error}")))?
+        tokio::spawn(async move {
+            manager
+                .load_inner(model_id, runtime_id, cancellation_epoch)
+                .await
+        })
+        .await
+        .map_err(|error| RuntimeError::Operation(format!("load task failed: {error}")))?
     }
 
     async fn load_inner(
         self: &Arc<Self>,
         model_id: ModelId,
+        runtime_id: Option<RuntimeId>,
         cancellation_epoch: u64,
     ) -> Result<ControlStatus, RuntimeError> {
         let _operation = self.operation.lock().await;
@@ -302,9 +340,11 @@ impl RuntimeManager {
             state.lifecycle = BackendLifecycle::Loading;
             state.model_id = Some(model_id.clone());
             state.engine_id = None;
+            state.runtime_id = None;
             state.failure = None;
             state.active = None;
             state.loading_process = None;
+            state.loading_runtime_lease = None;
             state.cancel_loading = self.load_cancelled(cancellation_epoch);
             state.provenance = None;
             push_notice(
@@ -320,14 +360,22 @@ impl RuntimeManager {
             return Err(RuntimeError::Operation(detail));
         }
 
-        let adapter = match self.select_engine(&model).await {
-            Ok(adapter) => adapter,
+        let (adapter, selection) = match self.select_runtime(&model, runtime_id.as_ref()).await {
+            Ok(selection) => selection,
             Err(error) => {
                 self.fail_loading(generation, error.to_string(), None).await;
                 return Err(error);
             }
         };
         let engine_id = adapter.identity().id;
+        let selected_runtime_id = selection.runtime.manifest.runtime_id.clone();
+        let runtime_lease = match self.packs.acquire_runtime_lease(&selected_runtime_id).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.fail_loading(generation, error.to_string(), None).await;
+                return Err(RuntimeError::Operation(error.to_string()));
+            }
+        };
         let cancelled = {
             let mut state = self.state.write().await;
             if state.generation != generation
@@ -338,6 +386,11 @@ impl RuntimeManager {
                 true
             } else {
                 state.engine_id = Some(engine_id.clone());
+                state.runtime_id = Some(selected_runtime_id.clone());
+                state.loading_runtime_lease = Some(runtime_lease);
+                for notice in &selection.notices {
+                    push_notice(&mut state, RuntimeNoticeLevel::Warning, notice.clone());
+                }
                 false
             }
         };
@@ -358,6 +411,7 @@ impl RuntimeManager {
         let launch_spec = match adapter
             .build_launch_spec(LaunchRequest {
                 model: model.clone(),
+                runtime: selection.runtime.clone(),
                 backend_address,
             })
             .await
@@ -374,10 +428,15 @@ impl RuntimeManager {
             return Err(RuntimeError::Operation(detail));
         }
         let installation = launch_spec.installation.clone();
+        let selected_runtime = launch_spec.runtime.clone();
         let normalized_settings = launch_spec.normalized_settings.clone();
         let native_arguments = launch_spec.native_arguments.clone();
-        let native_environment = environment_provenance(&launch_spec.environment);
         let inherits_parent_environment = launch_spec.inherits_parent_environment;
+        let native_environment = environment_provenance(
+            &launch_spec.environment,
+            &launch_spec.environment_remove,
+            inherits_parent_environment,
+        );
         let process = match self
             .supervisor
             .spawn(launch_spec, installation.engine.clone(), model_id.clone())
@@ -425,6 +484,9 @@ impl RuntimeManager {
                 artifact_path: model.path.clone(),
                 content_sha256: model.hash.clone(),
             },
+            runtime: selected_runtime.manifest.clone(),
+            runtime_entrypoint: selected_runtime.entrypoint_path(),
+            selection_source: selection.source,
             installation,
             profile: None,
             normalized_settings,
@@ -500,6 +562,20 @@ impl RuntimeManager {
             state.lifecycle = BackendLifecycle::Running;
             state.loading_process = None;
             state.cancel_loading = false;
+            if let Some(provenance) = state.provenance.as_mut() {
+                provenance.normalized_settings.insert(
+                    "temperature".to_owned(),
+                    serde_json::json!(effective_generation_settings.temperature),
+                );
+                provenance.normalized_settings.insert(
+                    "top_p".to_owned(),
+                    serde_json::json!(effective_generation_settings.top_p),
+                );
+            }
+            let runtime_lease = state
+                .loading_runtime_lease
+                .take()
+                .expect("a loading runtime must retain its store lease");
             state.active = Some(ActiveBackend {
                 adapter,
                 process: process.clone(),
@@ -507,6 +583,7 @@ impl RuntimeManager {
                 engine_id: engine_id.clone(),
                 endpoint,
                 effective_generation_settings,
+                _runtime_lease: runtime_lease,
             });
             push_notice(
                 &mut state,
@@ -574,8 +651,10 @@ impl RuntimeManager {
         state.lifecycle = BackendLifecycle::Stopped;
         state.model_id = None;
         state.engine_id = None;
+        state.runtime_id = None;
         state.active = None;
         state.loading_process = None;
+        state.loading_runtime_lease = None;
         state.cancel_loading = false;
         state.failure = None;
         push_notice(
@@ -676,56 +755,29 @@ impl RuntimeManager {
         }
     }
 
-    async fn select_engine(
+    async fn select_runtime(
         &self,
         model: &norted_core::ModelArtifact,
-    ) -> Result<Arc<dyn EngineAdapter>, RuntimeError> {
-        let mut compatible = Vec::new();
-        let mut incompatible_reasons = Vec::new();
-        for adapter in self.registry.adapters() {
-            match adapter.compatibility(model) {
-                CompatibilityDecision::Supported => {
-                    let probe = adapter.probe().await.map_err(|error| {
-                        RuntimeError::EngineUnavailable(format!(
-                            "{} probe failed: {error}",
-                            adapter.identity().id
-                        ))
-                    })?;
-                    self.state.write().await.engines.insert(
-                        adapter.identity().id.clone(),
-                        EngineStatus {
-                            identity: adapter.identity(),
-                            probe: probe.clone(),
-                        },
-                    );
-                    if probe.healthy
-                        && matches!(probe.installation, InstallationState::Installed { .. })
-                    {
-                        compatible.push(Arc::clone(adapter));
-                    }
-                }
-                CompatibilityDecision::Unsupported { reason } => {
-                    incompatible_reasons.push(format!("{}: {reason}", adapter.identity().id));
-                }
-            }
-        }
-        match compatible.len() {
-            0 if !incompatible_reasons.is_empty() => Err(RuntimeError::Incompatible {
-                model_id: model.id.clone(),
-                reason: incompatible_reasons.join("; "),
-            }),
-            0 => Err(RuntimeError::EngineUnavailable(
-                "compatible adapters are disabled, missing, or invalid".to_owned(),
-            )),
-            1 => Ok(compatible.remove(0)),
-            _ => Err(RuntimeError::AmbiguousEngine(
-                compatible
-                    .iter()
-                    .map(|adapter| adapter.identity().id)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )),
-        }
+        explicit_runtime: Option<&RuntimeId>,
+    ) -> Result<(Arc<dyn EngineAdapter>, RuntimeSelection), RuntimeError> {
+        let selection = self
+            .packs
+            .resolve(model, explicit_runtime)
+            .await
+            .map_err(|error| match error {
+                RuntimePackError::Incompatible { reason, .. } => RuntimeError::Incompatible {
+                    model_id: model.id.clone(),
+                    reason,
+                },
+                error => RuntimeError::EngineUnavailable(error.to_string()),
+            })?;
+        let engine_id = &selection.runtime.manifest.identity.engine_id;
+        let adapter = self.registry.get(engine_id).ok_or_else(|| {
+            RuntimeError::EngineUnavailable(format!(
+                "selected runtime uses unregistered engine `{engine_id}`"
+            ))
+        })?;
+        Ok((adapter, selection))
     }
 
     async fn wait_for_readiness(
@@ -776,6 +828,10 @@ impl RuntimeManager {
         state.failure = Some(detail.clone());
         state.active = None;
         state.loading_process = process.cloned();
+        if process.is_none() {
+            state.runtime_id = None;
+            state.loading_runtime_lease = None;
+        }
         state.cancel_loading = false;
         if let Some(process) = process
             && let Some(provenance) = &mut state.provenance
@@ -847,6 +903,7 @@ impl RuntimeManager {
         state.lifecycle = BackendLifecycle::Failed;
         state.failure = Some(detail.clone());
         state.active = None;
+        state.runtime_id = None;
         push_notice(
             &mut state,
             RuntimeNoticeLevel::Error,
@@ -882,6 +939,22 @@ impl RuntimeManager {
                 lifecycle: state.lifecycle,
                 model_id: state.model_id.clone(),
                 engine_id: state.engine_id.clone(),
+                runtime_id: state.runtime_id.clone(),
+                runtime_version: state
+                    .runtime_id
+                    .as_ref()
+                    .and(state.provenance.as_ref())
+                    .map(|provenance| provenance.runtime.identity.version.clone()),
+                runtime_variant: state
+                    .runtime_id
+                    .as_ref()
+                    .and(state.provenance.as_ref())
+                    .map(|provenance| provenance.runtime.identity.variant.clone()),
+                runtime_executable_sha256: state
+                    .runtime_id
+                    .as_ref()
+                    .and(state.provenance.as_ref())
+                    .map(|provenance| provenance.runtime.entrypoint_sha256.clone()),
                 process_id,
                 private_endpoint: if state.lifecycle == BackendLifecycle::Stopped {
                     None
@@ -935,33 +1008,59 @@ fn reserve_loopback_address() -> std::io::Result<SocketAddr> {
 }
 
 fn native_argument_provenance(arguments: Vec<String>) -> Vec<NativeArgumentProvenance> {
-    arguments
-        .into_iter()
-        .map(|argument| {
-            if let Some((name, _)) = argument.split_once('=')
-                && name.starts_with('-')
-            {
-                NativeArgumentProvenance::Redacted {
-                    argument: format!("{name}=<redacted>"),
-                }
-            } else if argument.starts_with('-') {
-                NativeArgumentProvenance::Value(argument)
-            } else {
-                NativeArgumentProvenance::Redacted {
-                    argument: "<redacted>".to_owned(),
-                }
-            }
-        })
-        .collect()
+    let mut provenance = Vec::with_capacity(arguments.len());
+    let mut previous_option = None;
+    for (index, argument) in arguments.into_iter().enumerate() {
+        if let Some((name, value)) = argument.split_once('=')
+            && name.starts_with('-')
+        {
+            provenance.push(NativeArgumentProvenance::Redacted {
+                argument: format!("{name}=<redacted>"),
+                value_sha256: hex_digest(Sha256::digest(value.as_bytes())),
+            });
+            previous_option = None;
+        } else if argument.starts_with('-') {
+            previous_option = Some(argument.clone());
+            provenance.push(NativeArgumentProvenance::Value(argument));
+        } else {
+            let owner = previous_option
+                .take()
+                .map(|option| format!("{option}=<redacted>"))
+                .unwrap_or_else(|| format!("<positional:{index}>=<redacted>"));
+            provenance.push(NativeArgumentProvenance::Redacted {
+                argument: owner,
+                value_sha256: hex_digest(Sha256::digest(argument.as_bytes())),
+            });
+        }
+    }
+    provenance
 }
 
 fn environment_provenance(
     environment: &BTreeMap<String, String>,
+    environment_remove: &[OsString],
+    inherits_parent_environment: bool,
 ) -> Vec<EnvironmentVariableProvenance> {
-    environment
+    let mut observed = environment
         .iter()
-        .map(|(name, value)| EnvironmentVariableProvenance {
-            name: name.clone(),
+        .map(|(name, value)| (name.clone(), (value.clone(), false)))
+        .collect::<BTreeMap<_, _>>();
+    if inherits_parent_environment {
+        for (name, value) in std::env::vars() {
+            let removed = environment_remove
+                .iter()
+                .any(|removed| name.eq_ignore_ascii_case(&removed.to_string_lossy()));
+            let overridden = observed.keys().any(|key| key.eq_ignore_ascii_case(&name));
+            if !removed && !overridden {
+                observed.insert(name, (value, true));
+            }
+        }
+    }
+    observed
+        .into_iter()
+        .map(|(name, (value, inherited))| EnvironmentVariableProvenance {
+            name,
+            inherited,
             value_sha256: Some(hex_digest(Sha256::digest(value.as_bytes()))),
         })
         .collect()

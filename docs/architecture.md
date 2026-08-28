@@ -1,202 +1,215 @@
 # Architecture
 
-Norted Server is an engine-agnostic local inference control plane composed by the `norted-server` binary. The first engine integration is llama.cpp, but llama.cpp-specific flags, probing, health checks, and backend JSON remain behind the common engine boundary.
+Norted Server is an engine-agnostic local inference control plane composed by the `norted-server` binary. It owns model discovery, runtime acquisition and selection, process lifecycle, normalized inference, provenance, and the public protocol. Upstream executables remain separately versioned runtime packs.
 
-There are three distinct network surfaces:
+## Engine and runtime boundaries
 
-```text
-                                              serve process
-                                      ┌───────────────────────────┐
-client ── configured public address ─▶│ public Axum gateway       │
-                                      │ /health                   │
-                                      │ /v1/models                │
-                                      │ /v1/responses             │
-                                      └─────────────┬─────────────┘
-                                                    │ engine-neutral inference
-                                                    ▼
-                                      ┌───────────────────────────┐
-                                      │ RuntimeManager            │
-                                      │ one active backend        │
-                                      └───────┬───────────▲───────┘
-                                              │           │
-                                  launch/infer│           │status/load/unload
-                                              ▼           │
-                                      ┌───────────────┐   │
-                                      │ llama.cpp     │   │
-                                      │ adapter       │   │
-                                      └───────┬───────┘   │
-                                              │           │
-                                  127.0.0.1:<dynamic>      │
-                                              ▼           │
-                                      ┌───────────────┐   │
-                                      │ llama-server  │   │
-                                      │ owned child   │   │
-                                      └───────────────┘   │
-                                                          │
-CLI / TUI ── descriptor + Bearer token ── 127.0.0.1:<dynamic>
-                                      private control listener
-```
+An `EngineAdapter` represents implementation knowledge: identity, supported artifact formats and capabilities, model compatibility, runtime probing, launch semantics, readiness, effective settings, and request/event translation. It never implies that only one executable exists.
 
-The configured public listener is the stable client-facing endpoint. It defaults to `127.0.0.1:8742`, but configuration can change it. The llama.cpp backend and control listener are always bound separately on IPv4 loopback with OS-assigned ports. Clients are never redirected to the backend.
-
-## Cross-process runtime and control
-
-A TUI or CLI invocation has its own in-memory `ApplicationCore`; it does not share an `Arc<ApplicationCore>` with a separately launched `serve` process. Cross-process observation and control therefore use the state directory:
+An `InstalledRuntime` represents one executable package and immutable provenance. Launch input is therefore:
 
 ```text
-state/runtime/servers/<instance-id>.json
+ModelArtifact + InstalledRuntime + private address
+                     │
+                     ▼
+                EngineAdapter
+                     │
+                     ▼
+                  LaunchSpec
 ```
 
-The schema-version-2 descriptor contains the random instance identity, PID, public endpoint and probe address, private control endpoint and loopback address, random control token, and start timestamp. The serving process writes the descriptor by syncing a uniquely named temporary file and atomically renaming it. On Unix, the runtime directory is set to mode `0700` and the descriptor to `0600`; on other platforms the current code leaves the existing application-state directory ACLs unchanged. Debug formatting redacts the token.
+`EngineRegistry` contains the llama.cpp and q27 adapters. `RuntimePackManager` finds installed runtimes whose engine adapter and declared formats can serve the model, applies the selection policy, and hands the selected exact runtime to the adapter. No core branch says that GGUF always means llama.cpp or that Q27 always means q27; additional adapters can advertise either format without changing the resolver.
 
-An observer does not trust the descriptor's PID as proof of liveness. It probes public `GET /health` and accepts a descriptor only when the response contains the same random instance identity. Probes run concurrently with per-request and whole-cycle time limits. Identity mismatches and repeated aged failures are cleaned up conservatively; startup-grace descriptors and one-off connection failures or timeouts are retained. A healthy observation clears accumulated failure evidence, and removal rereads the descriptor to ensure that it still matches the observed instance.
-
-After descriptor validation, `ControlClient` reads the private endpoint and token and sends `Authorization: Bearer <token>` to:
+The complete local serving shape is:
 
 ```text
-GET  /control/v1/status
-POST /control/v1/load
-POST /control/v1/unload
+                                   norted-server serve
+                         ┌─────────────────────────────────┐
+client ─ public address ▶│ Axum gateway                   │
+                         │ /health /v1/models /v1/responses│
+                         └──────────────┬──────────────────┘
+                                        │ normalized inference
+                                        ▼
+                         ┌─────────────────────────────────┐
+                         │ RuntimeManager                  │
+                         │ exact runtime + one backend     │
+                         └──────┬──────────────────▲───────┘
+                                │ LaunchSpec       │ control
+                                ▼                  │
+                         ┌────────────────┐         │
+                         │ common process │         │
+                         │ supervisor     │         │
+                         └──────┬─────────┘         │
+                                │ 127.0.0.1:<dynamic>
+                                ▼                  │
+                         ┌────────────────┐         │
+                         │ llama-server or│         │
+                         │ q27-server     │         │
+                         └────────────────┘         │
+                                                   │
+CLI / TUI ─ descriptor + bearer token ─ 127.0.0.1:<dynamic>
 ```
 
-The control listener binds only to `127.0.0.1`, uses a constant-time token comparison, and is not part of the public router. The token is not returned by `/health`, `/v1/models`, `/v1/responses`, normalized control status, CLI/TUI output, or logs. Control status carries registered engine probes, installed/running counts, backend lifecycle, active model and engine, process/private endpoint diagnostics, bounded recent runtime notices, and provenance without exposing the credential.
+The public listener is configurable and defaults to `127.0.0.1:8742`. Backend and authenticated control listeners are always separate loopback endpoints. Clients are never redirected to an upstream backend.
 
-## Crate boundaries
+## Crate responsibilities
 
-`norted-server` is the composition root. It parses commands, initializes structured logging, loads the core, registers `LlamaCppAdapter` in `EngineRegistry`, constructs `RuntimeManager` with `TokioProcessSupervisor`, launches the TUI or API, handles shutdown, and translates failures. A load or unload CLI command discovers the already-running control instance; it does not create a second hidden serving process. Doctor remains dispatchable before normal configuration and directory setup.
+- `norted-core` owns platform paths, schema-version-1 configuration, model/auxiliary-artifact discovery, stable IDs, runtime identity/manifest/preferences data, host-independent provenance, application state, and process descriptors.
+- `norted-engine` owns `EngineAdapter`, `EngineRegistry`, the provider/catalog/cache, secure installer, runtime store and resolver, runtime/backend manager, generic process supervisor, control client, and normalized inference types.
+- `norted-engine-llama-cpp` owns official llama.cpp asset classification, binary probes, flags/environment policy, readiness and `/props`, and Chat Completions JSON/SSE translation.
+- `norted-engine-q27` owns official q27 asset/variant classification, tokenizer requirements, usage-signature probes, flags/environment policy, readiness, provable sampler settings, and Chat Completions JSON/SSE translation.
+- `norted-api` owns the public Responses subset and private authenticated control HTTP surfaces. It does not construct upstream flags or expose backend-native bytes.
+- `norted-tui` owns terminal lifecycle, responsive rendering, runtime search/install/selection interaction, and normalized control observation.
+- `norted-server` is the composition root and scriptable CLI.
 
-`norted-core` owns platform paths, version-1 TOML configuration, resolved model paths, artifact discovery, stable identifiers, application events/state, runtime descriptor publication and observation, and provenance structures. The registry moves through `NotScanned`, `Scanning`, `Ready`, `ReadyWithWarnings`, or `Failed`. Recursive discovery runs on Tokio's blocking pool, does not follow symlinks, resolves relative roots against the configuration directory, and deduplicates overlapping canonical artifacts.
+Adapter registration and provider registration are separate. A built-in engine can be enabled even when no runtime is installed; conversely, every installed manifest still requires its corresponding registered adapter before it can launch.
 
-Model IDs have the form `<sanitized-name>-<12-hex-digest>`. The digest is SHA-256 over a versioned identity namespace, artifact format, and normalized canonical path. It is deterministic across Rust releases, keeps same-named files in different directories distinct, and avoids hashing multi-gigabyte contents. The registry still recognizes the existing Q27 artifact kind for discovery, but no Q27 or NInfer engine is implemented and the llama.cpp adapter rejects non-GGUF artifacts.
+## Runtime identity and store
 
-`norted-engine` owns engine-neutral contracts and their first concrete runtime services:
-
-- `EngineRegistry` registers stable adapter identities and applies concrete artifact compatibility decisions.
-- `RuntimeManager` composes the engine registry, process supervisor, discovered model registry, active state, inference routing, recent notices, and runtime provenance.
-- `TokioProcessSupervisor` owns generic child spawning, PID/supervisor identity, continuous stdout/stderr draining, structured tracing, bounded stderr tails, exit observation, termination, and shutdown cleanup.
-- `ControlClient` owns descriptor-based discovery and authenticated private control requests.
-- the minimal inference representation contains text messages, explicit maximum output tokens, streaming intent, text deltas/output, finish reason, and optional token usage.
-
-The engine acquisition contracts retain stable/latest/exact intent, but individual adapters must report what they actually implement.
-
-`norted-engine-llama-cpp` contains all current llama.cpp-specific behavior. It declares upstream identity `llama.cpp` and `https://github.com/ggml-org/llama.cpp`, accepts GGUF at the current coarse compatibility boundary, and declares only text generation through the backend's Chat Completions-compatible API. It does not claim vision, embeddings, tools, structured output, or native Responses support.
-
-`norted-api` owns the public protocol and both Axum listener lifecycles. The public router implements `GET /health`, `GET /v1/models`, and the narrow `POST /v1/responses` subset. The private router implements only authenticated status/load/unload. Public Responses parsing and serialization remain independent from llama.cpp-native JSON.
-
-`norted-tui` owns terminal lifecycle, UI-local state, commands, responsive rendering, and interaction. It enters terminal mode and draws an initial pending frame before starting discovery or control observation, so a slow filesystem or stale descriptor cannot delay visible startup. A low-frequency observer then obtains normalized control status from the serving process, so Overview, Models, Engines, and Server render real cross-process state rather than process-local placeholders. Models Enter and `/load` load the selected artifact; `u` and `/unload` unload the active backend. Single-click continues to select rather than start a potentially large load.
-
-## llama.cpp configuration and probing
-
-The minimal accepted configuration is:
-
-```toml
-[engine."llama.cpp"]
-enabled = true
-
-[engine."llama.cpp".settings]
-binary_path = "/path/to/llama-server"
-```
-
-A relative `binary_path` resolves against the directory containing `config.toml`. The adapter supports only the `binary_path` settings key. Its open engine-native escape hatches are `[engine."llama.cpp".native].arguments` (an array of strings) and `[engine."llama.cpp".env]` (string values).
-
-The probe:
-
-1. requires the adapter to be enabled and the configured path to resolve to a file;
-2. canonicalizes the path;
-3. runs `--version` and `--help` with bounded execution;
-4. requires help output to advertise `--model`, `--alias`, `--host`, and `--port`;
-5. parses version/revision only when reported; and
-6. calculates the binary SHA-256.
-
-A successful probe creates an `EngineInstallation` whose acquisition method is `ExternalBinary`, source repository is absent because a configured executable does not prove its source, build metadata is absent, platform/architecture describe the host, and unavailable revision/runtime-variant facts remain `None`. The adapter's canonical upstream identity remains llama.cpp. The adapter does not cache probes: every `probe()` call repeats path validation, version/help inspection, and binary hashing. The runtime manager stores the most recently observed result for status, while engine selection and launch obtain fresh probe evidence.
-
-Managed installation and updating intentionally return unsupported errors. There is no PATH discovery, release scraping, source build, downloader, or updater in this slice.
-
-## Process launch and lifecycle
-
-Norted preserves upstream defaults. The adapter's generated command line contains only:
+`RuntimeIdentity` is structured and hashed into a stable filesystem-safe `RuntimeId`. Its identity fields are:
 
 ```text
-llama-server --model <canonical-gguf> --alias <stable-model-id> --host 127.0.0.1 --port <dynamic> [configured native arguments...]
+engine ID
+package family
+upstream version/tag
+upstream revision when authoritative
+platform
+architecture
+accelerator/backend
+variant
+provider + repository + release + primary/additional asset identity
 ```
 
-It does not synthesize context size, GPU layers, batch size, threads, cache types, flash attention, tensor split, speculative decoding, or a chat template. Explicit native arguments are appended in order, but Norted rejects options that replace the primary model source, stable alias, private host/port, API prefix/authentication, TLS, embedding/reranking mode, or multi-model router semantics. The same critical llama.cpp variables are rejected in configured environment entries. The launch spec still inherits the parent environment, but its generic `environment_remove` list strips those variables before allowed configured entries are applied. Ordinary tuning arguments and environment variables remain available. A future engine can use the same generic removal contract or disable inheritance entirely.
-
-The runtime has exactly one backend state machine:
+The application-data store is versioned side by side:
 
 ```text
-Stopped ── load ──▶ Loading ── health ready ──▶ Running
-Loading ── startup failure ─────────────────────▶ Failed
-Loading ── unload/cancel ──▶ Stopping ── cleanup ──▶ Stopped
-Running ── unload ─────────▶ Stopping ── cleanup ──▶ Stopped
-Running ── unexpected exit ─────────────────────▶ Failed
-Failed  ── unload ──────────────────────────────▶ Stopped
+<data>/runtimes/
+  <engine>/
+    <platform-architecture-accelerator-variant>/
+      <version>/
+        <runtime-id>/
+          runtime.json
+          <package contents>
+  .staging/<random-id>/...
 ```
 
-Loading resolves the stable model ID from the completed discovery registry, selects one compatible healthy installed adapter, obtains an OS-assigned loopback address, asks the adapter for a `LaunchSpec`, and delegates spawning to the common supervisor. The manager then polls llama.cpp `GET /health` every 250 ms for up to five minutes while also observing process exit. After health returns `status: "ok"`, the adapter reads and validates `default_generation_settings.params.temperature` and `top_p` from `GET /props`. The manager stores those values with the active route and reports `Running` only after both checks succeed.
+`runtime.json` schema 1 adds supported formats, acquisition method, source URL, verified primary/additional archive SHA-256 values, contained entrypoint, entrypoint SHA-256, install time, and the successful probe observation. Managed entrypoints are relative to their installation root. An explicitly configured external binary is represented by an in-memory external manifest with an absolute canonical entrypoint, no fabricated archive or install-time fields, and unverified repository provenance.
 
-The supervisor starts the process with piped stdout/stderr and null stdin. Dedicated drain tasks prevent pipe deadlock and forward lines to structured tracing with engine ID, model ID, process ID, and stream name. Unexpected exit detail includes a bounded stderr tail. On unload, Unix sends SIGTERM before a timeout/kill fallback; Windows uses the available child-process termination primitive. Serving-process shutdown unloads the active backend and then asks the supervisor to terminate any remaining tracked children.
+Scanning validates every manifest, canonicalizes the root and entrypoint, and rejects containment failures, duplicate IDs, invalid schemas, failed probe records, and unsafe staging paths. Removal recomputes the expected directory from the manifest, canonicalizes it under the runtime root, rejects staging/external targets, and removes only that exact owned directory.
 
-Loading another model while one is active returns an explicit conflict; there is no implicit replacement. Unload can cancel an in-progress load, terminating a child that has already spawned before clearing state. A later crash clears the routable active backend, retains failure detail and provenance, and causes inference routing to fail instead of targeting a stale endpoint.
+Mutable `runtime-selections.json` schema 1 is adjacent to, not inside, the immutable installations. It contains exact format defaults, exact model overrides, and update preferences. Atomic temporary-file replacement is used for preferences and catalog cache data; neither is written into user TOML.
 
-## Runtime provenance
+## Live runtime catalog
 
-The manager constructs provenance from facts observed during the actual load:
+`RuntimeCatalogProvider` produces engine-neutral `AvailableRuntime` values. `RuntimeCatalog` aggregates providers and attaches local installed/selected and host compatibility state. Provider results are cached per provider in the application cache directory with a bounded freshness window; a fresh cache avoids API calls, and a stale cache can support explicit error reporting. Normal startup never fetches it.
 
-- stable model ID, canonical artifact path, and an optional model content hash if one already exists;
-- engine ID plus reported version/revision when known;
-- canonical binary path, binary SHA-256, optional proven source repository, and `ExternalBinary` acquisition method;
-- host platform/architecture and optional runtime variant;
-- normalized settings actually emitted (none are currently synthesized for llama.cpp);
-- configured native arguments, retaining bare dash-prefixed arguments but redacting every non-option argument and every value in a dash-prefixed `name=value` form;
-- explicitly configured environment variable names and SHA-256 value hashes, never raw values;
-- an explicit `inherits_parent_environment` boolean (true for llama.cpp); inherited environment entries are not copied into provenance;
-- process ID and supervisor identity;
-- private backend endpoint and launch timestamp.
+`GitHubReleaseClient` requests the newest 100 releases from the official repository for broad browsing. When a concrete older tag/runtime ID is requested or an installed exact runtime falls outside that window, the matching provider resolves GitHub's exact tag endpoint on demand. This keeps ordinary searches bounded without falsely declaring an older published pin missing. Optional `GITHUB_TOKEN`/`GH_TOKEN` authentication is confined to this API client. Catalog entries carry exact repository, release/tag, asset ID/name/URL/size/digest, channel, and requirements. The installer independently revalidates URL authority and digest presence.
 
-Missing upstream facts remain optional. Model discovery does not hash an entire GGUF merely to populate provenance. Unload clears active model/engine state but intentionally leaves the most recent provenance available for diagnostics.
+### llama.cpp
 
-## Public Responses translation
+The official provider classifies asset names rather than assuming a release matrix. Each platform/architecture/backend line receives its own newest actual `Latest` candidate. Windows CUDA requires the matching same-release `cudart` asset and both identities/downloads become part of the runtime identity. Stable follows the verified semantic-release `nightly-tag.txt` pointer, including its digest and commit relationship. Drafts, non-uploaded files, malformed/missing asset relationships, unknown grammars, and unsupported variants are not guessed.
 
-`POST /v1/responses` accepts only `model`, `input`, `stream`, `instructions`, and `max_output_tokens`. `input` is either a string or a non-empty array of message items. Supported message roles are system, developer, user, and assistant; content is a string or an array containing only `input_text` parts.
+Initial supported families include Windows x86_64 CPU/CUDA/Vulkan and Linux x86_64 CPU/Vulkan, plus straightforward official architecture variants recognized by the same strict grammar. Linux packages retain their internal relative library symlinks only after extractor containment validation.
 
-The API translates this request into the engine-neutral `InferenceRequest`. The llama.cpp adapter then maps messages to its private `POST /v1/chat/completions` call and maps an explicit `max_output_tokens` to `max_completion_tokens`. For streaming it asks the backend to include usage. The runtime returns the active backend's engine-neutral effective generation settings atomically with each inference route. The public API crate never builds llama.cpp flags, reads `/props`, or decodes llama.cpp-specific completion JSON.
+### q27
 
-For non-streaming inference, the adapter returns assistant text, optional internal usage, and a normalized finish reason. The API constructs a local Response object and assistant message/`output_text` item with locally generated response and message IDs, plus numeric `temperature` and `top_p` from the active route. llama.cpp `finish_reason: "length"` maps to an incomplete Response with `incomplete_details.reason: "max_output_tokens"`; other current finish reasons map to completed. `completed_at` is present only for completed snapshots. Public usage is emitted only when all Responses token-detail fields are known, so llama.cpp totals remain available internally without fabricating unavailable cache-write or reasoning-token counts. Unavailable output-text logprobs are likewise not fabricated.
+The provider accepts only exact uploaded `q27-v<version>-linux-x86_64.tar.gz` assets under a matching `v<version>` release and with GitHub SHA-256 metadata. Managed support begins at v0.2.0 because v0.1.x streaming omits the terminal finish reason required to distinguish stop from maximum-output truncation truthfully. It exposes real q27-server W8/W12/W16 executables as distinct variants, with authoritative CUDA driver/VRAM notes. Releases with source but no package are ignored, so Stable/Latest refer to the newest installable release. There is no fabricated Windows pack or source builder.
 
-For streaming inference, the adapter parses llama.cpp SSE into engine-neutral text deltas and a completion event. The public API emits a Responses event sequence with monotonically increasing `sequence_number`:
+## Compatibility and selection
+
+`HostCapabilities` records OS/architecture and optional NVIDIA model, VRAM, and driver observations from bounded `nvidia-smi` execution. Compatibility has four states: Recommended, Compatible, NeedsAttention(reason), and Incompatible(reason). Unknown accelerator evidence is not treated as certainty; known platform or upstream minimum mismatches are.
+
+For a model, resolution proceeds over all installed runtimes whose registered adapter declares the artifact format and accepts the concrete model:
 
 ```text
-response.created
-response.in_progress
-response.output_item.added
-response.content_part.added
-response.output_text.delta (zero or more)
-response.output_text.done
-response.content_part.done
-response.output_item.done
-response.completed | response.incomplete
+invocation RuntimeId
+  → model override RuntimeId
+  → format default RuntimeId
+  → deterministic best compatible fallback
 ```
 
-The adapter carries llama.cpp's final finish reason through the engine-neutral completion event. Each streaming snapshot uses the generation settings captured with its route. A normal stream terminates with `response.completed`; a `length` finish caused by the output-token limit terminates with `response.incomplete` and `incomplete_details.reason: "max_output_tokens"`. A backend failure after streaming starts instead terminates with `response.failed`. Initial and non-completed terminal snapshots omit `completed_at`; public usage is emitted only when the backend supplies every required Responses token-detail field. llama.cpp's native chunks and `[DONE]` marker are consumed internally and never forwarded verbatim.
+The selected ID does not bypass manifest, host, adapter, or model validation. A stale stored preference emits a runtime notice before fallback. Fallback ranks compatibility first, then managed provenance and current versions deterministically. Selection source is carried into launch provenance.
 
-Every unrecognized top-level request field is rejected with an OpenAI-style error envelope. Non-message items, non-`input_text` parts, tools/function calling, hosted tools, image/audio, remote MCP, reasoning controls, prior-response state, background mode, storage, and structured-output controls are therefore rejected rather than silently ignored. Public error mapping distinguishes malformed/unsupported requests, missing models, unloaded models, crashed or unavailable backends, inference timeouts, and other backend inference failures without disclosing the control token or raw environment values.
+A direct selection always writes an exact ID and defaults to a pinned update preference. CLI callers may instead track the provider-defined Stable or Latest channel without weakening the concrete selection: checks consider only that channel, installs remain explicit and side by side, and `update` does not rewrite selection. Missing truthful channel candidates, catalog outages, provider errors, unpublished exact assets, pins, and newer compatible packs remain distinct states. Users switch only through an explicit select action.
 
-`GET /v1/models` remains unchanged: it emits the OpenAI-style list envelope and only `id`, `object`, `created`, and `owned_by` for each discovered artifact. The route does not imply that every discovered artifact has a compatible installed engine.
+## Download, extraction, and activation
 
-## Configuration and safety invariants
+The secure installer accepts only a catalog value from a registered provider and requires an expected SHA-256 for every package component. URLs must be HTTPS on the authoritative GitHub release path. Redirects are manually restricted to exact GitHub API/release-asset hosts; authentication is not forwarded to the asset client.
 
-Configuration schema version `1` is enforced. Structured misspellings are rejected, while engine-native maps remain namespaced and extensible. Existing configuration is read but never overwritten. Configuration, data, state, cache, and logs occupy separate platform-native directories.
+Each component streams into a `.part` temporary cache file while hashing and reporting actual byte counts. Both response length and digest must match metadata before the content-addressed final cache name is made visible. A mismatch deletes the temporary data.
 
-The scriptable `status` path snapshots in-memory registry state and cross-process control facts without initiating model discovery. A fresh invocation can therefore report `NotScanned` immediately. Commands that require the artifact registry, including `models list` and `serve`, still await deterministic discovery.
+ZIP and tar.gz extraction runs off the async executor and enforces entry-count and expanded-size limits. It rejects absolute paths, parent components, drive prefixes, backslashes/colon tricks, duplicate entries, special devices/FIFOs, and overwrites. Tar symlink/hardlink targets are normalized and must resolve within staging; links are created only after their targets exist and are canonically contained.
 
-The current hard boundaries are:
+After extraction the installer requires exactly one regular file with the provider-declared entrypoint basename, hashes it, and creates a provisional `InstalledRuntime`. The matching engine adapter probes that exact entrypoint and verifies its identity/required interface. Only a successful observation is written into `runtime.json`; the directory and manifest are synced before one atomic staging-to-destination rename.
 
-- private control and inference backend listeners are loopback-only;
-- the descriptor token stays out of all public and normalized status surfaces;
-- only the supervisor owns generic child-process mechanics;
-- only adapters own engine-native flags, probes, health, and inference JSON;
-- only the public API layer owns Responses request/response/SSE shapes;
-- at most one backend is active;
-- only GGUF text generation is implemented;
-- managed llama.cpp install/update, Q27, and NInfer remain deferred.
+Activation refuses an existing different runtime ID and also scans for a different digest under the same claimed repository/tag/assets identity. All error paths clean staging. Shared per-runtime file leases span backend loading and execution; removal requires an exclusive lease, so another Norted process cannot race an active load. Thus extraction alone never produces local truth, failed probes cannot be selected, and updates cannot damage an older installation.
+
+## Model artifacts and q27 tokenizers
+
+`ModelArtifact` retains the primary artifact and stable ID while adding engine-neutral `AuxiliaryArtifact` values with roles. Q27 discovery prefers `model.q27` + `model.tok`; for quantized names it may use the unique longest boundary-safe prefix tokenizer. Candidates must be beside the model and contain `Q27T` magic with supported header version 1. `.tok` is never a primary model. Missing, invalid, or ambiguous companions are expressed by q27's model compatibility result and prevent launch.
+
+## Adapter launch contracts
+
+### llama.cpp
+
+The adapter probes a managed runtime's exact contained entrypoint, binary hash, `--version`, and `--help`, requiring `--model`, `--alias`, `--host`, and `--port`. For managed build tags it also checks the reported build/revision relationship rather than trusting the archive name alone. External `binary_path` uses the same interface probe but keeps its source unverified.
+
+Launch is conceptually:
+
+```text
+llama-server --model <canonical-gguf> --alias <stable-id>
+             --host 127.0.0.1 --port <dynamic> [allowed native arguments]
+```
+
+The adapter polls `/health`, then obtains authoritative effective `temperature` and `top_p` from `/props` before Running. It maps internal `/v1/chat/completions` responses/SSE to normalized inference output/events.
+
+### q27
+
+Current q27-server has no stable `--version` response. The adapter therefore validates the exact binary/hash and its real zero-argument usage signature; managed version/revision provenance remains supplied by the verified package manifest and probe reports only what was observed.
+
+Launch is conceptually:
+
+```text
+q27-server <canonical-model.q27> <canonical-tokenizer.tok>
+           --host 127.0.0.1 --port <dynamic> --no-think
+           [allowed native arguments]
+```
+
+Norted rejects q27 options/environment that could replace positional inputs, binding/authentication, thinking semantics, or sampling truth. It strips conflicting inherited q27 variables and sends explicit `temperature: 0.0` and `top_p: 1.0` on every Chat Completions request; those values are therefore the reported effective settings. Readiness requires `/health` status `ok`. JSON and SSE are translated through the same normalized inference types as llama.cpp.
+
+## Process, control, and provenance
+
+`RuntimeManager` maintains one Stopped/Loading/Running/Stopping/Failed backend. Loading resolves the discovered primary model, exact runtime, and adapter, obtains a dynamic loopback address, builds a `LaunchSpec`, and delegates the child to `TokioProcessSupervisor`. The supervisor drains both pipes, includes runtime identity in process facts, observes unexpected exit, supports startup cancellation, and owns graceful/forced cleanup. A second load conflicts instead of implicitly replacing the active backend.
+
+Cross-process CLI/TUI control uses schema-version-2 descriptors under:
+
+```text
+<state>/runtime/servers/<instance-id>.json
+```
+
+The serving process atomically writes its random identity, PID, public probe address, private loopback endpoint, and random bearer token. Observers prove identity through public health before sending authenticated `status`, `load`, or `unload` requests. Tokens are redacted and absent from public/status/provenance output.
+
+Private backend status carries model ID, engine ID, runtime ID/version/variant, executable SHA-256, PID, and private endpoint. `RuntimeProvenance` retains the exact immutable runtime manifest and selection source alongside model facts, sanitized native arguments with option/value association and value hashes, every effective explicit/inherited environment variable name with a value hash, inheritance policy, authoritative effective sampler settings, process identity, endpoint, and launch time. Missing facts stay optional; external acquisition never gains invented release provenance.
+
+## Public protocol
+
+`POST /v1/responses` accepts the documented text subset and is translated into `InferenceRequest`. Each adapter owns only its private upstream JSON/SSE. `norted-api` constructs the public response and event sequence, maps output-limit completion to incomplete state, and emits usage only when every required token-detail field is known. Unsupported input or top-level features are rejected rather than forwarded or silently ignored.
+
+`GET /v1/models` remains the audited OpenAI-style list with exactly `id`, `object`, `created`, and `owned_by`. Runtime metadata remains private control-plane state rather than leaking into this public compatibility surface.
+
+## TUI and network independence
+
+The TUI enters terminal mode and draws its pending first frame before starting model discovery, local runtime scanning, or control observation. The Runtimes page can load local selections/installs asynchronously. Remote search begins only after a user search action, and install/update work remains off the event loop with real installer progress messages. Keyboard, mouse, narrow layout, ASCII mode, and `NO_COLOR` are presentation concerns isolated in `norted-tui`.
+
+The hard invariants are:
+
+- no ordinary startup path depends on the runtime catalog network;
+- managed packages require authoritative SHA-256 verification;
+- extraction and removal remain contained within exact Norted-owned roots;
+- activation happens only after an exact adapter probe;
+- runtime versions are immutable and side by side;
+- selection always names a concrete runtime and never hard-codes format-to-engine identity;
+- only the supervisor owns generic child mechanics;
+- only adapters own backend-native behavior;
+- only the API crate owns the public Responses representation;
+- at most one backend is active.

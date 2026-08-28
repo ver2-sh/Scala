@@ -312,15 +312,14 @@ async fn control_load(
     })?;
     state
         .runtime
-        .load(request.model_id)
+        .load_with_runtime(request.model_id, request.runtime_id)
         .await
         .map(Json)
         .map_err(|error| ControlApiError {
             status: match error {
                 norted_engine::RuntimeError::ModelNotFound(_) => StatusCode::NOT_FOUND,
                 norted_engine::RuntimeError::AlreadyActive { .. }
-                | norted_engine::RuntimeError::Busy(_)
-                | norted_engine::RuntimeError::AmbiguousEngine(_) => StatusCode::CONFLICT,
+                | norted_engine::RuntimeError::Busy(_) => StatusCode::CONFLICT,
                 norted_engine::RuntimeError::Incompatible { .. } => {
                     StatusCode::UNPROCESSABLE_ENTITY
                 }

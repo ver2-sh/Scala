@@ -1,5 +1,4 @@
-use norted_core::RegistryState;
-use norted_engine::InstallationState;
+use norted_core::{ArtifactFormat, RegistryState, RuntimeCompatibility, RuntimeUpdateState};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -9,6 +8,7 @@ use crate::app::{App, Screen};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{content_layout, format_bytes, key_value, render_empty, section_title};
 use crate::ui::layout::{HoverTarget, UiLayout};
+use crate::ui::runtime_search::progress_text;
 
 pub fn render_screen(
     frame: &mut Frame<'_>,
@@ -21,7 +21,7 @@ pub fn render_screen(
     match app.screen {
         Screen::Overview => render_overview(frame, area, app, theme, glyphs, ui_layout.compact),
         Screen::Models => render_models(frame, area, app, theme, glyphs, ui_layout),
-        Screen::Engines => render_engines(frame, area, app, theme, glyphs),
+        Screen::Runtimes => render_runtimes(frame, area, app, theme, glyphs, ui_layout),
         Screen::Server => render_server(frame, area, app, theme),
         Screen::Logs => render_logs(frame, area, app, theme, ui_layout),
         Screen::Settings => render_settings(frame, area, app, theme),
@@ -142,15 +142,15 @@ fn render_metrics(
         }
         state => state.label().to_owned(),
     };
-    let engine_value = app.control.as_ref().map_or_else(
+    let runtime_value = app.runtime_list.as_ref().map_or_else(
         || {
-            if app.control_observation_pending() {
-                "Observing".to_owned()
+            if app.runtime_list_loading {
+                "Preparing".to_owned()
             } else {
                 "Unavailable".to_owned()
             }
         },
-        |control| control.installed_engine_count.to_string(),
+        |snapshot| snapshot.installed.len().to_string(),
     );
     let active_model = app.control.as_ref().map_or_else(
         || {
@@ -172,7 +172,7 @@ fn render_metrics(
     let values = [
         ("SERVER", app.snapshot.server.label().to_owned()),
         ("MODELS", model_value),
-        ("ENGINES", engine_value),
+        ("RUNTIMES", runtime_value),
         ("ACTIVE MODEL", active_model),
     ];
     if compact {
@@ -266,6 +266,19 @@ fn render_models(
     }
     let items = ui_layout.model_rows.iter().map(|(index, _)| {
         let model = &app.snapshot.models[*index];
+        let runtime_override = app.runtime_list.as_ref().and_then(|snapshot| {
+            let runtime_id = snapshot.selections.model_overrides.get(&model.id)?;
+            let label = snapshot
+                .installed
+                .iter()
+                .find(|status| &status.runtime.manifest.runtime_id == runtime_id)
+                .map(|status| {
+                    let identity = &status.runtime.manifest.identity;
+                    format!("{} {}", identity.engine_id, identity.version)
+                })
+                .unwrap_or_else(|| runtime_id.to_string());
+            Some(label)
+        });
         let mut style = if app.selected_model == Some(*index) {
             theme.selected
         } else {
@@ -292,6 +305,12 @@ fn render_models(
                 ),
                 Span::styled(&model.display_name, theme.text),
                 Span::styled(format!("  {}", model.format.as_str()), theme.accent),
+                Span::styled(
+                    runtime_override
+                        .map(|runtime| format!("  override: {runtime}"))
+                        .unwrap_or_default(),
+                    theme.hint,
+                ),
             ]),
             Line::from(vec![
                 Span::styled(format_bytes(model.size_bytes), theme.muted),
@@ -303,78 +322,250 @@ fn render_models(
     frame.render_widget(List::new(items), layout[1]);
 }
 
-fn render_engines(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, glyphs: &Glyphs) {
+fn render_runtimes(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    glyphs: &Glyphs,
+    ui_layout: &UiLayout,
+) {
     let layout = content_layout(area);
-    frame.render_widget(
-        section_title(
-            "Engines",
-            "Managed upstream runtimes and their capabilities",
-            theme,
-        ),
-        layout[0],
-    );
-    let Some(control) = &app.control else {
-        let (title, detail) = app.control_observation_error.as_deref().map_or_else(
-            || {
-                (
-                    format!("{}  Observing server control", glyphs.transitional),
-                    "Runtime status will appear when the initial control observation completes.",
-                )
-            },
-            |error| {
-                (
-                    format!("{}  Server control unavailable", glyphs.stopped),
-                    error,
-                )
-            },
-        );
-        render_empty(frame, layout[1], &title, detail, theme);
-        return;
+    let subtitle = if app.runtime_list_loading {
+        "Refreshing installed packs in the background"
+    } else {
+        "Installed packs, persisted format defaults, and official releases"
     };
-    if control.engines.is_empty() {
+    frame.render_widget(section_title("Runtimes", subtitle, theme), layout[0]);
+
+    let summary = app.runtime_list.as_ref().map_or_else(
+        || {
+            vec![Line::from(vec![
+                Span::styled("GGUF  ", theme.hint),
+                Span::styled("not loaded", theme.muted),
+                Span::styled("    Q27  ", theme.hint),
+                Span::styled("not loaded", theme.muted),
+            ])]
+        },
+        |snapshot| {
+            let gguf = selection_text(app, ArtifactFormat::Gguf);
+            let q27 = selection_text(app, ArtifactFormat::Q27);
+            let accelerator = snapshot.host.nvidia.as_ref().map_or("CPU", |_| "NVIDIA");
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled("GGUF  ", theme.hint),
+                    Span::styled(gguf, theme.text),
+                    Span::styled("    Q27  ", theme.hint),
+                    Span::styled(q27, theme.text),
+                ]),
+                Line::from(vec![
+                    Span::styled("HOST  ", theme.hint),
+                    Span::styled(
+                        format!(
+                            "{} / {} / {accelerator}",
+                            snapshot.host.platform, snapshot.host.architecture
+                        ),
+                        theme.muted,
+                    ),
+                ]),
+            ];
+            if !snapshot.warnings.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("{} runtime warning(s); see Logs", snapshot.warnings.len()),
+                    theme.warning,
+                )));
+            }
+            lines
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(summary).wrap(Wrap { trim: true }),
+        ui_layout.runtime_summary,
+    );
+
+    if app.runtime_list_loading && app.runtime_list.is_none() {
         render_empty(
             frame,
-            layout[1],
-            &format!("{}  No engine adapters registered", glyphs.stopped),
-            "The running server reported no available adapters.",
+            ui_layout.runtime_list,
+            &format!("{}  Inspecting installed runtimes", glyphs.transitional),
+            "Local pack manifests and configured external runtimes are being probed.",
             theme,
         );
-        return;
-    }
-    let mut lines = Vec::new();
-    for engine in &control.engines {
-        let (state, style) = match &engine.probe.installation {
-            InstallationState::Installed { .. } if engine.probe.healthy => {
-                ("available", theme.success)
-            }
-            InstallationState::Installed { .. } => ("unhealthy", theme.warning),
-            InstallationState::NotInstalled => ("not installed", theme.muted),
-            InstallationState::Invalid { .. } => ("invalid", theme.error),
+    } else if let Some(error) = &app.runtime_list_error {
+        render_empty(
+            frame,
+            ui_layout.runtime_list,
+            "Installed runtime scan failed",
+            error,
+            theme,
+        );
+    } else if app
+        .runtime_list
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.installed.is_empty())
+    {
+        let guidance = if app.snapshot.models.is_empty() {
+            "Search official releases to install a compatible runtime pack."
+        } else {
+            "Models detected: press s to see host-compatible official packs, recommended first. Installation stays explicit."
         };
-        lines.push(Line::from(vec![
-            Span::styled(&engine.identity.display_name, theme.text),
-            Span::styled(format!("  {state}"), style),
-        ]));
-        lines.push(Line::from(Span::styled(&engine.probe.detail, theme.muted)));
-        if let InstallationState::Installed { installation } = &engine.probe.installation {
-            lines.push(key_value(
-                "VERSION",
-                installation.engine.version.as_deref().unwrap_or("unknown"),
-                theme,
-            ));
-            lines.push(key_value(
-                "REVISION",
-                installation.engine.revision.as_deref().unwrap_or("unknown"),
-                theme,
-            ));
-            lines.push(Line::from(vec![
-                Span::styled(format!("{:<12}", "BINARY"), theme.hint),
-                Span::styled(installation.binary_path.display().to_string(), theme.text),
-            ]));
-        }
-        lines.push(Line::default());
+        render_empty(
+            frame,
+            ui_layout.runtime_list,
+            &format!("{}  No runtimes installed", glyphs.empty),
+            guidance,
+            theme,
+        );
+    } else if let Some(snapshot) = &app.runtime_list {
+        let items = ui_layout.runtime_rows.iter().map(|(index, _)| {
+            let status = &snapshot.installed[*index];
+            let manifest = &status.runtime.manifest;
+            let identity = &manifest.identity;
+            let (compatibility, compatibility_style) =
+                compatibility_label(&status.compatibility, theme);
+            let formats = manifest
+                .supported_formats
+                .iter()
+                .map(|format| format.as_str().to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join("/");
+            let selected = if status.selected_for.is_empty() {
+                String::new()
+            } else {
+                format!("  default: {}", status.selected_for.join(", "))
+            };
+            let update = app
+                .runtime_updates
+                .get(&manifest.runtime_id)
+                .map(runtime_update_text)
+                .unwrap_or_default();
+            let mut style = if app.selected_runtime == Some(*index) {
+                theme.selected
+            } else {
+                ratatui::style::Style::default()
+            };
+            if app.hover == Some(HoverTarget::Runtime(*index)) {
+                style = style.patch(theme.hovered);
+            }
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(format!("{}  ", glyphs.running), theme.success),
+                    Span::styled(&identity.engine_id, theme.text),
+                    Span::styled(format!("  {}", identity.version), theme.accent),
+                    Span::styled(format!("  {compatibility}"), compatibility_style),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        format!("{formats}  {} / {}", identity.accelerator, identity.variant),
+                        theme.muted,
+                    ),
+                    Span::styled(selected, theme.hint),
+                    Span::styled(update, theme.warning),
+                ]),
+            ])
+            .style(style)
+        });
+        frame.render_widget(List::new(items), ui_layout.runtime_list);
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), layout[1]);
+
+    if ui_layout.runtime_actions.height > 0 {
+        let search_style = if app.hover == Some(HoverTarget::RuntimeSearchAction) {
+            theme.hovered
+        } else {
+            theme.accent
+        };
+        let update_style = if app.hover == Some(HoverTarget::RuntimeUpdateAction) {
+            theme.hovered
+        } else {
+            theme.hint
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "[s] Search available",
+                search_style,
+            ))),
+            ui_layout.runtime_search_action,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                if app.runtime_update_loading {
+                    "Checking…"
+                } else {
+                    "[u] Check updates"
+                },
+                update_style,
+            ))),
+            ui_layout.runtime_update_action,
+        );
+        if let Some(operation) = &app.runtime_operation {
+            let progress_x = ui_layout.runtime_update_action.right().saturating_add(2);
+            let progress_area = Rect::new(
+                progress_x,
+                ui_layout.runtime_actions.y,
+                ui_layout.runtime_actions.right().saturating_sub(progress_x),
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    progress_text(operation),
+                    theme.muted,
+                ))),
+                progress_area,
+            );
+        }
+    }
+}
+
+fn runtime_update_text(state: &RuntimeUpdateState) -> String {
+    match state {
+        RuntimeUpdateState::Current => "  current".to_owned(),
+        RuntimeUpdateState::Unmanaged => "  unmanaged".to_owned(),
+        RuntimeUpdateState::NewerCompatibleVersion { version, .. } => {
+            format!("  update: {version}")
+        }
+        RuntimeUpdateState::Pinned {
+            newer_version: Some(version),
+            ..
+        } => format!("  pinned; {version} available"),
+        RuntimeUpdateState::Pinned { .. } => "  pinned".to_owned(),
+        RuntimeUpdateState::CatalogUnavailable(_) => "  catalog unavailable".to_owned(),
+        RuntimeUpdateState::ProviderError(_) => "  provider warning".to_owned(),
+        RuntimeUpdateState::NoLongerPublished => "  no longer published".to_owned(),
+        RuntimeUpdateState::ChannelUnavailable { .. } => "  channel unavailable".to_owned(),
+    }
+}
+
+fn selection_text(app: &App, format: ArtifactFormat) -> String {
+    let Some(snapshot) = &app.runtime_list else {
+        return "none".to_owned();
+    };
+    let Some(runtime_id) = snapshot.selections.format_defaults.get(&format) else {
+        return "none".to_owned();
+    };
+    snapshot
+        .installed
+        .iter()
+        .find(|status| &status.runtime.manifest.runtime_id == runtime_id)
+        .map(|status| {
+            let identity = &status.runtime.manifest.identity;
+            format!(
+                "{} {} {} / {}",
+                identity.engine_id, identity.version, identity.accelerator, identity.variant
+            )
+        })
+        .unwrap_or_else(|| runtime_id.to_string())
+}
+
+pub(crate) fn compatibility_label<'a>(
+    compatibility: &'a RuntimeCompatibility,
+    theme: &'a Theme,
+) -> (&'a str, ratatui::style::Style) {
+    match compatibility {
+        RuntimeCompatibility::Recommended => ("recommended", theme.success),
+        RuntimeCompatibility::Compatible => ("compatible", theme.accent),
+        RuntimeCompatibility::NeedsAttention(_) => ("needs attention", theme.warning),
+        RuntimeCompatibility::Incompatible(_) => ("incompatible", theme.error),
+    }
 }
 
 fn render_server(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
@@ -416,6 +607,18 @@ fn render_server(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         .as_ref()
         .and_then(|control| control.backend.engine_id.clone())
         .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
+    let active_runtime = app
+        .control
+        .as_ref()
+        .and_then(|control| {
+            control.backend.runtime_id.as_ref().map(|runtime_id| {
+                control.backend.runtime_version.as_deref().map_or_else(
+                    || runtime_id.to_string(),
+                    |version| format!("{runtime_id} / {version}"),
+                )
+            })
+        })
+        .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
     let private_backend = app
         .control
         .as_ref()
@@ -428,6 +631,7 @@ fn render_server(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
             key_value("BACKEND", &lifecycle, theme),
             key_value("MODEL", &active_model, theme),
             key_value("ENGINE", &active_engine, theme),
+            key_value("RUNTIME", &active_runtime, theme),
             key_value("PRIVATE", &private_backend, theme),
             Line::default(),
             Line::from(Span::styled("Available now", theme.text)),
@@ -435,7 +639,7 @@ fn render_server(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
             Line::from(Span::styled("GET  /v1/models", theme.accent)),
             Line::from(Span::styled("POST /v1/responses", theme.accent)),
             Line::from(Span::styled(
-                "PRIVATE is the internal loopback llama.cpp endpoint.",
+                "PRIVATE is the selected engine's internal loopback endpoint.",
                 theme.muted,
             )),
         ])
@@ -522,6 +726,12 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         key_value("Left / Right", "move navigation focus", theme),
         key_value("Enter", "open navigation or load selected model", theme),
         key_value("u", "unload the active model from Models", theme),
+        key_value("v", "choose a model-specific runtime override", theme),
+        key_value(
+            "x / Delete",
+            "clear an override from the model runtime picker",
+            theme,
+        ),
         key_value("Mouse", "click pages and interactive rows", theme),
         Line::default(),
         Line::from(Span::styled("CURRENT VIEW", theme.hint)),
@@ -529,6 +739,19 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         key_value("PageUp/PageDown", "scroll logs or model list", theme),
         key_value("Wheel", "scroll the current view", theme),
         key_value("End", "follow newest logs", theme),
+        key_value("s", "search available runtimes from Runtimes", theme),
+        key_value("g / Q", "select runtime for GGUF / Q27", theme),
+        key_value("u", "check for runtime updates", theme),
+        key_value(
+            "Shift+U",
+            "install the selected reported update side by side",
+            theme,
+        ),
+        key_value(
+            "d twice",
+            "confirm removal of an unselected inactive runtime",
+            theme,
+        ),
         Line::default(),
         Line::from(Span::styled("COMMANDS", theme.hint)),
         key_value("/", "open slash-command suggestions", theme),
@@ -541,7 +764,7 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         key_value("Ctrl+C", "exit cleanly", theme),
         Line::default(),
         Line::from(Span::styled(
-            "Slash commands: /load /unload /status /models /engines /server /logs /settings /help /quit",
+            "Slash commands: /load /unload /status /models /runtimes /server /logs /settings /help /quit",
             theme.muted,
         )),
     ]

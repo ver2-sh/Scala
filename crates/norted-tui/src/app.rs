@@ -1,8 +1,17 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use norted_core::{AppEvent, AppSnapshot, LogLevel, RegistryState};
-use norted_engine::{BackendLifecycle, ControlStatus};
+use norted_core::{
+    AppEvent, AppSnapshot, ArtifactFormat, LogLevel, ModelArtifact, ModelId, RegistryState,
+    RuntimeCompatibility, RuntimeId, RuntimeOperationPhase, RuntimeOperationProgress,
+    RuntimeUpdateState,
+};
+use norted_engine::{
+    BackendLifecycle, ControlStatus, RuntimeListSnapshot, RuntimeNoticeLevel,
+    RuntimeSearchSnapshot, RuntimeUpdateCheck,
+};
 use ratatui::layout::Position;
 
 use crate::commands::{self, CommandAction};
@@ -12,7 +21,7 @@ use crate::ui::layout::{HoverTarget, UiLayout};
 pub enum Screen {
     Overview,
     Models,
-    Engines,
+    Runtimes,
     Server,
     Logs,
     Settings,
@@ -23,7 +32,7 @@ impl Screen {
     pub const ALL: [Self; 7] = [
         Self::Overview,
         Self::Models,
-        Self::Engines,
+        Self::Runtimes,
         Self::Server,
         Self::Logs,
         Self::Settings,
@@ -34,7 +43,7 @@ impl Screen {
         match self {
             Self::Overview => "Overview",
             Self::Models => "Models",
-            Self::Engines => "Engines",
+            Self::Runtimes => "Runtimes",
             Self::Server => "Server",
             Self::Logs => "Logs",
             Self::Settings => "Settings",
@@ -46,6 +55,14 @@ impl Screen {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Overlay {
     Help,
+    RuntimeSearch,
+    ModelRuntime,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RuntimeSearchFocus {
+    Query,
+    Results,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -66,6 +83,70 @@ pub enum Update {
 pub enum ControlAction {
     Load(norted_core::ModelId),
     Unload,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeAction {
+    RefreshList,
+    Search {
+        query: String,
+        force_refresh: bool,
+    },
+    Install(RuntimeId),
+    CheckUpdates,
+    Update(RuntimeId),
+    Remove {
+        runtime_id: RuntimeId,
+    },
+    ModelCandidates {
+        model: Box<ModelArtifact>,
+    },
+    SelectFormat {
+        format: ArtifactFormat,
+        runtime_id: RuntimeId,
+    },
+    SelectModel {
+        model: Box<ModelArtifact>,
+        runtime_id: RuntimeId,
+    },
+    ClearModelSelection {
+        model_id: ModelId,
+    },
+}
+
+#[derive(Debug)]
+pub enum RuntimeTaskResult {
+    Listed(Result<RuntimeListSnapshot, String>),
+    Searched(Result<RuntimeSearchSnapshot, String>),
+    Updates(Result<Vec<RuntimeUpdateCheck>, String>),
+    Updated {
+        previous_runtime_id: RuntimeId,
+        result: Result<(RuntimeId, RuntimeListSnapshot), String>,
+    },
+    Installed {
+        runtime_id: RuntimeId,
+        result: Result<RuntimeListSnapshot, String>,
+    },
+    Selected {
+        format: ArtifactFormat,
+        result: Result<RuntimeListSnapshot, String>,
+    },
+    ModelSelected {
+        model_id: ModelId,
+        result: Result<RuntimeListSnapshot, String>,
+    },
+    ModelSelectionCleared {
+        model_id: ModelId,
+        result: Result<RuntimeListSnapshot, String>,
+    },
+    ModelCandidates {
+        model_id: ModelId,
+        result: Result<Vec<RuntimeId>, String>,
+    },
+    Removed {
+        runtime_id: RuntimeId,
+        result: Result<RuntimeListSnapshot, String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -98,9 +179,36 @@ pub struct App {
     pub selected_model: Option<usize>,
     pub model_scroll: usize,
     pub log_scroll: usize,
+    pub runtime_list: Option<RuntimeListSnapshot>,
+    pub runtime_list_error: Option<String>,
+    pub runtime_list_loading: bool,
+    pub selected_runtime: Option<usize>,
+    pub runtime_scroll: usize,
+    pub runtime_search: Option<RuntimeSearchSnapshot>,
+    pub runtime_search_error: Option<String>,
+    pub runtime_search_loading: bool,
+    pub runtime_search_query: String,
+    pub runtime_search_cursor: usize,
+    pub runtime_search_focus: RuntimeSearchFocus,
+    pub selected_runtime_search_result: Option<usize>,
+    pub runtime_search_scroll: usize,
+    pub runtime_search_context: Option<String>,
+    pub runtime_operation: Option<RuntimeOperationProgress>,
+    pub runtime_updates: BTreeMap<RuntimeId, RuntimeUpdateState>,
+    pub runtime_update_loading: bool,
+    pub runtime_update_error: Option<String>,
+    pub runtime_picker_selection: Option<usize>,
+    pub runtime_picker_scroll: usize,
+    pub runtime_picker_candidates: Vec<RuntimeId>,
+    pub runtime_picker_loading: bool,
+    pub runtime_picker_error: Option<String>,
     focus_before_command: FocusArea,
     pending_control_action: Option<ControlAction>,
     control_busy: bool,
+    pending_runtime_action: Option<RuntimeAction>,
+    runtime_mutation_busy: bool,
+    pending_runtime_remove_confirmation: Option<RuntimeId>,
+    seen_runtime_events: BTreeSet<(i64, u8, String)>,
 }
 
 impl App {
@@ -150,9 +258,36 @@ impl App {
             selected_model: None,
             model_scroll: 0,
             log_scroll: 0,
+            runtime_list: None,
+            runtime_list_error: None,
+            runtime_list_loading: true,
+            selected_runtime: None,
+            runtime_scroll: 0,
+            runtime_search: None,
+            runtime_search_error: None,
+            runtime_search_loading: false,
+            runtime_search_query: String::new(),
+            runtime_search_cursor: 0,
+            runtime_search_focus: RuntimeSearchFocus::Query,
+            selected_runtime_search_result: None,
+            runtime_search_scroll: 0,
+            runtime_search_context: None,
+            runtime_operation: None,
+            runtime_updates: BTreeMap::new(),
+            runtime_update_loading: false,
+            runtime_update_error: None,
+            runtime_picker_selection: None,
+            runtime_picker_scroll: 0,
+            runtime_picker_candidates: Vec::new(),
+            runtime_picker_loading: false,
+            runtime_picker_error: None,
             focus_before_command: FocusArea::Navigation,
             pending_control_action: None,
             control_busy: false,
+            pending_runtime_action: None,
+            runtime_mutation_busy: false,
+            pending_runtime_remove_confirmation: None,
+            seen_runtime_events: BTreeSet::new(),
         }
     }
 
@@ -167,17 +302,24 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Update::Quit;
         }
-        if self.overlay.is_some() {
-            return match key.code {
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => {
-                    self.overlay = None;
-                    Update::Render
-                }
-                _ => Update::None,
+        if let Some(overlay) = self.overlay {
+            return match overlay {
+                Overlay::Help => match key.code {
+                    KeyCode::Esc | KeyCode::Char('?') | KeyCode::Enter => {
+                        self.overlay = None;
+                        Update::Render
+                    }
+                    _ => Update::None,
+                },
+                Overlay::RuntimeSearch => self.handle_runtime_search_key(key, layout),
+                Overlay::ModelRuntime => self.handle_model_runtime_key(key, layout),
             };
         }
         if self.command_active {
             return self.handle_command_key(key);
+        }
+        if key.code != KeyCode::Char('d') {
+            self.pending_runtime_remove_confirmation = None;
         }
         match key.code {
             KeyCode::Char('/') => {
@@ -215,11 +357,41 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent, layout: &UiLayout) -> Update {
-        if self.overlay.is_some() {
-            if self.hover.take().is_some() {
-                return Update::Render;
+        if let Some(overlay) = self.overlay {
+            if overlay == Overlay::Help {
+                if self.hover.take().is_some() {
+                    return Update::Render;
+                }
+                return Update::None;
             }
-            return Update::None;
+            let position = Position::new(mouse.column, mouse.row);
+            return match mouse.kind {
+                MouseEventKind::Moved => {
+                    let hover = layout.hit_test(position);
+                    if hover == self.hover {
+                        Update::None
+                    } else {
+                        self.hover = hover;
+                        Update::Render
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => match overlay {
+                    Overlay::RuntimeSearch => self.handle_runtime_search_click(position, layout),
+                    Overlay::ModelRuntime => self.handle_model_runtime_click(position, layout),
+                    Overlay::Help => Update::None,
+                },
+                MouseEventKind::ScrollUp => match overlay {
+                    Overlay::RuntimeSearch => self.scroll_runtime_search(-3, layout),
+                    Overlay::ModelRuntime => self.scroll_model_runtime_picker(-3, layout),
+                    Overlay::Help => Update::None,
+                },
+                MouseEventKind::ScrollDown => match overlay {
+                    Overlay::RuntimeSearch => self.scroll_runtime_search(3, layout),
+                    Overlay::ModelRuntime => self.scroll_model_runtime_picker(3, layout),
+                    Overlay::Help => Update::None,
+                },
+                _ => Update::None,
+            };
         }
         let position = Position::new(mouse.column, mouse.row);
         match mouse.kind {
@@ -240,10 +412,16 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> Update {
+        let normalized = text.replace(['\r', '\n', '\t'], " ");
+        if self.overlay == Some(Overlay::RuntimeSearch)
+            && self.runtime_search_focus == RuntimeSearchFocus::Query
+        {
+            self.insert_runtime_search_text(&normalized);
+            return Update::Render;
+        }
         if !self.command_active {
             return Update::None;
         }
-        let normalized = text.replace(['\r', '\n', '\t'], " ");
         self.insert_text(&normalized);
         self.suggestion_index = 0;
         self.suggestion_scroll = 0;
@@ -297,6 +475,9 @@ impl App {
         control: Option<ControlStatus>,
         observation_error: Option<String>,
     ) {
+        if let Some(status) = &control {
+            self.ingest_control_events(status);
+        }
         self.control = control;
         self.control_observation_error = observation_error;
     }
@@ -314,19 +495,332 @@ impl App {
         match result {
             Ok(status) => {
                 let lifecycle = status.backend.lifecycle;
-                self.control = Some(status);
-                self.control_observation_error = None;
-                self.notice = Some(format!("Backend is now {lifecycle:?}"));
+                let runtime = status.backend.runtime_id.as_ref().map(|runtime_id| {
+                    status.backend.runtime_version.as_deref().map_or_else(
+                        || runtime_id.to_string(),
+                        |version| format!("{runtime_id} / {version}"),
+                    )
+                });
+                let completion = runtime.map_or_else(
+                    || format!("Backend is now {lifecycle:?}"),
+                    |runtime| format!("Backend is now {lifecycle:?} with runtime {runtime}"),
+                );
+                self.notice = Some(completion.clone());
                 self.push_log(
                     LogLevel::Info,
-                    format!("Control operation completed: {lifecycle:?}"),
+                    format!("Control operation completed: {completion}"),
                 );
+                self.ingest_control_events(&status);
+                self.control = Some(status);
+                self.control_observation_error = None;
             }
             Err(error) => {
                 self.notice = Some(error.clone());
                 self.push_log(LogLevel::Error, error);
             }
         }
+    }
+
+    pub fn take_runtime_action(&mut self) -> Option<RuntimeAction> {
+        self.pending_runtime_action.take()
+    }
+
+    pub fn runtime_mutation_busy(&self) -> bool {
+        self.runtime_mutation_busy
+    }
+
+    pub fn handle_runtime_task_result(&mut self, result: RuntimeTaskResult) {
+        match result {
+            RuntimeTaskResult::Listed(result) => {
+                self.runtime_list_loading = false;
+                self.apply_runtime_list_result(result);
+            }
+            RuntimeTaskResult::Searched(result) => {
+                self.runtime_search_loading = false;
+                match result {
+                    Ok(snapshot) => {
+                        self.runtime_search = Some(snapshot);
+                        self.runtime_search_error = None;
+                        self.selected_runtime_search_result =
+                            self.runtime_search_indices().first().copied();
+                        self.runtime_search_scroll = 0;
+                        self.runtime_search_focus = RuntimeSearchFocus::Results;
+                    }
+                    Err(error) => {
+                        self.runtime_search_error = Some(error.clone());
+                        self.notice = Some(error);
+                    }
+                }
+            }
+            RuntimeTaskResult::Updates(result) => {
+                self.runtime_update_loading = false;
+                match result {
+                    Ok(checks) => {
+                        self.runtime_updates = checks
+                            .into_iter()
+                            .map(|check| (check.runtime.manifest.runtime_id, check.state))
+                            .collect();
+                        self.runtime_update_error = None;
+                        self.notice = Some("Runtime update check completed".to_owned());
+                    }
+                    Err(error) => {
+                        self.runtime_update_error = Some(error.clone());
+                        self.notice = Some(error.clone());
+                        self.push_log(LogLevel::Error, error);
+                    }
+                }
+            }
+            RuntimeTaskResult::Updated {
+                previous_runtime_id,
+                result,
+            } => {
+                self.runtime_mutation_busy = false;
+                match result {
+                    Ok((installed_runtime_id, snapshot)) => {
+                        self.runtime_updates.remove(&previous_runtime_id);
+                        self.apply_runtime_list(snapshot);
+                        self.notice = Some(format!(
+                            "Installed update {installed_runtime_id} side by side; selections are unchanged"
+                        ));
+                        self.push_log(
+                            LogLevel::Info,
+                            format!(
+                                "Runtime update installed side by side: {previous_runtime_id} -> {installed_runtime_id}"
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        self.notice = Some(error.clone());
+                        self.push_log(LogLevel::Error, error);
+                    }
+                }
+            }
+            RuntimeTaskResult::Installed { runtime_id, result } => {
+                self.runtime_mutation_busy = false;
+                if let Some(search) = &mut self.runtime_search {
+                    if let Some(found) = search
+                        .results
+                        .iter_mut()
+                        .find(|result| result.entry.available.runtime_id == runtime_id)
+                    {
+                        found.installed = result.is_ok();
+                    }
+                }
+                match result {
+                    Ok(snapshot) => {
+                        self.apply_runtime_list(snapshot);
+                        self.notice = Some(format!("Installed runtime {runtime_id}"));
+                        self.push_log(
+                            LogLevel::Info,
+                            format!("Runtime installation completed: {runtime_id}"),
+                        );
+                    }
+                    Err(error) => {
+                        self.notice = Some(error.clone());
+                        self.push_log(LogLevel::Error, error);
+                    }
+                }
+            }
+            RuntimeTaskResult::Selected { format, result } => {
+                self.runtime_mutation_busy = false;
+                match result {
+                    Ok(snapshot) => {
+                        let selected = snapshot
+                            .selections
+                            .format_defaults
+                            .get(&format)
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "none".to_owned());
+                        self.apply_runtime_list(snapshot);
+                        self.notice = Some(format!(
+                            "Selected {selected} as the {} runtime",
+                            format.as_str().to_ascii_uppercase()
+                        ));
+                    }
+                    Err(error) => {
+                        self.notice = Some(error.clone());
+                        self.push_log(LogLevel::Error, error);
+                    }
+                }
+            }
+            RuntimeTaskResult::ModelSelected { model_id, result } => {
+                self.runtime_mutation_busy = false;
+                match result {
+                    Ok(snapshot) => {
+                        let selected = snapshot
+                            .selections
+                            .model_overrides
+                            .get(&model_id)
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "none".to_owned());
+                        self.apply_runtime_list(snapshot);
+                        self.overlay = None;
+                        self.hover = None;
+                        self.notice = Some(format!("Selected {selected} for model {model_id}"));
+                    }
+                    Err(error) => {
+                        self.notice = Some(error.clone());
+                        self.push_log(LogLevel::Error, error);
+                    }
+                }
+            }
+            RuntimeTaskResult::ModelSelectionCleared { model_id, result } => {
+                self.runtime_mutation_busy = false;
+                match result {
+                    Ok(snapshot) => {
+                        self.apply_runtime_list(snapshot);
+                        self.notice =
+                            Some(format!("Cleared the runtime override for model {model_id}"));
+                    }
+                    Err(error) => {
+                        self.notice = Some(error.clone());
+                        self.push_log(LogLevel::Error, error);
+                    }
+                }
+            }
+            RuntimeTaskResult::ModelCandidates { model_id, result } => {
+                self.runtime_picker_loading = false;
+                if self
+                    .selected_model
+                    .and_then(|index| self.snapshot.models.get(index))
+                    .is_none_or(|model| model.id != model_id)
+                {
+                    return;
+                }
+                match result {
+                    Ok(candidates) => {
+                        self.runtime_picker_candidates = candidates;
+                        self.runtime_picker_error = None;
+                        let indices = self.runtime_picker_indices();
+                        let selected_id = self.runtime_list.as_ref().and_then(|snapshot| {
+                            snapshot.selections.model_overrides.get(&model_id)
+                        });
+                        self.runtime_picker_selection = selected_id
+                            .and_then(|runtime_id| {
+                                indices.iter().copied().find(|index| {
+                                    self.runtime_list.as_ref().is_some_and(|snapshot| {
+                                        snapshot.installed[*index].runtime.manifest.runtime_id
+                                            == *runtime_id
+                                    })
+                                })
+                            })
+                            .or_else(|| indices.first().copied());
+                        self.runtime_picker_scroll = self
+                            .runtime_picker_selection
+                            .and_then(|selected| {
+                                indices.iter().position(|index| *index == selected)
+                            })
+                            .unwrap_or_default();
+                        self.overlay = Some(Overlay::ModelRuntime);
+                        self.hover = None;
+                        self.notice = None;
+                    }
+                    Err(error) => {
+                        self.runtime_picker_candidates.clear();
+                        self.runtime_picker_selection = None;
+                        self.runtime_picker_scroll = 0;
+                        self.runtime_picker_error = Some(error.clone());
+                        self.overlay = Some(Overlay::ModelRuntime);
+                        self.hover = None;
+                        self.notice = None;
+                        self.push_log(LogLevel::Warning, error);
+                    }
+                }
+            }
+            RuntimeTaskResult::Removed { runtime_id, result } => {
+                self.runtime_mutation_busy = false;
+                self.pending_runtime_remove_confirmation = None;
+                match result {
+                    Ok(snapshot) => {
+                        self.runtime_updates.remove(&runtime_id);
+                        self.apply_runtime_list(snapshot);
+                        self.notice = Some(format!("Removed runtime {runtime_id}"));
+                    }
+                    Err(error) => {
+                        self.notice = Some(error.clone());
+                        self.push_log(LogLevel::Error, error);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn handle_runtime_progress(&mut self, progress: RuntimeOperationProgress) {
+        let failed = progress.phase == RuntimeOperationPhase::Failed;
+        self.runtime_operation = Some(progress.clone());
+        if failed {
+            self.notice = Some(progress.detail.clone());
+            self.push_log(LogLevel::Error, progress.detail);
+        }
+    }
+
+    pub fn runtime_search_indices(&self) -> Vec<usize> {
+        let Some(search) = &self.runtime_search else {
+            return Vec::new();
+        };
+        let terms = self
+            .runtime_search_query
+            .split_whitespace()
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        search
+            .results
+            .iter()
+            .enumerate()
+            .filter_map(|(index, result)| {
+                let available = &result.entry.available;
+                let formats = available
+                    .supported_formats
+                    .iter()
+                    .map(|format| format.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let haystack = format!(
+                    "{} {} {} {} {} {} {} {}",
+                    available.display_name,
+                    available.runtime_id,
+                    available.identity.engine_id,
+                    available.identity.package_family,
+                    available.identity.version,
+                    available.identity.accelerator,
+                    available.identity.variant,
+                    formats,
+                )
+                .to_ascii_lowercase();
+                terms
+                    .iter()
+                    .all(|term| haystack.contains(term))
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    pub fn runtime_picker_indices(&self) -> Vec<usize> {
+        let Some(snapshot) = &self.runtime_list else {
+            return Vec::new();
+        };
+        snapshot
+            .installed
+            .iter()
+            .enumerate()
+            .filter(|(_, status)| {
+                self.runtime_picker_candidates
+                    .contains(&status.runtime.manifest.runtime_id)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    pub fn selected_model_has_runtime_override(&self) -> bool {
+        let Some(model) = self
+            .selected_model
+            .and_then(|index| self.snapshot.models.get(index))
+        else {
+            return false;
+        };
+        self.runtime_list
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.selections.model_overrides.contains_key(&model.id))
     }
 
     pub fn clear_hover(&mut self) {
@@ -340,6 +834,30 @@ impl App {
         self.logs.push(LogEntry { level, message });
         if self.logs.len() > 500 {
             self.logs.remove(0);
+        }
+    }
+
+    fn ingest_control_events(&mut self, status: &ControlStatus) {
+        for event in &status.recent_events {
+            let (level, rank) = match event.level {
+                RuntimeNoticeLevel::Info => (LogLevel::Info, 0),
+                RuntimeNoticeLevel::Warning => (LogLevel::Warning, 1),
+                RuntimeNoticeLevel::Error => (LogLevel::Error, 2),
+            };
+            let fingerprint = (event.timestamp_unix, rank, event.message.clone());
+            if !self.seen_runtime_events.insert(fingerprint) {
+                continue;
+            }
+            if matches!(
+                event.level,
+                RuntimeNoticeLevel::Warning | RuntimeNoticeLevel::Error
+            ) {
+                self.notice = Some(event.message.clone());
+            }
+            self.push_log(level, event.message.clone());
+        }
+        while self.seen_runtime_events.len() > 512 {
+            self.seen_runtime_events.pop_first();
         }
     }
 
@@ -549,6 +1067,7 @@ impl App {
                 }
                 KeyCode::Enter => self.request_load(),
                 KeyCode::Char('u') => self.request_unload(),
+                KeyCode::Char('v') => self.open_model_runtime_picker(),
                 _ => Update::None,
             },
             Screen::Logs => match key.code {
@@ -563,6 +1082,37 @@ impl App {
                 KeyCode::End => {
                     self.log_scroll = 0;
                     Update::Render
+                }
+                _ => Update::None,
+            },
+            Screen::Runtimes => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.move_runtime_selection(-1, layout),
+                KeyCode::Down | KeyCode::Char('j') => self.move_runtime_selection(1, layout),
+                KeyCode::PageUp => {
+                    self.scroll_runtimes(-(layout.runtime_capacity() as isize), layout)
+                }
+                KeyCode::PageDown => {
+                    self.scroll_runtimes(layout.runtime_capacity() as isize, layout)
+                }
+                KeyCode::Home => self.select_runtime(0, layout),
+                KeyCode::End => {
+                    let Some(last) = self
+                        .runtime_list
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.installed.len().checked_sub(1))
+                    else {
+                        return Update::None;
+                    };
+                    self.select_runtime(last, layout)
+                }
+                KeyCode::Char('s') => self.open_runtime_search(),
+                KeyCode::Char('r') => self.request_runtime_list(),
+                KeyCode::Char('u') => self.request_runtime_updates(),
+                KeyCode::Char('U') => self.request_selected_runtime_update(),
+                KeyCode::Char('d') => self.request_runtime_removal(),
+                KeyCode::Char('g') => self.request_runtime_selection(ArtifactFormat::Gguf),
+                KeyCode::Char('Q') | KeyCode::Char('2') => {
+                    self.request_runtime_selection(ArtifactFormat::Q27)
                 }
                 _ => Update::None,
             },
@@ -590,6 +1140,23 @@ impl App {
                 self.selected_model = Some(index);
                 Update::Render
             }
+            Some(HoverTarget::Runtime(index)) => {
+                if self.command_active {
+                    self.close_command();
+                }
+                self.focus = FocusArea::Content;
+                self.selected_runtime = Some(index);
+                self.pending_runtime_remove_confirmation = None;
+                Update::Render
+            }
+            Some(HoverTarget::RuntimeSearchAction) => {
+                self.focus = FocusArea::Content;
+                self.open_runtime_search()
+            }
+            Some(HoverTarget::RuntimeUpdateAction) => {
+                self.focus = FocusArea::Content;
+                self.request_runtime_updates()
+            }
             Some(HoverTarget::CommandSuggestion(index)) => {
                 self.suggestion_index = index;
                 self.submit_command()
@@ -605,6 +1172,14 @@ impl App {
                 self.focus = FocusArea::Content;
                 Update::Render
             }
+            Some(
+                HoverTarget::RuntimeSearchInput
+                | HoverTarget::RuntimeSearchResult(_)
+                | HoverTarget::RuntimeSearchSubmit
+                | HoverTarget::RuntimeInstall
+                | HoverTarget::RuntimePickerResult(_)
+                | HoverTarget::RuntimePickerApply,
+            ) => Update::None,
             None => Update::None,
         }
     }
@@ -630,8 +1205,753 @@ impl App {
         match self.screen {
             Screen::Models => self.scroll_models(direction * 3, layout),
             Screen::Logs => self.scroll_logs(direction * -3, layout),
+            Screen::Runtimes => self.scroll_runtimes(direction * 3, layout),
             _ => Update::None,
         }
+    }
+
+    fn handle_runtime_search_key(&mut self, key: KeyEvent, layout: &UiLayout) -> Update {
+        match key.code {
+            KeyCode::Esc => {
+                self.overlay = None;
+                self.hover = None;
+                Update::Render
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.runtime_search_focus = match self.runtime_search_focus {
+                    RuntimeSearchFocus::Query => RuntimeSearchFocus::Results,
+                    RuntimeSearchFocus::Results => RuntimeSearchFocus::Query,
+                };
+                Update::Render
+            }
+            _ => match self.runtime_search_focus {
+                RuntimeSearchFocus::Query => self.handle_runtime_search_query_key(key),
+                RuntimeSearchFocus::Results => self.handle_runtime_search_result_key(key, layout),
+            },
+        }
+    }
+
+    fn handle_model_runtime_key(&mut self, key: KeyEvent, layout: &UiLayout) -> Update {
+        match key.code {
+            KeyCode::Esc => {
+                self.overlay = None;
+                self.hover = None;
+                Update::Render
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_model_runtime_picker(-1, layout),
+            KeyCode::Down | KeyCode::Char('j') => self.move_model_runtime_picker(1, layout),
+            KeyCode::PageUp => {
+                self.move_model_runtime_picker(-(layout.runtime_search_capacity() as isize), layout)
+            }
+            KeyCode::PageDown => {
+                self.move_model_runtime_picker(layout.runtime_search_capacity() as isize, layout)
+            }
+            KeyCode::Home => self.select_model_runtime_position(0, layout),
+            KeyCode::End => {
+                let indices = self.runtime_picker_indices();
+                if indices.is_empty() {
+                    Update::None
+                } else {
+                    self.select_model_runtime_position(indices.len() - 1, layout)
+                }
+            }
+            KeyCode::Enter => self.activate_model_runtime_primary(),
+            KeyCode::Char('s') => self.open_runtime_search_for_selected_model(),
+            KeyCode::Char('x') | KeyCode::Delete => self.request_clear_model_runtime_selection(),
+            _ => Update::None,
+        }
+    }
+
+    fn handle_model_runtime_click(&mut self, position: Position, layout: &UiLayout) -> Update {
+        match layout.hit_test(position) {
+            Some(HoverTarget::RuntimePickerResult(index)) => {
+                self.runtime_picker_selection = Some(index);
+                Update::Render
+            }
+            Some(HoverTarget::RuntimePickerApply) => self.activate_model_runtime_primary(),
+            _ => Update::None,
+        }
+    }
+
+    fn open_model_runtime_picker(&mut self) -> Update {
+        let Some(model) = self
+            .selected_model
+            .and_then(|index| self.snapshot.models.get(index))
+            .cloned()
+        else {
+            self.notice = Some("Select a model before choosing its runtime".to_owned());
+            return Update::Render;
+        };
+        if self.runtime_list_loading && self.runtime_list.is_none() {
+            self.notice = Some("Installed runtimes are still being inspected".to_owned());
+            return Update::Render;
+        }
+        if self.runtime_picker_loading || self.runtime_mutation_busy {
+            self.notice = Some("A runtime operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        self.runtime_picker_loading = true;
+        self.runtime_picker_candidates.clear();
+        self.runtime_picker_error = None;
+        self.pending_runtime_action = Some(RuntimeAction::ModelCandidates {
+            model: Box::new(model),
+        });
+        self.notice = Some("Checking installed runtime compatibility…".to_owned());
+        Update::Render
+    }
+
+    fn request_model_runtime_selection(&mut self) -> Update {
+        if self.runtime_mutation_busy {
+            self.notice = Some("A runtime operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        let Some(model) = self
+            .selected_model
+            .and_then(|index| self.snapshot.models.get(index))
+            .cloned()
+        else {
+            self.notice = Some("The selected model is no longer available".to_owned());
+            return Update::Render;
+        };
+        let Some(runtime_id) = self.runtime_picker_selection.and_then(|index| {
+            self.runtime_list
+                .as_ref()?
+                .installed
+                .get(index)
+                .map(|status| status.runtime.manifest.runtime_id.clone())
+        }) else {
+            self.notice = Some("Select an installed runtime".to_owned());
+            return Update::Render;
+        };
+        self.pending_runtime_action = Some(RuntimeAction::SelectModel {
+            model: Box::new(model),
+            runtime_id,
+        });
+        self.runtime_mutation_busy = true;
+        self.runtime_operation = None;
+        self.notice = Some("Saving model-specific runtime selection…".to_owned());
+        Update::Render
+    }
+
+    fn activate_model_runtime_primary(&mut self) -> Update {
+        if self.runtime_mutation_busy {
+            self.notice = Some("A runtime operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        if self.runtime_picker_indices().is_empty() {
+            self.open_runtime_search_for_selected_model()
+        } else {
+            self.request_model_runtime_selection()
+        }
+    }
+
+    fn request_clear_model_runtime_selection(&mut self) -> Update {
+        if self.runtime_mutation_busy {
+            self.notice = Some("A runtime operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        let Some(model_id) = self
+            .selected_model
+            .and_then(|index| self.snapshot.models.get(index))
+            .map(|model| model.id.clone())
+        else {
+            self.notice = Some("The selected model is no longer available".to_owned());
+            return Update::Render;
+        };
+        if !self.selected_model_has_runtime_override() {
+            self.notice = Some("This model has no persisted runtime override".to_owned());
+            return Update::Render;
+        }
+        self.pending_runtime_action = Some(RuntimeAction::ClearModelSelection {
+            model_id: model_id.clone(),
+        });
+        self.runtime_mutation_busy = true;
+        self.runtime_operation = None;
+        self.notice = Some(format!(
+            "Clearing the runtime override for model {model_id}…"
+        ));
+        Update::Render
+    }
+
+    fn move_model_runtime_picker(&mut self, direction: isize, layout: &UiLayout) -> Update {
+        let indices = self.runtime_picker_indices();
+        if indices.is_empty() {
+            return Update::None;
+        }
+        let current = self
+            .runtime_picker_selection
+            .and_then(|selected| indices.iter().position(|index| *index == selected))
+            .unwrap_or_default();
+        let next = (current as isize + direction).clamp(0, indices.len() as isize - 1) as usize;
+        self.select_model_runtime_position(next, layout)
+    }
+
+    fn select_model_runtime_position(&mut self, position: usize, layout: &UiLayout) -> Update {
+        let indices = self.runtime_picker_indices();
+        let Some(index) = indices.get(position.min(indices.len().saturating_sub(1))) else {
+            return Update::None;
+        };
+        self.runtime_picker_selection = Some(*index);
+        let capacity = layout.runtime_search_capacity().max(1);
+        if position < self.runtime_picker_scroll {
+            self.runtime_picker_scroll = position;
+        } else if position >= self.runtime_picker_scroll + capacity {
+            self.runtime_picker_scroll = position + 1 - capacity;
+        }
+        Update::Render
+    }
+
+    fn scroll_model_runtime_picker(&mut self, amount: isize, layout: &UiLayout) -> Update {
+        let indices = self.runtime_picker_indices();
+        if indices.is_empty() {
+            return Update::None;
+        }
+        let capacity = layout.runtime_search_capacity().max(1);
+        let max_scroll = indices.len().saturating_sub(capacity);
+        self.runtime_picker_scroll = if amount < 0 {
+            self.runtime_picker_scroll
+                .saturating_sub(amount.unsigned_abs())
+        } else {
+            self.runtime_picker_scroll
+                .saturating_add(amount as usize)
+                .min(max_scroll)
+        };
+        if let Some(index) = indices.get(self.runtime_picker_scroll) {
+            self.runtime_picker_selection = Some(*index);
+        }
+        Update::Render
+    }
+
+    fn handle_runtime_search_query_key(&mut self, key: KeyEvent) -> Update {
+        match key.code {
+            KeyCode::Enter => self.request_runtime_search(false),
+            KeyCode::Down => {
+                if self.runtime_search_indices().is_empty() {
+                    Update::None
+                } else {
+                    self.runtime_search_focus = RuntimeSearchFocus::Results;
+                    Update::Render
+                }
+            }
+            KeyCode::Backspace => {
+                if self.runtime_search_cursor > 0 {
+                    self.runtime_search_cursor -= 1;
+                    let start = byte_index(&self.runtime_search_query, self.runtime_search_cursor);
+                    let end =
+                        byte_index(&self.runtime_search_query, self.runtime_search_cursor + 1);
+                    self.runtime_search_query.replace_range(start..end, "");
+                    self.reconcile_runtime_search_selection();
+                }
+                Update::Render
+            }
+            KeyCode::Delete => {
+                if self.runtime_search_cursor < self.runtime_search_query.chars().count() {
+                    let start = byte_index(&self.runtime_search_query, self.runtime_search_cursor);
+                    let end =
+                        byte_index(&self.runtime_search_query, self.runtime_search_cursor + 1);
+                    self.runtime_search_query.replace_range(start..end, "");
+                    self.reconcile_runtime_search_selection();
+                }
+                Update::Render
+            }
+            KeyCode::Left => {
+                self.runtime_search_cursor = self.runtime_search_cursor.saturating_sub(1);
+                Update::Render
+            }
+            KeyCode::Right => {
+                self.runtime_search_cursor =
+                    (self.runtime_search_cursor + 1).min(self.runtime_search_query.chars().count());
+                Update::Render
+            }
+            KeyCode::Home => {
+                self.runtime_search_cursor = 0;
+                Update::Render
+            }
+            KeyCode::End => {
+                self.runtime_search_cursor = self.runtime_search_query.chars().count();
+                Update::Render
+            }
+            KeyCode::F(5) => self.request_runtime_search(true),
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.insert_runtime_search_text(&character.to_string());
+                Update::Render
+            }
+            _ => Update::None,
+        }
+    }
+
+    fn handle_runtime_search_result_key(&mut self, key: KeyEvent, layout: &UiLayout) -> Update {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.move_runtime_search_selection(-1, layout),
+            KeyCode::Down | KeyCode::Char('j') => self.move_runtime_search_selection(1, layout),
+            KeyCode::PageUp => self.move_runtime_search_selection(
+                -(layout.runtime_search_capacity() as isize),
+                layout,
+            ),
+            KeyCode::PageDown => self
+                .move_runtime_search_selection(layout.runtime_search_capacity() as isize, layout),
+            KeyCode::Home => self.select_runtime_search_position(0, layout),
+            KeyCode::End => {
+                let indices = self.runtime_search_indices();
+                if indices.is_empty() {
+                    Update::None
+                } else {
+                    self.select_runtime_search_position(indices.len() - 1, layout)
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('i') => self.request_runtime_install(),
+            KeyCode::Char('r') | KeyCode::F(5) => self.request_runtime_search(true),
+            KeyCode::Char('/') => {
+                self.runtime_search_focus = RuntimeSearchFocus::Query;
+                Update::Render
+            }
+            _ => Update::None,
+        }
+    }
+
+    fn handle_runtime_search_click(&mut self, position: Position, layout: &UiLayout) -> Update {
+        match layout.hit_test(position) {
+            Some(HoverTarget::RuntimeSearchInput) => {
+                self.runtime_search_focus = RuntimeSearchFocus::Query;
+                Update::Render
+            }
+            Some(HoverTarget::RuntimeSearchResult(index)) => {
+                self.runtime_search_focus = RuntimeSearchFocus::Results;
+                self.selected_runtime_search_result = Some(index);
+                Update::Render
+            }
+            Some(HoverTarget::RuntimeSearchSubmit) => self.request_runtime_search(false),
+            Some(HoverTarget::RuntimeInstall) => self.request_runtime_install(),
+            _ => Update::None,
+        }
+    }
+
+    fn open_runtime_search(&mut self) -> Update {
+        if self.command_active {
+            self.close_command();
+        }
+        if self.runtime_search_context.take().is_some() {
+            self.runtime_search_query.clear();
+        }
+        self.overlay = Some(Overlay::RuntimeSearch);
+        self.pending_runtime_remove_confirmation = None;
+        self.hover = None;
+        self.runtime_search_focus = RuntimeSearchFocus::Query;
+        self.runtime_search_cursor = self.runtime_search_query.chars().count();
+        let _ = self.request_runtime_search(false);
+        Update::Render
+    }
+
+    fn open_runtime_search_for_selected_model(&mut self) -> Update {
+        if self.runtime_mutation_busy || self.runtime_search_loading {
+            self.notice = Some("A runtime operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        let Some(model) = self
+            .selected_model
+            .and_then(|index| self.snapshot.models.get(index))
+        else {
+            self.notice = Some("The selected model is no longer available".to_owned());
+            return Update::Render;
+        };
+        let format = model.format.as_str().to_owned();
+        self.runtime_search_context = Some(format!(
+            "recommended {} runtimes for {}",
+            format.to_ascii_uppercase(),
+            model.display_name
+        ));
+        self.runtime_search_query = format;
+        self.runtime_search_cursor = self.runtime_search_query.chars().count();
+        self.reconcile_runtime_search_selection();
+        self.overlay = Some(Overlay::RuntimeSearch);
+        self.pending_runtime_remove_confirmation = None;
+        self.hover = None;
+        self.runtime_search_focus = RuntimeSearchFocus::Query;
+        let _ = self.request_runtime_search(false);
+        Update::Render
+    }
+
+    fn request_runtime_list(&mut self) -> Update {
+        if self.runtime_list_loading {
+            return Update::None;
+        }
+        self.runtime_list_loading = true;
+        self.runtime_list_error = None;
+        self.pending_runtime_action = Some(RuntimeAction::RefreshList);
+        self.notice = Some("Refreshing installed runtimes…".to_owned());
+        Update::Render
+    }
+
+    fn request_runtime_updates(&mut self) -> Update {
+        self.pending_runtime_remove_confirmation = None;
+        if self.runtime_update_loading {
+            return Update::None;
+        }
+        if self.runtime_mutation_busy {
+            self.notice = Some("A runtime operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        self.runtime_update_loading = true;
+        self.runtime_update_error = None;
+        self.pending_runtime_action = Some(RuntimeAction::CheckUpdates);
+        self.notice = Some("Checking upstream runtime releases…".to_owned());
+        Update::Render
+    }
+
+    fn request_selected_runtime_update(&mut self) -> Update {
+        self.pending_runtime_remove_confirmation = None;
+        if self.runtime_mutation_busy || self.runtime_update_loading {
+            self.notice = Some("A runtime operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        let Some(runtime_id) = self.selected_runtime.and_then(|index| {
+            self.runtime_list
+                .as_ref()?
+                .installed
+                .get(index)
+                .map(|status| status.runtime.manifest.runtime_id.clone())
+        }) else {
+            self.notice = Some("Select an installed runtime first".to_owned());
+            return Update::Render;
+        };
+        match self.runtime_updates.get(&runtime_id) {
+            Some(RuntimeUpdateState::NewerCompatibleVersion { .. })
+            | Some(RuntimeUpdateState::Pinned {
+                newer_runtime_id: Some(_),
+                ..
+            }) => {}
+            Some(RuntimeUpdateState::Current) => {
+                self.notice = Some("The selected runtime is current".to_owned());
+                return Update::Render;
+            }
+            Some(RuntimeUpdateState::Pinned { .. }) => {
+                self.notice = Some("No newer compatible version is available".to_owned());
+                return Update::Render;
+            }
+            Some(state) => {
+                self.notice = Some(format!("The selected runtime cannot be updated: {state:?}"));
+                return Update::Render;
+            }
+            None => {
+                self.notice = Some("Press u to check for updates first".to_owned());
+                return Update::Render;
+            }
+        }
+        self.pending_runtime_action = Some(RuntimeAction::Update(runtime_id.clone()));
+        self.runtime_mutation_busy = true;
+        self.runtime_operation = None;
+        self.notice = Some(format!(
+            "Installing the update for {runtime_id} side by side…"
+        ));
+        Update::Render
+    }
+
+    fn request_runtime_removal(&mut self) -> Update {
+        if self.runtime_mutation_busy {
+            self.notice = Some("A runtime operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        if self.control_observation_pending() {
+            self.notice =
+                Some("Wait for server control observation before removing a runtime".to_owned());
+            return Update::Render;
+        }
+        let Some(status) = self
+            .selected_runtime
+            .and_then(|index| self.runtime_list.as_ref()?.installed.get(index))
+        else {
+            self.notice = Some("Select an installed runtime first".to_owned());
+            return Update::Render;
+        };
+        let runtime_id = status.runtime.manifest.runtime_id.clone();
+        if !status.selected_for.is_empty() {
+            self.notice = Some(format!(
+                "{runtime_id} is selected for {}; remap that selection before removal",
+                status.selected_for.join(", ")
+            ));
+            return Update::Render;
+        }
+        let active_runtime = self
+            .control
+            .as_ref()
+            .and_then(|control| control.backend.runtime_id.clone());
+        if active_runtime.as_ref() == Some(&runtime_id) {
+            self.notice = Some("The active runtime cannot be removed".to_owned());
+            return Update::Render;
+        }
+        if self.pending_runtime_remove_confirmation.as_ref() != Some(&runtime_id) {
+            self.pending_runtime_remove_confirmation = Some(runtime_id.clone());
+            self.notice = Some(format!(
+                "Press d again to confirm removal of exact runtime {runtime_id}"
+            ));
+            return Update::Render;
+        }
+        self.pending_runtime_action = Some(RuntimeAction::Remove {
+            runtime_id: runtime_id.clone(),
+        });
+        self.runtime_mutation_busy = true;
+        self.notice = Some(format!("Removing runtime {runtime_id}…"));
+        Update::Render
+    }
+
+    fn request_runtime_search(&mut self, force_refresh: bool) -> Update {
+        if self.runtime_search_loading {
+            return Update::None;
+        }
+        self.runtime_search_loading = true;
+        self.runtime_search_error = None;
+        self.pending_runtime_action = Some(RuntimeAction::Search {
+            query: self.runtime_search_query.clone(),
+            force_refresh,
+        });
+        Update::Render
+    }
+
+    fn request_runtime_install(&mut self) -> Update {
+        if self.runtime_mutation_busy {
+            self.notice = Some("A runtime operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        let Some(index) = self.selected_runtime_search_result else {
+            self.notice = Some("Select an available runtime to install".to_owned());
+            return Update::Render;
+        };
+        let Some(result) = self
+            .runtime_search
+            .as_ref()
+            .and_then(|snapshot| snapshot.results.get(index))
+        else {
+            self.notice = Some("The selected search result is no longer available".to_owned());
+            return Update::Render;
+        };
+        if result.installed {
+            self.notice = Some("That runtime is already installed".to_owned());
+            return Update::Render;
+        }
+        if let RuntimeCompatibility::Incompatible(reason) = &result.entry.compatibility {
+            self.notice = Some(format!("This runtime is incompatible: {reason}"));
+            return Update::Render;
+        }
+        let runtime_id = result.entry.available.runtime_id.clone();
+        self.pending_runtime_action = Some(RuntimeAction::Install(runtime_id.clone()));
+        self.runtime_mutation_busy = true;
+        self.runtime_operation = None;
+        self.notice = Some(format!("Installing runtime {runtime_id}…"));
+        Update::Render
+    }
+
+    fn request_runtime_selection(&mut self, format: ArtifactFormat) -> Update {
+        if self.runtime_mutation_busy {
+            self.notice = Some("A runtime operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        let Some(index) = self.selected_runtime else {
+            self.notice = Some("Select an installed runtime first".to_owned());
+            return Update::Render;
+        };
+        let Some(status) = self
+            .runtime_list
+            .as_ref()
+            .and_then(|snapshot| snapshot.installed.get(index))
+        else {
+            self.notice = Some("The selected runtime is no longer installed".to_owned());
+            return Update::Render;
+        };
+        if !status.runtime.manifest.supported_formats.contains(&format) {
+            self.notice = Some(format!(
+                "The selected runtime does not support {}",
+                format.as_str().to_ascii_uppercase()
+            ));
+            return Update::Render;
+        }
+        if !status.compatibility.is_usable() {
+            let reason = match &status.compatibility {
+                RuntimeCompatibility::Incompatible(reason) => reason.as_str(),
+                _ => "not usable on this host",
+            };
+            self.notice = Some(format!("The selected runtime is incompatible: {reason}"));
+            return Update::Render;
+        }
+        let runtime_id = status.runtime.manifest.runtime_id.clone();
+        self.pending_runtime_action = Some(RuntimeAction::SelectFormat { format, runtime_id });
+        self.runtime_mutation_busy = true;
+        self.runtime_operation = None;
+        self.notice = Some(format!(
+            "Selecting runtime for {}…",
+            format.as_str().to_ascii_uppercase()
+        ));
+        Update::Render
+    }
+
+    fn insert_runtime_search_text(&mut self, text: &str) {
+        let index = byte_index(&self.runtime_search_query, self.runtime_search_cursor);
+        self.runtime_search_query.insert_str(index, text);
+        self.runtime_search_cursor += text.chars().count();
+        self.reconcile_runtime_search_selection();
+    }
+
+    fn reconcile_runtime_search_selection(&mut self) {
+        let indices = self.runtime_search_indices();
+        if indices.is_empty() {
+            self.selected_runtime_search_result = None;
+            self.runtime_search_scroll = 0;
+            return;
+        }
+        if !self
+            .selected_runtime_search_result
+            .is_some_and(|selected| indices.contains(&selected))
+        {
+            self.selected_runtime_search_result = indices.first().copied();
+            self.runtime_search_scroll = 0;
+        }
+        self.runtime_search_scroll = self
+            .runtime_search_scroll
+            .min(indices.len().saturating_sub(1));
+    }
+
+    fn move_runtime_search_selection(&mut self, direction: isize, layout: &UiLayout) -> Update {
+        let indices = self.runtime_search_indices();
+        if indices.is_empty() {
+            return Update::None;
+        }
+        let current = self
+            .selected_runtime_search_result
+            .and_then(|selected| indices.iter().position(|index| *index == selected))
+            .unwrap_or_default();
+        let next = (current as isize + direction).clamp(0, indices.len() as isize - 1) as usize;
+        self.select_runtime_search_position(next, layout)
+    }
+
+    fn select_runtime_search_position(&mut self, position: usize, layout: &UiLayout) -> Update {
+        let indices = self.runtime_search_indices();
+        let Some(index) = indices.get(position.min(indices.len().saturating_sub(1))) else {
+            return Update::None;
+        };
+        self.selected_runtime_search_result = Some(*index);
+        let capacity = layout.runtime_search_capacity().max(1);
+        if position < self.runtime_search_scroll {
+            self.runtime_search_scroll = position;
+        } else if position >= self.runtime_search_scroll + capacity {
+            self.runtime_search_scroll = position + 1 - capacity;
+        }
+        Update::Render
+    }
+
+    fn scroll_runtime_search(&mut self, amount: isize, layout: &UiLayout) -> Update {
+        let indices = self.runtime_search_indices();
+        if indices.is_empty() {
+            return Update::None;
+        }
+        let capacity = layout.runtime_search_capacity().max(1);
+        let max_scroll = indices.len().saturating_sub(capacity);
+        self.runtime_search_scroll = if amount < 0 {
+            self.runtime_search_scroll
+                .saturating_sub(amount.unsigned_abs())
+        } else {
+            self.runtime_search_scroll
+                .saturating_add(amount as usize)
+                .min(max_scroll)
+        };
+        if let Some(index) = indices.get(self.runtime_search_scroll) {
+            self.selected_runtime_search_result = Some(*index);
+        }
+        self.runtime_search_focus = RuntimeSearchFocus::Results;
+        Update::Render
+    }
+
+    fn move_runtime_selection(&mut self, direction: isize, layout: &UiLayout) -> Update {
+        let Some(len) = self
+            .runtime_list
+            .as_ref()
+            .map(|snapshot| snapshot.installed.len())
+        else {
+            return Update::None;
+        };
+        if len == 0 {
+            return Update::None;
+        }
+        let next = self.selected_runtime.map_or(0, |current| {
+            (current as isize + direction).clamp(0, len as isize - 1) as usize
+        });
+        self.select_runtime(next, layout)
+    }
+
+    fn select_runtime(&mut self, index: usize, layout: &UiLayout) -> Update {
+        let Some(len) = self
+            .runtime_list
+            .as_ref()
+            .map(|snapshot| snapshot.installed.len())
+        else {
+            return Update::None;
+        };
+        if len == 0 {
+            return Update::None;
+        }
+        let index = index.min(len - 1);
+        self.selected_runtime = Some(index);
+        self.pending_runtime_remove_confirmation = None;
+        let capacity = layout.runtime_capacity().max(1);
+        if index < self.runtime_scroll {
+            self.runtime_scroll = index;
+        } else if index >= self.runtime_scroll + capacity {
+            self.runtime_scroll = index + 1 - capacity;
+        }
+        Update::Render
+    }
+
+    fn scroll_runtimes(&mut self, amount: isize, layout: &UiLayout) -> Update {
+        let len = self
+            .runtime_list
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.installed.len());
+        let capacity = layout.runtime_capacity().max(1);
+        let max_scroll = len.saturating_sub(capacity);
+        self.runtime_scroll = if amount < 0 {
+            self.runtime_scroll.saturating_sub(amount.unsigned_abs())
+        } else {
+            self.runtime_scroll
+                .saturating_add(amount as usize)
+                .min(max_scroll)
+        };
+        Update::Render
+    }
+
+    fn apply_runtime_list_result(&mut self, result: Result<RuntimeListSnapshot, String>) {
+        match result {
+            Ok(snapshot) => self.apply_runtime_list(snapshot),
+            Err(error) => {
+                self.runtime_list_error = Some(error.clone());
+                self.notice = Some(error.clone());
+                self.push_log(LogLevel::Error, error);
+            }
+        }
+    }
+
+    fn apply_runtime_list(&mut self, snapshot: RuntimeListSnapshot) {
+        let selected_id = self.selected_runtime.and_then(|index| {
+            self.runtime_list
+                .as_ref()?
+                .installed
+                .get(index)
+                .map(|status| status.runtime.manifest.runtime_id.clone())
+        });
+        self.runtime_list_error = None;
+        self.selected_runtime = selected_id
+            .and_then(|runtime_id| {
+                snapshot
+                    .installed
+                    .iter()
+                    .position(|status| status.runtime.manifest.runtime_id == runtime_id)
+            })
+            .or_else(|| (!snapshot.installed.is_empty()).then_some(0));
+        self.runtime_scroll = self
+            .runtime_scroll
+            .min(snapshot.installed.len().saturating_sub(1));
+        self.runtime_list = Some(snapshot);
     }
 
     fn move_model_selection(&mut self, direction: isize, layout: &UiLayout) -> Update {

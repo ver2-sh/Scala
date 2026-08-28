@@ -38,9 +38,9 @@ pub const COMMANDS: &[SlashCommand] = &[
         action: CommandAction::Navigate(Screen::Models),
     },
     SlashCommand {
-        name: "/engines",
-        description: "Open engine management",
-        action: CommandAction::Navigate(Screen::Engines),
+        name: "/runtimes",
+        description: "Open runtime pack management",
+        action: CommandAction::Navigate(Screen::Runtimes),
     },
     SlashCommand {
         name: "/status",

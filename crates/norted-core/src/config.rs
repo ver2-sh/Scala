@@ -18,6 +18,9 @@ pub struct AppPaths {
     pub state_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub log_dir: PathBuf,
+    pub runtimes_dir: PathBuf,
+    pub runtime_cache_dir: PathBuf,
+    pub runtime_selections_file: PathBuf,
 }
 
 impl AppPaths {
@@ -28,12 +31,17 @@ impl AppPaths {
             .state_dir()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| dirs.data_local_dir().join("state"));
+        let data_dir = dirs.data_dir().to_path_buf();
+        let cache_dir = dirs.cache_dir().to_path_buf();
         Ok(Self {
             config_dir: dirs.config_dir().to_path_buf(),
             config_file: dirs.config_dir().join("config.toml"),
-            data_dir: dirs.data_dir().to_path_buf(),
+            runtimes_dir: data_dir.join("runtimes"),
+            runtime_selections_file: data_dir.join("runtime-selections.json"),
+            data_dir,
             state_dir,
-            cache_dir: dirs.cache_dir().to_path_buf(),
+            runtime_cache_dir: cache_dir.join("runtime-packs"),
+            cache_dir,
             log_dir: dirs.data_local_dir().join("logs"),
         })
     }
@@ -45,6 +53,8 @@ impl AppPaths {
             &self.state_dir,
             &self.cache_dir,
             &self.log_dir,
+            &self.runtimes_dir,
+            &self.runtime_cache_dir,
         ] {
             fs::create_dir_all(path).map_err(|source| CoreError::CreateDirectory {
                 path: path.clone(),

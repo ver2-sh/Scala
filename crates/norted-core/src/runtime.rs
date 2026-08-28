@@ -762,6 +762,9 @@ mod tests {
             state_dir: root.join("state"),
             cache_dir: root.join("cache"),
             log_dir: root.join("logs"),
+            runtimes_dir: root.join("data/runtimes"),
+            runtime_cache_dir: root.join("cache/runtime-packs"),
+            runtime_selections_file: root.join("data/runtime-selections.json"),
         }
     }
 

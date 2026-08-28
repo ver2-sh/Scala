@@ -13,13 +13,13 @@ use color_eyre::Result;
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
 use norted_core::{AppPaths, ApplicationCore};
-use norted_engine::{ControlClient, ControlStatus};
+use norted_engine::{ControlClient, ControlClientError, ControlStatus, RuntimePackManager};
 
-use app::{App, ControlAction, Update};
+use app::{App, ControlAction, RuntimeAction, RuntimeTaskResult, Update};
 use terminal::TerminalSession;
 use ui::layout::UiLayout;
 
-pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
+pub async fn run(core: Arc<ApplicationCore>, runtime_packs: Arc<RuntimePackManager>) -> Result<()> {
     let mut terminal = TerminalSession::enter()?;
     let mut core_events = core.subscribe();
     let snapshot = core.snapshot().await;
@@ -47,6 +47,14 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
     let mut terminal_events = EventStream::new();
     let (control_updates, mut control_update_receiver) = tokio::sync::mpsc::channel(2);
     let (control_results, mut control_result_receiver) = tokio::sync::mpsc::channel(2);
+    let (runtime_results, mut runtime_result_receiver) = tokio::sync::mpsc::channel(4);
+    let mut runtime_progress = runtime_packs.progress();
+    spawn_runtime_action(
+        Arc::clone(&runtime_packs),
+        core.paths.clone(),
+        runtime_results.clone(),
+        RuntimeAction::RefreshList,
+    );
     let observer_core = Arc::clone(&core);
     let observer_paths = core.paths.clone();
     let runtime_observer = tokio::spawn(async move {
@@ -108,6 +116,21 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
                 }
                 None => Update::None,
             },
+            result = runtime_result_receiver.recv() => match result {
+                Some(result) => {
+                    app.handle_runtime_task_result(result);
+                    Update::Render
+                }
+                None => Update::None,
+            },
+            progress = runtime_progress.recv() => match progress {
+                Ok(progress) => {
+                    app.handle_runtime_progress(progress);
+                    Update::Render
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Update::Render,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => Update::None,
+            },
         };
         if update == Update::Quit {
             break;
@@ -120,11 +143,167 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
                 let _ = results.send(result).await;
             });
         }
+        if let Some(action) = app.take_runtime_action() {
+            spawn_runtime_action(
+                Arc::clone(&runtime_packs),
+                core.paths.clone(),
+                runtime_results.clone(),
+                action,
+            );
+        }
         render = update == Update::Render;
     }
     runtime_observer.abort();
     terminal.leave()?;
     Ok(())
+}
+
+fn spawn_runtime_action(
+    runtime_packs: Arc<RuntimePackManager>,
+    paths: AppPaths,
+    results: tokio::sync::mpsc::Sender<RuntimeTaskResult>,
+    action: RuntimeAction,
+) {
+    tokio::spawn(async move {
+        let result = execute_runtime_action(runtime_packs, &paths, action).await;
+        let _ = results.send(result).await;
+    });
+}
+
+async fn execute_runtime_action(
+    runtime_packs: Arc<RuntimePackManager>,
+    paths: &AppPaths,
+    action: RuntimeAction,
+) -> RuntimeTaskResult {
+    match action {
+        RuntimeAction::RefreshList => {
+            runtime_packs.refresh_host_capabilities().await;
+            RuntimeTaskResult::Listed(
+                runtime_packs
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string()),
+            )
+        }
+        RuntimeAction::Search {
+            query,
+            force_refresh,
+        } => {
+            runtime_packs.refresh_host_capabilities().await;
+            RuntimeTaskResult::Searched(
+                runtime_packs
+                    .search(&query, force_refresh)
+                    .await
+                    .map_err(|error| error.to_string()),
+            )
+        }
+        RuntimeAction::Install(runtime_id) => {
+            let result = match runtime_packs.install(&runtime_id).await {
+                Ok(_) => runtime_packs
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            RuntimeTaskResult::Installed { runtime_id, result }
+        }
+        RuntimeAction::CheckUpdates => RuntimeTaskResult::Updates(
+            runtime_packs
+                .check_updates()
+                .await
+                .map_err(|error| error.to_string()),
+        ),
+        RuntimeAction::Update(runtime_id) => {
+            let result = match runtime_packs.update(&runtime_id).await {
+                Ok(installed) if installed.manifest.runtime_id != runtime_id => {
+                    let installed_runtime_id = installed.manifest.runtime_id;
+                    runtime_packs
+                        .list()
+                        .await
+                        .map(|snapshot| (installed_runtime_id, snapshot))
+                        .map_err(|error| error.to_string())
+                }
+                Ok(_) => Err("no newer compatible runtime is currently available".to_owned()),
+                Err(error) => Err(error.to_string()),
+            };
+            RuntimeTaskResult::Updated {
+                previous_runtime_id: runtime_id,
+                result,
+            }
+        }
+        RuntimeAction::Remove { runtime_id } => {
+            let active_runtime = match ControlClient::discover(paths).await {
+                Ok(client) => match client.status().await {
+                    Ok(status) => status.backend.runtime_id,
+                    Err(error) => {
+                        return RuntimeTaskResult::Removed {
+                            runtime_id,
+                            result: Err(error.to_string()),
+                        };
+                    }
+                },
+                Err(ControlClientError::Unavailable) => None,
+                Err(error) => {
+                    return RuntimeTaskResult::Removed {
+                        runtime_id,
+                        result: Err(error.to_string()),
+                    };
+                }
+            };
+            let result = match runtime_packs
+                .remove(&runtime_id, active_runtime.as_ref())
+                .await
+            {
+                Ok(()) => runtime_packs
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            RuntimeTaskResult::Removed { runtime_id, result }
+        }
+        RuntimeAction::ModelCandidates { model } => {
+            let model_id = model.id.clone();
+            RuntimeTaskResult::ModelCandidates {
+                model_id,
+                result: runtime_packs
+                    .compatible_installed_for_model(&model)
+                    .await
+                    .map_err(|error| error.to_string()),
+            }
+        }
+        RuntimeAction::SelectFormat { format, runtime_id } => {
+            let result = match runtime_packs.select_format(format, runtime_id).await {
+                Ok(_) => runtime_packs
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            RuntimeTaskResult::Selected { format, result }
+        }
+        RuntimeAction::SelectModel { model, runtime_id } => {
+            let model_id = model.id.clone();
+            let result = match runtime_packs.select_model(&model, runtime_id).await {
+                Ok(_) => runtime_packs
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            RuntimeTaskResult::ModelSelected { model_id, result }
+        }
+        RuntimeAction::ClearModelSelection { model_id } => {
+            let result = match runtime_packs.clear_model_selection(&model_id).await {
+                Ok(_) => runtime_packs
+                    .list()
+                    .await
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            RuntimeTaskResult::ModelSelectionCleared { model_id, result }
+        }
+    }
 }
 
 struct ControlObservation {

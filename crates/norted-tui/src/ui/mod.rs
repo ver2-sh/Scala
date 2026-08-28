@@ -1,6 +1,8 @@
 mod command_palette;
 mod components;
 pub(crate) mod layout;
+mod model_runtime;
+mod runtime_search;
 mod screens;
 mod shell;
 
@@ -27,6 +29,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App) -> UiLayout {
     shell::render_command_bar(frame, layout.command_bar, app, &theme, &glyphs);
     shell::render_footer(frame, layout.footer, app, &theme, &glyphs);
     command_palette::render_overlays(frame, app, &theme, &glyphs, &layout);
-    shell::set_command_cursor(frame, layout.command_bar, app);
+    runtime_search::render(frame, app, &theme, &glyphs, &layout);
+    model_runtime::render(frame, app, &theme, &glyphs, &layout);
+    if app.overlay.is_none() {
+        shell::set_command_cursor(frame, layout.command_bar, app);
+    }
     layout
 }

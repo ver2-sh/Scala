@@ -519,11 +519,11 @@ fn streaming_response(context: ResponseContext, backend: InferenceStream) -> Res
                     state.complete(usage.as_ref(), finish_reason);
                 }
                 Some(Err(error)) => {
-                    tracing::warn!(%error, "llama.cpp streaming inference failed");
+                    tracing::warn!(%error, "private engine streaming inference failed");
                     state.fail();
                 }
                 None => {
-                    tracing::warn!("llama.cpp inference stream ended without completion");
+                    tracing::warn!("private engine inference stream ended without completion");
                     state.fail();
                 }
             }
