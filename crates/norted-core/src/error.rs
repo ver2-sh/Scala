@@ -25,6 +25,8 @@ pub enum CoreError {
     },
     #[error("server host `{host}` is not a valid IP address")]
     InvalidServerHost { host: String },
+    #[error("control listener must use a loopback address, found `{address}`")]
+    InvalidControlAddress { address: std::net::SocketAddr },
     #[error("runtime state operation failed for {path}: {source}")]
     RuntimeState {
         path: PathBuf,

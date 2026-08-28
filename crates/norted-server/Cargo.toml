@@ -15,6 +15,7 @@ color-eyre.workspace = true
 norted-api = { path = "../norted-api" }
 norted-core = { path = "../norted-core" }
 norted-engine = { path = "../norted-engine" }
+norted-engine-llama-cpp = { path = "../norted-engine-llama-cpp" }
 norted-tui = { path = "../norted-tui" }
 serde.workspace = true
 serde_json.workspace = true

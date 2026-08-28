@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use color_eyre::Result;
 use norted_core::{ApplicationCore, ConfigSource, LoadedConfig, RegistryState};
-use norted_engine::EngineRegistry;
+use norted_engine::{ControlClient, ControlStatus, InstallationState};
 use serde_json::json;
 
 use crate::doctor::DoctorCheck;
 
 pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
+    core.ensure_model_discovery().await?;
     let observation_error = core
         .refresh_server_state()
         .await
@@ -17,8 +18,27 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
     if let Some(message) = observation_error {
         snapshot.server = norted_core::ServerState::Unknown { message };
     }
+    let control = match ControlClient::discover(&core.paths).await {
+        Ok(client) => match client.status().await {
+            Ok(status) => Some(status),
+            Err(error) => {
+                tracing::warn!(%error, "private control status is unavailable");
+                None
+            }
+        },
+        Err(_) => None,
+    };
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "server": snapshot.server,
+                "registry_state": snapshot.registry_state,
+                "models": snapshot.models,
+                "registry_warnings": snapshot.registry_warnings,
+                "control": control,
+            }))?
+        );
     } else {
         println!("Norted Server");
         println!("  Server:          {}", snapshot.server.label());
@@ -34,14 +54,31 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
             }
             state => println!("  Models:          {}", state.label()),
         }
-        println!(
-            "  Engines:         {} installed, {} running",
-            snapshot.installed_engine_count, snapshot.running_engine_count
-        );
-        println!(
-            "  Active model:    {}",
-            snapshot.active_model.as_deref().unwrap_or("none")
-        );
+        if let Some(control) = &control {
+            println!(
+                "  Engines:         {} available, {} installed, {} running",
+                control.available_engine_count,
+                control.installed_engine_count,
+                control.running_engine_count
+            );
+            println!("  Backend:         {:?}", control.backend.lifecycle);
+            println!(
+                "  Active model:    {}",
+                control
+                    .backend
+                    .model_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref()
+                    .unwrap_or("none")
+            );
+            if let Some(engine) = &control.backend.engine_id {
+                println!("  Active engine:   {engine}");
+            }
+        } else {
+            println!("  Engines:         unavailable (no private control observation)");
+            println!("  Active model:    unavailable");
+        }
     }
     Ok(())
 }
@@ -66,11 +103,11 @@ pub async fn models(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
             );
         }
     } else {
-        println!("{:<28} {:<7} {:>12}  PATH", "MODEL", "FORMAT", "SIZE");
+        println!("{:<36} {:<7} {:>12}  PATH", "MODEL ID", "FORMAT", "SIZE");
         for model in snapshot.models {
             println!(
-                "{:<28} {:<7} {:>12}  {}",
-                model.display_name,
+                "{:<36} {:<7} {:>12}  {}",
+                model.id,
                 model.format.as_str(),
                 format_bytes(model.size_bytes),
                 model.path.display()
@@ -85,16 +122,101 @@ pub async fn models(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
     Ok(())
 }
 
-pub fn engines(json_output: bool) -> Result<()> {
-    let registry = EngineRegistry::default();
+pub async fn engines(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
+    let (status, source) = match ControlClient::discover(&core.paths).await {
+        Ok(client) => match client.status().await {
+            Ok(status) => (status, "running_server"),
+            Err(_) => (
+                crate::composition::runtime_manager(core)
+                    .await?
+                    .status()
+                    .await,
+                "local_probe",
+            ),
+        },
+        Err(_) => (
+            crate::composition::runtime_manager(core)
+                .await?
+                .status()
+                .await,
+            "local_probe",
+        ),
+    };
     if json_output {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({ "engines": [], "count": registry.len() }))?
+            serde_json::to_string_pretty(&json!({
+                "source": source,
+                "engines": status.engines,
+                "count": status.available_engine_count,
+            }))?
         );
     } else {
-        println!("No engine adapters are installed.");
-        println!("No inference engine support is implemented in this bootstrap.");
+        println!("Inference engines ({source})");
+        for engine in &status.engines {
+            let (state, installation) = match &engine.probe.installation {
+                InstallationState::NotInstalled => ("not installed", None),
+                InstallationState::Invalid { .. } => ("invalid", None),
+                InstallationState::Installed { installation } => (
+                    if engine.probe.healthy {
+                        "available"
+                    } else {
+                        "unhealthy"
+                    },
+                    Some(installation),
+                ),
+            };
+            println!("  {}: {state}", engine.identity.display_name);
+            println!("    Health: {}", engine.probe.detail);
+            if let Some(installation) = installation {
+                println!("    Binary: {}", installation.binary_path.display());
+                println!(
+                    "    Version: {}",
+                    installation.engine.version.as_deref().unwrap_or("unknown")
+                );
+                println!(
+                    "    Revision: {}",
+                    installation.engine.revision.as_deref().unwrap_or("unknown")
+                );
+                println!("    Source: external configured binary");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn control_operation(operation: &str, status: &ControlStatus, json_output: bool) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "operation": operation,
+                "status": status,
+            }))?
+        );
+    } else {
+        println!(
+            "{} complete.",
+            if operation == "load" {
+                "Load"
+            } else {
+                "Unload"
+            }
+        );
+        println!("  Backend: {:?}", status.backend.lifecycle);
+        println!(
+            "  Model:   {}",
+            status
+                .backend
+                .model_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("none")
+        );
+        if let Some(engine) = &status.backend.engine_id {
+            println!("  Engine:  {engine}");
+        }
     }
     Ok(())
 }

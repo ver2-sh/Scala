@@ -12,13 +12,15 @@ use std::time::Duration;
 use color_eyre::Result;
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
-use norted_core::ApplicationCore;
+use norted_core::{AppPaths, ApplicationCore};
+use norted_engine::{ControlClient, ControlStatus};
 
-use app::{App, Update};
+use app::{App, ControlAction, Update};
 use terminal::TerminalSession;
 use ui::layout::UiLayout;
 
 pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
+    let initial_control = observe_control(&core.paths).await;
     let mut terminal = TerminalSession::enter()?;
     let mut core_events = core.subscribe();
     core.start_model_discovery().await;
@@ -40,14 +42,25 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
         config_path,
         model_paths,
     );
+    app.replace_control(initial_control.status, initial_control.error);
     let mut terminal_events = EventStream::new();
+    let (control_updates, mut control_update_receiver) = tokio::sync::mpsc::channel(2);
+    let (control_results, mut control_result_receiver) = tokio::sync::mpsc::channel(2);
     let observer_core = Arc::clone(&core);
+    let observer_paths = core.paths.clone();
     let runtime_observer = tokio::spawn(async move {
         let mut refresh = tokio::time::interval(Duration::from_secs(2));
         refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             refresh.tick().await;
             let _ = observer_core.refresh_server_state().await;
+            if control_updates
+                .send(observe_control(&observer_paths).await)
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
     });
     let mut render = true;
@@ -82,13 +95,73 @@ pub async fn run(core: Arc<ApplicationCore>) -> Result<()> {
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => Update::None,
             },
+            observation = control_update_receiver.recv() => match observation {
+                Some(observation) => {
+                    app.replace_control(observation.status, observation.error);
+                    Update::Render
+                }
+                None => Update::None,
+            },
+            result = control_result_receiver.recv() => match result {
+                Some(result) => {
+                    app.handle_control_result(result);
+                    Update::Render
+                }
+                None => Update::None,
+            },
         };
         if update == Update::Quit {
             break;
+        }
+        if let Some(action) = app.take_control_action() {
+            let paths = core.paths.clone();
+            let results = control_results.clone();
+            tokio::spawn(async move {
+                let result = execute_control(&paths, action).await;
+                let _ = results.send(result).await;
+            });
         }
         render = update == Update::Render;
     }
     runtime_observer.abort();
     terminal.leave()?;
     Ok(())
+}
+
+struct ControlObservation {
+    status: Option<ControlStatus>,
+    error: Option<String>,
+}
+
+async fn observe_control(paths: &AppPaths) -> ControlObservation {
+    match ControlClient::discover(paths).await {
+        Ok(client) => match client.status().await {
+            Ok(status) => ControlObservation {
+                status: Some(status),
+                error: None,
+            },
+            Err(error) => ControlObservation {
+                status: None,
+                error: Some(error.to_string()),
+            },
+        },
+        Err(error) => ControlObservation {
+            status: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+async fn execute_control(
+    paths: &AppPaths,
+    action: ControlAction,
+) -> std::result::Result<ControlStatus, String> {
+    let client = ControlClient::discover(paths)
+        .await
+        .map_err(|error| error.to_string())?;
+    match action {
+        ControlAction::Load(model_id) => client.load(model_id).await,
+        ControlAction::Unload => client.unload().await,
+    }
+    .map_err(|error| error.to_string())
 }

@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{AppPaths, CoreError, Result, ServerState};
 
-const RUNTIME_SCHEMA_VERSION: u32 = 1;
+const RUNTIME_SCHEMA_VERSION: u32 = 2;
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(800);
 const OBSERVATION_TIMEOUT: Duration = Duration::from_millis(1_500);
 const STARTUP_GRACE: Duration = Duration::from_secs(30);
@@ -22,14 +22,34 @@ const TIMEOUT_CLEANUP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const TIMEOUT_FAILURE_WINDOW: Duration = Duration::from_secs(60 * 60);
 const TIMEOUT_FAILURES_REQUIRED: u32 = 3;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RuntimeDescriptor {
     pub schema_version: u32,
     pub instance_id: String,
     pub process_id: u32,
     pub endpoint: String,
     pub address: SocketAddr,
+    pub control_endpoint: String,
+    pub control_address: SocketAddr,
+    pub control_token: String,
     pub started_at_unix: i64,
+}
+
+impl std::fmt::Debug for RuntimeDescriptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeDescriptor")
+            .field("schema_version", &self.schema_version)
+            .field("instance_id", &self.instance_id)
+            .field("process_id", &self.process_id)
+            .field("endpoint", &self.endpoint)
+            .field("address", &self.address)
+            .field("control_endpoint", &self.control_endpoint)
+            .field("control_address", &self.control_address)
+            .field("control_token", &"<redacted>")
+            .field("started_at_unix", &self.started_at_unix)
+            .finish()
+    }
 }
 
 pub struct RuntimePublisher {
@@ -39,7 +59,17 @@ pub struct RuntimePublisher {
 }
 
 impl RuntimePublisher {
-    pub fn publish(paths: &AppPaths, address: SocketAddr) -> Result<Self> {
+    pub fn publish(
+        paths: &AppPaths,
+        address: SocketAddr,
+        control_address: SocketAddr,
+        control_token: String,
+    ) -> Result<Self> {
+        if !control_address.ip().is_loopback() {
+            return Err(CoreError::InvalidControlAddress {
+                address: control_address,
+            });
+        }
         let instance_id = Uuid::new_v4().to_string();
         let probe_address = match address {
             SocketAddr::V4(address) if address.ip().is_unspecified() => {
@@ -56,6 +86,9 @@ impl RuntimePublisher {
             process_id: std::process::id(),
             endpoint: format!("http://{address}"),
             address: probe_address,
+            control_endpoint: format!("http://{control_address}"),
+            control_address,
+            control_token,
             started_at_unix: unix_timestamp(),
         };
         let directory = runtime_directory(paths);
@@ -63,6 +96,7 @@ impl RuntimePublisher {
             path: directory.clone(),
             source,
         })?;
+        restrict_directory_permissions(&directory)?;
         let path = directory.join(format!("{instance_id}.json"));
         let temporary = directory.join(format!(".{instance_id}.tmp"));
         let bytes = serde_json::to_vec_pretty(&descriptor).map_err(|source| {
@@ -79,6 +113,7 @@ impl RuntimePublisher {
                 path: temporary.clone(),
                 source,
             })?;
+        restrict_file_permissions(&temporary)?;
         if let Err(source) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
             let _ = fs::remove_file(&temporary);
             return Err(CoreError::RuntimeState {
@@ -152,18 +187,34 @@ pub async fn observe_runtime(
     observe_runtime_with_timeout(paths, OBSERVATION_TIMEOUT).await
 }
 
-async fn observe_runtime_with_timeout(
+pub async fn observe_runtime_descriptor(
     paths: &AppPaths,
-    timeout: Duration,
-) -> std::result::Result<ServerState, RuntimeObservationError> {
-    tokio::time::timeout(timeout, observe_runtime_cycle(paths))
+) -> std::result::Result<Option<RuntimeDescriptor>, RuntimeObservationError> {
+    tokio::time::timeout(OBSERVATION_TIMEOUT, observe_runtime_descriptor_cycle(paths))
         .await
         .map_err(|_| RuntimeObservationError::TimedOut)?
 }
 
-async fn observe_runtime_cycle(
+async fn observe_runtime_with_timeout(
     paths: &AppPaths,
+    timeout: Duration,
 ) -> std::result::Result<ServerState, RuntimeObservationError> {
+    if timeout.is_zero() {
+        return Err(RuntimeObservationError::TimedOut);
+    }
+    tokio::time::timeout(timeout, observe_runtime_descriptor_cycle(paths))
+        .await
+        .map_err(|_| RuntimeObservationError::TimedOut)?
+        .map(|descriptor| {
+            descriptor.map_or(ServerState::Stopped, |descriptor| ServerState::Running {
+                endpoint: descriptor.endpoint,
+            })
+        })
+}
+
+async fn observe_runtime_descriptor_cycle(
+    paths: &AppPaths,
+) -> std::result::Result<Option<RuntimeDescriptor>, RuntimeObservationError> {
     let directory = runtime_directory(paths);
     let read_directory = directory.clone();
     let candidates =
@@ -203,12 +254,7 @@ async fn observe_runtime_cycle(
 
     let mut healthy = healthy;
     healthy.sort_by_key(|descriptor| std::cmp::Reverse(descriptor.started_at_unix));
-    Ok(healthy
-        .into_iter()
-        .next()
-        .map_or(ServerState::Stopped, |descriptor| ServerState::Running {
-            endpoint: descriptor.endpoint,
-        }))
+    Ok(healthy.into_iter().next())
 }
 
 fn runtime_directory(paths: &AppPaths) -> PathBuf {
@@ -246,8 +292,10 @@ fn read_descriptors(directory: &Path) -> std::io::Result<Vec<DescriptorCandidate
             let path = entry.path();
             let bytes = fs::read(&path).ok()?;
             let descriptor = serde_json::from_slice::<RuntimeDescriptor>(&bytes).ok()?;
-            (descriptor.schema_version == RUNTIME_SCHEMA_VERSION)
-                .then_some(DescriptorCandidate { path, descriptor })
+            (descriptor.schema_version == RUNTIME_SCHEMA_VERSION
+                && descriptor.control_address.ip().is_loopback()
+                && !descriptor.control_token.is_empty())
+            .then_some(DescriptorCandidate { path, descriptor })
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.descriptor.started_at_unix));
@@ -486,6 +534,40 @@ fn unix_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
+#[cfg(unix)]
+fn restrict_directory_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+        CoreError::RuntimeState {
+            path: path.to_owned(),
+            source,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_directory_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+        CoreError::RuntimeState {
+            path: path.to_owned(),
+            source,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -499,8 +581,9 @@ mod tests {
 
     use super::{
         DescriptorCandidate, ProbeFailureEvidence, ProbeFailureKind, ProbeOutcome,
-        RuntimeDescriptor, RuntimeObservationError, failure_evidence_path, observe_runtime,
-        observe_runtime_with_timeout, process_probe_evidence, runtime_directory, unix_timestamp,
+        RUNTIME_SCHEMA_VERSION, RuntimeDescriptor, RuntimeObservationError, failure_evidence_path,
+        observe_runtime, observe_runtime_with_timeout, process_probe_evidence, runtime_directory,
+        unix_timestamp,
     };
     use crate::{AppPaths, ServerState};
 
@@ -689,11 +772,14 @@ mod tests {
         age_seconds: i64,
     ) -> PathBuf {
         let descriptor = RuntimeDescriptor {
-            schema_version: 1,
+            schema_version: RUNTIME_SCHEMA_VERSION,
             instance_id: instance_id.to_owned(),
             process_id: u32::MAX,
             endpoint: format!("http://{address}"),
             address,
+            control_endpoint: format!("http://{address}"),
+            control_address: address,
+            control_token: "test-control-token".to_owned(),
             started_at_unix: unix_timestamp() - age_seconds,
         };
         let path = directory.join(format!("{instance_id}.json"));

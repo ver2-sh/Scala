@@ -17,6 +17,8 @@ pub struct EngineRevision {
 pub enum AcquisitionMethod {
     OfficialBinary,
     SourceBuild,
+    /// A user-supplied binary that Norted did not install or manage.
+    ExternalBinary,
     Other(String),
 }
 
@@ -44,7 +46,8 @@ pub struct EngineInstallation {
     pub platform: String,
     pub architecture: String,
     pub runtime_variant: Option<String>,
-    pub installed_at_unix: i64,
+    pub acquired_at_unix: Option<i64>,
+    pub observed_at_unix: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,7 +61,7 @@ pub struct ModelRuntimeIdentity {
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum NativeArgumentProvenance {
     Value(String),
-    Redacted,
+    Redacted { argument: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,12 +80,14 @@ pub struct ProcessIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeProvenance {
     pub model: ModelRuntimeIdentity,
-    pub engine: EngineRevision,
-    pub engine_binary_sha256: Option<String>,
+    pub installation: EngineInstallation,
     pub profile: Option<String>,
     pub normalized_settings: BTreeMap<String, serde_json::Value>,
     pub native_arguments: Vec<NativeArgumentProvenance>,
     pub native_environment: Vec<EnvironmentVariableProvenance>,
+    /// Whether the engine process also inherited the parent process environment.
+    pub inherits_parent_environment: bool,
     pub process: ProcessIdentity,
+    pub private_backend_endpoint: String,
     pub launched_at_unix: i64,
 }

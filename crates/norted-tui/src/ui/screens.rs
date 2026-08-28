@@ -1,4 +1,5 @@
 use norted_core::RegistryState;
+use norted_engine::InstallationState;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -20,7 +21,7 @@ pub fn render_screen(
     match app.screen {
         Screen::Overview => render_overview(frame, area, app, theme, glyphs, ui_layout.compact),
         Screen::Models => render_models(frame, area, app, theme, glyphs, ui_layout),
-        Screen::Engines => render_engines(frame, area, theme, glyphs),
+        Screen::Engines => render_engines(frame, area, app, theme, glyphs),
         Screen::Server => render_server(frame, area, app, theme),
         Screen::Logs => render_logs(frame, area, app, theme, ui_layout),
         Screen::Settings => render_settings(frame, area, app, theme),
@@ -126,18 +127,26 @@ fn render_metrics(
         }
         state => state.label().to_owned(),
     };
+    let engine_value = app.control.as_ref().map_or_else(
+        || "Unavailable".to_owned(),
+        |control| control.installed_engine_count.to_string(),
+    );
+    let active_model = app.control.as_ref().map_or_else(
+        || "Unavailable".to_owned(),
+        |control| {
+            control
+                .backend
+                .model_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "None".to_owned())
+        },
+    );
     let values = [
         ("SERVER", app.snapshot.server.label().to_owned()),
         ("MODELS", model_value),
-        ("ENGINES", app.snapshot.installed_engine_count.to_string()),
-        (
-            "ACTIVE MODEL",
-            app.snapshot
-                .active_model
-                .as_deref()
-                .unwrap_or("None")
-                .to_owned(),
-        ),
+        ("ENGINES", engine_value),
+        ("ACTIVE MODEL", active_model),
     ];
     if compact {
         let lines = values.into_iter().map(|(label, value)| {
@@ -233,6 +242,20 @@ fn render_models(
         }
         ListItem::new(vec![
             Line::from(vec![
+                Span::styled(
+                    if app.control.as_ref().is_some_and(|control| {
+                        matches!(
+                            control.backend.lifecycle,
+                            norted_engine::BackendLifecycle::Loading
+                                | norted_engine::BackendLifecycle::Running
+                        ) && control.backend.model_id.as_ref() == Some(&model.id)
+                    }) {
+                        format!("{}  ", glyphs.running)
+                    } else {
+                        "   ".to_owned()
+                    },
+                    theme.success,
+                ),
                 Span::styled(&model.display_name, theme.text),
                 Span::styled(format!("  {}", model.format.as_str()), theme.accent),
             ]),
@@ -246,7 +269,7 @@ fn render_models(
     frame.render_widget(List::new(items), layout[1]);
 }
 
-fn render_engines(frame: &mut Frame<'_>, area: Rect, theme: &Theme, glyphs: &Glyphs) {
+fn render_engines(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, glyphs: &Glyphs) {
     let layout = content_layout(area);
     frame.render_widget(
         section_title(
@@ -256,13 +279,62 @@ fn render_engines(frame: &mut Frame<'_>, area: Rect, theme: &Theme, glyphs: &Gly
         ),
         layout[0],
     );
-    render_empty(
-        frame,
-        layout[1],
-        &format!("{}  No engine adapters registered", glyphs.stopped),
-        "Engine support is intentionally absent while the adapter and supervisor foundations settle.",
-        theme,
-    );
+    let Some(control) = &app.control else {
+        render_empty(
+            frame,
+            layout[1],
+            &format!("{}  Server control unavailable", glyphs.stopped),
+            app.control_observation_error
+                .as_deref()
+                .unwrap_or("Start `norted-server serve` to inspect registered engines."),
+            theme,
+        );
+        return;
+    };
+    if control.engines.is_empty() {
+        render_empty(
+            frame,
+            layout[1],
+            &format!("{}  No engine adapters registered", glyphs.stopped),
+            "The running server reported no available adapters.",
+            theme,
+        );
+        return;
+    }
+    let mut lines = Vec::new();
+    for engine in &control.engines {
+        let (state, style) = match &engine.probe.installation {
+            InstallationState::Installed { .. } if engine.probe.healthy => {
+                ("available", theme.success)
+            }
+            InstallationState::Installed { .. } => ("unhealthy", theme.warning),
+            InstallationState::NotInstalled => ("not installed", theme.muted),
+            InstallationState::Invalid { .. } => ("invalid", theme.error),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(&engine.identity.display_name, theme.text),
+            Span::styled(format!("  {state}"), style),
+        ]));
+        lines.push(Line::from(Span::styled(&engine.probe.detail, theme.muted)));
+        if let InstallationState::Installed { installation } = &engine.probe.installation {
+            lines.push(key_value(
+                "VERSION",
+                installation.engine.version.as_deref().unwrap_or("unknown"),
+                theme,
+            ));
+            lines.push(key_value(
+                "REVISION",
+                installation.engine.revision.as_deref().unwrap_or("unknown"),
+                theme,
+            ));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:<12}", "BINARY"), theme.hint),
+                Span::styled(installation.binary_path.display().to_string(), theme.text),
+            ]));
+        }
+        lines.push(Line::default());
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), layout[1]);
 }
 
 fn render_server(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
@@ -275,18 +347,48 @@ fn render_server(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         ),
         layout[0],
     );
-    let endpoint = app.snapshot.server.endpoint().unwrap_or("Not serving");
+    let endpoint = app
+        .control
+        .as_ref()
+        .and_then(|control| control.public_endpoint.as_deref())
+        .or_else(|| app.snapshot.server.endpoint())
+        .unwrap_or("Not serving");
+    let lifecycle = app
+        .control
+        .as_ref()
+        .map(|control| format!("{:?}", control.backend.lifecycle))
+        .unwrap_or_else(|| "Unavailable".to_owned());
+    let active_model = app
+        .control
+        .as_ref()
+        .and_then(|control| control.backend.model_id.as_ref())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "None".to_owned());
+    let active_engine = app
+        .control
+        .as_ref()
+        .and_then(|control| control.backend.engine_id.clone())
+        .unwrap_or_else(|| "None".to_owned());
+    let private_backend = app
+        .control
+        .as_ref()
+        .and_then(|control| control.backend.private_endpoint.clone())
+        .unwrap_or_else(|| "None".to_owned());
     frame.render_widget(
         Paragraph::new(vec![
             key_value("STATE", app.snapshot.server.label(), theme),
             key_value("ENDPOINT", endpoint, theme),
+            key_value("BACKEND", &lifecycle, theme),
+            key_value("MODEL", &active_model, theme),
+            key_value("ENGINE", &active_engine, theme),
+            key_value("PRIVATE", &private_backend, theme),
             Line::default(),
             Line::from(Span::styled("Available now", theme.text)),
             Line::from(Span::styled("GET  /health", theme.accent)),
             Line::from(Span::styled("GET  /v1/models", theme.accent)),
-            Line::default(),
+            Line::from(Span::styled("POST /v1/responses", theme.accent)),
             Line::from(Span::styled(
-                "The Responses API remains future work; no inference endpoint is advertised.",
+                "PRIVATE is the internal loopback llama.cpp endpoint.",
                 theme.muted,
             )),
         ])
@@ -371,7 +473,8 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         Line::from(Span::styled("NAVIGATION", theme.hint)),
         key_value("Tab / Shift+Tab", "change focus", theme),
         key_value("Left / Right", "move navigation focus", theme),
-        key_value("Enter", "activate focused navigation", theme),
+        key_value("Enter", "open navigation or load selected model", theme),
+        key_value("u", "unload the active model from Models", theme),
         key_value("Mouse", "click pages and interactive rows", theme),
         Line::default(),
         Line::from(Span::styled("CURRENT VIEW", theme.hint)),
@@ -391,7 +494,7 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         key_value("Ctrl+C", "exit cleanly", theme),
         Line::default(),
         Line::from(Span::styled(
-            "Slash commands: /status /models /engines /server /logs /settings /help /quit",
+            "Slash commands: /load /unload /status /models /engines /server /logs /settings /help /quit",
             theme.muted,
         )),
     ]

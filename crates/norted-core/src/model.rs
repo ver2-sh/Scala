@@ -142,6 +142,10 @@ impl ModelRegistry {
         &self.artifacts
     }
 
+    pub fn get(&self, id: &ModelId) -> Option<&ModelArtifact> {
+        self.artifacts.iter().find(|artifact| &artifact.id == id)
+    }
+
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }

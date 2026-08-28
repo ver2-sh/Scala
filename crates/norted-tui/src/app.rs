@@ -2,6 +2,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use norted_core::{AppEvent, AppSnapshot, LogLevel, RegistryState};
+use norted_engine::{BackendLifecycle, ControlStatus};
 use ratatui::layout::Position;
 
 use crate::commands::{self, CommandAction};
@@ -62,6 +63,12 @@ pub enum Update {
 }
 
 #[derive(Debug, Clone)]
+pub enum ControlAction {
+    Load(norted_core::ModelId),
+    Unload,
+}
+
+#[derive(Debug, Clone)]
 pub struct LogEntry {
     pub level: LogLevel,
     pub message: String,
@@ -69,6 +76,8 @@ pub struct LogEntry {
 
 pub struct App {
     pub snapshot: AppSnapshot,
+    pub control: Option<ControlStatus>,
+    pub control_observation_error: Option<String>,
     pub no_color: bool,
     pub unicode: bool,
     pub server_address: String,
@@ -90,6 +99,8 @@ pub struct App {
     pub model_scroll: usize,
     pub log_scroll: usize,
     focus_before_command: FocusArea,
+    pending_control_action: Option<ControlAction>,
+    control_busy: bool,
 }
 
 impl App {
@@ -117,6 +128,8 @@ impl App {
         );
         Self {
             snapshot,
+            control: None,
+            control_observation_error: None,
             no_color,
             unicode,
             server_address,
@@ -138,6 +151,8 @@ impl App {
             model_scroll: 0,
             log_scroll: 0,
             focus_before_command: FocusArea::Navigation,
+            pending_control_action: None,
+            control_busy: false,
         }
     }
 
@@ -277,6 +292,39 @@ impl App {
         self.reconcile_models();
     }
 
+    pub fn replace_control(
+        &mut self,
+        control: Option<ControlStatus>,
+        observation_error: Option<String>,
+    ) {
+        self.control = control;
+        self.control_observation_error = observation_error;
+    }
+
+    pub fn take_control_action(&mut self) -> Option<ControlAction> {
+        self.pending_control_action.take()
+    }
+
+    pub fn handle_control_result(&mut self, result: Result<ControlStatus, String>) {
+        self.control_busy = false;
+        match result {
+            Ok(status) => {
+                let lifecycle = status.backend.lifecycle;
+                self.control = Some(status);
+                self.control_observation_error = None;
+                self.notice = Some(format!("Backend is now {lifecycle:?}"));
+                self.push_log(
+                    LogLevel::Info,
+                    format!("Control operation completed: {lifecycle:?}"),
+                );
+            }
+            Err(error) => {
+                self.notice = Some(error.clone());
+                self.push_log(LogLevel::Error, error);
+            }
+        }
+    }
+
     pub fn clear_hover(&mut self) {
         self.hover = None;
     }
@@ -400,6 +448,8 @@ impl App {
                 self.hover = None;
                 Update::Render
             }
+            CommandAction::LoadSelected => self.request_load(),
+            CommandAction::Unload => self.request_unload(),
             CommandAction::ShowHelp => {
                 self.overlay = Some(Overlay::Help);
                 Update::Render
@@ -493,6 +543,8 @@ impl App {
                 KeyCode::End if !self.snapshot.models.is_empty() => {
                     self.select_model(self.snapshot.models.len() - 1, layout)
                 }
+                KeyCode::Enter => self.request_load(),
+                KeyCode::Char('u') => self.request_unload(),
                 _ => Update::None,
             },
             Screen::Logs => match key.code {
@@ -634,6 +686,54 @@ impl App {
             .selected_model
             .and_then(|index| (len > 0).then(|| index.min(len - 1)));
         self.model_scroll = self.model_scroll.min(len.saturating_sub(1));
+    }
+
+    fn request_load(&mut self) -> Update {
+        if self.control_busy {
+            self.notice = Some("A control operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        let Some(index) = self.selected_model else {
+            self.notice = Some("Select a model before loading it".to_owned());
+            return Update::Render;
+        };
+        let Some(model) = self.snapshot.models.get(index) else {
+            self.notice = Some("The selected model is no longer available".to_owned());
+            return Update::Render;
+        };
+        let Some(control) = &self.control else {
+            self.notice = Some("No running Norted Server control instance is available".to_owned());
+            return Update::Render;
+        };
+        if control.backend.lifecycle == BackendLifecycle::Running
+            && control.backend.model_id.as_ref() == Some(&model.id)
+        {
+            self.notice = Some("The selected model is already active".to_owned());
+            return Update::Render;
+        }
+        self.pending_control_action = Some(ControlAction::Load(model.id.clone()));
+        self.control_busy = true;
+        self.notice = Some(format!("Loading {}…", model.display_name));
+        Update::Render
+    }
+
+    fn request_unload(&mut self) -> Update {
+        if self.control_busy {
+            self.notice = Some("A control operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        let Some(control) = &self.control else {
+            self.notice = Some("No running Norted Server control instance is available".to_owned());
+            return Update::Render;
+        };
+        if matches!(control.backend.lifecycle, BackendLifecycle::Stopped) {
+            self.notice = Some("No model is currently loaded".to_owned());
+            return Update::Render;
+        }
+        self.pending_control_action = Some(ControlAction::Unload);
+        self.control_busy = true;
+        self.notice = Some("Unloading the active model…".to_owned());
+        Update::Render
     }
 }
 

@@ -179,6 +179,8 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
             ],
             (FocusArea::Content, crate::app::Screen::Models) => vec![
                 hint(glyphs.up_down, "select", theme),
+                hint("Enter", "load", theme),
+                hint("u", "unload", theme),
                 hint("wheel", "scroll", theme),
                 hint("Tab", "focus", theme),
                 hint("/", "commands", theme),

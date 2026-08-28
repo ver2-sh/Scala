@@ -1,21 +1,18 @@
 [package]
-name = "norted-api"
+name = "norted-engine-llama-cpp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-axum.workspace = true
+async-trait.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 norted-core = { path = "../norted-core" }
 norted-engine = { path = "../norted-engine" }
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
+sha2.workspace = true
 tokio.workspace = true
-tracing.workspace = true
-uuid.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true
+toml.workspace = true

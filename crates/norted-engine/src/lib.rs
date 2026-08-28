@@ -1,12 +1,31 @@
 //! Engine-neutral contracts for managed upstream inference runtimes.
 
 use std::collections::{BTreeMap, btree_map::Entry};
+use std::ffi::OsString;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::Stream;
 use norted_core::{ArtifactFormat, EngineInstallation, EngineRevision, ModelArtifact};
 use serde::{Deserialize, Deserializer, Serialize};
+use tokio::sync::watch;
+
+mod control;
+mod manager;
+mod supervisor;
+
+pub use control::{
+    CONTROL_LOAD_PATH, CONTROL_STATUS_PATH, CONTROL_UNLOAD_PATH, ControlClient, ControlClientError,
+    ControlErrorResponse, ControlLoadRequest,
+};
+pub use manager::{
+    BackendLifecycle, BackendStatus, ControlStatus, EngineStatus, RuntimeError, RuntimeManager,
+    RuntimeManagerOptions, RuntimeNotice, RuntimeNoticeLevel,
+};
+pub use supervisor::{CapturedCommand, TokioProcessSupervisor, capture_command};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineIdentity {
@@ -176,29 +195,104 @@ pub enum OptionValueKind {
     Path,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct LaunchRequest {
     pub model: ModelArtifact,
-    pub normalized_options: BTreeMap<String, String>,
-    pub native_arguments: Vec<String>,
-    pub native_environment: BTreeMap<String, String>,
+    pub backend_address: SocketAddr,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct LaunchSpec {
     pub executable: PathBuf,
-    pub arguments: Vec<String>,
+    pub arguments: Vec<OsString>,
     pub environment: BTreeMap<String, String>,
+    pub inherits_parent_environment: bool,
     pub working_directory: Option<PathBuf>,
+    pub endpoint: Option<String>,
+    pub normalized_settings: BTreeMap<String, serde_json::Value>,
+    pub native_arguments: Vec<String>,
+    pub installation: EngineInstallation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessDescriptor {
+    pub supervisor_id: String,
     pub process_id: u32,
     pub engine: EngineRevision,
     pub model_id: norted_core::ModelId,
     pub endpoint: Option<String>,
+    pub launched_at_unix: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessExit {
+    pub process_id: u32,
+    pub success: bool,
+    pub code: Option<i32>,
+    pub expected: bool,
+    pub detail: String,
+    pub stderr_tail: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InferenceRole {
+    System,
+    Developer,
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceMessage {
+    pub role: InferenceRole,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceRequest {
+    pub model_id: norted_core::ModelId,
+    pub messages: Vec<InferenceMessage>,
+    pub max_output_tokens: Option<u32>,
+    pub stream: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InferenceUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_input_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceOutput {
+    pub text: String,
+    pub usage: Option<InferenceUsage>,
+    pub finish_reason: InferenceFinishReason,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceFinishReason {
+    Stop,
+    MaxOutputTokens,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "event")]
+pub enum InferenceEvent {
+    TextDelta {
+        delta: String,
+    },
+    Completed {
+        usage: Option<InferenceUsage>,
+        finish_reason: InferenceFinishReason,
+    },
+}
+
+pub type InferenceStream =
+    Pin<Box<dyn Stream<Item = Result<InferenceEvent, EngineError>> + Send + 'static>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -208,6 +302,12 @@ pub enum EngineError {
     NotInstalled,
     #[error("engine operation failed: {0}")]
     Operation(String),
+    #[error("engine backend is unavailable: {0}")]
+    BackendUnavailable(String),
+    #[error("engine operation timed out: {0}")]
+    TimedOut(String),
+    #[error("invalid engine configuration: {0}")]
+    InvalidConfiguration(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -241,6 +341,16 @@ pub trait EngineAdapter: Send + Sync {
     async fn update(&self, request: AcquisitionRequest) -> Result<EngineInstallation, EngineError>;
     async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError>;
     async fn health(&self, process: &ProcessDescriptor) -> Result<bool, EngineError>;
+    async fn infer(
+        &self,
+        endpoint: &str,
+        request: InferenceRequest,
+    ) -> Result<InferenceOutput, EngineError>;
+    async fn infer_stream(
+        &self,
+        endpoint: &str,
+        request: InferenceRequest,
+    ) -> Result<InferenceStream, EngineError>;
 }
 
 /// Common process mechanics live behind this boundary, not in engine adapters.
@@ -253,9 +363,14 @@ pub trait ProcessSupervisor: Send + Sync {
         model_id: norted_core::ModelId,
     ) -> Result<ProcessDescriptor, EngineError>;
     async fn terminate(&self, process: &ProcessDescriptor) -> Result<(), EngineError>;
+    async fn subscribe(
+        &self,
+        process: &ProcessDescriptor,
+    ) -> Result<watch::Receiver<Option<ProcessExit>>, EngineError>;
+    async fn shutdown(&self);
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct EngineRegistry {
     adapters: BTreeMap<String, Arc<dyn EngineAdapter>>,
 }
@@ -438,6 +553,22 @@ mod tests {
         }
 
         async fn health(&self, _process: &ProcessDescriptor) -> Result<bool, EngineError> {
+            unreachable!()
+        }
+
+        async fn infer(
+            &self,
+            _endpoint: &str,
+            _request: super::InferenceRequest,
+        ) -> Result<super::InferenceOutput, EngineError> {
+            unreachable!()
+        }
+
+        async fn infer_stream(
+            &self,
+            _endpoint: &str,
+            _request: super::InferenceRequest,
+        ) -> Result<super::InferenceStream, EngineError> {
             unreachable!()
         }
     }

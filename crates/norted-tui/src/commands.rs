@@ -3,6 +3,8 @@ use crate::app::Screen;
 #[derive(Debug, Clone, Copy)]
 pub enum CommandAction {
     Navigate(Screen),
+    LoadSelected,
+    Unload,
     ShowHelp,
     Quit,
 }
@@ -15,6 +17,16 @@ pub struct SlashCommand {
 }
 
 pub const COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "/load",
+        description: "Load the selected model through the running server",
+        action: CommandAction::LoadSelected,
+    },
+    SlashCommand {
+        name: "/unload",
+        description: "Unload the active model",
+        action: CommandAction::Unload,
+    },
     SlashCommand {
         name: "/help",
         description: "Show commands and keyboard shortcuts",

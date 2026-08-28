@@ -1,5 +1,35 @@
 /target/
 *.log
+
+# Local model and engine artifacts
+*.gguf
+llama-server
+llama-server.exe
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# Downloaded release archives
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+*.tar.xz
+*.tar.zst
+
+# Repository-local runtime state and configuration
+/.norted/
+/.runtime/
+/runtime/
+/state/
+/config.toml
+/config.local.toml
+/.env
+/.env.local
+
 .idea/
 .vscode/
 .DS_Store

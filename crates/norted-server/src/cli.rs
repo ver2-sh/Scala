@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
     name = "norted-server",
     version,
     about = "Local language-model server and runtime manager",
-    long_about = "Inspect local model artifacts and the Norted HTTP foundation from a polished terminal interface or deterministic CLI commands. No inference engine is implemented yet."
+    long_about = "Discover local model artifacts, manage a private llama.cpp backend, and serve local text generation through the Norted gateway."
 )]
 pub struct Cli {
     /// Emit machine-readable JSON where supported
@@ -24,6 +24,13 @@ pub enum Command {
     Serve,
     /// Show current server, model, and engine state
     Status,
+    /// Load a discovered model through the running Norted Server instance
+    Load {
+        /// Stable model ID from `norted-server models list`
+        model_id: String,
+    },
+    /// Unload the active model from the running Norted Server instance
+    Unload,
     /// Inspect locally discovered model artifacts
     Models(ModelsArgs),
     /// Inspect available inference engines

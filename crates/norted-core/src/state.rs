@@ -10,16 +10,6 @@ use crate::{
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
-pub enum RuntimeStatus {
-    Stopped,
-    Starting,
-    Running { process_id: u32 },
-    Stopping,
-    Failed { message: String },
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "state")]
 pub enum ServerState {
     Unknown { message: String },
     Stopped,
@@ -77,9 +67,6 @@ pub struct AppSnapshot {
     pub registry_state: RegistryState,
     pub models: Vec<ModelArtifact>,
     pub registry_warnings: Vec<String>,
-    pub installed_engine_count: usize,
-    pub running_engine_count: usize,
-    pub active_model: Option<String>,
 }
 
 #[derive(Debug)]
@@ -138,10 +125,11 @@ impl ApplicationCore {
             registry_state: state.registry_state.clone(),
             models: state.registry.artifacts().to_vec(),
             registry_warnings: state.registry.warnings().to_vec(),
-            installed_engine_count: 0,
-            running_engine_count: 0,
-            active_model: None,
         }
+    }
+
+    pub async fn model(&self, id: &crate::ModelId) -> Option<ModelArtifact> {
+        self.state.read().await.registry.get(id).cloned()
     }
 
     pub async fn start_model_discovery(self: &Arc<Self>) {
