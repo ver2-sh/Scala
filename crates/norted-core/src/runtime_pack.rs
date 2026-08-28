@@ -213,6 +213,10 @@ pub struct RuntimeRequirements {
     /// larger devices still depend on any unverified requirement below.
     #[serde(default)]
     pub minimum_vram_exclusive_class_gib: Option<u16>,
+    /// Exact CUDA compute capabilities compiled into this runtime. An empty
+    /// set means the runtime's CUDA target coverage is not known.
+    #[serde(default)]
+    pub supported_cuda_compute_capabilities: Vec<ComputeCapability>,
     /// Legacy schema-v1 unverified compatibility conditions. New manifests
     /// should use `unverified_requirements`; preserving this meaning keeps old
     /// manifests fail-closed.
@@ -224,6 +228,24 @@ pub struct RuntimeRequirements {
     /// Compatibility conditions that the current host probe cannot verify.
     #[serde(default)]
     pub unverified_requirements: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct ComputeCapability {
+    pub major: u16,
+    pub minor: u16,
+}
+
+impl ComputeCapability {
+    pub const fn new(major: u16, minor: u16) -> Self {
+        Self { major, minor }
+    }
+}
+
+impl std::fmt::Display for ComputeCapability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.{}", self.major, self.minor)
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -485,6 +507,10 @@ pub struct AcceleratorDevice {
     pub name: Option<String>,
     pub vram_bytes: Option<u64>,
     pub driver_version: Option<String>,
+    /// Numeric compute capability reported by the accelerator vendor. This is
+    /// never inferred from a marketing name.
+    #[serde(default)]
+    pub compute_capability: Option<ComputeCapability>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

@@ -6,8 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use norted_core::{
-    AcceleratorDevice, AvailableRuntime, HostCapabilities, RuntimeCompatibility, RuntimeId,
-    RuntimeRequirements,
+    AcceleratorDevice, AvailableRuntime, ComputeCapability, HostCapabilities, RuntimeCompatibility,
+    RuntimeId, RuntimeRequirements,
 };
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
@@ -708,38 +708,25 @@ fn same_install_candidate(left: &AvailableRuntime, right: &AvailableRuntime) -> 
 
 pub async fn detect_host_capabilities() -> HostCapabilities {
     let mut host = HostCapabilities::current_without_accelerator_probe();
-    let mut command = Command::new("nvidia-smi");
-    command
-        .args([
-            "--query-gpu=uuid,name,memory.total,driver_version",
-            "--format=csv,noheader,nounits",
-        ])
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(NVIDIA_PROBE_TIMEOUT, command.output()).await;
+    let output = tokio::time::timeout(NVIDIA_PROBE_TIMEOUT, query_nvidia_gpus()).await;
     match output {
-        Ok(Ok(output)) if output.status.success() => {
-            let observed = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter_map(|line| {
-                    let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
-                    (fields.len() >= 4).then(|| AcceleratorDevice {
-                        accelerator: "cuda".to_owned(),
-                        stable_id: nonempty(fields[0]).filter(|uuid| uuid.starts_with("GPU-")),
-                        name: nonempty(fields[1]),
-                        vram_bytes: fields[2]
-                            .parse::<u64>()
-                            .ok()
-                            .and_then(|mib| mib.checked_mul(1024 * 1024)),
-                        driver_version: nonempty(fields[3]),
-                    })
-                })
-                .collect::<Vec<_>>();
+        Ok(Ok((output, includes_compute_capability))) if output.status.success() => {
+            let observed = parse_nvidia_smi_devices(
+                &String::from_utf8_lossy(&output.stdout),
+                includes_compute_capability,
+            );
             if !observed.is_empty() {
                 let count = observed.len();
                 host.accelerators = observed;
-                host.observations.push(format!(
-                    "observed {count} NVIDIA GPU device(s) with stable UUID queries through nvidia-smi"
-                ));
+                host.observations.push(if includes_compute_capability {
+                    format!(
+                        "observed {count} NVIDIA GPU device(s) with stable UUID and compute-capability queries through nvidia-smi"
+                    )
+                } else {
+                    format!(
+                        "observed {count} NVIDIA GPU device(s) with stable UUID queries through nvidia-smi; compute capability is unavailable from this nvidia-smi"
+                    )
+                });
             } else {
                 host.observations
                     .push("nvidia-smi returned an unexpected result".to_owned());
@@ -756,6 +743,81 @@ pub async fn detect_host_capabilities() -> HostCapabilities {
             .push("nvidia-smi timed out; NVIDIA capability is unknown".to_owned()),
     }
     host
+}
+
+async fn query_nvidia_gpus() -> std::io::Result<(std::process::Output, bool)> {
+    let mut command = Command::new("nvidia-smi");
+    command
+        .args([
+            "--query-gpu=uuid,name,memory.total,driver_version,compute_cap",
+            "--format=csv,noheader,nounits",
+        ])
+        .kill_on_drop(true);
+    let rich = command.output().await?;
+    if rich.status.success() || !compute_cap_query_is_unsupported(&rich.stderr) {
+        return Ok((rich, true));
+    }
+
+    let mut fallback = Command::new("nvidia-smi");
+    fallback
+        .args([
+            "--query-gpu=uuid,name,memory.total,driver_version",
+            "--format=csv,noheader,nounits",
+        ])
+        .kill_on_drop(true);
+    fallback.output().await.map(|output| (output, false))
+}
+
+fn compute_cap_query_is_unsupported(stderr: &[u8]) -> bool {
+    let detail = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    detail.contains("compute_cap")
+        && (detail.contains("not a valid field")
+            || detail.contains("unknown field")
+            || detail.contains("not supported"))
+}
+
+fn parse_nvidia_smi_devices(
+    output: &str,
+    includes_compute_capability: bool,
+) -> Vec<AcceleratorDevice> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
+            (fields.len() >= 4).then(|| AcceleratorDevice {
+                accelerator: "cuda".to_owned(),
+                stable_id: nonempty(fields[0]).filter(|uuid| uuid.starts_with("GPU-")),
+                name: nonempty(fields[1]),
+                vram_bytes: fields[2]
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|mib| mib.checked_mul(1024 * 1024)),
+                driver_version: nonempty(fields[3]),
+                compute_capability: includes_compute_capability
+                    .then(|| {
+                        fields
+                            .get(4)
+                            .and_then(|value| parse_compute_capability(value))
+                    })
+                    .flatten(),
+            })
+        })
+        .collect()
+}
+
+fn parse_compute_capability(value: &str) -> Option<ComputeCapability> {
+    let (major, minor) = value.trim().split_once('.')?;
+    if major.is_empty()
+        || minor.is_empty()
+        || !major.bytes().all(|byte| byte.is_ascii_digit())
+        || !minor.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(ComputeCapability::new(
+        major.parse().ok()?,
+        minor.parse().ok()?,
+    ))
 }
 
 pub fn compatibility_for(
@@ -811,6 +873,23 @@ pub fn compatibility_for_nvidia_device(
     requirements: &RuntimeRequirements,
     nvidia: &AcceleratorDevice,
 ) -> RuntimeCompatibility {
+    if !requirements.supported_cuda_compute_capabilities.is_empty() {
+        let Some(observed) = nvidia.compute_capability else {
+            return RuntimeCompatibility::NeedsAttention(format!(
+                "runtime CUDA targets are known ({}), but nvidia-smi did not report this GPU's compute capability",
+                format_compute_capabilities(&requirements.supported_cuda_compute_capabilities)
+            ));
+        };
+        if !requirements
+            .supported_cuda_compute_capabilities
+            .contains(&observed)
+        {
+            return RuntimeCompatibility::Incompatible(format!(
+                "runtime CUDA targets are {}; observed GPU compute capability is {observed}",
+                format_compute_capabilities(&requirements.supported_cuda_compute_capabilities)
+            ));
+        }
+    }
     if (requirements.minimum_vram_bytes.is_some()
         || requirements.minimum_vram_class_gib.is_some()
         || requirements.minimum_vram_exclusive_class_gib.is_some())
@@ -883,6 +962,14 @@ pub fn compatibility_for_nvidia_device(
         ));
     }
     RuntimeCompatibility::Recommended
+}
+
+fn format_compute_capabilities(capabilities: &[ComputeCapability]) -> String {
+    capabilities
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -1034,14 +1121,40 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use norted_core::{
-        AcceleratorDevice, ArtifactFormat, AvailableRuntime, HostCapabilities,
+        AcceleratorDevice, ArtifactFormat, AvailableRuntime, ComputeCapability, HostCapabilities,
         RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest, RuntimeDownload,
         RuntimeIdentity, RuntimePackageIdentity, RuntimeReleaseChannel, RuntimeRequirements,
     };
 
     use super::{
-        RuntimeProviderAuthority, compatibility_for, is_allowed_github_host, same_install_candidate,
+        RuntimeProviderAuthority, compatibility_for, compute_cap_query_is_unsupported,
+        is_allowed_github_host, parse_nvidia_smi_devices, same_install_candidate,
     };
+
+    #[test]
+    fn parses_nvidia_compute_capability_without_guessing_malformed_values() {
+        let devices = parse_nvidia_smi_devices(
+            "GPU-one, NVIDIA One, 24576, 580.1, 8.6\nGPU-two, NVIDIA Two, 32768, 580.1, malformed\n",
+            true,
+        );
+        assert_eq!(devices.len(), 2);
+        assert_eq!(
+            devices[0].compute_capability,
+            Some(ComputeCapability::new(8, 6))
+        );
+        assert_eq!(devices[1].compute_capability, None);
+    }
+
+    #[test]
+    fn unsupported_compute_query_preserves_legacy_gpu_observation() {
+        assert!(compute_cap_query_is_unsupported(
+            b"Field 'compute_cap' is not a valid field to query."
+        ));
+        let devices = parse_nvidia_smi_devices("GPU-one, NVIDIA One, 24576, 550.54.14\n", false);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].stable_id.as_deref(), Some("GPU-one"));
+        assert_eq!(devices[0].compute_capability, None);
+    }
 
     #[test]
     fn advisory_notes_do_not_downgrade_verified_compatibility() {
@@ -1058,6 +1171,7 @@ mod tests {
                 name: None,
                 vram_bytes: Some(24 * 1024 * 1024 * 1024),
                 driver_version: None,
+                compute_capability: None,
             }],
             cuda_visible_devices: None,
             observations: Vec::new(),
@@ -1093,6 +1207,7 @@ mod tests {
                 name: None,
                 vram_bytes: Some(gib * 1024 * 1024 * 1024),
                 driver_version: None,
+                compute_capability: None,
             }],
             cuda_visible_devices: None,
             observations: Vec::new(),

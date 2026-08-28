@@ -13,10 +13,10 @@ use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use norted_core::{
     AcceleratorDevice, AcquisitionMethod, ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime,
-    EngineConfig, EngineInstallation, EngineRevision, HostCapabilities, InstalledRuntime,
-    ModelArtifact, RuntimeAcquisitionMethod, RuntimeArchiveFormat, RuntimeCompatibility,
-    RuntimeDigest, RuntimeDownload, RuntimeId, RuntimeIdentity, RuntimePackageIdentity,
-    RuntimeProbeObservation, RuntimeReleaseChannel, RuntimeRequirements,
+    ComputeCapability, EngineConfig, EngineInstallation, EngineRevision, HostCapabilities,
+    InstalledRuntime, ModelArtifact, RuntimeAcquisitionMethod, RuntimeArchiveFormat,
+    RuntimeCompatibility, RuntimeDigest, RuntimeDownload, RuntimeId, RuntimeIdentity,
+    RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel, RuntimeRequirements,
 };
 use norted_engine::{
     ApiCapability, CatalogError, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
@@ -385,13 +385,14 @@ fn variants_for(_version: &str) -> &'static [RuntimeVariant] {
 
 fn requirements_for(version: &str, variant: &RuntimeVariant) -> RuntimeRequirements {
     let tri_arch = version_at_least(version, 0, 3, 1);
-    let architecture_note = if tri_arch {
-        "Official fat binary targets NVIDIA compute capabilities 8.6, 8.9, and 12.0".to_owned()
-    } else if version == "0.3.0" {
-        "Official fat binary targets NVIDIA compute capabilities 8.6 and 12.0; v0.3.0 does not contain an Ada/8.9 target"
-            .to_owned()
+    let supported_cuda_compute_capabilities = if tri_arch {
+        vec![
+            ComputeCapability::new(8, 6),
+            ComputeCapability::new(8, 9),
+            ComputeCapability::new(12, 0),
+        ]
     } else {
-        "Official fat binary targets NVIDIA compute capabilities 8.6 and 12.0".to_owned()
+        vec![ComputeCapability::new(8, 6), ComputeCapability::new(12, 0)]
     };
     let mut advisories = vec![
         match variant.id {
@@ -412,7 +413,6 @@ fn requirements_for(version: &str, variant: &RuntimeVariant) -> RuntimeRequireme
                 .to_owned(),
         );
     }
-    unverified_requirements.push(architecture_note);
     if tri_arch {
         advisories.push(
             "Prebuilt binaries statically link CUDA 13.2; q27 documents NVIDIA driver branch r580 or newer"
@@ -430,6 +430,7 @@ fn requirements_for(version: &str, variant: &RuntimeVariant) -> RuntimeRequireme
         minimum_vram_bytes: None,
         minimum_vram_class_gib: variant.minimum_vram_class_gib,
         minimum_vram_exclusive_class_gib: variant.minimum_vram_exclusive_class_gib,
+        supported_cuda_compute_capabilities,
         notes: Vec::new(),
         advisories,
         unverified_requirements,
@@ -482,6 +483,7 @@ fn q27_device_evaluation(
     requirements: &RuntimeRequirements,
     tier: Option<Q27Tier>,
     host: &HostCapabilities,
+    external_build: bool,
 ) -> Q27DeviceEvaluation {
     let devices = match q27_visible_devices(host) {
         Ok(devices) => devices,
@@ -494,6 +496,12 @@ fn q27_device_evaluation(
     };
     let mut effective_requirements = requirements.clone();
     effective_requirements.requires_nvidia_gpu = true;
+    if external_build {
+        effective_requirements.unverified_requirements.push(
+            "external q27 build variant, runtime-specific VRAM floor, and CUDA targets are unverified"
+                .to_owned(),
+        );
+    }
     let unknown_tier = tier.is_none().then(|| {
         RuntimeCompatibility::NeedsAttention(
             "Q27 architecture is supported, but the exact published model tier cannot be proven from quant_policy/q4_head/q8_extra metadata"
@@ -1101,6 +1109,7 @@ impl EngineAdapter for Q27Adapter {
             &runtime.manifest.requirements,
             facts.tier,
             host,
+            runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
         );
         qualify_tier_compatibility(facts.tier, evaluation.compatibility)
     }
@@ -1118,6 +1127,7 @@ impl EngineAdapter for Q27Adapter {
                 &runtime.manifest.requirements,
                 facts.tier,
                 host,
+                runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
             )
             .accelerator
         });
@@ -1143,6 +1153,7 @@ impl EngineAdapter for Q27Adapter {
             &runtime.requirements,
             facts.tier,
             host,
+            false,
         );
         qualify_tier_compatibility(facts.tier, evaluation.compatibility)
     }
@@ -1160,6 +1171,7 @@ impl EngineAdapter for Q27Adapter {
                 &runtime.requirements,
                 facts.tier,
                 host,
+                false,
             )
             .accelerator
         });
@@ -1179,6 +1191,7 @@ impl EngineAdapter for Q27Adapter {
                 &runtime.manifest.requirements,
                 facts.tier,
                 host,
+                runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
             )
             .accelerator
         })
@@ -2263,6 +2276,14 @@ mod tests {
             w8.requirements.minimum_nvidia_driver.as_deref(),
             Some("580")
         );
+        assert_eq!(
+            w8.requirements.supported_cuda_compute_capabilities,
+            vec![
+                ComputeCapability::new(8, 6),
+                ComputeCapability::new(8, 9),
+                ComputeCapability::new(12, 0)
+            ]
+        );
         assert!(w16.requirements.advisories.iter().any(|note| {
             note.contains("specialist") && note.contains("no separate W16 VRAM floor")
         }));
@@ -2402,12 +2423,21 @@ mod tests {
     }
 
     fn accelerator(uuid: &str, vram_gib: Option<u64>) -> AcceleratorDevice {
+        accelerator_with_compute(uuid, vram_gib, Some(ComputeCapability::new(12, 0)))
+    }
+
+    fn accelerator_with_compute(
+        uuid: &str,
+        vram_gib: Option<u64>,
+        compute_capability: Option<ComputeCapability>,
+    ) -> AcceleratorDevice {
         AcceleratorDevice {
             accelerator: "cuda".to_owned(),
             stable_id: Some(uuid.to_owned()),
             name: Some("fixture".to_owned()),
             vram_bytes: vram_gib.map(|gib| gib * 1024 * 1024 * 1024),
             driver_version: Some("600".to_owned()),
+            compute_capability,
         }
     }
 
@@ -2495,6 +2525,7 @@ mod tests {
             &requirements_for("0.6.2", w12),
             Some(Q27Tier::Qwen36Q4s),
             &host,
+            false,
         );
         let selected = evaluation.accelerator.expect("selected GPU");
         assert_eq!(
@@ -2511,6 +2542,130 @@ mod tests {
             q27_launch_environment(&BTreeMap::new(), &accelerator("GPU-bbbbbbbb", Some(32)),)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn managed_cuda_targets_are_version_specific_and_checked_before_vram() {
+        let w8 = Q27_VARIANTS
+            .iter()
+            .find(|variant| variant.id == "w8")
+            .expect("W8");
+        let v030 = requirements_for("0.3.0", w8);
+        let v031 = requirements_for("0.3.1", w8);
+        let ada = accelerator_with_compute(
+            "GPU-adaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            Some(24),
+            Some(ComputeCapability::new(8, 9)),
+        );
+        assert!(matches!(
+            compatibility_for_nvidia_device(&v030, &ada),
+            RuntimeCompatibility::Incompatible(_)
+        ));
+        assert!(matches!(
+            compatibility_for_nvidia_device(&v031, &ada),
+            RuntimeCompatibility::Recommended
+        ));
+
+        let unknown =
+            accelerator_with_compute("GPU-unknownn-aaaa-aaaa-aaaa-aaaaaaaaaaaa", Some(24), None);
+        assert!(matches!(
+            compatibility_for_nvidia_device(&v031, &unknown),
+            RuntimeCompatibility::NeedsAttention(_)
+        ));
+    }
+
+    #[test]
+    fn supported_lower_vram_gpu_beats_unsupported_higher_vram_gpu_and_keeps_uuid() {
+        let unsupported = accelerator_with_compute(
+            "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            Some(40),
+            Some(ComputeCapability::new(8, 0)),
+        );
+        let supported = accelerator_with_compute(
+            "GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            Some(32),
+            Some(ComputeCapability::new(12, 0)),
+        );
+        let host = HostCapabilities {
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            accelerators: vec![unsupported, supported],
+            cuda_visible_devices: None,
+            observations: Vec::new(),
+        };
+        let w12 = Q27_VARIANTS
+            .iter()
+            .find(|variant| variant.id == "w12")
+            .expect("W12");
+        let evaluation = q27_device_evaluation(
+            "linux",
+            "x86_64",
+            &requirements_for("0.3.1", w12),
+            Some(Q27Tier::Qwen36Q4s),
+            &host,
+            false,
+        );
+        assert!(matches!(
+            evaluation.compatibility,
+            RuntimeCompatibility::Recommended
+        ));
+        let selected = evaluation.accelerator.expect("supported GPU");
+        assert_eq!(
+            selected.stable_id.as_deref(),
+            Some("GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        );
+        let environment =
+            q27_launch_environment(&BTreeMap::new(), &selected).expect("launch binding");
+        assert_eq!(
+            environment.get("CUDA_VISIBLE_DEVICES").map(String::as_str),
+            selected.stable_id.as_deref()
+        );
+    }
+
+    #[test]
+    fn external_q27_uncertainty_is_usable_but_managed_w8_wins_fallback_ranking() {
+        let host = host_with_vram(24);
+        let device = &host.accelerators[0];
+        let managed = q27_device_evaluation(
+            "linux",
+            "x86_64",
+            &requirements_for("0.3.1", &Q27_VARIANTS[0]),
+            Some(Q27Tier::Qwen36Q4s),
+            &host,
+            false,
+        );
+        let external = q27_device_evaluation(
+            "linux",
+            "x86_64",
+            &RuntimeRequirements::default(),
+            Some(Q27Tier::Qwen36Q4s),
+            &host,
+            true,
+        );
+        let external_with_oversized_model = q27_device_evaluation(
+            "linux",
+            "x86_64",
+            &RuntimeRequirements::default(),
+            Some(Q27Tier::Qwen36Q6),
+            &host,
+            true,
+        );
+        assert!(matches!(
+            managed.compatibility,
+            RuntimeCompatibility::Recommended
+        ));
+        assert!(matches!(
+            &external.compatibility,
+            RuntimeCompatibility::NeedsAttention(reason)
+                if reason.contains("external q27 build variant")
+        ));
+        assert!(external.compatibility.is_usable());
+        assert!(matches!(
+            external_with_oversized_model.compatibility,
+            RuntimeCompatibility::Incompatible(_)
+        ));
+        assert!(managed.compatibility.preference_rank() < external.compatibility.preference_rank());
+        assert_eq!(external.accelerator.as_ref(), Some(device));
     }
 
     #[test]
@@ -2560,6 +2715,7 @@ mod tests {
                 &requirements,
                 Some(Q27Tier::Qwen36Q4s),
                 &host_24,
+                false,
             )
             .compatibility,
             RuntimeCompatibility::Incompatible(_)
@@ -2572,6 +2728,7 @@ mod tests {
                 &requirements,
                 Some(Q27Tier::Qwen36Q4s),
                 &host_48,
+                false,
             )
             .compatibility,
             RuntimeCompatibility::NeedsAttention(_)

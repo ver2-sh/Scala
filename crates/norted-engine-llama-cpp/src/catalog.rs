@@ -208,6 +208,7 @@ fn available_runtime(
         minimum_vram_bytes: None,
         minimum_vram_class_gib: None,
         minimum_vram_exclusive_class_gib: None,
+        supported_cuda_compute_capabilities: Vec::new(),
         notes: Vec::new(),
         advisories: Vec::new(),
         unverified_requirements: companion
