@@ -13,8 +13,8 @@ use color_eyre::Result;
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
 use norted_core::{
-    AppPaths, ApplicationCore, LoadProfilesStore, LoadSettingDefinition, LoadSettingsError,
-    LoadSettingsPatch,
+    ApiKeyStore, AppPaths, ApplicationCore, LoadProfilesStore, LoadSettingDefinition,
+    LoadSettingsError, LoadSettingsPatch, PublicAuthStatus, ServerConfig,
 };
 use norted_engine::{ControlClient, ControlClientError, ControlStatus, RuntimePackManager};
 
@@ -33,8 +33,10 @@ pub async fn run(
     let mut terminal = TerminalSession::enter()?;
     let mut core_events = core.subscribe();
     let snapshot = core.snapshot().await;
+    let initial_auth_status = core.config.server.public_auth_status(0)?;
     let mut app = App::new(
         snapshot,
+        initial_auth_status,
         core.config.tui.no_color,
         core.config.tui.unicode,
         load_setting_definitions,
@@ -48,6 +50,7 @@ pub async fn run(
     let (control_results, mut control_result_receiver) = tokio::sync::mpsc::channel(2);
     let (runtime_results, mut runtime_result_receiver) = tokio::sync::mpsc::channel(4);
     let (settings_results, mut settings_result_receiver) = tokio::sync::mpsc::channel(4);
+    let (auth_updates, mut auth_update_receiver) = tokio::sync::mpsc::channel(2);
     let mut runtime_progress = runtime_packs.progress();
     spawn_runtime_action(
         Arc::clone(&runtime_packs),
@@ -61,6 +64,11 @@ pub async fn run(
         settings_results.clone(),
         SettingsAction::Refresh,
     );
+    let auth_paths = core.paths.clone();
+    let auth_server_config = core.config.server.clone();
+    let auth_observer = tokio::spawn(async move {
+        observe_public_auth(auth_paths, auth_server_config, auth_updates).await;
+    });
     let observer_core = Arc::clone(&core);
     let observer_paths = core.paths.clone();
     let runtime_observer = tokio::spawn(async move {
@@ -136,6 +144,13 @@ pub async fn run(
                 }
                 None => Update::None,
             },
+            result = auth_update_receiver.recv() => match result {
+                Some(result) => {
+                    app.replace_public_auth_status(result);
+                    Update::Render
+                }
+                None => Update::None,
+            },
             progress = runtime_progress.recv() => match progress {
                 Ok(progress) => {
                     app.handle_runtime_progress(progress);
@@ -175,8 +190,31 @@ pub async fn run(
         render = update == Update::Render;
     }
     runtime_observer.abort();
+    auth_observer.abort();
     terminal.leave()?;
     Ok(())
+}
+
+async fn observe_public_auth(
+    paths: AppPaths,
+    server: ServerConfig,
+    updates: tokio::sync::mpsc::Sender<Result<PublicAuthStatus, String>>,
+) {
+    let store = ApiKeyStore::new(&paths);
+    let mut refresh = tokio::time::interval(Duration::from_secs(2));
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        refresh.tick().await;
+        let result = match store.active_count().await {
+            Ok(active) => server
+                .public_auth_status(active)
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        if updates.send(result).await.is_err() {
+            break;
+        }
+    }
 }
 
 fn spawn_settings_action(

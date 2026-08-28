@@ -22,11 +22,11 @@ use norted_core::{
 };
 use norted_engine::{
     ApiCapability, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
-    EngineCapabilities, EngineError, EngineFeature, EngineIdentity, EngineProbe, InferenceEvent,
-    InferenceFinishReason, InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole,
-    InferenceStream, InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, NativeOption,
-    OptionValueKind, ProcessDescriptor, UpdateState, capture_command,
-    common_load_setting_definitions,
+    EngineCapabilities, EngineError, EngineFeature, EngineIdentity, EngineProbe,
+    GenerationSettingsPatch, InferenceEvent, InferenceFinishReason, InferenceMessage,
+    InferenceOutput, InferenceRequest, InferenceRole, InferenceStream, InferenceUsage,
+    InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind, ProcessDescriptor,
+    UpdateState, capture_command, common_load_setting_definitions,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -404,6 +404,12 @@ impl LlamaCppAdapter {
         if let Some(maximum) = request.max_output_tokens {
             body["max_completion_tokens"] = json!(maximum);
         }
+        if let Some(temperature) = request.generation_settings.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.generation_settings.top_p {
+            body["top_p"] = json!(top_p);
+        }
         if stream {
             body["stream_options"] = json!({ "include_usage": true });
         }
@@ -427,6 +433,27 @@ impl EngineAdapter for LlamaCppAdapter {
             api: vec![ApiCapability::ChatCompletions],
             features: vec![EngineFeature::TextGeneration],
         }
+    }
+
+    fn validate_generation_settings(
+        &self,
+        settings: &GenerationSettingsPatch,
+    ) -> Result<(), EngineError> {
+        if let Some(temperature) = settings.temperature
+            && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "llama.cpp temperature must be finite and in the range 0..=2".to_owned(),
+            ));
+        }
+        if let Some(top_p) = settings.top_p
+            && (!top_p.is_finite() || !(0.0..=1.0).contains(&top_p))
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "llama.cpp top_p must be finite and in the range 0..=1".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn runtime_management_compatibility(&self) -> CompatibilityDecision {
@@ -1703,6 +1730,82 @@ fn unix_timestamp() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod generation_settings_tests {
+    use norted_core::ModelId;
+
+    use super::*;
+
+    fn request(generation_settings: GenerationSettingsPatch) -> InferenceRequest {
+        InferenceRequest {
+            model_id: ModelId("model".to_owned()),
+            messages: vec![InferenceMessage {
+                role: InferenceRole::User,
+                text: "hello".to_owned(),
+            }],
+            generation_settings,
+            max_output_tokens: Some(123),
+            stream: false,
+        }
+    }
+
+    #[test]
+    fn backend_request_sends_only_explicit_sampler_fields() {
+        let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
+        let omitted = adapter.backend_request(&request(GenerationSettingsPatch::default()), false);
+        assert!(omitted.get("temperature").is_none());
+        assert!(omitted.get("top_p").is_none());
+        assert_eq!(omitted["max_completion_tokens"], 123);
+
+        let explicit = adapter.backend_request(
+            &request(GenerationSettingsPatch {
+                temperature: Some(0.25),
+                top_p: Some(0.8),
+            }),
+            false,
+        );
+        assert_eq!(explicit["temperature"], 0.25);
+        assert_eq!(explicit["top_p"], 0.8);
+        assert_eq!(explicit["max_completion_tokens"], 123);
+    }
+
+    #[test]
+    fn validates_supported_sampler_ranges() {
+        let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
+        assert!(
+            adapter
+                .validate_generation_settings(&GenerationSettingsPatch {
+                    temperature: Some(2.0),
+                    top_p: Some(0.0),
+                })
+                .is_ok()
+        );
+        for invalid in [
+            GenerationSettingsPatch {
+                temperature: Some(-0.1),
+                top_p: None,
+            },
+            GenerationSettingsPatch {
+                temperature: Some(2.1),
+                top_p: None,
+            },
+            GenerationSettingsPatch {
+                temperature: None,
+                top_p: Some(1.1),
+            },
+            GenerationSettingsPatch {
+                temperature: Some(f64::NAN),
+                top_p: None,
+            },
+        ] {
+            assert!(matches!(
+                adapter.validate_generation_settings(&invalid),
+                Err(EngineError::InvalidGenerationSettings(_))
+            ));
+        }
+    }
 }
 
 #[cfg(test)]

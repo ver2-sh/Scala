@@ -12,8 +12,9 @@ use futures_util::Stream;
 use norted_core::{
     AcceleratorDevice, ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime, EngineInstallation,
     EngineRevision, HostCapabilities, InstalledRuntime, LoadSettingDefinition, LoadSettingId,
-    LoadSettingsError, LoadSettingsPatch, LoadSettingsSchema, ModelArtifact, ModelRuntimeIdentity,
-    ResolvedLoadSettings, RuntimeCompatibility, RuntimeProbeObservation,
+    LoadSettingsError, LoadSettingsPatch, LoadSettingsSchema, ModelArtifact, ModelId,
+    ModelRuntimeIdentity, ResolvedLoadSettings, RuntimeCompatibility, RuntimeId,
+    RuntimeProbeObservation,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -248,6 +249,33 @@ pub struct EffectiveGenerationSettings {
     pub top_p: f64,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModelServingCapabilities {
+    pub model_id: ModelId,
+    pub format: ArtifactFormat,
+    pub compatible_engine_ids: Vec<String>,
+    pub compatible_installed_runtime_ids: Vec<RuntimeId>,
+    pub selected_runtime_id: Option<RuntimeId>,
+    pub active: bool,
+    pub text_input: bool,
+    pub text_output: bool,
+    pub responses: bool,
+    pub chat_completions: bool,
+    pub streaming: bool,
+    pub tools: bool,
+    pub vision: bool,
+    pub structured_output: bool,
+}
+
+impl EffectiveGenerationSettings {
+    pub fn merged(self, patch: &GenerationSettingsPatch) -> Self {
+        Self {
+            temperature: patch.temperature.unwrap_or(self.temperature),
+            top_p: patch.top_p.unwrap_or(self.top_p),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessDescriptor {
     pub supervisor_id: String,
@@ -287,10 +315,23 @@ pub struct InferenceMessage {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct GenerationSettingsPatch {
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+}
+
+impl GenerationSettingsPatch {
+    pub fn is_empty(&self) -> bool {
+        self.temperature.is_none() && self.top_p.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
     pub model_id: norted_core::ModelId,
     pub messages: Vec<InferenceMessage>,
+    pub generation_settings: GenerationSettingsPatch,
     pub max_output_tokens: Option<u32>,
     pub stream: bool,
 }
@@ -358,6 +399,8 @@ pub enum EngineError {
     TimedOut(String),
     #[error("invalid engine configuration: {0}")]
     InvalidConfiguration(String),
+    #[error("invalid generation settings: {0}")]
+    InvalidGenerationSettings(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -498,6 +541,19 @@ pub trait EngineAdapter: Send + Sync {
         &self,
         process: &ProcessDescriptor,
     ) -> Result<EffectiveGenerationSettings, EngineError>;
+    fn validate_generation_settings(
+        &self,
+        settings: &GenerationSettingsPatch,
+    ) -> Result<(), EngineError> {
+        if settings.is_empty() {
+            Ok(())
+        } else {
+            Err(EngineError::InvalidGenerationSettings(format!(
+                "engine `{}` does not support explicit request-time generation settings",
+                self.identity().id
+            )))
+        }
+    }
     async fn infer(
         &self,
         endpoint: &str,
@@ -631,21 +687,62 @@ mod tests {
 
     use async_trait::async_trait;
     use norted_core::{
-        ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime, HostCapabilities, ModelArtifact,
-        ModelId, RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest, RuntimeDownload,
-        RuntimeIdentity, RuntimePackageIdentity, RuntimeReleaseChannel, RuntimeRequirements,
+        AppPaths, ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime, HostCapabilities,
+        ModelArtifact, ModelId, RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest,
+        RuntimeDownload, RuntimeIdentity, RuntimePackageIdentity, RuntimeReleaseChannel,
+        RuntimeRequirements,
     };
 
     use super::{
-        CompatibilityDecision, EngineAdapter, EngineCapabilities, EngineError, EngineIdentity,
-        EngineProbe, EngineRegistry, LaunchRequest, LaunchSpec, NativeOption,
-        PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor,
+        CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter, EngineCapabilities,
+        EngineError, EngineIdentity, EngineProbe, EngineRegistry, GenerationSettingsPatch,
+        InferenceRole, InstallationState, LaunchRequest, LaunchSpec, NativeOption,
+        PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
+        RuntimePackManager, UpdateState,
     };
 
     struct ArchitectureAdapter {
         id: &'static str,
         architecture: &'static str,
         format: ArtifactFormat,
+    }
+
+    #[test]
+    fn effective_generation_settings_merge_without_changing_backend_defaults() {
+        let backend_defaults = EffectiveGenerationSettings {
+            temperature: 0.7,
+            top_p: 0.9,
+        };
+        let override_temperature = GenerationSettingsPatch {
+            temperature: Some(0.2),
+            top_p: None,
+        };
+
+        assert_eq!(
+            backend_defaults.merged(&GenerationSettingsPatch::default()),
+            backend_defaults
+        );
+        assert_eq!(
+            backend_defaults.merged(&override_temperature),
+            EffectiveGenerationSettings {
+                temperature: 0.2,
+                top_p: 0.9,
+            }
+        );
+        assert_eq!(backend_defaults.temperature, 0.7);
+        assert_eq!(backend_defaults.top_p, 0.9);
+    }
+
+    #[test]
+    fn canonical_inference_roles_serialize_with_openai_names() {
+        for (role, expected) in [
+            (InferenceRole::Developer, "developer"),
+            (InferenceRole::System, "system"),
+            (InferenceRole::User, "user"),
+            (InferenceRole::Assistant, "assistant"),
+        ] {
+            assert_eq!(serde_json::to_value(role).expect("role"), expected);
+        }
     }
 
     #[async_trait]
@@ -695,7 +792,12 @@ mod tests {
         }
 
         async fn probe(&self) -> Result<EngineProbe, EngineError> {
-            unreachable!()
+            Ok(EngineProbe {
+                installation: InstallationState::NotInstalled,
+                update: UpdateState::Unknown,
+                healthy: false,
+                detail: "fixture adapter has no installed runtime".to_owned(),
+            })
         }
 
         async fn probe_runtime(
@@ -784,6 +886,87 @@ mod tests {
                 reason: "requires architecture `architecture-a`, found `architecture-b`".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn adapter_default_rejects_explicit_generation_settings() {
+        let adapter = ArchitectureAdapter {
+            id: "no-request-samplers",
+            architecture: "fixture",
+            format: ArtifactFormat::Gguf,
+        };
+        assert!(
+            adapter
+                .validate_generation_settings(&GenerationSettingsPatch::default())
+                .is_ok()
+        );
+        assert!(matches!(
+            adapter.validate_generation_settings(&GenerationSettingsPatch {
+                temperature: Some(0.5),
+                top_p: None,
+            }),
+            Err(EngineError::InvalidGenerationSettings(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_serving_capabilities_are_registry_derived_and_allow_no_runtime() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.toml"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            runtimes_dir: root.join("data/runtimes"),
+            runtime_cache_dir: root.join("cache/runtime-packs"),
+            runtime_selections_file: root.join("data/runtime-selections.json"),
+            load_profiles_file: root.join("data/load-profiles.json"),
+            load_profiles_lock_file: root.join("data/.load-profiles.lock"),
+        };
+        paths.ensure_required().expect("application paths");
+
+        let mut registry = EngineRegistry::default();
+        registry
+            .register(Arc::new(ArchitectureAdapter {
+                id: "fixture-engine",
+                architecture: "fixture-architecture",
+                format: ArtifactFormat::Gguf,
+            }))
+            .expect("register fixture adapter");
+        let providers = Vec::<Arc<dyn RuntimeCatalogProvider>>::new();
+        let manager = RuntimePackManager::new(&paths, registry, providers).expect("pack manager");
+        let model = ModelArtifact {
+            id: ModelId("fixture-model".to_owned()),
+            display_name: "Fixture model".to_owned(),
+            path: root.join("model.gguf"),
+            format: ArtifactFormat::Gguf,
+            size_bytes: 0,
+            created: 0,
+            hash: None,
+            architecture: Some("fixture-architecture".to_owned()),
+            context_length: None,
+            provenance: None,
+            auxiliary_artifacts: Vec::new(),
+        };
+
+        let capabilities = manager
+            .model_serving_capabilities(&model, Some(&model.id))
+            .await
+            .expect("capabilities");
+        assert_eq!(capabilities.model_id, model.id);
+        assert_eq!(capabilities.compatible_engine_ids, ["fixture-engine"]);
+        assert!(capabilities.compatible_installed_runtime_ids.is_empty());
+        assert_eq!(capabilities.selected_runtime_id, None);
+        assert!(capabilities.active);
+        assert!(capabilities.text_input && capabilities.text_output);
+        assert!(capabilities.responses && capabilities.chat_completions && capabilities.streaming);
+        assert!(!capabilities.tools);
+        assert!(!capabilities.vision);
+        assert!(!capabilities.structured_output);
+        serde_json::to_value(&capabilities).expect("serializable capabilities");
     }
 
     #[test]

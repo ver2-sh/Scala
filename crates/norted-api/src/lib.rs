@@ -1,16 +1,21 @@
 //! Public OpenAI-compatible gateway and private authenticated control listener.
 
+mod auth;
+mod chat;
+mod error;
+mod input;
 mod responses;
 
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::Router;
 use axum::extract::{Json, State, rejection::JsonRejection};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Router, middleware};
 use norted_core::{ApplicationCore, RuntimePublisher, ServerState};
 use norted_engine::{
     CONTROL_LOAD_PATH, CONTROL_STATUS_PATH, CONTROL_UNLOAD_PATH, ControlErrorResponse,
@@ -20,7 +25,12 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
+pub use auth::{PublicAuth, PublicAuthVerifier};
+
 const GATEWAY_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Public inference bodies are buffered for JSON parsing, but never beyond this
+/// explicit large-context ceiling.
+pub const MAX_INFERENCE_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -45,6 +55,7 @@ pub struct ApiServer {
     address: SocketAddr,
     control_address: SocketAddr,
     control_token: String,
+    public_auth: PublicAuth,
     publisher: RuntimePublisher,
 }
 
@@ -52,6 +63,7 @@ impl ApiServer {
     pub async fn bind(
         core: Arc<ApplicationCore>,
         runtime: Arc<RuntimeManager>,
+        public_auth: PublicAuth,
     ) -> Result<Self, ApiError> {
         core.set_server_state(ServerState::Starting).await;
         let requested_address = SocketAddr::new(
@@ -107,6 +119,7 @@ impl ApiServer {
             address,
             control_address,
             control_token,
+            public_auth,
             publisher,
         })
     }
@@ -129,14 +142,18 @@ impl ApiServer {
             public_listener,
             control_listener,
             control_token,
+            public_auth,
             mut publisher,
             ..
         } = self;
-        let public = public_routes(PublicApiState {
-            core: Arc::clone(&core),
-            runtime: Arc::clone(&runtime),
-            instance_id: publisher.instance_id().to_owned(),
-        });
+        let public = public_routes(
+            PublicApiState {
+                core: Arc::clone(&core),
+                runtime: Arc::clone(&runtime),
+                instance_id: publisher.instance_id().to_owned(),
+            },
+            public_auth,
+        );
         let control = control_routes(ControlApiState {
             runtime: Arc::clone(&runtime),
             token: Arc::from(control_token),
@@ -216,12 +233,23 @@ struct PublicApiState {
     instance_id: String,
 }
 
-fn public_routes(state: PublicApiState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+fn public_routes(state: PublicApiState, auth: PublicAuth) -> Router {
+    let openai_routes = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/responses", post(responses::create))
+        .route("/v1/chat/completions", post(chat::create))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            MAX_INFERENCE_BODY_BYTES,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            auth,
+            auth::public_auth_middleware,
+        ));
+    Router::new()
+        .route("/health", get(health))
+        .merge(openai_routes)
         .with_state(state)
+        .layer(middleware::from_fn(auth::request_id_middleware))
 }
 
 #[derive(Serialize)]
@@ -383,6 +411,14 @@ fn constant_time_equal(left: &str, right: &str) -> bool {
         == 0
 }
 
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(0)
+}
+
 struct ControlApiError {
     status: StatusCode,
     message: String,
@@ -403,6 +439,7 @@ impl IntoResponse for ControlApiError {
 #[cfg(test)]
 mod tests {
     use super::ApiModel;
+    use serde_json::json;
 
     #[test]
     fn model_object_contains_only_the_supported_openai_fields() {
@@ -420,5 +457,39 @@ mod tests {
         assert!(object.contains_key("created"));
         assert!(object.contains_key("object"));
         assert!(object.contains_key("owned_by"));
+    }
+
+    #[test]
+    fn responses_and_chat_share_the_same_canonical_inference_shape() {
+        let responses = super::responses::parse_request(json!({
+            "model": "model",
+            "input": [{"role": "user", "content": "hello"}],
+            "max_output_tokens": 32,
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "stream": true
+        }))
+        .expect("Responses request")
+        .normalized
+        .inference_request();
+        let chat = super::chat::parse_request(json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 32,
+            "temperature": 0.3,
+            "top_p": 0.8,
+            "stream": true
+        }))
+        .expect("Chat request")
+        .normalized
+        .inference_request();
+
+        assert_eq!(responses.model_id, chat.model_id);
+        assert_eq!(responses.messages.len(), chat.messages.len());
+        assert_eq!(responses.messages[0].role, chat.messages[0].role);
+        assert_eq!(responses.messages[0].text, chat.messages[0].text);
+        assert_eq!(responses.max_output_tokens, chat.max_output_tokens);
+        assert_eq!(responses.generation_settings, chat.generation_settings);
+        assert_eq!(responses.stream, chat.stream);
     }
 }

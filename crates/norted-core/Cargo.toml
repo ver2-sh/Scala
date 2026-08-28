@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 directories.workspace = true
 fs2.workspace = true
+getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

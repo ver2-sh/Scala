@@ -6,9 +6,9 @@ use crossterm::event::{
 use norted_core::{
     AppEvent, AppSnapshot, ArtifactFormat, LoadProfileName, LoadProfilesState,
     LoadSettingDefinition, LoadSettingId, LoadSettingScope, LoadSettingSource, LoadSettingValue,
-    LoadSettingsSchema, LogLevel, ModelArtifact, ModelId, RegistryState, ResolvedLoadSettings,
-    RuntimeCompatibility, RuntimeId, RuntimeOperationPhase, RuntimeOperationProgress,
-    RuntimeUpdateState,
+    LoadSettingsSchema, LogLevel, ModelArtifact, ModelId, PublicAuthStatus, RegistryState,
+    ResolvedLoadSettings, RuntimeCompatibility, RuntimeId, RuntimeOperationPhase,
+    RuntimeOperationProgress, RuntimeUpdateState,
 };
 use norted_engine::{
     BackendLifecycle, ControlStatus, RuntimeListSnapshot, RuntimeModelCandidate,
@@ -221,6 +221,9 @@ pub struct LogEntry {
 
 pub struct App {
     pub snapshot: AppSnapshot,
+    pub public_auth_status: PublicAuthStatus,
+    pub public_auth_loading: bool,
+    pub public_auth_error: Option<String>,
     pub control: Option<ControlStatus>,
     pub control_observation_error: Option<String>,
     pub no_color: bool,
@@ -291,6 +294,7 @@ pub struct App {
 impl App {
     pub fn new(
         snapshot: AppSnapshot,
+        public_auth_status: PublicAuthStatus,
         no_color: bool,
         unicode: bool,
         load_setting_definitions: Vec<LoadSettingDefinition>,
@@ -311,6 +315,9 @@ impl App {
         );
         Self {
             snapshot,
+            public_auth_status,
+            public_auth_loading: true,
+            public_auth_error: None,
             control: None,
             control_observation_error: None,
             no_color,
@@ -565,6 +572,17 @@ impl App {
     pub fn replace_snapshot(&mut self, snapshot: AppSnapshot) {
         self.snapshot = snapshot;
         self.reconcile_models();
+    }
+
+    pub fn replace_public_auth_status(&mut self, result: Result<PublicAuthStatus, String>) {
+        self.public_auth_loading = false;
+        match result {
+            Ok(status) => {
+                self.public_auth_status = status;
+                self.public_auth_error = None;
+            }
+            Err(error) => self.public_auth_error = Some(error),
+        }
     }
 
     pub fn replace_control(

@@ -22,13 +22,13 @@ use norted_core::{
 };
 use norted_engine::{
     ApiCapability, CatalogError, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
-    EngineCapabilities, EngineError, EngineFeature, EngineIdentity, EngineProbe, GitHubRelease,
-    GitHubReleaseAsset, GitHubReleaseClient, InferenceEvent, InferenceFinishReason,
-    InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
-    InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind,
-    PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
-    UpdateState, capture_command, common_load_setting_definitions, compatibility_for,
-    compatibility_for_nvidia_device,
+    EngineCapabilities, EngineError, EngineFeature, EngineIdentity, EngineProbe,
+    GenerationSettingsPatch, GitHubRelease, GitHubReleaseAsset, GitHubReleaseClient,
+    InferenceEvent, InferenceFinishReason, InferenceMessage, InferenceOutput, InferenceRequest,
+    InferenceRole, InferenceStream, InferenceUsage, InstallationState, LaunchRequest, LaunchSpec,
+    NativeOption, OptionValueKind, PreparedAuxiliaryArtifact, PreparedModelInput,
+    ProcessDescriptor, RuntimeCatalogProvider, UpdateState, capture_command,
+    common_load_setting_definitions, compatibility_for, compatibility_for_nvidia_device,
 };
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -994,8 +994,8 @@ impl Q27Adapter {
         let mut body = json!({
             "model": request.model_id.0,
             "messages": request.messages.iter().map(message_json).collect::<Vec<_>>(),
-            "temperature": 0.0,
-            "top_p": 1.0,
+            "temperature": request.generation_settings.temperature.unwrap_or(0.0),
+            "top_p": request.generation_settings.top_p.unwrap_or(1.0),
             "stream": stream,
         });
         if let Some(maximum) = request.max_output_tokens {
@@ -1024,6 +1024,28 @@ impl EngineAdapter for Q27Adapter {
             api: vec![ApiCapability::ChatCompletions],
             features: vec![EngineFeature::TextGeneration],
         }
+    }
+
+    fn validate_generation_settings(
+        &self,
+        settings: &GenerationSettingsPatch,
+    ) -> Result<(), EngineError> {
+        if let Some(temperature) = settings.temperature
+            && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 temperature must be finite and in the range 0..=2".to_owned(),
+            ));
+        }
+        if let Some(top_p) = settings.top_p
+            && !(top_p.is_finite() && 0.0 < top_p && top_p <= 1.0)
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 top_p must be finite and in the range 0 < top_p <= 1; q27 reinterprets other values as 1"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn runtime_management_compatibility(&self) -> CompatibilityDecision {
@@ -3385,6 +3407,7 @@ mod tests {
                     role: InferenceRole::Developer,
                     text: "instruction".to_owned(),
                 }],
+                generation_settings: GenerationSettingsPatch::default(),
                 max_output_tokens: Some(123),
                 stream: false,
             },
@@ -3394,6 +3417,86 @@ mod tests {
         assert_eq!(body["top_p"], 1.0);
         assert_eq!(body["max_tokens"], 123);
         assert_eq!(body["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn chat_translation_applies_overrides_and_retains_each_omitted_default() {
+        let adapter = Q27Adapter::from_config(None, Path::new("."));
+        let request = |generation_settings| InferenceRequest {
+            model_id: ModelId("model".to_owned()),
+            messages: Vec::new(),
+            generation_settings,
+            max_output_tokens: None,
+            stream: false,
+        };
+
+        let temperature = adapter.backend_request(
+            &request(GenerationSettingsPatch {
+                temperature: Some(0.6),
+                top_p: None,
+            }),
+            false,
+        );
+        assert_eq!(temperature["temperature"], 0.6);
+        assert_eq!(temperature["top_p"], 1.0);
+
+        let top_p = adapter.backend_request(
+            &request(GenerationSettingsPatch {
+                temperature: None,
+                top_p: Some(0.75),
+            }),
+            false,
+        );
+        assert_eq!(top_p["temperature"], 0.0);
+        assert_eq!(top_p["top_p"], 0.75);
+    }
+
+    #[test]
+    fn sampler_validation_rejects_values_q27_would_reinterpret() {
+        let adapter = Q27Adapter::from_config(None, Path::new("."));
+        assert!(
+            adapter
+                .validate_generation_settings(&GenerationSettingsPatch {
+                    temperature: Some(0.0),
+                    top_p: Some(1.0),
+                })
+                .is_ok()
+        );
+        assert!(
+            adapter
+                .validate_generation_settings(&GenerationSettingsPatch {
+                    temperature: Some(2.0),
+                    top_p: Some(0.1),
+                })
+                .is_ok()
+        );
+        for invalid in [
+            GenerationSettingsPatch {
+                temperature: Some(-0.1),
+                top_p: None,
+            },
+            GenerationSettingsPatch {
+                temperature: Some(2.1),
+                top_p: None,
+            },
+            GenerationSettingsPatch {
+                temperature: None,
+                top_p: Some(0.0),
+            },
+            GenerationSettingsPatch {
+                temperature: None,
+                top_p: Some(1.1),
+            },
+            GenerationSettingsPatch {
+                temperature: Some(f64::INFINITY),
+                top_p: None,
+            },
+        ] {
+            assert!(matches!(
+                adapter.validate_generation_settings(&invalid),
+                Err(EngineError::InvalidGenerationSettings(_))
+            ));
+        }
     }
 
     #[tokio::test]

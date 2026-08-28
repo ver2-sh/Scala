@@ -1,170 +1,141 @@
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::Json;
 use axum::body::Body;
-use axum::extract::{Json, State, rejection::JsonRejection};
+use axum::extract::{Extension, State, rejection::JsonRejection};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
-use norted_core::ModelId;
 use norted_engine::{
     EffectiveGenerationSettings, InferenceEvent, InferenceFinishReason, InferenceMessage,
-    InferenceRequest, InferenceRole, InferenceStream, InferenceUsage, RuntimeError,
+    InferenceRole, InferenceStream, InferenceUsage,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::PublicApiState;
+use crate::auth::RequestCorrelation;
+use crate::error::{OpenAiError, runtime_error};
+use crate::input::{
+    NormalizedRequest, generation_settings, object, optional_bool, optional_positive_u32,
+    optional_string, reject_unknown_fields, require_null_or, required_string, role, text_content,
+};
+use crate::{PublicApiState, unix_timestamp};
 
 const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
-    "model",
+    "background",
+    "conversation",
+    "include",
     "input",
-    "stream",
     "instructions",
     "max_output_tokens",
+    "max_tool_calls",
+    "metadata",
+    "model",
+    "parallel_tool_calls",
+    "previous_response_id",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "reasoning",
+    "safety_identifier",
+    "service_tier",
+    "store",
+    "stream",
+    "stream_options",
+    "temperature",
+    "text",
+    "tool_choice",
+    "tools",
+    "top_logprobs",
+    "top_p",
+    "truncation",
+    "user",
 ];
 
 pub(super) async fn create(
     State(state): State<PublicApiState>,
+    Extension(correlation): Extension<RequestCorrelation>,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, OpenAiError> {
-    let Json(value) = payload.map_err(|error| {
-        OpenAiError::invalid(
-            format!("Malformed JSON request: {}", error.body_text()),
-            None,
-            "invalid_json",
-        )
-    })?;
+    let Json(value) = payload.map_err(|error| OpenAiError::malformed_json(&error))?;
     let parsed = parse_request(value)?;
+    correlation.record_inference(&parsed.normalized.model, parsed.normalized.stream);
     let response_id = format!("resp_{}", Uuid::new_v4().simple());
     let message_id = format!("msg_{}", Uuid::new_v4().simple());
     let created_at = unix_timestamp();
-    let public_model = parsed.model.clone();
-    let inference = InferenceRequest {
-        model_id: ModelId(parsed.model),
-        messages: parsed.messages,
-        max_output_tokens: parsed.max_output_tokens,
-        stream: parsed.stream,
-    };
-    if parsed.stream {
+    let inference = parsed.normalized.inference_request();
+    let public_model = parsed.normalized.model.clone();
+    let max_output_tokens = parsed.normalized.max_output_tokens;
+    if parsed.normalized.stream {
         let routed = state
             .runtime
             .infer_stream(inference)
             .await
             .map_err(runtime_error)?;
-        let context = ResponseContext {
-            response_id,
-            message_id,
-            created_at,
-            model: public_model,
-            instructions: parsed.instructions,
-            max_output_tokens: parsed.max_output_tokens,
-            effective_generation_settings: routed.effective_generation_settings,
-        };
-        Ok(streaming_response(context, routed.stream))
+        Ok(streaming_response(
+            ResponseContext {
+                response_id,
+                message_id,
+                created_at,
+                model: public_model,
+                instructions: parsed.instructions,
+                max_output_tokens,
+                effective_generation_settings: routed.effective_generation_settings,
+            },
+            routed.stream,
+        ))
     } else {
         let routed = state
             .runtime
             .infer(inference)
             .await
             .map_err(runtime_error)?;
-        let output = routed.output;
+        let status = if routed.output.finish_reason == InferenceFinishReason::MaxOutputTokens {
+            ResponseStatus::Incomplete
+        } else {
+            ResponseStatus::Completed
+        };
         let context = ResponseContext {
             response_id,
             message_id,
             created_at,
             model: public_model,
             instructions: parsed.instructions,
-            max_output_tokens: parsed.max_output_tokens,
+            max_output_tokens,
             effective_generation_settings: routed.effective_generation_settings,
-        };
-        let status = if output.finish_reason == InferenceFinishReason::MaxOutputTokens {
-            "incomplete"
-        } else {
-            "completed"
         };
         Ok(Json(response_document(
             &context,
             status,
-            Some(&output.text),
-            output.usage.as_ref(),
+            Some(&routed.output.text),
+            routed.output.usage.as_ref(),
             None,
         ))
         .into_response())
     }
 }
 
-struct ParsedRequest {
-    model: String,
-    messages: Vec<InferenceMessage>,
-    stream: bool,
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedRequest {
+    pub(crate) normalized: NormalizedRequest,
     instructions: Option<String>,
-    max_output_tokens: Option<u32>,
 }
 
-fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> {
-    let object = value.as_object().ok_or_else(|| {
-        OpenAiError::invalid(
-            "The request body must be a JSON object.",
-            None,
-            "invalid_request",
-        )
-    })?;
-    if let Some(field) = object
-        .keys()
-        .find(|field| !ALLOWED_TOP_LEVEL_FIELDS.contains(&field.as_str()))
-    {
-        return Err(OpenAiError::unsupported(
-            format!("Unsupported Responses field: {field}"),
-            field.clone(),
-        ));
-    }
+pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> {
+    let object = object(&value)?;
+    reject_unknown_fields(object, ALLOWED_TOP_LEVEL_FIELDS, "Responses")?;
+    validate_identity_fields(object)?;
+
     let model = required_string(object, "model")?;
-    if model.trim().is_empty() {
-        return Err(OpenAiError::invalid(
-            "`model` must not be empty.",
-            Some("model".to_owned()),
-            "invalid_value",
-        ));
-    }
     let instructions = optional_string(object, "instructions")?;
-    let stream = match object.get("stream") {
-        None => false,
-        Some(Value::Bool(stream)) => *stream,
-        Some(_) => {
-            return Err(OpenAiError::invalid(
-                "`stream` must be a boolean.",
-                Some("stream".to_owned()),
-                "invalid_type",
-            ));
-        }
-    };
-    let max_output_tokens = match object.get("max_output_tokens") {
-        None | Some(Value::Null) => None,
-        Some(value) => {
-            let tokens = value.as_u64().ok_or_else(|| {
-                OpenAiError::invalid(
-                    "`max_output_tokens` must be a positive integer.",
-                    Some("max_output_tokens".to_owned()),
-                    "invalid_type",
-                )
-            })?;
-            if tokens == 0 || tokens > u64::from(u32::MAX) {
-                return Err(OpenAiError::invalid(
-                    "`max_output_tokens` is outside the supported positive integer range.",
-                    Some("max_output_tokens".to_owned()),
-                    "invalid_value",
-                ));
-            }
-            Some(tokens as u32)
-        }
-    };
+    let stream = optional_bool(object, "stream", false)?;
+    let max_output_tokens = optional_positive_u32(object, "max_output_tokens")?;
+    let generation_settings = generation_settings(object)?;
     let input = object.get("input").ok_or_else(|| {
         OpenAiError::invalid(
             "Missing required field: input",
-            Some("input".to_owned()),
+            Some("input"),
             "missing_required_parameter",
         )
     })?;
@@ -184,7 +155,7 @@ fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> {
             if items.is_empty() {
                 return Err(OpenAiError::invalid(
                     "`input` must contain at least one message.",
-                    Some("input".to_owned()),
+                    Some("input"),
                     "invalid_value",
                 ));
             }
@@ -195,39 +166,35 @@ fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> {
         _ => {
             return Err(OpenAiError::invalid(
                 "`input` must be a string or an array of text messages.",
-                Some("input".to_owned()),
+                Some("input"),
                 "invalid_type",
             ));
         }
     }
     Ok(ParsedRequest {
-        model,
-        messages,
-        stream,
+        normalized: NormalizedRequest {
+            model,
+            messages,
+            max_output_tokens,
+            generation_settings,
+            stream,
+        },
         instructions,
-        max_output_tokens,
     })
 }
 
 fn parse_message(value: &Value, index: usize) -> Result<InferenceMessage, OpenAiError> {
     let parameter = format!("input[{index}]");
-    let object = value.as_object().ok_or_else(|| {
+    let message = value.as_object().ok_or_else(|| {
         OpenAiError::invalid(
             "Each input item must be a text message object.",
             Some(parameter.clone()),
             "invalid_type",
         )
     })?;
-    if let Some(field) = object
-        .keys()
-        .find(|field| !["type", "role", "content"].contains(&field.as_str()))
-    {
-        return Err(OpenAiError::unsupported(
-            format!("Unsupported input message field: {field}"),
-            format!("{parameter}.{field}"),
-        ));
-    }
-    if let Some(kind) = object.get("type")
+    reject_unknown_fields(message, &["type", "role", "content"], "input message")?;
+    if let Some(kind) = message.get("type")
+        && !kind.is_null()
         && kind.as_str() != Some("message")
     {
         return Err(OpenAiError::unsupported(
@@ -235,109 +202,136 @@ fn parse_message(value: &Value, index: usize) -> Result<InferenceMessage, OpenAi
             format!("{parameter}.type"),
         ));
     }
-    let role = match object.get("role").and_then(Value::as_str) {
-        Some("system") => InferenceRole::System,
-        Some("developer") => InferenceRole::Developer,
-        Some("user") => InferenceRole::User,
-        Some("assistant") => InferenceRole::Assistant,
-        Some(_) => {
-            return Err(OpenAiError::unsupported(
-                "Unsupported input message role.",
-                format!("{parameter}.role"),
-            ));
-        }
-        None => {
-            return Err(OpenAiError::invalid(
-                "Input messages require a string `role`.",
-                Some(format!("{parameter}.role")),
-                "missing_required_parameter",
-            ));
-        }
-    };
-    let content = object.get("content").ok_or_else(|| {
+    let role = role(message.get("role"), &format!("{parameter}.role"))?;
+    let content = message.get("content").ok_or_else(|| {
         OpenAiError::invalid(
             "Input messages require `content`.",
             Some(format!("{parameter}.content")),
             "missing_required_parameter",
         )
     })?;
-    let text = match content {
-        Value::String(text) => text.clone(),
-        Value::Array(parts) => {
-            let mut text = String::new();
-            for (content_index, part) in parts.iter().enumerate() {
-                let part_parameter = format!("{parameter}.content[{content_index}]");
-                let part = part.as_object().ok_or_else(|| {
-                    OpenAiError::invalid(
-                        "Text content parts must be objects.",
-                        Some(part_parameter.clone()),
-                        "invalid_type",
-                    )
-                })?;
-                if let Some(field) = part
-                    .keys()
-                    .find(|field| !["type", "text"].contains(&field.as_str()))
-                {
-                    return Err(OpenAiError::unsupported(
-                        format!("Unsupported text content field: {field}"),
-                        format!("{part_parameter}.{field}"),
-                    ));
-                }
-                if part.get("type").and_then(Value::as_str) != Some("input_text") {
-                    return Err(OpenAiError::unsupported(
-                        "Only `input_text` content parts are supported.",
-                        format!("{part_parameter}.type"),
-                    ));
-                }
-                let part_text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
-                    OpenAiError::invalid(
-                        "`input_text` content requires a string `text` field.",
-                        Some(format!("{part_parameter}.text")),
-                        "missing_required_parameter",
-                    )
-                })?;
-                text.push_str(part_text);
-            }
-            text
-        }
-        _ => {
-            return Err(OpenAiError::invalid(
-                "Message `content` must be a string or an array of `input_text` parts.",
-                Some(format!("{parameter}.content")),
-                "invalid_type",
-            ));
-        }
-    };
+    let text = text_content(content, &format!("{parameter}.content"), "input_text")?;
     Ok(InferenceMessage { role, text })
 }
 
-fn required_string(object: &Map<String, Value>, field: &str) -> Result<String, OpenAiError> {
-    object
-        .get(field)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            OpenAiError::invalid(
-                format!("Missing or invalid required string field: {field}"),
-                Some(field.to_owned()),
-                "missing_required_parameter",
-            )
-        })
+fn validate_identity_fields(object: &serde_json::Map<String, Value>) -> Result<(), OpenAiError> {
+    require_null_or(object, "store", |value| value == false, "`false`")?;
+    require_null_or(object, "background", |value| value == false, "`false`")?;
+    require_null_or(
+        object,
+        "tools",
+        |value| value.as_array().is_some_and(Vec::is_empty),
+        "an empty array",
+    )?;
+    require_null_or(
+        object,
+        "tool_choice",
+        |value| value.as_str() == Some("none"),
+        "`\"none\"`",
+    )?;
+    require_null_or(
+        object,
+        "truncation",
+        |value| value.as_str() == Some("disabled"),
+        "`\"disabled\"`",
+    )?;
+    require_null_or(
+        object,
+        "metadata",
+        |value| value.as_object().is_some_and(serde_json::Map::is_empty),
+        "an empty object",
+    )?;
+    require_null_or(
+        object,
+        "include",
+        |value| value.as_array().is_some_and(Vec::is_empty),
+        "an empty array",
+    )?;
+    require_null_or(
+        object,
+        "parallel_tool_calls",
+        |value| value == false,
+        "`false`",
+    )?;
+    require_null_or(
+        object,
+        "top_logprobs",
+        |value| value.as_u64() == Some(0),
+        "zero",
+    )?;
+    require_null_or(
+        object,
+        "service_tier",
+        |value| matches!(value.as_str(), Some("auto" | "default")),
+        "`\"auto\"` or `\"default\"`",
+    )?;
+    for field in [
+        "conversation",
+        "max_tool_calls",
+        "previous_response_id",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "reasoning",
+    ] {
+        require_null_or(object, field, |_| false, "`null`")?;
+    }
+    for field in ["safety_identifier", "user"] {
+        require_null_or(object, field, Value::is_string, "a string")?;
+    }
+    validate_text_format(object.get("text"))?;
+    validate_stream_options(object.get("stream_options"))
 }
 
-fn optional_string(
-    object: &Map<String, Value>,
-    field: &str,
-) -> Result<Option<String>, OpenAiError> {
-    match object.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(value)) => Ok(Some(value.clone())),
-        Some(_) => Err(OpenAiError::invalid(
-            format!("`{field}` must be a string."),
-            Some(field.to_owned()),
+fn validate_text_format(value: Option<&Value>) -> Result<(), OpenAiError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let text = value.as_object().ok_or_else(|| {
+        OpenAiError::invalid("`text` must be an object.", Some("text"), "invalid_type")
+    })?;
+    reject_unknown_fields(text, &["format"], "Responses text")?;
+    let Some(format) = text.get("format").filter(|format| !format.is_null()) else {
+        return Ok(());
+    };
+    let format = format.as_object().ok_or_else(|| {
+        OpenAiError::invalid(
+            "`text.format` must be an object.",
+            Some("text.format"),
             "invalid_type",
-        )),
+        )
+    })?;
+    reject_unknown_fields(format, &["type"], "Responses text format")?;
+    if format.get("type").and_then(Value::as_str) != Some("text") {
+        return Err(OpenAiError::unsupported(
+            "Only plain text output format is supported.",
+            "text.format.type",
+        ));
     }
+    Ok(())
+}
+
+fn validate_stream_options(value: Option<&Value>) -> Result<(), OpenAiError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let options = value.as_object().ok_or_else(|| {
+        OpenAiError::invalid(
+            "`stream_options` must be an object.",
+            Some("stream_options"),
+            "invalid_type",
+        )
+    })?;
+    reject_unknown_fields(
+        options,
+        &["include_obfuscation"],
+        "Responses stream_options",
+    )?;
+    require_null_or(
+        options,
+        "include_obfuscation",
+        |value| value == false,
+        "`false`",
+    )
 }
 
 #[derive(Clone)]
@@ -351,31 +345,46 @@ struct ResponseContext {
     effective_generation_settings: EffectiveGenerationSettings,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ResponseStatus {
+    InProgress,
+    Completed,
+    Incomplete,
+    Failed,
+}
+
+impl ResponseStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Incomplete => "incomplete",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 fn response_document(
     context: &ResponseContext,
-    status: &str,
+    status: ResponseStatus,
     text: Option<&str>,
     usage: Option<&InferenceUsage>,
     error: Option<Value>,
 ) -> Value {
-    let output = text.map_or_else(Vec::new, |text| {
-        vec![message_item(
-            context,
-            if status == "completed" {
-                "completed"
-            } else {
-                "incomplete"
-            },
-            text,
-        )]
-    });
+    let output = text.map_or_else(Vec::new, |text| vec![message_item(context, status, text)]);
+    let completed_at = if status == ResponseStatus::Completed {
+        json!(unix_timestamp())
+    } else {
+        Value::Null
+    };
     let mut document = json!({
         "id": context.response_id,
         "object": "response",
         "created_at": context.created_at,
-        "status": status,
+        "completed_at": completed_at,
+        "status": status.as_str(),
         "error": error,
-        "incomplete_details": if status == "incomplete" {
+        "incomplete_details": if status == ResponseStatus::Incomplete {
             json!({ "reason": "max_output_tokens" })
         } else {
             Value::Null
@@ -397,23 +406,20 @@ fn response_document(
         "text": { "format": { "type": "text" } },
         "truncation": "disabled",
     });
-    let response = document
-        .as_object_mut()
-        .expect("Response document is constructed as an object");
-    if status == "completed" {
-        response.insert("completed_at".to_owned(), json!(unix_timestamp()));
-    }
     if let Some(usage) = usage.and_then(usage_document) {
-        response.insert("usage".to_owned(), usage);
+        document
+            .as_object_mut()
+            .expect("Response document is an object")
+            .insert("usage".to_owned(), usage);
     }
     document
 }
 
-fn message_item(context: &ResponseContext, status: &str, text: &str) -> Value {
+fn message_item(context: &ResponseContext, status: ResponseStatus, text: &str) -> Value {
     json!({
         "id": context.message_id,
         "type": "message",
-        "status": status,
+        "status": status.as_str(),
         "role": "assistant",
         "content": [{
             "type": "output_text",
@@ -459,9 +465,11 @@ fn streaming_response(context: ResponseContext, backend: InferenceStream) -> Res
         sequence: 0,
         terminal: false,
     };
-    let initial_response = response_document(&state.context, "in_progress", None, None, None);
+    let initial_response =
+        response_document(&state.context, ResponseStatus::InProgress, None, None, None);
     state.push_event("response.created", json!({ "response": initial_response }));
-    let in_progress = response_document(&state.context, "in_progress", None, None, None);
+    let in_progress =
+        response_document(&state.context, ResponseStatus::InProgress, None, None, None);
     state.push_event("response.in_progress", json!({ "response": in_progress }));
     state.push_event(
         "response.output_item.added",
@@ -490,7 +498,7 @@ fn streaming_response(context: ResponseContext, backend: InferenceStream) -> Res
         }),
     );
 
-    let stream = stream::unfold(state, |mut state| async move {
+    let public_stream = stream::unfold(state, |mut state| async move {
         loop {
             if let Some(event) = state.queue.pop_front() {
                 return Some((event, state));
@@ -515,15 +523,13 @@ fn streaming_response(context: ResponseContext, backend: InferenceStream) -> Res
                 Some(Ok(InferenceEvent::Completed {
                     usage,
                     finish_reason,
-                })) => {
-                    state.complete(usage.as_ref(), finish_reason);
-                }
+                })) => state.complete(usage.as_ref(), finish_reason),
                 Some(Err(error)) => {
-                    tracing::warn!(%error, "private engine streaming inference failed");
+                    tracing::warn!(%error, "private engine Responses stream failed");
                     state.fail();
                 }
                 None => {
-                    tracing::warn!("private engine inference stream ended without completion");
+                    tracing::warn!("private engine Responses stream ended without completion");
                     state.fail();
                 }
             }
@@ -534,7 +540,7 @@ fn streaming_response(context: ResponseContext, backend: InferenceStream) -> Res
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(stream))
+        .body(Body::from_stream(public_stream))
         .expect("static streaming response headers are valid")
 }
 
@@ -551,12 +557,11 @@ impl PublicStreamState {
     }
 
     fn complete(&mut self, usage: Option<&InferenceUsage>, finish_reason: InferenceFinishReason) {
-        let (response_status, item_status, terminal_event) =
-            if finish_reason == InferenceFinishReason::MaxOutputTokens {
-                ("incomplete", "incomplete", "response.incomplete")
-            } else {
-                ("completed", "completed", "response.completed")
-            };
+        let (status, terminal_event) = if finish_reason == InferenceFinishReason::MaxOutputTokens {
+            (ResponseStatus::Incomplete, "response.incomplete")
+        } else {
+            (ResponseStatus::Completed, "response.completed")
+        };
         let text = self.text.clone();
         self.push_event(
             "response.output_text.done",
@@ -585,23 +590,23 @@ impl PublicStreamState {
             "response.output_item.done",
             json!({
                 "output_index": 0,
-                "item": message_item(&self.context, item_status, &text),
+                "item": message_item(&self.context, status, &text),
             }),
         );
-        let response = response_document(&self.context, response_status, Some(&text), usage, None);
+        let response = response_document(&self.context, status, Some(&text), usage, None);
         self.push_event(terminal_event, json!({ "response": response }));
         self.terminal = true;
     }
 
     fn fail(&mut self) {
         let error = json!({
-            "code": "server_error",
+            "code": "backend_inference_error",
             "message": "The local inference backend failed while generating this response.",
         });
         let text = self.text.clone();
         let response = response_document(
             &self.context,
-            "failed",
+            ResponseStatus::Failed,
             (!text.is_empty()).then_some(text.as_str()),
             None,
             Some(error),
@@ -611,108 +616,190 @@ impl PublicStreamState {
     }
 }
 
-pub(super) struct OpenAiError {
-    status: StatusCode,
-    message: String,
-    kind: &'static str,
-    parameter: Option<String>,
-    code: &'static str,
-}
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-impl OpenAiError {
-    fn invalid(message: impl Into<String>, parameter: Option<String>, code: &'static str) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-            kind: "invalid_request_error",
-            parameter,
-            code,
+    use axum::body::to_bytes;
+    use futures_util::stream;
+    use norted_engine::{
+        EffectiveGenerationSettings, InferenceEvent, InferenceFinishReason, InferenceRole,
+        InferenceStream, InferenceUsage,
+    };
+    use serde_json::json;
+
+    use super::{
+        ResponseContext, ResponseStatus, parse_request, response_document, streaming_response,
+    };
+
+    #[test]
+    fn string_and_message_inputs_normalize_to_the_canonical_request() {
+        let string = parse_request(json!({
+            "model": "local/model",
+            "instructions": "Be concise",
+            "input": "Hello",
+            "temperature": 0.25,
+            "top_p": 0.9,
+        }))
+        .expect("valid string input");
+        assert_eq!(string.normalized.messages.len(), 2);
+        assert_eq!(string.normalized.messages[0].role, InferenceRole::Developer);
+        assert_eq!(string.normalized.messages[1].role, InferenceRole::User);
+        assert_eq!(
+            string.normalized.generation_settings.temperature,
+            Some(0.25)
+        );
+        assert_eq!(string.normalized.generation_settings.top_p, Some(0.9));
+
+        let messages = parse_request(json!({
+            "model": "local/model",
+            "input": [
+                {"role": "system", "content": [{"type": "input_text", "text": "S"}]},
+                {"role": "developer", "content": "D"},
+                {"role": "user", "content": "U"},
+                {"role": "assistant", "content": "A"}
+            ],
+            "store": false,
+            "background": false,
+            "tools": [],
+            "tool_choice": "none",
+            "metadata": {},
+            "truncation": "disabled",
+            "text": {"format": {"type": "text"}}
+        }))
+        .expect("valid text messages");
+        assert_eq!(messages.normalized.messages.len(), 4);
+        assert_eq!(messages.normalized.messages[0].role, InferenceRole::System);
+        assert_eq!(
+            messages.normalized.messages[3].role,
+            InferenceRole::Assistant
+        );
+    }
+
+    #[test]
+    fn behavior_requesting_identity_fields_are_rejected() {
+        for (field, value) in [
+            ("store", json!(true)),
+            ("background", json!(true)),
+            ("tools", json!([{"type": "function"}])),
+            ("truncation", json!("auto")),
+        ] {
+            let mut request = json!({"model": "m", "input": "hello"});
+            request[field] = value;
+            assert!(parse_request(request).is_err(), "field {field} must fail");
         }
     }
 
-    fn unsupported(message: impl Into<String>, parameter: String) -> Self {
-        Self::invalid(message, Some(parameter), "unsupported_value")
-    }
-}
+    #[test]
+    fn non_stream_documents_report_completion_and_max_output_truthfully() {
+        let completed = response_document(
+            &context(),
+            ResponseStatus::Completed,
+            Some("done"),
+            None,
+            None,
+        );
+        assert_eq!(completed["object"], "response");
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["output"][0]["content"][0]["text"], "done");
+        assert!(completed.get("usage").is_none());
 
-impl IntoResponse for OpenAiError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({
-                "error": {
-                    "message": self.message,
-                    "type": self.kind,
-                    "param": self.parameter,
-                    "code": self.code,
-                }
-            })),
-        )
-            .into_response()
+        let incomplete = response_document(
+            &context(),
+            ResponseStatus::Incomplete,
+            Some("partial"),
+            Some(&InferenceUsage {
+                input_tokens: 2,
+                output_tokens: 1,
+                total_tokens: 3,
+                ..Default::default()
+            }),
+            None,
+        );
+        assert_eq!(incomplete["status"], "incomplete");
+        assert_eq!(
+            incomplete["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+        assert!(incomplete.get("usage").is_none());
     }
-}
 
-fn runtime_error(error: RuntimeError) -> OpenAiError {
-    tracing::warn!(%error, "Responses request could not be routed");
-    match error {
-        RuntimeError::ModelNotFound(_) => OpenAiError {
-            status: StatusCode::NOT_FOUND,
-            message: "The requested model does not exist in the local model registry.".to_owned(),
-            kind: "invalid_request_error",
-            parameter: Some("model".to_owned()),
-            code: "model_not_found",
-        },
-        RuntimeError::ModelNotLoaded(_) => OpenAiError {
-            status: StatusCode::CONFLICT,
-            message: "The requested model exists but is not loaded.".to_owned(),
-            kind: "invalid_request_error",
-            parameter: Some("model".to_owned()),
-            code: "model_not_loaded",
-        },
-        RuntimeError::BackendCrashed(_) => OpenAiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "The local inference backend is unavailable after an unexpected exit."
-                .to_owned(),
-            kind: "server_error",
-            parameter: None,
-            code: "backend_unavailable",
-        },
-        RuntimeError::Inference(_) => OpenAiError {
-            status: StatusCode::BAD_GATEWAY,
-            message: "The local inference backend failed to complete the request.".to_owned(),
-            kind: "server_error",
-            parameter: None,
-            code: "backend_inference_error",
-        },
-        RuntimeError::InferenceTimedOut(_) => OpenAiError {
-            status: StatusCode::GATEWAY_TIMEOUT,
-            message: "The local inference backend timed out while completing the request."
-                .to_owned(),
-            kind: "server_error",
-            parameter: None,
-            code: "backend_timeout",
-        },
-        RuntimeError::InferenceUnavailable(_) => OpenAiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "The local inference backend is unavailable.".to_owned(),
-            kind: "server_error",
-            parameter: None,
-            code: "backend_unavailable",
-        },
-        _ => OpenAiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: "The local inference runtime is not available for this request.".to_owned(),
-            kind: "server_error",
-            parameter: None,
-            code: "backend_unavailable",
-        },
+    #[tokio::test]
+    async fn stream_events_have_the_text_sequence_and_stable_ids() {
+        let backend: InferenceStream = Box::pin(stream::iter([
+            Ok(InferenceEvent::TextDelta {
+                delta: "hi".to_owned(),
+            }),
+            Ok(InferenceEvent::Completed {
+                usage: None,
+                finish_reason: InferenceFinishReason::Stop,
+            }),
+        ]));
+        let response = streaming_response(context(), backend);
+        let bytes = to_bytes(response.into_body(), 128 * 1024)
+            .await
+            .expect("stream body");
+        let body = String::from_utf8(bytes.to_vec()).expect("UTF-8 SSE");
+        let expected = [
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.content_part.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.content_part.done",
+            "response.output_item.done",
+            "response.completed",
+        ];
+        let events = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("event: "))
+            .collect::<Vec<_>>();
+        assert_eq!(events, expected);
+        assert!(body.contains("resp_stable"));
+        assert!(body.contains("msg_stable"));
     }
-}
 
-fn unix_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-        .unwrap_or(0)
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_public_body_drops_owned_backend_stream() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropSignal(Arc::clone(&dropped));
+        let backend: InferenceStream = Box::pin(stream::unfold(guard, |guard| async move {
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            Some((
+                Ok(InferenceEvent::TextDelta {
+                    delta: String::new(),
+                }),
+                guard,
+            ))
+        }));
+        let response = streaming_response(context(), backend);
+        drop(response);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    fn context() -> ResponseContext {
+        ResponseContext {
+            response_id: "resp_stable".to_owned(),
+            message_id: "msg_stable".to_owned(),
+            created_at: 1,
+            model: "model".to_owned(),
+            instructions: None,
+            max_output_tokens: None,
+            effective_generation_settings: EffectiveGenerationSettings {
+                temperature: 0.7,
+                top_p: 0.95,
+            },
+        }
+    }
 }

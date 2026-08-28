@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
 use color_eyre::Result;
-use norted_core::{ApplicationCore, ConfigSource, LoadedConfig, RegistryState};
-use norted_engine::{ControlClient, ControlStatus, InstallationState};
+use norted_core::{
+    ApiKeyStore, ApiKeySummary, ApplicationCore, ConfigSource, CreatedApiKey, LoadedConfig,
+    PublicAuthStatus, RegistryState,
+};
+use norted_engine::{ControlClient, ControlStatus, InstallationState, ModelServingCapabilities};
 use serde_json::json;
 
 use crate::doctor::DoctorCheck;
@@ -14,6 +17,10 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
         .err()
         .map(|error| error.to_string());
     let mut snapshot = core.snapshot().await;
+    let auth = core
+        .config
+        .server
+        .public_auth_status(ApiKeyStore::new(&core.paths).active_count().await?)?;
     if let Some(message) = observation_error {
         snapshot.server = norted_core::ServerState::Unknown { message };
     }
@@ -36,6 +43,7 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
                 "models": snapshot.models,
                 "registry_warnings": snapshot.registry_warnings,
                 "control": control,
+                "public_auth": auth,
             }))?
         );
     } else {
@@ -46,6 +54,13 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
         }
         if let Some(endpoint) = snapshot.server.endpoint() {
             println!("  Endpoint:        {endpoint}");
+        }
+        println!("  Public bind:     {}", auth.bind);
+        println!("  Auth configured: {}", auth.configured_mode);
+        println!("  Auth effective:  {}", auth.effective_mode);
+        println!("  Active API keys: {}", auth.active_key_count);
+        if auth.insecure_remote {
+            println!("  SECURITY:        WARNING: remote authentication is disabled");
         }
         match snapshot.registry_state {
             RegistryState::Ready | RegistryState::ReadyWithWarnings { .. } => {
@@ -129,6 +144,158 @@ pub async fn models(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
         for warning in &snapshot.registry_warnings {
             eprintln!("Warning: {warning}");
         }
+    }
+    Ok(())
+}
+
+pub fn model_info(capabilities: &ModelServingCapabilities, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(capabilities)?);
+    } else {
+        println!("Model:                {}", capabilities.model_id);
+        println!("Format:               {}", capabilities.format);
+        println!(
+            "Compatible engines:   {}",
+            comma_list(&capabilities.compatible_engine_ids)
+        );
+        println!(
+            "Compatible runtimes:  {}",
+            comma_list(
+                &capabilities
+                    .compatible_installed_runtime_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            )
+        );
+        println!(
+            "Selected runtime:     {}",
+            capabilities
+                .selected_runtime_id
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref()
+                .unwrap_or("none")
+        );
+        println!("Active:               {}", yes_no(capabilities.active));
+        println!(
+            "Text input/output:    {} / {}",
+            yes_no(capabilities.text_input),
+            yes_no(capabilities.text_output)
+        );
+        println!("Responses:            {}", yes_no(capabilities.responses));
+        println!(
+            "Chat Completions:     {}",
+            yes_no(capabilities.chat_completions)
+        );
+        println!("Streaming:            {}", yes_no(capabilities.streaming));
+        println!("Tool calling:         {}", yes_no(capabilities.tools));
+        println!("Vision:               {}", yes_no(capabilities.vision));
+        println!(
+            "Structured output:    {}",
+            yes_no(capabilities.structured_output)
+        );
+    }
+    Ok(())
+}
+
+fn comma_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_owned()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+pub fn auth_status(status: &PublicAuthStatus, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(status)?);
+    } else {
+        println!("Norted public API authentication");
+        println!("  Bind:             {}", status.bind);
+        println!(
+            "  Exposure:         {}",
+            if status.loopback {
+                "loopback"
+            } else {
+                "remote"
+            }
+        );
+        println!("  Configured mode:  {}", status.configured_mode);
+        println!("  Effective mode:   {}", status.effective_mode);
+        println!("  Active API keys:  {}", status.active_key_count);
+        println!(
+            "  Bind allowed:     {}",
+            if status.bind_allowed { "yes" } else { "no" }
+        );
+        if status.insecure_remote {
+            eprintln!(
+                "WARNING: remote HTTP serving has authentication disabled; prompts, outputs, and credentials have no Norted transport protection."
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn api_keys(keys: &[ApiKeySummary], json_output: bool) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "data": keys }))?
+        );
+    } else if keys.is_empty() {
+        println!("No Norted API keys exist.");
+    } else {
+        println!("{:<38} {:<24} {:<20} STATE", "KEY ID", "NAME", "PREFIX");
+        for key in keys {
+            println!(
+                "{:<38} {:<24} {:<20} {}",
+                key.key_id,
+                key.name,
+                format!("{}...", key.display_prefix),
+                if key.active { "active" } else { "revoked" }
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn api_key_created(created: &CreatedApiKey, json_output: bool) -> Result<()> {
+    let key = created.summary();
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "key_id": key.key_id,
+                "name": key.name,
+                "display_prefix": key.display_prefix,
+                "created_at": key.created_at,
+                "api_key": created.secret(),
+            }))?
+        );
+    } else {
+        println!("Created Norted API key {} ({})", key.key_id, key.name);
+        println!("The secret is shown once; store it securely:");
+        println!("{}", created.secret());
+    }
+    Ok(())
+}
+
+pub fn api_key_revoked(key: &ApiKeySummary, json_output: bool) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "operation": "revoke",
+                "key": key,
+            }))?
+        );
+    } else {
+        println!("Revoked Norted API key {} ({}).", key.key_id, key.name);
     }
     Ok(())
 }

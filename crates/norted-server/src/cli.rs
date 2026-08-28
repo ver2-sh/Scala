@@ -40,6 +40,8 @@ pub enum Command {
     Tui,
     /// Run the local HTTP API gateway until interrupted
     Serve,
+    /// Inspect public authentication or manage Norted API keys
+    Auth(AuthArgs),
     /// Show current server, model, and engine state
     Status,
     /// Load a discovered model through the running Norted Server instance
@@ -84,6 +86,42 @@ pub struct ModelsArgs {
 pub enum ModelsCommand {
     /// List recognized .gguf and .q27 artifacts
     List,
+    /// Show private serving capabilities for one discovered model
+    Info { model_id: String },
+}
+
+#[derive(Debug, Args)]
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub command: AuthCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Show configured/effective public authentication and bind safety
+    Status,
+    /// List, create, or revoke Norted API keys
+    Keys(AuthKeysArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AuthKeysArgs {
+    #[command(subcommand)]
+    pub command: AuthKeysCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthKeysCommand {
+    /// List key metadata without secrets or digests
+    List,
+    /// Create a strong random API key; its secret is shown once
+    Create {
+        /// Human-readable key label
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Revoke an API key by its stable key ID
+    Revoke { key_id: String },
 }
 
 #[derive(Debug, Args)]

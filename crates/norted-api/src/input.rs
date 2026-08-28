@@ -1,0 +1,255 @@
+use norted_core::ModelId;
+use norted_engine::{GenerationSettingsPatch, InferenceMessage, InferenceRequest, InferenceRole};
+use serde_json::{Map, Value};
+
+use crate::error::OpenAiError;
+
+#[derive(Debug, Clone)]
+pub(crate) struct NormalizedRequest {
+    pub(crate) model: String,
+    pub(crate) messages: Vec<InferenceMessage>,
+    pub(crate) max_output_tokens: Option<u32>,
+    pub(crate) generation_settings: GenerationSettingsPatch,
+    pub(crate) stream: bool,
+}
+
+impl NormalizedRequest {
+    pub(crate) fn inference_request(&self) -> InferenceRequest {
+        InferenceRequest {
+            model_id: ModelId(self.model.clone()),
+            messages: self.messages.clone(),
+            max_output_tokens: self.max_output_tokens,
+            generation_settings: self.generation_settings,
+            stream: self.stream,
+        }
+    }
+}
+
+pub(crate) fn object(value: &Value) -> Result<&Map<String, Value>, OpenAiError> {
+    value.as_object().ok_or_else(|| {
+        OpenAiError::invalid(
+            "The request body must be a JSON object.",
+            None::<String>,
+            "invalid_request",
+        )
+    })
+}
+
+pub(crate) fn reject_unknown_fields(
+    object: &Map<String, Value>,
+    allowed: &[&str],
+    surface: &str,
+) -> Result<(), OpenAiError> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(OpenAiError::unsupported(
+            format!("Unsupported {surface} field: {field}"),
+            field,
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn required_string(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<String, OpenAiError> {
+    let value = object.get(field).ok_or_else(|| {
+        OpenAiError::invalid(
+            format!("Missing required field: {field}"),
+            Some(field),
+            "missing_required_parameter",
+        )
+    })?;
+    let value = value.as_str().ok_or_else(|| {
+        OpenAiError::invalid(
+            format!("`{field}` must be a string."),
+            Some(field),
+            "invalid_type",
+        )
+    })?;
+    if value.trim().is_empty() {
+        return Err(OpenAiError::invalid(
+            format!("`{field}` must not be empty."),
+            Some(field),
+            "invalid_value",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+pub(crate) fn optional_string(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, OpenAiError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(OpenAiError::invalid(
+            format!("`{field}` must be a string."),
+            Some(field),
+            "invalid_type",
+        )),
+    }
+}
+
+pub(crate) fn optional_bool(
+    object: &Map<String, Value>,
+    field: &str,
+    default: bool,
+) -> Result<bool, OpenAiError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(OpenAiError::invalid(
+            format!("`{field}` must be a boolean."),
+            Some(field),
+            "invalid_type",
+        )),
+    }
+}
+
+pub(crate) fn optional_positive_u32(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<u32>, OpenAiError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let number = value.as_u64().ok_or_else(|| {
+                OpenAiError::invalid(
+                    format!("`{field}` must be a positive integer."),
+                    Some(field),
+                    "invalid_type",
+                )
+            })?;
+            if number == 0 || number > u64::from(u32::MAX) {
+                return Err(OpenAiError::invalid(
+                    format!("`{field}` is outside the supported positive integer range."),
+                    Some(field),
+                    "invalid_value",
+                ));
+            }
+            Ok(Some(number as u32))
+        }
+    }
+}
+
+pub(crate) fn generation_settings(
+    object: &Map<String, Value>,
+) -> Result<GenerationSettingsPatch, OpenAiError> {
+    Ok(GenerationSettingsPatch {
+        temperature: optional_f64(object, "temperature", 0.0, 2.0)?,
+        top_p: optional_f64(object, "top_p", 0.0, 1.0)?,
+    })
+}
+
+fn optional_f64(
+    object: &Map<String, Value>,
+    field: &str,
+    minimum: f64,
+    maximum: f64,
+) -> Result<Option<f64>, OpenAiError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let number = value.as_f64().ok_or_else(|| {
+                OpenAiError::invalid(
+                    format!("`{field}` must be a number."),
+                    Some(field),
+                    "invalid_type",
+                )
+            })?;
+            if !number.is_finite() || number < minimum || number > maximum {
+                return Err(OpenAiError::invalid(
+                    format!("`{field}` must be between {minimum} and {maximum}, inclusive."),
+                    Some(field),
+                    "invalid_value",
+                ));
+            }
+            Ok(Some(number))
+        }
+    }
+}
+
+pub(crate) fn role(value: Option<&Value>, parameter: &str) -> Result<InferenceRole, OpenAiError> {
+    match value.and_then(Value::as_str) {
+        Some("developer") => Ok(InferenceRole::Developer),
+        Some("system") => Ok(InferenceRole::System),
+        Some("user") => Ok(InferenceRole::User),
+        Some("assistant") => Ok(InferenceRole::Assistant),
+        Some(_) => Err(OpenAiError::unsupported(
+            "Only developer, system, user, and assistant text messages are supported.",
+            parameter,
+        )),
+        None => Err(OpenAiError::invalid(
+            "Each message requires a string `role`.",
+            Some(parameter),
+            "missing_required_parameter",
+        )),
+    }
+}
+
+pub(crate) fn text_content(
+    value: &Value,
+    parameter: &str,
+    part_type: &str,
+) -> Result<String, OpenAiError> {
+    match value {
+        Value::String(text) => Ok(text.clone()),
+        Value::Array(parts) => {
+            let mut text = String::new();
+            for (index, part) in parts.iter().enumerate() {
+                let part_parameter = format!("{parameter}[{index}]");
+                let part = part.as_object().ok_or_else(|| {
+                    OpenAiError::invalid(
+                        "Text content parts must be JSON objects.",
+                        Some(part_parameter.clone()),
+                        "invalid_type",
+                    )
+                })?;
+                reject_unknown_fields(part, &["type", "text"], "text content")?;
+                if part.get("type").and_then(Value::as_str) != Some(part_type) {
+                    return Err(OpenAiError::unsupported(
+                        format!("Only `{part_type}` content parts are supported."),
+                        format!("{part_parameter}.type"),
+                    ));
+                }
+                let part_text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    OpenAiError::invalid(
+                        format!("`{part_type}` content requires a string `text` field."),
+                        Some(format!("{part_parameter}.text")),
+                        "missing_required_parameter",
+                    )
+                })?;
+                text.push_str(part_text);
+            }
+            Ok(text)
+        }
+        _ => Err(OpenAiError::invalid(
+            "Message `content` must be a string or an array of text content parts.",
+            Some(parameter),
+            "invalid_type",
+        )),
+    }
+}
+
+pub(crate) fn require_null_or(
+    object: &Map<String, Value>,
+    field: &str,
+    predicate: impl FnOnce(&Value) -> bool,
+    supported_description: &str,
+) -> Result<(), OpenAiError> {
+    if let Some(value) = object.get(field)
+        && !value.is_null()
+        && !predicate(value)
+    {
+        return Err(OpenAiError::unsupported(
+            format!("`{field}` only supports {supported_description}."),
+            field,
+        ));
+    }
+    Ok(())
+}

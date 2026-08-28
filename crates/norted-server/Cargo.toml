@@ -10,6 +10,7 @@ name = "norted-server"
 path = "src/main.rs"
 
 [dependencies]
+async-trait.workspace = true
 clap.workspace = true
 color-eyre.workspace = true
 norted-api = { path = "../norted-api" }

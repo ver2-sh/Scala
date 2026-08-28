@@ -118,6 +118,8 @@ pub enum RuntimeError {
     StartupTimedOut(Duration),
     #[error("the loaded backend crashed: {0}")]
     BackendCrashed(String),
+    #[error("invalid generation settings: {0}")]
+    InvalidGenerationSettings(String),
     #[error("backend inference failed: {0}")]
     Inference(String),
     #[error("backend inference timed out: {0}")]
@@ -744,8 +746,13 @@ impl RuntimeManager {
         &self,
         request: InferenceRequest,
     ) -> Result<RoutedInferenceOutput, RuntimeError> {
-        let (adapter, endpoint, effective_generation_settings) =
+        let (adapter, endpoint, backend_generation_settings) =
             self.inference_target(&request.model_id).await?;
+        adapter
+            .validate_generation_settings(&request.generation_settings)
+            .map_err(map_inference_error)?;
+        let effective_generation_settings =
+            backend_generation_settings.merged(&request.generation_settings);
         let output = adapter
             .infer(&endpoint, request)
             .await
@@ -760,8 +767,13 @@ impl RuntimeManager {
         &self,
         request: InferenceRequest,
     ) -> Result<RoutedInferenceStream, RuntimeError> {
-        let (adapter, endpoint, effective_generation_settings) =
+        let (adapter, endpoint, backend_generation_settings) =
             self.inference_target(&request.model_id).await?;
+        adapter
+            .validate_generation_settings(&request.generation_settings)
+            .map_err(map_inference_error)?;
+        let effective_generation_settings =
+            backend_generation_settings.merged(&request.generation_settings);
         let stream = adapter
             .infer_stream(&endpoint, request)
             .await
@@ -1162,6 +1174,9 @@ fn exit_detail(exit: &ProcessExit) -> String {
 
 fn map_inference_error(error: EngineError) -> RuntimeError {
     match error {
+        EngineError::InvalidGenerationSettings(message) => {
+            RuntimeError::InvalidGenerationSettings(message)
+        }
         EngineError::TimedOut(message) => RuntimeError::InferenceTimedOut(message),
         EngineError::BackendUnavailable(message) => RuntimeError::InferenceUnavailable(message),
         error => RuntimeError::Inference(error.to_string()),

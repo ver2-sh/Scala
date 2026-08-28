@@ -1422,6 +1422,7 @@ dependencies = [
 name = "norted-api"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "bytes",
  "futures-util",
@@ -1429,8 +1430,10 @@ dependencies = [
  "norted-engine",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tower",
  "tracing",
  "uuid",
 ]
@@ -1441,6 +1444,7 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "fs2",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
  "sha2",
@@ -1515,6 +1519,7 @@ dependencies = [
 name = "norted-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
  "color-eyre",
  "norted-api",

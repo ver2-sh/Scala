@@ -20,7 +20,9 @@ use crate::catalog::{
 };
 use crate::installer::{RuntimeInstallError, RuntimeInstaller};
 use crate::store::{RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreSnapshot};
-use crate::{CompatibilityDecision, EngineError, EngineRegistry, InstallationState};
+use crate::{
+    CompatibilityDecision, EngineError, EngineRegistry, InstallationState, ModelServingCapabilities,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimePackError {
@@ -593,8 +595,18 @@ impl RuntimePackManager {
         model: &ModelArtifact,
         explicit: Option<&RuntimeId>,
     ) -> Result<RuntimeSelection, RuntimePackError> {
-        let host = self.refresh_host_capabilities().await;
+        self.refresh_host_capabilities().await;
         let list = self.list().await?;
+        self.resolve_from_snapshot(model, explicit, &list)
+    }
+
+    fn resolve_from_snapshot(
+        &self,
+        model: &ModelArtifact,
+        explicit: Option<&RuntimeId>,
+        list: &RuntimeListSnapshot,
+    ) -> Result<RuntimeSelection, RuntimePackError> {
+        let host = list.host.clone();
         if let Some(runtime_id) = explicit {
             let status = list
                 .installed
@@ -617,7 +629,7 @@ impl RuntimePackManager {
         }
         let mut notices = Vec::new();
         if let Some(runtime_id) = list.selections.model_overrides.get(&model.id) {
-            match self.selected_candidate(&list, runtime_id, model) {
+            match self.selected_candidate(list, runtime_id, model) {
                 Ok(runtime) => {
                     return Ok(RuntimeSelection {
                         accelerator: self.model_candidate_accelerator(&runtime, model, &list.host),
@@ -632,7 +644,7 @@ impl RuntimePackManager {
             }
         }
         if let Some(runtime_id) = list.selections.format_defaults.get(&model.format) {
-            match self.selected_candidate(&list, runtime_id, model) {
+            match self.selected_candidate(list, runtime_id, model) {
                 Ok(runtime) => {
                     return Ok(RuntimeSelection {
                         accelerator: self.model_candidate_accelerator(&runtime, model, &list.host),
@@ -718,6 +730,66 @@ impl RuntimePackManager {
             runtime,
             source: RuntimeSelectionSource::Fallback,
             notices,
+        })
+    }
+
+    pub async fn model_serving_capabilities(
+        &self,
+        model: &ModelArtifact,
+        active_model: Option<&ModelId>,
+    ) -> Result<ModelServingCapabilities, RuntimePackError> {
+        self.refresh_host_capabilities().await;
+        let list = self.list().await?;
+
+        let mut compatible_engine_ids = self
+            .registry
+            .compatible_with(model)
+            .into_iter()
+            .map(|adapter| adapter.identity().id)
+            .collect::<Vec<_>>();
+        compatible_engine_ids.sort();
+        compatible_engine_ids.dedup();
+
+        let mut compatible_installed_runtime_ids = list
+            .installed
+            .iter()
+            .filter(|status| {
+                status
+                    .runtime
+                    .manifest
+                    .supported_formats
+                    .contains(&model.format)
+            })
+            .filter_map(|status| {
+                self.model_candidate_compatibility(&status.runtime, model, &list.host)
+                    .ok()
+                    .filter(RuntimeCompatibility::is_usable)
+                    .map(|_| status.runtime.manifest.runtime_id.clone())
+            })
+            .collect::<Vec<_>>();
+        compatible_installed_runtime_ids.sort();
+        compatible_installed_runtime_ids.dedup();
+
+        let selected_runtime_id = self
+            .resolve_from_snapshot(model, None, &list)
+            .ok()
+            .map(|selection| selection.runtime.manifest.runtime_id);
+
+        Ok(ModelServingCapabilities {
+            model_id: model.id.clone(),
+            format: model.format,
+            compatible_engine_ids,
+            compatible_installed_runtime_ids,
+            selected_runtime_id,
+            active: active_model == Some(&model.id),
+            text_input: true,
+            text_output: true,
+            responses: true,
+            chat_completions: true,
+            streaming: true,
+            tools: false,
+            vision: false,
+            structured_output: false,
         })
     }
 

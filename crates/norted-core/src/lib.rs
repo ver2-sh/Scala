@@ -1,5 +1,6 @@
 //! Engine-neutral application services and domain types.
 
+mod auth;
 mod config;
 mod error;
 mod event;
@@ -10,6 +11,11 @@ mod runtime;
 mod runtime_pack;
 mod state;
 
+pub use auth::{
+    API_KEY_PREFIX, API_KEYS_SCHEMA_VERSION, ApiKeyRecord, ApiKeyState, ApiKeyStore,
+    ApiKeyStoreError, ApiKeySummary, CreatedApiKey, EffectivePublicAuthMode, MAX_API_KEYS,
+    PublicAuthMode, PublicAuthStatus,
+};
 pub use config::{
     AppConfig, AppPaths, ConfigSource, EngineConfig, LoadedConfig, ModelConfig,
     SUPPORTED_CONFIG_VERSION, ServerConfig, TuiConfig,

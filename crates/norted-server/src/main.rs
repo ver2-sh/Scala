@@ -8,14 +8,15 @@ use std::sync::Arc;
 
 use clap::Parser;
 use cli::{
-    Cli, Command, ConfigCommand, EnginesCommand, ModelsCommand, ProfilesCommand, RuntimesCommand,
-    SettingsCommand, SettingsMutationArgs, SettingsUnsetArgs,
+    AuthCommand, AuthKeysCommand, Cli, Command, ConfigCommand, EnginesCommand, ModelsCommand,
+    ProfilesCommand, RuntimesCommand, SettingsCommand, SettingsMutationArgs, SettingsUnsetArgs,
 };
 use color_eyre::Result;
-use norted_api::ApiServer;
+use norted_api::{ApiServer, PublicAuth, PublicAuthVerifier};
 use norted_core::{
-    AppPaths, ApplicationCore, LoadProfileName, LoadProfilesStore, LoadSettingId, LoadSettingScope,
-    LoadSettingsError, LoadSettingsPatch, ModelId, RuntimeId,
+    ApiKeyStore, AppPaths, ApplicationCore, EffectivePublicAuthMode, LoadProfileName,
+    LoadProfilesStore, LoadSettingId, LoadSettingScope, LoadSettingsError, LoadSettingsPatch,
+    ModelId, PublicAuthStatus, RuntimeId,
 };
 use norted_engine::{ControlClient, ControlClientError, EngineRegistry};
 use tracing_subscriber::EnvFilter;
@@ -69,9 +70,44 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             norted_tui::run(core, packs, definitions).await?;
         }
         Command::Serve => {
+            let key_store = ApiKeyStore::new(&core.paths);
+            let auth_status = core
+                .config
+                .server
+                .public_auth_status(key_store.active_count().await?)?;
+            validate_public_auth_startup(&auth_status)?;
+            if auth_status.insecure_remote {
+                tracing::warn!(
+                    bind = %auth_status.bind,
+                    "INSECURE REMOTE SERVING: public authentication is explicitly disabled and HTTP traffic is not encrypted"
+                );
+                if cli.json {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "warning": {
+                                "code": "insecure_remote_serving",
+                                "bind": auth_status.bind,
+                                "message": "public authentication is disabled; plain HTTP does not protect prompts, outputs, or credentials",
+                            }
+                        })
+                    );
+                } else {
+                    eprintln!(
+                        "WARNING: INSECURE REMOTE SERVING on {}: public authentication is disabled and plain HTTP is not encrypted.",
+                        auth_status.bind
+                    );
+                }
+            }
+            let public_auth = match auth_status.effective_mode {
+                EffectivePublicAuthMode::Disabled => PublicAuth::disabled(),
+                EffectivePublicAuthMode::Required => {
+                    PublicAuth::required(Arc::new(KeyStoreVerifier(key_store)))
+                }
+            };
             core.ensure_model_discovery().await?;
             let runtime = composition::runtime_manager(Arc::clone(&core)).await?;
-            let server = ApiServer::bind(core, runtime).await?;
+            let server = ApiServer::bind(core, runtime, public_auth).await?;
             if cli.json {
                 println!(
                     "{}",
@@ -87,6 +123,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             server.run(shutdown_signal()).await?;
         }
         Command::Status => output::status(core, cli.json).await?,
+        Command::Auth(args) => {
+            handle_auth(&core, args.command, cli.json).await?;
+        }
         Command::Load {
             model_id,
             runtime,
@@ -110,6 +149,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Models(args) => match args.command {
             ModelsCommand::List => output::models(core, cli.json).await?,
+            ModelsCommand::Info { model_id } => {
+                model_info(core, ModelId(model_id), cli.json).await?
+            }
         },
         Command::Engines(args) => match args.command {
             EnginesCommand::List => output::engines(core, cli.json).await?,
@@ -238,6 +280,82 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Doctor => unreachable!("doctor is dispatched before application startup"),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn validate_public_auth_startup(status: &PublicAuthStatus) -> Result<()> {
+    if !status.bind_allowed {
+        return Err(color_eyre::eyre::eyre!(
+            "public authentication is required for {}, but there are no active API keys; create one with `norted-server auth keys create --name <LABEL>` before serving",
+            status.bind
+        ));
+    }
+    Ok(())
+}
+
+async fn model_info(
+    core: Arc<ApplicationCore>,
+    model_id: ModelId,
+    json_output: bool,
+) -> Result<()> {
+    core.ensure_model_discovery().await?;
+    let model = core.model(&model_id).await.ok_or_else(|| {
+        color_eyre::eyre::eyre!("model `{model_id}` does not exist in the discovered registry")
+    })?;
+    let active_model = match ControlClient::discover(&core.paths).await {
+        Ok(client) => client.status().await?.backend.model_id,
+        Err(ControlClientError::Unavailable) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let registry = composition::engine_registry(&core)?;
+    let packs = composition::runtime_pack_manager(&core, registry)?;
+    let capabilities = packs
+        .model_serving_capabilities(&model, active_model.as_ref())
+        .await?;
+    output::model_info(&capabilities, json_output)?;
+    Ok(())
+}
+
+#[derive(Clone)]
+struct KeyStoreVerifier(ApiKeyStore);
+
+#[async_trait::async_trait]
+impl PublicAuthVerifier for KeyStoreVerifier {
+    async fn verify(&self, credential: &str) -> bool {
+        match self.0.verify(credential).await {
+            Ok(verified) => verified,
+            Err(error) => {
+                tracing::error!(%error, "public API-key verification failed closed");
+                false
+            }
+        }
+    }
+}
+
+async fn handle_auth(
+    core: &ApplicationCore,
+    command: AuthCommand,
+    json_output: bool,
+) -> Result<()> {
+    let store = ApiKeyStore::new(&core.paths);
+    match command {
+        AuthCommand::Status => {
+            let active_key_count = store.active_count().await?;
+            let status = core.config.server.public_auth_status(active_key_count)?;
+            output::auth_status(&status, json_output)?;
+        }
+        AuthCommand::Keys(args) => match args.command {
+            AuthKeysCommand::List => output::api_keys(&store.list().await?, json_output)?,
+            AuthKeysCommand::Create { name } => {
+                let created = store.create(name).await?;
+                output::api_key_created(&created, json_output)?;
+            }
+            AuthKeysCommand::Revoke { key_id } => {
+                let revoked = store.revoke(key_id).await?;
+                output::api_key_revoked(&revoked, json_output)?;
+            }
+        },
+    }
+    Ok(())
 }
 
 async fn handle_profiles(
@@ -644,4 +762,37 @@ fn init_logging(paths: &AppPaths) -> tracing_appender::non_blocking::WorkerGuard
         .with_writer(writer)
         .init();
     guard
+}
+
+#[cfg(test)]
+mod tests {
+    use norted_core::{PublicAuthMode, ServerConfig};
+
+    use super::validate_public_auth_startup;
+
+    #[test]
+    fn required_auth_without_an_active_key_fails_before_server_binding() {
+        let status = ServerConfig {
+            host: "0.0.0.0".to_owned(),
+            port: 8742,
+            auth: PublicAuthMode::Auto,
+        }
+        .public_auth_status(0)
+        .expect("auth status");
+        let error = validate_public_auth_startup(&status).expect_err("must fail closed");
+        assert!(error.to_string().contains("auth keys create"));
+    }
+
+    #[test]
+    fn explicit_insecure_remote_override_is_allowed_but_marked() {
+        let status = ServerConfig {
+            host: "0.0.0.0".to_owned(),
+            port: 8742,
+            auth: PublicAuthMode::Disabled,
+        }
+        .public_auth_status(0)
+        .expect("auth status");
+        validate_public_auth_startup(&status).expect("explicit override");
+        assert!(status.insecure_remote);
+    }
 }

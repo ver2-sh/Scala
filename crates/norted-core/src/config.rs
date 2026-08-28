@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
-use crate::{CoreError, Result};
+use crate::{CoreError, EffectivePublicAuthMode, PublicAuthMode, PublicAuthStatus, Result};
 
 pub const SUPPORTED_CONFIG_VERSION: u32 = 1;
 
@@ -129,6 +129,7 @@ pub struct EngineConfig {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    pub auth: PublicAuthMode,
 }
 
 impl Default for ServerConfig {
@@ -136,6 +137,7 @@ impl Default for ServerConfig {
         Self {
             host: "127.0.0.1".into(),
             port: 8742,
+            auth: PublicAuthMode::Auto,
         }
     }
 }
@@ -144,6 +146,38 @@ impl ServerConfig {
     pub fn ip_addr(&self) -> Result<IpAddr> {
         self.host.parse().map_err(|_| CoreError::InvalidServerHost {
             host: self.host.clone(),
+        })
+    }
+
+    pub fn socket_addr(&self) -> Result<std::net::SocketAddr> {
+        Ok(std::net::SocketAddr::new(self.ip_addr()?, self.port))
+    }
+
+    pub fn is_loopback(&self) -> Result<bool> {
+        Ok(self.ip_addr()?.is_loopback())
+    }
+
+    pub fn effective_auth_mode(&self) -> Result<EffectivePublicAuthMode> {
+        Ok(match self.auth {
+            PublicAuthMode::Auto if self.is_loopback()? => EffectivePublicAuthMode::Disabled,
+            PublicAuthMode::Auto | PublicAuthMode::Required => EffectivePublicAuthMode::Required,
+            PublicAuthMode::Disabled => EffectivePublicAuthMode::Disabled,
+        })
+    }
+
+    pub fn public_auth_status(&self, active_key_count: usize) -> Result<PublicAuthStatus> {
+        let address = self.socket_addr()?;
+        let loopback = address.ip().is_loopback();
+        let effective_mode = self.effective_auth_mode()?;
+        Ok(PublicAuthStatus {
+            bind: address.to_string(),
+            loopback,
+            configured_mode: self.auth,
+            effective_mode,
+            active_key_count,
+            bind_allowed: effective_mode == EffectivePublicAuthMode::Disabled
+                || active_key_count > 0,
+            insecure_remote: !loopback && self.auth == PublicAuthMode::Disabled,
         })
     }
 }
@@ -209,5 +243,92 @@ impl LoadedConfig {
             path: paths.config_file.clone(),
             source: ConfigSource::File,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppConfig, ServerConfig};
+    use crate::{EffectivePublicAuthMode, PublicAuthMode};
+
+    #[test]
+    fn existing_version_one_config_defaults_to_safe_auto_auth() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            version = 1
+
+            [server]
+            host = "127.0.0.1"
+            port = 8742
+            "#,
+        )
+        .expect("parse existing config");
+
+        assert_eq!(config.server.auth, PublicAuthMode::Auto);
+        assert_eq!(
+            config.server.effective_auth_mode().expect("effective auth"),
+            EffectivePublicAuthMode::Disabled
+        );
+    }
+
+    #[test]
+    fn public_auth_policy_matrix_fails_remote_auto_closed() {
+        let cases = [
+            (
+                "127.0.0.1",
+                PublicAuthMode::Auto,
+                EffectivePublicAuthMode::Disabled,
+                true,
+                false,
+            ),
+            (
+                "0.0.0.0",
+                PublicAuthMode::Auto,
+                EffectivePublicAuthMode::Required,
+                false,
+                false,
+            ),
+            (
+                "127.0.0.1",
+                PublicAuthMode::Required,
+                EffectivePublicAuthMode::Required,
+                false,
+                false,
+            ),
+            (
+                "192.168.1.50",
+                PublicAuthMode::Disabled,
+                EffectivePublicAuthMode::Disabled,
+                true,
+                true,
+            ),
+        ];
+
+        for (host, auth, effective, allowed_without_keys, insecure_remote) in cases {
+            let server = ServerConfig {
+                host: host.to_owned(),
+                port: 8742,
+                auth,
+            };
+            let status = server.public_auth_status(0).expect("auth status");
+            assert_eq!(status.effective_mode, effective, "host {host}");
+            assert_eq!(status.bind_allowed, allowed_without_keys, "host {host}");
+            assert_eq!(status.insecure_remote, insecure_remote, "host {host}");
+        }
+    }
+
+    #[test]
+    fn active_key_allows_required_bind() {
+        let server = ServerConfig {
+            host: "::".to_owned(),
+            port: 8742,
+            auth: PublicAuthMode::Auto,
+        };
+        assert!(
+            server
+                .public_auth_status(1)
+                .expect("auth status")
+                .bind_allowed
+        );
     }
 }

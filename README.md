@@ -1,6 +1,6 @@
 # Norted Server
 
-Norted Server is a terminal-first local inference control plane. It discovers local model artifacts, manages separately versioned inference runtimes, owns backend processes, and exposes a narrow OpenAI Responses-compatible text API.
+Norted Server is a terminal-first local inference control plane. It discovers local model artifacts, manages separately versioned inference runtimes, owns backend processes, and exposes an authenticated OpenAI-compatible text gateway. Responses is the primary API; Chat Completions is a compatibility surface.
 
 The central distinction is:
 
@@ -161,9 +161,11 @@ norted-server
 ├── tui
 ├── serve
 ├── status
+├── auth status
+├── auth keys list|create|revoke
 ├── load <MODEL_ID> [--runtime <RUNTIME_ID>] [--profile <NAME>] [--set <ID=VALUE>]...
 ├── unload
-├── models list
+├── models list|info <MODEL_ID>
 ├── runtimes ...
 ├── profiles list|show|create|delete|set|unset|assign|clear-assignment
 ├── settings show|schema|set|unset
@@ -220,6 +222,7 @@ version = 1
 [server]
 host = "127.0.0.1"
 port = 8742
+auth = "auto"
 
 [models]
 paths = ["D:/models"]
@@ -243,7 +246,7 @@ Discovery recognizes `.gguf` and `.q27` primary artifacts. Q27 admission reads o
 
 Q27 serving also requires one unambiguous `.tok` companion. An exact same-stem tokenizer is preferred; otherwise discovery may associate a unique boundary-safe prefix match for quantized filenames. The tokenizer must have the current `Q27T` magic/version header. It is recorded as an auxiliary artifact, never listed as an independent model, and does not change the stable primary model ID. During load the adapter canonicalizes and hashes the declared tokenizer into a prepared engine-neutral input. q27-server receives that exact path, and size/SHA-256 are revalidated immediately before launch; the adapter no longer performs a second companion search.
 
-## Serving and Responses subset
+## Secure serving and OpenAI-compatible text APIs
 
 The public gateway defaults to `127.0.0.1:8742`:
 
@@ -251,23 +254,87 @@ The public gateway defaults to `127.0.0.1:8742`:
 GET  /health
 GET  /v1/models
 POST /v1/responses
+POST /v1/chat/completions
 ```
 
-The public API has no authentication in this release, so keep it on loopback unless the surrounding network is protected. Each backend and the authenticated control listener use separate OS-assigned ports on `127.0.0.1`; clients are never redirected to an upstream server.
+Public authentication is configured under `[server]` with `auth = "auto"`, `"required"`, or `"disabled"`:
 
-The Responses text subset accepts `model`, string or text-message `input`, optional `instructions`, positive `max_output_tokens`, and `stream`. Unsupported fields and non-text inputs are rejected rather than ignored. Norted translates both llama.cpp and q27 Chat Completions JSON/SSE into its canonical internal inference events and constructs public Responses objects itself; upstream bytes are not proxied through.
+- `auto` disables public bearer authentication only for a loopback bind and requires it for every non-loopback bind.
+- `required` requires a key even on loopback.
+- `disabled` is an explicit insecure override. A non-loopback bind is allowed but produces prominent CLI, log, status, and TUI warnings.
 
-For q27, Norted explicitly owns `temperature = 0.0` and `top_p = 1.0` on every request and strips conflicting inherited environment controls, so the reported effective settings are provable. For llama.cpp, settings are read from its authoritative `/props` after readiness. Public token usage is omitted unless every required Responses detail is actually known.
+When authentication is effective, it applies to `/v1/models`, `/v1/responses`, and `/v1/chat/completions`. `/health` remains a minimal unauthenticated liveness endpoint. `serve` validates that at least one active key exists before binding a required-auth public listener.
+
+Create and manage keys with the scriptable CLI:
+
+```console
+norted-server auth status
+norted-server auth keys list
+norted-server auth keys create --name vscode
+norted-server auth keys revoke <KEY_ID>
+```
+
+The create command prints a `norted_sk_...` secret exactly once. The versioned store lives at `<data>/api-keys.json`, uses `<data>/.api-keys.lock` plus atomic replacement, and persists only a key ID, label, display prefix, SHA-256 digest, creation time, and revocation time. It never stores the full key. Every authenticated request reads this small mutable state through a blocking boundary, so revocation takes effect without a restart. `--json` is supported; list output never contains secrets or digests.
+
+Useful server configurations are:
+
+```toml
+# Default local: no public key required.
+[server]
+host = "127.0.0.1"
+port = 8742
+auth = "auto"
+```
+
+```toml
+# Tailscale/VPN-style bind: at least one active Norted key is required.
+[server]
+host = "<TAILSCALE_OR_VPN_IP>"
+port = 8742
+auth = "auto"
+```
+
+```toml
+# Explicit insecure remote HTTP. Do not use on an untrusted network.
+[server]
+host = "0.0.0.0"
+port = 8742
+auth = "disabled"
+```
+
+Bearer authentication does not encrypt transport. Loopback needs no network transport layer; Tailscale or another trusted VPN can provide encrypted transport, and a reverse proxy can provide TLS. Plain HTTP on an untrusted LAN exposes bearer credentials, prompts, and outputs. Norted does not manage certificates and does not enable permissive browser CORS.
+
+Each backend and the separately authenticated private control listener use OS-assigned loopback ports. Public API keys cannot authorize control operations, and clients are never redirected to or given the private upstream server.
+
+The Responses text subset accepts `model`; string or text-message `input`; `developer`, `system`, `user`, and `assistant` roles; optional `instructions`; `max_output_tokens`; `temperature`; `top_p`; and `stream`. Identity values such as `store=false`, `background=false`, `tools=[]`, `tool_choice="none"`, plain-text format, `truncation="disabled"`, empty metadata, and null optional fields are accepted where they request no extra behavior. Stateful Responses, storage, non-empty tools, reasoning controls, automatic truncation, structured output, and non-text content are rejected explicitly.
+
+Chat Completions accepts the same canonical text messages and generation controls, plus `max_completion_tokens` and its deprecated `max_tokens` alias. Equal aliases are accepted and conflicting aliases fail. Compatibility identity values include `n=1`, `store=false`, `tools=[]`, `tool_choice="none"`, text-only modality, and `stream_options.include_usage`; requests for multiple choices, tools, logprobs, audio, vision, stored completions, structured output, penalties, or stop-sequence behavior are rejected. Both public parsers produce the same engine-neutral `InferenceRequest`; neither endpoint proxies upstream JSON.
+
+Request-time `temperature`, `top_p`, and output-token limits are generation settings, not load settings. They never modify profiles, runtime selection, launch provenance, or backend defaults. llama.cpp receives only explicitly supplied sampler fields and otherwise retains the values observed from `/props`. q27 retains Norted's existing omitted defaults of `temperature=0` and `top_p=1`, substitutes explicit supported values, and rejects sampler values that q27 would silently reinterpret. Responses usage remains omitted unless its required shape is known truthfully; Chat emits basic prompt/completion/total counts when the backend reports them.
+
+Every public success, error, and stream carries a fresh opaque `x-request-id`. A valid ASCII `X-Client-Request-Id` of at most 512 characters is retained only as correlation metadata and never replaces the server ID. Public inference JSON is bounded to 32 MiB; oversized bodies receive a clean 413. Errors use one sanitized OpenAI-style envelope and never expose local paths, private endpoints, control tokens, key digests, or Rust debug output.
 
 Example:
 
 ```console
 curl http://127.0.0.1:8742/v1/responses \
+  -H "Authorization: Bearer $NORTED_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"<MODEL_ID>","input":"Reply with exactly: Norted works."}'
 ```
 
-Streaming emits Norted-generated Responses SSE events and ends in completed, incomplete, or failed state. llama.cpp and q27 health/readiness, native requests, and stream parsing remain isolated in their adapters.
+Chat uses the same key:
+
+```console
+curl http://127.0.0.1:8742/v1/chat/completions \
+  -H "Authorization: Bearer $NORTED_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"<MODEL_ID>","messages":[{"role":"user","content":"Say hello."}]}'
+```
+
+Responses streaming emits the current ordered Norted-generated Responses SSE events and ends in completed, incomplete, or failed state. Chat streaming emits stable `chat.completion.chunk` IDs, assistant/text deltas, a truthful stop/length finish reason, optional known usage, and `[DONE]`. Dropping a client stream drops its owned backend stream rather than leaving detached generation.
+
+Public `/v1/models` remains the minimal OpenAI list (`id`, `object`, `created`, `owned_by`). Use the private local `norted-server models info <MODEL_ID>` command, with optional `--json`, to inspect compatible engines/runtimes, current resolution and active state, and Norted serving capabilities without exposing them publicly.
 
 ## Lifecycle and provenance
 
@@ -292,7 +359,7 @@ Focused tests cover security-sensitive archive traversal, digest verification, f
 - Only one model/backend can run at a time; there is no scheduler or implicit swap.
 - Managed q27 is Linux x86_64 CUDA only because that is what upstream currently publishes; Windows can use only a separately supplied compatible external binary.
 - q27 source-only releases are not managed builds, and Norted does not compile runtime packs from source.
-- The public surface is the documented Responses text subset plus health/model listing; tools, embeddings, vision, audio, and multimodal inference are not implemented.
-- There is no public API authentication, service installer, model downloader, or web UI.
+- The public surface is the documented Responses and Chat Completions text subsets plus health/model listing; tools, embeddings, vision, audio, stateful Responses, and multimodal inference are not implemented.
+- There is no built-in TLS/certificate management, permissive CORS, rate-limit infrastructure, service installer, model downloader, or web UI.
 
 See [docs/architecture.md](docs/architecture.md) for component boundaries and the exact runtime acquisition, resolution, and launch flow.

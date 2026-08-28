@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
@@ -19,3 +20,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tempfile.workspace = true
+tower = { version = "0.5.2", features = ["util"] }

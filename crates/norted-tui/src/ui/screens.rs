@@ -628,20 +628,48 @@ fn render_server(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
         .as_ref()
         .and_then(|control| control.backend.private_endpoint.clone())
         .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
+    let auth = &app.public_auth_status;
+    let active_key_count = if app.public_auth_loading {
+        "Loading".to_owned()
+    } else if app.public_auth_error.is_some() {
+        "Unavailable".to_owned()
+    } else {
+        auth.active_key_count.to_string()
+    };
+    let exposure = if auth.loopback { "loopback" } else { "remote" };
     frame.render_widget(
         Paragraph::new(vec![
             key_value("STATE", app.snapshot.server.label(), theme),
             key_value("ENDPOINT", endpoint, theme),
+            key_value("PUBLIC BIND", &auth.bind, theme),
+            key_value("EXPOSURE", exposure, theme),
+            key_value("AUTH CONFIGURED", &auth.configured_mode.to_string(), theme),
+            key_value("AUTH EFFECTIVE", &auth.effective_mode.to_string(), theme),
+            key_value("ACTIVE API KEYS", &active_key_count, theme),
             key_value("BACKEND", &lifecycle, theme),
             key_value("MODEL", &active_model, theme),
             key_value("ENGINE", &active_engine, theme),
             key_value("RUNTIME", &active_runtime, theme),
             key_value("PRIVATE", &private_backend, theme),
+            if auth.insecure_remote {
+                Line::from(Span::styled(
+                    "SECURITY WARNING: remote authentication is disabled",
+                    theme.error,
+                ))
+            } else if let Some(error) = &app.public_auth_error {
+                Line::from(Span::styled(
+                    format!("AUTH STATE UNAVAILABLE: {error}"),
+                    theme.error,
+                ))
+            } else {
+                Line::default()
+            },
             Line::default(),
             Line::from(Span::styled("Available now", theme.text)),
             Line::from(Span::styled("GET  /health", theme.accent)),
             Line::from(Span::styled("GET  /v1/models", theme.accent)),
             Line::from(Span::styled("POST /v1/responses", theme.accent)),
+            Line::from(Span::styled("POST /v1/chat/completions", theme.accent)),
             Line::from(Span::styled(
                 "PRIVATE is the selected engine's internal loopback endpoint.",
                 theme.muted,

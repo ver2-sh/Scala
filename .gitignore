@@ -32,6 +32,8 @@ llama-server.exe
 /runtime-selections.json
 /load-profiles.json
 /.load-profiles.lock
+/api-keys.json
+/.api-keys.lock
 /runtime.json
 /.env
 /.env.local

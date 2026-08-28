@@ -20,45 +20,43 @@ ModelArtifact + InstalledRuntime + private address
 
 `EngineRegistry` contains the llama.cpp and q27 adapters. `RuntimePackManager` finds installed runtimes whose engine adapter and declared formats can serve the model, applies the selection policy, and hands the selected exact runtime to the adapter. No core branch says that GGUF always means llama.cpp or that Q27 always means q27; additional adapters can advertise either format without changing the resolver.
 
-The complete local serving shape is:
+The serving and security boundaries are:
 
 ```text
-                                   norted-server serve
-                         ┌─────────────────────────────────┐
-client ─ public address ▶│ Axum gateway                   │
-                         │ /health /v1/models /v1/responses│
-                         └──────────────┬──────────────────┘
-                                        │ normalized inference
-                                        ▼
-                         ┌─────────────────────────────────┐
-                         │ RuntimeManager                  │
-                         │ exact runtime + one backend     │
-                         └──────┬──────────────────▲───────┘
-                                │ LaunchSpec       │ control
-                                ▼                  │
-                         ┌────────────────┐         │
-                         │ common process │         │
-                         │ supervisor     │         │
-                         └──────┬─────────┘         │
-                                │ 127.0.0.1:<dynamic>
-                                ▼                  │
-                         ┌────────────────┐         │
-                         │ llama-server or│         │
-                         │ q27-server     │         │
-                         └────────────────┘         │
-                                                   │
-CLI / TUI ─ descriptor + bearer token ─ 127.0.0.1:<dynamic>
+PUBLIC CLIENT
+    │ HTTP Bearer authentication when effective
+    ▼
+PUBLIC NORTED GATEWAY
+    ├── GET  /health                 (minimal liveness, never key-authorized control)
+    ├── GET  /v1/models              ┐
+    ├── POST /v1/responses           ├ authenticated together when required
+    └── POST /v1/chat/completions    ┘
+              │
+       Responses parser ─┐
+       Chat parser ──────┴──▶ canonical InferenceRequest
+                                      │
+                                      ▼
+                               RuntimeManager
+                                      │ selected EngineAdapter
+                                      ▼
+                         127.0.0.1:<dynamic private backend>
+                              llama-server or q27-server
+
+LOCAL CONTROL CLIENT (CLI / TUI)
+    │ distinct random control bearer token from private descriptor
+    ▼
+PRIVATE LOOPBACK CONTROL API
 ```
 
-The public listener is configurable and defaults to `127.0.0.1:8742`. Backend and authenticated control listeners are always separate loopback endpoints. Clients are never redirected to an upstream backend.
+The public listener is configurable and defaults to `127.0.0.1:8742`. `auto` auth is disabled only on loopback and required on every non-loopback address; `required` always requires it, while `disabled` is an explicit insecure override. Backend and authenticated control listeners are always separate loopback endpoints with different credentials. Public keys cannot authorize control requests, and clients are never redirected to an upstream backend.
 
 ## Crate responsibilities
 
-- `norted-core` owns platform paths, schema-version-1 configuration, the typed load-setting/profile domain and five-layer resolver, the versioned atomic profile store, model/auxiliary-artifact discovery, stable IDs, runtime identity/manifest/preferences data, host-independent provenance, application state, and process descriptors.
+- `norted-core` owns platform paths, schema-version-1 configuration, public-auth policy, the versioned atomic API-key store, the typed load-setting/profile domain and five-layer resolver, the versioned atomic profile store, model/auxiliary-artifact discovery, stable IDs, runtime identity/manifest/preferences data, host-independent provenance, application state, and process descriptors.
 - `norted-engine` owns `EngineAdapter`, `EngineRegistry`, the provider/catalog/cache, secure installer, runtime store and resolver, runtime/backend manager, generic process supervisor, control client, and normalized inference types.
 - `norted-engine-llama-cpp` owns official llama.cpp asset classification, binary probes, flags/environment policy, readiness and `/props`, and Chat Completions JSON/SSE translation.
 - `norted-engine-q27` owns official q27 asset/variant classification, tokenizer requirements, usage-signature probes, flags/environment policy, readiness, provable sampler settings, and Chat Completions JSON/SSE translation.
-- `norted-api` owns the public Responses subset and private authenticated control HTTP surfaces. It does not construct upstream flags or expose backend-native bytes.
+- `norted-api` owns public bearer/request middleware, the shared sanitized error contract, Responses and Chat Completions text surfaces, and the private authenticated control HTTP surface. It does not construct upstream flags or expose backend-native bytes.
 - `norted-tui` owns terminal lifecycle, responsive rendering, runtime search/install/selection interaction, the generic schema-driven load-settings editor, and normalized control observation.
 - `norted-server` is the composition root and scriptable CLI.
 
@@ -205,13 +203,27 @@ Private backend status carries model ID, engine ID, runtime ID/version/variant, 
 
 ## Public protocol
 
-`POST /v1/responses` accepts the documented text subset and is translated into `InferenceRequest`. Each adapter owns only its private upstream JSON/SSE. `norted-api` constructs the public response and event sequence, maps output-limit completion to incomplete state, and emits usage only when every required token-detail field is known. Unsupported input or top-level features are rejected rather than forwarded or silently ignored.
+Responses remains canonical and Chat Completions is compatibility-only. Both public parsers normalize `developer`, `system`, `user`, and `assistant` text into the same engine-neutral `InferenceMessage` list and attach a typed `GenerationSettingsPatch`. `RuntimeManager` asks the selected adapter to validate explicit settings, merges them with the running backend's observed defaults for truthful public reporting, and does not mutate those defaults. Load profiles, runtime selection, and immutable launch provenance never contain request-time values.
+
+`POST /v1/responses` accepts the documented text subset and constructs the current non-streaming document or ordered Responses SSE sequence itself. `POST /v1/chat/completions` constructs current text ChatCompletion objects/chunks from the same normalized inference output. Each adapter owns only its private upstream JSON/SSE: llama.cpp omits absent sampler fields and q27 materializes its established 0/1 defaults while substituting validated explicit values. Output-limit completion maps to incomplete/length state, basic Chat usage is emitted when known, and richer Responses usage is emitted only when every required detail is known. Unsupported input or top-level behavior is rejected rather than forwarded or silently ignored.
+
+Public middleware assigns an independent `req_...` ID and returns it as `x-request-id` on success, JSON errors, and streams. `X-Client-Request-Id` is accepted only as ASCII correlation metadata up to 512 characters. Authentication runs before bounded JSON extraction; inference bodies are capped at 32 MiB. Errors share the OpenAI-style `error { message, type, param, code }` envelope and map internal conditions deliberately without local paths, private addresses, credentials, or debug text. No permissive CORS layer is installed.
 
 `GET /v1/models` remains the audited OpenAI-style list with exactly `id`, `object`, `created`, and `owned_by`. Runtime metadata remains private control-plane state rather than leaking into this public compatibility surface.
 
+The richer `ModelServingCapabilities` view is local/private: it derives format, compatible registered engines, compatible installed runtimes, resolved runtime, active state, and gateway features from real compatibility and selection data. Tools, vision, and structured output are false for this milestone. `norted-server models info <MODEL_ID>` exposes the view without expanding the public Model object.
+
+## Public API-key state and transport
+
+`<data>/api-keys.json` schema 1 contains bounded key records with stable IDs, labels, display prefixes, SHA-256 digests, and creation/revocation timestamps. A separate inter-process lock and atomic replacement serialize writers; corruption is an error rather than an empty-store fallback. Creation draws 256 bits from the operating-system RNG and returns the `norted_sk_...` plaintext only to that one CLI invocation. Verification accepts only bounded Bearer credentials, hashes the supplied secret, compares fixed-size digests in constant time, and considers only active records. The small atomic file is reread per authenticated request so revocation is live.
+
+`serve` reads key state and resolves configured/effective auth before creating the public socket. Required auth with zero active keys therefore fails closed before exposure. Non-loopback `disabled` remains allowed only because it is an explicit operator choice and is labelled insecure throughout local status surfaces.
+
+Application authentication provides no confidentiality. Loopback is local; a trusted VPN such as Tailscale can encrypt remote transport; or an operator-managed reverse proxy can terminate TLS. Norted does not include certificate management, and plain HTTP over an untrusted network exposes credentials and content.
+
 ## TUI and network independence
 
-The TUI enters terminal mode and draws its pending first frame before starting model discovery, local runtime scanning, or control observation. The Runtimes page can load local selections/installs asynchronously. Remote search begins only after a user search action, and install/update work remains off the event loop with real installer progress messages. Keyboard, mouse, narrow layout, ASCII mode, and `NO_COLOR` are presentation concerns isolated in `norted-tui`.
+The TUI enters terminal mode and draws its pending first frame before starting model discovery, local runtime scanning, control observation, or API-key file reads. The Server page derives configured bind/auth policy without I/O for that frame, then refreshes the small local key count asynchronously. The Runtimes page can load local selections/installs asynchronously. Remote search begins only after a user search action, and install/update work remains off the event loop with real installer progress messages. Keyboard, mouse, narrow layout, ASCII mode, and `NO_COLOR` are presentation concerns isolated in `norted-tui`.
 
 The hard invariants are:
 
@@ -223,5 +235,7 @@ The hard invariants are:
 - selection always names a concrete runtime and never hard-codes format-to-engine identity;
 - only the supervisor owns generic child mechanics;
 - only adapters own backend-native behavior;
-- only the API crate owns the public Responses representation;
+- only the API crate owns public Responses and Chat representations;
+- public API keys and private control credentials remain separate authentication domains;
+- no public path exposes a private backend or control operation;
 - at most one backend is active.
