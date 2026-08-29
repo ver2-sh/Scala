@@ -142,23 +142,31 @@ struct NinferPackageRuntimeCapabilities {
 fn evaluate_ninfer_package_runtime(
     capabilities: NinferPackageRuntimeCapabilities,
 ) -> RuntimeCompatibility {
+    match validate_ninfer_package_prelaunch(capabilities) {
+        Ok(()) => RuntimeCompatibility::NeedsAttention(
+            "runtime capabilities satisfy pre-launch requirements; context, KV capacity, sampler, and MTP policy still require server_start proof"
+                .to_owned(),
+        ),
+        Err(reasons) => RuntimeCompatibility::Incompatible(format!(
+            "{reasons}; actual context/KV capacity, graph/prefix state, sampler defaults, and MTP profile remain unproven until server_start"
+        )),
+    }
+}
+
+fn validate_ninfer_package_prelaunch(
+    capabilities: NinferPackageRuntimeCapabilities,
+) -> Result<(), String> {
     if !capabilities.trustworthy_identity {
-        return RuntimeCompatibility::NeedsAttention(
+        return Err(
             "the exact NInfer executable has no trustworthy package-capability observation; external binaries are not credited from filenames or upstream assumptions"
                 .to_owned(),
         );
     }
     let reasons = ninfer_package_prelaunch_failures(capabilities);
     if reasons.is_empty() {
-        RuntimeCompatibility::NeedsAttention(
-            "runtime capabilities satisfy pre-launch requirements; context, KV capacity, sampler, and MTP policy still require server_start proof"
-                .to_owned(),
-        )
+        Ok(())
     } else {
-        RuntimeCompatibility::Incompatible(format!(
-            "{}; actual context/KV capacity, graph/prefix state, sampler defaults, and MTP profile remain unproven until server_start",
-            reasons.join("; ")
-        ))
+        Err(reasons.join("; "))
     }
 }
 
@@ -722,7 +730,7 @@ impl EngineAdapter for NinferAdapter {
         model.norted_package.as_ref()?;
         let capabilities = ninfer_package_capabilities_for_installed(runtime);
         Some(if !capabilities.trustworthy_identity {
-            RuntimeCompatibility::NeedsAttention(
+            RuntimeCompatibility::Incompatible(
                 "external Sharp application capability is unproven for this exact NInfer executable"
                     .to_owned(),
             )
@@ -927,17 +935,9 @@ impl EngineAdapter for NinferAdapter {
         }
         if request.model.primary.norted_package.is_some() {
             let capabilities = ninfer_package_capabilities_for_installed(&request.runtime);
-            if !capabilities.trustworthy_identity {
-                return Err(EngineError::InvalidConfiguration(
-                    "selected NInfer executable has no trustworthy observation proving the Norted package capability contract"
-                        .to_owned(),
-                ));
-            }
-            let failures = ninfer_package_prelaunch_failures(capabilities);
-            if !failures.is_empty() {
+            if let Err(reason) = validate_ninfer_package_prelaunch(capabilities) {
                 return Err(EngineError::InvalidConfiguration(format!(
-                    "selected NInfer runtime cannot launch the Norted package: {}",
-                    failures.join("; ")
+                    "selected NInfer runtime cannot launch the Norted package: {reason}"
                 )));
             }
         }
@@ -1989,6 +1989,30 @@ mod tests {
             bounded_server_start: true,
         });
         assert!(matches!(future, RuntimeCompatibility::NeedsAttention(_)));
+        assert!(
+            validate_ninfer_package_prelaunch(NinferPackageRuntimeCapabilities {
+                trustworthy_identity: true,
+                external_sharp: true,
+                process_sampler_overrides: true,
+                bounded_server_start: true,
+            })
+            .is_ok()
+        );
+
+        let untrusted = NinferPackageRuntimeCapabilities {
+            trustworthy_identity: false,
+            external_sharp: false,
+            process_sampler_overrides: false,
+            bounded_server_start: false,
+        };
+        let untrusted_compatibility = evaluate_ninfer_package_runtime(untrusted);
+        assert!(matches!(
+            untrusted_compatibility,
+            RuntimeCompatibility::Incompatible(ref reason)
+                if reason.contains("no trustworthy package-capability observation")
+        ));
+        assert!(!untrusted_compatibility.is_usable());
+        assert!(validate_ninfer_package_prelaunch(untrusted).is_err());
     }
 
     #[test]

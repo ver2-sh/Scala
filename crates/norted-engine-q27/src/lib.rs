@@ -28,7 +28,7 @@ use norted_engine::{
     InferenceEvent, InferenceFinishReason, InferenceMessage, InferenceOutput, InferenceRequest,
     InferenceRole, InferenceStream, InferenceUsage, InstallationState, LaunchRequest, LaunchSpec,
     NativeOption, OptionValueKind, PreparedAuxiliaryArtifact, PreparedModelInput,
-    ProcessDescriptor, RuntimeCatalogProvider, UpdateState, capture_command,
+    ProcessDescriptor, RuntimeCatalogProvider, StartupObservation, UpdateState, capture_command,
     common_load_setting_definitions, compatibility_for, compatibility_for_nvidia_device,
     isolated_cuda_environment, prepare_norted_package_input,
     revalidate_norted_package_before_launch, visible_nvidia_devices,
@@ -506,7 +506,31 @@ fn q27_compiled_w_max(identity: &RuntimeIdentity, external: bool) -> Option<u64>
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Q27PackageKvMode {
+    Fp8,
+    Turbo5k,
+    Turbo3,
+}
+
+impl Q27PackageKvMode {
+    const QUALITY_ORDER: [Self; 3] = [Self::Fp8, Self::Turbo5k, Self::Turbo3];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fp8 => "fp8",
+            Self::Turbo5k => "turbo5k",
+            Self::Turbo3 => "turbo3",
+        }
+    }
+}
+
+const Q27_V062_PACKAGE_KV_MODES: &[Q27PackageKvMode] =
+    &[Q27PackageKvMode::Fp8, Q27PackageKvMode::Turbo3];
+#[cfg(test)]
+const ALL_PACKAGE_KV_MODES: &[Q27PackageKvMode] = &Q27PackageKvMode::QUALITY_ORDER;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct Q27PackageRuntimeCapabilities {
     trustworthy_identity: bool,
     raw_completions: bool,
@@ -519,6 +543,7 @@ struct Q27PackageRuntimeCapabilities {
     fast_head_control: bool,
     bounded_startup_observation: bool,
     compiled_w_max: Option<u64>,
+    supported_kv_modes: &'static [Q27PackageKvMode],
 }
 
 fn q27_package_capabilities(
@@ -526,9 +551,15 @@ fn q27_package_capabilities(
     acquisition: &RuntimeAcquisitionMethod,
 ) -> Q27PackageRuntimeCapabilities {
     let external = acquisition == &RuntimeAcquisitionMethod::ExternalBinary;
-    let exact_managed_v062 = !external
-        && identity.engine_id == ENGINE_ID
+    let exact_managed_v062 = matches!(
+        acquisition,
+        RuntimeAcquisitionMethod::OfficialReleaseAsset
+            | RuntimeAcquisitionMethod::PreseededOfficialPack
+    ) && identity.engine_id == ENGINE_ID
+        && identity.package_family == PACKAGE_FAMILY
+        && identity.package.provider_id == PROVIDER_ID
         && identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
+        && identity.package.release_tag.as_deref() == Some("v0.6.2")
         && identity.version == "0.6.2";
     Q27PackageRuntimeCapabilities {
         trustworthy_identity: exact_managed_v062,
@@ -546,6 +577,13 @@ fn q27_package_capabilities(
         fast_head_control: exact_managed_v062,
         bounded_startup_observation: exact_managed_v062,
         compiled_w_max: q27_compiled_w_max(identity, external),
+        // q27 v0.6.2 source contains fp8 and turbo3. It does not contain the
+        // package policy's intermediate turbo5k mode.
+        supported_kv_modes: if exact_managed_v062 {
+            Q27_V062_PACKAGE_KV_MODES
+        } else {
+            &[]
+        },
     }
 }
 
@@ -583,30 +621,57 @@ fn q27_package_prelaunch_failures(
     if capabilities.compiled_w_max.is_none() {
         reasons.push("numeric compiled W_MAX is unproven");
     }
+    if capabilities.supported_kv_modes.is_empty() {
+        reasons.push("no package-policy KV mode is proven for this executable");
+    }
     reasons
 }
 
 fn evaluate_q27_package_runtime(
     capabilities: Q27PackageRuntimeCapabilities,
 ) -> RuntimeCompatibility {
+    match validate_q27_package_prelaunch(capabilities) {
+        Ok(()) => RuntimeCompatibility::NeedsAttention(
+            "pre-launch q27 package capabilities are proven; actual served context, KV mode, and W_MAX still require bounded startup observation"
+                .to_owned(),
+        ),
+        Err(reason) => RuntimeCompatibility::Incompatible(format!(
+            "{reason}; actual served context and selected KV mode are not yet proven because startup cannot proceed"
+        )),
+    }
+}
+
+fn validate_q27_package_prelaunch(
+    capabilities: Q27PackageRuntimeCapabilities,
+) -> Result<(), String> {
     if !capabilities.trustworthy_identity {
-        return RuntimeCompatibility::NeedsAttention(
+        return Err(
             "the exact q27 executable has no trustworthy package-capability observation; external binaries are not credited from filenames or upstream version assumptions"
                 .to_owned(),
         );
     }
     let failures = q27_package_prelaunch_failures(capabilities);
     if failures.is_empty() {
-        RuntimeCompatibility::NeedsAttention(
-            "pre-launch q27 package capabilities are proven; actual served context, KV mode, and W_MAX still require bounded startup observation"
-                .to_owned(),
-        )
+        Ok(())
     } else {
-        RuntimeCompatibility::Incompatible(format!(
-            "{}; actual served context and selected KV mode are not yet proven because startup cannot proceed",
-            failures.join("; ")
-        ))
+        Err(failures.join("; "))
     }
+}
+
+fn q27_package_kv_attempt_modes(
+    capabilities: Q27PackageRuntimeCapabilities,
+    policy: &Q27PackagePolicy,
+) -> Vec<Q27PackageKvMode> {
+    Q27PackageKvMode::QUALITY_ORDER
+        .into_iter()
+        .filter(|mode| capabilities.supported_kv_modes.contains(mode))
+        .filter(|mode| {
+            policy
+                .kv_preference
+                .iter()
+                .any(|declared| declared == mode.as_str())
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -823,6 +888,7 @@ struct Q27PackageExecution {
     policy: Q27PackagePolicy,
     compiled_w_max: u64,
     expected_fast_head: bool,
+    selected_kv_mode: Q27PackageKvMode,
 }
 
 #[derive(Debug)]
@@ -858,6 +924,7 @@ fn q27_package_launch_policy(
     package: &NortedPackageBinding,
     compiled_w_max: u64,
     fast_head: bool,
+    kv_mode: Q27PackageKvMode,
 ) -> Result<Q27PackageLaunchPolicy, EngineError> {
     let policy = q27_package_policy(package)?;
     let arguments = [
@@ -877,7 +944,7 @@ fn q27_package_launch_policy(
     .map(OsString::from)
     .collect();
     let environment = BTreeMap::from([
-        ("Q27_KV".to_owned(), "fp8".to_owned()),
+        ("Q27_KV".to_owned(), kv_mode.as_str().to_owned()),
         ("Q27_MAXD".to_owned(), policy.maximum_mtp_depth.clone()),
         (
             "Q27_PMIN".to_owned(),
@@ -905,7 +972,7 @@ fn q27_package_launch_policy(
             "minimum_context_tokens".to_owned(),
             json!(policy.minimum_context_tokens),
         ),
-        ("requested_kv_mode".to_owned(), json!("fp8")),
+        ("requested_kv_mode".to_owned(), json!(kv_mode.as_str())),
         ("compiled_w_max".to_owned(), json!(compiled_w_max)),
         ("fast_head".to_owned(), json!(fast_head)),
     ]);
@@ -1406,7 +1473,7 @@ impl EngineAdapter for Q27Adapter {
             &runtime.manifest.acquisition_method,
         );
         Some(if !capabilities.trustworthy_identity {
-            RuntimeCompatibility::NeedsAttention(
+            RuntimeCompatibility::Incompatible(
                 "external Sharp/raw-prompt capability is unproven for this exact q27 executable"
                     .to_owned(),
             )
@@ -1690,6 +1757,8 @@ impl EngineAdapter for Q27Adapter {
     }
 
     async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError> {
+        let endpoint = http_endpoint(request.backend_address);
+        self.package_executions.write().await.remove(&endpoint);
         if !request.backend_address.ip().is_loopback() {
             return Err(EngineError::InvalidConfiguration(
                 "q27 backend address must be loopback".to_owned(),
@@ -1707,17 +1776,9 @@ impl EngineAdapter for Q27Adapter {
             )
         });
         if let Some(capabilities) = package_capabilities {
-            if !capabilities.trustworthy_identity {
-                return Err(EngineError::InvalidConfiguration(
-                    "selected q27 executable has no trustworthy observation proving the Norted package capability contract"
-                        .to_owned(),
-                ));
-            }
-            let failures = q27_package_prelaunch_failures(capabilities);
-            if !failures.is_empty() {
+            if let Err(reason) = validate_q27_package_prelaunch(capabilities) {
                 return Err(EngineError::InvalidConfiguration(format!(
-                    "selected q27 runtime cannot launch the Norted package: {}",
-                    failures.join("; ")
+                    "selected q27 runtime cannot launch the Norted package: {reason}"
                 )));
             }
         }
@@ -1768,8 +1829,7 @@ impl EngineAdapter for Q27Adapter {
         };
         let tokenizer_path = revalidate_prepared_tokenizer(tokenizer).await?;
         let observation = self.probe_runtime(&request.runtime).await?;
-        let package_execution = if let Some(package) = request.model.primary.norted_package.as_ref()
-        {
+        let package_launch = if let Some(package) = request.model.primary.norted_package.as_ref() {
             let capabilities = package_capabilities.expect("package capabilities");
             let compiled_w_max = capabilities.compiled_w_max.ok_or_else(|| {
                 EngineError::InvalidConfiguration(
@@ -1782,22 +1842,21 @@ impl EngineAdapter for Q27Adapter {
                 .extend([OsString::from("--ctx"), OsString::from("auto")]);
             let sharp_template = read_prepared_sharp_template(&request.model).await?;
             validate_sharp_template(&sharp_template)?;
-            Some((
-                Q27PackageExecution {
-                    sharp_template,
-                    policy: q27_package_policy(package)?.clone(),
-                    compiled_w_max,
-                    expected_fast_head: q27_selected_fast_head(
-                        &request.load_settings,
-                        q27_package_policy(package)?,
-                    )?,
-                },
-                q27_package_launch_policy(
-                    package,
-                    compiled_w_max,
-                    q27_selected_fast_head(&request.load_settings, q27_package_policy(package)?)?,
-                )?,
-            ))
+            let policy = q27_package_policy(package)?;
+            let selected_kv_mode = q27_package_kv_attempt_modes(capabilities, policy)
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    EngineError::InvalidConfiguration(
+                        "selected q27 runtime proves no package-declared KV mode".to_owned(),
+                    )
+                })?;
+            Some(q27_package_launch_policy(
+                package,
+                compiled_w_max,
+                q27_selected_fast_head(&request.load_settings, policy)?,
+                selected_kv_mode,
+            )?)
         } else {
             None
         };
@@ -1835,7 +1894,7 @@ impl EngineAdapter for Q27Adapter {
             OsString::from("--port"),
             OsString::from(request.backend_address.port().to_string()),
         ];
-        if let Some((_, package_launch)) = package_execution.as_ref() {
+        if let Some(package_launch) = package_launch.as_ref() {
             arguments.extend(package_launch.arguments.iter().cloned());
         } else {
             arguments.push(OsString::from("--no-think"));
@@ -1849,17 +1908,12 @@ impl EngineAdapter for Q27Adapter {
             )
         })?;
         let mut environment = q27_launch_environment(&self.environment, &accelerator)?;
-        if let Some((_, package_launch)) = package_execution.as_ref() {
+        if let Some(package_launch) = package_launch.as_ref() {
             environment.extend(package_launch.environment.clone());
         }
         let mut environment_remove = managed_environment_removals();
         environment_remove.extend(structured.environment_remove);
-        let endpoint = http_endpoint(request.backend_address);
-        let normalized_settings = if let Some((execution, package_launch)) = package_execution {
-            self.package_executions
-                .write()
-                .await
-                .insert(endpoint.clone(), execution);
+        let normalized_settings = if let Some(package_launch) = package_launch {
             package_launch.normalized_settings
         } else {
             BTreeMap::from([
@@ -1885,6 +1939,110 @@ impl EngineAdapter for Q27Adapter {
             model: request.model,
             accelerator: Some(accelerator),
         })
+    }
+
+    async fn build_launch_attempts(
+        &self,
+        request: LaunchRequest,
+    ) -> Result<Vec<LaunchSpec>, EngineError> {
+        let package = request.model.primary.norted_package.clone();
+        let capabilities = package.as_ref().map(|_| {
+            q27_package_capabilities(
+                &request.runtime.manifest.identity,
+                &request.runtime.manifest.acquisition_method,
+            )
+        });
+        let first = self.build_launch_spec(request).await?;
+        let Some(package) = package else {
+            return Ok(vec![first]);
+        };
+        let capabilities = capabilities.expect("package capabilities");
+        let policy = q27_package_policy(&package)?;
+        let modes = q27_package_kv_attempt_modes(capabilities, policy);
+        if modes.is_empty() {
+            return Err(EngineError::InvalidConfiguration(
+                "selected q27 runtime proves no package-declared KV mode".to_owned(),
+            ));
+        }
+        Ok(modes
+            .into_iter()
+            .map(|mode| {
+                let mut attempt = first.clone();
+                attempt
+                    .environment
+                    .insert("Q27_KV".to_owned(), mode.as_str().to_owned());
+                attempt
+                    .normalized_settings
+                    .insert("requested_kv_mode".to_owned(), json!(mode.as_str()));
+                attempt
+            })
+            .collect())
+    }
+
+    async fn prepare_launch_attempt(&self, spec: &LaunchSpec) -> Result<(), EngineError> {
+        let endpoint = spec.endpoint.as_deref().ok_or_else(|| {
+            EngineError::InvalidConfiguration("q27 launch has no private endpoint".to_owned())
+        })?;
+        self.package_executions.write().await.remove(endpoint);
+        let Some(package) = spec.model.primary.norted_package.as_ref() else {
+            return Ok(());
+        };
+        revalidate_norted_package_before_launch(&spec.model).await?;
+        let capabilities = q27_package_capabilities(
+            &spec.runtime.manifest.identity,
+            &spec.runtime.manifest.acquisition_method,
+        );
+        validate_q27_package_prelaunch(capabilities).map_err(|reason| {
+            EngineError::InvalidConfiguration(format!(
+                "selected q27 runtime cannot launch the Norted package: {reason}"
+            ))
+        })?;
+        let selected_kv_mode = Q27PackageKvMode::QUALITY_ORDER
+            .into_iter()
+            .find(|mode| spec.environment.get("Q27_KV").map(String::as_str) == Some(mode.as_str()))
+            .ok_or_else(|| {
+                EngineError::InvalidConfiguration(
+                    "q27 package launch did not select a recognized policy KV mode".to_owned(),
+                )
+            })?;
+        if !capabilities.supported_kv_modes.contains(&selected_kv_mode)
+            || !q27_package_policy(package)?
+                .kv_preference
+                .iter()
+                .any(|mode| mode == selected_kv_mode.as_str())
+        {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "q27 package KV mode `{}` is not proven and package-declared for this executable",
+                selected_kv_mode.as_str()
+            )));
+        }
+        let sharp_template = read_prepared_sharp_template(&spec.model).await?;
+        validate_sharp_template(&sharp_template)?;
+        let compiled_w_max = capabilities.compiled_w_max.ok_or_else(|| {
+            EngineError::InvalidConfiguration(
+                "q27 package launch has no proven numeric compiled W_MAX".to_owned(),
+            )
+        })?;
+        self.package_executions.write().await.insert(
+            endpoint.to_owned(),
+            Q27PackageExecution {
+                sharp_template,
+                policy: q27_package_policy(package)?.clone(),
+                compiled_w_max,
+                expected_fast_head: q27_selected_fast_head(
+                    &spec.load_settings,
+                    q27_package_policy(package)?,
+                )?,
+                selected_kv_mode,
+            },
+        );
+        Ok(())
+    }
+
+    async fn clear_launch_state(&self, endpoint: Option<&str>) {
+        if let Some(endpoint) = endpoint {
+            self.package_executions.write().await.remove(endpoint);
+        }
     }
 
     async fn health(&self, process: &ProcessDescriptor) -> Result<bool, EngineError> {
@@ -1917,30 +2075,20 @@ impl EngineAdapter for Q27Adapter {
         &self,
         process: &ProcessDescriptor,
         stderr_tail: &[String],
-    ) -> Result<BTreeMap<String, Value>, EngineError> {
+    ) -> Result<StartupObservation, EngineError> {
         let endpoint = process.endpoint.as_deref().ok_or_else(|| {
             EngineError::Operation("q27 process has no backend endpoint".to_owned())
         })?;
         let executions = self.package_executions.read().await;
         let Some(execution) = executions.get(endpoint) else {
-            return Ok(BTreeMap::new());
+            return Ok(StartupObservation::Ready(BTreeMap::new()));
         };
         let observed = parse_q27_startup_observation(stderr_tail)?;
-        if observed.served_context < execution.policy.minimum_context_tokens {
+        if observed.kv_mode != execution.selected_kv_mode.as_str() {
             return Err(EngineError::Operation(format!(
-                "q27 served only {} context tokens; the package requires at least {}",
-                observed.served_context, execution.policy.minimum_context_tokens
-            )));
-        }
-        if !execution
-            .policy
-            .kv_preference
-            .iter()
-            .any(|mode| mode == &observed.kv_mode)
-        {
-            return Err(EngineError::Operation(format!(
-                "q27 selected unsupported package KV mode `{}`",
-                observed.kv_mode
+                "q27 startup selected KV mode `{}` instead of requested package mode `{}`",
+                observed.kv_mode,
+                execution.selected_kv_mode.as_str()
             )));
         }
         if observed.compiled_w_max != execution.compiled_w_max
@@ -1965,7 +2113,14 @@ impl EngineAdapter for Q27Adapter {
                     .to_owned(),
             ));
         }
-        Ok(BTreeMap::from([
+        if observed.served_context < execution.policy.minimum_context_tokens {
+            return Ok(StartupObservation::RetryContextCapacity {
+                kv_mode: observed.kv_mode,
+                observed_context: observed.served_context,
+                minimum_context: execution.policy.minimum_context_tokens,
+            });
+        }
+        Ok(StartupObservation::Ready(BTreeMap::from([
             (
                 "observed_served_context".to_owned(),
                 json!(observed.served_context),
@@ -1979,7 +2134,7 @@ impl EngineAdapter for Q27Adapter {
                 "sharp_application".to_owned(),
                 json!("pretokenized-raw-prompt"),
             ),
-        ]))
+        ])))
     }
 
     async fn effective_generation_settings(
@@ -2051,6 +2206,11 @@ impl EngineAdapter for Q27Adapter {
             .ok_or_else(|| {
                 EngineError::Operation("q27 response contained no assistant text".to_owned())
             })?;
+        let text = if package.is_some() {
+            filter_q27_package_output(&text)
+        } else {
+            text
+        };
         Ok(InferenceOutput {
             text,
             usage: response.usage.map(Into::into),
@@ -2088,7 +2248,10 @@ impl EngineAdapter for Q27Adapter {
                 .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
             return Err(backend_http_error(status, &body));
         }
-        Ok(q27_sse_stream(response.bytes_stream().boxed()))
+        Ok(q27_sse_stream(
+            response.bytes_stream().boxed(),
+            package.is_some(),
+        ))
     }
 }
 
@@ -2556,22 +2719,112 @@ impl From<ChatUsage> for InferenceUsage {
     }
 }
 
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+#[derive(Debug, Default)]
+struct Q27PackageOutputFilter {
+    reasoning_closed: bool,
+    pending: String,
+}
+
+impl Q27PackageOutputFilter {
+    fn push(&mut self, input: &str) -> String {
+        self.pending.push_str(input);
+        if !self.reasoning_closed {
+            let Some(close) = self.pending.find(THINK_CLOSE) else {
+                self.retain_possible_marker_suffix(&[THINK_CLOSE]);
+                return String::new();
+            };
+            self.pending.drain(..close + THINK_CLOSE.len());
+            self.reasoning_closed = true;
+        }
+        self.drain_public()
+    }
+
+    fn finish(&mut self) -> String {
+        if !self.reasoning_closed {
+            self.pending.clear();
+            return String::new();
+        }
+        // `pending` can only be a prefix of a control delimiter. Dropping it
+        // prevents a truncated tag from becoming ordinary assistant text.
+        self.pending.clear();
+        String::new()
+    }
+
+    fn drain_public(&mut self) -> String {
+        let mut output = String::new();
+        loop {
+            let marker = [THINK_OPEN, THINK_CLOSE]
+                .into_iter()
+                .filter_map(|marker| self.pending.find(marker).map(|index| (index, marker)))
+                .min_by_key(|(index, _)| *index);
+            let Some((index, marker)) = marker else {
+                let retained =
+                    possible_marker_suffix_len(&self.pending, &[THINK_OPEN, THINK_CLOSE]);
+                let emit = self.pending.len() - retained;
+                output.push_str(&self.pending[..emit]);
+                self.pending.drain(..emit);
+                break;
+            };
+            output.push_str(&self.pending[..index]);
+            self.pending.drain(..index + marker.len());
+        }
+        output
+    }
+
+    fn retain_possible_marker_suffix(&mut self, markers: &[&str]) {
+        let retained = possible_marker_suffix_len(&self.pending, markers);
+        if retained == 0 {
+            self.pending.clear();
+        } else {
+            self.pending.drain(..self.pending.len() - retained);
+        }
+    }
+}
+
+fn filter_q27_package_output(text: &str) -> String {
+    let mut filter = Q27PackageOutputFilter::default();
+    let mut public = filter.push(text);
+    public.push_str(&filter.finish());
+    public
+}
+
+fn possible_marker_suffix_len(value: &str, markers: &[&str]) -> usize {
+    markers
+        .iter()
+        .flat_map(|marker| 1..marker.len().min(value.len() + 1))
+        .filter(|length| {
+            value
+                .get(value.len().saturating_sub(*length)..)
+                .is_some_and(|suffix| markers.iter().any(|marker| marker.starts_with(suffix)))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 struct SseState {
     source: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     buffer: Vec<u8>,
     queued: VecDeque<Result<InferenceEvent, EngineError>>,
     usage: Option<InferenceUsage>,
     finish_reason: Option<InferenceFinishReason>,
+    package_output_filter: Option<Q27PackageOutputFilter>,
     finished: bool,
 }
 
-fn q27_sse_stream(source: BoxStream<'static, Result<Bytes, reqwest::Error>>) -> InferenceStream {
+fn q27_sse_stream(
+    source: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    filter_package_output: bool,
+) -> InferenceStream {
     let state = SseState {
         source,
         buffer: Vec::new(),
         queued: VecDeque::new(),
         usage: None,
         finish_reason: None,
+        package_output_filter: filter_package_output.then(Q27PackageOutputFilter::default),
         finished: false,
     };
     Box::pin(stream::unfold(state, |mut state| async move {
@@ -2627,6 +2880,14 @@ fn parse_sse_frames(state: &mut SseState) {
             continue;
         }
         if data == "[DONE]" {
+            if let Some(filter) = state.package_output_filter.as_mut() {
+                let delta = filter.finish();
+                if !delta.is_empty() {
+                    state
+                        .queued
+                        .push_back(Ok(InferenceEvent::TextDelta { delta }));
+                }
+            }
             match state.finish_reason.take() {
                 Some(finish_reason) => {
                     state.queued.push_back(Ok(InferenceEvent::Completed {
@@ -2706,9 +2967,15 @@ fn parse_sse_frames(state: &mut SseState) {
             .and_then(Value::as_str)
             .filter(|delta| !delta.is_empty())
         {
-            state.queued.push_back(Ok(InferenceEvent::TextDelta {
-                delta: delta.to_owned(),
-            }));
+            let delta = state
+                .package_output_filter
+                .as_mut()
+                .map_or_else(|| delta.to_owned(), |filter| filter.push(delta));
+            if !delta.is_empty() {
+                state
+                    .queued
+                    .push_back(Ok(InferenceEvent::TextDelta { delta }));
+            }
         }
     }
 }
@@ -3378,15 +3645,49 @@ mod tests {
             fast_head_control: true,
             bounded_startup_observation: true,
             compiled_w_max: Some(12),
+            supported_kv_modes: ALL_PACKAGE_KV_MODES,
         });
         assert!(matches!(synthetic, RuntimeCompatibility::NeedsAttention(_)));
+        assert!(
+            validate_q27_package_prelaunch(Q27PackageRuntimeCapabilities {
+                trustworthy_identity: true,
+                raw_completions: true,
+                exact_sharp_renderer: true,
+                thinking: true,
+                unlimited_think_budget: true,
+                temperature_top_p: true,
+                top_k_min_p: true,
+                mtp_environment: true,
+                fast_head_control: true,
+                bounded_startup_observation: true,
+                compiled_w_max: Some(12),
+                supported_kv_modes: ALL_PACKAGE_KV_MODES,
+            })
+            .is_ok()
+        );
+
+        let untrusted = q27_package_capabilities(
+            &RuntimeIdentity {
+                version: "future-by-name-only".to_owned(),
+                ..identity
+            },
+            &RuntimeAcquisitionMethod::ExternalBinary,
+        );
+        let untrusted_compatibility = evaluate_q27_package_runtime(untrusted);
+        assert!(matches!(
+            untrusted_compatibility,
+            RuntimeCompatibility::Incompatible(ref reason)
+                if reason.contains("no trustworthy package-capability observation")
+        ));
+        assert!(!untrusted_compatibility.is_usable());
+        assert!(validate_q27_package_prelaunch(untrusted).is_err());
     }
 
     #[test]
     fn fully_capable_package_policy_reaches_q27_arguments_and_environment() {
         let package = q27_package_fixture();
-        let translated =
-            q27_package_launch_policy(&package, 12, false).expect("package launch policy");
+        let translated = q27_package_launch_policy(&package, 12, false, Q27PackageKvMode::Fp8)
+            .expect("package launch policy");
         let arguments = argument_strings(translated.arguments);
         assert!(arguments.windows(2).any(|pair| pair == ["--top-k", "20"]));
         assert!(arguments.windows(2).any(|pair| pair == ["--min-p", "0.05"]));
@@ -3404,6 +3705,35 @@ mod tests {
     }
 
     #[test]
+    fn exact_runtime_kv_modes_follow_package_quality_order_without_inventing_turbo5k() {
+        let package = q27_package_fixture();
+        let policy = q27_package_policy(&package).expect("q27 policy");
+        let exact = q27_package_capabilities(
+            &q27_runtime_identity("w12"),
+            &RuntimeAcquisitionMethod::OfficialReleaseAsset,
+        );
+        assert_eq!(
+            q27_package_kv_attempt_modes(exact, policy),
+            [Q27PackageKvMode::Fp8, Q27PackageKvMode::Turbo3]
+        );
+
+        let future = Q27PackageRuntimeCapabilities {
+            top_k_min_p: true,
+            supported_kv_modes: ALL_PACKAGE_KV_MODES,
+            ..exact
+        };
+        assert_eq!(
+            q27_package_kv_attempt_modes(future, policy),
+            Q27PackageKvMode::QUALITY_ORDER
+        );
+        assert!(matches!(
+            evaluate_q27_package_runtime(future),
+            RuntimeCompatibility::NeedsAttention(_)
+        ));
+        assert!(validate_q27_package_prelaunch(future).is_ok());
+    }
+
+    #[test]
     fn bounded_startup_parser_proves_context_kv_and_numeric_wmax() {
         let observation = parse_q27_startup_observation(&[
             "profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=0 think=1".to_owned(),
@@ -3416,6 +3746,91 @@ mod tests {
         assert_eq!(observation.compiled_w_max, 12);
         assert_eq!(observation.suffix_width, 12);
         assert!(observation.thinking);
+    }
+
+    #[tokio::test]
+    async fn package_startup_retries_only_a_fully_valid_low_context_observation() {
+        let adapter = Q27Adapter::from_config(None, Path::new("."));
+        let endpoint = "http://127.0.0.1:43127";
+        let package = q27_package_fixture();
+        adapter.package_executions.write().await.insert(
+            endpoint.to_owned(),
+            Q27PackageExecution {
+                sharp_template: "sharp".to_owned(),
+                policy: q27_package_policy(&package).expect("policy").clone(),
+                compiled_w_max: 12,
+                expected_fast_head: false,
+                selected_kv_mode: Q27PackageKvMode::Fp8,
+            },
+        );
+        let process = ProcessDescriptor {
+            supervisor_id: "test".to_owned(),
+            process_id: 1,
+            engine: EngineRevision {
+                engine_id: ENGINE_ID.to_owned(),
+                version: Some("0.6.2".to_owned()),
+                revision: None,
+            },
+            runtime_id: RuntimeId("runtime".to_owned()),
+            runtime_version: "0.6.2".to_owned(),
+            runtime_variant: "w12".to_owned(),
+            runtime_executable_sha256: "00".repeat(32),
+            model_id: ModelId("model".to_owned()),
+            endpoint: Some(endpoint.to_owned()),
+            launched_at_unix: 0,
+        };
+        let low_context = [
+            "profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=0 think=1".to_owned(),
+            "--ctx auto: 180000 (free 30.0GB post-weights, fp8 KV, W_MAX=12)".to_owned(),
+            "slot 0 ready: ctx=180000".to_owned(),
+        ];
+        assert!(matches!(
+            adapter
+                .startup_observation(&process, &low_context)
+                .await
+                .expect("classified observation"),
+            StartupObservation::RetryContextCapacity {
+                ref kv_mode,
+                observed_context: 180_000,
+                minimum_context: 200_000,
+            } if kv_mode == "fp8"
+        ));
+
+        let wrong_wmax = [
+            low_context[0].clone(),
+            "--ctx auto: 180000 (free 30.0GB post-weights, fp8 KV, W_MAX=8)".to_owned(),
+            low_context[2].clone(),
+        ];
+        assert!(matches!(
+            adapter.startup_observation(&process, &wrong_wmax).await,
+            Err(EngineError::Operation(reason)) if reason.contains("W_MAX")
+        ));
+    }
+
+    #[tokio::test]
+    async fn clearing_reused_endpoint_forces_a_later_raw_launch_to_raw_state() {
+        let adapter = Q27Adapter::from_config(None, Path::new("."));
+        let endpoint = "http://127.0.0.1:43128";
+        let package = q27_package_fixture();
+        adapter.package_executions.write().await.insert(
+            endpoint.to_owned(),
+            Q27PackageExecution {
+                sharp_template: "stale".to_owned(),
+                policy: q27_package_policy(&package).expect("policy").clone(),
+                compiled_w_max: 12,
+                expected_fast_head: false,
+                selected_kv_mode: Q27PackageKvMode::Fp8,
+            },
+        );
+        adapter.clear_launch_state(Some(endpoint)).await;
+        assert!(
+            adapter
+                .package_executions
+                .read()
+                .await
+                .get(endpoint)
+                .is_none()
+        );
     }
 
     #[test]
@@ -3463,6 +3878,7 @@ mod tests {
                 policy,
                 compiled_w_max: 12,
                 expected_fast_head: false,
+                selected_kv_mode: Q27PackageKvMode::Fp8,
             },
             &InferenceRequest {
                 model_id: ModelId("package-model".to_owned()),
@@ -4527,7 +4943,7 @@ mod tests {
               data: [DONE]\n\n",
         );
         let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(bytes)]).boxed();
-        let mut translated = q27_sse_stream(source);
+        let mut translated = q27_sse_stream(source, false);
         let first = translated.next().await.expect("text event").expect("text");
         assert!(matches!(
             first,
@@ -4560,7 +4976,7 @@ mod tests {
               data: [DONE]\n\n",
         );
         let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(bytes)]).boxed();
-        let mut translated = q27_sse_stream(source);
+        let mut translated = q27_sse_stream(source, false);
         assert!(matches!(
             translated.next().await.expect("text event"),
             Ok(InferenceEvent::TextDelta { ref delta }) if delta == "hello"
@@ -4570,6 +4986,126 @@ mod tests {
             Err(EngineError::BackendUnavailable(message)) if message.contains("finish reason")
         ));
         assert!(translated.next().await.is_none());
+    }
+
+    #[test]
+    fn package_non_stream_output_suppresses_reasoning_and_control_transition() {
+        assert_eq!(
+            filter_q27_package_output(
+                "private chain of thought\nmore private\n</think>\nPublic answer"
+            ),
+            "\nPublic answer"
+        );
+        assert_eq!(filter_q27_package_output("reasoning only"), "");
+        assert_eq!(
+            filter_q27_package_output("private</think>answer<think>"),
+            "answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn package_stream_filter_handles_every_reasoning_close_boundary() {
+        for boundary in 0..=THINK_CLOSE.len() {
+            let first = format!("private{}", &THINK_CLOSE[..boundary]);
+            let second = format!("{}answer", &THINK_CLOSE[boundary..]);
+            let payload = format!(
+                "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices": [{"text": first, "finish_reason": null}]}),
+                json!({"choices": [{"text": second, "finish_reason": null}]}),
+                json!({"choices": [{"text": "", "finish_reason": "stop"}], "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7}}),
+            );
+            let source =
+                stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(payload))]).boxed();
+            let events = q27_sse_stream(source, true)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("filtered events");
+            assert!(matches!(
+                events.as_slice(),
+                [InferenceEvent::TextDelta { delta }, InferenceEvent::Completed { usage: Some(usage), finish_reason: InferenceFinishReason::Stop }]
+                    if delta == "answer"
+                        && usage.input_tokens == 4
+                        && usage.output_tokens == 3
+                        && usage.total_tokens == 7
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn package_reasoning_only_length_stream_emits_no_public_text() {
+        let payload = concat!(
+            "data: {\"choices\":[{\"text\":\"private reasoning\",\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"text\":\"\",\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":16,\"total_tokens\":24}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+            payload.as_bytes(),
+        ))])
+        .boxed();
+        let events = q27_sse_stream(source, true)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("filtered events");
+        assert!(matches!(
+            events.as_slice(),
+            [InferenceEvent::Completed { usage: Some(usage), finish_reason: InferenceFinishReason::MaxOutputTokens }]
+                if usage.input_tokens == 8
+                    && usage.output_tokens == 16
+                    && usage.total_tokens == 24
+        ));
+    }
+
+    #[tokio::test]
+    async fn package_stream_emits_normal_answer_deltas_only_after_close() {
+        let payload = concat!(
+            "data: {\"choices\":[{\"text\":\"private</thi\",\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"text\":\"nk>first \" ,\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"text\":\"second\",\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"text\":\"\",\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+            payload.as_bytes(),
+        ))])
+        .boxed();
+        let events = q27_sse_stream(source, true)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("filtered events");
+        assert!(matches!(
+            events.as_slice(),
+            [InferenceEvent::TextDelta { delta: first }, InferenceEvent::TextDelta { delta: second }, InferenceEvent::Completed { finish_reason: InferenceFinishReason::Stop, .. }]
+                if first == "first " && second == "second"
+        ));
+    }
+
+    #[tokio::test]
+    async fn raw_q27_stream_keeps_reasoning_like_text_unchanged() {
+        let payload = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>raw</think>answer\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+            payload.as_bytes(),
+        ))])
+        .boxed();
+        let events = q27_sse_stream(source, false)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("raw events");
+        assert!(matches!(
+            events.first(),
+            Some(InferenceEvent::TextDelta { delta }) if delta == "<think>raw</think>answer"
+        ));
     }
 
     fn model_artifact(path: PathBuf) -> ModelArtifact {

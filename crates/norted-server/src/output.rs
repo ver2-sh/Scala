@@ -173,6 +173,15 @@ pub fn model_info(capabilities: &ModelServingCapabilities, json_output: bool) ->
                 package.runtime_policy.as_deref().unwrap_or("n/a")
             );
             println!(
+                "Package runtime:      {}",
+                package
+                    .runtime_package_capability
+                    .as_ref()
+                    .map(|state| format!("{state:?}"))
+                    .as_deref()
+                    .unwrap_or("unknown")
+            );
+            println!(
                 "Sharp:                required={} validated={} application={}",
                 yes_no(package.sharp_required),
                 yes_no(package.sharp_validated),

@@ -448,6 +448,16 @@ pub struct LaunchSpec {
     pub accelerator: Option<AcceleratorDevice>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum StartupObservation {
+    Ready(BTreeMap<String, serde_json::Value>),
+    RetryContextCapacity {
+        kv_mode: String,
+        observed_context: u64,
+        minimum_context: u64,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EffectiveGenerationSettings {
     pub temperature: f64,
@@ -816,6 +826,24 @@ pub trait EngineAdapter: Send + Sync {
         Ok(Vec::new())
     }
     async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError>;
+    /// Returns the narrowly ordered process attempts for one launch. Most
+    /// adapters have exactly one attempt. q27 package execution uses this to
+    /// enumerate only exact-runtime-proven KV modes in package quality order.
+    async fn build_launch_attempts(
+        &self,
+        request: LaunchRequest,
+    ) -> Result<Vec<LaunchSpec>, EngineError> {
+        Ok(vec![self.build_launch_spec(request).await?])
+    }
+    /// Re-establishes the adapter-owned launch boundary immediately before an
+    /// actual spawn. This is also where endpoint-scoped request routing state
+    /// may be installed after clearing stale state.
+    async fn prepare_launch_attempt(&self, _spec: &LaunchSpec) -> Result<(), EngineError> {
+        Ok(())
+    }
+    /// Clears adapter-owned state after a spawn failure, terminated attempt,
+    /// unload, or crash. Process supervision itself remains manager-owned.
+    async fn clear_launch_state(&self, _endpoint: Option<&str>) {}
     async fn health(&self, process: &ProcessDescriptor) -> Result<bool, EngineError>;
     /// Converts bounded process startup output into facts that must be proven
     /// before a backend is promoted to healthy. Adapters should reject absent
@@ -824,8 +852,8 @@ pub trait EngineAdapter: Send + Sync {
         &self,
         _process: &ProcessDescriptor,
         _stderr_tail: &[String],
-    ) -> Result<BTreeMap<String, serde_json::Value>, EngineError> {
-        Ok(BTreeMap::new())
+    ) -> Result<StartupObservation, EngineError> {
+        Ok(StartupObservation::Ready(BTreeMap::new()))
     }
     async fn effective_generation_settings(
         &self,

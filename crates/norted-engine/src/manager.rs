@@ -18,7 +18,7 @@ use crate::{
     EffectiveGenerationSettings, EngineAdapter, EngineError, EngineIdentity, EngineProbe,
     EngineRegistry, InferenceRequest, InstallationState, LaunchRequest, ProcessDescriptor,
     ProcessExit, ProcessSupervisor, RoutedInferenceOutput, RoutedInferenceStream, RuntimeLease,
-    RuntimePackError, RuntimePackManager,
+    RuntimePackError, RuntimePackManager, StartupObservation,
 };
 
 const NOTICE_LIMIT: usize = 64;
@@ -482,8 +482,8 @@ impl RuntimeManager {
                 return Err(RuntimeError::StartupFailed(error.to_string()));
             }
         };
-        let launch_spec = match adapter
-            .build_launch_spec(LaunchRequest {
+        let launch_attempts = match adapter
+            .build_launch_attempts(LaunchRequest {
                 model: prepared_model,
                 runtime: selection.runtime.clone(),
                 accelerator: selection.accelerator.clone(),
@@ -493,178 +493,288 @@ impl RuntimeManager {
             })
             .await
         {
-            Ok(spec) => spec,
+            Ok(attempts) if !attempts.is_empty() => attempts,
+            Ok(_) => {
+                let detail = "engine adapter produced no launch attempts".to_owned();
+                self.fail_loading(generation, detail.clone(), None).await;
+                return Err(RuntimeError::StartupFailed(detail));
+            }
             Err(error) => {
                 self.fail_loading(generation, error.to_string(), None).await;
                 return Err(RuntimeError::StartupFailed(error.to_string()));
             }
         };
+        let mut launch_attempts = VecDeque::from(launch_attempts);
         if self.load_cancelled(cancellation_epoch) {
-            cleanup_temporary_launch_files(&launch_spec.temporary_files).await;
+            cleanup_pending_launch_files(&launch_attempts).await;
             let detail = "model load was cancelled".to_owned();
             self.fail_loading(generation, detail.clone(), None).await;
             return Err(RuntimeError::Operation(detail));
         }
-        let installation = launch_spec.installation.clone();
-        let selected_runtime = launch_spec.runtime.clone();
-        let selected_accelerator = launch_spec.accelerator.clone();
-        let mut model_identity = launch_spec.model.runtime_identity();
-        let normalized_settings = launch_spec.normalized_settings.clone();
-        let load_settings = launch_spec.load_settings.clone();
-        if let Some(package) = &mut model_identity.norted_package
-            && let Some(norted_core::LoadSettingValue::Choice(profile)) =
-                load_settings.value("ninfer.package_profile")
-        {
-            package.selected_package_profile = Some(profile.clone());
-        }
-        let native_arguments = launch_spec.native_arguments.clone();
-        let inherits_parent_environment = launch_spec.inherits_parent_environment;
-        let native_environment = environment_provenance(
-            &launch_spec.environment,
-            &launch_spec.environment_remove,
-            inherits_parent_environment,
-        );
-        let temporary_files = launch_spec.temporary_files.clone();
-        let process = match self
-            .supervisor
-            .spawn(launch_spec, installation.engine.clone(), model_id.clone())
-            .await
-        {
-            Ok(process) => process,
-            Err(error) => {
-                cleanup_temporary_launch_files(&temporary_files).await;
+        let mut context_attempts = Vec::new();
+        let (process, endpoint, exit, mut startup_observation, effective_generation_settings) = loop {
+            let launch_spec = launch_attempts
+                .pop_front()
+                .expect("launch attempts were checked as non-empty");
+            if self.load_cancelled(cancellation_epoch) {
+                cleanup_temporary_launch_files(&launch_spec.temporary_files).await;
+                cleanup_pending_launch_files(&launch_attempts).await;
+                let detail = "model load was cancelled".to_owned();
+                self.fail_loading(generation, detail.clone(), None).await;
+                return Err(RuntimeError::Operation(detail));
+            }
+            if let Err(error) = adapter.prepare_launch_attempt(&launch_spec).await {
+                cleanup_temporary_launch_files(&launch_spec.temporary_files).await;
+                cleanup_pending_launch_files(&launch_attempts).await;
+                adapter
+                    .clear_launch_state(launch_spec.endpoint.as_deref())
+                    .await;
                 self.fail_loading(generation, error.to_string(), None).await;
                 return Err(RuntimeError::StartupFailed(error.to_string()));
             }
-        };
-        let cancelled = {
-            let mut state = self.state.write().await;
-            if state.generation != generation
-                || state.lifecycle != BackendLifecycle::Loading
-                || state.cancel_loading
-                || self.load_cancelled(cancellation_epoch)
-            {
-                true
-            } else {
-                state.loading_process = Some(process.clone());
-                false
-            }
-        };
-        if cancelled {
-            let detail = "model load was cancelled".to_owned();
-            let retained = self.terminate_or_retain(&process).await;
-            self.fail_loading(generation, detail.clone(), retained.as_ref())
-                .await;
-            return Err(RuntimeError::Operation(detail));
-        }
-        let endpoint = match process.endpoint.clone() {
-            Some(endpoint) => endpoint,
-            None => {
-                let detail = "engine launch did not provide a backend endpoint".to_owned();
-                let retained = self.terminate_or_retain(&process).await;
-                self.fail_loading(generation, detail.clone(), retained.as_ref())
-                    .await;
-                return Err(RuntimeError::StartupFailed(detail));
-            }
-        };
-        let provenance = RuntimeProvenance {
-            model: model_identity,
-            runtime: selected_runtime.manifest.clone(),
-            runtime_entrypoint: selected_runtime.entrypoint_path(),
-            selection_source: selection.source,
-            accelerator: selected_accelerator,
-            installation,
-            profile: load_settings
-                .selected_profile
-                .as_ref()
-                .map(ToString::to_string),
-            load_settings: LoadSettingsProvenance {
-                effective: load_settings.effective,
-            },
-            normalized_settings,
-            native_arguments: native_argument_provenance(native_arguments),
-            native_environment,
-            inherits_parent_environment,
-            process: ProcessIdentity {
-                process_id: process.process_id,
-                process_start_identity: Some(process.supervisor_id.clone()),
-            },
-            private_backend_endpoint: endpoint.clone(),
-            launched_at_unix: process.launched_at_unix,
-        };
-        {
-            self.state.write().await.provenance = Some(provenance);
-        }
-        let mut exit = match self.supervisor.subscribe(&process).await {
-            Ok(exit) => exit,
-            Err(error) => {
-                let detail = error.to_string();
-                let retained = self.terminate_or_retain(&process).await;
-                self.fail_loading(generation, detail.clone(), retained.as_ref())
-                    .await;
-                return Err(RuntimeError::StartupFailed(detail));
-            }
-        };
 
-        let readiness = self
-            .wait_for_readiness(adapter.as_ref(), &process, &mut exit)
-            .await;
-        if let Err(error) = readiness {
-            let detail = error.to_string();
-            let retained = self.terminate_or_retain(&process).await;
-            self.fail_loading(generation, detail.clone(), retained.as_ref())
-                .await;
-            return Err(error);
-        }
-        let mut startup_attempt = 0_u8;
-        let startup_observation = loop {
-            let stderr_tail = match self.supervisor.stderr_tail(&process).await {
-                Ok(stderr_tail) => stderr_tail,
+            let installation = launch_spec.installation.clone();
+            let selected_runtime = launch_spec.runtime.clone();
+            let selected_accelerator = launch_spec.accelerator.clone();
+            let mut model_identity = launch_spec.model.runtime_identity();
+            let normalized_settings = launch_spec.normalized_settings.clone();
+            let load_settings = launch_spec.load_settings.clone();
+            if let Some(package) = &mut model_identity.norted_package
+                && let Some(norted_core::LoadSettingValue::Choice(profile)) =
+                    load_settings.value("ninfer.package_profile")
+            {
+                package.selected_package_profile = Some(profile.clone());
+            }
+            let native_arguments = launch_spec.native_arguments.clone();
+            let inherits_parent_environment = launch_spec.inherits_parent_environment;
+            let native_environment = environment_provenance(
+                &launch_spec.environment,
+                &launch_spec.environment_remove,
+                inherits_parent_environment,
+            );
+            let temporary_files = launch_spec.temporary_files.clone();
+            let launch_endpoint = launch_spec.endpoint.clone();
+            let process = match self
+                .supervisor
+                .spawn(launch_spec, installation.engine.clone(), model_id.clone())
+                .await
+            {
+                Ok(process) => process,
                 Err(error) => {
-                    let detail = format!("could not read bounded engine startup output: {error}");
+                    cleanup_temporary_launch_files(&temporary_files).await;
+                    cleanup_pending_launch_files(&launch_attempts).await;
+                    adapter.clear_launch_state(launch_endpoint.as_deref()).await;
+                    self.fail_loading(generation, error.to_string(), None).await;
+                    return Err(RuntimeError::StartupFailed(error.to_string()));
+                }
+            };
+            let cancelled = {
+                let mut state = self.state.write().await;
+                if state.generation != generation
+                    || state.lifecycle != BackendLifecycle::Loading
+                    || state.cancel_loading
+                    || self.load_cancelled(cancellation_epoch)
+                {
+                    true
+                } else {
+                    state.loading_process = Some(process.clone());
+                    false
+                }
+            };
+            if cancelled {
+                cleanup_pending_launch_files(&launch_attempts).await;
+                let detail = "model load was cancelled".to_owned();
+                let retained = self.terminate_or_retain(&process).await;
+                adapter
+                    .clear_launch_state(process.endpoint.as_deref())
+                    .await;
+                self.fail_loading(generation, detail.clone(), retained.as_ref())
+                    .await;
+                return Err(RuntimeError::Operation(detail));
+            }
+            let endpoint = match process.endpoint.clone() {
+                Some(endpoint) => endpoint,
+                None => {
+                    cleanup_pending_launch_files(&launch_attempts).await;
+                    let detail = "engine launch did not provide a backend endpoint".to_owned();
                     let retained = self.terminate_or_retain(&process).await;
+                    adapter.clear_launch_state(None).await;
                     self.fail_loading(generation, detail.clone(), retained.as_ref())
                         .await;
                     return Err(RuntimeError::StartupFailed(detail));
                 }
             };
-            match adapter.startup_observation(&process, &stderr_tail).await {
-                Ok(observation) => break observation,
-                Err(EngineError::BackendUnavailable(_)) if startup_attempt < 20 => {
-                    startup_attempt += 1;
-                    if exit.borrow().is_some() {
-                        let detail =
-                            "engine exited before startup policy observation completed".to_owned();
-                        let retained = self.terminate_or_retain(&process).await;
-                        self.fail_loading(generation, detail.clone(), retained.as_ref())
-                            .await;
-                        return Err(RuntimeError::StartupFailed(detail));
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+            let provenance = RuntimeProvenance {
+                model: model_identity,
+                runtime: selected_runtime.manifest.clone(),
+                runtime_entrypoint: selected_runtime.entrypoint_path(),
+                selection_source: selection.source,
+                accelerator: selected_accelerator,
+                installation,
+                profile: load_settings
+                    .selected_profile
+                    .as_ref()
+                    .map(ToString::to_string),
+                load_settings: LoadSettingsProvenance {
+                    effective: load_settings.effective,
+                },
+                normalized_settings,
+                native_arguments: native_argument_provenance(native_arguments),
+                native_environment,
+                inherits_parent_environment,
+                process: ProcessIdentity {
+                    process_id: process.process_id,
+                    process_start_identity: Some(process.supervisor_id.clone()),
+                },
+                private_backend_endpoint: endpoint.clone(),
+                launched_at_unix: process.launched_at_unix,
+            };
+            self.state.write().await.provenance = Some(provenance);
+            let mut exit = match self.supervisor.subscribe(&process).await {
+                Ok(exit) => exit,
                 Err(error) => {
+                    cleanup_pending_launch_files(&launch_attempts).await;
+                    let detail = error.to_string();
+                    let retained = self.terminate_or_retain(&process).await;
+                    adapter.clear_launch_state(Some(&endpoint)).await;
+                    self.fail_loading(generation, detail.clone(), retained.as_ref())
+                        .await;
+                    return Err(RuntimeError::StartupFailed(detail));
+                }
+            };
+            if let Err(error) = self
+                .wait_for_readiness(adapter.as_ref(), &process, &mut exit)
+                .await
+            {
+                cleanup_pending_launch_files(&launch_attempts).await;
+                let detail = error.to_string();
+                let retained = self.terminate_or_retain(&process).await;
+                adapter.clear_launch_state(Some(&endpoint)).await;
+                self.fail_loading(generation, detail.clone(), retained.as_ref())
+                    .await;
+                return Err(error);
+            }
+            let mut observation_poll = 0_u8;
+            let observation = loop {
+                let stderr_tail = match self.supervisor.stderr_tail(&process).await {
+                    Ok(stderr_tail) => stderr_tail,
+                    Err(error) => {
+                        break Err(EngineError::Operation(format!(
+                            "could not read bounded engine startup output: {error}"
+                        )));
+                    }
+                };
+                match adapter.startup_observation(&process, &stderr_tail).await {
+                    Ok(observation) => break Ok(observation),
+                    Err(EngineError::BackendUnavailable(_)) if observation_poll < 20 => {
+                        observation_poll += 1;
+                        if exit.borrow().is_some() {
+                            break Err(EngineError::Operation(
+                                "engine exited before startup policy observation completed"
+                                    .to_owned(),
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(error) => break Err(error),
+                }
+            };
+            let observation = match observation {
+                Ok(observation) => observation,
+                Err(error) => {
+                    cleanup_pending_launch_files(&launch_attempts).await;
                     let detail =
                         format!("engine startup did not prove the selected model policy: {error}");
                     let retained = self.terminate_or_retain(&process).await;
-                    self.fail_loading(generation, detail.clone(), retained.as_ref())
-                        .await;
-                    return Err(RuntimeError::StartupFailed(detail));
-                }
-            }
-        };
-        let effective_generation_settings =
-            match adapter.effective_generation_settings(&process).await {
-                Ok(settings) => settings,
-                Err(error) => {
-                    let detail = format!(
-                        "could not obtain effective generation settings from the engine: {error}"
-                    );
-                    let retained = self.terminate_or_retain(&process).await;
+                    adapter.clear_launch_state(Some(&endpoint)).await;
                     self.fail_loading(generation, detail.clone(), retained.as_ref())
                         .await;
                     return Err(RuntimeError::StartupFailed(detail));
                 }
             };
+            match observation {
+                StartupObservation::Ready(observation) => {
+                    let settings = match adapter.effective_generation_settings(&process).await {
+                        Ok(settings) => settings,
+                        Err(error) => {
+                            cleanup_pending_launch_files(&launch_attempts).await;
+                            let detail = format!(
+                                "could not obtain effective generation settings from the engine: {error}"
+                            );
+                            let retained = self.terminate_or_retain(&process).await;
+                            adapter.clear_launch_state(Some(&endpoint)).await;
+                            self.fail_loading(generation, detail.clone(), retained.as_ref())
+                                .await;
+                            return Err(RuntimeError::StartupFailed(detail));
+                        }
+                    };
+                    break (process, endpoint, exit, observation, settings);
+                }
+                StartupObservation::RetryContextCapacity {
+                    kv_mode,
+                    observed_context,
+                    minimum_context,
+                } => {
+                    context_attempts.push((kv_mode, observed_context));
+                    if let Err(error) = self.supervisor.terminate(&process).await {
+                        cleanup_pending_launch_files(&launch_attempts).await;
+                        let detail = format!(
+                            "could not stop the insufficient-context backend before KV fallback: {error}"
+                        );
+                        adapter.clear_launch_state(Some(&endpoint)).await;
+                        self.fail_loading(generation, detail.clone(), Some(&process))
+                            .await;
+                        return Err(RuntimeError::StartupFailed(detail));
+                    }
+                    adapter.clear_launch_state(Some(&endpoint)).await;
+                    self.state.write().await.loading_process = None;
+                    if launch_attempts.is_empty() {
+                        let attempts = context_attempts
+                            .iter()
+                            .map(|(mode, context)| format!("{mode}={context}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let detail = format!(
+                            "no exact-runtime-supported package KV mode met the {minimum_context}-token minimum; attempted modes and observed contexts: {attempts}"
+                        );
+                        self.fail_loading(generation, detail.clone(), None).await;
+                        return Err(RuntimeError::StartupFailed(detail));
+                    }
+                }
+            }
+        };
+
+        if let (Some(mode), Some(context)) = (
+            startup_observation
+                .get("observed_kv_mode")
+                .and_then(serde_json::Value::as_str),
+            startup_observation
+                .get("observed_served_context")
+                .and_then(serde_json::Value::as_u64),
+        ) {
+            let mode = mode.to_owned();
+            context_attempts.push((mode.clone(), context));
+            startup_observation.insert(
+                "package_kv_attempts".to_owned(),
+                serde_json::Value::Array(
+                    context_attempts
+                        .iter()
+                        .map(|(mode, context)| {
+                            serde_json::json!({
+                                "kv_mode": mode,
+                                "observed_context": context,
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+            startup_observation
+                .insert("final_selected_kv_mode".to_owned(), serde_json::json!(mode));
+            startup_observation.insert(
+                "final_proven_served_context".to_owned(),
+                serde_json::json!(context),
+            );
+        }
 
         {
             let mut state = self.state.write().await;
@@ -683,6 +793,9 @@ impl RuntimeManager {
                 .to_owned();
                 drop(state);
                 let retained = self.terminate_or_retain(&process).await;
+                adapter
+                    .clear_launch_state(process.endpoint.as_deref())
+                    .await;
                 self.fail_loading(generation, detail.clone(), retained.as_ref())
                     .await;
                 return Err(RuntimeError::Operation(detail));
@@ -752,7 +865,7 @@ impl RuntimeManager {
 
     async fn unload_inner(&self) -> Result<ControlStatus, RuntimeError> {
         let _operation = self.operation.lock().await;
-        let process = {
+        let (process, adapter) = {
             let mut state = self.state.write().await;
             match state.lifecycle {
                 BackendLifecycle::Stopped => {
@@ -769,17 +882,35 @@ impl RuntimeManager {
                         RuntimeNoticeLevel::Info,
                         "Stopping the active backend".to_owned(),
                     );
-                    state.active.as_ref().map(|active| active.process.clone())
+                    (
+                        state.active.as_ref().map(|active| active.process.clone()),
+                        state
+                            .active
+                            .as_ref()
+                            .map(|active| Arc::clone(&active.adapter)),
+                    )
                 }
-                BackendLifecycle::Failed => state
-                    .active
-                    .as_ref()
-                    .map(|active| active.process.clone())
-                    .or_else(|| state.loading_process.clone()),
+                BackendLifecycle::Failed => (
+                    state
+                        .active
+                        .as_ref()
+                        .map(|active| active.process.clone())
+                        .or_else(|| state.loading_process.clone()),
+                    state
+                        .active
+                        .as_ref()
+                        .map(|active| Arc::clone(&active.adapter))
+                        .or_else(|| {
+                            state
+                                .engine_id
+                                .as_deref()
+                                .and_then(|engine_id| self.registry.get(engine_id))
+                        }),
+                ),
             }
         };
-        if let Some(process) = process
-            && let Err(error) = self.supervisor.terminate(&process).await
+        if let Some(process) = process.as_ref()
+            && let Err(error) = self.supervisor.terminate(process).await
         {
             let mut state = self.state.write().await;
             state.lifecycle = BackendLifecycle::Failed;
@@ -790,6 +921,15 @@ impl RuntimeManager {
                 format!("Backend termination failed: {error}"),
             );
             return Err(RuntimeError::Operation(error.to_string()));
+        }
+        if let Some(adapter) = adapter {
+            adapter
+                .clear_launch_state(
+                    process
+                        .as_ref()
+                        .and_then(|process| process.endpoint.as_deref()),
+                )
+                .await;
         }
         let mut state = self.state.write().await;
         state.lifecycle = BackendLifecycle::Stopped;
@@ -873,7 +1013,7 @@ impl RuntimeManager {
     }
 
     async fn cancel_loading(&self) {
-        let process = {
+        let (process, adapter) = {
             let mut state = self.state.write().await;
             if state.lifecycle != BackendLifecycle::Loading {
                 return;
@@ -885,16 +1025,31 @@ impl RuntimeManager {
                 RuntimeNoticeLevel::Info,
                 "Cancelling the model load".to_owned(),
             );
-            state.loading_process.clone()
+            (
+                state.loading_process.clone(),
+                state
+                    .engine_id
+                    .as_deref()
+                    .and_then(|engine_id| self.registry.get(engine_id)),
+            )
         };
-        if let Some(process) = process
-            && let Err(error) = self.supervisor.terminate(&process).await
+        if let Some(process) = process.as_ref()
+            && let Err(error) = self.supervisor.terminate(process).await
         {
             tracing::warn!(
                 process_id = process.process_id,
                 %error,
                 "could not terminate a loading backend immediately"
             );
+        }
+        if let Some(adapter) = adapter {
+            adapter
+                .clear_launch_state(
+                    process
+                        .as_ref()
+                        .and_then(|process| process.endpoint.as_deref()),
+                )
+                .await;
         }
     }
 
@@ -1060,6 +1215,10 @@ impl RuntimeManager {
             return;
         }
         let detail = exit_detail(&exit);
+        let adapter = state
+            .active
+            .as_ref()
+            .map(|active| Arc::clone(&active.adapter));
         state.lifecycle = BackendLifecycle::Failed;
         state.failure = Some(detail.clone());
         state.active = None;
@@ -1069,6 +1228,12 @@ impl RuntimeManager {
             RuntimeNoticeLevel::Error,
             format!("Backend exited unexpectedly: {detail}"),
         );
+        drop(state);
+        if let Some(adapter) = adapter {
+            adapter
+                .clear_launch_state(process.endpoint.as_deref())
+                .await;
+        }
     }
 
     fn status_from_state(&self, state: &ManagerState) -> ControlStatus {
@@ -1141,6 +1306,12 @@ async fn cleanup_temporary_launch_files(paths: &[std::path::PathBuf]) {
         {
             tracing::warn!(path = %path.display(), %error, "could not remove temporary engine launch file");
         }
+    }
+}
+
+async fn cleanup_pending_launch_files(attempts: &VecDeque<crate::LaunchSpec>) {
+    for attempt in attempts {
+        cleanup_temporary_launch_files(&attempt.temporary_files).await;
     }
 }
 
