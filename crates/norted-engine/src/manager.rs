@@ -405,7 +405,7 @@ impl RuntimeManager {
                 return Err(RuntimeError::Operation(error.to_string()));
             }
         };
-        let resolved_load_settings = match profile_state.resolve(
+        let mut resolved_load_settings = match profile_state.resolve(
             &model_id,
             &engine_id,
             profile.as_ref(),
@@ -418,6 +418,12 @@ impl RuntimeManager {
                 return Err(RuntimeError::Operation(error.to_string()));
             }
         };
+        if let Err(error) =
+            norted_core::apply_norted_package_load_policy(&model, &mut resolved_load_settings)
+        {
+            self.fail_loading(generation, error.clone(), None).await;
+            return Err(RuntimeError::Operation(error));
+        }
         let host = self.packs.host_capabilities().await;
         let load_settings_schema = match adapter
             .load_settings_schema(&selection.runtime, &model, &host)
@@ -502,9 +508,15 @@ impl RuntimeManager {
         let installation = launch_spec.installation.clone();
         let selected_runtime = launch_spec.runtime.clone();
         let selected_accelerator = launch_spec.accelerator.clone();
-        let model_identity = launch_spec.model.runtime_identity();
+        let mut model_identity = launch_spec.model.runtime_identity();
         let normalized_settings = launch_spec.normalized_settings.clone();
         let load_settings = launch_spec.load_settings.clone();
+        if let Some(package) = &mut model_identity.norted_package
+            && let Some(norted_core::LoadSettingValue::Choice(profile)) =
+                load_settings.value("ninfer.package_profile")
+        {
+            package.selected_package_profile = Some(profile.clone());
+        }
         let native_arguments = launch_spec.native_arguments.clone();
         let inherits_parent_environment = launch_spec.inherits_parent_environment;
         let native_environment = environment_provenance(

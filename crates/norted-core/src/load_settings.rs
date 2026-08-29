@@ -731,6 +731,7 @@ pub enum LoadSettingSource {
     ModelDefault { model_id: ModelId },
     NamedProfile { profile: LoadProfileName },
     Invocation,
+    NortedPackagePolicy { policy_id: String },
 }
 
 impl std::fmt::Display for LoadSettingSource {
@@ -741,6 +742,9 @@ impl std::fmt::Display for LoadSettingSource {
             Self::ModelDefault { model_id } => write!(formatter, "model-default:{model_id}"),
             Self::NamedProfile { profile } => write!(formatter, "profile:{profile}"),
             Self::Invocation => formatter.write_str("invocation"),
+            Self::NortedPackagePolicy { policy_id } => {
+                write!(formatter, "norted-package-policy:{policy_id}")
+            }
         }
     }
 }

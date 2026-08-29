@@ -316,6 +316,30 @@ fn render_models(
                 Span::styled(format_bytes(model.size_bytes), theme.muted),
                 Span::styled(format!("  {}", model.path.display()), theme.hint),
             ]),
+            Line::from(model.norted_package.as_ref().map_or_else(
+                || Span::styled("Package: Raw", theme.muted),
+                |package| {
+                    let status = match &package.status {
+                        norted_core::NortedPackageStatus::Valid => "valid",
+                        norted_core::NortedPackageStatus::NeedsRuntimeCapability { .. } => {
+                            "needs runtime capability"
+                        }
+                    };
+                    Span::styled(
+                        format!(
+                            "Package: {}  {status}  schema {}  profile {}",
+                            package.kind,
+                            package.manifest_version,
+                            package
+                                .runtime_policy_profile
+                                .as_deref()
+                                .or(package.runtime_policy_id.as_deref())
+                                .unwrap_or("n/a")
+                        ),
+                        theme.hint,
+                    )
+                },
+            )),
         ])
         .style(style)
     });

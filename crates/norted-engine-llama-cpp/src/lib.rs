@@ -25,8 +25,10 @@ use norted_engine::{
     EngineCapabilities, EngineError, EngineFeature, EngineIdentity, EngineProbe,
     GenerationSettingsPatch, InferenceEvent, InferenceFinishReason, InferenceMessage,
     InferenceOutput, InferenceRequest, InferenceRole, InferenceStream, InferenceUsage,
-    InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind, ProcessDescriptor,
-    UpdateState, capture_command, common_load_setting_definitions,
+    InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind,
+    PreparedModelInput, ProcessDescriptor, UpdateState, capture_command,
+    common_load_setting_definitions, prepare_norted_package_input,
+    revalidate_norted_package_before_launch,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -499,6 +501,13 @@ impl EngineAdapter for LlamaCppAdapter {
         }]
     }
 
+    async fn prepare_model_input(
+        &self,
+        model: &ModelArtifact,
+    ) -> Result<PreparedModelInput, EngineError> {
+        prepare_norted_package_input(model).await
+    }
+
     fn load_setting_definitions(&self) -> Vec<LoadSettingDefinition> {
         llama_load_setting_definitions()
     }
@@ -738,6 +747,7 @@ impl EngineAdapter for LlamaCppAdapter {
             .load_settings_schema
             .validate(&request.load_settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
+        revalidate_norted_package_before_launch(&request.model).await?;
         let structured = translate_llama_load_settings(
             &request.load_settings,
             &self.native_arguments,

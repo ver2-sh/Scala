@@ -14,6 +14,16 @@ generation settings = request-time sampling/output behavior
 
 A GGUF model is not permanently tied to llama.cpp, a Q27 model is not permanently tied to q27, and a NInfer container is not the NInfer executable itself. Selection happens among all installed runtimes whose registered engine can actually use the artifact. Today Norted ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp), [q27](https://github.com/signalnine/q27), and [NInfer](https://github.com/Neroued/ninfer).
 
+## Norted Builder packages
+
+Model paths are served in place. When a configured search directory contains a Norted Builder `BUILD-MANIFEST.json`, `q27/Q27-MANIFEST.json`, or `ninfer/NINFER-MANIFEST.json`, discovery binds the declared primary artifacts to their exact tokenizer, projector, Sharp template, runtime policy, hashes, and canonical lineage. It does not copy, move, hardlink, or symlink those files into the Server data directory. `mmproj-F16.gguf` is retained as a projector auxiliary and is not listed as a language model.
+
+Claimed package directories fail closed: an unsupported schema, malformed or oversized JSON, unsafe relative path, symlink escape, missing file, size mismatch, sidecar hash mismatch, duplicate binding, lineage mismatch, or NInfer native-identity mismatch rejects the claimed artifacts instead of reverting to raw serving. Standalone GGUF, q27 plus tokenizer, and NInfer v2 files in directories without the corresponding Norted manifest keep the existing raw-artifact behavior.
+
+Discovery parses at most 16 MiB per manifest/runtime-policy JSON, validates recorded primary sizes, hashes bounded sidecars, and retains the expected primary digest. The multi-gigabyte primary artifact is hashed only during explicit preparation, then its path, size, timestamp, and prepared digest are rechecked before launch; sidecars are hashed again immediately before launch. Runtime provenance retains the typed package binding and package-derived load-setting source separately from persistent profiles.
+
+The current q27 and NInfer runtime contracts can load their raw containers but do not expose a proven mechanism for applying the exact external Sharp template before tokenization. For official q27 v0.6.2 runtimes, the immutable build contract proves numeric compiled `W_MAX` values 8, 12, and 16 from the selected W8/W12/W16 variant; external and unknown future runtimes remain unproven. The current q27 contract still provides no per-GPU/KV startup proof of at least 200,000 served tokens, and the current NInfer `server_start` record does not prove that capacity. Those Builder quality packages are therefore discovered normally but marked as requiring runtime capability and rejected for launch by current runtimes; Norted does not claim Dirk equivalence or silently weaken the package policy. Raw artifacts retain their prior launch semantics.
+
 ## Load settings and profiles
 
 Load settings are typed, stable Norted IDs. Common settings such as `context_length` and `parallel_requests` are engine-neutral; adapter-owned settings use namespaces such as `llama.cpp.kv_cache_k` and `q27.kv_fp16`. Raw upstream flag spellings remain adapter details. Load profiles never contain a runtime ID or request-time generation controls such as temperature and `top_p`.

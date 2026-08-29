@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -7,6 +7,8 @@ use std::time::UNIX_EPOCH;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
+
+use crate::norted_package::{PackageDirectory, discover_package_directory};
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -104,6 +106,8 @@ pub struct ModelArtifact {
     pub native_identity: Option<ArtifactNativeIdentity>,
     #[serde(default)]
     pub auxiliary_artifacts: Vec<AuxiliaryArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub norted_package: Option<crate::NortedPackageBinding>,
 }
 
 impl std::fmt::Display for ArtifactFormat {
@@ -130,7 +134,11 @@ impl std::str::FromStr for ArtifactFormat {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "role", content = "name")]
 pub enum AuxiliaryArtifactRole {
+    Manifest,
     Tokenizer,
+    Projector,
+    Sharp,
+    RuntimePolicy,
     Other(String),
 }
 
@@ -152,6 +160,7 @@ impl ModelRegistry {
     pub fn discover(search_paths: &[PathBuf]) -> Self {
         let mut registry = Self::default();
         let mut seen = HashSet::new();
+        let mut package_directories = HashMap::new();
         for root in search_paths {
             if !root.exists() {
                 registry
@@ -188,9 +197,46 @@ impl ModelRegistry {
                 if !seen.insert(identity.clone()) {
                     continue;
                 }
+                let package = canonical_path.parent().and_then(|parent| {
+                    package_directories
+                        .entry((parent.to_path_buf(), format))
+                        .or_insert_with(|| discover_package_directory(parent, format))
+                        .clone()
+                });
+                let package_member = match package {
+                    Some(PackageDirectory::Valid {
+                        members: _,
+                        ref suppressed,
+                    }) if suppressed.contains(&canonical_path) => continue,
+                    Some(PackageDirectory::Valid { ref members, .. }) => {
+                        match members.get(&canonical_path) {
+                            Some(member) => Some(member.clone()),
+                            None => {
+                                registry.warnings.push(format!(
+                                    "artifact {} was rejected because the Norted manifest in its directory does not bind it",
+                                    canonical_path.display()
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                    Some(PackageDirectory::Invalid(reason)) => {
+                        registry.warnings.push(format!(
+                            "artifact {} was rejected because its claimed Norted package is invalid: {reason}",
+                            canonical_path.display()
+                        ));
+                        continue;
+                    }
+                    None => None,
+                };
                 match entry.metadata() {
                     Ok(metadata) => {
-                        let native_identity = if format == ArtifactFormat::Ninfer {
+                        let native_identity = if let Some(identity) = package_member
+                            .as_ref()
+                            .and_then(|member| member.native_identity.clone())
+                        {
+                            Some(identity)
+                        } else if format == ArtifactFormat::Ninfer {
                             match inspect_ninfer_container(&canonical_path) {
                                 Ok(metadata) => {
                                     Some(ArtifactNativeIdentity::Ninfer(metadata.identity))
@@ -206,11 +252,16 @@ impl ModelRegistry {
                         } else {
                             None
                         };
-                        let auxiliary_artifacts = discover_auxiliary_artifacts(
-                            &canonical_path,
-                            format,
-                            &mut registry.warnings,
-                        );
+                        let auxiliary_artifacts = package_member
+                            .as_ref()
+                            .map(|member| member.auxiliary.clone())
+                            .unwrap_or_else(|| {
+                                discover_auxiliary_artifacts(
+                                    &canonical_path,
+                                    format,
+                                    &mut registry.warnings,
+                                )
+                            });
                         registry.artifacts.push(ModelArtifact {
                             id: model_id(path, format, &identity, None),
                             display_name: path
@@ -228,6 +279,7 @@ impl ModelRegistry {
                             provenance: None,
                             native_identity,
                             auxiliary_artifacts,
+                            norted_package: package_member.map(|member| member.binding),
                         });
                     }
                     Err(error) => registry
@@ -548,7 +600,7 @@ fn q27_tokenizer_candidate(primary: &Path, warnings: &mut Vec<String>) -> Option
     }
 }
 
-fn validate_q27_tokenizer_header(path: &Path) -> Result<(), String> {
+pub(crate) fn validate_q27_tokenizer_header(path: &Path) -> Result<(), String> {
     let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let mut header = [0_u8; 8];
     file.read_exact(&mut header)
@@ -638,9 +690,15 @@ fn artifact_timestamp(metadata: &Metadata) -> i64 {
 mod tests {
     use std::io::Write;
 
+    use sha2::{Digest, Sha256};
+
     use super::{
         ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifactRole, ModelRegistry,
         NinferContainerError, inspect_ninfer_container,
+    };
+    use crate::{
+        LoadSettingId, LoadSettingSource, LoadSettingValue, ResolvedLoadSetting,
+        ResolvedLoadSettings, apply_norted_package_load_policy,
     };
 
     #[test]
@@ -670,6 +728,256 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).expect("remove model fixture directory");
+    }
+
+    #[test]
+    fn q27_package_is_manifest_bound_and_broken_claims_fail_closed() {
+        let temporary = tempfile::tempdir().expect("q27 package fixture");
+        let root = temporary.path();
+        std::fs::write(root.join("model-Q6.q27"), b"q27-primary").expect("primary");
+        let tokenizer = [b"Q27T".as_slice(), &1_u32.to_le_bytes()].concat();
+        std::fs::write(root.join("model.tok"), &tokenizer).expect("tokenizer");
+        std::fs::write(root.join("Sharp.jinja"), b"sharp").expect("Sharp");
+        let runtime = q27_runtime_policy();
+        let runtime_bytes = serde_json::to_vec(&runtime).expect("runtime JSON");
+        std::fs::write(root.join("q27-runtime.json"), &runtime_bytes).expect("runtime policy");
+        let lineage = sha(b"{}");
+        let manifest = serde_json::json!({
+            "schema": 3,
+            "source_lineage": {"key": lineage},
+            "sharp": {"filename":"Sharp.jinja","template_sha256":sha(b"sharp"),"resolved_commit":"2".repeat(40),"version":"1"},
+            "tokenizer": {"filename":"model.tok","size":tokenizer.len(),"sha256":sha(&tokenizer)},
+            "runtime_policy": {"filename":"q27-runtime.json","sha256":sha(&runtime_bytes)},
+            "outputs": {"q6": {"filename":"model-Q6.q27","size":11,"sha256":sha(b"q27-primary"),"source_lineage":{"key":lineage},"tokenizer_sha256":sha(&tokenizer)}}
+        });
+        std::fs::write(
+            root.join("Q27-MANIFEST.json"),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("manifest");
+
+        let registry = ModelRegistry::discover(&[root.to_path_buf()]);
+        assert_eq!(registry.artifacts().len(), 1, "{:?}", registry.warnings());
+        let artifact = &registry.artifacts()[0];
+        let package = artifact.norted_package.as_ref().expect("package binding");
+        assert_eq!(package.output_key, "q6");
+        assert_eq!(
+            artifact.auxiliary_artifacts[0].path,
+            root.join("model.tok").canonicalize().unwrap()
+        );
+        let mut settings = ResolvedLoadSettings {
+            engine_id: "q27".to_owned(),
+            ..Default::default()
+        };
+        apply_norted_package_load_policy(artifact, &mut settings).expect("q27 package settings");
+        assert_eq!(
+            settings.value("context_length"),
+            Some(&LoadSettingValue::UnsignedInteger(262144))
+        );
+        assert_eq!(
+            settings.value("q27.fast_head"),
+            Some(&LoadSettingValue::Toggle(false))
+        );
+        assert!(matches!(
+            settings.effective.values().next().unwrap().source,
+            LoadSettingSource::NortedPackagePolicy { .. }
+        ));
+
+        std::fs::write(root.join("q27-runtime.json"), b"{}").expect("break runtime policy");
+        let rejected = ModelRegistry::discover(&[root.to_path_buf()]);
+        assert!(rejected.artifacts().is_empty());
+        assert!(
+            rejected
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("SHA256 mismatch"))
+        );
+
+        std::fs::write(root.join("q27-runtime.json"), &runtime_bytes)
+            .expect("restore runtime policy");
+        std::fs::write(root.join("Sharp.jinja"), b"changed").expect("break Sharp");
+        let rejected = ModelRegistry::discover(&[root.to_path_buf()]);
+        assert!(rejected.artifacts().is_empty());
+        assert!(
+            rejected
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("claimed Norted package is invalid"))
+        );
+    }
+
+    #[test]
+    fn build_manifest_suppresses_projector_and_raw_artifacts_remain_supported() {
+        let temporary = tempfile::tempdir().expect("GGUF package fixture");
+        let root = temporary.path();
+        std::fs::write(root.join("model.gguf"), b"model").expect("model");
+        std::fs::write(root.join("mmproj-F16.gguf"), b"projector").expect("projector");
+        let manifest = serde_json::json!({
+            "schema":3,"build_key":"3".repeat(64),"outputs":{
+                "model.gguf":{"filename":"model.gguf","size":5,"sha256":sha(b"model"),"quant":"UD-Q6_K_XL"},
+                "mmproj-F16.gguf":{"filename":"mmproj-F16.gguf","size":9,"sha256":sha(b"projector"),"quant":"high-precision vision projector","format":"high-precision-projector","projector_key":"4".repeat(64)}
+            }
+        });
+        std::fs::write(
+            root.join("BUILD-MANIFEST.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let registry = ModelRegistry::discover(&[root.to_path_buf()]);
+        assert_eq!(registry.artifacts().len(), 1, "{:?}", registry.warnings());
+        assert_eq!(
+            registry.artifacts()[0].auxiliary_artifacts[0].role,
+            AuxiliaryArtifactRole::Projector
+        );
+
+        let raw_root = tempfile::tempdir().expect("raw fixture");
+        std::fs::write(raw_root.path().join("standalone.gguf"), b"raw").unwrap();
+        let raw = ModelRegistry::discover(&[raw_root.path().to_path_buf()]);
+        assert_eq!(raw.artifacts().len(), 1);
+        assert!(raw.artifacts()[0].norted_package.is_none());
+    }
+
+    #[test]
+    fn ninfer_package_binds_native_identity_policy_and_sharp() {
+        let temporary = tempfile::tempdir().expect("NInfer package fixture");
+        let root = temporary.path();
+        let primary = root.join("groupwise.ninfer");
+        write_ninfer_fixture(
+            &primary,
+            &serde_json::json!({
+                "identity":{"model_id":"qwen3.8-27b","weights_id":"groupwise-int"},
+                "objects":[{"name":"resource","kind":"resource","encoding":"raw-bytes-v1","offset":0,"bytes":1}]
+            }),
+            1,
+        );
+        std::fs::write(root.join("Sharp.jinja"), b"sharp").unwrap();
+        let policy = ninfer_runtime_policy();
+        let policy_bytes = serde_json::to_vec(&policy).unwrap();
+        std::fs::write(root.join("ninfer-runtime.json"), &policy_bytes).unwrap();
+        let size = primary.metadata().unwrap().len();
+        let manifest = serde_json::json!({
+            "schema":"norted.ninfer-manifest","schema_version":3,
+            "canonical_source_lineage_key":sha(b"{}"),
+            "outputs":{"groupwise-int":{"artifact":{"filename":"groupwise.ninfer","model_id":"qwen3.8-27b","weights_id":"groupwise-int","container_version":2,"size":size,"sha256":"6".repeat(64)},"source_lineage":{"key":sha(b"{}")} }},
+            "sharp":{"filename":"Sharp.jinja","revision":"7".repeat(40),"version":"1","size":5,"sha256":sha(b"sharp"),"required_for_dirk_equivalence":true},
+            "runtime_policy":{"filename":"ninfer-runtime.json","sha256":sha(&policy_bytes),"policy_id":policy["policy_id"],"weights_reconverted_for_policy":false}
+        });
+        std::fs::write(
+            root.join("NINFER-MANIFEST.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let registry = ModelRegistry::discover(&[root.to_path_buf()]);
+        assert_eq!(registry.artifacts().len(), 1, "{:?}", registry.warnings());
+        let artifact = &registry.artifacts()[0];
+        assert!(
+            matches!(&artifact.native_identity, Some(ArtifactNativeIdentity::Ninfer(identity)) if identity.model_id == "qwen3.8-27b" && identity.weights_id == "groupwise-int")
+        );
+        assert_eq!(artifact.auxiliary_artifacts.len(), 3);
+        let mut dflash = ResolvedLoadSettings {
+            engine_id: "ninfer".to_owned(),
+            ..Default::default()
+        };
+        dflash.effective.insert(
+            LoadSettingId::new("ninfer.speculative_backend").unwrap(),
+            ResolvedLoadSetting {
+                value: LoadSettingValue::Choice("dflash".to_owned()),
+                source: LoadSettingSource::Invocation,
+            },
+        );
+        assert!(apply_norted_package_load_policy(artifact, &mut dflash).is_err());
+        let profile_id = LoadSettingId::new("ninfer.package_profile").unwrap();
+        let mut settings = ResolvedLoadSettings {
+            engine_id: "ninfer".to_owned(),
+            ..Default::default()
+        };
+        settings.effective.insert(
+            profile_id,
+            ResolvedLoadSetting {
+                value: LoadSettingValue::Choice("mtp3".to_owned()),
+                source: LoadSettingSource::Invocation,
+            },
+        );
+        apply_norted_package_load_policy(artifact, &mut settings).expect("NInfer package settings");
+        assert_eq!(
+            settings.value("ninfer.speculative_backend"),
+            Some(&LoadSettingValue::Choice("mtp".to_owned()))
+        );
+        assert_eq!(
+            settings.value("ninfer.draft_tokens"),
+            Some(&LoadSettingValue::UnsignedInteger(3))
+        );
+        assert_eq!(
+            settings.value("ninfer.lm_head_draft"),
+            Some(&LoadSettingValue::FlagEnabled)
+        );
+        assert_eq!(
+            settings.value("ninfer.kv_dtype"),
+            Some(&LoadSettingValue::Choice("int8".to_owned()))
+        );
+        settings
+            .effective
+            .get_mut(&LoadSettingId::new("ninfer.package_profile").unwrap())
+            .unwrap()
+            .value = LoadSettingValue::Choice("mtp0".to_owned());
+        apply_norted_package_load_policy(artifact, &mut settings).expect("NInfer mtp0 settings");
+        assert!(settings.value("ninfer.speculative_backend").is_none());
+        assert!(settings.value("ninfer.draft_tokens").is_none());
+        assert!(settings.value("ninfer.lm_head_draft").is_none());
+
+        let mut wrong = manifest;
+        wrong["outputs"]["groupwise-int"]["artifact"]["weights_id"] = serde_json::json!("nvfp4");
+        std::fs::write(
+            root.join("NINFER-MANIFEST.json"),
+            serde_json::to_vec(&wrong).unwrap(),
+        )
+        .unwrap();
+        let rejected = ModelRegistry::discover(&[root.to_path_buf()]);
+        assert!(rejected.artifacts().is_empty());
+    }
+
+    #[test]
+    fn claimed_package_rejects_unsupported_schema_and_path_escape() {
+        let temporary = tempfile::tempdir().expect("unsafe package fixture");
+        let root = temporary.path().join("package");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("model.q27"), b"primary").unwrap();
+        std::fs::write(root.join("Q27-MANIFEST.json"), br#"{"schema":99}"#).unwrap();
+        let unsupported = ModelRegistry::discover(&[root.clone()]);
+        assert!(unsupported.artifacts().is_empty());
+        assert!(
+            unsupported
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("claimed Norted package is invalid"))
+        );
+
+        let escaped = temporary.path().join("outside.tok");
+        std::fs::write(
+            &escaped,
+            [b"Q27T".as_slice(), &1_u32.to_le_bytes()].concat(),
+        )
+        .unwrap();
+        let manifest = serde_json::json!({
+            "schema":3,"source_lineage":{"key":sha(b"{}")},
+            "sharp":{"filename":"../outside.tok","template_sha256":sha(&std::fs::read(&escaped).unwrap()),"resolved_commit":"2".repeat(40),"version":"1"},
+            "tokenizer":{"filename":"../outside.tok","size":8,"sha256":sha(&std::fs::read(&escaped).unwrap())},
+            "runtime_policy":{"filename":"../outside.tok","sha256":sha(&std::fs::read(&escaped).unwrap())},
+            "outputs":{}
+        });
+        std::fs::write(
+            root.join("Q27-MANIFEST.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let traversal = ModelRegistry::discover(&[root]);
+        assert!(traversal.artifacts().is_empty());
+        assert!(
+            traversal
+                .warnings()
+                .iter()
+                .any(|warning| warning.contains("unsafe package-relative path"))
+        );
     }
 
     #[test]
@@ -792,5 +1100,40 @@ mod tests {
         let payload_offset = metadata_end.div_ceil(4096) * 4096;
         file.set_len(payload_offset + payload)
             .expect("size sparse NInfer payload");
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn q27_runtime_policy() -> serde_json::Value {
+        serde_json::json!({
+            "schema":3,"profile":"norted-dirk-quality-reference","targets":["q6"],
+            "sharp":{"required":true,"sha256":sha(b"sharp"),"application":"runtime-render-before-tokenization"},
+            "reasoning":{"thinking_enabled":true,"default_effort":"medium","thinking_budget":{"policy":"unlimited"}},
+            "sampling":{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.05},
+            "mtp":{"enabled":true,"required":true,"runtime_depth_policy":"adaptive","adaptive":{"maximum_depth":"auto7","confidence_gate":{"enabled":true,"minimum_probability":0.5},"suffix_drafting":true,"suffix_width":{"policy":"runtime-compiled-maximum"}}},
+            "quality":{"fast_head_default":false,"fast_head_allowed_only_by_explicit_override":true},
+            "context":{"minimum_required_served_tokens":200000,"preferred_served_tokens":262144,"artifact_alone_proves_served_context":false,"kv_cache_resolution":{"quality_order":["fp8","turbo5k","turbo3"]}},
+            "vision":{"supported":false}
+        })
+    }
+
+    fn ninfer_runtime_policy() -> serde_json::Value {
+        let mut policy = serde_json::json!({
+            "schema":"norted.ninfer-runtime","schema_version":2,
+            "artifact_identities":[{"model_id":"qwen3.8-27b","weights_id":"groupwise-int"}],
+            "benchmark_profiles":{
+                "mtp0":{"speculative_decoding":false,"cli":[]},
+                "mtp3":{"speculative_decoding":true,"backend":"mtp","draft_tokens":3,"optimized_proposal_head":true,"cli":["--spec","mtp","--draft-tokens","3","--lm-head-draft"]}
+            },
+            "serving":{"thinking_enabled":true,"cuda_graph_decode":true,"compatible_prefix_reuse":true,"vision_loaded":false,"kv_preference":"int8"},
+            "context":{"hard_minimum_served_tokens":200000,"artifact_size_is_capacity_evidence":false},
+            "sampler":{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.05},
+            "sharp":{"required_for_dirk_equivalence":true,"sha256":sha(b"sharp"),"application":"runtime-sidecar"}
+        });
+        let policy_id = sha(&serde_json::to_vec(&policy).unwrap());
+        policy["policy_id"] = serde_json::json!(policy_id);
+        policy
     }
 }

@@ -19,7 +19,7 @@ use norted_engine::{
     GenerationSettingsPatch, InferenceOutput, InferenceRequest, InferenceStream, InstallationState,
     LaunchRequest, LaunchSpec, NativeOption, OptionValueKind, PreparedModelInput,
     ProcessDescriptor, UpdateState, capture_command, compatibility_for, isolated_cuda_environment,
-    visible_nvidia_devices,
+    prepare_norted_package_input, revalidate_norted_package_before_launch, visible_nvidia_devices,
 };
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -470,6 +470,12 @@ impl EngineAdapter for NinferAdapter {
         if let CompatibilityDecision::Unsupported { reason } = self.runtime_compatibility(runtime) {
             return RuntimeCompatibility::Incompatible(reason);
         }
+        if model.norted_package.is_some() {
+            return RuntimeCompatibility::Incompatible(
+                "this NInfer runtime can load the native container but does not expose a proven external Sharp template path or a server_start capacity observation proving >=200000 served tokens for the Norted Dirk package"
+                    .to_owned(),
+            );
+        }
         let native = native_compatibility(
             &runtime.manifest.supported_native_identities,
             model
@@ -501,6 +507,12 @@ impl EngineAdapter for NinferAdapter {
             self.available_runtime_compatibility(runtime)
         {
             return RuntimeCompatibility::Incompatible(reason);
+        }
+        if model.norted_package.is_some() {
+            return RuntimeCompatibility::Incompatible(
+                "catalog NInfer runtime metadata does not prove Sharp application or >=200000 served tokens for the Norted Dirk package"
+                    .to_owned(),
+            );
         }
         let native = native_compatibility(
             &runtime.supported_native_identities,
@@ -565,13 +577,20 @@ impl EngineAdapter for NinferAdapter {
                 "NInfer artifact native identity changed after discovery".to_owned(),
             ));
         }
-        let mut primary = model.clone();
-        primary.path = canonical;
-        primary.native_identity = Some(observed);
-        Ok(PreparedModelInput {
-            primary,
-            auxiliary: Vec::new(),
-        })
+        if model.norted_package.is_some() {
+            let mut prepared = prepare_norted_package_input(model).await?;
+            prepared.primary.native_identity = Some(observed);
+            Ok(prepared)
+        } else {
+            let mut primary = model.clone();
+            primary.path = canonical;
+            primary.native_identity = Some(observed);
+            Ok(PreparedModelInput {
+                primary,
+                auxiliary: Vec::new(),
+                primary_file_identity: None,
+            })
+        }
     }
 
     fn native_options(&self) -> Vec<NativeOption> {
@@ -592,7 +611,7 @@ impl EngineAdapter for NinferAdapter {
     async fn load_settings_schema(
         &self,
         runtime: &InstalledRuntime,
-        _model: &ModelArtifact,
+        model: &ModelArtifact,
         _host: &HostCapabilities,
     ) -> Result<norted_core::LoadSettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
@@ -608,6 +627,16 @@ impl EngineAdapter for NinferAdapter {
         let mut definitions = settings::definitions();
         settings::apply_runtime_bounds(&mut definitions);
         for definition in &mut definitions {
+            if definition.id.as_str() == "ninfer.package_profile" {
+                if model.norted_package.is_none() {
+                    definition.supported = false;
+                    definition.unsupported_reason = Some(
+                        "benchmark profile selection is available only for a manifest-bound Norted NInfer package"
+                            .to_owned(),
+                    );
+                }
+                continue;
+            }
             let option = settings::option_for_setting(definition.id.as_str());
             if option.is_empty() || !usage_has_token(&help, option) {
                 definition.supported = false;
@@ -693,10 +722,17 @@ impl EngineAdapter for NinferAdapter {
                 "NInfer backend address must be loopback".to_owned(),
             ));
         }
+        if request.model.primary.norted_package.is_some() {
+            return Err(EngineError::InvalidConfiguration(
+                "selected NInfer runtime cannot launch the Norted Dirk package: exact Sharp application and a >=200000-token server_start capacity observation are not proven"
+                    .to_owned(),
+            ));
+        }
         request
             .load_settings_schema
             .validate(&request.load_settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
+        revalidate_norted_package_before_launch(&request.model).await?;
         let structured = settings::translate(
             &request.load_settings,
             &request.model.primary,

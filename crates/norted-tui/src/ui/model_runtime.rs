@@ -24,6 +24,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     let heading = model.map_or_else(
         || Line::from(Span::styled("Model unavailable", theme.error)),
         |model| {
+            let package = model
+                .norted_package
+                .as_ref()
+                .map_or_else(|| "Raw".to_owned(), |package| package.kind.to_string());
             Line::from(vec![
                 Span::styled("Model  ", theme.hint),
                 Span::styled(&model.display_name, theme.text),
@@ -31,6 +35,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
                     format!("  {}", model.format.as_str().to_ascii_uppercase()),
                     theme.accent,
                 ),
+                Span::styled(format!("  {package}"), theme.hint),
             ])
         },
     );

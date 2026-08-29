@@ -29,7 +29,8 @@ use norted_engine::{
     NativeOption, OptionValueKind, PreparedAuxiliaryArtifact, PreparedModelInput,
     ProcessDescriptor, RuntimeCatalogProvider, UpdateState, capture_command,
     common_load_setting_definitions, compatibility_for, compatibility_for_nvidia_device,
-    isolated_cuda_environment, visible_nvidia_devices,
+    isolated_cuda_environment, prepare_norted_package_input,
+    revalidate_norted_package_before_launch, visible_nvidia_devices,
 };
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -477,6 +478,34 @@ fn q27_runtime_preference(variant: &str, device: Option<&AcceleratorDevice>) -> 
         "w8" | "w12" => 10,
         _ => 100,
     }
+}
+
+/// The official q27 Makefile builds W8/W16 with explicit Q27_W_MAX defines
+/// and the ordinary server with engine.cuh's Q27_W_MAX=12 default. This is an
+/// exact package-identity capability, not a filename or model-name guess.
+fn q27_compiled_w_max(identity: &RuntimeIdentity, external: bool) -> Option<u64> {
+    if external
+        || identity.engine_id != ENGINE_ID
+        || identity.package.repository.as_deref() != Some(GITHUB_REPOSITORY)
+        || identity.version != "0.6.2"
+    {
+        return None;
+    }
+    match identity.variant.as_str() {
+        "w8" => Some(8),
+        "w12" => Some(12),
+        "w16" => Some(16),
+        _ => None,
+    }
+}
+
+fn q27_package_capability_failure(identity: &RuntimeIdentity, external: bool) -> String {
+    let width = q27_compiled_w_max(identity, external)
+        .map(|width| format!("compiled W_MAX={width} is proven"))
+        .unwrap_or_else(|| "numeric compiled W_MAX is not proven".to_owned());
+    format!(
+        "this q27 runtime can load the raw container, and {width}, but it does not expose a proven external Sharp template path or observed >=200000-token capacity for a selected GPU/KV mode required by the Norted Dirk quality package"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1089,6 +1118,12 @@ impl EngineAdapter for Q27Adapter {
         model: &ModelArtifact,
         host: &HostCapabilities,
     ) -> RuntimeCompatibility {
+        if model.norted_package.is_some() {
+            return RuntimeCompatibility::Incompatible(q27_package_capability_failure(
+                &runtime.manifest.identity,
+                runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
+            ));
+        }
         let facts = match inspect_q27_model(&model.path) {
             Ok(facts) => facts,
             Err(reason) => return RuntimeCompatibility::Incompatible(reason),
@@ -1132,6 +1167,12 @@ impl EngineAdapter for Q27Adapter {
     ) -> RuntimeCompatibility {
         if let CompatibilityDecision::Unsupported { reason } = self.compatibility(model) {
             return RuntimeCompatibility::Incompatible(reason);
+        }
+        if model.norted_package.is_some() {
+            return RuntimeCompatibility::Incompatible(q27_package_capability_failure(
+                &runtime.identity,
+                false,
+            ));
         }
         let facts = match inspect_q27_model(&model.path) {
             Ok(facts) => facts,
@@ -1197,6 +1238,20 @@ impl EngineAdapter for Q27Adapter {
             ));
         }
         inspect_q27_model(&model.path).map_err(EngineError::InvalidConfiguration)?;
+        if model.norted_package.is_some() {
+            let prepared = prepare_norted_package_input(model).await?;
+            let tokenizer = prepared
+                .auxiliary
+                .iter()
+                .find(|artifact| artifact.role == AuxiliaryArtifactRole::Tokenizer)
+                .ok_or_else(|| {
+                    EngineError::InvalidConfiguration(
+                        "Norted q27 package has no prepared manifest-bound tokenizer".to_owned(),
+                    )
+                })?;
+            validate_tokenizer_path(&tokenizer.path).await?;
+            return Ok(prepared);
+        }
         let mut primary = model.clone();
         primary.path = canonical_regular_file(&model.path, "q27 model").await?;
         let candidate = tokenizer_candidate(model).map_err(EngineError::InvalidConfiguration)?;
@@ -1222,6 +1277,7 @@ impl EngineAdapter for Q27Adapter {
                 size_bytes: metadata.len(),
                 content_sha256,
             }],
+            primary_file_identity: None,
         })
     }
 
@@ -1372,10 +1428,22 @@ impl EngineAdapter for Q27Adapter {
                 "q27 can only launch Q27 model artifacts".to_owned(),
             ));
         }
+        if request.model.primary.norted_package.is_some() {
+            let width = q27_compiled_w_max(
+                &request.runtime.manifest.identity,
+                request.runtime.manifest.acquisition_method
+                    == RuntimeAcquisitionMethod::ExternalBinary,
+            )
+            .map_or_else(|| "unproven".to_owned(), |width| width.to_string());
+            return Err(EngineError::InvalidConfiguration(format!(
+                "selected q27 runtime cannot launch the Norted Dirk quality package: compiled W_MAX is {width}, but exact Sharp application and >=200000-token capacity for a selected KV mode are not proven"
+            )));
+        }
         request
             .load_settings_schema
             .validate(&request.load_settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
+        revalidate_norted_package_before_launch(&request.model).await?;
         let structured = translate_q27_load_settings(
             &request.load_settings,
             &self.native_arguments,
@@ -1402,8 +1470,14 @@ impl EngineAdapter for Q27Adapter {
             ));
         }
         inspect_q27_model(&model_path).map_err(EngineError::InvalidConfiguration)?;
-        let tokenizer = match request.model.auxiliary.as_slice() {
-            [tokenizer] if tokenizer.role == AuxiliaryArtifactRole::Tokenizer => tokenizer,
+        let tokenizers = request
+            .model
+            .auxiliary
+            .iter()
+            .filter(|artifact| artifact.role == AuxiliaryArtifactRole::Tokenizer)
+            .collect::<Vec<_>>();
+        let tokenizer = match tokenizers.as_slice() {
+            [tokenizer] => *tokenizer,
             _ => {
                 return Err(EngineError::InvalidConfiguration(
                     "prepared q27 input must contain exactly one tokenizer".to_owned(),
@@ -2464,6 +2538,34 @@ mod tests {
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn official_q27_variants_have_source_proven_compiled_widths() {
+        let mut identity = RuntimeIdentity {
+            engine_id: ENGINE_ID.to_owned(),
+            package_family: PACKAGE_FAMILY.to_owned(),
+            version: "0.6.2".to_owned(),
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            accelerator: "cuda".to_owned(),
+            variant: "w8".to_owned(),
+            upstream_revision: None,
+            package: RuntimePackageIdentity {
+                provider_id: PROVIDER_ID.to_owned(),
+                repository: Some(GITHUB_REPOSITORY.to_owned()),
+                release_tag: Some("v0.6.2".to_owned()),
+                asset_id: Some("1".to_owned()),
+                asset_name: Some("q27-v0.6.2-linux-x86_64.tar.gz".to_owned()),
+                additional_assets: Vec::new(),
+            },
+        };
+        assert_eq!(q27_compiled_w_max(&identity, false), Some(8));
+        identity.variant = "w12".to_owned();
+        assert_eq!(q27_compiled_w_max(&identity, false), Some(12));
+        identity.variant = "w16".to_owned();
+        assert_eq!(q27_compiled_w_max(&identity, false), Some(16));
+        assert_eq!(q27_compiled_w_max(&identity, true), None);
     }
 
     #[test]
@@ -3569,6 +3671,7 @@ mod tests {
             provenance: None,
             native_identity: None,
             auxiliary_artifacts: Vec::<AuxiliaryArtifact>::new(),
+            norted_package: None,
         }
     }
 

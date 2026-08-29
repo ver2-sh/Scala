@@ -62,6 +62,19 @@ pub struct ModelRuntimeIdentity {
     pub native_identity: Option<ArtifactNativeIdentity>,
     #[serde(default)]
     pub auxiliary: Vec<AuxiliaryRuntimeIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub norted_package: Option<NortedPackageRuntimeIdentity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NortedPackageRuntimeIdentity {
+    pub binding: crate::NortedPackageBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharp_applied: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proven_served_context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_package_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

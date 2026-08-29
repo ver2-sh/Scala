@@ -794,6 +794,7 @@ pub struct RuntimeOperationProgress {
 pub fn is_safe_relative_path(path: &Path) -> bool {
     !path.as_os_str().is_empty()
         && !path.is_absolute()
+        && !path.to_string_lossy().contains(['\\', ':'])
         && path
             .components()
             .any(|component| matches!(component, Component::Normal(_)))

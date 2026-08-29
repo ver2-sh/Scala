@@ -6,6 +6,7 @@ mod error;
 mod event;
 mod load_settings;
 mod model;
+mod norted_package;
 mod provenance;
 mod runtime;
 mod runtime_pack;
@@ -33,10 +34,16 @@ pub use model::{
     ModelArtifact, ModelArtifactProvenance, ModelId, ModelRegistry, NinferArtifactIdentity,
     NinferContainerError, NinferContainerMetadata, inspect_ninfer_container,
 };
+pub use norted_package::{
+    NinferBenchmarkProfile, NinferPackagePolicy, NortedPackageBinding, NortedPackageFile,
+    NortedPackageKind, NortedPackagePolicy, NortedPackageStatus, Q27PackagePolicy,
+    apply_norted_package_load_policy,
+};
 pub use provenance::{
     AcquisitionMethod, AuxiliaryRuntimeIdentity, BuildProvenance, EngineInstallation,
     EngineRevision, EnvironmentVariableProvenance, LoadSettingsProvenance, ModelRuntimeIdentity,
-    NativeArgumentProvenance, ProcessIdentity, RuntimeProvenance, ToolchainProvenance,
+    NativeArgumentProvenance, NortedPackageRuntimeIdentity, ProcessIdentity, RuntimeProvenance,
+    ToolchainProvenance,
 };
 pub use runtime::{
     RuntimeDescriptor, RuntimeObservationError, RuntimePublisher, observe_runtime,

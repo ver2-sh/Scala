@@ -17,6 +17,8 @@ use norted_core::{
     RuntimeId, RuntimeProbeObservation,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 
 mod catalog;
@@ -194,6 +196,193 @@ pub struct PreparedAuxiliaryArtifact {
 pub struct PreparedModelInput {
     pub primary: ModelArtifact,
     pub auxiliary: Vec<PreparedAuxiliaryArtifact>,
+    pub primary_file_identity: Option<PreparedFileIdentity>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PreparedFileIdentity {
+    pub size_bytes: u64,
+    pub modified_unix_nanos: Option<u128>,
+    pub filesystem_device: Option<u64>,
+    pub filesystem_inode: Option<u64>,
+}
+
+/// Prepares a manifest-bound model in place. The primary artifact is hashed
+/// only at this explicit load boundary; package sidecars are hash-checked here
+/// and again immediately before launch.
+pub async fn prepare_norted_package_input(
+    model: &ModelArtifact,
+) -> Result<PreparedModelInput, EngineError> {
+    let Some(package) = &model.norted_package else {
+        return Ok(PreparedModelInput {
+            primary: model.clone(),
+            auxiliary: Vec::new(),
+            primary_file_identity: None,
+        });
+    };
+    let canonical = canonical_regular_file(&model.path, "Norted package primary artifact").await?;
+    if canonical != model.path {
+        return Err(EngineError::InvalidConfiguration(
+            "Norted package primary path changed after discovery".to_owned(),
+        ));
+    }
+    let metadata = tokio::fs::metadata(&canonical).await.map_err(package_io)?;
+    if metadata.len() != package.expected_primary_size {
+        return Err(EngineError::InvalidConfiguration(format!(
+            "Norted package primary size mismatch: expected {}, observed {}",
+            package.expected_primary_size,
+            metadata.len()
+        )));
+    }
+    let primary_sha = hash_file(&canonical).await.map_err(package_io)?;
+    if primary_sha != package.expected_primary_sha256 {
+        return Err(EngineError::InvalidConfiguration(
+            "Norted package primary artifact SHA256 differs from its manifest".to_owned(),
+        ));
+    }
+    let mut primary = model.clone();
+    primary.path = canonical;
+    primary.hash = Some(primary_sha);
+    primary.created = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(0);
+    let mut auxiliary = Vec::new();
+    for declared in &model.auxiliary_artifacts {
+        let expected = declared.hash.as_deref().ok_or_else(|| {
+            EngineError::InvalidConfiguration(format!(
+                "Norted package auxiliary {} has no manifest SHA256",
+                declared.path.display()
+            ))
+        })?;
+        let path = canonical_regular_file(&declared.path, "Norted package auxiliary").await?;
+        if path != declared.path {
+            return Err(EngineError::InvalidConfiguration(
+                "Norted package auxiliary path changed after discovery".to_owned(),
+            ));
+        }
+        let metadata = tokio::fs::metadata(&path).await.map_err(package_io)?;
+        if metadata.len() != declared.size_bytes {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "Norted package auxiliary {} changed size after discovery",
+                path.display()
+            )));
+        }
+        let observed = hash_file(&path).await.map_err(package_io)?;
+        if observed != expected {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "Norted package auxiliary {} SHA256 differs from its manifest",
+                path.display()
+            )));
+        }
+        auxiliary.push(PreparedAuxiliaryArtifact {
+            role: declared.role.clone(),
+            path,
+            size_bytes: metadata.len(),
+            content_sha256: observed,
+        });
+    }
+    Ok(PreparedModelInput {
+        primary,
+        auxiliary,
+        primary_file_identity: Some(file_identity(&metadata)),
+    })
+}
+
+pub async fn revalidate_norted_package_before_launch(
+    model: &PreparedModelInput,
+) -> Result<(), EngineError> {
+    let Some(package) = &model.primary.norted_package else {
+        return Ok(());
+    };
+    let canonical =
+        canonical_regular_file(&model.primary.path, "prepared Norted package primary").await?;
+    let metadata = tokio::fs::metadata(&canonical).await.map_err(package_io)?;
+    let observed_identity = file_identity(&metadata);
+    if canonical != model.primary.path
+        || observed_identity.size_bytes != package.expected_primary_size
+        || model.primary_file_identity.as_ref() != Some(&observed_identity)
+        || model.primary.hash.as_deref() != Some(package.expected_primary_sha256.as_str())
+    {
+        return Err(EngineError::InvalidConfiguration(
+            "Norted package primary artifact changed between preparation and launch".to_owned(),
+        ));
+    }
+    for auxiliary in &model.auxiliary {
+        let path =
+            canonical_regular_file(&auxiliary.path, "prepared Norted package auxiliary").await?;
+        let metadata = tokio::fs::metadata(&path).await.map_err(package_io)?;
+        let observed = hash_file(&path).await.map_err(package_io)?;
+        if path != auxiliary.path
+            || metadata.len() != auxiliary.size_bytes
+            || observed != auxiliary.content_sha256
+        {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "Norted package auxiliary {} changed between preparation and launch",
+                auxiliary.path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn canonical_regular_file(path: &Path, label: &str) -> Result<PathBuf, EngineError> {
+    let path = tokio::fs::canonicalize(path).await.map_err(package_io)?;
+    if !tokio::fs::metadata(&path)
+        .await
+        .map_err(package_io)?
+        .is_file()
+    {
+        return Err(EngineError::InvalidConfiguration(format!(
+            "{label} is not a regular file"
+        )));
+    }
+    Ok(path)
+}
+
+async fn hash_file(path: &Path) -> std::io::Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn package_io(error: std::io::Error) -> EngineError {
+    EngineError::InvalidConfiguration(format!("could not validate Norted package file: {error}"))
+}
+
+fn file_identity(metadata: &std::fs::Metadata) -> PreparedFileIdentity {
+    let modified_unix_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        PreparedFileIdentity {
+            size_bytes: metadata.len(),
+            modified_unix_nanos,
+            filesystem_device: Some(metadata.dev()),
+            filesystem_inode: Some(metadata.ino()),
+        }
+    }
+    #[cfg(not(unix))]
+    PreparedFileIdentity {
+        size_bytes: metadata.len(),
+        modified_unix_nanos,
+        filesystem_device: None,
+        filesystem_inode: None,
+    }
 }
 
 impl PreparedModelInput {
@@ -213,6 +402,15 @@ impl PreparedModelInput {
                     content_sha256: artifact.content_sha256.clone(),
                 })
                 .collect(),
+            norted_package: self.primary.norted_package.clone().map(|binding| {
+                let sharp_applied = binding.sharp.as_ref().map(|_| false);
+                norted_core::NortedPackageRuntimeIdentity {
+                    selected_package_profile: binding.runtime_policy_profile.clone(),
+                    binding,
+                    sharp_applied,
+                    proven_served_context_tokens: None,
+                }
+            }),
         }
     }
 }
@@ -512,6 +710,7 @@ pub trait EngineAdapter: Send + Sync {
         Ok(PreparedModelInput {
             primary: model.clone(),
             auxiliary: Vec::new(),
+            primary_file_identity: None,
         })
     }
     fn native_options(&self) -> Vec<NativeOption>;
@@ -705,17 +904,18 @@ mod tests {
     use async_trait::async_trait;
     use norted_core::{
         AppPaths, ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime, HostCapabilities,
-        ModelArtifact, ModelId, RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest,
-        RuntimeDownload, RuntimeIdentity, RuntimePackageIdentity, RuntimeReleaseChannel,
-        RuntimeRequirements,
+        ModelArtifact, ModelId, ModelRegistry, RuntimeArchiveFormat, RuntimeCompatibility,
+        RuntimeDigest, RuntimeDownload, RuntimeIdentity, RuntimePackageIdentity,
+        RuntimeReleaseChannel, RuntimeRequirements,
     };
+    use sha2::{Digest, Sha256};
 
     use super::{
         CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter, EngineCapabilities,
         EngineError, EngineIdentity, EngineProbe, EngineRegistry, GenerationSettingsPatch,
         InferenceRole, InstallationState, LaunchRequest, LaunchSpec, NativeOption,
         PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
-        RuntimePackManager, UpdateState,
+        RuntimePackManager, UpdateState, prepare_norted_package_input,
     };
 
     struct ArchitectureAdapter {
@@ -890,6 +1090,7 @@ mod tests {
             provenance: None,
             native_identity: None,
             auxiliary_artifacts: Vec::new(),
+            norted_package: None,
         };
         let compatible = registry.compatible_with(&model);
 
@@ -981,6 +1182,7 @@ mod tests {
             provenance: None,
             native_identity: None,
             auxiliary_artifacts: Vec::new(),
+            norted_package: None,
         };
 
         let capabilities = manager
@@ -1020,6 +1222,7 @@ mod tests {
             provenance: None,
             native_identity: None,
             auxiliary_artifacts: Vec::new(),
+            norted_package: None,
         };
         let identity = RuntimeIdentity {
             engine_id: "second-q27-engine".to_owned(),
@@ -1088,6 +1291,7 @@ mod tests {
                 provenance: None,
                 native_identity: None,
                 auxiliary_artifacts: Vec::new(),
+                norted_package: None,
             },
             auxiliary: vec![PreparedAuxiliaryArtifact {
                 role: AuxiliaryArtifactRole::Tokenizer,
@@ -1095,11 +1299,50 @@ mod tests {
                 size_bytes: 8,
                 content_sha256: "a".repeat(64),
             }],
+            primary_file_identity: None,
         };
         let identity = prepared.runtime_identity();
         assert_eq!(identity.auxiliary.len(), 1);
         assert_eq!(identity.auxiliary[0].role, AuxiliaryArtifactRole::Tokenizer);
         assert_eq!(identity.auxiliary[0].size_bytes, 8);
         assert_eq!(identity.auxiliary[0].content_sha256, "a".repeat(64));
+    }
+
+    #[tokio::test]
+    async fn package_preparation_hashes_primary_in_place_and_rejects_tampering() {
+        let temporary = tempfile::tempdir().expect("package preparation fixture");
+        let primary = temporary.path().join("model.gguf");
+        let bytes = b"package-primary";
+        std::fs::write(&primary, bytes).expect("primary fixture");
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let manifest = serde_json::json!({
+            "schema": 3,
+            "build_key": "a".repeat(64),
+            "outputs": {
+                "model.gguf": {
+                    "filename": "model.gguf",
+                    "size": bytes.len(),
+                    "sha256": digest,
+                    "quant": "UD-Q6_K_XL"
+                }
+            }
+        });
+        std::fs::write(
+            temporary.path().join("BUILD-MANIFEST.json"),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("manifest fixture");
+        let registry = ModelRegistry::discover(&[temporary.path().to_path_buf()]);
+        let artifact = registry.artifacts().first().expect("package artifact");
+        let prepared = prepare_norted_package_input(artifact)
+            .await
+            .expect("prepared package");
+        assert_eq!(prepared.primary.path, primary.canonicalize().unwrap());
+        assert_eq!(prepared.primary.hash.as_deref(), Some(digest.as_str()));
+        assert!(prepared.primary_file_identity.is_some());
+        assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 2);
+
+        std::fs::write(&primary, b"PACKAGE-primary").expect("tamper primary in place");
+        assert!(prepare_norted_package_input(artifact).await.is_err());
     }
 }
