@@ -161,6 +161,38 @@ pub fn model_info(capabilities: &ModelServingCapabilities, json_output: bool) ->
             println!("Native model:         {}", identity.model_id);
             println!("Native weights:       {}", identity.weights_id);
         }
+        if let Some(package) = &capabilities.package {
+            println!("Package:              {}", package.kind);
+            println!(
+                "Package manifest:     {} v{}",
+                package.manifest_schema, package.manifest_version
+            );
+            println!("Package validation:   {:?}", package.validation_status);
+            println!(
+                "Package policy:       {}",
+                package.runtime_policy.as_deref().unwrap_or("n/a")
+            );
+            println!(
+                "Sharp:                required={} validated={} application={}",
+                yes_no(package.sharp_required),
+                yes_no(package.sharp_validated),
+                package
+                    .sharp_application_capability
+                    .as_ref()
+                    .map(|state| format!("{state:?}"))
+                    .as_deref()
+                    .unwrap_or("unknown")
+            );
+            if let Some(lineage) = &package.canonical_lineage_key_short {
+                println!("Package lineage:      {lineage}");
+            }
+            if !package.ninfer_benchmark_profiles.is_empty() {
+                println!(
+                    "Package profiles:     {}",
+                    comma_list(&package.ninfer_benchmark_profiles)
+                );
+            }
+        }
         println!(
             "Compatible engines:   {}",
             comma_list(&capabilities.compatible_engine_ids)

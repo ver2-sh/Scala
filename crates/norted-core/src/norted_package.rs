@@ -112,6 +112,9 @@ pub struct NortedPackageBinding {
     pub output_key: String,
     pub expected_primary_size: u64,
     pub expected_primary_sha256: String,
+    pub build_key: Option<String>,
+    pub master_id: Option<String>,
+    pub quant_recipe_key: Option<String>,
     pub canonical_source_lineage_key: Option<String>,
     pub runtime_policy: Option<NortedPackageFile>,
     pub runtime_policy_id: Option<String>,
@@ -139,7 +142,12 @@ pub(crate) enum PackageDirectory {
         members: HashMap<PathBuf, PackageMember>,
         suppressed: HashSet<PathBuf>,
     },
-    Invalid(String),
+    Invalid {
+        reason: String,
+        /// `None` means the manifest could not be read well enough to recover
+        /// its claims, so every same-format artifact remains quarantined.
+        claimed: Option<HashSet<PathBuf>>,
+    },
 }
 
 pub fn apply_norted_package_load_policy(
@@ -164,6 +172,12 @@ pub fn apply_norted_package_load_policy(
                 policy.preferred_context_tokens,
                 &source,
             )?;
+            if settings.value("q27.kv_fp16").is_some() {
+                return Err(
+                    "Norted q27 package KV mode is selected by its quality-order policy and cannot be forced to FP16"
+                        .to_owned(),
+                );
+            }
             let fast_head = setting_id("q27.fast_head")?;
             match settings
                 .effective
@@ -579,8 +593,17 @@ struct NinferPolicySharp {
 struct BuildManifest {
     build_key: String,
     #[serde(default)]
+    master: Option<BuildMaster>,
+    #[serde(default)]
     route: Option<BuildRoute>,
+    #[serde(default)]
+    lineage: Option<BuildLineage>,
     outputs: BTreeMap<String, BuildOutput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildMaster {
+    master_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -591,7 +614,25 @@ struct BuildRoute {
 
 #[derive(Debug, Deserialize)]
 struct BuildQuantRoute {
-    cache_source_key: String,
+    #[serde(default)]
+    cache_source_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildLineage {
+    #[serde(default)]
+    quants: BTreeMap<String, BuildQuantLineage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildQuantLineage {
+    raw_quant_key: String,
+    #[serde(default)]
+    unsloth_quant_recipe_key: Option<String>,
+    #[serde(default)]
+    provider_recipe_key: Option<String>,
+    #[serde(default)]
+    effective_quant_source: Option<SourceLineage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -620,14 +661,15 @@ pub(crate) fn discover_package_directory(
     if !manifest.exists() {
         return None;
     }
-    Some(
-        match format {
-            ArtifactFormat::Gguf => discover_gguf(root, &manifest),
-            ArtifactFormat::Q27 => discover_q27(root, &manifest),
-            ArtifactFormat::Ninfer => discover_ninfer(root, &manifest),
-        }
-        .unwrap_or_else(PackageDirectory::Invalid),
-    )
+    let result = match format {
+        ArtifactFormat::Gguf => discover_gguf(root, &manifest),
+        ArtifactFormat::Q27 => discover_q27(root, &manifest),
+        ArtifactFormat::Ninfer => discover_ninfer(root, &manifest),
+    };
+    Some(result.unwrap_or_else(|reason| PackageDirectory::Invalid {
+        reason,
+        claimed: recover_manifest_claims(root, &manifest, format),
+    }))
 }
 
 fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, String> {
@@ -764,6 +806,9 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
             output_key: target.clone(),
             expected_primary_size: output.size,
             expected_primary_sha256: output.sha256.clone(),
+            build_key: None,
+            master_id: None,
+            quant_recipe_key: None,
             canonical_source_lineage_key: Some(manifest.source_lineage.key.clone()),
             runtime_policy: Some(runtime.clone()),
             runtime_policy_id: None,
@@ -780,13 +825,7 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
                 "q27.fast_head".to_owned(),
                 "reasoning_effort".to_owned(),
             ],
-            status: NortedPackageStatus::NeedsRuntimeCapability {
-                requirements: vec![
-                    "exact Sharp rendering before tokenization".to_owned(),
-                    "numeric compiled W_MAX".to_owned(),
-                    ">=200000 served tokens with a declared KV mode".to_owned(),
-                ],
-            },
+            status: NortedPackageStatus::Valid,
         };
         members.insert(
             primary.path,
@@ -997,6 +1036,9 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
             output_key: weights_key.clone(),
             expected_primary_size: output.artifact.size,
             expected_primary_sha256: output.artifact.sha256.clone(),
+            build_key: None,
+            master_id: None,
+            quant_recipe_key: None,
             canonical_source_lineage_key: Some(manifest.canonical_source_lineage_key.clone()),
             runtime_policy: Some(runtime.clone()),
             runtime_policy_id: Some(policy.policy_id.clone()),
@@ -1012,12 +1054,7 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
                 "top_p".to_owned(),
                 "ninfer.package_profile".to_owned(),
             ],
-            status: NortedPackageStatus::NeedsRuntimeCapability {
-                requirements: vec![
-                    "exact Sharp rendering before tokenization".to_owned(),
-                    ">=200000 served tokens proven by startup observation".to_owned(),
-                ],
-            },
+            status: NortedPackageStatus::Valid,
         };
         members.insert(
             primary.path,
@@ -1091,14 +1128,17 @@ fn discover_gguf(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, 
         .get("schema")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "BUILD-MANIFEST schema must be an integer".to_owned())?;
-    if observed_schema != 3 {
+    if !matches!(observed_schema, 2 | 3) {
         return Err(format!(
-            "unsupported BUILD-MANIFEST schema {observed_schema}; expected 3"
+            "unsupported BUILD-MANIFEST schema {observed_schema}; expected 2 or 3"
         ));
     }
-    let manifest: BuildManifest = serde_json::from_value(manifest_value)
-        .map_err(|error| format!("invalid BUILD-MANIFEST schema 3: {error}"))?;
+    let manifest: BuildManifest = serde_json::from_value(manifest_value.clone())
+        .map_err(|error| format!("invalid BUILD-MANIFEST schema {observed_schema}: {error}"))?;
     validate_sha(&manifest.build_key, "GGUF build key")?;
+    if let Some(master) = &manifest.master {
+        validate_sha(&master.master_id, "GGUF master ID")?;
+    }
     let mut records = Vec::new();
     let mut projector = None;
     let mut bound = HashSet::new();
@@ -1131,24 +1171,74 @@ fn discover_gguf(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, 
     }
     let mut members = HashMap::new();
     for (key, output, primary) in records {
-        let lineage_key = output
+        let quant_lineage = output
+            .quant
+            .as_ref()
+            .and_then(|quant| manifest.lineage.as_ref()?.quants.get(quant));
+        if let Some(lineage) = quant_lineage {
+            validate_sha(&lineage.raw_quant_key, "GGUF raw quant key")?;
+            if let Some(recipe) = lineage
+                .unsloth_quant_recipe_key
+                .as_ref()
+                .or(lineage.provider_recipe_key.as_ref())
+            {
+                validate_sha(recipe, "GGUF quant recipe key")?;
+            }
+        }
+        let lineage_key = if observed_schema == 3 {
+            let quant = output
+                .quant
+                .as_ref()
+                .ok_or_else(|| format!("schema-3 GGUF output `{key}` has no quant identity"))?;
+            let lineage = quant_lineage.ok_or_else(|| {
+                format!("schema-3 GGUF output `{key}` has no durable quant lineage")
+            })?;
+            let effective = lineage.effective_quant_source.as_ref().ok_or_else(|| {
+                format!("schema-3 GGUF output `{key}` has no effective quant source")
+            })?;
+            validate_effective_quant_source(
+                &manifest_value["lineage"]["quants"][quant]["effective_quant_source"],
+                &format!("schema-3 GGUF output `{key}` effective quant source"),
+            )?;
+            Some(effective.key.clone())
+        } else {
+            None
+        };
+        if let Some(route_key) = output
             .quant
             .as_ref()
             .and_then(|quant| manifest.route.as_ref()?.quants.get(quant))
-            .map(|route| route.cache_source_key.clone())
-            .unwrap_or_else(|| manifest.build_key.clone());
-        validate_sha(&lineage_key, "GGUF source lineage key")?;
+            .and_then(|route| route.cache_source_key.as_ref())
+        {
+            validate_sha(route_key, "GGUF route cache source key")?;
+            if lineage_key.as_ref().is_some_and(|key| key != route_key) {
+                return Err(format!(
+                    "schema-3 GGUF output `{key}` route cache identity disagrees with durable lineage"
+                ));
+            }
+        }
         let binding = NortedPackageBinding {
             kind: NortedPackageKind::Gguf,
             manifest_schema: "norted.build-manifest".to_owned(),
-            manifest_version: 3,
+            manifest_version: observed_schema as u32,
             package_root: root.clone(),
             manifest_path: manifest_path.clone(),
             manifest_sha256: manifest_sha.clone(),
             output_key: output.quant.clone().unwrap_or(key),
             expected_primary_size: output.size,
             expected_primary_sha256: output.sha256.clone(),
-            canonical_source_lineage_key: Some(lineage_key),
+            build_key: Some(manifest.build_key.clone()),
+            master_id: manifest
+                .master
+                .as_ref()
+                .map(|master| master.master_id.clone()),
+            quant_recipe_key: quant_lineage.and_then(|lineage| {
+                lineage
+                    .unsloth_quant_recipe_key
+                    .clone()
+                    .or_else(|| lineage.provider_recipe_key.clone())
+            }),
+            canonical_source_lineage_key: lineage_key,
             runtime_policy: None,
             runtime_policy_id: None,
             runtime_policy_profile: None,
@@ -1195,6 +1285,48 @@ fn canonical_root(root: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(root)
+}
+
+fn recover_manifest_claims(
+    root: &Path,
+    manifest_path: &Path,
+    format: ArtifactFormat,
+) -> Option<HashSet<PathBuf>> {
+    let root = root.canonicalize().ok()?;
+    let manifest = manifest_path.canonicalize().ok()?;
+    if !manifest.starts_with(&root) {
+        return None;
+    }
+    let (value, _): (serde_json::Value, String) = read_json(&manifest).ok()?;
+    let outputs = value.get("outputs")?.as_object()?;
+    let mut claims = HashSet::new();
+    for output in outputs.values() {
+        let filename = match format {
+            ArtifactFormat::Ninfer => output.get("artifact")?.get("filename")?.as_str(),
+            ArtifactFormat::Gguf | ArtifactFormat::Q27 => output.get("filename")?.as_str(),
+        }?;
+        let relative = Path::new(filename);
+        if filename.is_empty()
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return None;
+        }
+        let candidate = root.join(relative);
+        match candidate.canonicalize() {
+            Ok(path) if path.starts_with(&root) => {
+                claims.insert(path);
+            }
+            Ok(_) => return None,
+            Err(_) => {
+                // A missing claimed file still makes the package invalid, but
+                // cannot accidentally identify an unrelated existing model.
+            }
+        }
+    }
+    (!claims.is_empty()).then_some(claims)
 }
 
 fn canonical_manifest(root: &Path, manifest: &Path) -> Result<PathBuf, String> {
@@ -1354,6 +1486,68 @@ fn validate_lineage_value(value: &serde_json::Value, label: &str) -> Result<(), 
     validate_sha(expected, label)?;
     if canonical_hash_without_key(value, "key")? != expected {
         return Err(format!("{label} key does not match its canonical content"));
+    }
+    Ok(())
+}
+
+fn validate_effective_quant_source(value: &serde_json::Value, label: &str) -> Result<(), String> {
+    let expected = value
+        .get("key")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{label} lacks a key"))?;
+    validate_sha(expected, label)?;
+    let key_material = value
+        .get("key_material")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("{label} lacks Builder key_material"))?;
+    let observed = serde_json::to_vec(key_material)
+        .map(|bytes| hex_digest(Sha256::digest(bytes)))
+        .map_err(|error| format!("could not canonicalize {label}: {error}"))?;
+    if observed != expected {
+        return Err(format!("{label} key does not match Builder key_material"));
+    }
+    let repository = value.get("repository").and_then(serde_json::Value::as_str);
+    let route = value.get("route").and_then(serde_json::Value::as_str);
+    let artifact_key = value
+        .get("artifact_identity")
+        .and_then(|identity| identity.get("key"))
+        .and_then(serde_json::Value::as_str);
+    if key_material
+        .get("repository")
+        .and_then(serde_json::Value::as_str)
+        != repository
+        || key_material
+            .get("route")
+            .and_then(serde_json::Value::as_str)
+            != route
+        || key_material
+            .get("artifact")
+            .and_then(serde_json::Value::as_str)
+            != artifact_key
+    {
+        return Err(format!(
+            "{label} Builder key_material disagrees with its declared source identity"
+        ));
+    }
+    if let Some(restoration) = value.get("restoration").filter(|value| !value.is_null()) {
+        let restoration_key = restoration
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("{label} restoration lacks a key"))?;
+        validate_sha(restoration_key, &format!("{label} restoration key"))?;
+        if key_material
+            .get("restoration")
+            .and_then(serde_json::Value::as_str)
+            != Some(restoration_key)
+        {
+            return Err(format!(
+                "{label} Builder key_material disagrees with restoration identity"
+            ));
+        }
+    } else if key_material.contains_key("restoration") {
+        return Err(format!(
+            "{label} Builder key_material invents a restoration identity"
+        ));
     }
     Ok(())
 }

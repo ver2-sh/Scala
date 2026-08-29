@@ -209,23 +209,20 @@ impl ModelRegistry {
                         ref suppressed,
                     }) if suppressed.contains(&canonical_path) => continue,
                     Some(PackageDirectory::Valid { ref members, .. }) => {
-                        match members.get(&canonical_path) {
-                            Some(member) => Some(member.clone()),
-                            None => {
-                                registry.warnings.push(format!(
-                                    "artifact {} was rejected because the Norted manifest in its directory does not bind it",
-                                    canonical_path.display()
-                                ));
-                                continue;
-                            }
-                        }
+                        members.get(&canonical_path).cloned()
                     }
-                    Some(PackageDirectory::Invalid(reason)) => {
-                        registry.warnings.push(format!(
-                            "artifact {} was rejected because its claimed Norted package is invalid: {reason}",
-                            canonical_path.display()
-                        ));
-                        continue;
+                    Some(PackageDirectory::Invalid { reason, claimed }) => {
+                        if claimed
+                            .as_ref()
+                            .is_none_or(|claimed| claimed.contains(&canonical_path))
+                        {
+                            registry.warnings.push(format!(
+                                "artifact {} was rejected because its claimed Norted package is invalid: {reason}",
+                                canonical_path.display()
+                            ));
+                            continue;
+                        }
+                        None
                     }
                     None => None,
                 };
@@ -735,8 +732,10 @@ mod tests {
         let temporary = tempfile::tempdir().expect("q27 package fixture");
         let root = temporary.path();
         std::fs::write(root.join("model-Q6.q27"), b"q27-primary").expect("primary");
+        std::fs::write(root.join("unrelated.q27"), b"raw-q27").expect("raw q27");
         let tokenizer = [b"Q27T".as_slice(), &1_u32.to_le_bytes()].concat();
         std::fs::write(root.join("model.tok"), &tokenizer).expect("tokenizer");
+        std::fs::write(root.join("unrelated.tok"), &tokenizer).expect("raw tokenizer");
         std::fs::write(root.join("Sharp.jinja"), b"sharp").expect("Sharp");
         let runtime = q27_runtime_policy();
         let runtime_bytes = serde_json::to_vec(&runtime).expect("runtime JSON");
@@ -757,8 +756,19 @@ mod tests {
         .expect("manifest");
 
         let registry = ModelRegistry::discover(&[root.to_path_buf()]);
-        assert_eq!(registry.artifacts().len(), 1, "{:?}", registry.warnings());
-        let artifact = &registry.artifacts()[0];
+        assert_eq!(registry.artifacts().len(), 2, "{:?}", registry.warnings());
+        let artifact = registry
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.norted_package.is_some())
+            .expect("package member");
+        assert!(
+            registry
+                .artifacts()
+                .iter()
+                .any(|artifact| artifact.path.ends_with("unrelated.q27")
+                    && artifact.norted_package.is_none())
+        );
         let package = artifact.norted_package.as_ref().expect("package binding");
         assert_eq!(package.output_key, "q6");
         assert_eq!(
@@ -785,7 +795,8 @@ mod tests {
 
         std::fs::write(root.join("q27-runtime.json"), b"{}").expect("break runtime policy");
         let rejected = ModelRegistry::discover(&[root.to_path_buf()]);
-        assert!(rejected.artifacts().is_empty());
+        assert_eq!(rejected.artifacts().len(), 1);
+        assert!(rejected.artifacts()[0].path.ends_with("unrelated.q27"));
         assert!(
             rejected
                 .warnings()
@@ -797,7 +808,8 @@ mod tests {
             .expect("restore runtime policy");
         std::fs::write(root.join("Sharp.jinja"), b"changed").expect("break Sharp");
         let rejected = ModelRegistry::discover(&[root.to_path_buf()]);
-        assert!(rejected.artifacts().is_empty());
+        assert_eq!(rejected.artifacts().len(), 1);
+        assert!(rejected.artifacts()[0].path.ends_with("unrelated.q27"));
         assert!(
             rejected
                 .warnings()
@@ -808,33 +820,116 @@ mod tests {
 
     #[test]
     fn build_manifest_suppresses_projector_and_raw_artifacts_remain_supported() {
-        let temporary = tempfile::tempdir().expect("GGUF package fixture");
-        let root = temporary.path();
-        std::fs::write(root.join("model.gguf"), b"model").expect("model");
-        std::fs::write(root.join("mmproj-F16.gguf"), b"projector").expect("projector");
-        let manifest = serde_json::json!({
-            "schema":3,"build_key":"3".repeat(64),"outputs":{
-                "model.gguf":{"filename":"model.gguf","size":5,"sha256":sha(b"model"),"quant":"UD-Q6_K_XL"},
-                "mmproj-F16.gguf":{"filename":"mmproj-F16.gguf","size":9,"sha256":sha(b"projector"),"quant":"high-precision vision projector","format":"high-precision-projector","projector_key":"4".repeat(64)}
+        for schema in [2, 3] {
+            let temporary = tempfile::tempdir().expect("GGUF package fixture");
+            let root = temporary.path();
+            std::fs::write(root.join("model.gguf"), b"model").expect("model");
+            std::fs::write(root.join("unrelated.gguf"), b"raw").expect("raw model");
+            std::fs::write(root.join("mmproj-F16.gguf"), b"projector").expect("projector");
+            let effective_source =
+                effective_quant_source_fixture("convert-safetensors-and-quantize");
+            let source_key = effective_source["key"].as_str().unwrap().to_owned();
+            let mut manifest = serde_json::json!({
+                "schema":schema,"build_key":"3".repeat(64),"master":{"master_id":"5".repeat(64)},"outputs":{
+                    "model.gguf":{"filename":"model.gguf","size":5,"sha256":sha(b"model"),"quant":"UD-Q6_K_XL"},
+                    "mmproj-F16.gguf":{"filename":"mmproj-F16.gguf","size":9,"sha256":sha(b"projector"),"quant":"high-precision vision projector","format":"high-precision-projector","projector_key":"4".repeat(64)}
+                }
+            });
+            if schema == 2 {
+                manifest["lineage"] = serde_json::json!({"quants":{"UD-Q6_K_XL":{
+                    "raw_quant_key":"6".repeat(64),"provider_recipe_key":"7".repeat(64)
+                }}});
+            } else {
+                manifest["lineage"] = serde_json::json!({"quants":{"UD-Q6_K_XL":{
+                    "raw_quant_key":"6".repeat(64),"unsloth_quant_recipe_key":"7".repeat(64),
+                    "effective_quant_source":effective_source
+                }}});
             }
-        });
-        std::fs::write(
-            root.join("BUILD-MANIFEST.json"),
-            serde_json::to_vec(&manifest).unwrap(),
-        )
-        .unwrap();
-        let registry = ModelRegistry::discover(&[root.to_path_buf()]);
-        assert_eq!(registry.artifacts().len(), 1, "{:?}", registry.warnings());
-        assert_eq!(
-            registry.artifacts()[0].auxiliary_artifacts[0].role,
-            AuxiliaryArtifactRole::Projector
-        );
+            std::fs::write(
+                root.join("BUILD-MANIFEST.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let registry = ModelRegistry::discover(&[root.to_path_buf()]);
+            assert_eq!(registry.artifacts().len(), 2, "{:?}", registry.warnings());
+            let package = registry
+                .artifacts()
+                .iter()
+                .find(|artifact| artifact.norted_package.is_some())
+                .expect("package model");
+            assert_eq!(
+                package.auxiliary_artifacts[0].role,
+                AuxiliaryArtifactRole::Projector
+            );
+            let binding = package.norted_package.as_ref().unwrap();
+            assert_eq!(binding.manifest_version, schema);
+            assert_eq!(
+                binding.canonical_source_lineage_key.as_deref(),
+                (schema == 3).then_some(source_key.as_str())
+            );
+            assert!(
+                registry
+                    .artifacts()
+                    .iter()
+                    .any(|artifact| artifact.path.ends_with("unrelated.gguf")
+                        && artifact.norted_package.is_none())
+            );
+            assert!(
+                registry
+                    .artifacts()
+                    .iter()
+                    .all(|artifact| !artifact.path.ends_with("mmproj-F16.gguf"))
+            );
+        }
+    }
 
-        let raw_root = tempfile::tempdir().expect("raw fixture");
-        std::fs::write(raw_root.path().join("standalone.gguf"), b"raw").unwrap();
-        let raw = ModelRegistry::discover(&[raw_root.path().to_path_buf()]);
-        assert_eq!(raw.artifacts().len(), 1);
-        assert!(raw.artifacts()[0].norted_package.is_none());
+    #[test]
+    fn schema_three_build_routes_use_durable_lineage_for_fresh_and_reuse_publications() {
+        for action in [
+            "reuse-cache",
+            "convert-safetensors-and-quantize",
+            "transform-high-precision-gguf",
+        ] {
+            let temporary = tempfile::tempdir().expect("schema-3 route fixture");
+            let root = temporary.path();
+            std::fs::write(root.join("model.gguf"), b"model").unwrap();
+            let durable_route = if action == "transform-high-precision-gguf" {
+                "transform-high-precision-gguf"
+            } else {
+                "convert-safetensors-and-quantize"
+            };
+            let effective_source = effective_quant_source_fixture(durable_route);
+            let source_key = effective_source["key"].as_str().unwrap().to_owned();
+            let route = if action == "reuse-cache" {
+                serde_json::json!({"action":action,"cache_source_key":source_key})
+            } else {
+                serde_json::json!({"action":action,"artifact":"source","steps":["transform","publish"],"effective_source":{"key":"route-local-detail"},"restoration":null,"current_source_anchor":{}})
+            };
+            let manifest = serde_json::json!({
+                "schema":3,"build_key":"3".repeat(64),
+                "route":{"quants":{"UD-Q6_K_XL":route}},
+                "lineage":{"quants":{"UD-Q6_K_XL":{
+                    "raw_quant_key":"6".repeat(64),"unsloth_quant_recipe_key":"7".repeat(64),
+                    "effective_quant_source":effective_source,
+                    "current_source_anchor":{},"quantization":{"performed_by_norted":true}
+                }}},
+                "outputs":{"model.gguf":{"filename":"model.gguf","size":5,"sha256":sha(b"model"),"quant":"UD-Q6_K_XL"}}
+            });
+            std::fs::write(
+                root.join("BUILD-MANIFEST.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let registry = ModelRegistry::discover(&[root.to_path_buf()]);
+            assert_eq!(registry.artifacts().len(), 1, "{:?}", registry.warnings());
+            assert_eq!(
+                registry.artifacts()[0]
+                    .norted_package
+                    .as_ref()
+                    .and_then(|package| package.canonical_source_lineage_key.as_deref()),
+                Some(source_key.as_str())
+            );
+        }
     }
 
     #[test]
@@ -846,6 +941,15 @@ mod tests {
             &primary,
             &serde_json::json!({
                 "identity":{"model_id":"qwen3.8-27b","weights_id":"groupwise-int"},
+                "objects":[{"name":"resource","kind":"resource","encoding":"raw-bytes-v1","offset":0,"bytes":1}]
+            }),
+            1,
+        );
+        let unrelated = root.join("unrelated.ninfer");
+        write_ninfer_fixture(
+            &unrelated,
+            &serde_json::json!({
+                "identity":{"model_id":"other-model","weights_id":"other-weights"},
                 "objects":[{"name":"resource","kind":"resource","encoding":"raw-bytes-v1","offset":0,"bytes":1}]
             }),
             1,
@@ -868,8 +972,19 @@ mod tests {
         )
         .unwrap();
         let registry = ModelRegistry::discover(&[root.to_path_buf()]);
-        assert_eq!(registry.artifacts().len(), 1, "{:?}", registry.warnings());
-        let artifact = &registry.artifacts()[0];
+        assert_eq!(registry.artifacts().len(), 2, "{:?}", registry.warnings());
+        let artifact = registry
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.norted_package.is_some())
+            .expect("package member");
+        assert!(
+            registry
+                .artifacts()
+                .iter()
+                .any(|artifact| artifact.path.ends_with("unrelated.ninfer")
+                    && artifact.norted_package.is_none())
+        );
         assert!(
             matches!(&artifact.native_identity, Some(ArtifactNativeIdentity::Ninfer(identity)) if identity.model_id == "qwen3.8-27b" && identity.weights_id == "groupwise-int")
         );
@@ -933,7 +1048,8 @@ mod tests {
         )
         .unwrap();
         let rejected = ModelRegistry::discover(&[root.to_path_buf()]);
-        assert!(rejected.artifacts().is_empty());
+        assert_eq!(rejected.artifacts().len(), 1);
+        assert!(rejected.artifacts()[0].path.ends_with("unrelated.ninfer"));
     }
 
     #[test]
@@ -1104,6 +1220,28 @@ mod tests {
 
     fn sha(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn effective_quant_source_fixture(route: &str) -> serde_json::Value {
+        let artifact = "8".repeat(64);
+        let key_material = serde_json::json!({
+            "repository":"example/source",
+            "artifact":artifact,
+            "route":route
+        });
+        let key = sha(&serde_json::to_vec(&key_material).unwrap());
+        serde_json::json!({
+            "schema":3,
+            "created_under_source_identity":"9".repeat(64),
+            "repository":"example/source",
+            "parent_artifact_id":"source",
+            "view_id":"source#language-mtp",
+            "artifact_identity":{"key":artifact},
+            "route":route,
+            "restoration":null,
+            "key_material":key_material,
+            "key":key
+        })
     }
 
     fn q27_runtime_policy() -> serde_json::Value {

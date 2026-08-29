@@ -327,7 +327,7 @@ fn render_models(
                     };
                     Span::styled(
                         format!(
-                            "Package: {}  {status}  schema {}  profile {}",
+                            "Package: {}  {status}  schema {}  profile {}  runtime: evaluated separately",
                             package.kind,
                             package.manifest_version,
                             package

@@ -207,9 +207,8 @@ pub struct PreparedFileIdentity {
     pub filesystem_inode: Option<u64>,
 }
 
-/// Prepares a manifest-bound model in place. The primary artifact is hashed
-/// only at this explicit load boundary; package sidecars are hash-checked here
-/// and again immediately before launch.
+/// Prepares a manifest-bound model in place. Package files are hash-checked at
+/// this explicit load boundary and again immediately before launch.
 pub async fn prepare_norted_package_input(
     model: &ModelArtifact,
 ) -> Result<PreparedModelInput, EngineError> {
@@ -301,10 +300,13 @@ pub async fn revalidate_norted_package_before_launch(
         canonical_regular_file(&model.primary.path, "prepared Norted package primary").await?;
     let metadata = tokio::fs::metadata(&canonical).await.map_err(package_io)?;
     let observed_identity = file_identity(&metadata);
+    let observed_sha = hash_file(&canonical).await.map_err(package_io)?;
     if canonical != model.primary.path
         || observed_identity.size_bytes != package.expected_primary_size
         || model.primary_file_identity.as_ref() != Some(&observed_identity)
         || model.primary.hash.as_deref() != Some(package.expected_primary_sha256.as_str())
+        || observed_sha != package.expected_primary_sha256
+        || model.primary.hash.as_deref() != Some(observed_sha.as_str())
     {
         return Err(EngineError::InvalidConfiguration(
             "Norted package primary artifact changed between preparation and launch".to_owned(),
@@ -458,6 +460,8 @@ pub struct ModelServingCapabilities {
     pub format: ArtifactFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_identity: Option<ArtifactNativeIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<NortedPackageSummary>,
     pub compatible_engine_ids: Vec<String>,
     pub compatible_installed_runtime_ids: Vec<RuntimeId>,
     pub selected_runtime_id: Option<RuntimeId>,
@@ -470,6 +474,57 @@ pub struct ModelServingCapabilities {
     pub tools: bool,
     pub vision: bool,
     pub structured_output: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NortedPackageSummary {
+    pub kind: norted_core::NortedPackageKind,
+    pub manifest_schema: String,
+    pub manifest_version: u32,
+    pub validation_status: norted_core::NortedPackageStatus,
+    pub runtime_policy: Option<String>,
+    pub sharp_required: bool,
+    pub sharp_validated: bool,
+    pub sharp_application_capability: Option<RuntimeCompatibility>,
+    pub canonical_lineage_key_short: Option<String>,
+    pub native_identity: Option<ArtifactNativeIdentity>,
+    pub ninfer_benchmark_profiles: Vec<String>,
+    pub runtime_package_capability: Option<RuntimeCompatibility>,
+}
+
+fn norted_package_summary(
+    model: &ModelArtifact,
+    runtime_capability: Option<RuntimeCompatibility>,
+    sharp_application_capability: Option<RuntimeCompatibility>,
+) -> Option<NortedPackageSummary> {
+    let package = model.norted_package.as_ref()?;
+    let mut benchmark_profiles = match &package.policy {
+        norted_core::NortedPackagePolicy::Ninfer(policy) => {
+            policy.benchmark_profiles.keys().cloned().collect()
+        }
+        _ => Vec::new(),
+    };
+    benchmark_profiles.sort();
+    Some(NortedPackageSummary {
+        kind: package.kind,
+        manifest_schema: package.manifest_schema.clone(),
+        manifest_version: package.manifest_version,
+        validation_status: package.status.clone(),
+        runtime_policy: package
+            .runtime_policy_profile
+            .clone()
+            .or_else(|| package.runtime_policy_id.clone()),
+        sharp_required: package.sharp.is_some(),
+        sharp_validated: package.sharp.is_some(),
+        sharp_application_capability,
+        canonical_lineage_key_short: package
+            .canonical_source_lineage_key
+            .as_ref()
+            .map(|key| key.chars().take(12).collect()),
+        native_identity: model.native_identity.clone(),
+        ninfer_benchmark_profiles: benchmark_profiles,
+        runtime_package_capability: runtime_capability,
+    })
 }
 
 impl EffectiveGenerationSettings {
@@ -669,6 +724,16 @@ pub trait EngineAdapter: Send + Sync {
     ) -> u16 {
         100
     }
+    /// Reports only the external-template/raw-prompt capability for a package.
+    /// This stays separate from overall runtime/model compatibility so local
+    /// model info does not mislabel an unrelated runtime failure as Sharp.
+    fn runtime_package_sharp_compatibility(
+        &self,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+    ) -> Option<RuntimeCompatibility> {
+        None
+    }
     /// Evaluates a catalog runtime against a concrete model without installing
     /// it. Ordinary engines inherit the same coarse model gate as installed
     /// runtimes.
@@ -752,6 +817,16 @@ pub trait EngineAdapter: Send + Sync {
     }
     async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError>;
     async fn health(&self, process: &ProcessDescriptor) -> Result<bool, EngineError>;
+    /// Converts bounded process startup output into facts that must be proven
+    /// before a backend is promoted to healthy. Adapters should reject absent
+    /// or contradictory observations when a model policy requires them.
+    async fn startup_observation(
+        &self,
+        _process: &ProcessDescriptor,
+        _stderr_tail: &[String],
+    ) -> Result<BTreeMap<String, serde_json::Value>, EngineError> {
+        Ok(BTreeMap::new())
+    }
     async fn effective_generation_settings(
         &self,
         process: &ProcessDescriptor,
@@ -796,6 +871,7 @@ pub trait ProcessSupervisor: Send + Sync {
         &self,
         process: &ProcessDescriptor,
     ) -> Result<watch::Receiver<Option<ProcessExit>>, EngineError>;
+    async fn stderr_tail(&self, process: &ProcessDescriptor) -> Result<Vec<String>, EngineError>;
     async fn shutdown(&self);
 }
 
@@ -916,6 +992,7 @@ mod tests {
         InferenceRole, InstallationState, LaunchRequest, LaunchSpec, NativeOption,
         PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
         RuntimePackManager, UpdateState, prepare_norted_package_input,
+        revalidate_norted_package_before_launch,
     };
 
     struct ArchitectureAdapter {
@@ -1316,7 +1393,7 @@ mod tests {
         std::fs::write(&primary, bytes).expect("primary fixture");
         let digest = format!("{:x}", Sha256::digest(bytes));
         let manifest = serde_json::json!({
-            "schema": 3,
+            "schema": 2,
             "build_key": "a".repeat(64),
             "outputs": {
                 "model.gguf": {
@@ -1334,6 +1411,21 @@ mod tests {
         .expect("manifest fixture");
         let registry = ModelRegistry::discover(&[temporary.path().to_path_buf()]);
         let artifact = registry.artifacts().first().expect("package artifact");
+        let summary = super::norted_package_summary(
+            artifact,
+            Some(RuntimeCompatibility::Incompatible(
+                "runtime package capability fixture".to_owned(),
+            )),
+            None,
+        )
+        .expect("local package summary");
+        assert_eq!(summary.kind, norted_core::NortedPackageKind::Gguf);
+        assert_eq!(summary.manifest_version, 2);
+        assert_eq!(
+            summary.validation_status,
+            norted_core::NortedPackageStatus::Valid
+        );
+        assert!(summary.runtime_package_capability.is_some());
         let prepared = prepare_norted_package_input(artifact)
             .await
             .expect("prepared package");
@@ -1342,7 +1434,16 @@ mod tests {
         assert!(prepared.primary_file_identity.is_some());
         assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 2);
 
-        std::fs::write(&primary, b"PACKAGE-primary").expect("tamper primary in place");
+        std::fs::write(&primary, b"PACKAGE-primary").expect("same-size tamper in place");
+        assert_eq!(
+            std::fs::metadata(&primary).unwrap().len(),
+            bytes.len() as u64
+        );
+        assert!(
+            revalidate_norted_package_before_launch(&prepared)
+                .await
+                .is_err()
+        );
         assert!(prepare_norted_package_input(artifact).await.is_err());
     }
 }

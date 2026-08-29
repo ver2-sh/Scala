@@ -774,10 +774,49 @@ impl RuntimePackManager {
             .ok()
             .map(|selection| selection.runtime.manifest.runtime_id);
 
+        let runtime_package_capability = model.norted_package.as_ref().and_then(|_| {
+            list.installed
+                .iter()
+                .filter(|status| {
+                    status
+                        .runtime
+                        .manifest
+                        .supported_formats
+                        .contains(&model.format)
+                })
+                .filter_map(|status| {
+                    self.model_candidate_compatibility(&status.runtime, model, &list.host)
+                        .ok()
+                })
+                .min_by_key(RuntimeCompatibility::preference_rank)
+        });
+        let sharp_application_capability = model.norted_package.as_ref().and_then(|_| {
+            list.installed
+                .iter()
+                .filter(|status| {
+                    status
+                        .runtime
+                        .manifest
+                        .supported_formats
+                        .contains(&model.format)
+                })
+                .filter_map(|status| {
+                    self.registry
+                        .get(&status.runtime.manifest.identity.engine_id)?
+                        .runtime_package_sharp_compatibility(&status.runtime, model)
+                })
+                .min_by_key(RuntimeCompatibility::preference_rank)
+        });
+
         Ok(ModelServingCapabilities {
             model_id: model.id.clone(),
             format: model.format,
             native_identity: model.native_identity.clone(),
+            package: super::norted_package_summary(
+                model,
+                runtime_package_capability,
+                sharp_application_capability,
+            ),
             compatible_engine_ids,
             compatible_installed_runtime_ids,
             selected_runtime_id,

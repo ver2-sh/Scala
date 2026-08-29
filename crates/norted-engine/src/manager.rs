@@ -616,6 +616,42 @@ impl RuntimeManager {
                 .await;
             return Err(error);
         }
+        let mut startup_attempt = 0_u8;
+        let startup_observation = loop {
+            let stderr_tail = match self.supervisor.stderr_tail(&process).await {
+                Ok(stderr_tail) => stderr_tail,
+                Err(error) => {
+                    let detail = format!("could not read bounded engine startup output: {error}");
+                    let retained = self.terminate_or_retain(&process).await;
+                    self.fail_loading(generation, detail.clone(), retained.as_ref())
+                        .await;
+                    return Err(RuntimeError::StartupFailed(detail));
+                }
+            };
+            match adapter.startup_observation(&process, &stderr_tail).await {
+                Ok(observation) => break observation,
+                Err(EngineError::BackendUnavailable(_)) if startup_attempt < 20 => {
+                    startup_attempt += 1;
+                    if exit.borrow().is_some() {
+                        let detail =
+                            "engine exited before startup policy observation completed".to_owned();
+                        let retained = self.terminate_or_retain(&process).await;
+                        self.fail_loading(generation, detail.clone(), retained.as_ref())
+                            .await;
+                        return Err(RuntimeError::StartupFailed(detail));
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => {
+                    let detail =
+                        format!("engine startup did not prove the selected model policy: {error}");
+                    let retained = self.terminate_or_retain(&process).await;
+                    self.fail_loading(generation, detail.clone(), retained.as_ref())
+                        .await;
+                    return Err(RuntimeError::StartupFailed(detail));
+                }
+            }
+        };
         let effective_generation_settings =
             match adapter.effective_generation_settings(&process).await {
                 Ok(settings) => settings,
@@ -655,6 +691,22 @@ impl RuntimeManager {
             state.loading_process = None;
             state.cancel_loading = false;
             if let Some(provenance) = state.provenance.as_mut() {
+                if let Some(package) = provenance.model.norted_package.as_mut() {
+                    if startup_observation
+                        .get("sharp_application")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("pretokenized-raw-prompt")
+                    {
+                        package.sharp_applied = Some(true);
+                    }
+                    if let Some(context) = startup_observation
+                        .get("observed_served_context")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        package.proven_served_context_tokens = Some(context);
+                    }
+                }
+                provenance.normalized_settings.extend(startup_observation);
                 provenance.normalized_settings.insert(
                     "temperature".to_owned(),
                     serde_json::json!(effective_generation_settings.temperature),

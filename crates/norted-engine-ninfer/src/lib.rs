@@ -10,8 +10,10 @@ use async_trait::async_trait;
 use norted_core::{
     AcceleratorDevice, AcquisitionMethod, ArtifactFormat, ArtifactNativeIdentity, AvailableRuntime,
     EngineConfig, EngineInstallation, EngineRevision, HostCapabilities, InstalledRuntime,
-    ModelArtifact, ModelId, NinferArtifactIdentity, RuntimeAcquisitionMethod, RuntimeCompatibility,
-    RuntimeId, RuntimeProbeObservation, RuntimeRequirements, inspect_ninfer_container,
+    LoadSettingValue, ModelArtifact, ModelId, NinferArtifactIdentity, NinferPackagePolicy,
+    NortedPackageBinding, NortedPackagePolicy, ResolvedLoadSettings, RuntimeAcquisitionMethod,
+    RuntimeCompatibility, RuntimeId, RuntimeProbeObservation, RuntimeRequirements,
+    inspect_ninfer_container,
 };
 use norted_engine::{
     ApiCapability, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
@@ -38,6 +40,7 @@ pub const ENGINE_ID: &str = "ninfer";
 pub const UPSTREAM_REPOSITORY: &str = "https://github.com/Neroued/ninfer";
 pub const GITHUB_REPOSITORY: &str = "Neroued/ninfer";
 pub const PROVIDER_ID: &str = "ninfer-official-source";
+const PACKAGE_CAPABILITY_REVISION: &str = "6b94b8c5721f075624c4f36d18279a848ba8b6c9";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -110,6 +113,181 @@ struct PendingStartup {
     native_identity: NinferArtifactIdentity,
     public_model_id: ModelId,
     accelerator: AcceleratorDevice,
+    package_requirements: Option<NinferStartupRequirements>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NinferStartupRequirements {
+    minimum_context_tokens: u64,
+    kv_cache: String,
+    cuda_graph: bool,
+    prefix_reuse: bool,
+    speculative_backend: String,
+    speculative_draft_window: u64,
+    proposal_head: String,
+    temperature: f64,
+    top_p: f64,
+    top_k: u64,
+    min_p: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct NinferPackageRuntimeCapabilities {
+    trustworthy_identity: bool,
+    external_sharp: bool,
+    process_sampler_overrides: bool,
+    bounded_server_start: bool,
+}
+
+fn evaluate_ninfer_package_runtime(
+    capabilities: NinferPackageRuntimeCapabilities,
+) -> RuntimeCompatibility {
+    if !capabilities.trustworthy_identity {
+        return RuntimeCompatibility::NeedsAttention(
+            "the exact NInfer executable has no trustworthy package-capability observation; external binaries are not credited from filenames or upstream assumptions"
+                .to_owned(),
+        );
+    }
+    let reasons = ninfer_package_prelaunch_failures(capabilities);
+    if reasons.is_empty() {
+        RuntimeCompatibility::NeedsAttention(
+            "runtime capabilities satisfy pre-launch requirements; context, KV capacity, sampler, and MTP policy still require server_start proof"
+                .to_owned(),
+        )
+    } else {
+        RuntimeCompatibility::Incompatible(format!(
+            "{}; actual context/KV capacity, graph/prefix state, sampler defaults, and MTP profile remain unproven until server_start",
+            reasons.join("; ")
+        ))
+    }
+}
+
+fn ninfer_package_prelaunch_failures(
+    capabilities: NinferPackageRuntimeCapabilities,
+) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if !capabilities.external_sharp {
+        reasons.push("required external Sharp application is unsupported/unproven");
+    }
+    if !capabilities.process_sampler_overrides {
+        reasons.push("package temperature/top-p/top-k/min-p process overrides are unproven");
+    }
+    if !capabilities.bounded_server_start {
+        reasons.push("server_start context/KV/graph/prefix/speculation observation is unproven");
+    }
+    reasons
+}
+
+fn ninfer_package_capabilities_for_installed(
+    runtime: &InstalledRuntime,
+) -> NinferPackageRuntimeCapabilities {
+    let managed_source = runtime.manifest.acquisition_method
+        == RuntimeAcquisitionMethod::SourceBuild
+        && runtime.manifest.identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
+        && runtime.manifest.identity.upstream_revision.as_deref()
+            == Some(PACKAGE_CAPABILITY_REVISION)
+        && runtime.manifest.identity.variant == format!("{}-sm120a", catalog::RECIPE_VERSION);
+    NinferPackageRuntimeCapabilities {
+        trustworthy_identity: managed_source,
+        // The current managed source recipe embeds its frontend template and
+        // advertises no external template or raw pre-rendered prompt input.
+        external_sharp: false,
+        process_sampler_overrides: managed_source,
+        bounded_server_start: managed_source,
+    }
+}
+
+fn ninfer_package_capabilities_for_available(
+    runtime: &AvailableRuntime,
+) -> NinferPackageRuntimeCapabilities {
+    let managed_source = matches!(
+        runtime.acquisition,
+        norted_core::RuntimeAcquisitionPlan::SourceBuild(_)
+    ) && runtime.identity.package.repository.as_deref()
+        == Some(GITHUB_REPOSITORY)
+        && runtime.identity.upstream_revision.as_deref() == Some(PACKAGE_CAPABILITY_REVISION)
+        && runtime.identity.variant == format!("{}-sm120a", catalog::RECIPE_VERSION);
+    NinferPackageRuntimeCapabilities {
+        trustworthy_identity: managed_source,
+        external_sharp: false,
+        process_sampler_overrides: managed_source,
+        bounded_server_start: managed_source,
+    }
+}
+
+fn ninfer_package_policy(
+    package: &NortedPackageBinding,
+) -> Result<&NinferPackagePolicy, EngineError> {
+    match &package.policy {
+        NortedPackagePolicy::Ninfer(policy) => Ok(policy),
+        _ => Err(EngineError::InvalidConfiguration(
+            "NInfer received a non-NInfer Norted package policy".to_owned(),
+        )),
+    }
+}
+
+fn ninfer_package_sampler_arguments(
+    package: &NortedPackageBinding,
+) -> Result<Vec<OsString>, EngineError> {
+    let policy = ninfer_package_policy(package)?;
+    Ok([
+        "--temperature".to_owned(),
+        policy.temperature.to_string(),
+        "--top-p".to_owned(),
+        policy.top_p.to_string(),
+        "--top-k".to_owned(),
+        policy.top_k.to_string(),
+        "--min-p".to_owned(),
+        policy.min_p.to_string(),
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect())
+}
+
+fn ninfer_startup_requirements(
+    package: &NortedPackageBinding,
+    settings: &ResolvedLoadSettings,
+) -> Result<NinferStartupRequirements, EngineError> {
+    let policy = ninfer_package_policy(package)?;
+    let profile_name = match settings.value("ninfer.package_profile") {
+        Some(LoadSettingValue::Choice(profile)) => profile.as_str(),
+        Some(_) => {
+            return Err(EngineError::InvalidConfiguration(
+                "ninfer.package_profile must be a choice".to_owned(),
+            ));
+        }
+        None => "mtp0",
+    };
+    let profile = policy.benchmark_profiles.get(profile_name).ok_or_else(|| {
+        EngineError::InvalidConfiguration(format!(
+            "NInfer package benchmark profile `{profile_name}` is not declared by the package"
+        ))
+    })?;
+    Ok(NinferStartupRequirements {
+        minimum_context_tokens: policy.minimum_context_tokens,
+        kv_cache: match policy.kv_preference.as_str() {
+            "int8" => "int8-group64".to_owned(),
+            other => {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "unsupported NInfer package KV policy `{other}`"
+                )));
+            }
+        },
+        cuda_graph: policy.cuda_graph_decode,
+        prefix_reuse: policy.compatible_prefix_reuse,
+        speculative_backend: profile.backend.clone().unwrap_or_else(|| "none".to_owned()),
+        speculative_draft_window: profile.draft_tokens.unwrap_or(0),
+        proposal_head: if profile.lm_head_draft {
+            "optimized".to_owned()
+        } else {
+            "full".to_owned()
+        },
+        temperature: policy.temperature,
+        top_p: policy.top_p,
+        top_k: policy.top_k,
+        min_p: policy.min_p,
+    })
 }
 
 pub struct NinferAdapter {
@@ -470,12 +648,6 @@ impl EngineAdapter for NinferAdapter {
         if let CompatibilityDecision::Unsupported { reason } = self.runtime_compatibility(runtime) {
             return RuntimeCompatibility::Incompatible(reason);
         }
-        if model.norted_package.is_some() {
-            return RuntimeCompatibility::Incompatible(
-                "this NInfer runtime can load the native container but does not expose a proven external Sharp template path or a server_start capacity observation proving >=200000 served tokens for the Norted Dirk package"
-                    .to_owned(),
-            );
-        }
         let native = native_compatibility(
             &runtime.manifest.supported_native_identities,
             model
@@ -491,7 +663,15 @@ impl EngineAdapter for NinferAdapter {
             runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
         )
         .compatibility;
-        combine_compatibility(native, device)
+        let base = combine_compatibility(native, device);
+        if model.norted_package.is_some() {
+            combine_compatibility(
+                base,
+                evaluate_ninfer_package_runtime(ninfer_package_capabilities_for_installed(runtime)),
+            )
+        } else {
+            base
+        }
     }
 
     fn available_runtime_model_compatibility(
@@ -508,12 +688,6 @@ impl EngineAdapter for NinferAdapter {
         {
             return RuntimeCompatibility::Incompatible(reason);
         }
-        if model.norted_package.is_some() {
-            return RuntimeCompatibility::Incompatible(
-                "catalog NInfer runtime metadata does not prove Sharp application or >=200000 served tokens for the Norted Dirk package"
-                    .to_owned(),
-            );
-        }
         let native = native_compatibility(
             &runtime.supported_native_identities,
             model
@@ -529,7 +703,36 @@ impl EngineAdapter for NinferAdapter {
             false,
         )
         .compatibility;
-        combine_compatibility(native, device)
+        let base = combine_compatibility(native, device);
+        if model.norted_package.is_some() {
+            combine_compatibility(
+                base,
+                evaluate_ninfer_package_runtime(ninfer_package_capabilities_for_available(runtime)),
+            )
+        } else {
+            base
+        }
+    }
+
+    fn runtime_package_sharp_compatibility(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+    ) -> Option<RuntimeCompatibility> {
+        model.norted_package.as_ref()?;
+        let capabilities = ninfer_package_capabilities_for_installed(runtime);
+        Some(if !capabilities.trustworthy_identity {
+            RuntimeCompatibility::NeedsAttention(
+                "external Sharp application capability is unproven for this exact NInfer executable"
+                    .to_owned(),
+            )
+        } else if capabilities.external_sharp {
+            RuntimeCompatibility::Compatible
+        } else {
+            RuntimeCompatibility::Incompatible(
+                "required external Sharp application is unsupported/unproven".to_owned(),
+            )
+        })
     }
 
     fn runtime_model_accelerator(
@@ -723,21 +926,41 @@ impl EngineAdapter for NinferAdapter {
             ));
         }
         if request.model.primary.norted_package.is_some() {
-            return Err(EngineError::InvalidConfiguration(
-                "selected NInfer runtime cannot launch the Norted Dirk package: exact Sharp application and a >=200000-token server_start capacity observation are not proven"
-                    .to_owned(),
-            ));
+            let capabilities = ninfer_package_capabilities_for_installed(&request.runtime);
+            if !capabilities.trustworthy_identity {
+                return Err(EngineError::InvalidConfiguration(
+                    "selected NInfer executable has no trustworthy observation proving the Norted package capability contract"
+                        .to_owned(),
+                ));
+            }
+            let failures = ninfer_package_prelaunch_failures(capabilities);
+            if !failures.is_empty() {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "selected NInfer runtime cannot launch the Norted package: {}",
+                    failures.join("; ")
+                )));
+            }
         }
         request
             .load_settings_schema
             .validate(&request.load_settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
         revalidate_norted_package_before_launch(&request.model).await?;
-        let structured = settings::translate(
+        let mut structured = settings::translate(
             &request.load_settings,
             &request.model.primary,
             &self.native_arguments,
         )?;
+        let package_requirements = request
+            .model
+            .primary
+            .norted_package
+            .as_ref()
+            .map(|package| ninfer_startup_requirements(package, &request.load_settings))
+            .transpose()?;
+        if let Some(package) = request.model.primary.norted_package.as_ref() {
+            structured.extend(ninfer_package_sampler_arguments(package)?);
+        }
         let model_path =
             canonical_regular_file(&request.model.primary.path, "NInfer model").await?;
         if model_path != request.model.primary.path {
@@ -826,11 +1049,56 @@ impl EngineAdapter for NinferAdapter {
                 native_identity: expected_identity.clone(),
                 public_model_id: public_model_id.clone(),
                 accelerator: accelerator.clone(),
+                package_requirements: package_requirements.clone(),
             },
         ) {
             let _ = tokio::fs::remove_file(previous.request_log_path).await;
         }
         self.observed_defaults.write().await.remove(&endpoint);
+
+        let mut normalized_settings = BTreeMap::from([
+            (
+                "container_version".to_owned(),
+                json!(expected_identity.container_version),
+            ),
+            (
+                "native_model_id".to_owned(),
+                json!(expected_identity.model_id),
+            ),
+            (
+                "native_weights_id".to_owned(),
+                json!(expected_identity.weights_id),
+            ),
+            ("request_log_schema".to_owned(), json!(18)),
+        ]);
+        if let Some(requirements) = package_requirements.as_ref() {
+            normalized_settings.extend([
+                (
+                    "package_temperature".to_owned(),
+                    json!(requirements.temperature),
+                ),
+                ("package_top_p".to_owned(), json!(requirements.top_p)),
+                ("package_top_k".to_owned(), json!(requirements.top_k)),
+                ("package_min_p".to_owned(), json!(requirements.min_p)),
+                (
+                    "package_minimum_context_tokens".to_owned(),
+                    json!(requirements.minimum_context_tokens),
+                ),
+                ("package_kv_cache".to_owned(), json!(requirements.kv_cache)),
+                (
+                    "package_speculative_backend".to_owned(),
+                    json!(requirements.speculative_backend),
+                ),
+                (
+                    "package_speculative_draft_window".to_owned(),
+                    json!(requirements.speculative_draft_window),
+                ),
+                (
+                    "package_proposal_head".to_owned(),
+                    json!(requirements.proposal_head),
+                ),
+            ]);
+        }
 
         Ok(LaunchSpec {
             executable: binary_path.clone(),
@@ -841,21 +1109,7 @@ impl EngineAdapter for NinferAdapter {
             working_directory: binary_path.parent().map(PathBuf::from),
             temporary_files: vec![request_log_path],
             endpoint: Some(endpoint),
-            normalized_settings: BTreeMap::from([
-                (
-                    "container_version".to_owned(),
-                    json!(expected_identity.container_version),
-                ),
-                (
-                    "native_model_id".to_owned(),
-                    json!(expected_identity.model_id),
-                ),
-                (
-                    "native_weights_id".to_owned(),
-                    json!(expected_identity.weights_id),
-                ),
-                ("request_log_schema".to_owned(), json!(18)),
-            ]),
+            normalized_settings,
             load_settings: request.load_settings,
             native_arguments: self.native_arguments.clone(),
             installation,
@@ -1149,6 +1403,15 @@ struct StartupArtifact {
 
 #[derive(Deserialize)]
 struct StartupEngine {
+    max_context: u64,
+    kv_capacity_mode: String,
+    kv_capacity: u64,
+    kv_cache: String,
+    cuda_graph: bool,
+    prefix_reuse: bool,
+    speculative_backend: String,
+    speculative_draft_window: u64,
+    proposal_head: String,
     context_cost: StartupContextCost,
 }
 
@@ -1170,12 +1433,16 @@ struct StartupSamplingDefaults {
 struct StartupPreset {
     temperature: f64,
     top_p: f64,
+    top_k: u64,
+    min_p: f64,
 }
 
 #[derive(Deserialize)]
 struct StartupOverrides {
     temperature: Option<f64>,
     top_p: Option<f64>,
+    top_k: Option<u64>,
+    min_p: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1303,6 +1570,16 @@ async fn read_and_validate_startup_log(
             .top_p
             .unwrap_or(preset.top_p),
     };
+    let effective_top_k = startup
+        .sampling_defaults
+        .server_overrides
+        .top_k
+        .unwrap_or(preset.top_k);
+    let effective_min_p = startup
+        .sampling_defaults
+        .server_overrides
+        .min_p
+        .unwrap_or(preset.min_p);
     if !defaults.temperature.is_finite()
         || !(0.0..=2.0).contains(&defaults.temperature)
         || !defaults.top_p.is_finite()
@@ -1312,7 +1589,64 @@ async fn read_and_validate_startup_log(
             "NInfer startup sampler defaults are outside the supported API ranges".to_owned(),
         ));
     }
+    if let Some(requirements) = pending.package_requirements.as_ref() {
+        if !startup.server.default_thinking {
+            return Err(EngineError::Operation(
+                "NInfer package startup did not enable thinking by default".to_owned(),
+            ));
+        }
+        if startup.engine.max_context < requirements.minimum_context_tokens {
+            return Err(EngineError::Operation(format!(
+                "NInfer package startup served only {} context tokens; at least {} are required",
+                startup.engine.max_context, requirements.minimum_context_tokens
+            )));
+        }
+        if !matches!(
+            startup.engine.kv_capacity_mode.as_str(),
+            "auto" | "explicit"
+        ) || startup.engine.kv_capacity < startup.engine.max_context
+            || startup.engine.kv_capacity < requirements.minimum_context_tokens
+        {
+            return Err(EngineError::Operation(format!(
+                "NInfer package startup KV capacity {} ({}) does not prove the {}-token serving contract",
+                startup.engine.kv_capacity,
+                startup.engine.kv_capacity_mode,
+                requirements.minimum_context_tokens
+            )));
+        }
+        if startup.engine.kv_cache != requirements.kv_cache
+            || startup.engine.cuda_graph != requirements.cuda_graph
+            || startup.engine.prefix_reuse != requirements.prefix_reuse
+        {
+            return Err(EngineError::Operation(
+                "NInfer package startup did not prove the required KV/CUDA-graph/prefix-reuse policy"
+                    .to_owned(),
+            ));
+        }
+        if startup.engine.speculative_backend != requirements.speculative_backend
+            || startup.engine.speculative_draft_window != requirements.speculative_draft_window
+            || startup.engine.proposal_head != requirements.proposal_head
+        {
+            return Err(EngineError::Operation(
+                "NInfer package startup did not prove the selected MTP0/MTP3 profile".to_owned(),
+            ));
+        }
+        if !approximately_equal(defaults.temperature, requirements.temperature)
+            || !approximately_equal(defaults.top_p, requirements.top_p)
+            || effective_top_k != requirements.top_k
+            || !approximately_equal(effective_min_p, requirements.min_p)
+        {
+            return Err(EngineError::Operation(
+                "NInfer package startup did not resolve the required temperature/top-p/top-k/min-p defaults"
+                    .to_owned(),
+            ));
+        }
+    }
     Ok(Some(defaults))
+}
+
+fn approximately_equal(left: f64, right: f64) -> bool {
+    (left - right).abs() <= f64::EPSILON * left.abs().max(right.abs()).max(1.0) * 8.0
 }
 
 fn create_private_request_log() -> Result<PathBuf, EngineError> {
@@ -1635,6 +1969,51 @@ mod tests {
     }
 
     #[test]
+    fn package_compatibility_is_capability_driven_and_current_sharp_is_precise() {
+        let current = evaluate_ninfer_package_runtime(NinferPackageRuntimeCapabilities {
+            trustworthy_identity: true,
+            external_sharp: false,
+            process_sampler_overrides: true,
+            bounded_server_start: true,
+        });
+        assert!(matches!(
+            current,
+            RuntimeCompatibility::Incompatible(ref reason)
+                if reason.contains("required external Sharp application is unsupported/unproven")
+                    && reason.contains("remain unproven until server_start")
+        ));
+        let future = evaluate_ninfer_package_runtime(NinferPackageRuntimeCapabilities {
+            trustworthy_identity: true,
+            external_sharp: true,
+            process_sampler_overrides: true,
+            bounded_server_start: true,
+        });
+        assert!(matches!(future, RuntimeCompatibility::NeedsAttention(_)));
+    }
+
+    #[test]
+    fn package_sampler_arguments_include_top_k_and_min_p() {
+        let package = ninfer_package_fixture();
+        assert_eq!(
+            ninfer_package_sampler_arguments(&package)
+                .expect("package sampler")
+                .into_iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                "--temperature",
+                "1",
+                "--top-p",
+                "0.95",
+                "--top-k",
+                "20",
+                "--min-p",
+                "0.05",
+            ]
+        );
+    }
+
+    #[test]
     fn current_upstream_target_registry_is_enumerated_exactly() {
         let fixture = tempfile::tempdir().expect("source registry fixture");
         write_registry_target(
@@ -1823,6 +2202,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn package_startup_observation_proves_context_capacity_and_policy() {
+        let temporary = tempfile::NamedTempFile::new().expect("startup log fixture");
+        let mut record = startup_record_fixture(false, false);
+        record["server"]["default_thinking"] = json!(true);
+        record["sampling_defaults"]["server_overrides"] = json!({
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.05
+        });
+        std::fs::write(
+            temporary.path(),
+            format!("{}\n", serde_json::to_string(&record).expect("JSON")),
+        )
+        .expect("write startup log");
+        let mut pending = startup_pending_fixture(temporary.path());
+        pending.package_requirements = Some(NinferStartupRequirements {
+            minimum_context_tokens: 200_000,
+            kv_cache: "int8-group64".to_owned(),
+            cuda_graph: true,
+            prefix_reuse: true,
+            speculative_backend: "none".to_owned(),
+            speculative_draft_window: 0,
+            proposal_head: "full".to_owned(),
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 20,
+            min_p: 0.05,
+        });
+        assert!(
+            read_and_validate_startup_log(&pending)
+                .await
+                .expect("validated package startup")
+                .is_some()
+        );
+
+        record["engine"]["kv_capacity"] = json!(199_999);
+        std::fs::write(
+            temporary.path(),
+            format!("{}\n", serde_json::to_string(&record).expect("JSON")),
+        )
+        .expect("write insufficient startup log");
+        assert!(read_and_validate_startup_log(&pending).await.is_err());
+    }
+
     #[test]
     fn request_sampler_ranges_are_validated_without_clamping() {
         let adapter = NinferAdapter::from_config(None, Path::new("."));
@@ -1921,6 +2346,7 @@ mod tests {
                 driver_version: Some("600".to_owned()),
                 compute_capability: Some(norted_core::ComputeCapability::new(12, 0)),
             },
+            package_requirements: None,
         }
     }
 
@@ -1943,15 +2369,29 @@ mod tests {
                 "weights_id": "groupwise-int"
             },
             "engine": {
+                "max_context": 262144,
+                "kv_capacity_mode": "auto",
+                "kv_capacity": 262144,
+                "kv_cache": "int8-group64",
+                "cuda_graph": true,
+                "prefix_reuse": true,
+                "speculative_backend": "none",
+                "speculative_draft_window": 0,
+                "proposal_head": "full",
                 "context_cost": {
                     "model_id": model_id,
                     "weights_id": "groupwise-int"
                 }
             },
             "sampling_defaults": {
-                "thinking": {"temperature": 0.6, "top_p": 0.95},
-                "non_thinking": {"temperature": 0.25, "top_p": 0.73},
-                "server_overrides": {"temperature": 0.42, "top_p": null},
+                "thinking": {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.05},
+                "non_thinking": {"temperature": 0.25, "top_p": 0.73, "top_k": 20, "min_p": 0.05},
+                "server_overrides": {
+                    "temperature": 0.42,
+                    "top_p": null,
+                    "top_k": null,
+                    "min_p": null
+                },
                 "greedy": greedy
             },
             "environment": {
@@ -1961,6 +2401,70 @@ mod tests {
                 "compute_capability_minor": 0
             }
         })
+    }
+
+    fn ninfer_package_fixture() -> NortedPackageBinding {
+        let benchmark_profiles = BTreeMap::from([
+            (
+                "mtp0".to_owned(),
+                norted_core::NinferBenchmarkProfile {
+                    speculative_decoding: false,
+                    backend: None,
+                    draft_tokens: None,
+                    lm_head_draft: false,
+                },
+            ),
+            (
+                "mtp3".to_owned(),
+                norted_core::NinferBenchmarkProfile {
+                    speculative_decoding: true,
+                    backend: Some("mtp".to_owned()),
+                    draft_tokens: Some(3),
+                    lm_head_draft: true,
+                },
+            ),
+        ]);
+        NortedPackageBinding {
+            kind: norted_core::NortedPackageKind::Ninfer,
+            manifest_schema: "norted.ninfer-manifest".to_owned(),
+            manifest_version: 1,
+            package_root: PathBuf::new(),
+            manifest_path: PathBuf::new(),
+            manifest_sha256: "00".repeat(32),
+            output_key: "groupwise-int".to_owned(),
+            expected_primary_size: 1,
+            expected_primary_sha256: "11".repeat(32),
+            build_key: None,
+            master_id: None,
+            quant_recipe_key: None,
+            canonical_source_lineage_key: None,
+            runtime_policy: None,
+            runtime_policy_id: Some("dirk".to_owned()),
+            runtime_policy_profile: None,
+            sharp: None,
+            sharp_revision: None,
+            sharp_version: None,
+            tokenizer: None,
+            projector: None,
+            policy: NortedPackagePolicy::Ninfer(NinferPackagePolicy {
+                policy_id: "dirk".to_owned(),
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+                min_p: 0.05,
+                thinking_enabled: true,
+                cuda_graph_decode: true,
+                compatible_prefix_reuse: true,
+                text_only_default: true,
+                kv_preference: "int8".to_owned(),
+                minimum_context_tokens: 200_000,
+                benchmark_profiles,
+            }),
+            allowed_user_overrides: vec!["temperature".to_owned(), "top_p".to_owned()],
+            status: norted_core::NortedPackageStatus::NeedsRuntimeCapability {
+                requirements: vec!["Sharp".to_owned()],
+            },
+        }
     }
 
     fn write_registry_target(root: &Path, target: &str, header: &str, package: &str) {

@@ -11,14 +11,15 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
+use minijinja::{Environment, ErrorKind, context};
 use norted_core::{
     AcceleratorDevice, AcquisitionMethod, ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime,
     ComputeCapability, EngineConfig, EngineInstallation, EngineRevision, HostCapabilities,
     InstalledRuntime, LoadSettingDefinition, LoadSettingId, LoadSettingKind, LoadSettingScope,
-    LoadSettingValue, LoadSettingsSchema, ModelArtifact, RuntimeAcquisitionMethod,
-    RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest,
-    RuntimeDownload, RuntimeId, RuntimeIdentity, RuntimePackageIdentity, RuntimeProbeObservation,
-    RuntimeReleaseChannel, RuntimeRequirements,
+    LoadSettingValue, LoadSettingsSchema, ModelArtifact, NortedPackageBinding, NortedPackagePolicy,
+    Q27PackagePolicy, RuntimeAcquisitionMethod, RuntimeAcquisitionPlan, RuntimeArchiveFormat,
+    RuntimeCompatibility, RuntimeDigest, RuntimeDownload, RuntimeId, RuntimeIdentity,
+    RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel, RuntimeRequirements,
 };
 use norted_engine::{
     ApiCapability, CatalogError, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
@@ -52,6 +53,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SSE_FRAME_LIMIT: usize = 1024 * 1024;
+const SHARP_TEMPLATE_LIMIT: u64 = 4 * 1024 * 1024;
 
 // These values can change authentication, sampling, or prompt semantics behind
 // Norted's back. They are removed from the inherited environment and rejected
@@ -62,6 +64,11 @@ const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &[
     "Q27_FORCE_TOP_P",
     "Q27_SAMPLED",
     "Q27_BARE",
+    "Q27_KV",
+    "Q27_MAXD",
+    "Q27_PMIN",
+    "Q27_SUFFIX",
+    "Q27_SUFFIX_W",
     "CUDA_VISIBLE_DEVICES",
 ];
 
@@ -499,13 +506,107 @@ fn q27_compiled_w_max(identity: &RuntimeIdentity, external: bool) -> Option<u64>
     }
 }
 
-fn q27_package_capability_failure(identity: &RuntimeIdentity, external: bool) -> String {
-    let width = q27_compiled_w_max(identity, external)
-        .map(|width| format!("compiled W_MAX={width} is proven"))
-        .unwrap_or_else(|| "numeric compiled W_MAX is not proven".to_owned());
-    format!(
-        "this q27 runtime can load the raw container, and {width}, but it does not expose a proven external Sharp template path or observed >=200000-token capacity for a selected GPU/KV mode required by the Norted Dirk quality package"
-    )
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct Q27PackageRuntimeCapabilities {
+    trustworthy_identity: bool,
+    raw_completions: bool,
+    exact_sharp_renderer: bool,
+    thinking: bool,
+    unlimited_think_budget: bool,
+    temperature_top_p: bool,
+    top_k_min_p: bool,
+    mtp_environment: bool,
+    fast_head_control: bool,
+    bounded_startup_observation: bool,
+    compiled_w_max: Option<u64>,
+}
+
+fn q27_package_capabilities(
+    identity: &RuntimeIdentity,
+    acquisition: &RuntimeAcquisitionMethod,
+) -> Q27PackageRuntimeCapabilities {
+    let external = acquisition == &RuntimeAcquisitionMethod::ExternalBinary;
+    let exact_managed_v062 = !external
+        && identity.engine_id == ENGINE_ID
+        && identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
+        && identity.version == "0.6.2";
+    Q27PackageRuntimeCapabilities {
+        trustworthy_identity: exact_managed_v062,
+        // These are proven directly from q27 v0.6.2 source. New runtime
+        // identities remain unknown until their own provenance/probe is wired.
+        raw_completions: exact_managed_v062,
+        exact_sharp_renderer: exact_managed_v062,
+        thinking: exact_managed_v062,
+        // v0.6.2 has no separate thinking-budget limiter: the ordinary
+        // max-token limit is the only generation bound on its raw route.
+        unlimited_think_budget: exact_managed_v062,
+        temperature_top_p: exact_managed_v062,
+        top_k_min_p: false,
+        mtp_environment: exact_managed_v062,
+        fast_head_control: exact_managed_v062,
+        bounded_startup_observation: exact_managed_v062,
+        compiled_w_max: q27_compiled_w_max(identity, external),
+    }
+}
+
+fn q27_package_prelaunch_failures(
+    capabilities: Q27PackageRuntimeCapabilities,
+) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+    if !capabilities.raw_completions {
+        reasons.push("raw /v1/completions prompt handling is unproven");
+    }
+    if !capabilities.exact_sharp_renderer {
+        reasons.push("exact manifest-bound Sharp application is unproven");
+    }
+    if !capabilities.thinking {
+        reasons.push("thinking-enabled package execution is unproven");
+    }
+    if !capabilities.unlimited_think_budget {
+        reasons.push("unlimited thinking budget is unsupported/unproven");
+    }
+    if !capabilities.temperature_top_p {
+        reasons.push("temperature/top-p package defaults are unsupported/unproven");
+    }
+    if !capabilities.top_k_min_p {
+        reasons.push("top-k/min-p package defaults are unsupported/unproven");
+    }
+    if !capabilities.mtp_environment {
+        reasons.push("Q27_MAXD/Q27_PMIN/Q27_SUFFIX package policy is unproven");
+    }
+    if !capabilities.fast_head_control {
+        reasons.push("fast-head package control is unproven");
+    }
+    if !capabilities.bounded_startup_observation {
+        reasons.push("served context/KV startup observation is unproven");
+    }
+    if capabilities.compiled_w_max.is_none() {
+        reasons.push("numeric compiled W_MAX is unproven");
+    }
+    reasons
+}
+
+fn evaluate_q27_package_runtime(
+    capabilities: Q27PackageRuntimeCapabilities,
+) -> RuntimeCompatibility {
+    if !capabilities.trustworthy_identity {
+        return RuntimeCompatibility::NeedsAttention(
+            "the exact q27 executable has no trustworthy package-capability observation; external binaries are not credited from filenames or upstream version assumptions"
+                .to_owned(),
+        );
+    }
+    let failures = q27_package_prelaunch_failures(capabilities);
+    if failures.is_empty() {
+        RuntimeCompatibility::NeedsAttention(
+            "pre-launch q27 package capabilities are proven; actual served context, KV mode, and W_MAX still require bounded startup observation"
+                .to_owned(),
+        )
+    } else {
+        RuntimeCompatibility::Incompatible(format!(
+            "{}; actual served context and selected KV mode are not yet proven because startup cannot proceed",
+            failures.join("; ")
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -713,6 +814,106 @@ pub struct Q27Adapter {
     configuration_error: Option<String>,
     client: reqwest::Client,
     capability_cache: tokio::sync::RwLock<BTreeMap<String, String>>,
+    package_executions: tokio::sync::RwLock<BTreeMap<String, Q27PackageExecution>>,
+}
+
+#[derive(Debug, Clone)]
+struct Q27PackageExecution {
+    sharp_template: String,
+    policy: Q27PackagePolicy,
+    compiled_w_max: u64,
+    expected_fast_head: bool,
+}
+
+#[derive(Debug)]
+struct Q27PackageLaunchPolicy {
+    arguments: Vec<OsString>,
+    environment: BTreeMap<String, String>,
+    normalized_settings: BTreeMap<String, Value>,
+}
+
+fn q27_package_policy(package: &NortedPackageBinding) -> Result<&Q27PackagePolicy, EngineError> {
+    match &package.policy {
+        NortedPackagePolicy::Q27(policy) => Ok(policy),
+        _ => Err(EngineError::InvalidConfiguration(
+            "q27 received a non-q27 Norted package policy".to_owned(),
+        )),
+    }
+}
+
+fn q27_selected_fast_head(
+    settings: &norted_core::ResolvedLoadSettings,
+    policy: &Q27PackagePolicy,
+) -> Result<bool, EngineError> {
+    match settings.value("q27.fast_head") {
+        Some(LoadSettingValue::Toggle(value)) => Ok(*value),
+        None => Ok(policy.fast_head_default),
+        Some(_) => Err(EngineError::InvalidConfiguration(
+            "q27.fast_head has an invalid package-policy value".to_owned(),
+        )),
+    }
+}
+
+fn q27_package_launch_policy(
+    package: &NortedPackageBinding,
+    compiled_w_max: u64,
+    fast_head: bool,
+) -> Result<Q27PackageLaunchPolicy, EngineError> {
+    let policy = q27_package_policy(package)?;
+    let arguments = [
+        "--think".to_owned(),
+        "--think-budget".to_owned(),
+        "0".to_owned(),
+        "--temp".to_owned(),
+        policy.temperature.to_string(),
+        "--top-p".to_owned(),
+        policy.top_p.to_string(),
+        "--top-k".to_owned(),
+        policy.top_k.to_string(),
+        "--min-p".to_owned(),
+        policy.min_p.to_string(),
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    let environment = BTreeMap::from([
+        ("Q27_KV".to_owned(), "fp8".to_owned()),
+        ("Q27_MAXD".to_owned(), policy.maximum_mtp_depth.clone()),
+        (
+            "Q27_PMIN".to_owned(),
+            policy.mtp_minimum_probability.to_string(),
+        ),
+        (
+            "Q27_SUFFIX".to_owned(),
+            u8::from(policy.suffix_drafting).to_string(),
+        ),
+        ("Q27_SUFFIX_W".to_owned(), compiled_w_max.to_string()),
+    ]);
+    let normalized_settings = BTreeMap::from([
+        ("temperature".to_owned(), json!(policy.temperature)),
+        ("top_p".to_owned(), json!(policy.top_p)),
+        ("top_k".to_owned(), json!(policy.top_k)),
+        ("min_p".to_owned(), json!(policy.min_p)),
+        ("thinking".to_owned(), json!(policy.thinking_enabled)),
+        ("thinking_budget".to_owned(), json!("unlimited")),
+        (
+            "default_reasoning_effort".to_owned(),
+            json!(policy.default_reasoning_effort),
+        ),
+        ("requested_context".to_owned(), json!("auto")),
+        (
+            "minimum_context_tokens".to_owned(),
+            json!(policy.minimum_context_tokens),
+        ),
+        ("requested_kv_mode".to_owned(), json!("fp8")),
+        ("compiled_w_max".to_owned(), json!(compiled_w_max)),
+        ("fast_head".to_owned(), json!(fast_head)),
+    ]);
+    Ok(Q27PackageLaunchPolicy {
+        arguments,
+        environment,
+        normalized_settings,
+    })
 }
 
 impl Q27Adapter {
@@ -833,6 +1034,7 @@ impl Q27Adapter {
             configuration_error,
             client,
             capability_cache: tokio::sync::RwLock::new(BTreeMap::new()),
+            package_executions: tokio::sync::RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -986,6 +1188,35 @@ impl Q27Adapter {
         }
         body
     }
+
+    fn package_backend_request(
+        execution: &Q27PackageExecution,
+        request: &InferenceRequest,
+        stream: bool,
+    ) -> Result<Value, EngineError> {
+        let mut body = json!({
+            "model": request.model_id.0,
+            "prompt": render_sharp_template(&execution.sharp_template, &request.messages)?,
+            "temperature": request
+                .generation_settings
+                .temperature
+                .unwrap_or(execution.policy.temperature),
+            "top_p": request
+                .generation_settings
+                .top_p
+                .unwrap_or(execution.policy.top_p),
+            "top_k": execution.policy.top_k,
+            "min_p": execution.policy.min_p,
+            "stream": stream,
+        });
+        if let Some(maximum) = request.max_output_tokens {
+            body["max_tokens"] = json!(maximum);
+        }
+        if stream {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
+        Ok(body)
+    }
 }
 
 #[async_trait]
@@ -1118,12 +1349,6 @@ impl EngineAdapter for Q27Adapter {
         model: &ModelArtifact,
         host: &HostCapabilities,
     ) -> RuntimeCompatibility {
-        if model.norted_package.is_some() {
-            return RuntimeCompatibility::Incompatible(q27_package_capability_failure(
-                &runtime.manifest.identity,
-                runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
-            ));
-        }
         let facts = match inspect_q27_model(&model.path) {
             Ok(facts) => facts,
             Err(reason) => return RuntimeCompatibility::Incompatible(reason),
@@ -1136,7 +1361,18 @@ impl EngineAdapter for Q27Adapter {
             host,
             runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
         );
-        qualify_tier_compatibility(facts.tier, evaluation.compatibility)
+        let artifact_and_device = qualify_tier_compatibility(facts.tier, evaluation.compatibility);
+        if model.norted_package.is_some() {
+            combine_q27_compatibility(
+                artifact_and_device,
+                evaluate_q27_package_runtime(q27_package_capabilities(
+                    &runtime.manifest.identity,
+                    &runtime.manifest.acquisition_method,
+                )),
+            )
+        } else {
+            artifact_and_device
+        }
     }
 
     fn runtime_model_preference(
@@ -1159,6 +1395,31 @@ impl EngineAdapter for Q27Adapter {
         q27_runtime_preference(&runtime.manifest.identity.variant, accelerator.as_ref())
     }
 
+    fn runtime_package_sharp_compatibility(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+    ) -> Option<RuntimeCompatibility> {
+        model.norted_package.as_ref()?;
+        let capabilities = q27_package_capabilities(
+            &runtime.manifest.identity,
+            &runtime.manifest.acquisition_method,
+        );
+        Some(if !capabilities.trustworthy_identity {
+            RuntimeCompatibility::NeedsAttention(
+                "external Sharp/raw-prompt capability is unproven for this exact q27 executable"
+                    .to_owned(),
+            )
+        } else if capabilities.exact_sharp_renderer && capabilities.raw_completions {
+            RuntimeCompatibility::Compatible
+        } else {
+            RuntimeCompatibility::Incompatible(
+                "manifest-bound Sharp rendering into q27 raw completions is unsupported/unproven"
+                    .to_owned(),
+            )
+        })
+    }
+
     fn available_runtime_model_compatibility(
         &self,
         runtime: &AvailableRuntime,
@@ -1167,12 +1428,6 @@ impl EngineAdapter for Q27Adapter {
     ) -> RuntimeCompatibility {
         if let CompatibilityDecision::Unsupported { reason } = self.compatibility(model) {
             return RuntimeCompatibility::Incompatible(reason);
-        }
-        if model.norted_package.is_some() {
-            return RuntimeCompatibility::Incompatible(q27_package_capability_failure(
-                &runtime.identity,
-                false,
-            ));
         }
         let facts = match inspect_q27_model(&model.path) {
             Ok(facts) => facts,
@@ -1186,7 +1441,24 @@ impl EngineAdapter for Q27Adapter {
             host,
             false,
         );
-        qualify_tier_compatibility(facts.tier, evaluation.compatibility)
+        let artifact_and_device = qualify_tier_compatibility(facts.tier, evaluation.compatibility);
+        if model.norted_package.is_some() {
+            let acquisition = match runtime.acquisition {
+                RuntimeAcquisitionPlan::ReleaseAsset { .. } => {
+                    RuntimeAcquisitionMethod::OfficialReleaseAsset
+                }
+                RuntimeAcquisitionPlan::SourceBuild(_) => RuntimeAcquisitionMethod::SourceBuild,
+            };
+            combine_q27_compatibility(
+                artifact_and_device,
+                evaluate_q27_package_runtime(q27_package_capabilities(
+                    &runtime.identity,
+                    &acquisition,
+                )),
+            )
+        } else {
+            artifact_and_device
+        }
     }
 
     fn available_runtime_model_preference(
@@ -1428,23 +1700,33 @@ impl EngineAdapter for Q27Adapter {
                 "q27 can only launch Q27 model artifacts".to_owned(),
             ));
         }
-        if request.model.primary.norted_package.is_some() {
-            let width = q27_compiled_w_max(
+        let package_capabilities = request.model.primary.norted_package.as_ref().map(|_| {
+            q27_package_capabilities(
                 &request.runtime.manifest.identity,
-                request.runtime.manifest.acquisition_method
-                    == RuntimeAcquisitionMethod::ExternalBinary,
+                &request.runtime.manifest.acquisition_method,
             )
-            .map_or_else(|| "unproven".to_owned(), |width| width.to_string());
-            return Err(EngineError::InvalidConfiguration(format!(
-                "selected q27 runtime cannot launch the Norted Dirk quality package: compiled W_MAX is {width}, but exact Sharp application and >=200000-token capacity for a selected KV mode are not proven"
-            )));
+        });
+        if let Some(capabilities) = package_capabilities {
+            if !capabilities.trustworthy_identity {
+                return Err(EngineError::InvalidConfiguration(
+                    "selected q27 executable has no trustworthy observation proving the Norted package capability contract"
+                        .to_owned(),
+                ));
+            }
+            let failures = q27_package_prelaunch_failures(capabilities);
+            if !failures.is_empty() {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "selected q27 runtime cannot launch the Norted package: {}",
+                    failures.join("; ")
+                )));
+            }
         }
         request
             .load_settings_schema
             .validate(&request.load_settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
         revalidate_norted_package_before_launch(&request.model).await?;
-        let structured = translate_q27_load_settings(
+        let mut structured = translate_q27_load_settings(
             &request.load_settings,
             &self.native_arguments,
             &self.environment,
@@ -1486,6 +1768,39 @@ impl EngineAdapter for Q27Adapter {
         };
         let tokenizer_path = revalidate_prepared_tokenizer(tokenizer).await?;
         let observation = self.probe_runtime(&request.runtime).await?;
+        let package_execution = if let Some(package) = request.model.primary.norted_package.as_ref()
+        {
+            let capabilities = package_capabilities.expect("package capabilities");
+            let compiled_w_max = capabilities.compiled_w_max.ok_or_else(|| {
+                EngineError::InvalidConfiguration(
+                    "q27 package launch has no proven numeric compiled W_MAX".to_owned(),
+                )
+            })?;
+            remove_q27_value_argument(&mut structured.arguments, "--ctx")?;
+            structured
+                .arguments
+                .extend([OsString::from("--ctx"), OsString::from("auto")]);
+            let sharp_template = read_prepared_sharp_template(&request.model).await?;
+            validate_sharp_template(&sharp_template)?;
+            Some((
+                Q27PackageExecution {
+                    sharp_template,
+                    policy: q27_package_policy(package)?.clone(),
+                    compiled_w_max,
+                    expected_fast_head: q27_selected_fast_head(
+                        &request.load_settings,
+                        q27_package_policy(package)?,
+                    )?,
+                },
+                q27_package_launch_policy(
+                    package,
+                    compiled_w_max,
+                    q27_selected_fast_head(&request.load_settings, q27_package_policy(package)?)?,
+                )?,
+            ))
+        } else {
+            None
+        };
         let binary_path = request.runtime.entrypoint_path();
         let manifest = &request.runtime.manifest;
         let installation = EngineInstallation {
@@ -1512,28 +1827,47 @@ impl EngineAdapter for Q27Adapter {
             acquired_at_unix: manifest.installed_at_unix,
             observed_at_unix: observation.observed_at_unix,
         };
-        let arguments = vec![
+        let mut arguments = vec![
             model_path.as_os_str().to_owned(),
             tokenizer_path.as_os_str().to_owned(),
             OsString::from("--host"),
             OsString::from(request.backend_address.ip().to_string()),
             OsString::from("--port"),
             OsString::from(request.backend_address.port().to_string()),
-            OsString::from("--no-think"),
-        ]
-        .into_iter()
-        .chain(structured.arguments)
-        .chain(self.native_arguments.iter().map(OsString::from))
-        .collect();
+        ];
+        if let Some((_, package_launch)) = package_execution.as_ref() {
+            arguments.extend(package_launch.arguments.iter().cloned());
+        } else {
+            arguments.push(OsString::from("--no-think"));
+        }
+        arguments.extend(structured.arguments);
+        arguments.extend(self.native_arguments.iter().map(OsString::from));
         let accelerator = request.accelerator.ok_or_else(|| {
             EngineError::InvalidConfiguration(
                 "q27 launch has no exact NVIDIA GPU selected by compatibility evaluation"
                     .to_owned(),
             )
         })?;
-        let environment = q27_launch_environment(&self.environment, &accelerator)?;
+        let mut environment = q27_launch_environment(&self.environment, &accelerator)?;
+        if let Some((_, package_launch)) = package_execution.as_ref() {
+            environment.extend(package_launch.environment.clone());
+        }
         let mut environment_remove = managed_environment_removals();
         environment_remove.extend(structured.environment_remove);
+        let endpoint = http_endpoint(request.backend_address);
+        let normalized_settings = if let Some((execution, package_launch)) = package_execution {
+            self.package_executions
+                .write()
+                .await
+                .insert(endpoint.clone(), execution);
+            package_launch.normalized_settings
+        } else {
+            BTreeMap::from([
+                ("temperature".to_owned(), json!(0.0)),
+                ("top_p".to_owned(), json!(1.0)),
+                ("thinking".to_owned(), json!(false)),
+            ])
+        };
         Ok(LaunchSpec {
             executable: binary_path,
             arguments,
@@ -1542,12 +1876,8 @@ impl EngineAdapter for Q27Adapter {
             inherits_parent_environment: true,
             working_directory: None,
             temporary_files: Vec::new(),
-            endpoint: Some(http_endpoint(request.backend_address)),
-            normalized_settings: BTreeMap::from([
-                ("temperature".to_owned(), json!(0.0)),
-                ("top_p".to_owned(), json!(1.0)),
-                ("thinking".to_owned(), json!(false)),
-            ]),
+            endpoint: Some(endpoint),
+            normalized_settings,
             load_settings: request.load_settings,
             native_arguments: self.native_arguments.clone(),
             installation,
@@ -1583,17 +1913,97 @@ impl EngineAdapter for Q27Adapter {
         Ok(health.status == "ok")
     }
 
+    async fn startup_observation(
+        &self,
+        process: &ProcessDescriptor,
+        stderr_tail: &[String],
+    ) -> Result<BTreeMap<String, Value>, EngineError> {
+        let endpoint = process.endpoint.as_deref().ok_or_else(|| {
+            EngineError::Operation("q27 process has no backend endpoint".to_owned())
+        })?;
+        let executions = self.package_executions.read().await;
+        let Some(execution) = executions.get(endpoint) else {
+            return Ok(BTreeMap::new());
+        };
+        let observed = parse_q27_startup_observation(stderr_tail)?;
+        if observed.served_context < execution.policy.minimum_context_tokens {
+            return Err(EngineError::Operation(format!(
+                "q27 served only {} context tokens; the package requires at least {}",
+                observed.served_context, execution.policy.minimum_context_tokens
+            )));
+        }
+        if !execution
+            .policy
+            .kv_preference
+            .iter()
+            .any(|mode| mode == &observed.kv_mode)
+        {
+            return Err(EngineError::Operation(format!(
+                "q27 selected unsupported package KV mode `{}`",
+                observed.kv_mode
+            )));
+        }
+        if observed.compiled_w_max != execution.compiled_w_max
+            || observed.suffix_width != execution.compiled_w_max
+        {
+            return Err(EngineError::Operation(format!(
+                "q27 startup W_MAX/suffix proof ({}/{}) disagrees with the pre-launch numeric W_MAX {}",
+                observed.compiled_w_max, observed.suffix_width, execution.compiled_w_max
+            )));
+        }
+        if !observed.thinking
+            || observed.fast_head != execution.expected_fast_head
+            || observed.maximum_mtp_depth != execution.policy.maximum_mtp_depth
+            || !approximately_equal(
+                observed.mtp_minimum_probability(),
+                execution.policy.mtp_minimum_probability,
+            )
+            || observed.suffix_drafting != execution.policy.suffix_drafting
+        {
+            return Err(EngineError::Operation(
+                "q27 startup profile disagrees with the Norted thinking/MTP/fast-head policy"
+                    .to_owned(),
+            ));
+        }
+        Ok(BTreeMap::from([
+            (
+                "observed_served_context".to_owned(),
+                json!(observed.served_context),
+            ),
+            ("observed_kv_mode".to_owned(), json!(observed.kv_mode)),
+            (
+                "observed_compiled_w_max".to_owned(),
+                json!(observed.compiled_w_max),
+            ),
+            (
+                "sharp_application".to_owned(),
+                json!("pretokenized-raw-prompt"),
+            ),
+        ]))
+    }
+
     async fn effective_generation_settings(
         &self,
-        _process: &ProcessDescriptor,
+        process: &ProcessDescriptor,
     ) -> Result<EffectiveGenerationSettings, EngineError> {
         // q27 exposes no effective-config endpoint. These values are owned by
         // this adapter, sent explicitly on every request, and force env vars
         // are removed from the child environment.
-        Ok(EffectiveGenerationSettings {
-            temperature: 0.0,
-            top_p: 1.0,
-        })
+        let package = if let Some(endpoint) = process.endpoint.as_deref() {
+            self.package_executions.read().await.get(endpoint).cloned()
+        } else {
+            None
+        };
+        Ok(package.map_or(
+            EffectiveGenerationSettings {
+                temperature: 0.0,
+                top_p: 1.0,
+            },
+            |execution| EffectiveGenerationSettings {
+                temperature: execution.policy.temperature,
+                top_p: execution.policy.top_p,
+            },
+        ))
     }
 
     async fn infer(
@@ -1601,11 +2011,23 @@ impl EngineAdapter for Q27Adapter {
         endpoint: &str,
         request: InferenceRequest,
     ) -> Result<InferenceOutput, EngineError> {
+        let package = self.package_executions.read().await.get(endpoint).cloned();
+        let (route, body) = if let Some(execution) = package.as_ref() {
+            (
+                "/v1/completions",
+                Self::package_backend_request(execution, &request, false)?,
+            )
+        } else {
+            (
+                "/v1/chat/completions",
+                self.backend_request(&request, false),
+            )
+        };
         let response = self
             .client
-            .post(format!("{endpoint}/v1/chat/completions"))
+            .post(format!("{endpoint}{route}"))
             .timeout(INFERENCE_TIMEOUT)
-            .json(&self.backend_request(&request, false))
+            .json(&body)
             .send()
             .await
             .map_err(map_transport_error)?;
@@ -1623,9 +2045,12 @@ impl EngineAdapter for Q27Adapter {
         let choice = response.choices.into_iter().next().ok_or_else(|| {
             EngineError::Operation("q27 response contained no completion choice".to_owned())
         })?;
-        let text = choice.message.content.ok_or_else(|| {
-            EngineError::Operation("q27 response contained no assistant text".to_owned())
-        })?;
+        let text = choice
+            .text
+            .or_else(|| choice.message.and_then(|message| message.content))
+            .ok_or_else(|| {
+                EngineError::Operation("q27 response contained no assistant text".to_owned())
+            })?;
         Ok(InferenceOutput {
             text,
             usage: response.usage.map(Into::into),
@@ -1638,11 +2063,20 @@ impl EngineAdapter for Q27Adapter {
         endpoint: &str,
         request: InferenceRequest,
     ) -> Result<InferenceStream, EngineError> {
+        let package = self.package_executions.read().await.get(endpoint).cloned();
+        let (route, body) = if let Some(execution) = package.as_ref() {
+            (
+                "/v1/completions",
+                Self::package_backend_request(execution, &request, true)?,
+            )
+        } else {
+            ("/v1/chat/completions", self.backend_request(&request, true))
+        };
         let response = self
             .client
-            .post(format!("{endpoint}/v1/chat/completions"))
+            .post(format!("{endpoint}{route}"))
             .timeout(INFERENCE_TIMEOUT)
-            .json(&self.backend_request(&request, true))
+            .json(&body)
             .send()
             .await
             .map_err(map_transport_error)?;
@@ -1656,6 +2090,269 @@ impl EngineAdapter for Q27Adapter {
         }
         Ok(q27_sse_stream(response.bytes_stream().boxed()))
     }
+}
+
+fn remove_q27_value_argument(
+    arguments: &mut Vec<OsString>,
+    option: &str,
+) -> Result<(), EngineError> {
+    let positions = arguments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| (argument == option).then_some(index))
+        .collect::<Vec<_>>();
+    let [index] = positions.as_slice() else {
+        return Err(EngineError::InvalidConfiguration(format!(
+            "q27 package policy expected exactly one structured `{option}` argument"
+        )));
+    };
+    if *index + 1 >= arguments.len() {
+        return Err(EngineError::InvalidConfiguration(format!(
+            "q27 structured `{option}` argument has no value"
+        )));
+    }
+    arguments.drain(*index..=*index + 1);
+    Ok(())
+}
+
+async fn read_prepared_sharp_template(model: &PreparedModelInput) -> Result<String, EngineError> {
+    let sharp = model
+        .auxiliary
+        .iter()
+        .filter(|artifact| artifact.role == AuxiliaryArtifactRole::Sharp)
+        .collect::<Vec<_>>();
+    let [sharp] = sharp.as_slice() else {
+        return Err(EngineError::InvalidConfiguration(
+            "prepared q27 Norted package must contain exactly one manifest-bound Sharp template"
+                .to_owned(),
+        ));
+    };
+    let file = tokio::fs::File::open(&sharp.path).await.map_err(|error| {
+        EngineError::InvalidConfiguration(format!(
+            "could not open prepared Sharp template {}: {error}",
+            sharp.path.display()
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    file.take(SHARP_TEMPLATE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| {
+            EngineError::InvalidConfiguration(format!(
+                "could not read prepared Sharp template {}: {error}",
+                sharp.path.display()
+            ))
+        })?;
+    if bytes.len() as u64 > SHARP_TEMPLATE_LIMIT {
+        return Err(EngineError::InvalidConfiguration(
+            "prepared Sharp template exceeded the local size limit".to_owned(),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        EngineError::InvalidConfiguration("prepared Sharp template is not UTF-8".to_owned())
+    })
+}
+
+fn sharp_environment<'source>() -> Environment<'source> {
+    let mut environment = Environment::new();
+    environment.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    environment.add_function(
+        "raise_exception",
+        |message: String| -> Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(ErrorKind::InvalidOperation, message))
+        },
+    );
+    environment
+}
+
+fn render_sharp_template(
+    template_source: &str,
+    messages: &[InferenceMessage],
+) -> Result<String, EngineError> {
+    let mut environment = sharp_environment();
+    environment
+        .add_template("sharp", template_source)
+        .map_err(|error| {
+            EngineError::InvalidConfiguration(format!(
+                "manifest-bound Sharp template is not supported by the exact Jinja renderer: {error}"
+            ))
+        })?;
+    let template = environment.get_template("sharp").map_err(|error| {
+        EngineError::InvalidConfiguration(format!(
+            "manifest-bound Sharp template could not be loaded: {error}"
+        ))
+    })?;
+    let messages = messages.iter().map(sharp_message_json).collect::<Vec<_>>();
+    template
+        .render(context! {
+            messages => messages,
+            add_generation_prompt => true,
+            enable_thinking => true,
+            reasoning_effort => "medium",
+            tools => Vec::<Value>::new(),
+        })
+        .map_err(|error| {
+            EngineError::InvalidConfiguration(format!(
+                "manifest-bound Sharp rendering failed: {error}"
+            ))
+        })
+}
+
+fn validate_sharp_template(template_source: &str) -> Result<(), EngineError> {
+    let rendered = render_sharp_template(
+        template_source,
+        &[InferenceMessage {
+            role: InferenceRole::User,
+            text: "Sharp startup validation".to_owned(),
+        }],
+    )?;
+    if !rendered.contains("<|im_start|>user\nSharp startup validation<|im_end|>")
+        || !rendered.ends_with("<|im_start|>assistant\n<think>\n")
+    {
+        return Err(EngineError::InvalidConfiguration(
+            "manifest-bound Sharp template did not produce the required raw user/assistant token framing"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct Q27StartupObservation {
+    served_context: u64,
+    kv_mode: String,
+    compiled_w_max: u64,
+    suffix_width: u64,
+    maximum_mtp_depth: String,
+    mtp_minimum_probability_bits: u64,
+    suffix_drafting: bool,
+    fast_head: bool,
+    thinking: bool,
+}
+
+impl Q27StartupObservation {
+    fn mtp_minimum_probability(&self) -> f64 {
+        f64::from_bits(self.mtp_minimum_probability_bits)
+    }
+}
+
+fn parse_q27_startup_observation(
+    stderr_tail: &[String],
+) -> Result<Q27StartupObservation, EngineError> {
+    if stderr_tail.len() > 80 || stderr_tail.iter().any(|line| line.len() > 4_096) {
+        return Err(EngineError::Operation(
+            "q27 startup observation exceeded the bounded supervisor log contract".to_owned(),
+        ));
+    }
+    let profile = stderr_tail
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("profile:"))
+        .ok_or_else(|| {
+            EngineError::BackendUnavailable(
+                "q27 startup profile line has not been observed yet".to_owned(),
+            )
+        })?;
+    let auto = stderr_tail
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("--ctx auto:"))
+        .ok_or_else(|| {
+            EngineError::BackendUnavailable(
+                "q27 auto-context resolution has not been observed yet".to_owned(),
+            )
+        })?;
+    let slot = stderr_tail
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("slot 0 ready: ctx="))
+        .ok_or_else(|| {
+            EngineError::BackendUnavailable(
+                "q27 served slot context has not been observed yet".to_owned(),
+            )
+        })?;
+
+    let profile_kv = startup_token(profile, "kv=")?;
+    let maximum_mtp_depth = startup_token(profile, "maxd=")?.to_owned();
+    let pmin = startup_token(profile, "pmin=")?
+        .parse::<f64>()
+        .map_err(|_| EngineError::Operation("q27 startup P_MIN was not numeric".to_owned()))?;
+    let suffix = startup_token(profile, "suffix=")?;
+    let (suffix_enabled, suffix_width) = suffix.split_once("/w").ok_or_else(|| {
+        EngineError::Operation("q27 startup suffix profile had no numeric width".to_owned())
+    })?;
+    let suffix_width = suffix_width.parse::<u64>().map_err(|_| {
+        EngineError::Operation("q27 startup suffix width was not numeric".to_owned())
+    })?;
+    let fast_head = parse_startup_bool(startup_token(profile, "fast-head=")?, "fast-head")?;
+    let thinking = parse_startup_bool(startup_token(profile, "think=")?, "thinking")?;
+
+    let auto_context = auto
+        .strip_prefix("--ctx auto:")
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            EngineError::Operation("q27 resolved auto context was not numeric".to_owned())
+        })?;
+    let served_context = slot
+        .strip_prefix("slot 0 ready: ctx=")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .ok_or_else(|| EngineError::Operation("q27 served context was not numeric".to_owned()))?;
+    if served_context != auto_context {
+        return Err(EngineError::Operation(format!(
+            "q27 served context {served_context} disagrees with auto-context resolution {auto_context}"
+        )));
+    }
+    let compiled_w_max = startup_parenthesized_value(auto, "W_MAX=")?
+        .parse::<u64>()
+        .map_err(|_| EngineError::Operation("q27 startup W_MAX was not numeric".to_owned()))?;
+    let kv_mode = ["fp8", "turbo5k", "turbo3", "turbo3v", "fp16"]
+        .into_iter()
+        .find(|mode| auto.contains(&format!("{mode} KV")))
+        .ok_or_else(|| EngineError::Operation("q27 startup KV mode was not recognized".to_owned()))?
+        .to_owned();
+    if kv_mode != profile_kv {
+        return Err(EngineError::Operation(format!(
+            "q27 startup KV profile `{profile_kv}` disagrees with auto-context mode `{kv_mode}`"
+        )));
+    }
+    Ok(Q27StartupObservation {
+        served_context,
+        kv_mode,
+        compiled_w_max,
+        suffix_width,
+        maximum_mtp_depth,
+        mtp_minimum_probability_bits: pmin.to_bits(),
+        suffix_drafting: suffix_enabled == "1",
+        fast_head,
+        thinking,
+    })
+}
+
+fn startup_token<'a>(line: &'a str, prefix: &str) -> Result<&'a str, EngineError> {
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(prefix))
+        .ok_or_else(|| EngineError::Operation(format!("q27 startup profile omitted `{prefix}`")))
+}
+
+fn startup_parenthesized_value<'a>(line: &'a str, prefix: &str) -> Result<&'a str, EngineError> {
+    line.split(|character: char| character.is_whitespace() || matches!(character, ',' | ')'))
+        .find_map(|token| token.strip_prefix(prefix))
+        .ok_or_else(|| EngineError::Operation(format!("q27 startup output omitted `{prefix}`")))
+}
+
+fn parse_startup_bool(value: &str, label: &str) -> Result<bool, EngineError> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(EngineError::Operation(format!(
+            "q27 startup {label} value was not boolean"
+        ))),
+    }
+}
+
+fn approximately_equal(left: f64, right: f64) -> bool {
+    (left - right).abs() <= f64::EPSILON * left.abs().max(right.abs()).max(1.0) * 8.0
 }
 
 async fn canonical_regular_file(path: &Path, description: &str) -> Result<PathBuf, EngineError> {
@@ -1829,7 +2526,8 @@ struct ChatCompletionResponse {
 
 #[derive(Deserialize)]
 struct ChatChoice {
-    message: ChatMessage,
+    message: Option<ChatMessage>,
+    text: Option<String>,
     finish_reason: Option<String>,
 }
 
@@ -2000,8 +2698,11 @@ fn parse_sse_frames(state: &mut SseState) {
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("delta"))
-            .and_then(|delta| delta.get("content"))
+            .and_then(|choice| {
+                choice
+                    .get("text")
+                    .or_else(|| choice.get("delta").and_then(|delta| delta.get("content")))
+            })
             .and_then(Value::as_str)
             .filter(|delta| !delta.is_empty())
         {
@@ -2028,6 +2729,18 @@ fn message_json(message: &InferenceMessage) -> Value {
     json!({
         "role": match message.role {
             InferenceRole::System | InferenceRole::Developer => "system",
+            InferenceRole::User => "user",
+            InferenceRole::Assistant => "assistant",
+        },
+        "content": message.text,
+    })
+}
+
+fn sharp_message_json(message: &InferenceMessage) -> Value {
+    json!({
+        "role": match message.role {
+            InferenceRole::System => "system",
+            InferenceRole::Developer => "developer",
             InferenceRole::User => "user",
             InferenceRole::Assistant => "assistant",
         },
@@ -2540,6 +3253,77 @@ mod tests {
             .collect()
     }
 
+    fn q27_runtime_identity(variant: &str) -> RuntimeIdentity {
+        RuntimeIdentity {
+            engine_id: ENGINE_ID.to_owned(),
+            package_family: PACKAGE_FAMILY.to_owned(),
+            version: "0.6.2".to_owned(),
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            accelerator: "cuda".to_owned(),
+            variant: variant.to_owned(),
+            upstream_revision: None,
+            package: RuntimePackageIdentity {
+                provider_id: PROVIDER_ID.to_owned(),
+                repository: Some(GITHUB_REPOSITORY.to_owned()),
+                release_tag: Some("v0.6.2".to_owned()),
+                asset_id: Some("1".to_owned()),
+                asset_name: Some("q27-v0.6.2-linux-x86_64.tar.gz".to_owned()),
+                additional_assets: Vec::new(),
+            },
+        }
+    }
+
+    fn q27_package_fixture() -> NortedPackageBinding {
+        NortedPackageBinding {
+            kind: norted_core::NortedPackageKind::Q27,
+            manifest_schema: "norted.q27-package".to_owned(),
+            manifest_version: 1,
+            package_root: PathBuf::new(),
+            manifest_path: PathBuf::new(),
+            manifest_sha256: "00".repeat(32),
+            output_key: "q6".to_owned(),
+            expected_primary_size: 1,
+            expected_primary_sha256: "11".repeat(32),
+            build_key: None,
+            master_id: None,
+            quant_recipe_key: None,
+            canonical_source_lineage_key: Some("22".repeat(32)),
+            runtime_policy: None,
+            runtime_policy_id: None,
+            runtime_policy_profile: Some("quality".to_owned()),
+            sharp: None,
+            sharp_revision: Some("sharp".to_owned()),
+            sharp_version: Some("1".to_owned()),
+            tokenizer: None,
+            projector: None,
+            policy: NortedPackagePolicy::Q27(Q27PackagePolicy {
+                profile: "quality".to_owned(),
+                target: "qwen3.8-27b".to_owned(),
+                thinking_enabled: true,
+                default_reasoning_effort: "medium".to_owned(),
+                unlimited_thinking_budget: true,
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 20,
+                min_p: 0.05,
+                maximum_mtp_depth: "auto7".to_owned(),
+                mtp_minimum_probability: 0.5,
+                suffix_drafting: true,
+                suffix_width_from_runtime_w_max: true,
+                fast_head_default: false,
+                fast_head_override_allowed: true,
+                preferred_context_tokens: 262_144,
+                minimum_context_tokens: 200_000,
+                kv_preference: vec!["fp8".to_owned(), "turbo5k".to_owned(), "turbo3".to_owned()],
+            }),
+            allowed_user_overrides: vec!["temperature".to_owned(), "top_p".to_owned()],
+            status: norted_core::NortedPackageStatus::NeedsRuntimeCapability {
+                requirements: vec!["runtime".to_owned()],
+            },
+        }
+    }
+
     #[test]
     fn official_q27_variants_have_source_proven_compiled_widths() {
         let mut identity = RuntimeIdentity {
@@ -2566,6 +3350,137 @@ mod tests {
         identity.variant = "w16".to_owned();
         assert_eq!(q27_compiled_w_max(&identity, false), Some(16));
         assert_eq!(q27_compiled_w_max(&identity, true), None);
+    }
+
+    #[test]
+    fn exact_old_runtime_has_precise_package_capability_failures() {
+        let identity = q27_runtime_identity("w12");
+        let compatibility = evaluate_q27_package_runtime(q27_package_capabilities(
+            &identity,
+            &RuntimeAcquisitionMethod::OfficialReleaseAsset,
+        ));
+        assert!(matches!(
+            compatibility,
+            RuntimeCompatibility::Incompatible(ref reason)
+                if reason.contains("top-k/min-p")
+                    && !reason.contains("all Norted packages")
+        ));
+
+        let synthetic = evaluate_q27_package_runtime(Q27PackageRuntimeCapabilities {
+            trustworthy_identity: true,
+            raw_completions: true,
+            exact_sharp_renderer: true,
+            thinking: true,
+            unlimited_think_budget: true,
+            temperature_top_p: true,
+            top_k_min_p: true,
+            mtp_environment: true,
+            fast_head_control: true,
+            bounded_startup_observation: true,
+            compiled_w_max: Some(12),
+        });
+        assert!(matches!(synthetic, RuntimeCompatibility::NeedsAttention(_)));
+    }
+
+    #[test]
+    fn fully_capable_package_policy_reaches_q27_arguments_and_environment() {
+        let package = q27_package_fixture();
+        let translated =
+            q27_package_launch_policy(&package, 12, false).expect("package launch policy");
+        let arguments = argument_strings(translated.arguments);
+        assert!(arguments.windows(2).any(|pair| pair == ["--top-k", "20"]));
+        assert!(arguments.windows(2).any(|pair| pair == ["--min-p", "0.05"]));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--think-budget", "0"])
+        );
+        assert_eq!(translated.environment["Q27_MAXD"], "auto7");
+        assert_eq!(translated.environment["Q27_PMIN"], "0.5");
+        assert_eq!(translated.environment["Q27_SUFFIX"], "1");
+        assert_eq!(translated.environment["Q27_SUFFIX_W"], "12");
+        assert_eq!(translated.normalized_settings["top_k"], json!(20));
+        assert_eq!(translated.normalized_settings["min_p"], json!(0.05));
+    }
+
+    #[test]
+    fn bounded_startup_parser_proves_context_kv_and_numeric_wmax() {
+        let observation = parse_q27_startup_observation(&[
+            "profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=0 think=1".to_owned(),
+            "--ctx auto: 262144 (free 30.0GB post-weights, fp8 KV, W_MAX=12)".to_owned(),
+            "slot 0 ready: ctx=262144".to_owned(),
+        ])
+        .expect("startup observation");
+        assert_eq!(observation.served_context, 262_144);
+        assert_eq!(observation.kv_mode, "fp8");
+        assert_eq!(observation.compiled_w_max, 12);
+        assert_eq!(observation.suffix_width, 12);
+        assert!(observation.thinking);
+    }
+
+    #[test]
+    fn sharp_renderer_preserves_developer_and_message_order() {
+        let template = concat!(
+            "{%- for message in messages -%}",
+            "{{ message.role }}={{ message.content }};",
+            "{%- endfor -%}",
+            "{% if add_generation_prompt %}assistant={{ reasoning_effort }}{% endif %}"
+        );
+        let rendered = render_sharp_template(
+            template,
+            &[
+                InferenceMessage {
+                    role: InferenceRole::System,
+                    text: "s".to_owned(),
+                },
+                InferenceMessage {
+                    role: InferenceRole::Developer,
+                    text: "d".to_owned(),
+                },
+                InferenceMessage {
+                    role: InferenceRole::User,
+                    text: "u".to_owned(),
+                },
+                InferenceMessage {
+                    role: InferenceRole::Assistant,
+                    text: "a".to_owned(),
+                },
+            ],
+        )
+        .expect("Sharp rendering");
+        assert_eq!(
+            rendered,
+            "system=s;developer=d;user=u;assistant=a;assistant=medium"
+        );
+
+        let package = q27_package_fixture();
+        let NortedPackagePolicy::Q27(policy) = package.policy else {
+            unreachable!()
+        };
+        let body = Q27Adapter::package_backend_request(
+            &Q27PackageExecution {
+                sharp_template: template.to_owned(),
+                policy,
+                compiled_w_max: 12,
+                expected_fast_head: false,
+            },
+            &InferenceRequest {
+                model_id: ModelId("package-model".to_owned()),
+                messages: vec![InferenceMessage {
+                    role: InferenceRole::Developer,
+                    text: "bound Sharp".to_owned(),
+                }],
+                generation_settings: GenerationSettingsPatch::default(),
+                max_output_tokens: Some(32),
+                stream: false,
+            },
+            false,
+        )
+        .expect("raw package request");
+        assert!(body.get("messages").is_none());
+        assert_eq!(body["prompt"], "developer=bound Sharp;assistant=medium");
+        assert_eq!(body["top_k"], 20);
+        assert_eq!(body["min_p"], 0.05);
     }
 
     #[test]

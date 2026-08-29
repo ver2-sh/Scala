@@ -77,6 +77,7 @@ struct ManagedProcess {
     descriptor: ProcessDescriptor,
     commands: mpsc::Sender<ProcessCommand>,
     exit: watch::Receiver<Option<ProcessExit>>,
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 enum ProcessCommand {
@@ -200,6 +201,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
                 descriptor: descriptor.clone(),
                 commands,
                 exit,
+                stderr_tail: Arc::clone(&tail),
             },
         );
         tokio::spawn(run_child_actor(ChildActor {
@@ -296,6 +298,25 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             ));
         }
         Ok(managed.exit.clone())
+    }
+
+    async fn stderr_tail(&self, process: &ProcessDescriptor) -> Result<Vec<String>, EngineError> {
+        let tail = self
+            .inner
+            .processes
+            .read()
+            .await
+            .get(&process.supervisor_id)
+            .filter(|managed| managed.descriptor.process_id == process.process_id)
+            .map(|managed| Arc::clone(&managed.stderr_tail))
+            .ok_or_else(|| EngineError::Operation("managed process is not tracked".to_owned()))?;
+        let result = tail
+            .lock()
+            .map_err(|_| EngineError::Operation("managed process log tail is poisoned".to_owned()))?
+            .iter()
+            .cloned()
+            .collect();
+        Ok(result)
     }
 
     async fn shutdown(&self) {
