@@ -1569,6 +1569,7 @@ dependencies = [
  "async-trait",
  "clap",
  "color-eyre",
+ "fs2",
  "norted-api",
  "norted-core",
  "norted-engine",

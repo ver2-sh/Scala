@@ -218,17 +218,23 @@ norted-server
 └── doctor
 ```
 
-Typical use is:
+For normal interactive use, start the TUI directly:
 
 ```console
-cargo run -p norted-server -- models list
-cargo run -p norted-server -- runtimes search gguf
-cargo run -p norted-server -- runtimes install <RUNTIME_ID>
-cargo run -p norted-server -- runtimes select --format gguf <RUNTIME_ID>
+cargo run -p norted-server
+# or explicitly:
+cargo run -p norted-server -- tui
+```
+
+The TUI attaches to an existing healthy Norted Server when one is already running. Otherwise it owns the real public gateway, private control API, runtime manager, and backend lifecycle in the same process for as long as the TUI is open. No second terminal running `serve` is normally required. Load and Unload from the TUI still cross the authenticated private loopback control API.
+
+For headless/server-only use, run:
+
+```console
 cargo run -p norted-server -- serve
 ```
 
-Then, in another terminal:
+Scriptable management commands remain clients of a running instance. With headless `serve` running, another terminal can use:
 
 ```console
 cargo run -p norted-server -- load <MODEL_ID>
@@ -252,9 +258,11 @@ cargo run -p norted-server
 cargo run -p norted-server -- tui
 ```
 
+At startup the TUI safely chooses one of two modes: it attaches to a healthy instance discovered through the existing runtime descriptor and identity probe, or it starts and owns the same serving composition used by headless `serve`. In owned mode the configured OpenAI-compatible endpoint is live while the TUI runs. Exiting shuts down the owned listeners and active backend and removes the owned descriptor; exiting an attached TUI leaves the external server running.
+
 Its top-level pages are Overview, Models, Runtimes, Server, Logs, Settings, and Help. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Installed source-runtime details include short commit/tree, recipe, Make or CMake, and CUDA provenance.
 
-The TUI draws its pending first frame before model/runtime scans and never performs catalog network I/O merely to start. Settings is a generic schema-driven editor for global/engine defaults and named profiles; Enter edits or cycles, Delete clears the current layer, and profile creation/deletion is explicit. From Models, `p` opens model defaults, assignment selection, exact-runtime support, and effective value/source inspection. Runtime help/usage probing runs in the background. Keyboard, mouse/wheel navigation, narrow layout, `NO_COLOR`, and configured ASCII mode remain supported. Edits never hot-mutate a running backend and apply on its next load.
+Owned startup completes the bounded local model discovery required by the serving stack before entering terminal mode, so startup errors remain visible. The TUI then draws its pending first frame before its local runtime scan and periodic control/auth observation, and it never performs catalog network I/O merely to start. Settings is a generic schema-driven editor for global/engine defaults and named profiles; Enter edits or cycles, Delete clears the current layer, and profile creation/deletion is explicit. From Models, `p` opens model defaults, assignment selection, exact-runtime support, and effective value/source inspection. Runtime help/usage probing runs in the background. Keyboard, mouse/wheel navigation, narrow layout, `NO_COLOR`, and configured ASCII mode remain supported. Edits never hot-mutate a running backend and apply on its next load.
 
 ## External runtimes and configuration
 
