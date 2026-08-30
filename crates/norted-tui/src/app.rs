@@ -11,8 +11,8 @@ use norted_core::{
     RuntimeOperationProgress, RuntimeUpdateState,
 };
 use norted_engine::{
-    BackendLifecycle, ControlStatus, RuntimeListSnapshot, RuntimeModelCandidate,
-    RuntimeNoticeLevel, RuntimeSearchSnapshot, RuntimeUpdateCheck,
+    BackendLifecycle, BackendLoadProgress, ControlStatus, RuntimeListSnapshot,
+    RuntimeModelCandidate, RuntimeNoticeLevel, RuntimeSearchSnapshot, RuntimeUpdateCheck,
 };
 use ratatui::layout::Position;
 
@@ -609,8 +609,25 @@ impl App {
             .is_some_and(|status| status.backend.lifecycle.is_loading())
     }
 
-    pub fn advance_load_animation(&mut self) -> bool {
+    pub fn load_progress(&self) -> Option<&BackendLoadProgress> {
         if !self.is_loading() {
+            return None;
+        }
+        self.control.as_ref()?.backend.load_progress.as_ref()
+    }
+
+    pub fn selected_model_load_progress(&self) -> Option<&BackendLoadProgress> {
+        let progress = self.load_progress()?;
+        let control = self.control.as_ref()?;
+        let selected = self.snapshot.models.get(self.selected_model?)?;
+        (control.backend.model_id.as_ref() == Some(&selected.id)).then_some(progress)
+    }
+
+    pub fn advance_load_animation(&mut self) -> bool {
+        let indeterminate = self
+            .load_progress()
+            .is_some_and(|progress| progress.fraction.is_none());
+        if !indeterminate {
             if self.load_animation_frame != 0 {
                 self.load_animation_frame = 0;
                 return true;

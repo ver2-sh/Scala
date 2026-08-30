@@ -898,8 +898,10 @@ impl RuntimeManager {
                         generation,
                         BackendLoadProgress::with_message(
                             BackendLoadPhase::AllocatingContext,
-                            format!(
-                                "Retrying with the next KV mode: {kv_mode} served {observed_context} of the required {minimum_context} context tokens"
+                            retry_context_capacity_message(
+                                &kv_mode,
+                                observed_context,
+                                minimum_context,
                             ),
                         ),
                     )
@@ -1683,6 +1685,16 @@ fn unix_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
+fn retry_context_capacity_message(
+    kv_mode: &str,
+    observed_context: u64,
+    minimum_context: u64,
+) -> String {
+    format!(
+        "KV mode {kv_mode} served {observed_context} of the required {minimum_context} context tokens; retrying with the next policy KV mode"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1782,5 +1794,15 @@ mod tests {
         assert_eq!(progress.fraction, None);
         assert_eq!(progress.current, None);
         assert_eq!(progress.total, None);
+    }
+
+    #[test]
+    fn context_capacity_retry_names_the_attempted_kv_mode() {
+        let message = retry_context_capacity_message("fp8", 180_000, 200_000);
+        assert_eq!(
+            message,
+            "KV mode fp8 served 180000 of the required 200000 context tokens; retrying with the next policy KV mode"
+        );
+        assert!(!message.contains("next KV mode: fp8"));
     }
 }

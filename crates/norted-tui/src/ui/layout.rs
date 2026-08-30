@@ -33,7 +33,14 @@ pub struct UiLayout {
     pub compact: bool,
     pub nav_items: Vec<(Screen, Rect)>,
     pub content: Rect,
+    pub overview_metrics: Rect,
+    pub overview_body: Rect,
+    pub overview_progress: Rect,
+    pub model_list: Rect,
+    pub model_progress: Rect,
     pub model_rows: Vec<(usize, Rect)>,
+    pub server_details: Rect,
+    pub server_progress: Rect,
     pub runtime_summary: Rect,
     pub runtime_list: Rect,
     pub runtime_rows: Vec<(usize, Rect)>,
@@ -91,6 +98,31 @@ impl UiLayout {
         let screen_body = content_layout(content)[1];
         let nav_items = nav_rects(regions[0], compact);
 
+        let mut overview_metrics = Rect::default();
+        let mut overview_body = Rect::default();
+        let mut overview_progress = Rect::default();
+        if app.screen == Screen::Overview {
+            let progress_height = u16::from(app.load_progress().is_some());
+            let overview = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(if compact { 6 } else { 4 }),
+                    Constraint::Length(progress_height),
+                    Constraint::Min(5),
+                ])
+                .split(content);
+            overview_metrics = overview[1];
+            overview_progress = overview[2];
+            overview_body = overview[3];
+        }
+
+        let (model_list, model_progress) = if app.screen == Screen::Models {
+            reserve_bottom(screen_body, app.selected_model_load_progress().is_some(), 3)
+        } else {
+            (Rect::default(), Rect::default())
+        };
+
         let mut model_rows = Vec::new();
         if app.screen == Screen::Models
             && matches!(
@@ -99,20 +131,26 @@ impl UiLayout {
             )
             && !app.snapshot.models.is_empty()
         {
-            let capacity = (screen_body.height / MODEL_ROW_HEIGHT) as usize;
+            let capacity = (model_list.height / MODEL_ROW_HEIGHT) as usize;
             let end = (app.model_scroll + capacity).min(app.snapshot.models.len());
             for index in app.model_scroll..end {
                 model_rows.push((
                     index,
                     Rect::new(
-                        screen_body.x,
-                        screen_body.y + ((index - app.model_scroll) as u16 * MODEL_ROW_HEIGHT),
-                        screen_body.width,
+                        model_list.x,
+                        model_list.y + ((index - app.model_scroll) as u16 * MODEL_ROW_HEIGHT),
+                        model_list.width,
                         MODEL_ROW_HEIGHT,
                     ),
                 ));
             }
         }
+
+        let (server_details, server_progress) = if app.screen == Screen::Server {
+            reserve_bottom(screen_body, app.load_progress().is_some(), 3)
+        } else {
+            (Rect::default(), Rect::default())
+        };
 
         let mut runtime_summary = Rect::default();
         let mut runtime_list = Rect::default();
@@ -364,7 +402,14 @@ impl UiLayout {
             compact,
             nav_items,
             content,
+            overview_metrics,
+            overview_body,
+            overview_progress,
+            model_list,
+            model_progress,
             model_rows,
+            server_details,
+            server_progress,
             runtime_summary,
             runtime_list,
             runtime_rows,
@@ -477,7 +522,7 @@ impl UiLayout {
     }
 
     pub fn model_capacity(&self) -> usize {
-        (self.content.height.saturating_sub(3) / MODEL_ROW_HEIGHT) as usize
+        (self.model_list.height / MODEL_ROW_HEIGHT) as usize
     }
 
     pub fn log_capacity(&self) -> usize {
@@ -504,6 +549,18 @@ impl UiLayout {
         self.suggestion_popup
             .is_some_and(|area| contains(area, position))
     }
+}
+
+fn reserve_bottom(area: Rect, enabled: bool, requested_height: u16) -> (Rect, Rect) {
+    if !enabled {
+        return (area, Rect::default());
+    }
+    let progress_height = requested_height.min(area.height);
+    let body_height = area.height.saturating_sub(progress_height);
+    (
+        Rect::new(area.x, area.y, area.width, body_height),
+        Rect::new(area.x, area.y + body_height, area.width, progress_height),
+    )
 }
 
 fn nav_rects(header: Rect, compact: bool) -> Vec<(Screen, Rect)> {
@@ -534,4 +591,168 @@ fn contains(area: Rect, position: Position) -> bool {
         && position.x < area.right()
         && position.y >= area.y
         && position.y < area.bottom()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use norted_core::{
+        AppSnapshot, ArtifactFormat, EffectivePublicAuthMode, ModelArtifact, ModelId,
+        PublicAuthMode, PublicAuthStatus, RegistryState, ServerState,
+    };
+    use norted_engine::{
+        BackendLifecycle, BackendLoadPhase, BackendLoadProgress, BackendStatus, ControlStatus,
+    };
+
+    use super::*;
+
+    fn test_app(model_count: usize) -> App {
+        let models = (0..model_count)
+            .map(|index| ModelArtifact {
+                id: ModelId(format!("model-{index}")),
+                display_name: format!("Model {index}"),
+                path: PathBuf::from(format!("/models/model-{index}.gguf")),
+                format: ArtifactFormat::Gguf,
+                size_bytes: 1,
+                created: 0,
+                hash: None,
+                architecture: None,
+                context_length: None,
+                provenance: None,
+                native_identity: None,
+                auxiliary_artifacts: Vec::new(),
+                norted_package: None,
+            })
+            .collect();
+        App::new(
+            AppSnapshot {
+                server: ServerState::Running {
+                    endpoint: "http://127.0.0.1:8080".to_owned(),
+                },
+                registry_state: RegistryState::Ready,
+                models,
+                registry_warnings: Vec::new(),
+            },
+            PublicAuthStatus {
+                bind: "127.0.0.1:8080".to_owned(),
+                loopback: true,
+                configured_mode: PublicAuthMode::Auto,
+                effective_mode: EffectivePublicAuthMode::Disabled,
+                active_key_count: 0,
+                bind_allowed: true,
+                insecure_remote: false,
+            },
+            true,
+            true,
+            Vec::new(),
+        )
+    }
+
+    fn set_loading(app: &mut App, model_index: usize) {
+        app.selected_model = Some(model_index);
+        app.control = Some(ControlStatus {
+            public_endpoint: Some("http://127.0.0.1:8080".to_owned()),
+            available_engine_count: 1,
+            installed_engine_count: 1,
+            running_engine_count: 1,
+            engines: Vec::new(),
+            backend: BackendStatus {
+                lifecycle: BackendLifecycle::Loading,
+                model_id: Some(app.snapshot.models[model_index].id.clone()),
+                engine_id: Some("llama.cpp".to_owned()),
+                runtime_id: None,
+                runtime_version: None,
+                runtime_variant: None,
+                runtime_executable_sha256: None,
+                process_id: None,
+                private_endpoint: None,
+                load_progress: Some(BackendLoadProgress::indeterminate(
+                    BackendLoadPhase::LoadingModel,
+                )),
+                failure: None,
+                provenance: None,
+            },
+            recent_events: Vec::new(),
+        });
+    }
+
+    fn overlaps(left: Rect, right: Rect) -> bool {
+        left.x < right.right()
+            && left.right() > right.x
+            && left.y < right.bottom()
+            && left.bottom() > right.y
+    }
+
+    #[test]
+    fn overview_progress_reserves_a_non_overlapping_row() {
+        let mut app = test_app(1);
+        app.screen = Screen::Overview;
+        set_loading(&mut app, 0);
+        let layout = UiLayout::calculate(Rect::new(0, 0, 100, 30), &app);
+
+        assert_eq!(layout.overview_progress.height, 1);
+        assert!(!overlaps(layout.overview_progress, layout.overview_body));
+    }
+
+    #[test]
+    fn model_progress_reduces_capacity_and_cannot_hit_hidden_rows() {
+        let area = Rect::new(0, 0, 100, 30);
+        let mut app = test_app(20);
+        app.screen = Screen::Models;
+        app.selected_model = Some(5);
+        app.model_scroll = 2;
+        let idle = UiLayout::calculate(area, &app);
+        let idle_capacity = idle.model_capacity();
+        assert_eq!(idle_capacity, idle.model_rows.len());
+
+        set_loading(&mut app, 5);
+        let loading = UiLayout::calculate(area, &app);
+        assert_eq!(loading.model_progress.height, 3);
+        assert_eq!(loading.model_capacity(), idle_capacity.saturating_sub(1));
+        assert_eq!(loading.model_rows.len(), loading.model_capacity());
+        assert!(
+            loading
+                .model_rows
+                .iter()
+                .all(|(_, row)| !overlaps(*row, loading.model_progress))
+        );
+
+        let position = Position::new(loading.model_progress.x, loading.model_progress.y);
+        assert!(!matches!(
+            loading.hit_test(position),
+            Some(HoverTarget::Model(_))
+        ));
+        assert_eq!(
+            loading.model_rows.last().map(|(index, _)| *index),
+            Some(app.model_scroll + loading.model_capacity() - 1),
+            "visible rows and selection/scroll capacity must use the same reduced area"
+        );
+    }
+
+    #[test]
+    fn model_layout_without_progress_keeps_the_full_body_capacity() {
+        let mut app = test_app(20);
+        app.screen = Screen::Models;
+        let layout = UiLayout::calculate(Rect::new(0, 0, 100, 30), &app);
+        let screen_body = content_layout(layout.content)[1];
+
+        assert_eq!(layout.model_progress, Rect::default());
+        assert_eq!(layout.model_list, screen_body);
+        assert_eq!(
+            layout.model_capacity(),
+            (screen_body.height / MODEL_ROW_HEIGHT) as usize
+        );
+    }
+
+    #[test]
+    fn server_progress_reserves_space_below_details() {
+        let mut app = test_app(1);
+        app.screen = Screen::Server;
+        set_loading(&mut app, 0);
+        let layout = UiLayout::calculate(Rect::new(0, 0, 100, 30), &app);
+
+        assert_eq!(layout.server_progress.height, 3);
+        assert!(!overlaps(layout.server_progress, layout.server_details));
+    }
 }

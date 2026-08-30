@@ -182,49 +182,31 @@ fn determinate_bar(fraction: f32, width: u16, glyphs: &Glyphs, theme: &Theme) ->
 }
 
 fn indeterminate_bar(frame: u32, width: u16, glyphs: &Glyphs, theme: &Theme) -> Line<'static> {
-    let inner_width = (width as usize).saturating_sub(1);
-    if inner_width == 0 {
-        return Line::from(Span::styled(
-            if glyphs.unicode { "\u{2501}" } else { "-" },
-            theme.accent,
-        ));
+    let width = width as usize;
+    if width == 0 {
+        return Line::default();
     }
-    let segment_len = if glyphs.unicode { 6 } else { 5 };
-    let segment_len = segment_len.min(inner_width);
-    let position = (frame as usize) % (inner_width + segment_len);
-    let start = position.saturating_sub(segment_len);
-    let end = position.min(inner_width);
-
     let (track, head, segment) = if glyphs.unicode {
         ("\u{2500}", "\u{2578}", "\u{2501}")
     } else {
         ("-", ">", "=")
     };
-
-    let mut bar = String::with_capacity(inner_width);
-    bar.push_str(&track.repeat(start));
-    if start < end {
-        if start < position && position > segment_len {
-            bar.push_str(segment);
-        }
-        let seg_start = if position > segment_len {
-            start + 1
-        } else {
-            start
-        };
-        let seg_fill = end.saturating_sub(seg_start);
-        bar.push_str(&segment.repeat(seg_fill));
-        if end < inner_width && end == position {
-            bar.push_str(head);
-        }
-    }
-    let remaining = inner_width.saturating_sub(bar.chars().count());
-    bar.push_str(&track.repeat(remaining));
-
-    Line::from(vec![
-        Span::styled(bar, theme.muted),
-        Span::styled(head, theme.accent),
-    ])
+    let segment_len = (if glyphs.unicode { 6 } else { 5 }).min(width);
+    let head_position = (frame as usize) % width;
+    Line::from(
+        (0..width)
+            .map(|position| {
+                let distance_behind = (head_position + width - position) % width;
+                if distance_behind == 0 {
+                    Span::styled(head, theme.accent)
+                } else if distance_behind < segment_len {
+                    Span::styled(segment, theme.accent)
+                } else {
+                    Span::styled(track, theme.muted)
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn progress_detail(progress: &BackendLoadProgress, width: u16) -> String {
@@ -290,6 +272,7 @@ pub fn load_progress_compact(
 mod tests {
     use super::*;
     use norted_engine::BackendLoadPhase;
+    use unicode_width::UnicodeWidthStr;
 
     fn theme() -> Theme {
         Theme::current(true)
@@ -345,18 +328,37 @@ mod tests {
     }
 
     #[test]
+    fn indeterminate_bar_has_exact_width_and_one_moving_head() {
+        for frame in 0..40 {
+            let line = indeterminate_bar(frame, 30, &glyphs(), &theme());
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(UnicodeWidthStr::width(text.as_str()), 30);
+            assert_eq!(text.matches('\u{2578}').count(), 1);
+            if frame % 30 != 29 {
+                assert!(!text.ends_with('\u{2578}'));
+            }
+        }
+    }
+
+    #[test]
     fn indeterminate_bar_ascii_mode_uses_ascii_characters() {
         let line = indeterminate_bar(3, 30, &ascii_glyphs(), &theme());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains('-') || text.contains('>'));
-        assert!(!text.contains('\u{2500}'));
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 30);
+        assert_eq!(text.matches('>').count(), 1);
+        assert!(text.is_ascii());
     }
 
     #[test]
     fn indeterminate_bar_handles_narrow_width() {
-        let line = indeterminate_bar(0, 4, &glyphs(), &theme());
-        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(!text.is_empty());
+        for width in 0..=4 {
+            for frame in 0..10 {
+                let line = indeterminate_bar(frame, width, &glyphs(), &theme());
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert_eq!(UnicodeWidthStr::width(text.as_str()), width as usize);
+                assert_eq!(text.matches('\u{2578}').count(), usize::from(width > 0));
+            }
+        }
     }
 
     #[test]
