@@ -22,6 +22,7 @@ pub struct Glyphs {
     pub command: &'static str,
     pub dimensions: &'static str,
     pub up_down: &'static str,
+    pub ellipsis: &'static str,
     pub border: border::Set<'static>,
 }
 
@@ -37,6 +38,7 @@ impl Glyphs {
                 command: "›",
                 dimensions: "×",
                 up_down: "↑↓",
+                ellipsis: "…",
                 border: border::PLAIN,
             }
         } else {
@@ -49,6 +51,7 @@ impl Glyphs {
                 command: ">",
                 dimensions: "x",
                 up_down: "Up/Dn",
+                ellipsis: "...",
                 border: ASCII_BORDER,
             }
         }

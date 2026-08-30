@@ -6,6 +6,8 @@ use crate::app::{App, Overlay, Screen};
 use super::components::content_layout;
 use super::shell::{COMPACT_WIDTH, MIN_HEIGHT, MIN_WIDTH};
 
+pub const MODEL_ROW_HEIGHT: u16 = 3;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum HoverTarget {
     Navigation(Screen),
@@ -97,16 +99,16 @@ impl UiLayout {
             )
             && !app.snapshot.models.is_empty()
         {
-            let capacity = (screen_body.height / 2) as usize;
+            let capacity = (screen_body.height / MODEL_ROW_HEIGHT) as usize;
             let end = (app.model_scroll + capacity).min(app.snapshot.models.len());
             for index in app.model_scroll..end {
                 model_rows.push((
                     index,
                     Rect::new(
                         screen_body.x,
-                        screen_body.y + ((index - app.model_scroll) as u16 * 2),
+                        screen_body.y + ((index - app.model_scroll) as u16 * MODEL_ROW_HEIGHT),
                         screen_body.width,
-                        2,
+                        MODEL_ROW_HEIGHT,
                     ),
                 ));
             }
@@ -475,7 +477,7 @@ impl UiLayout {
     }
 
     pub fn model_capacity(&self) -> usize {
-        (self.content.height.saturating_sub(3) / 2) as usize
+        (self.content.height.saturating_sub(3) / MODEL_ROW_HEIGHT) as usize
     }
 
     pub fn log_capacity(&self) -> usize {

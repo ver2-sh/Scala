@@ -4,7 +4,7 @@ use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, Overlay};
 use crate::theme::{Glyphs, Theme};
-use crate::ui::components::{key_value, popup_block};
+use crate::ui::components::{KEY_COLUMN, key_value, popup_block};
 use crate::ui::layout::{HoverTarget, UiLayout};
 use crate::ui::screens::compatibility_label;
 
@@ -156,7 +156,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             key_value("BACKEND", &backend, theme),
             key_value("FORMATS", &formats, theme),
             Line::from(vec![
-                Span::styled(format!("{:<12}", "FIT"), theme.hint),
+                Span::styled(format!("{:<KEY_COLUMN$} ", "FIT"), theme.hint),
                 Span::styled(compatibility, compatibility_style),
             ]),
         ];

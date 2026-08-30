@@ -1,7 +1,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, FocusArea};
@@ -54,16 +54,16 @@ pub fn render_header(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(20), Constraint::Length(24)])
         .split(rows[0]);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(glyphs.brand, theme.accent),
-            Span::raw("  "),
-            Span::styled("NORTED", theme.accent),
-            Span::styled(" SERVER", theme.text),
-            Span::styled("  local runtime control", theme.muted),
-        ])),
-        top[0],
-    );
+    let mut brand = vec![
+        Span::styled(glyphs.brand, theme.accent),
+        Span::raw("  "),
+        Span::styled("NORTED", theme.accent),
+        Span::styled(" SERVER", theme.text),
+    ];
+    if !layout.compact {
+        brand.push(Span::styled("  local runtime control", theme.muted));
+    }
+    frame.render_widget(Paragraph::new(Line::from(brand)), top[0]);
     let (marker, state_style) = match &app.snapshot.server {
         norted_core::ServerState::Unknown { .. } => ("?", theme.warning),
         norted_core::ServerState::Running { .. } => (glyphs.running, theme.success),
@@ -239,7 +239,8 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
         }
     };
     frame.render_widget(
-        Paragraph::new(Line::from(line.into_iter().flatten().collect::<Vec<_>>())),
+        Paragraph::new(Line::from(line.into_iter().flatten().collect::<Vec<_>>()))
+            .wrap(Wrap { trim: true }),
         area,
     );
 }

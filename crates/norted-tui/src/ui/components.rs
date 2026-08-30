@@ -10,6 +10,7 @@ pub fn section_title<'a>(title: &'a str, subtitle: &'a str, theme: &Theme) -> Pa
         Line::from(Span::styled(title, theme.accent)),
         Line::from(Span::styled(subtitle, theme.muted)),
     ])
+    .wrap(Wrap { trim: true })
 }
 
 pub fn content_layout(area: Rect) -> std::rc::Rc<[Rect]> {
@@ -31,9 +32,11 @@ pub fn render_empty(frame: &mut Frame<'_>, area: Rect, title: &str, detail: &str
     );
 }
 
+pub const KEY_COLUMN: usize = 15;
+
 pub fn key_value<'a>(key: &'a str, value: &'a str, theme: &Theme) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!("{key:<12}"), theme.hint),
+        Span::styled(format!("{key:<KEY_COLUMN$} "), theme.hint),
         Span::styled(value, theme.text),
     ])
 }
@@ -87,6 +90,25 @@ pub fn centered_message(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'_>>)
             .wrap(Wrap { trim: true }),
         Rect::new(area.x, y, area.width, height),
     );
+}
+
+pub fn truncate_middle(text: &str, max_width: usize, ellipsis: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_width {
+        return text.to_owned();
+    }
+    let ellipsis_width = ellipsis.chars().count();
+    if max_width <= ellipsis_width {
+        return chars[..max_width].iter().collect();
+    }
+    let keep = max_width - ellipsis_width;
+    let front = keep / 2;
+    let back = keep - front;
+    format!(
+        "{}{ellipsis}{}",
+        chars[..front].iter().collect::<String>(),
+        chars[chars.len() - back..].iter().collect::<String>()
+    )
 }
 
 pub fn format_bytes(bytes: u64) -> String {
