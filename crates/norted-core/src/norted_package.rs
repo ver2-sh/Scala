@@ -225,12 +225,7 @@ pub fn apply_norted_package_load_policy(
                 "ninfer.no_prefix_reuse",
                 "NInfer package requires compatible prefix reuse",
             )?;
-            insert_default(
-                settings,
-                "ninfer.kv_dtype",
-                LoadSettingValue::Choice(policy.kv_dtype.clone()),
-                &source,
-            )?;
+            enforce_ninfer_package_choice(settings, "ninfer.kv_dtype", &policy.kv_dtype, &source)?;
             let selected_profile = settings.value("ninfer.package_profile").cloned();
             if selected_profile.is_none()
                 && [
@@ -327,21 +322,37 @@ fn reject_enabled_flag(
     }
 }
 
-fn insert_default(
+fn enforce_ninfer_package_choice(
     settings: &mut ResolvedLoadSettings,
     id: &str,
-    value: LoadSettingValue,
+    required: &str,
     source: &LoadSettingSource,
 ) -> Result<(), String> {
     let id = setting_id(id)?;
-    settings
-        .effective
-        .entry(id)
-        .or_insert_with(|| ResolvedLoadSetting {
-            value,
-            source: source.clone(),
-        });
-    Ok(())
+    match settings.effective.get_mut(&id) {
+        Some(setting) => match &setting.value {
+            LoadSettingValue::Choice(requested) if requested == required => {
+                setting.source = source.clone();
+                Ok(())
+            }
+            LoadSettingValue::Choice(requested) => Err(format!(
+                "Norted NInfer package requires {id}={required}; requested {requested}"
+            )),
+            _ => Err(format!(
+                "Norted NInfer package requires {id}={required}; resolved value has an invalid type"
+            )),
+        },
+        None => {
+            settings.effective.insert(
+                id,
+                ResolvedLoadSetting {
+                    value: LoadSettingValue::Choice(required.to_owned()),
+                    source: source.clone(),
+                },
+            );
+            Ok(())
+        }
+    }
 }
 
 fn insert_package_value(

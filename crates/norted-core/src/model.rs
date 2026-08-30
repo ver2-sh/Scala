@@ -1040,6 +1040,80 @@ mod tests {
             settings.value("ninfer.kv_dtype"),
             Some(&LoadSettingValue::Choice("int8".to_owned()))
         );
+        assert!(matches!(
+            settings
+                .effective
+                .get(&LoadSettingId::new("ninfer.kv_dtype").unwrap())
+                .expect("package-owned KV dtype")
+                .source,
+            LoadSettingSource::NortedPackagePolicy { .. }
+        ));
+
+        let kv_dtype_id = LoadSettingId::new("ninfer.kv_dtype").unwrap();
+        let mut explicit_int8 = ResolvedLoadSettings {
+            engine_id: "ninfer".to_owned(),
+            ..Default::default()
+        };
+        explicit_int8.effective.insert(
+            kv_dtype_id.clone(),
+            ResolvedLoadSetting {
+                value: LoadSettingValue::Choice("int8".to_owned()),
+                source: LoadSettingSource::Invocation,
+            },
+        );
+        apply_norted_package_load_policy(artifact, &mut explicit_int8)
+            .expect("package-compatible explicit KV dtype");
+        assert_eq!(
+            explicit_int8.value("ninfer.kv_dtype"),
+            Some(&LoadSettingValue::Choice("int8".to_owned()))
+        );
+        assert!(matches!(
+            explicit_int8
+                .effective
+                .get(&kv_dtype_id)
+                .expect("explicit package-owned KV dtype")
+                .source,
+            LoadSettingSource::NortedPackagePolicy { .. }
+        ));
+
+        for conflicting in ["fp8", "bf16"] {
+            let mut settings = ResolvedLoadSettings {
+                engine_id: "ninfer".to_owned(),
+                ..Default::default()
+            };
+            settings.effective.insert(
+                kv_dtype_id.clone(),
+                ResolvedLoadSetting {
+                    value: LoadSettingValue::Choice(conflicting.to_owned()),
+                    source: LoadSettingSource::Invocation,
+                },
+            );
+            assert_eq!(
+                apply_norted_package_load_policy(artifact, &mut settings),
+                Err(format!(
+                    "Norted NInfer package requires ninfer.kv_dtype=int8; requested {conflicting}"
+                ))
+            );
+        }
+
+        let mut wrong_kv_type = ResolvedLoadSettings {
+            engine_id: "ninfer".to_owned(),
+            ..Default::default()
+        };
+        wrong_kv_type.effective.insert(
+            kv_dtype_id,
+            ResolvedLoadSetting {
+                value: LoadSettingValue::Toggle(true),
+                source: LoadSettingSource::Invocation,
+            },
+        );
+        assert_eq!(
+            apply_norted_package_load_policy(artifact, &mut wrong_kv_type),
+            Err(
+                "Norted NInfer package requires ninfer.kv_dtype=int8; resolved value has an invalid type"
+                    .to_owned()
+            )
+        );
         settings
             .effective
             .get_mut(&LoadSettingId::new("ninfer.package_profile").unwrap())
