@@ -16,9 +16,9 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, oneshot};
 
 use crate::{
     EffectiveGenerationSettings, EngineAdapter, EngineError, EngineIdentity, EngineProbe,
-    EngineRegistry, InferenceRequest, InstallationState, LaunchRequest, ProcessDescriptor,
-    ProcessExit, ProcessSupervisor, RoutedInferenceOutput, RoutedInferenceStream, RuntimeLease,
-    RuntimePackError, RuntimePackManager, StartupObservation,
+    EngineRegistry, InferenceRequest, InstallationState, LaunchRequest, LoadProgressReporter,
+    ProcessDescriptor, ProcessExit, ProcessSupervisor, RoutedInferenceOutput,
+    RoutedInferenceStream, RuntimeLease, RuntimePackError, RuntimePackManager, StartupObservation,
 };
 
 const NOTICE_LIMIT: usize = 64;
@@ -746,7 +746,13 @@ impl RuntimeManager {
             BackendLoadProgress::indeterminate(BackendLoadPhase::PreparingModel),
         )
         .await;
-        let prepared_model = match adapter.prepare_model_input(&model).await {
+        let (progress, progress_pump) = self.load_progress_reporter(generation);
+        let prepared_model_result = adapter
+            .prepare_model_input_with_progress(&model, Arc::clone(&progress))
+            .await;
+        drop(progress);
+        let _ = progress_pump.await;
+        let prepared_model = match prepared_model_result {
             Ok(model) => model,
             Err(error) => {
                 self.fail_loading(generation, error.to_string(), None).await;
@@ -808,7 +814,13 @@ impl RuntimeManager {
                     }),
             )
             .await;
-            if let Err(error) = adapter.prepare_launch_attempt(&launch_spec).await {
+            let (progress, progress_pump) = self.load_progress_reporter(generation);
+            let preparation_result = adapter
+                .prepare_launch_attempt_with_progress(&launch_spec, Arc::clone(&progress))
+                .await;
+            drop(progress);
+            let _ = progress_pump.await;
+            if let Err(error) = preparation_result {
                 cleanup_temporary_launch_files(&launch_spec.temporary_files).await;
                 cleanup_pending_launch_files(&launch_attempts).await;
                 adapter
@@ -1336,6 +1348,34 @@ impl RuntimeManager {
             .write()
             .await
             .apply_load_progress(generation, progress);
+    }
+
+    fn load_progress_reporter(
+        self: &Arc<Self>,
+        generation: u64,
+    ) -> (LoadProgressReporter, tokio::task::JoinHandle<()>) {
+        let (sender, mut receiver) = tokio::sync::watch::channel(None);
+        let reporter: LoadProgressReporter = Arc::new(move |progress| {
+            sender.send_replace(Some(progress));
+        });
+        let manager = Arc::downgrade(self);
+        let pump = tokio::spawn(async move {
+            loop {
+                match receiver.changed().await {
+                    Ok(()) => {}
+                    Err(_) if !receiver.has_changed().unwrap_or(false) => break,
+                    Err(_) => {}
+                }
+                let Some(progress) = receiver.borrow_and_update().clone() else {
+                    continue;
+                };
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                manager.set_load_progress(generation, progress).await;
+            }
+        });
+        (reporter, pump)
     }
 
     fn load_cancelled(&self, cancellation_epoch: u64) -> bool {
@@ -2099,6 +2139,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn coalesced_hash_progress_from_an_old_generation_is_ignored() {
+        let fixture = manager_fixture().await;
+        {
+            let mut state = fixture.manager.state.write().await;
+            state.generation = 8;
+            state.lifecycle = BackendLifecycle::Loading;
+            state.load_progress = Some(BackendLoadProgress::with_message(
+                BackendLoadPhase::SelectingRuntime,
+                "newer load",
+            ));
+        }
+        let (reporter, pump) = fixture.manager.load_progress_reporter(7);
+        reporter(BackendLoadProgress {
+            phase: BackendLoadPhase::PreparingModel,
+            fraction: None,
+            current: Some(64),
+            total: Some(128),
+            message: Some("stale package hash".to_owned()),
+        });
+        drop(reporter);
+        pump.await.expect("progress pump");
+
+        let state = fixture.manager.state.read().await;
+        let progress = state.load_progress.as_ref().expect("new load progress");
+        assert_eq!(progress.phase, BackendLoadPhase::SelectingRuntime);
+        assert_eq!(progress.message.as_deref(), Some("newer load"));
+    }
+
     #[test]
     fn apply_load_progress_is_ignored_once_loading_is_no_longer_active() {
         let mut state = empty_state();
@@ -2154,7 +2223,7 @@ mod tests {
             .expect("supervisor spawn boundary")
             .0;
         let preparation = launch_loop
-            .find("adapter.prepare_launch_attempt(&launch_spec).await")
+            .find(".prepare_launch_attempt_with_progress(&launch_spec")
             .expect("adapter preparation");
         let spawning = launch_loop
             .find("BackendLoadPhase::SpawningBackend")

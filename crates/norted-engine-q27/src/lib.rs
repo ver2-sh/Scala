@@ -29,11 +29,13 @@ use norted_engine::{
     EngineIdentity, EngineProbe, GenerationSettingsPatch, GitHubCommit, GitHubRelease,
     GitHubReleaseAsset, GitHubReleaseClient, InferenceEvent, InferenceFinishReason,
     InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
-    InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind,
-    PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
-    StartupObservation, UpdateState, capture_command, common_load_setting_definitions,
-    compatibility_for, compatibility_for_nvidia_device, isolated_cuda_environment,
-    prepare_norted_package_input, revalidate_norted_package_before_launch, visible_nvidia_devices,
+    InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter,
+    NativeOption, OptionValueKind, PreparedAuxiliaryArtifact, PreparedModelInput,
+    ProcessDescriptor, RuntimeCatalogProvider, StartupObservation, UpdateState, capture_command,
+    common_load_setting_definitions, compatibility_for, compatibility_for_nvidia_device,
+    isolated_cuda_environment, prepare_norted_package_input,
+    prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
+    revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
 };
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -1783,6 +1785,80 @@ impl Q27Adapter {
         ))
     }
 
+    async fn prepare_launch_attempt_inner(
+        &self,
+        spec: &LaunchSpec,
+        progress: Option<&LoadProgressReporter>,
+    ) -> Result<(), EngineError> {
+        let endpoint = spec.endpoint.as_deref().ok_or_else(|| {
+            EngineError::InvalidConfiguration("q27 launch has no private endpoint".to_owned())
+        })?;
+        self.package_executions.write().await.remove(endpoint);
+        let Some(package) = spec.model.primary.norted_package.as_ref() else {
+            return Ok(());
+        };
+        match progress {
+            Some(progress) => {
+                revalidate_norted_package_before_launch_with_progress(&spec.model, progress).await?
+            }
+            None => revalidate_norted_package_before_launch(&spec.model).await?,
+        }
+        let capabilities = q27_package_capabilities(
+            &spec.runtime.manifest.identity,
+            &spec.runtime.manifest.acquisition_method,
+            spec.runtime
+                .manifest
+                .source_build
+                .as_ref()
+                .map(Q27SourceBuildEvidence::Provenance),
+        );
+        validate_q27_package_prelaunch(capabilities).map_err(|reason| {
+            EngineError::InvalidConfiguration(format!(
+                "selected q27 runtime cannot launch the Norted package: {reason}"
+            ))
+        })?;
+        let selected_kv_mode = Q27PackageKvMode::QUALITY_ORDER
+            .into_iter()
+            .find(|mode| spec.environment.get("Q27_KV").map(String::as_str) == Some(mode.as_str()))
+            .ok_or_else(|| {
+                EngineError::InvalidConfiguration(
+                    "q27 package launch did not select a recognized policy KV mode".to_owned(),
+                )
+            })?;
+        if !capabilities.supported_kv_modes.contains(&selected_kv_mode)
+            || !q27_package_policy(package)?
+                .kv_preference
+                .iter()
+                .any(|mode| mode == selected_kv_mode.as_str())
+        {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "q27 package KV mode `{}` is not proven and package-declared for this executable",
+                selected_kv_mode.as_str()
+            )));
+        }
+        let sharp_template = read_prepared_sharp_template(&spec.model).await?;
+        validate_sharp_template(&sharp_template)?;
+        let compiled_w_max = capabilities.compiled_w_max.ok_or_else(|| {
+            EngineError::InvalidConfiguration(
+                "q27 package launch has no proven numeric compiled W_MAX".to_owned(),
+            )
+        })?;
+        self.package_executions.write().await.insert(
+            endpoint.to_owned(),
+            Q27PackageExecution {
+                sharp_template,
+                policy: q27_package_policy(package)?.clone(),
+                compiled_w_max,
+                expected_fast_head: q27_selected_fast_head(
+                    &spec.load_settings,
+                    q27_package_policy(package)?,
+                )?,
+                selected_kv_mode,
+            },
+        );
+        Ok(())
+    }
+
     fn backend_request(&self, request: &InferenceRequest, stream: bool) -> Value {
         let mut body = json!({
             "model": request.model_id.0,
@@ -2130,53 +2206,15 @@ impl EngineAdapter for Q27Adapter {
         &self,
         model: &ModelArtifact,
     ) -> Result<PreparedModelInput, EngineError> {
-        if model.format != ArtifactFormat::Q27 {
-            return Err(EngineError::InvalidConfiguration(
-                "q27 can only prepare Q27 model artifacts".to_owned(),
-            ));
-        }
-        inspect_q27_model(&model.path).map_err(EngineError::InvalidConfiguration)?;
-        if model.norted_package.is_some() {
-            let prepared = prepare_norted_package_input(model).await?;
-            let tokenizer = prepared
-                .auxiliary
-                .iter()
-                .find(|artifact| artifact.role == AuxiliaryArtifactRole::Tokenizer)
-                .ok_or_else(|| {
-                    EngineError::InvalidConfiguration(
-                        "Norted q27 package has no prepared manifest-bound tokenizer".to_owned(),
-                    )
-                })?;
-            validate_tokenizer_path(&tokenizer.path).await?;
-            return Ok(prepared);
-        }
-        let mut primary = model.clone();
-        primary.path = canonical_regular_file(&model.path, "q27 model").await?;
-        let candidate = tokenizer_candidate(model).map_err(EngineError::InvalidConfiguration)?;
-        let tokenizer = canonical_regular_file(&candidate, "q27 tokenizer companion").await?;
-        validate_tokenizer_path(&tokenizer).await?;
-        let metadata = tokio::fs::metadata(&tokenizer).await.map_err(|error| {
-            EngineError::InvalidConfiguration(format!(
-                "could not inspect q27 tokenizer {}: {error}",
-                tokenizer.display()
-            ))
-        })?;
-        let content_sha256 = hash_file(&tokenizer).await.map_err(|error| {
-            EngineError::InvalidConfiguration(format!(
-                "could not hash q27 tokenizer {}: {error}",
-                tokenizer.display()
-            ))
-        })?;
-        Ok(PreparedModelInput {
-            primary,
-            auxiliary: vec![PreparedAuxiliaryArtifact {
-                role: AuxiliaryArtifactRole::Tokenizer,
-                path: tokenizer,
-                size_bytes: metadata.len(),
-                content_sha256,
-            }],
-            primary_file_identity: None,
-        })
+        prepare_q27_model_input(model, None).await
+    }
+
+    async fn prepare_model_input_with_progress(
+        &self,
+        model: &ModelArtifact,
+        progress: LoadProgressReporter,
+    ) -> Result<PreparedModelInput, EngineError> {
+        prepare_q27_model_input(model, Some(&progress)).await
     }
 
     fn native_options(&self) -> Vec<NativeOption> {
@@ -2532,68 +2570,16 @@ impl EngineAdapter for Q27Adapter {
     }
 
     async fn prepare_launch_attempt(&self, spec: &LaunchSpec) -> Result<(), EngineError> {
-        let endpoint = spec.endpoint.as_deref().ok_or_else(|| {
-            EngineError::InvalidConfiguration("q27 launch has no private endpoint".to_owned())
-        })?;
-        self.package_executions.write().await.remove(endpoint);
-        let Some(package) = spec.model.primary.norted_package.as_ref() else {
-            return Ok(());
-        };
-        revalidate_norted_package_before_launch(&spec.model).await?;
-        let capabilities = q27_package_capabilities(
-            &spec.runtime.manifest.identity,
-            &spec.runtime.manifest.acquisition_method,
-            spec.runtime
-                .manifest
-                .source_build
-                .as_ref()
-                .map(Q27SourceBuildEvidence::Provenance),
-        );
-        validate_q27_package_prelaunch(capabilities).map_err(|reason| {
-            EngineError::InvalidConfiguration(format!(
-                "selected q27 runtime cannot launch the Norted package: {reason}"
-            ))
-        })?;
-        let selected_kv_mode = Q27PackageKvMode::QUALITY_ORDER
-            .into_iter()
-            .find(|mode| spec.environment.get("Q27_KV").map(String::as_str) == Some(mode.as_str()))
-            .ok_or_else(|| {
-                EngineError::InvalidConfiguration(
-                    "q27 package launch did not select a recognized policy KV mode".to_owned(),
-                )
-            })?;
-        if !capabilities.supported_kv_modes.contains(&selected_kv_mode)
-            || !q27_package_policy(package)?
-                .kv_preference
-                .iter()
-                .any(|mode| mode == selected_kv_mode.as_str())
-        {
-            return Err(EngineError::InvalidConfiguration(format!(
-                "q27 package KV mode `{}` is not proven and package-declared for this executable",
-                selected_kv_mode.as_str()
-            )));
-        }
-        let sharp_template = read_prepared_sharp_template(&spec.model).await?;
-        validate_sharp_template(&sharp_template)?;
-        let compiled_w_max = capabilities.compiled_w_max.ok_or_else(|| {
-            EngineError::InvalidConfiguration(
-                "q27 package launch has no proven numeric compiled W_MAX".to_owned(),
-            )
-        })?;
-        self.package_executions.write().await.insert(
-            endpoint.to_owned(),
-            Q27PackageExecution {
-                sharp_template,
-                policy: q27_package_policy(package)?.clone(),
-                compiled_w_max,
-                expected_fast_head: q27_selected_fast_head(
-                    &spec.load_settings,
-                    q27_package_policy(package)?,
-                )?,
-                selected_kv_mode,
-            },
-        );
-        Ok(())
+        self.prepare_launch_attempt_inner(spec, None).await
+    }
+
+    async fn prepare_launch_attempt_with_progress(
+        &self,
+        spec: &LaunchSpec,
+        progress: LoadProgressReporter,
+    ) -> Result<(), EngineError> {
+        self.prepare_launch_attempt_inner(spec, Some(&progress))
+            .await
     }
 
     fn prepare_launch_progress(&self, spec: &LaunchSpec) -> Option<BackendLoadProgress> {
@@ -3188,6 +3174,62 @@ async fn validate_tokenizer_path(tokenizer: &Path) -> Result<(), EngineError> {
         ));
     }
     validate_tokenizer(tokenizer).await
+}
+
+async fn prepare_q27_model_input(
+    model: &ModelArtifact,
+    progress: Option<&LoadProgressReporter>,
+) -> Result<PreparedModelInput, EngineError> {
+    if model.format != ArtifactFormat::Q27 {
+        return Err(EngineError::InvalidConfiguration(
+            "q27 can only prepare Q27 model artifacts".to_owned(),
+        ));
+    }
+    inspect_q27_model(&model.path).map_err(EngineError::InvalidConfiguration)?;
+    if model.norted_package.is_some() {
+        let prepared = match progress {
+            Some(progress) => prepare_norted_package_input_with_progress(model, progress).await?,
+            None => prepare_norted_package_input(model).await?,
+        };
+        let tokenizer = prepared
+            .auxiliary
+            .iter()
+            .find(|artifact| artifact.role == AuxiliaryArtifactRole::Tokenizer)
+            .ok_or_else(|| {
+                EngineError::InvalidConfiguration(
+                    "Norted q27 package has no prepared manifest-bound tokenizer".to_owned(),
+                )
+            })?;
+        validate_tokenizer_path(&tokenizer.path).await?;
+        return Ok(prepared);
+    }
+    let mut primary = model.clone();
+    primary.path = canonical_regular_file(&model.path, "q27 model").await?;
+    let candidate = tokenizer_candidate(model).map_err(EngineError::InvalidConfiguration)?;
+    let tokenizer = canonical_regular_file(&candidate, "q27 tokenizer companion").await?;
+    validate_tokenizer_path(&tokenizer).await?;
+    let metadata = tokio::fs::metadata(&tokenizer).await.map_err(|error| {
+        EngineError::InvalidConfiguration(format!(
+            "could not inspect q27 tokenizer {}: {error}",
+            tokenizer.display()
+        ))
+    })?;
+    let content_sha256 = hash_file(&tokenizer).await.map_err(|error| {
+        EngineError::InvalidConfiguration(format!(
+            "could not hash q27 tokenizer {}: {error}",
+            tokenizer.display()
+        ))
+    })?;
+    Ok(PreparedModelInput {
+        primary,
+        auxiliary: vec![PreparedAuxiliaryArtifact {
+            role: AuxiliaryArtifactRole::Tokenizer,
+            path: tokenizer,
+            size_bytes: metadata.len(),
+            content_sha256,
+        }],
+        primary_file_identity: None,
+    })
 }
 
 async fn revalidate_prepared_tokenizer(
@@ -6031,21 +6073,28 @@ mod tests {
         );
 
         let prepare_attempt = source
-            .split_once("async fn prepare_launch_attempt(&self, spec: &LaunchSpec)")
-            .expect("q27 prepare_launch_attempt")
+            .split_once("async fn prepare_launch_attempt_inner(")
+            .expect("q27 prepare_launch_attempt_inner")
             .1
-            .split_once("async fn clear_launch_state")
-            .expect("q27 clear_launch_state")
+            .split_once("fn backend_request")
+            .expect("q27 backend request")
             .0;
+        assert_eq!(
+            prepare_attempt
+                .matches("revalidate_norted_package_before_launch_with_progress")
+                .count(),
+            1,
+            "the progress path must retain one complete final revalidation"
+        );
         assert_eq!(
             prepare_attempt
                 .matches("revalidate_norted_package_before_launch(&spec.model).await?")
                 .count(),
             1,
-            "each actual q27 launch attempt must retain exactly one complete final revalidation"
+            "the compatibility path must retain one complete final revalidation"
         );
-        assert!(prepare_attempt.contains("Revalidating package before launch"));
-        assert!(prepare_attempt.contains("BackendLoadPhase::PreparingLaunch"));
+        assert!(source.contains("Revalidating package before launch"));
+        assert!(source.contains("BackendLoadPhase::PreparingLaunch"));
     }
 
     #[test]

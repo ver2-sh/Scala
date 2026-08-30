@@ -226,6 +226,14 @@ cargo run -p norted-server
 cargo run -p norted-server -- tui
 ```
 
+Development builds optimize the SHA-256 dependency used for package verification, but production
+Norted Server builds should still use the release profile:
+
+```console
+cargo build --release -p norted-server
+./target/release/norted-server tui
+```
+
 The TUI attaches to an existing healthy Norted Server when one is already running and both its public identity and authenticated private control status can be verified. Otherwise it owns the real public gateway, private control API, runtime manager, and backend lifecycle in the same process for as long as the TUI is open. No second terminal running `serve` is normally required. Load and Unload from the TUI still cross the authenticated private loopback control API. A public-healthy descriptor whose private control status cannot be verified is treated as uncertain ownership: startup fails instead of attaching or starting a competing owner.
 
 For headless/server-only use, run:
