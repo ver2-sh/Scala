@@ -7,7 +7,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Overlay, RuntimeSearchFocus};
 use crate::theme::{Glyphs, Theme};
-use crate::ui::components::{format_bytes, key_value, popup_block};
+use crate::ui::components::{KEY_COLUMN, format_bytes, key_value, popup_block};
 use crate::ui::layout::{HoverTarget, UiLayout};
 use crate::ui::screens::compatibility_label;
 
@@ -246,7 +246,7 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
         key_value("PROVIDER", provider, theme),
         key_value("SOURCE", source, theme),
         Line::from(vec![
-            Span::styled(format!("{:<12}", "FIT"), theme.hint),
+            Span::styled(format!("{:<KEY_COLUMN$} ", "FIT"), theme.hint),
             Span::styled(compatibility, compatibility_style),
         ]),
     ];
@@ -293,7 +293,7 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
             ),
         };
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<12}", "BUILD NEEDS"), theme.hint),
+            Span::styled(format!("{:<KEY_COLUMN$} ", "BUILD NEEDS"), theme.hint),
             Span::styled(build_needs, theme.text),
         ]));
     }

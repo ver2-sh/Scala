@@ -9,7 +9,9 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap}
 
 use crate::app::{App, Screen};
 use crate::theme::{Glyphs, Theme};
-use crate::ui::components::{content_layout, format_bytes, key_value, render_empty, section_title};
+use crate::ui::components::{
+    content_layout, format_bytes, key_value, render_empty, section_title, truncate_middle,
+};
 use crate::ui::layout::{HoverTarget, UiLayout};
 use crate::ui::runtime_search::progress_text;
 
@@ -315,10 +317,20 @@ fn render_models(
                     theme.hint,
                 ),
             ]),
-            Line::from(vec![
-                Span::styled(format_bytes(model.size_bytes), theme.muted),
-                Span::styled(format!("  {}", model.path.display()), theme.hint),
-            ]),
+            {
+                let size_text = format_bytes(model.size_bytes);
+                let path_width = (layout[1].width as usize)
+                    .saturating_sub(size_text.chars().count() + 2);
+                let path = truncate_middle(
+                    &model.path.display().to_string(),
+                    path_width,
+                    glyphs.ellipsis,
+                );
+                Line::from(vec![
+                    Span::styled(size_text, theme.muted),
+                    Span::styled(format!("  {path}"), theme.hint),
+                ])
+            },
             Line::from(model.norted_package.as_ref().map_or_else(
                 || Span::styled("Package: Raw", theme.muted),
                 |package| {
@@ -377,9 +389,9 @@ fn render_runtimes(
             ])]
         },
         |snapshot| {
-            let gguf = selection_text(app, ArtifactFormat::Gguf);
-            let q27 = selection_text(app, ArtifactFormat::Q27);
-            let ninfer = selection_text(app, ArtifactFormat::Ninfer);
+            let gguf = selection_text(app, ArtifactFormat::Gguf, ui_layout.compact);
+            let q27 = selection_text(app, ArtifactFormat::Q27, ui_layout.compact);
+            let ninfer = selection_text(app, ArtifactFormat::Ninfer, ui_layout.compact);
             let accelerator = if snapshot.host.accelerators.is_empty() {
                 "CPU"
             } else {
@@ -593,7 +605,7 @@ fn runtime_update_text(state: &RuntimeUpdateState) -> String {
     }
 }
 
-fn selection_text(app: &App, format: ArtifactFormat) -> String {
+fn selection_text(app: &App, format: ArtifactFormat, compact: bool) -> String {
     let Some(snapshot) = &app.runtime_list else {
         return "none".to_owned();
     };
@@ -606,10 +618,14 @@ fn selection_text(app: &App, format: ArtifactFormat) -> String {
         .find(|status| &status.runtime.manifest.runtime_id == runtime_id)
         .map(|status| {
             let identity = &status.runtime.manifest.identity;
-            format!(
-                "{} {} {} / {}",
-                identity.engine_id, identity.version, identity.accelerator, identity.variant
-            )
+            if compact {
+                format!("{} {}", identity.engine_id, identity.version)
+            } else {
+                format!(
+                    "{} {} {} / {}",
+                    identity.engine_id, identity.version, identity.accelerator, identity.variant
+                )
+            }
         })
         .unwrap_or_else(|| runtime_id.to_string())
 }
@@ -931,8 +947,8 @@ fn render_settings(
         } else {
             vec![
                 Line::from(vec![
-                    Span::styled(format!("{:<38}", definition.id), theme.text),
-                    Span::styled(format!("{value:<18}"), theme.accent),
+                    Span::styled(format!("{:<36}  ", definition.id), theme.text),
+                    Span::styled(format!("{value:<16}  "), theme.accent),
                     Span::styled(source, theme.muted),
                 ]),
                 Line::from(vec![
