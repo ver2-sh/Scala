@@ -87,6 +87,12 @@ pub enum ControlAction {
     Unload,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ControlStatusSource {
+    Observation,
+    ControlResult,
+}
+
 #[derive(Debug, Clone)]
 pub enum RuntimeAction {
     RefreshList,
@@ -592,10 +598,11 @@ impl App {
         control: Option<ControlStatus>,
         observation_error: Option<String>,
     ) {
-        if let Some(status) = &control {
-            self.ingest_control_events(status);
+        if let Some(status) = control {
+            self.apply_control_status(ControlStatusSource::Observation, status);
+        } else {
+            self.control = None;
         }
-        self.control = control;
         self.control_observation_error = observation_error;
     }
 
@@ -646,33 +653,9 @@ impl App {
         self.control_busy = false;
         match result {
             Ok(status) => {
-                let lifecycle = status.backend.lifecycle;
-                if lifecycle.is_loading() {
-                    self.notice = Some("Model load started".to_owned());
-                    self.push_log(LogLevel::Info, "Model load started".to_owned());
-                    self.ingest_control_events(&status);
-                    self.control = Some(status);
+                if self.apply_control_status(ControlStatusSource::ControlResult, status) {
                     self.control_observation_error = None;
-                    return;
                 }
-                let runtime = status.backend.runtime_id.as_ref().map(|runtime_id| {
-                    status.backend.runtime_version.as_deref().map_or_else(
-                        || runtime_id.to_string(),
-                        |version| format!("{runtime_id} / {version}"),
-                    )
-                });
-                let completion = runtime.map_or_else(
-                    || format!("Backend is now {lifecycle:?}"),
-                    |runtime| format!("Backend is now {lifecycle:?} with runtime {runtime}"),
-                );
-                self.notice = Some(completion.clone());
-                self.push_log(
-                    LogLevel::Info,
-                    format!("Control operation completed: {completion}"),
-                );
-                self.ingest_control_events(&status);
-                self.control = Some(status);
-                self.control_observation_error = None;
             }
             Err(error) => {
                 self.notice = Some(error.clone());
@@ -1185,6 +1168,104 @@ impl App {
         self.logs.push(LogEntry { level, message });
         if self.logs.len() > 500 {
             self.logs.remove(0);
+        }
+    }
+
+    fn apply_control_status(&mut self, source: ControlStatusSource, status: ControlStatus) -> bool {
+        let previous = self
+            .control
+            .as_ref()
+            .map(|current| (current.backend.generation, current.backend.lifecycle));
+        let incoming = (status.backend.generation, status.backend.lifecycle);
+
+        if previous.is_some_and(|(generation, lifecycle)| {
+            incoming.0 < generation
+                || (incoming.0 == generation && incoming.1.is_loading() && !lifecycle.is_loading())
+        }) {
+            return false;
+        }
+
+        if source == ControlStatusSource::ControlResult {
+            self.set_control_result_notice(&status);
+        }
+        self.ingest_control_events(&status);
+        if source == ControlStatusSource::Observation {
+            self.reconcile_lifecycle_notice(previous, &status);
+        }
+        self.control = Some(status);
+        true
+    }
+
+    fn set_control_result_notice(&mut self, status: &ControlStatus) {
+        let lifecycle = status.backend.lifecycle;
+        if lifecycle.is_loading() {
+            self.notice = Some("Model load started".to_owned());
+            self.push_log(LogLevel::Info, "Model load started".to_owned());
+            return;
+        }
+
+        let runtime = status.backend.runtime_id.as_ref().map(|runtime_id| {
+            status.backend.runtime_version.as_deref().map_or_else(
+                || runtime_id.to_string(),
+                |version| format!("{runtime_id} / {version}"),
+            )
+        });
+        let completion = runtime.map_or_else(
+            || format!("Backend is now {lifecycle:?}"),
+            |runtime| format!("Backend is now {lifecycle:?} with runtime {runtime}"),
+        );
+        self.notice = Some(completion.clone());
+        self.push_log(
+            LogLevel::Info,
+            format!("Control operation completed: {completion}"),
+        );
+    }
+
+    fn reconcile_lifecycle_notice(
+        &mut self,
+        previous: Option<(u64, BackendLifecycle)>,
+        status: &ControlStatus,
+    ) {
+        let generation = status.backend.generation;
+        let lifecycle = status.backend.lifecycle;
+        let generation_advanced =
+            previous.is_some_and(|(previous_generation, _)| generation > previous_generation);
+        let lifecycle_changed =
+            previous.is_some_and(|(previous_generation, previous_lifecycle)| {
+                generation > previous_generation || lifecycle != previous_lifecycle
+            });
+
+        if lifecycle == BackendLifecycle::Failed {
+            if let Some(failure) = &status.backend.failure {
+                self.notice = Some(failure.clone());
+            }
+            return;
+        }
+        if !lifecycle_changed {
+            return;
+        }
+
+        let previous_lifecycle = previous.map(|(_, lifecycle)| lifecycle);
+        let notice = match lifecycle {
+            BackendLifecycle::Running
+                if generation_advanced || previous_lifecycle == Some(BackendLifecycle::Loading) =>
+            {
+                Some("Model loaded")
+            }
+            BackendLifecycle::Stopping
+                if generation_advanced || previous_lifecycle == Some(BackendLifecycle::Loading) =>
+            {
+                Some("Model load stopping")
+            }
+            BackendLifecycle::Stopped => Some(match previous_lifecycle {
+                Some(BackendLifecycle::Loading) => "Model load stopped",
+                _ => "Backend stopped",
+            }),
+            _ => None,
+        };
+        if let Some(notice) = notice {
+            self.notice = Some(notice.to_owned());
+            self.push_log(LogLevel::Info, notice.to_owned());
         }
     }
 
@@ -2814,4 +2895,220 @@ fn byte_index(value: &str, char_index: usize) -> usize {
         .nth(char_index)
         .map(|(index, _)| index)
         .unwrap_or(value.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use norted_core::{
+        AppSnapshot, EffectivePublicAuthMode, PublicAuthMode, PublicAuthStatus, RegistryState,
+        ServerState,
+    };
+    use norted_engine::{
+        BackendLifecycle, BackendLoadPhase, BackendLoadProgress, BackendStatus, ControlStatus,
+        RuntimeNotice, RuntimeNoticeLevel,
+    };
+
+    use super::App;
+
+    fn test_app() -> App {
+        App::new(
+            AppSnapshot {
+                server: ServerState::Stopped,
+                registry_state: RegistryState::Ready,
+                models: Vec::new(),
+                registry_warnings: Vec::new(),
+            },
+            PublicAuthStatus {
+                bind: "127.0.0.1:8080".to_owned(),
+                loopback: true,
+                configured_mode: PublicAuthMode::Auto,
+                effective_mode: EffectivePublicAuthMode::Disabled,
+                active_key_count: 0,
+                bind_allowed: true,
+                insecure_remote: false,
+            },
+            true,
+            true,
+            Vec::new(),
+        )
+    }
+
+    fn status(generation: u64, lifecycle: BackendLifecycle) -> ControlStatus {
+        ControlStatus {
+            public_endpoint: Some("http://127.0.0.1:8080".to_owned()),
+            available_engine_count: 1,
+            installed_engine_count: 1,
+            running_engine_count: usize::from(lifecycle == BackendLifecycle::Running),
+            engines: Vec::new(),
+            backend: BackendStatus {
+                generation,
+                lifecycle,
+                model_id: None,
+                engine_id: None,
+                runtime_id: None,
+                runtime_version: None,
+                runtime_variant: None,
+                runtime_executable_sha256: None,
+                process_id: None,
+                private_endpoint: None,
+                load_progress: None,
+                failure: None,
+                provenance: None,
+            },
+            recent_events: Vec::new(),
+        }
+    }
+
+    fn lifecycle(app: &App) -> BackendLifecycle {
+        app.control.as_ref().unwrap().backend.lifecycle
+    }
+
+    #[test]
+    fn loading_to_running_reports_success() {
+        let mut app = test_app();
+        app.handle_control_result(Ok(status(7, BackendLifecycle::Loading)));
+        assert_eq!(app.notice.as_deref(), Some("Model load started"));
+
+        app.replace_control(Some(status(7, BackendLifecycle::Running)), None);
+
+        assert_eq!(lifecycle(&app), BackendLifecycle::Running);
+        assert_eq!(app.notice.as_deref(), Some("Model loaded"));
+    }
+
+    #[test]
+    fn loading_to_failed_surfaces_exact_backend_failure() {
+        let mut app = test_app();
+        app.handle_control_result(Ok(status(8, BackendLifecycle::Loading)));
+        let mut failed = status(8, BackendLifecycle::Failed);
+        failed.backend.failure = Some("q27 rejected tensor metadata at offset 42".to_owned());
+
+        app.replace_control(Some(failed), None);
+
+        assert_eq!(lifecycle(&app), BackendLifecycle::Failed);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("q27 rejected tensor metadata at offset 42")
+        );
+    }
+
+    #[test]
+    fn stale_loading_admission_cannot_regress_failed_status_or_notice() {
+        let mut app = test_app();
+        let mut failed = status(9, BackendLifecycle::Failed);
+        failed.backend.failure = Some("runtime exited before readiness probe".to_owned());
+        app.replace_control(Some(failed), None);
+
+        app.handle_control_result(Ok(status(9, BackendLifecycle::Loading)));
+
+        assert_eq!(lifecycle(&app), BackendLifecycle::Failed);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("runtime exited before readiness probe")
+        );
+    }
+
+    #[test]
+    fn stale_loading_admission_cannot_regress_running_status() {
+        let mut app = test_app();
+        app.replace_control(Some(status(10, BackendLifecycle::Running)), None);
+
+        app.handle_control_result(Ok(status(10, BackendLifecycle::Loading)));
+
+        assert_eq!(lifecycle(&app), BackendLifecycle::Running);
+    }
+
+    #[test]
+    fn lower_generation_status_cannot_replace_newer_status() {
+        let mut app = test_app();
+        app.replace_control(Some(status(12, BackendLifecycle::Running)), None);
+
+        app.replace_control(Some(status(11, BackendLifecycle::Stopped)), None);
+
+        assert_eq!(
+            app.control.as_ref().unwrap().backend.generation,
+            12,
+            "the newer generation must remain displayed"
+        );
+        assert_eq!(lifecycle(&app), BackendLifecycle::Running);
+    }
+
+    #[test]
+    fn same_generation_loading_status_refreshes_progress_fields() {
+        let mut app = test_app();
+        let mut initial = status(13, BackendLifecycle::Loading);
+        initial.backend.load_progress = Some(BackendLoadProgress::with_message(
+            BackendLoadPhase::PreparingModel,
+            "Preparing model input",
+        ));
+        app.replace_control(Some(initial), None);
+
+        let mut refreshed = status(13, BackendLifecycle::Loading);
+        refreshed.backend.engine_id = Some("q27".to_owned());
+        refreshed.backend.load_progress = Some(BackendLoadProgress::with_message(
+            BackendLoadPhase::PreparingLaunch,
+            "Revalidating package before launch",
+        ));
+        app.replace_control(Some(refreshed), None);
+
+        let backend = &app.control.as_ref().unwrap().backend;
+        assert_eq!(backend.engine_id.as_deref(), Some("q27"));
+        assert_eq!(
+            backend
+                .load_progress
+                .as_ref()
+                .and_then(|progress| progress.message.as_deref()),
+            Some("Revalidating package before launch")
+        );
+    }
+
+    #[test]
+    fn running_to_failed_is_accepted_and_surfaces_failure() {
+        let mut app = test_app();
+        app.replace_control(Some(status(14, BackendLifecycle::Running)), None);
+        let mut failed = status(14, BackendLifecycle::Failed);
+        failed.backend.failure = Some("backend process exited with status 137".to_owned());
+
+        app.replace_control(Some(failed), None);
+
+        assert_eq!(lifecycle(&app), BackendLifecycle::Failed);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("backend process exited with status 137")
+        );
+    }
+
+    #[test]
+    fn repeated_failed_observation_restores_failure_without_a_new_runtime_event() {
+        let mut app = test_app();
+        app.replace_control(Some(status(15, BackendLifecycle::Loading)), None);
+        let failure = "runtime health check failed: connection refused";
+        let mut failed = status(15, BackendLifecycle::Failed);
+        failed.backend.failure = Some(failure.to_owned());
+        failed.recent_events.push(RuntimeNotice {
+            timestamp_unix: 123,
+            level: RuntimeNoticeLevel::Error,
+            message: failure.to_owned(),
+        });
+        app.replace_control(Some(failed.clone()), None);
+        assert_eq!(app.notice.as_deref(), Some(failure));
+
+        app.notice = Some("Model load started".to_owned());
+        app.replace_control(Some(failed), None);
+
+        assert_eq!(app.notice.as_deref(), Some(failure));
+    }
+
+    #[test]
+    fn loading_admission_for_newer_generation_is_accepted() {
+        let mut app = test_app();
+        let mut failed = status(20, BackendLifecycle::Failed);
+        failed.backend.failure = Some("previous load failed".to_owned());
+        app.replace_control(Some(failed), None);
+
+        app.handle_control_result(Ok(status(21, BackendLifecycle::Loading)));
+
+        assert_eq!(app.control.as_ref().unwrap().backend.generation, 21);
+        assert_eq!(lifecycle(&app), BackendLifecycle::Loading);
+        assert_eq!(app.notice.as_deref(), Some("Model load started"));
+    }
 }
