@@ -19,10 +19,11 @@ use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CompatibilityDecision,
     EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError, EngineFeature,
     EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceOutput, InferenceRequest,
-    InferenceStream, InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind,
-    PreparedModelInput, ProcessDescriptor, UpdateState, capture_command, compatibility_for,
-    isolated_cuda_environment, prepare_norted_package_input,
-    revalidate_norted_package_before_launch, visible_nvidia_devices,
+    InferenceStream, InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter,
+    NativeOption, OptionValueKind, PreparedModelInput, ProcessDescriptor, UpdateState,
+    capture_command, compatibility_for, isolated_cuda_environment, prepare_norted_package_input,
+    prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
+    revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
 };
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -800,6 +801,50 @@ impl EngineAdapter for NinferAdapter {
         }
     }
 
+    async fn prepare_model_input_with_progress(
+        &self,
+        model: &ModelArtifact,
+        progress: LoadProgressReporter,
+    ) -> Result<PreparedModelInput, EngineError> {
+        if model.format != ArtifactFormat::Ninfer {
+            return Err(EngineError::InvalidConfiguration(
+                "NInfer can only prepare `.ninfer` artifacts".to_owned(),
+            ));
+        }
+        let expected = model.native_identity.clone().ok_or_else(|| {
+            EngineError::InvalidConfiguration(
+                "NInfer artifact is missing its inspected native identity".to_owned(),
+            )
+        })?;
+        let canonical = canonical_regular_file(&model.path, "NInfer model").await?;
+        let inspected = inspect_ninfer_container(&canonical).map_err(|error| {
+            EngineError::InvalidConfiguration(format!(
+                "could not re-inspect NInfer artifact {}: {error}",
+                canonical.display()
+            ))
+        })?;
+        let observed = ArtifactNativeIdentity::Ninfer(inspected.identity);
+        if observed != expected {
+            return Err(EngineError::InvalidConfiguration(
+                "NInfer artifact native identity changed after discovery".to_owned(),
+            ));
+        }
+        if model.norted_package.is_some() {
+            let mut prepared = prepare_norted_package_input_with_progress(model, &progress).await?;
+            prepared.primary.native_identity = Some(observed);
+            Ok(prepared)
+        } else {
+            let mut primary = model.clone();
+            primary.path = canonical;
+            primary.native_identity = Some(observed);
+            Ok(PreparedModelInput {
+                primary,
+                auxiliary: Vec::new(),
+                primary_file_identity: None,
+            })
+        }
+    }
+
     fn native_options(&self) -> Vec<NativeOption> {
         vec![NativeOption {
             name: "arguments".to_owned(),
@@ -941,7 +986,6 @@ impl EngineAdapter for NinferAdapter {
             .load_settings_schema
             .validate(&request.load_settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
-        revalidate_norted_package_before_launch(&request.model).await?;
         let mut structured = settings::translate(
             &request.load_settings,
             &request.model.primary,
@@ -1114,6 +1158,27 @@ impl EngineAdapter for NinferAdapter {
             model: request.model,
             accelerator: Some(accelerator),
         })
+    }
+
+    fn prepare_launch_progress(&self, spec: &LaunchSpec) -> Option<BackendLoadProgress> {
+        spec.model.primary.norted_package.as_ref().map(|_| {
+            BackendLoadProgress::with_message(
+                BackendLoadPhase::PreparingLaunch,
+                "Revalidating package before launch",
+            )
+        })
+    }
+
+    async fn prepare_launch_attempt(&self, spec: &LaunchSpec) -> Result<(), EngineError> {
+        revalidate_norted_package_before_launch(&spec.model).await
+    }
+
+    async fn prepare_launch_attempt_with_progress(
+        &self,
+        spec: &LaunchSpec,
+        progress: LoadProgressReporter,
+    ) -> Result<(), EngineError> {
+        revalidate_norted_package_before_launch_with_progress(&spec.model, &progress).await
     }
 
     async fn health(&self, process: &ProcessDescriptor) -> Result<bool, EngineError> {

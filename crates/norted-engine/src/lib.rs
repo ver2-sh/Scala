@@ -2,10 +2,12 @@
 
 use std::collections::{BTreeMap, btree_map::Entry};
 use std::ffi::OsString;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures_util::Stream;
@@ -18,7 +20,6 @@ use norted_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 
 mod catalog;
@@ -208,10 +209,34 @@ pub struct PreparedFileIdentity {
     pub filesystem_inode: Option<u64>,
 }
 
+/// Non-blocking sink for engine-neutral load progress. Reporters must return
+/// promptly; the runtime manager uses a coalescing channel behind this API.
+pub type LoadProgressReporter = Arc<dyn Fn(BackendLoadProgress) + Send + Sync>;
+
+const HASH_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+const HASH_PROGRESS_BYTE_INTERVAL: u64 = 64 * 1024 * 1024;
+const HASH_PROGRESS_TIME_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Prepares a manifest-bound model in place. Package files are hash-checked at
 /// this explicit load boundary and again immediately before launch.
 pub async fn prepare_norted_package_input(
     model: &ModelArtifact,
+) -> Result<PreparedModelInput, EngineError> {
+    prepare_norted_package_input_inner(model, None).await
+}
+
+/// Prepares and completely verifies a manifest-bound model while reporting
+/// byte-accurate progress for each artifact being hashed.
+pub async fn prepare_norted_package_input_with_progress(
+    model: &ModelArtifact,
+    progress: &LoadProgressReporter,
+) -> Result<PreparedModelInput, EngineError> {
+    prepare_norted_package_input_inner(model, Some(progress)).await
+}
+
+async fn prepare_norted_package_input_inner(
+    model: &ModelArtifact,
+    progress: Option<&LoadProgressReporter>,
 ) -> Result<PreparedModelInput, EngineError> {
     let Some(package) = &model.norted_package else {
         return Ok(PreparedModelInput {
@@ -234,7 +259,16 @@ pub async fn prepare_norted_package_input(
             metadata.len()
         )));
     }
-    let primary_sha = hash_file(&canonical).await.map_err(package_io)?;
+    let primary_sha = hash_package_artifact(
+        &canonical,
+        "primary",
+        "initial preparation",
+        BackendLoadPhase::PreparingModel,
+        "Verifying package SHA-256",
+        progress,
+    )
+    .await
+    .map_err(package_io)?;
     if primary_sha != package.expected_primary_sha256 {
         return Err(EngineError::InvalidConfiguration(
             "Norted package primary artifact SHA256 differs from its manifest".to_owned(),
@@ -270,7 +304,21 @@ pub async fn prepare_norted_package_input(
                 path.display()
             )));
         }
-        let observed = hash_file(&path).await.map_err(package_io)?;
+        let artifact_role = format!("auxiliary:{}", auxiliary_role_label(&declared.role));
+        let message = format!(
+            "Verifying package {} SHA-256",
+            auxiliary_role_label(&declared.role)
+        );
+        let observed = hash_package_artifact(
+            &path,
+            &artifact_role,
+            "initial preparation",
+            BackendLoadPhase::PreparingModel,
+            &message,
+            progress,
+        )
+        .await
+        .map_err(package_io)?;
         if observed != expected {
             return Err(EngineError::InvalidConfiguration(format!(
                 "Norted package auxiliary {} SHA256 differs from its manifest",
@@ -294,6 +342,23 @@ pub async fn prepare_norted_package_input(
 pub async fn revalidate_norted_package_before_launch(
     model: &PreparedModelInput,
 ) -> Result<(), EngineError> {
+    revalidate_norted_package_before_launch_inner(model, None).await
+}
+
+/// Repeats the complete package verification at the final pre-launch boundary
+/// while reporting byte-accurate progress. This is intentionally independent
+/// from preparation and must never be replaced by cached metadata.
+pub async fn revalidate_norted_package_before_launch_with_progress(
+    model: &PreparedModelInput,
+    progress: &LoadProgressReporter,
+) -> Result<(), EngineError> {
+    revalidate_norted_package_before_launch_inner(model, Some(progress)).await
+}
+
+async fn revalidate_norted_package_before_launch_inner(
+    model: &PreparedModelInput,
+    progress: Option<&LoadProgressReporter>,
+) -> Result<(), EngineError> {
     let Some(package) = &model.primary.norted_package else {
         return Ok(());
     };
@@ -301,7 +366,16 @@ pub async fn revalidate_norted_package_before_launch(
         canonical_regular_file(&model.primary.path, "prepared Norted package primary").await?;
     let metadata = tokio::fs::metadata(&canonical).await.map_err(package_io)?;
     let observed_identity = file_identity(&metadata);
-    let observed_sha = hash_file(&canonical).await.map_err(package_io)?;
+    let observed_sha = hash_package_artifact(
+        &canonical,
+        "primary",
+        "final pre-launch revalidation",
+        BackendLoadPhase::PreparingLaunch,
+        "Revalidating package before launch",
+        progress,
+    )
+    .await
+    .map_err(package_io)?;
     if canonical != model.primary.path
         || observed_identity.size_bytes != package.expected_primary_size
         || model.primary_file_identity.as_ref() != Some(&observed_identity)
@@ -317,7 +391,21 @@ pub async fn revalidate_norted_package_before_launch(
         let path =
             canonical_regular_file(&auxiliary.path, "prepared Norted package auxiliary").await?;
         let metadata = tokio::fs::metadata(&path).await.map_err(package_io)?;
-        let observed = hash_file(&path).await.map_err(package_io)?;
+        let artifact_role = format!("auxiliary:{}", auxiliary_role_label(&auxiliary.role));
+        let message = format!(
+            "Revalidating package {} before launch",
+            auxiliary_role_label(&auxiliary.role)
+        );
+        let observed = hash_package_artifact(
+            &path,
+            &artifact_role,
+            "final pre-launch revalidation",
+            BackendLoadPhase::PreparingLaunch,
+            &message,
+            progress,
+        )
+        .await
+        .map_err(package_io)?;
         if path != auxiliary.path
             || metadata.len() != auxiliary.size_bytes
             || observed != auxiliary.content_sha256
@@ -345,18 +433,132 @@ async fn canonical_regular_file(path: &Path, label: &str) -> Result<PathBuf, Eng
     Ok(path)
 }
 
-async fn hash_file(path: &Path) -> std::io::Result<String> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer).await?;
-        if read == 0 {
-            break;
+async fn hash_package_artifact(
+    path: &Path,
+    artifact_role: &str,
+    verification: &str,
+    phase: BackendLoadPhase,
+    message: &str,
+    progress: Option<&LoadProgressReporter>,
+) -> std::io::Result<String> {
+    let started = Instant::now();
+    let path = path.to_path_buf();
+    let progress = progress.cloned();
+    let message = message.to_owned();
+    let (digest, size_bytes) = hash_file_with_progress(&path, move |current, total, throughput| {
+        if let Some(progress) = &progress {
+            let message = throughput.map_or_else(
+                || message.clone(),
+                |bytes_per_second| {
+                    format!("{message} · {}", format_hash_throughput(bytes_per_second))
+                },
+            );
+            progress(BackendLoadProgress {
+                phase,
+                fraction: None,
+                current: Some(current),
+                total: Some(total),
+                message: Some(message),
+            });
         }
-        digest.update(&buffer[..read]);
+    })
+    .await?;
+    let elapsed = started.elapsed();
+    let throughput = throughput_bytes_per_second(size_bytes, elapsed);
+    tracing::info!(
+        artifact_role,
+        verification,
+        size_bytes,
+        elapsed_seconds = elapsed.as_secs_f64(),
+        throughput_mib_per_second = throughput as f64 / (1024.0 * 1024.0),
+        "completed Norted package SHA-256 verification"
+    );
+    Ok(digest)
+}
+
+async fn hash_file_with_progress<F>(path: &Path, progress: F) -> std::io::Result<(String, u64)>
+where
+    F: Fn(u64, u64, Option<u64>) + Send + 'static,
+{
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(&path).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("could not open {} for hashing: {error}", path.display()),
+            )
+        })?;
+        let total = file
+            .metadata()
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("could not inspect {} for hashing: {error}", path.display()),
+                )
+            })?
+            .len();
+        let started = Instant::now();
+        let mut last_reported_at = started;
+        let mut last_reported_bytes = 0_u64;
+        let mut current = 0_u64;
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0_u8; HASH_BUFFER_SIZE];
+        progress(0, total, None);
+        loop {
+            let read = file.read(&mut buffer).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("could not read {} while hashing: {error}", path.display()),
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+            current = current.saturating_add(read as u64);
+            let now = Instant::now();
+            if current.saturating_sub(last_reported_bytes) >= HASH_PROGRESS_BYTE_INTERVAL
+                || now.duration_since(last_reported_at) >= HASH_PROGRESS_TIME_INTERVAL
+            {
+                progress(
+                    current.min(total),
+                    total,
+                    Some(throughput_bytes_per_second(current, started.elapsed())),
+                );
+                last_reported_bytes = current;
+                last_reported_at = now;
+            }
+        }
+        progress(
+            current.min(total),
+            total,
+            Some(throughput_bytes_per_second(current, started.elapsed())),
+        );
+        Ok((format!("{:x}", digest.finalize()), current))
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("hashing task failed: {error}")))?
+}
+
+fn throughput_bytes_per_second(bytes: u64, elapsed: Duration) -> u64 {
+    let nanos = elapsed.as_nanos().max(1);
+    let bytes = u128::from(bytes);
+    u64::try_from(bytes.saturating_mul(1_000_000_000) / nanos).unwrap_or(u64::MAX)
+}
+
+fn format_hash_throughput(bytes_per_second: u64) -> String {
+    format!("{:.0} MiB/s", bytes_per_second as f64 / (1024.0 * 1024.0))
+}
+
+fn auxiliary_role_label(role: &AuxiliaryArtifactRole) -> &str {
+    match role {
+        AuxiliaryArtifactRole::Manifest => "manifest",
+        AuxiliaryArtifactRole::Tokenizer => "tokenizer",
+        AuxiliaryArtifactRole::Projector => "projector",
+        AuxiliaryArtifactRole::Sharp => "Sharp template",
+        AuxiliaryArtifactRole::RuntimePolicy => "runtime policy",
+        AuxiliaryArtifactRole::Other(name) => name,
     }
-    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn package_io(error: std::io::Error) -> EngineError {
@@ -789,6 +991,16 @@ pub trait EngineAdapter: Send + Sync {
             primary_file_identity: None,
         })
     }
+    /// Progress-aware form used by the runtime manager. Adapters that perform
+    /// measurable preparation should override this and keep the original
+    /// method as a compatibility path for direct callers.
+    async fn prepare_model_input_with_progress(
+        &self,
+        model: &ModelArtifact,
+        _progress: LoadProgressReporter,
+    ) -> Result<PreparedModelInput, EngineError> {
+        self.prepare_model_input(model).await
+    }
     fn native_options(&self) -> Vec<NativeOption>;
     /// Returns every stable setting this adapter understands, independent of
     /// whether one exact installed runtime currently supports it.
@@ -847,6 +1059,15 @@ pub trait EngineAdapter: Send + Sync {
     /// may be installed after clearing stale state.
     async fn prepare_launch_attempt(&self, _spec: &LaunchSpec) -> Result<(), EngineError> {
         Ok(())
+    }
+    /// Progress-aware final launch boundary. The default preserves adapters
+    /// with no measurable preparation work.
+    async fn prepare_launch_attempt_with_progress(
+        &self,
+        spec: &LaunchSpec,
+        _progress: LoadProgressReporter,
+    ) -> Result<(), EngineError> {
+        self.prepare_launch_attempt(spec).await
     }
     /// Clears adapter-owned state after a spawn failure, terminated attempt,
     /// unload, or crash. Process supervision itself remains manager-owned.
@@ -1018,8 +1239,9 @@ impl EngineRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use norted_core::{
@@ -1036,8 +1258,9 @@ mod tests {
         EngineError, EngineIdentity, EngineProbe, EngineRegistry, GenerationSettingsPatch,
         InferenceRole, InstallationState, LaunchRequest, LaunchSpec, NativeOption,
         PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
-        RuntimePackManager, UpdateState, prepare_norted_package_input,
-        revalidate_norted_package_before_launch,
+        RuntimePackManager, UpdateState, hash_file_with_progress, prepare_norted_package_input,
+        prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
+        revalidate_norted_package_before_launch_with_progress,
     };
 
     struct ArchitectureAdapter {
@@ -1070,6 +1293,85 @@ mod tests {
         );
         assert_eq!(backend_defaults.temperature, 0.7);
         assert_eq!(backend_defaults.top_p, 0.9);
+    }
+
+    #[tokio::test]
+    async fn blocking_hash_matches_reference_for_empty_and_small_files() {
+        let temporary = tempfile::tempdir().expect("hash fixture");
+        for (name, bytes) in [("empty", &b""[..]), ("small", &b"norted hash fixture"[..])] {
+            let path = temporary.path().join(name);
+            std::fs::write(&path, bytes).expect("write hash fixture");
+            let (observed, size) = hash_file_with_progress(&path, |_, _, _| {})
+                .await
+                .expect("hash fixture");
+            assert_eq!(observed, format!("{:x}", Sha256::digest(bytes)));
+            assert_eq!(size, bytes.len() as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_hash_reports_monotonic_bounded_multibuffer_progress() {
+        let temporary = tempfile::tempdir().expect("hash fixture");
+        let path = temporary.path().join("multi-buffer.bin");
+        let bytes = (0..(20 * 1024 * 1024 + 137))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut file = std::fs::File::create(&path).expect("create fixture");
+        file.write_all(&bytes).expect("write fixture");
+        drop(file);
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&observations);
+        let (observed, size) = hash_file_with_progress(&path, move |current, total, _| {
+            captured
+                .lock()
+                .expect("progress observations")
+                .push((current, total));
+        })
+        .await
+        .expect("hash fixture");
+
+        assert_eq!(observed, format!("{:x}", Sha256::digest(&bytes)));
+        assert_eq!(size, bytes.len() as u64);
+        let observations = observations.lock().expect("progress observations");
+        assert!(!observations.is_empty());
+        assert!(
+            observations.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+            "hash byte progress must be monotonic"
+        );
+        assert!(
+            observations.iter().all(|(current, total)| current <= total),
+            "hash byte progress must never exceed its total"
+        );
+        assert_eq!(observations.last().copied(), Some((size, size)));
+    }
+
+    #[tokio::test]
+    async fn blocking_hash_propagates_open_failure() {
+        let temporary = tempfile::tempdir().expect("hash fixture");
+        let missing = temporary.path().join("missing.bin");
+        let error = hash_file_with_progress(&missing, |_, _, _| {})
+            .await
+            .expect_err("missing hash input must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("missing.bin"));
+    }
+
+    #[tokio::test]
+    #[ignore = "manual local-file throughput comparison"]
+    async fn manual_blocking_hash_benchmark() {
+        let path = std::env::var_os("NORTED_HASH_BENCH_FILE")
+            .map(PathBuf::from)
+            .expect("set NORTED_HASH_BENCH_FILE");
+        let started = std::time::Instant::now();
+        let (_, size) = hash_file_with_progress(&path, |_, _, _| {})
+            .await
+            .expect("benchmark hash");
+        let elapsed = started.elapsed();
+        eprintln!(
+            "hashed {size} bytes in {:.3}s ({:.1} MiB/s)",
+            elapsed.as_secs_f64(),
+            size as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0)
+        );
     }
 
     #[test]
@@ -1449,11 +1751,9 @@ mod tests {
                 }
             }
         });
-        std::fs::write(
-            temporary.path().join("BUILD-MANIFEST.json"),
-            serde_json::to_vec(&manifest).expect("manifest JSON"),
-        )
-        .expect("manifest fixture");
+        let manifest_path = temporary.path().join("BUILD-MANIFEST.json");
+        let manifest_bytes = serde_json::to_vec(&manifest).expect("manifest JSON");
+        std::fs::write(&manifest_path, &manifest_bytes).expect("manifest fixture");
         let registry = ModelRegistry::discover(&[temporary.path().to_path_buf()]);
         let artifact = registry.artifacts().first().expect("package artifact");
         let summary = super::norted_package_summary(
@@ -1471,13 +1771,82 @@ mod tests {
             norted_core::NortedPackageStatus::Valid
         );
         assert!(summary.runtime_package_capability.is_some());
-        let prepared = prepare_norted_package_input(artifact)
+        let preparation_progress = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&preparation_progress);
+        let reporter: super::LoadProgressReporter = Arc::new(move |progress| {
+            captured
+                .lock()
+                .expect("preparation progress")
+                .push(progress);
+        });
+        let prepared = prepare_norted_package_input_with_progress(artifact, &reporter)
             .await
             .expect("prepared package");
         assert_eq!(prepared.primary.path, primary.canonicalize().unwrap());
         assert_eq!(prepared.primary.hash.as_deref(), Some(digest.as_str()));
         assert!(prepared.primary_file_identity.is_some());
+        assert!(
+            prepared
+                .auxiliary
+                .iter()
+                .any(|artifact| artifact.role == AuxiliaryArtifactRole::Manifest),
+            "package manifest remains a completely verified auxiliary artifact"
+        );
         assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 2);
+        let primary_preparation_completed = {
+            let preparation_progress = preparation_progress.lock().expect("preparation progress");
+            preparation_progress.iter().any(|progress| {
+                progress.phase == BackendLoadPhase::PreparingModel
+                    && progress.current == Some(bytes.len() as u64)
+                    && progress.total == Some(bytes.len() as u64)
+                    && progress
+                        .message
+                        .as_deref()
+                        .is_some_and(|message| message.starts_with("Verifying package SHA-256"))
+            })
+        };
+        assert!(primary_preparation_completed);
+
+        let launch_progress = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&launch_progress);
+        let reporter: super::LoadProgressReporter = Arc::new(move |progress| {
+            captured.lock().expect("launch progress").push(progress);
+        });
+        revalidate_norted_package_before_launch_with_progress(&prepared, &reporter)
+            .await
+            .expect("unchanged package revalidation");
+        assert!(
+            launch_progress
+                .lock()
+                .expect("launch progress")
+                .iter()
+                .any(|progress| {
+                    progress.phase == BackendLoadPhase::PreparingLaunch
+                        && progress.current == Some(bytes.len() as u64)
+                        && progress.total == Some(bytes.len() as u64)
+                        && progress.message.as_deref().is_some_and(|message| {
+                            message.starts_with("Revalidating package before launch")
+                        })
+                })
+        );
+
+        let mut changed_manifest = manifest_bytes.clone();
+        changed_manifest.push(b' ');
+        std::fs::write(&manifest_path, changed_manifest).expect("mutated manifest fixture");
+        assert!(
+            revalidate_norted_package_before_launch(&prepared)
+                .await
+                .is_err(),
+            "final verification must fail closed for a changed auxiliary"
+        );
+        assert!(
+            prepare_norted_package_input(artifact).await.is_err(),
+            "initial verification must fail closed for a changed auxiliary"
+        );
+        std::fs::write(&manifest_path, &manifest_bytes).expect("restore manifest fixture");
+        revalidate_norted_package_before_launch(&prepared)
+            .await
+            .expect("restored auxiliary remains valid");
 
         std::fs::write(&primary, b"PACKAGE-primary").expect("same-size tamper in place");
         assert_eq!(

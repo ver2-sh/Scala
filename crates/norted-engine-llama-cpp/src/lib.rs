@@ -25,10 +25,11 @@ use norted_engine::{
     EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError, EngineFeature,
     EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceEvent, InferenceFinishReason,
     InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
-    InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind,
-    PreparedModelInput, ProcessDescriptor, UpdateState, capture_command,
-    common_load_setting_definitions, prepare_norted_package_input,
-    revalidate_norted_package_before_launch,
+    InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter,
+    NativeOption, OptionValueKind, PreparedModelInput, ProcessDescriptor, UpdateState,
+    capture_command, common_load_setting_definitions, prepare_norted_package_input,
+    prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
+    revalidate_norted_package_before_launch_with_progress,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -508,6 +509,14 @@ impl EngineAdapter for LlamaCppAdapter {
         prepare_norted_package_input(model).await
     }
 
+    async fn prepare_model_input_with_progress(
+        &self,
+        model: &ModelArtifact,
+        progress: LoadProgressReporter,
+    ) -> Result<PreparedModelInput, EngineError> {
+        prepare_norted_package_input_with_progress(model, &progress).await
+    }
+
     fn load_setting_definitions(&self) -> Vec<LoadSettingDefinition> {
         llama_load_setting_definitions()
     }
@@ -747,7 +756,6 @@ impl EngineAdapter for LlamaCppAdapter {
             .load_settings_schema
             .validate(&request.load_settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
-        revalidate_norted_package_before_launch(&request.model).await?;
         let structured = translate_llama_load_settings(
             &request.load_settings,
             &self.native_arguments,
@@ -813,6 +821,27 @@ impl EngineAdapter for LlamaCppAdapter {
             model: request.model,
             accelerator: request.accelerator,
         })
+    }
+
+    fn prepare_launch_progress(&self, spec: &LaunchSpec) -> Option<BackendLoadProgress> {
+        spec.model.primary.norted_package.as_ref().map(|_| {
+            BackendLoadProgress::with_message(
+                BackendLoadPhase::PreparingLaunch,
+                "Revalidating package before launch",
+            )
+        })
+    }
+
+    async fn prepare_launch_attempt(&self, spec: &LaunchSpec) -> Result<(), EngineError> {
+        revalidate_norted_package_before_launch(&spec.model).await
+    }
+
+    async fn prepare_launch_attempt_with_progress(
+        &self,
+        spec: &LaunchSpec,
+        progress: LoadProgressReporter,
+    ) -> Result<(), EngineError> {
+        revalidate_norted_package_before_launch_with_progress(&spec.model, &progress).await
     }
 
     async fn health(&self, process: &ProcessDescriptor) -> Result<bool, EngineError> {

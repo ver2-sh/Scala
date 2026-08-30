@@ -221,7 +221,11 @@ fn progress_detail(progress: &BackendLoadProgress, width: u16) -> String {
         phase.to_owned()
     };
     if let (Some(current), Some(total)) = (progress.current, progress.total) {
-        detail.push_str(&format!(" {current} / {total}"));
+        detail.push_str(&format!(
+            " {} / {}",
+            format_bytes(current),
+            format_bytes(total)
+        ));
     }
     if detail.len() > width as usize {
         truncate_middle(&detail, width as usize, "\u{2026}")
@@ -393,7 +397,7 @@ mod tests {
             message: Some("Loading tensors".to_owned()),
         };
         let detail = progress_detail(&progress, 80);
-        assert!(detail.contains("148 / 200"));
+        assert!(detail.contains("148 B / 200 B"));
     }
 
     #[test]
