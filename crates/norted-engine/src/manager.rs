@@ -12,7 +12,7 @@ use norted_core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, oneshot};
 
 use crate::{
     EffectiveGenerationSettings, EngineAdapter, EngineError, EngineIdentity, EngineProbe,
@@ -161,6 +161,10 @@ impl BackendLoadProgress {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendStatus {
+    /// Monotonic manager generation used by private control clients to
+    /// correlate an admitted load with later status observations.
+    #[serde(default)]
+    pub generation: u64,
     pub lifecycle: BackendLifecycle,
     pub model_id: Option<ModelId>,
     pub engine_id: Option<String>,
@@ -230,6 +234,8 @@ pub enum RuntimeError {
     },
     #[error("the backend is currently {0:?}")]
     Busy(BackendLifecycle),
+    #[error("the runtime is shutting down")]
+    ShuttingDown,
     #[error("no registered engine is compatible with model `{model_id}`: {reason}")]
     Incompatible { model_id: ModelId, reason: String },
     #[error("no compatible installed engine is available: {0}")]
@@ -260,6 +266,20 @@ struct ActiveBackend {
     endpoint: String,
     effective_generation_settings: EffectiveGenerationSettings,
     _runtime_lease: RuntimeLease,
+}
+
+struct LoadAdmission {
+    status: ControlStatus,
+    completion: oneshot::Receiver<Result<ControlStatus, RuntimeError>>,
+}
+
+struct AdmittedLoad {
+    model: norted_core::ModelArtifact,
+    runtime_id: Option<RuntimeId>,
+    profile: Option<LoadProfileName>,
+    settings: LoadSettingsPatch,
+    cancellation_epoch: u64,
+    generation: u64,
 }
 
 struct ManagerState {
@@ -298,10 +318,12 @@ pub struct RuntimeManager {
     supervisor: Arc<dyn ProcessSupervisor>,
     options: RuntimeManagerOptions,
     state: RwLock<ManagerState>,
-    operation: Mutex<()>,
+    operation: Arc<Mutex<()>>,
     cancellation_epoch: AtomicU64,
     shutting_down: AtomicBool,
     load_profiles: LoadProfilesStore,
+    #[cfg(test)]
+    load_start_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl RuntimeManager {
@@ -336,10 +358,12 @@ impl RuntimeManager {
                 generation: 0,
                 notices: VecDeque::new(),
             }),
-            operation: Mutex::new(()),
+            operation: Arc::new(Mutex::new(())),
             cancellation_epoch: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
             load_profiles,
+            #[cfg(test)]
+            load_start_gate: Mutex::new(None),
         });
         manager.refresh_engine_probes().await;
         manager
@@ -394,6 +418,7 @@ impl RuntimeManager {
             running_engine_count: usize::from(state.lifecycle == BackendLifecycle::Running),
             engines,
             backend: BackendStatus {
+                generation: state.generation,
                 lifecycle: state.lifecycle,
                 model_id: state.model_id.clone(),
                 engine_id: state.engine_id.clone(),
@@ -452,66 +477,153 @@ impl RuntimeManager {
         profile: Option<LoadProfileName>,
         settings: LoadSettingsPatch,
     ) -> Result<ControlStatus, RuntimeError> {
-        if self.shutting_down.load(Ordering::Acquire) {
-            return Err(RuntimeError::Operation(
-                "the runtime is shutting down".to_owned(),
-            ));
-        }
-        let cancellation_epoch = self.cancellation_epoch.load(Ordering::Acquire);
-        let manager = Arc::clone(self);
-        tokio::spawn(async move {
-            manager
-                .load_inner(model_id, runtime_id, profile, settings, cancellation_epoch)
-                .await
-        })
-        .await
-        .map_err(|error| RuntimeError::Operation(format!("load task failed: {error}")))?
+        let admission = self
+            .admit_load_with_settings(model_id, runtime_id, profile, settings)
+            .await?;
+        admission.completion.await.map_err(|_| {
+            RuntimeError::Operation("server-owned load task ended without a result".to_owned())
+        })?
     }
 
-    async fn load_inner(
+    pub async fn start_load(
+        self: &Arc<Self>,
+        model_id: ModelId,
+    ) -> Result<ControlStatus, RuntimeError> {
+        self.start_load_with_runtime(model_id, None).await
+    }
+
+    pub async fn start_load_with_runtime(
+        self: &Arc<Self>,
+        model_id: ModelId,
+        runtime_id: Option<RuntimeId>,
+    ) -> Result<ControlStatus, RuntimeError> {
+        self.start_load_with_settings(model_id, runtime_id, None, LoadSettingsPatch::default())
+            .await
+    }
+
+    /// Admits a load and returns after its generation has been authoritatively
+    /// reserved as `Loading`. The load task remains owned by the manager after
+    /// this future (or its caller) is dropped.
+    pub async fn start_load_with_settings(
         self: &Arc<Self>,
         model_id: ModelId,
         runtime_id: Option<RuntimeId>,
         profile: Option<LoadProfileName>,
-        invocation_settings: LoadSettingsPatch,
-        cancellation_epoch: u64,
+        settings: LoadSettingsPatch,
     ) -> Result<ControlStatus, RuntimeError> {
-        let _operation = self.operation.lock().await;
-        self.ensure_idle_for_load().await?;
-        if self.load_cancelled(cancellation_epoch) {
-            return Err(RuntimeError::Operation(
-                "model load was cancelled".to_owned(),
-            ));
+        let admission = self
+            .admit_load_with_settings(model_id, runtime_id, profile, settings)
+            .await?;
+        Ok(admission.status)
+    }
+
+    async fn admit_load_with_settings(
+        self: &Arc<Self>,
+        model_id: ModelId,
+        runtime_id: Option<RuntimeId>,
+        profile: Option<LoadProfileName>,
+        settings: LoadSettingsPatch,
+    ) -> Result<LoadAdmission, RuntimeError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(RuntimeError::ShuttingDown);
         }
+        // Capture before acquiring/validating so a concurrent unload that
+        // begins anywhere during admission invalidates this reservation.
+        let cancellation_epoch = self.cancellation_epoch.load(Ordering::Acquire);
+        let operation = Arc::clone(&self.operation)
+            .try_lock_owned()
+            .map_err(|_| RuntimeError::Busy(self.current_lifecycle()))?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(RuntimeError::ShuttingDown);
+        }
+        self.ensure_idle_for_load().await?;
         let model = self
             .core
             .model(&model_id)
             .await
             .ok_or_else(|| RuntimeError::ModelNotFound(model_id.clone()))?;
+        let generation = self.reserve_loading(&model_id, cancellation_epoch).await?;
+        let status = self.status().await;
+        let (completion_sender, completion) = oneshot::channel();
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = manager
+                .load_admitted(
+                    AdmittedLoad {
+                        model,
+                        runtime_id,
+                        profile,
+                        settings,
+                        cancellation_epoch,
+                        generation,
+                    },
+                    operation,
+                )
+                .await;
+            let _ = completion_sender.send(result);
+        });
+        Ok(LoadAdmission { status, completion })
+    }
 
-        let generation = {
-            let mut state = self.state.write().await;
-            state.generation = state.generation.wrapping_add(1);
-            state.lifecycle = BackendLifecycle::Loading;
-            state.model_id = Some(model_id.clone());
-            state.engine_id = None;
-            state.runtime_id = None;
-            state.failure = None;
-            state.active = None;
-            state.loading_process = None;
-            state.loading_runtime_lease = None;
-            state.cancel_loading = self.load_cancelled(cancellation_epoch);
-            state.load_progress = Some(BackendLoadProgress::indeterminate(
-                BackendLoadPhase::Starting,
-            ));
-            state.provenance = None;
-            push_notice(
-                &mut state,
-                RuntimeNoticeLevel::Info,
-                format!("Loading model {model_id}"),
-            );
-            state.generation
-        };
+    async fn reserve_loading(
+        &self,
+        model_id: &ModelId,
+        cancellation_epoch: u64,
+    ) -> Result<u64, RuntimeError> {
+        if self.load_cancelled(cancellation_epoch) {
+            return Err(if self.shutting_down.load(Ordering::Acquire) {
+                RuntimeError::ShuttingDown
+            } else {
+                RuntimeError::Operation("model load was cancelled before admission".to_owned())
+            });
+        }
+        let mut state = self.state.write().await;
+        state.generation = state.generation.wrapping_add(1);
+        state.lifecycle = BackendLifecycle::Loading;
+        state.model_id = Some(model_id.clone());
+        state.engine_id = None;
+        state.runtime_id = None;
+        state.failure = None;
+        state.active = None;
+        state.loading_process = None;
+        state.loading_runtime_lease = None;
+        state.cancel_loading = false;
+        state.load_progress = Some(BackendLoadProgress::indeterminate(
+            BackendLoadPhase::Starting,
+        ));
+        state.provenance = None;
+        push_notice(
+            &mut state,
+            RuntimeNoticeLevel::Info,
+            format!("Loading model {model_id}"),
+        );
+        Ok(state.generation)
+    }
+
+    fn current_lifecycle(&self) -> BackendLifecycle {
+        self.state
+            .try_read()
+            .map_or(BackendLifecycle::Loading, |state| state.lifecycle)
+    }
+
+    async fn load_admitted(
+        self: &Arc<Self>,
+        admitted: AdmittedLoad,
+        _operation: OwnedMutexGuard<()>,
+    ) -> Result<ControlStatus, RuntimeError> {
+        let AdmittedLoad {
+            model,
+            runtime_id,
+            profile,
+            settings: invocation_settings,
+            cancellation_epoch,
+            generation,
+        } = admitted;
+        let model_id = model.id.clone();
+        #[cfg(test)]
+        if let Some(gate) = self.load_start_gate.lock().await.clone() {
+            gate.notified().await;
+        }
         if self.load_cancelled(cancellation_epoch) {
             let detail = "model load was cancelled".to_owned();
             self.fail_loading(generation, detail.clone(), None).await;
@@ -689,7 +801,11 @@ impl RuntimeManager {
             }
             self.set_load_progress(
                 generation,
-                BackendLoadProgress::indeterminate(BackendLoadPhase::SpawningBackend),
+                adapter
+                    .prepare_launch_progress(&launch_spec)
+                    .unwrap_or_else(|| {
+                        BackendLoadProgress::indeterminate(BackendLoadPhase::PreparingLaunch)
+                    }),
             )
             .await;
             if let Err(error) = adapter.prepare_launch_attempt(&launch_spec).await {
@@ -700,6 +816,16 @@ impl RuntimeManager {
                     .await;
                 self.fail_loading(generation, error.to_string(), None).await;
                 return Err(RuntimeError::StartupFailed(error.to_string()));
+            }
+            if self.load_cancelled(cancellation_epoch) {
+                cleanup_temporary_launch_files(&launch_spec.temporary_files).await;
+                cleanup_pending_launch_files(&launch_attempts).await;
+                adapter
+                    .clear_launch_state(launch_spec.endpoint.as_deref())
+                    .await;
+                let detail = "model load was cancelled".to_owned();
+                self.fail_loading(generation, detail.clone(), None).await;
+                return Err(RuntimeError::Operation(detail));
             }
 
             let installation = launch_spec.installation.clone();
@@ -723,6 +849,11 @@ impl RuntimeManager {
             );
             let temporary_files = launch_spec.temporary_files.clone();
             let launch_endpoint = launch_spec.endpoint.clone();
+            self.set_load_progress(
+                generation,
+                BackendLoadProgress::indeterminate(BackendLoadPhase::SpawningBackend),
+            )
+            .await;
             let process = match self
                 .supervisor
                 .spawn(launch_spec, installation.engine.clone(), model_id.clone())
@@ -1489,6 +1620,7 @@ impl RuntimeManager {
             running_engine_count: usize::from(state.lifecycle == BackendLifecycle::Running),
             engines,
             backend: BackendStatus {
+                generation: state.generation,
                 lifecycle: state.lifecycle,
                 model_id: state.model_id.clone(),
                 engine_id: state.engine_id.clone(),
@@ -1699,6 +1831,91 @@ fn retry_context_capacity_message(
 mod tests {
     use super::*;
 
+    struct ManagerFixture {
+        _temporary: tempfile::TempDir,
+        manager: Arc<RuntimeManager>,
+        model_id: ModelId,
+    }
+
+    async fn manager_fixture() -> ManagerFixture {
+        let temporary = tempfile::tempdir().expect("temporary manager fixture");
+        let root = temporary.path();
+        let model_dir = root.join("models");
+        std::fs::create_dir_all(&model_dir).expect("model directory");
+        std::fs::write(model_dir.join("fixture.gguf"), b"fixture").expect("model fixture");
+        let paths = norted_core::AppPaths {
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.toml"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            runtimes_dir: root.join("data/runtimes"),
+            runtime_cache_dir: root.join("cache/runtime-packs"),
+            runtime_selections_file: root.join("data/runtime-selections.json"),
+            load_profiles_file: root.join("data/load-profiles.json"),
+            load_profiles_lock_file: root.join("data/.load-profiles.lock"),
+        };
+        paths.ensure_required().expect("fixture paths");
+        std::fs::write(
+            &paths.config_file,
+            format!(
+                "version = 1\n\n[models]\npaths = [{}]\n",
+                serde_json::to_string(&model_dir).expect("model path string")
+            ),
+        )
+        .expect("fixture config");
+        let core = ApplicationCore::load_from_paths(paths.clone())
+            .await
+            .expect("fixture core");
+        core.refresh_models().await.expect("model discovery");
+        let model_id = core
+            .snapshot()
+            .await
+            .models
+            .into_iter()
+            .next()
+            .expect("discovered model")
+            .id;
+        let registry = EngineRegistry::default();
+        let packs = RuntimePackManager::new(
+            &paths,
+            registry.clone(),
+            Vec::<Arc<dyn crate::RuntimeCatalogProvider>>::new(),
+        )
+        .expect("runtime packs");
+        let manager = RuntimeManager::initialize(
+            core,
+            registry,
+            packs,
+            Arc::new(crate::TokioProcessSupervisor::default()),
+            RuntimeManagerOptions::default(),
+        )
+        .await;
+        ManagerFixture {
+            _temporary: temporary,
+            manager,
+            model_id,
+        }
+    }
+
+    async fn wait_for_lifecycle(
+        manager: &RuntimeManager,
+        expected: BackendLifecycle,
+    ) -> ControlStatus {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = manager.status().await;
+                if status.backend.lifecycle == expected {
+                    return status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lifecycle transition")
+    }
+
     fn empty_state() -> ManagerState {
         ManagerState {
             public_endpoint: None,
@@ -1717,6 +1934,136 @@ mod tests {
             generation: 7,
             notices: VecDeque::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn admission_returns_after_loading_generation_is_reserved() {
+        let fixture = manager_fixture().await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *fixture.manager.load_start_gate.lock().await = Some(Arc::clone(&gate));
+
+        let admitted = fixture
+            .manager
+            .start_load(fixture.model_id.clone())
+            .await
+            .expect("load admission");
+        assert_eq!(admitted.backend.lifecycle, BackendLifecycle::Loading);
+        assert_eq!(admitted.backend.model_id.as_ref(), Some(&fixture.model_id));
+        assert_eq!(
+            fixture.manager.status().await.backend.generation,
+            admitted.backend.generation
+        );
+
+        gate.notify_one();
+        let _ = wait_for_lifecycle(&fixture.manager, BackendLifecycle::Failed).await;
+    }
+
+    #[tokio::test]
+    async fn simultaneous_second_admission_is_busy_instead_of_queued() {
+        let fixture = manager_fixture().await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *fixture.manager.load_start_gate.lock().await = Some(Arc::clone(&gate));
+        fixture
+            .manager
+            .start_load(fixture.model_id.clone())
+            .await
+            .expect("first admission");
+
+        let error = fixture
+            .manager
+            .start_load(fixture.model_id.clone())
+            .await
+            .expect_err("second admission must be rejected");
+        assert!(matches!(
+            error,
+            RuntimeError::Busy(BackendLifecycle::Loading)
+        ));
+
+        gate.notify_one();
+        let _ = wait_for_lifecycle(&fixture.manager, BackendLifecycle::Failed).await;
+    }
+
+    #[tokio::test]
+    async fn unload_epoch_change_prevents_a_stale_admission_reservation() {
+        let fixture = manager_fixture().await;
+        let stale_epoch = fixture.manager.cancellation_epoch.load(Ordering::Acquire);
+        fixture
+            .manager
+            .cancellation_epoch
+            .fetch_add(1, Ordering::AcqRel);
+
+        let error = fixture
+            .manager
+            .reserve_loading(&fixture.model_id, stale_epoch)
+            .await
+            .expect_err("stale admission epoch");
+        assert!(error.to_string().contains("cancelled before admission"));
+        assert_eq!(
+            fixture.manager.status().await.backend.lifecycle,
+            BackendLifecycle::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_background_failure_is_authoritative() {
+        let fixture = manager_fixture().await;
+        let admitted = fixture
+            .manager
+            .start_load(fixture.model_id.clone())
+            .await
+            .expect("load admission");
+        let failed = wait_for_lifecycle(&fixture.manager, BackendLifecycle::Failed).await;
+
+        assert_eq!(failed.backend.generation, admitted.backend.generation);
+        assert!(
+            failed
+                .backend
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("compatible installed engine"))
+        );
+    }
+
+    #[tokio::test]
+    async fn unload_cancels_an_admitted_background_load() {
+        let fixture = manager_fixture().await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *fixture.manager.load_start_gate.lock().await = Some(Arc::clone(&gate));
+        fixture
+            .manager
+            .start_load(fixture.model_id.clone())
+            .await
+            .expect("load admission");
+
+        let manager = Arc::clone(&fixture.manager);
+        let unload = tokio::spawn(async move { manager.unload().await });
+        let _ = wait_for_lifecycle(&fixture.manager, BackendLifecycle::Stopping).await;
+        gate.notify_one();
+        let stopped = unload.await.expect("unload task").expect("unload");
+        assert_eq!(stopped.backend.lifecycle, BackendLifecycle::Stopped);
+        assert!(stopped.backend.model_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleans_up_an_admitted_background_load() {
+        let fixture = manager_fixture().await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *fixture.manager.load_start_gate.lock().await = Some(Arc::clone(&gate));
+        fixture
+            .manager
+            .start_load(fixture.model_id.clone())
+            .await
+            .expect("load admission");
+
+        let manager = Arc::clone(&fixture.manager);
+        let shutdown = tokio::spawn(async move { manager.shutdown().await });
+        let _ = wait_for_lifecycle(&fixture.manager, BackendLifecycle::Stopping).await;
+        gate.notify_one();
+        shutdown.await.expect("shutdown task");
+        assert_eq!(
+            fixture.manager.status().await.backend.lifecycle,
+            BackendLifecycle::Stopped
+        );
     }
 
     #[test]
@@ -1794,6 +2141,32 @@ mod tests {
         assert_eq!(progress.fraction, None);
         assert_eq!(progress.current, None);
         assert_eq!(progress.total, None);
+    }
+
+    #[test]
+    fn pre_launch_preparation_precedes_the_spawning_phase() {
+        let source = include_str!("manager.rs");
+        let launch_loop = source
+            .split_once("let mut context_attempts = Vec::new();")
+            .expect("launch loop")
+            .1
+            .split_once("let process = match self")
+            .expect("supervisor spawn boundary")
+            .0;
+        let preparation = launch_loop
+            .find("adapter.prepare_launch_attempt(&launch_spec).await")
+            .expect("adapter preparation");
+        let spawning = launch_loop
+            .find("BackendLoadPhase::SpawningBackend")
+            .expect("spawning phase");
+        assert!(
+            preparation < spawning,
+            "SpawningBackend must not be published during adapter preparation"
+        );
+        assert!(
+            launch_loop[preparation..spawning].contains("self.load_cancelled(cancellation_epoch)"),
+            "cancellation during final preparation must prevent process creation"
+        );
     }
 
     #[test]

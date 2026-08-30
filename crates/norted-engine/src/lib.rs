@@ -836,6 +836,12 @@ pub trait EngineAdapter: Send + Sync {
     ) -> Result<Vec<LaunchSpec>, EngineError> {
         Ok(vec![self.build_launch_spec(request).await?])
     }
+    /// Optionally describes adapter-owned work performed immediately before a
+    /// launch attempt. The manager publishes this before calling
+    /// `prepare_launch_attempt`, while process spawning has not started.
+    fn prepare_launch_progress(&self, _spec: &LaunchSpec) -> Option<BackendLoadProgress> {
+        None
+    }
     /// Re-establishes the adapter-owned launch boundary immediately before an
     /// actual spawn. This is also where endpoint-scoped request routing state
     /// may be installed after clearing stale state.
@@ -1489,6 +1495,7 @@ mod tests {
     #[test]
     fn backend_status_serializes_an_optional_load_progress_state() {
         let with_progress = BackendStatus {
+            generation: 9,
             lifecycle: BackendLifecycle::Loading,
             model_id: Some(ModelId("qwen3.8-27b".to_owned())),
             engine_id: Some("q27".to_owned()),

@@ -90,6 +90,13 @@ pub struct ApplicationCore {
 impl ApplicationCore {
     pub async fn load() -> Result<Arc<Self>> {
         let paths = AppPaths::discover()?;
+        Self::load_from_paths(paths).await
+    }
+
+    /// Loads application state from an explicit path set. This keeps service
+    /// composition and isolated control-path tests independent of process-wide
+    /// directory environment variables.
+    pub async fn load_from_paths(paths: AppPaths) -> Result<Arc<Self>> {
         paths.ensure_required()?;
         let LoadedConfig {
             config,

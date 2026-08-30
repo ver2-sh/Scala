@@ -2333,7 +2333,6 @@ impl EngineAdapter for Q27Adapter {
             .load_settings_schema
             .validate(&request.load_settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
-        revalidate_norted_package_before_launch(&request.model).await?;
         let mut structured = translate_q27_load_settings(
             &request.load_settings,
             &self.native_arguments,
@@ -2595,6 +2594,15 @@ impl EngineAdapter for Q27Adapter {
             },
         );
         Ok(())
+    }
+
+    fn prepare_launch_progress(&self, spec: &LaunchSpec) -> Option<BackendLoadProgress> {
+        spec.model.primary.norted_package.as_ref().map(|_| {
+            BackendLoadProgress::with_message(
+                BackendLoadPhase::PreparingLaunch,
+                "Revalidating package before launch",
+            )
+        })
     }
 
     async fn clear_launch_state(&self, endpoint: Option<&str>) {
@@ -6005,6 +6013,39 @@ mod tests {
                 .to_string()
                 .contains("changed")
         );
+    }
+
+    #[test]
+    fn package_full_hash_is_deferred_to_the_final_launch_attempt_boundary() {
+        let source = include_str!("lib.rs");
+        let build_spec = source
+            .split_once("async fn build_launch_spec(&self, request: LaunchRequest)")
+            .expect("q27 build_launch_spec")
+            .1
+            .split_once("async fn build_launch_attempts(")
+            .expect("q27 build_launch_attempts")
+            .0;
+        assert!(
+            !build_spec.contains("revalidate_norted_package_before_launch"),
+            "launch-spec construction must not perform the redundant full package hash"
+        );
+
+        let prepare_attempt = source
+            .split_once("async fn prepare_launch_attempt(&self, spec: &LaunchSpec)")
+            .expect("q27 prepare_launch_attempt")
+            .1
+            .split_once("async fn clear_launch_state")
+            .expect("q27 clear_launch_state")
+            .0;
+        assert_eq!(
+            prepare_attempt
+                .matches("revalidate_norted_package_before_launch(&spec.model).await?")
+                .count(),
+            1,
+            "each actual q27 launch attempt must retain exactly one complete final revalidation"
+        );
+        assert!(prepare_attempt.contains("Revalidating package before launch"));
+        assert!(prepare_attempt.contains("BackendLoadPhase::PreparingLaunch"));
     }
 
     #[test]
