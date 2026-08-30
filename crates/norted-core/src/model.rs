@@ -933,7 +933,7 @@ mod tests {
     }
 
     #[test]
-    fn ninfer_package_binds_native_identity_policy_and_sharp() {
+    fn current_builder_schema_v2_ninfer_package_binds_native_identity_policy_and_sharp() {
         let temporary = tempfile::tempdir().expect("NInfer package fixture");
         let root = temporary.path();
         let primary = root.join("groupwise.ninfer");
@@ -989,6 +989,16 @@ mod tests {
             matches!(&artifact.native_identity, Some(ArtifactNativeIdentity::Ninfer(identity)) if identity.model_id == "qwen3.8-27b" && identity.weights_id == "groupwise-int")
         );
         assert_eq!(artifact.auxiliary_artifacts.len(), 3);
+        let crate::NortedPackagePolicy::Ninfer(policy) = &artifact
+            .norted_package
+            .as_ref()
+            .expect("package binding")
+            .policy
+        else {
+            panic!("NInfer package policy");
+        };
+        assert_eq!(policy.kv_cache, "int8-group64");
+        assert_eq!(policy.kv_dtype, "int8");
         let mut dflash = ResolvedLoadSettings {
             engine_id: "ninfer".to_owned(),
             ..Default::default()
@@ -1050,6 +1060,42 @@ mod tests {
         let rejected = ModelRegistry::discover(&[root.to_path_buf()]);
         assert_eq!(rejected.artifacts().len(), 1);
         assert!(rejected.artifacts()[0].path.ends_with("unrelated.ninfer"));
+    }
+
+    #[test]
+    fn current_builder_schema_v2_ninfer_kv_contract_rejects_semantic_cli_drift() {
+        // Mirrors Yuuyuuei/Norted scripts/ninfer_format.py::runtime_policy schema v2.
+        let cases = [
+            ("wrong semantic cache", "int8", Some("int8")),
+            ("wrong CLI dtype", "int8-group64", Some("fp8")),
+            ("missing kv_cli", "int8-group64", None),
+        ];
+        for (case, kv_cache, kv_dtype) in cases {
+            let temporary = tempfile::tempdir().expect("NInfer policy rejection fixture");
+            let mut policy = ninfer_runtime_policy();
+            policy["serving"]["kv_preference"] = serde_json::json!(kv_cache);
+            match kv_dtype {
+                Some(kv_dtype) => {
+                    policy["serving"]["kv_cli"] = serde_json::json!(["--kv-dtype", kv_dtype]);
+                }
+                None => {
+                    policy["serving"].as_object_mut().unwrap().remove("kv_cli");
+                }
+            }
+            refresh_ninfer_policy_id(&mut policy);
+            write_ninfer_package(temporary.path(), &policy);
+
+            let registry = ModelRegistry::discover(&[temporary.path().to_path_buf()]);
+            assert!(registry.artifacts().is_empty(), "{case}");
+            assert!(
+                registry
+                    .warnings()
+                    .iter()
+                    .any(|warning| warning.contains("claimed Norted package is invalid")),
+                "{case}: {:?}",
+                registry.warnings()
+            );
+        }
     }
 
     #[test]
@@ -1258,20 +1304,108 @@ mod tests {
     }
 
     fn ninfer_runtime_policy() -> serde_json::Value {
+        // Representative, checkout-independent copy of the current Builder contract from
+        // Yuuyuuei/Norted scripts/ninfer_format.py::runtime_policy schema v2.
         let mut policy = serde_json::json!({
             "schema":"norted.ninfer-runtime","schema_version":2,
-            "artifact_identities":[{"model_id":"qwen3.8-27b","weights_id":"groupwise-int"}],
+            "artifact_identities":[
+                {"model_id":"qwen3.8-27b","weights_id":"groupwise-int"},
+                {"model_id":"qwen3.8-27b","weights_id":"nvfp4"}
+            ],
             "benchmark_profiles":{
-                "mtp0":{"speculative_decoding":false,"cli":[]},
-                "mtp3":{"speculative_decoding":true,"backend":"mtp","draft_tokens":3,"optimized_proposal_head":true,"cli":["--spec","mtp","--draft-tokens","3","--lm-head-draft"]}
+                "mtp0":{"speculative_decoding":false,"cli":[],"trained_mtp_layers":1},
+                "mtp3":{
+                    "speculative_decoding":true,"backend":"mtp","draft_tokens":3,
+                    "trained_mtp_layers":1,
+                    "semantics":"three draft positions from one trained MTP/NextN layer",
+                    "optimized_proposal_head":true,
+                    "cli":["--spec","mtp","--draft-tokens","3","--lm-head-draft"],
+                    "sampling_verification":"target-verification correction; intended to preserve the target sampling distribution"
+                }
             },
-            "serving":{"thinking_enabled":true,"cuda_graph_decode":true,"compatible_prefix_reuse":true,"vision_loaded":false,"kv_preference":"int8"},
-            "context":{"hard_minimum_served_tokens":200000,"artifact_size_is_capacity_evidence":false},
+            "serving":{
+                "thinking_enabled":true,"cuda_graph_decode":true,
+                "compatible_prefix_reuse":true,"vision_loaded":false,
+                "vision_policy":"disabled for text-only comparison unless explicitly requested",
+                "kv_preference":"int8-group64","kv_cli":["--kv-dtype","int8"],
+                "protocols":["openai-responses-core","openai-chat-completions"],
+                "tool_calls":true
+            },
+            "context":{
+                "native_architectural_tokens":262144,"hard_minimum_served_tokens":200000,
+                "qualification":{
+                    "groupwise-int":"separate runtime startup probe on the actual RTX 5090",
+                    "nvfp4":"separate runtime startup probe on the actual RTX 5090"
+                },
+                "artifact_size_is_capacity_evidence":false,
+                "on_insufficient_capacity":"report the per-target benchmark result without changing metadata"
+            },
             "sampler":{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.05},
-            "sharp":{"required_for_dirk_equivalence":true,"sha256":sha(b"sharp"),"application":"runtime-sidecar"}
+            "runtime":{
+                "repository":"https://github.com/natpate/ninfer-windows.git",
+                "revision":"b686696eebd43b72f58239740ae002fad6afaf5e",
+                "release":"v0.4.0","platform":"Windows 11 x64",
+                "gpu":"NVIDIA GeForce RTX 5090","cuda_architecture":"sm_120a",
+                "minimum_cuda":"13.1"
+            },
+            "sharp":{
+                "required_for_dirk_equivalence":true,"raw_ninfer_is_dirk_equivalent":false,
+                "filename":"Norted-Dirk-Heretic-Qwen3.8-27B-Sharp.jinja",
+                "sha256":sha(b"sharp"),"application":"runtime-sidecar",
+                "external_override_supported_by_pinned_runtime":false,
+                "required_future_argument":"--chat-template-file",
+                "status":"required-runtime-capability-missing"
+            }
         });
-        let policy_id = sha(&serde_json::to_vec(&policy).unwrap());
-        policy["policy_id"] = serde_json::json!(policy_id);
+        refresh_ninfer_policy_id(&mut policy);
         policy
+    }
+
+    fn refresh_ninfer_policy_id(policy: &mut serde_json::Value) {
+        policy.as_object_mut().unwrap().remove("policy_id");
+        let policy_id = sha(&serde_json::to_vec(policy).unwrap());
+        policy["policy_id"] = serde_json::json!(policy_id);
+    }
+
+    fn write_ninfer_package(root: &std::path::Path, policy: &serde_json::Value) {
+        let primary = root.join("groupwise.ninfer");
+        write_ninfer_fixture(
+            &primary,
+            &serde_json::json!({
+                "identity":{"model_id":"qwen3.8-27b","weights_id":"groupwise-int"},
+                "objects":[{"name":"resource","kind":"resource","encoding":"raw-bytes-v1","offset":0,"bytes":1}]
+            }),
+            1,
+        );
+        std::fs::write(root.join("Sharp.jinja"), b"sharp").unwrap();
+        let policy_bytes = serde_json::to_vec(policy).unwrap();
+        std::fs::write(root.join("ninfer-runtime.json"), &policy_bytes).unwrap();
+        let size = primary.metadata().unwrap().len();
+        let lineage = sha(b"{}");
+        let manifest = serde_json::json!({
+            "schema":"norted.ninfer-manifest","schema_version":3,
+            "canonical_source_lineage_key":lineage,
+            "outputs":{"groupwise-int":{
+                "artifact":{
+                    "filename":"groupwise.ninfer","model_id":"qwen3.8-27b",
+                    "weights_id":"groupwise-int","container_version":2,
+                    "size":size,"sha256":"6".repeat(64)
+                },
+                "source_lineage":{"key":lineage}
+            }},
+            "sharp":{
+                "filename":"Sharp.jinja","revision":"7".repeat(40),"version":"1",
+                "size":5,"sha256":sha(b"sharp"),"required_for_dirk_equivalence":true
+            },
+            "runtime_policy":{
+                "filename":"ninfer-runtime.json","sha256":sha(&policy_bytes),
+                "policy_id":policy["policy_id"],"weights_reconverted_for_policy":false
+            }
+        });
+        std::fs::write(
+            root.join("NINFER-MANIFEST.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
     }
 }

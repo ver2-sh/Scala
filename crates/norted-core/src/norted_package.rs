@@ -96,7 +96,8 @@ pub struct NinferPackagePolicy {
     pub cuda_graph_decode: bool,
     pub compatible_prefix_reuse: bool,
     pub text_only_default: bool,
-    pub kv_preference: String,
+    pub kv_cache: String,
+    pub kv_dtype: String,
     pub minimum_context_tokens: u64,
     pub benchmark_profiles: BTreeMap<String, NinferBenchmarkProfile>,
 }
@@ -227,7 +228,7 @@ pub fn apply_norted_package_load_policy(
             insert_default(
                 settings,
                 "ninfer.kv_dtype",
-                LoadSettingValue::Choice(policy.kv_preference.clone()),
+                LoadSettingValue::Choice(policy.kv_dtype.clone()),
                 &source,
             )?;
             let selected_profile = settings.value("ninfer.package_profile").cloned();
@@ -574,6 +575,7 @@ struct NinferServing {
     compatible_prefix_reuse: bool,
     vision_loaded: bool,
     kv_preference: String,
+    kv_cli: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -969,7 +971,8 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
         cuda_graph_decode: policy.serving.cuda_graph_decode,
         compatible_prefix_reuse: policy.serving.compatible_prefix_reuse,
         text_only_default: !policy.serving.vision_loaded,
-        kv_preference: policy.serving.kv_preference.clone(),
+        kv_cache: policy.serving.kv_preference.clone(),
+        kv_dtype: policy.serving.kv_cli[1].clone(),
         minimum_context_tokens: policy.context.hard_minimum_served_tokens,
         benchmark_profiles,
     };
@@ -1096,7 +1099,8 @@ fn validate_ninfer_policy(
         || !policy.serving.cuda_graph_decode
         || !policy.serving.compatible_prefix_reuse
         || policy.serving.vision_loaded
-        || policy.serving.kv_preference != "int8"
+        || policy.serving.kv_preference != "int8-group64"
+        || policy.serving.kv_cli != ["--kv-dtype", "int8"]
         || policy.context.hard_minimum_served_tokens != 200000
         || policy.context.artifact_size_is_capacity_evidence
         || policy.sampler.temperature != 1.0

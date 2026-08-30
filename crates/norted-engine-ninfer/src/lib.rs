@@ -120,6 +120,7 @@ struct PendingStartup {
 struct NinferStartupRequirements {
     minimum_context_tokens: u64,
     kv_cache: String,
+    kv_dtype: String,
     cuda_graph: bool,
     prefix_reuse: bool,
     speculative_backend: String,
@@ -274,14 +275,8 @@ fn ninfer_startup_requirements(
     })?;
     Ok(NinferStartupRequirements {
         minimum_context_tokens: policy.minimum_context_tokens,
-        kv_cache: match policy.kv_preference.as_str() {
-            "int8" => "int8-group64".to_owned(),
-            other => {
-                return Err(EngineError::InvalidConfiguration(format!(
-                    "unsupported NInfer package KV policy `{other}`"
-                )));
-            }
-        },
+        kv_cache: policy.kv_cache.clone(),
+        kv_dtype: policy.kv_dtype.clone(),
         cuda_graph: policy.cuda_graph_decode,
         prefix_reuse: policy.compatible_prefix_reuse,
         speculative_backend: profile.backend.clone().unwrap_or_else(|| "none".to_owned()),
@@ -1085,6 +1080,7 @@ impl EngineAdapter for NinferAdapter {
                     json!(requirements.minimum_context_tokens),
                 ),
                 ("package_kv_cache".to_owned(), json!(requirements.kv_cache)),
+                ("package_kv_dtype".to_owned(), json!(requirements.kv_dtype)),
                 (
                     "package_speculative_backend".to_owned(),
                     json!(requirements.speculative_backend),
@@ -2038,6 +2034,18 @@ mod tests {
     }
 
     #[test]
+    fn package_startup_requirements_preserve_semantic_cache_and_cli_dtype() {
+        let requirements = ninfer_startup_requirements(
+            &ninfer_package_fixture(),
+            &ResolvedLoadSettings::default(),
+        )
+        .expect("package startup requirements");
+
+        assert_eq!(requirements.kv_cache, "int8-group64");
+        assert_eq!(requirements.kv_dtype, "int8");
+    }
+
+    #[test]
     fn current_upstream_target_registry_is_enumerated_exactly() {
         let fixture = tempfile::tempdir().expect("source registry fixture");
         write_registry_target(
@@ -2246,6 +2254,7 @@ mod tests {
         pending.package_requirements = Some(NinferStartupRequirements {
             minimum_context_tokens: 200_000,
             kv_cache: "int8-group64".to_owned(),
+            kv_dtype: "int8".to_owned(),
             cuda_graph: true,
             prefix_reuse: true,
             speculative_backend: "none".to_owned(),
@@ -2480,7 +2489,8 @@ mod tests {
                 cuda_graph_decode: true,
                 compatible_prefix_reuse: true,
                 text_only_default: true,
-                kv_preference: "int8".to_owned(),
+                kv_cache: "int8-group64".to_owned(),
+                kv_dtype: "int8".to_owned(),
                 minimum_context_tokens: 200_000,
                 benchmark_profiles,
             }),
