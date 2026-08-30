@@ -25,6 +25,50 @@ use app::{
 use terminal::TerminalSession;
 use ui::layout::UiLayout;
 
+const CONTROL_IDLE_CADENCE: Duration = Duration::from_secs(2);
+const CONTROL_LOADING_CADENCE: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Default)]
+struct ControlPollState {
+    initial_observation_pending: bool,
+    local_load_pending: bool,
+    observed_loading: bool,
+}
+
+impl ControlPollState {
+    fn new() -> Self {
+        Self {
+            initial_observation_pending: true,
+            ..Self::default()
+        }
+    }
+
+    fn next_delay(&mut self) -> Option<Duration> {
+        if self.initial_observation_pending {
+            self.initial_observation_pending = false;
+            None
+        } else {
+            Some(self.cadence())
+        }
+    }
+
+    fn set_local_load_pending(&mut self, pending: bool) {
+        self.local_load_pending = pending;
+    }
+
+    fn record_observation(&mut self, loading: bool) {
+        self.observed_loading = loading;
+    }
+
+    fn cadence(&self) -> Duration {
+        if self.local_load_pending || self.observed_loading {
+            CONTROL_LOADING_CADENCE
+        } else {
+            CONTROL_IDLE_CADENCE
+        }
+    }
+}
+
 pub async fn run(
     core: Arc<ApplicationCore>,
     runtime_packs: Arc<RuntimePackManager>,
@@ -71,29 +115,38 @@ pub async fn run(
     });
     let observer_core = Arc::clone(&core);
     let observer_paths = core.paths.clone();
-    let control_cadence = Arc::new(tokio::sync::Mutex::new(Duration::from_secs(2)));
-    let runtime_observer = tokio::spawn({
-        let cadence = Arc::clone(&control_cadence);
-        async move {
-            loop {
-                let delay = *cadence.lock().await;
-                tokio::time::sleep(delay).await;
-                let (_, observation) = tokio::join!(
-                    observer_core.refresh_server_state(),
-                    observe_control(&observer_paths)
-                );
-                let loading = observation
+    let (local_load_intent, mut local_load_intent_receiver) = tokio::sync::watch::channel(false);
+    let runtime_observer = tokio::spawn(async move {
+        let mut poll_state = ControlPollState::new();
+        loop {
+            if let Some(delay) = poll_state.next_delay() {
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    changed = local_load_intent_receiver.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            poll_state.set_local_load_pending(*local_load_intent_receiver.borrow_and_update());
+            let (_, observation) = tokio::join!(
+                observer_core.refresh_server_state(),
+                observe_control(&observer_paths)
+            );
+            poll_state.record_observation(
+                observation
                     .status
                     .as_ref()
-                    .is_some_and(|status| status.backend.lifecycle.is_loading());
-                *cadence.lock().await = if loading {
-                    Duration::from_millis(200)
-                } else {
-                    Duration::from_secs(2)
-                };
-                if control_updates.send(observation).await.is_err() {
-                    break;
-                }
+                    .is_some_and(|status| status.backend.lifecycle.is_loading()),
+            );
+            // A local load can finish while the status request is outstanding.
+            // Consume the newest intent after the observation without allowing
+            // an early Stopped response to erase a still-pending load intent.
+            poll_state.set_local_load_pending(*local_load_intent_receiver.borrow_and_update());
+            if control_updates.send(observation).await.is_err() {
+                break;
             }
         }
     });
@@ -139,6 +192,7 @@ pub async fn run(
             },
             result = control_result_receiver.recv() => match result {
                 Some(result) => {
+                    local_load_intent.send_replace(false);
                     app.handle_control_result(result);
                     Update::Render
                 }
@@ -185,6 +239,9 @@ pub async fn run(
             break;
         }
         if let Some(action) = app.take_control_action() {
+            if matches!(action, ControlAction::Load(_)) {
+                local_load_intent.send_replace(true);
+            }
             let paths = core.paths.clone();
             let results = control_results.clone();
             tokio::spawn(async move {
@@ -595,4 +652,51 @@ async fn execute_control(
         ControlAction::Unload => client.unload().await,
     }
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_polling_starts_with_an_immediate_observation() {
+        let mut state = ControlPollState::new();
+        assert_eq!(state.next_delay(), None);
+        state.record_observation(false);
+        assert_eq!(state.next_delay(), Some(CONTROL_IDLE_CADENCE));
+    }
+
+    #[test]
+    fn local_load_intent_immediately_enters_and_holds_fast_polling() {
+        let mut state = ControlPollState::new();
+        let _ = state.next_delay();
+        state.set_local_load_pending(true);
+        assert_eq!(state.cadence(), CONTROL_LOADING_CADENCE);
+
+        state.record_observation(false);
+        assert_eq!(
+            state.cadence(),
+            CONTROL_LOADING_CADENCE,
+            "an early Stopped observation must not erase pending local load intent"
+        );
+
+        state.record_observation(true);
+        state.set_local_load_pending(false);
+        assert_eq!(state.cadence(), CONTROL_LOADING_CADENCE);
+
+        state.record_observation(false);
+        assert_eq!(state.cadence(), CONTROL_IDLE_CADENCE);
+    }
+
+    #[test]
+    fn external_loading_observation_uses_fast_polling_until_completion() {
+        let mut state = ControlPollState::new();
+        let _ = state.next_delay();
+        state.record_observation(true);
+        assert_eq!(state.cadence(), CONTROL_LOADING_CADENCE);
+
+        state.record_observation(false);
+        assert_eq!(state.cadence(), CONTROL_IDLE_CADENCE);
+        assert_eq!(state.next_delay(), Some(CONTROL_IDLE_CADENCE));
+    }
 }

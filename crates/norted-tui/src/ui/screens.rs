@@ -25,10 +25,10 @@ pub fn render_screen(
 ) {
     let area = ui_layout.content;
     match app.screen {
-        Screen::Overview => render_overview(frame, area, app, theme, glyphs, ui_layout.compact),
+        Screen::Overview => render_overview(frame, area, app, theme, glyphs, ui_layout),
         Screen::Models => render_models(frame, area, app, theme, glyphs, ui_layout),
         Screen::Runtimes => render_runtimes(frame, area, app, theme, glyphs, ui_layout),
-        Screen::Server => render_server(frame, area, app, theme, glyphs),
+        Screen::Server => render_server(frame, area, app, theme, glyphs, ui_layout),
         Screen::Logs => render_logs(frame, area, app, theme, ui_layout),
         Screen::Settings => render_settings(frame, area, app, theme, ui_layout),
         Screen::Help => render_help_content(frame, area, theme, glyphs),
@@ -41,41 +41,35 @@ fn render_overview(
     app: &App,
     theme: &Theme,
     glyphs: &Glyphs,
-    compact: bool,
+    ui_layout: &UiLayout,
 ) {
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(if compact { 6 } else { 4 }),
-            Constraint::Min(5),
-        ])
-        .split(area);
+    let title = content_layout(area)[0];
     frame.render_widget(
         section_title(
             "Overview",
             "Your local model runtime, from artifacts to API",
             theme,
         ),
-        layout[0],
+        title,
     );
-    render_metrics(frame, layout[1], app, theme, glyphs, compact);
-    if let Some(progress) = app
-        .control
-        .as_ref()
-        .and_then(|control| control.backend.load_progress.as_ref())
-    {
-        let compact_line =
-            load_progress_compact(progress, app.load_animation_frame, layout[1].width, glyphs);
-        let progress_area = Rect::new(
-            layout[1].x,
-            layout[1].y + layout[1].height,
-            layout[1].width,
-            1,
+    render_metrics(
+        frame,
+        ui_layout.overview_metrics,
+        app,
+        theme,
+        glyphs,
+        ui_layout.compact,
+    );
+    if let Some(progress) = app.load_progress() {
+        let compact_line = load_progress_compact(
+            progress,
+            app.load_animation_frame,
+            ui_layout.overview_progress.width,
+            glyphs,
         );
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(compact_line, theme.accent))),
-            progress_area,
+            ui_layout.overview_progress,
         );
     }
     let body = match &app.snapshot.registry_state {
@@ -149,7 +143,10 @@ fn render_overview(
             )),
         ],
     };
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), layout[2]);
+    frame.render_widget(
+        Paragraph::new(body).wrap(Wrap { trim: true }),
+        ui_layout.overview_body,
+    );
 }
 
 fn render_metrics(
@@ -338,7 +335,7 @@ fn render_models(
             ]),
             {
                 let size_text = format_bytes(model.size_bytes);
-                let path_width = (layout[1].width as usize)
+                let path_width = (ui_layout.model_list.width as usize)
                     .saturating_sub(size_text.chars().count() + 2);
                 let path = truncate_middle(
                     &model.path.display().to_string(),
@@ -377,37 +374,11 @@ fn render_models(
         ])
         .style(style)
     });
-    let loading_progress = app
-        .control
-        .as_ref()
-        .and_then(|control| control.backend.load_progress.as_ref())
-        .filter(|_| {
-            app.control.as_ref().is_some_and(|control| {
-                control.backend.lifecycle.is_loading()
-                    && control
-                        .backend
-                        .model_id
-                        .as_ref()
-                        .zip(app.selected_model)
-                        .is_some_and(|(mid, idx)| {
-                            app.snapshot.models.get(idx).is_some_and(|m| &m.id == mid)
-                        })
-            })
-        });
-    let (list_area, progress_area) = if loading_progress.is_some() && layout[1].height > 5 {
-        let split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(5), Constraint::Length(3)])
-            .split(layout[1]);
-        (split[0], Some(split[1]))
-    } else {
-        (layout[1], None)
-    };
-    frame.render_widget(List::new(items), list_area);
-    if let (Some(progress), Some(area)) = (loading_progress, progress_area) {
+    frame.render_widget(List::new(items), ui_layout.model_list);
+    if let Some(progress) = app.selected_model_load_progress() {
         render_load_progress(
             frame,
-            area,
+            ui_layout.model_progress,
             progress,
             app.load_animation_frame,
             theme,
@@ -697,7 +668,14 @@ pub(crate) fn compatibility_label<'a>(
     }
 }
 
-fn render_server(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, glyphs: &Glyphs) {
+fn render_server(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    glyphs: &Glyphs,
+    ui_layout: &UiLayout,
+) {
     let layout = content_layout(area);
     frame.render_widget(
         section_title(
@@ -801,22 +779,12 @@ fn render_server(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, gl
             )),
         ])
         .wrap(Wrap { trim: true }),
-        layout[1],
+        ui_layout.server_details,
     );
-    if let Some(progress) = app
-        .control
-        .as_ref()
-        .and_then(|control| control.backend.load_progress.as_ref())
-    {
-        let progress_area = Rect::new(
-            layout[1].x,
-            layout[1].y + layout[1].height.saturating_sub(3),
-            layout[1].width,
-            3,
-        );
+    if let Some(progress) = app.load_progress() {
         render_load_progress(
             frame,
-            progress_area,
+            ui_layout.server_progress,
             progress,
             app.load_animation_frame,
             theme,
