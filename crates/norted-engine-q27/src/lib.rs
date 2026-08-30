@@ -2209,35 +2209,17 @@ impl EngineAdapter for Q27Adapter {
             .ok_or_else(|| {
                 EngineError::Operation("q27 usage observation was not cached".to_owned())
             })?;
-        let managed = !matches!(
-            runtime.manifest.acquisition_method,
-            RuntimeAcquisitionMethod::ExternalBinary
-        );
-        let version = runtime.manifest.identity.version.as_str();
-        let usage = usage.to_ascii_lowercase();
-        let mut definitions = q27_load_setting_definitions();
-        apply_q27_runtime_bounds(&mut definitions, managed, version);
-        for definition in &mut definitions {
-            let option = q27_setting_option(definition.id.as_str());
-            let unavailable_by_version =
-                q27_setting_unavailable_by_version(managed, version, option);
-            let missing_from_contract = !usage_has_token(&usage, option)
-                || (definition.id.as_str() == "q27.fast_head"
-                    && !usage_has_token(&usage, "--no-fast-head"));
-            if unavailable_by_version || missing_from_contract {
-                definition.supported = false;
-                definition.unsupported_reason = Some(if unavailable_by_version {
-                    format!("q27 runtime {version} predates `{option}`")
-                } else {
-                    format!("the exact q27-server usage contract does not advertise `{option}`")
-                });
-            }
-        }
-        Ok(LoadSettingsSchema {
-            engine_id: ENGINE_ID.to_owned(),
-            runtime_id: Some(runtime.manifest.runtime_id.clone()),
-            definitions,
-        })
+        Ok(q27_load_settings_schema_from_usage(
+            Some(runtime.manifest.runtime_id.clone()),
+            &runtime.manifest.identity,
+            &runtime.manifest.acquisition_method,
+            runtime
+                .manifest
+                .source_build
+                .as_ref()
+                .map(Q27SourceBuildEvidence::Provenance),
+            &usage,
+        ))
     }
 
     async fn probe(&self) -> Result<EngineProbe, EngineError> {
@@ -3602,6 +3584,56 @@ fn invalid_probe(reason: String) -> EngineProbe {
     }
 }
 
+fn q27_load_settings_schema_from_usage(
+    runtime_id: Option<RuntimeId>,
+    identity: &RuntimeIdentity,
+    acquisition: &RuntimeAcquisitionMethod,
+    source_evidence: Option<Q27SourceBuildEvidence<'_>>,
+    usage: &str,
+) -> LoadSettingsSchema {
+    let managed = !matches!(acquisition, RuntimeAcquisitionMethod::ExternalBinary);
+    let version = identity.version.as_str();
+    let usage = usage.to_ascii_lowercase();
+    let trusted_source_capabilities = matches!(acquisition, RuntimeAcquisitionMethod::SourceBuild)
+        .then(|| q27_package_capabilities(identity, acquisition, source_evidence));
+    let mut definitions = q27_load_setting_definitions();
+    apply_q27_runtime_bounds(&mut definitions, managed, version);
+    for definition in &mut definitions {
+        let option = q27_setting_option(definition.id.as_str());
+        let unavailable_by_version = q27_setting_unavailable_by_version(managed, version, option);
+        let observed = match definition.id.as_str() {
+            "q27.fast_head" => {
+                trusted_source_capabilities
+                    .is_some_and(|capabilities| capabilities.fast_head_control)
+                    || (usage_has_token(&usage, "--fast-head")
+                        && usage_has_token(&usage, "--no-fast-head"))
+            }
+            "parallel_requests" => {
+                trusted_source_capabilities
+                    .is_some_and(|capabilities| capabilities.trustworthy_identity)
+                    || usage_has_token(&usage, option)
+            }
+            _ => usage_has_token(&usage, option),
+        };
+        if unavailable_by_version || !observed {
+            definition.supported = false;
+            definition.unsupported_reason = Some(if unavailable_by_version {
+                format!("q27 runtime {version} predates `{option}`")
+            } else if definition.id.as_str() == "q27.fast_head" {
+                "the exact q27-server usage contract does not advertise both `--fast-head` and `--no-fast-head`"
+                    .to_owned()
+            } else {
+                format!("the exact q27-server usage contract does not advertise `{option}`")
+            });
+        }
+    }
+    LoadSettingsSchema {
+        engine_id: ENGINE_ID.to_owned(),
+        runtime_id,
+        definitions,
+    }
+}
+
 fn q27_load_setting_definitions() -> Vec<LoadSettingDefinition> {
     let mut definitions = common_load_setting_definitions();
     definitions.extend([
@@ -4064,6 +4096,7 @@ mod tests {
     use norted_core::{
         AcceleratorDevice, ArtifactFormat, AuxiliaryArtifact, LoadSettingSource,
         LoadSettingsProvenance, ModelArtifact, ModelId, ResolvedLoadSetting, ResolvedLoadSettings,
+        apply_norted_package_load_policy,
     };
     use serde_json::json;
 
@@ -4154,6 +4187,32 @@ mod tests {
             ordinal: 0,
         }])
         .expect("current source runtimes")
+    }
+
+    fn current_source_provenance(plan: &RuntimeSourceBuildPlan) -> RuntimeSourceBuildProvenance {
+        RuntimeSourceBuildProvenance {
+            source: plan.source.clone(),
+            recipe_version: plan.recipe.recipe_version.clone(),
+            build_system: plan.recipe.build_system,
+            build_definition_sha256: plan.recipe.build_definition_sha256.clone(),
+            cmake_configuration_arguments: Vec::new(),
+            build_target: plan.recipe.build_target.clone(),
+            toolchain: norted_core::RuntimeSourceBuildToolchain {
+                cmake_version: "not required".to_owned(),
+                ninja_version: "not required".to_owned(),
+                make_version: "GNU Make 4.4".to_owned(),
+                cpp_compiler: "g++".to_owned(),
+                nvcc_version: "Cuda compilation tools, release 12.8".to_owned(),
+                pkg_config_version: "not required".to_owned(),
+                system_dependencies: BTreeMap::new(),
+            },
+            build_platform: "linux".to_owned(),
+            build_architecture: "x86_64".to_owned(),
+            accelerator_target: plan.recipe.accelerator_target.clone(),
+            built_at_unix: 1_788_000_000,
+            entrypoint: Path::new("source").join(&plan.recipe.entrypoint),
+            entrypoint_sha256: "a".repeat(64),
+        }
     }
 
     fn q27_package_fixture() -> NortedPackageBinding {
@@ -4356,29 +4415,7 @@ mod tests {
                 capabilities.supported_kv_modes,
                 Q27PackageKvMode::QUALITY_ORDER
             );
-            let provenance = RuntimeSourceBuildProvenance {
-                source: plan.source.clone(),
-                recipe_version: plan.recipe.recipe_version.clone(),
-                build_system: plan.recipe.build_system,
-                build_definition_sha256: plan.recipe.build_definition_sha256.clone(),
-                cmake_configuration_arguments: Vec::new(),
-                build_target: plan.recipe.build_target.clone(),
-                toolchain: norted_core::RuntimeSourceBuildToolchain {
-                    cmake_version: "not required".to_owned(),
-                    ninja_version: "not required".to_owned(),
-                    make_version: "GNU Make 4.4".to_owned(),
-                    cpp_compiler: "g++".to_owned(),
-                    nvcc_version: "Cuda compilation tools, release 12.8".to_owned(),
-                    pkg_config_version: "not required".to_owned(),
-                    system_dependencies: BTreeMap::new(),
-                },
-                build_platform: "linux".to_owned(),
-                build_architecture: "x86_64".to_owned(),
-                accelerator_target: plan.recipe.accelerator_target.clone(),
-                built_at_unix: 1_788_000_000,
-                entrypoint: Path::new("source").join(&plan.recipe.entrypoint),
-                entrypoint_sha256: "a".repeat(64),
-            };
+            let provenance = current_source_provenance(plan);
             let installed_capabilities = q27_package_capabilities(
                 &runtime.identity,
                 &RuntimeAcquisitionMethod::SourceBuild,
@@ -4446,6 +4483,179 @@ mod tests {
             Some(Q27SourceBuildEvidence::Plan(plan)),
         );
         assert!(!capabilities.trustworthy_identity);
+    }
+
+    const INCOMPLETE_FAST_HEAD_USAGE: &str = "Usage: q27-server model.q27 model.tok --host HOST --port PORT --ctx C \
+         --kv-fp16 --no-fast-head";
+
+    fn trusted_source_schema(usage: &str) -> LoadSettingsSchema {
+        let runtime = current_source_runtimes()
+            .into_iter()
+            .find(|runtime| runtime.identity.variant == "w12")
+            .expect("W12 source runtime");
+        let plan = runtime.source_build().expect("source plan");
+        let provenance = current_source_provenance(plan);
+        q27_load_settings_schema_from_usage(
+            Some(runtime.runtime_id.clone()),
+            &runtime.identity,
+            &RuntimeAcquisitionMethod::SourceBuild,
+            Some(Q27SourceBuildEvidence::Provenance(&provenance)),
+            usage,
+        )
+    }
+
+    #[test]
+    fn trusted_source_contract_supplements_incomplete_usage() {
+        let schema = trusted_source_schema(INCOMPLETE_FAST_HEAD_USAGE);
+        let fast_head = schema
+            .definitions
+            .iter()
+            .find(|definition| definition.id.as_str() == "q27.fast_head")
+            .expect("fast-head definition");
+        assert!(fast_head.supported);
+        assert!(
+            schema
+                .definitions
+                .iter()
+                .find(|definition| definition.id.as_str() == "parallel_requests")
+                .expect("parallel-requests definition")
+                .supported
+        );
+    }
+
+    #[test]
+    fn trusted_source_fast_head_true_translates_to_enable_flag() {
+        let schema = trusted_source_schema(INCOMPLETE_FAST_HEAD_USAGE);
+        let settings = resolved_load_settings(&[("q27.fast_head", LoadSettingValue::Toggle(true))]);
+        schema.validate(&settings).expect("trusted source schema");
+        let translated =
+            translate_q27_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
+        assert_eq!(argument_strings(translated.arguments), ["--fast-head"]);
+    }
+
+    #[test]
+    fn trusted_source_fast_head_false_translates_to_disable_flag() {
+        let schema = trusted_source_schema(INCOMPLETE_FAST_HEAD_USAGE);
+        let settings =
+            resolved_load_settings(&[("q27.fast_head", LoadSettingValue::Toggle(false))]);
+        schema.validate(&settings).expect("trusted source schema");
+        let translated =
+            translate_q27_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
+        assert_eq!(argument_strings(translated.arguments), ["--no-fast-head"]);
+    }
+
+    #[test]
+    fn external_runtime_with_incomplete_usage_remains_fail_closed() {
+        let mut identity = current_source_runtimes()
+            .into_iter()
+            .find(|runtime| runtime.identity.variant == "w12")
+            .expect("W12 source runtime")
+            .identity;
+        identity.package_family = ENGINE_ID.to_owned();
+        identity.accelerator = "external".to_owned();
+        identity.variant = "q27-server-v0.10.0".to_owned();
+        identity.upstream_revision = None;
+        identity.package = RuntimePackageIdentity {
+            provider_id: "external-binary".to_owned(),
+            repository: Some(GITHUB_REPOSITORY.to_owned()),
+            release_tag: None,
+            asset_id: Some("/opt/q27-server-v0.10.0".to_owned()),
+            asset_name: Some("q27-server-v0.10.0".to_owned()),
+            additional_assets: Vec::new(),
+        };
+        let schema = q27_load_settings_schema_from_usage(
+            None,
+            &identity,
+            &RuntimeAcquisitionMethod::ExternalBinary,
+            None,
+            INCOMPLETE_FAST_HEAD_USAGE,
+        );
+        let fast_head = schema
+            .definitions
+            .iter()
+            .find(|definition| definition.id.as_str() == "q27.fast_head")
+            .expect("fast-head definition");
+        assert!(!fast_head.supported);
+        assert!(
+            !schema
+                .definitions
+                .iter()
+                .find(|definition| definition.id.as_str() == "parallel_requests")
+                .expect("parallel-requests definition")
+                .supported
+        );
+
+        let complete_usage = format!("{INCOMPLETE_FAST_HEAD_USAGE} --fast-head");
+        let schema = q27_load_settings_schema_from_usage(
+            None,
+            &identity,
+            &RuntimeAcquisitionMethod::ExternalBinary,
+            None,
+            &complete_usage,
+        );
+        assert!(
+            schema
+                .definitions
+                .iter()
+                .find(|definition| definition.id.as_str() == "q27.fast_head")
+                .expect("fast-head definition")
+                .supported
+        );
+    }
+
+    #[test]
+    fn mismatched_source_provenance_with_v0100_claim_remains_fail_closed() {
+        let runtime = current_source_runtimes()
+            .into_iter()
+            .find(|runtime| runtime.identity.variant == "w12")
+            .expect("W12 source runtime");
+        let mut provenance =
+            current_source_provenance(runtime.source_build().expect("source plan"));
+        provenance.source.tree_sha = "0".repeat(40);
+        let schema = q27_load_settings_schema_from_usage(
+            Some(runtime.runtime_id.clone()),
+            &runtime.identity,
+            &RuntimeAcquisitionMethod::SourceBuild,
+            Some(Q27SourceBuildEvidence::Provenance(&provenance)),
+            INCOMPLETE_FAST_HEAD_USAGE,
+        );
+        let fast_head = schema
+            .definitions
+            .iter()
+            .find(|definition| definition.id.as_str() == "q27.fast_head")
+            .expect("fast-head definition");
+        assert!(!fast_head.supported);
+    }
+
+    #[test]
+    fn package_derived_fast_head_default_passes_trusted_source_schema() {
+        let mut model = model_artifact(PathBuf::from("model.q27"));
+        model.norted_package = Some(q27_package_fixture());
+        let mut settings = ResolvedLoadSettings {
+            engine_id: ENGINE_ID.to_owned(),
+            ..ResolvedLoadSettings::default()
+        };
+        apply_norted_package_load_policy(&model, &mut settings).expect("package load policy");
+        assert_eq!(
+            settings.value("q27.fast_head"),
+            Some(&LoadSettingValue::Toggle(false))
+        );
+        assert!(matches!(
+            settings
+                .effective
+                .get(&LoadSettingId::new("q27.fast_head").expect("setting ID"))
+                .map(|setting| &setting.source),
+            Some(LoadSettingSource::NortedPackagePolicy { .. })
+        ));
+        let schema = trusted_source_schema(INCOMPLETE_FAST_HEAD_USAGE);
+        schema.validate(&settings).expect("trusted source schema");
+        let translated =
+            translate_q27_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
+        assert!(
+            argument_strings(translated.arguments)
+                .iter()
+                .any(|argument| argument == "--no-fast-head")
+        );
     }
 
     #[test]
@@ -4813,6 +5023,16 @@ mod tests {
             .to_string()
             .contains("Q27_KV")
         );
+        let fast_head =
+            resolved_load_settings(&[("q27.fast_head", LoadSettingValue::Toggle(false))]);
+        for native in ["--fast-head", "--no-fast-head"] {
+            assert!(
+                translate_q27_load_settings(&fast_head, &[native.to_owned()], &BTreeMap::new())
+                    .expect_err("fast-head native collision")
+                    .to_string()
+                    .contains("conflicts")
+            );
+        }
     }
 
     #[test]
