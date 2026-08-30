@@ -1,10 +1,18 @@
+use std::fs::{File, OpenOptions};
+use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use color_eyre::Result;
-use norted_core::ApplicationCore;
+use color_eyre::eyre::{Context, Result, eyre};
+use fs2::FileExt;
+use norted_api::{ApiServer, PublicAuth, PublicAuthVerifier};
+use norted_core::{
+    ApiKeyStore, AppPaths, ApplicationCore, EffectivePublicAuthMode, PublicAuthStatus,
+};
 use norted_engine::{
-    EngineRegistry, RuntimeCatalogProvider, RuntimeManager, RuntimeManagerOptions,
-    RuntimePackManager, TokioProcessSupervisor,
+    ControlClient, ControlClientError, EngineRegistry, RuntimeCatalogProvider, RuntimeManager,
+    RuntimeManagerOptions, RuntimePackManager, TokioProcessSupervisor,
 };
 use norted_engine_llama_cpp::{
     ENGINE_ID as LLAMA_CPP_ENGINE_ID, LlamaCppAdapter, LlamaCppRuntimeCatalogProvider,
@@ -14,24 +22,59 @@ use norted_engine_ninfer::{
 };
 use norted_engine_q27::{ENGINE_ID as Q27_ENGINE_ID, Q27Adapter, Q27RuntimeCatalogProvider};
 
+const SERVER_START_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const SERVER_START_LOCK_RETRY: Duration = Duration::from_millis(50);
+const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const SERVER_READY_RETRY: Duration = Duration::from_millis(50);
+
+pub struct ApplicationServices {
+    pub registry: EngineRegistry,
+    pub runtime_packs: Arc<RuntimePackManager>,
+}
+
+impl ApplicationServices {
+    pub fn new(core: &ApplicationCore) -> Result<Self> {
+        let registry = engine_registry(core)?;
+        let runtime_packs = runtime_pack_manager(core, registry.clone())?;
+        Ok(Self {
+            registry,
+            runtime_packs,
+        })
+    }
+
+    pub async fn runtime_manager(&self, core: Arc<ApplicationCore>) -> Arc<RuntimeManager> {
+        RuntimeManager::initialize(
+            core,
+            self.registry.clone(),
+            Arc::clone(&self.runtime_packs),
+            Arc::new(TokioProcessSupervisor::default()),
+            RuntimeManagerOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn start_server(&self, core: Arc<ApplicationCore>) -> Result<RunningServer> {
+        let (public_auth, auth_status) = public_auth(&core).await?;
+        core.ensure_model_discovery().await?;
+        let runtime = self.runtime_manager(Arc::clone(&core)).await;
+        let server =
+            match ApiServer::bind(Arc::clone(&core), Arc::clone(&runtime), public_auth).await {
+                Ok(server) => server,
+                Err(error) => {
+                    runtime.shutdown().await;
+                    return Err(error.into());
+                }
+            };
+        RunningServer::start(&core.paths, server, auth_status).await
+    }
+}
+
 pub async fn runtime_manager(core: Arc<ApplicationCore>) -> Result<Arc<RuntimeManager>> {
-    let registry = engine_registry(&core)?;
-    let packs = runtime_pack_manager(&core, registry.clone())?;
-    Ok(RuntimeManager::initialize(
-        core,
-        registry,
-        packs,
-        Arc::new(TokioProcessSupervisor::default()),
-        RuntimeManagerOptions::default(),
-    )
-    .await)
+    Ok(ApplicationServices::new(&core)?.runtime_manager(core).await)
 }
 
 pub fn engine_registry(core: &ApplicationCore) -> Result<EngineRegistry> {
-    let config_directory = core
-        .config_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
+    let config_directory = core.config_path.parent().unwrap_or_else(|| Path::new("."));
     let mut registry = EngineRegistry::default();
     registry.register(Arc::new(LlamaCppAdapter::from_config(
         core.config.engine.get(LLAMA_CPP_ENGINE_ID),
@@ -58,4 +101,346 @@ pub fn runtime_pack_manager(
         Arc::new(NinferRuntimeCatalogProvider::new()),
     ];
     Ok(RuntimePackManager::new(&core.paths, registry, providers)?)
+}
+
+pub async fn discover_existing_control(paths: &AppPaths) -> Result<Option<ControlClient>> {
+    match ControlClient::discover(paths).await {
+        Ok(client) => Ok(Some(client)),
+        Err(ControlClientError::Unavailable) => Ok(None),
+        Err(error) => Err(error).wrap_err(
+            "could not safely determine whether a Norted Server instance is already running",
+        ),
+    }
+}
+
+pub struct ServerStartupGuard {
+    lock: File,
+}
+
+impl ServerStartupGuard {
+    pub async fn acquire(paths: &AppPaths) -> Result<Self> {
+        let lock_path = paths.state_dir.join("runtime").join("server-start.lock");
+        if let Some(parent) = lock_path.parent() {
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!(
+                    "could not create server startup lock directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| {
+                format!("could not open server startup lock {}", lock_path.display())
+            })?;
+        let started = Instant::now();
+        loop {
+            match lock.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { lock }),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if started.elapsed() >= SERVER_START_LOCK_TIMEOUT {
+                        return Err(eyre!(
+                            "another Norted Server process is still determining server ownership; retry after its startup completes"
+                        ));
+                    }
+                    tokio::time::sleep(SERVER_START_LOCK_RETRY).await;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "could not acquire server startup lock {}",
+                            lock_path.display()
+                        )
+                    });
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ServerStartupGuard {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.lock) {
+            tracing::warn!(%error, "could not release server startup lock");
+        }
+    }
+}
+
+pub struct RunningServer {
+    address: std::net::SocketAddr,
+    auth_status: PublicAuthStatus,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<std::result::Result<(), norted_api::ApiError>>>,
+}
+
+impl RunningServer {
+    async fn start(
+        paths: &AppPaths,
+        server: ApiServer,
+        auth_status: PublicAuthStatus,
+    ) -> Result<Self> {
+        let address = server.local_addr();
+        let (shutdown, shutdown_receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.run(async move {
+            let _ = shutdown_receiver.await;
+        }));
+        let mut running = Self {
+            address,
+            auth_status,
+            shutdown: Some(shutdown),
+            task: Some(task),
+        };
+        if let Err(error) = running.wait_until_ready(paths).await {
+            let cleanup = running.shutdown().await;
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.wrap_err(format!(
+                    "the failed server startup also could not shut down cleanly: {cleanup}"
+                ))),
+            };
+        }
+        Ok(running)
+    }
+
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.address
+    }
+
+    pub fn auth_status(&self) -> &PublicAuthStatus {
+        &self.auth_status
+    }
+
+    pub async fn run_while<F>(mut self, foreground: F) -> Result<()>
+    where
+        F: Future<Output = Result<()>>,
+    {
+        tokio::pin!(foreground);
+        let mut task = self.task.take().expect("a running server has a task");
+        tokio::select! {
+            foreground_result = &mut foreground => {
+                self.signal_shutdown();
+                let server_result = Self::task_result(task.await);
+                match foreground_result {
+                    Ok(()) => server_result,
+                    Err(error) => {
+                        if let Err(shutdown_error) = server_result {
+                            tracing::error!(%shutdown_error, "owned server cleanup failed after the foreground task returned an error");
+                        }
+                        Err(error)
+                    }
+                }
+            }
+            server_result = &mut task => {
+                self.shutdown.take();
+                Self::task_result(server_result).and_then(|()| {
+                    Err(eyre!("the owned Norted Server stopped unexpectedly"))
+                })
+            }
+        }
+    }
+
+    async fn wait_until_ready(&mut self, paths: &AppPaths) -> Result<()> {
+        let ready = async {
+            loop {
+                match ControlClient::discover(paths).await {
+                    Ok(client) => match client.status().await {
+                        Ok(_) => return Ok(()),
+                        Err(error) => {
+                            tracing::debug!(%error, "owned control API is not ready yet");
+                        }
+                    },
+                    Err(ControlClientError::Unavailable) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                tokio::time::sleep(SERVER_READY_RETRY).await;
+            }
+        };
+        enum ReadyOutcome {
+            Observation(Result<()>),
+            Server(
+                std::result::Result<
+                    std::result::Result<(), norted_api::ApiError>,
+                    tokio::task::JoinError,
+                >,
+            ),
+        }
+        let outcome = tokio::select! {
+            result = tokio::time::timeout(SERVER_READY_TIMEOUT, ready) => {
+                ReadyOutcome::Observation(result
+                    .map_err(|_| eyre!("the owned Norted Server did not become discoverable within {} seconds", SERVER_READY_TIMEOUT.as_secs()))?
+                )
+            }
+            result = self.task.as_mut().expect("a starting server has a task") => {
+                ReadyOutcome::Server(result)
+            }
+        };
+        match outcome {
+            ReadyOutcome::Observation(result) => result,
+            ReadyOutcome::Server(result) => {
+                self.task.take();
+                self.shutdown.take();
+                Self::task_result(result)?;
+                Err(eyre!(
+                    "the owned Norted Server stopped before its control API became ready"
+                ))
+            }
+        }
+    }
+
+    async fn shutdown(mut self) -> Result<()> {
+        self.signal_shutdown();
+        let Some(task) = self.task.take() else {
+            return Ok(());
+        };
+        Self::task_result(task.await)
+    }
+
+    fn signal_shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+
+    fn task_result(
+        result: std::result::Result<
+            std::result::Result<(), norted_api::ApiError>,
+            tokio::task::JoinError,
+        >,
+    ) -> Result<()> {
+        match result {
+            Ok(result) => result.map_err(Into::into),
+            Err(error) => Err(eyre!("owned server task failed: {error}")),
+        }
+    }
+}
+
+async fn public_auth(core: &ApplicationCore) -> Result<(PublicAuth, PublicAuthStatus)> {
+    let key_store = ApiKeyStore::new(&core.paths);
+    let auth_status = core
+        .config
+        .server
+        .public_auth_status(key_store.active_count().await?)?;
+    validate_public_auth_startup(&auth_status)?;
+    let public_auth = match auth_status.effective_mode {
+        EffectivePublicAuthMode::Disabled => PublicAuth::disabled(),
+        EffectivePublicAuthMode::Required => {
+            PublicAuth::required(Arc::new(KeyStoreVerifier(key_store)))
+        }
+    };
+    Ok((public_auth, auth_status))
+}
+
+fn validate_public_auth_startup(status: &PublicAuthStatus) -> Result<()> {
+    if !status.bind_allowed {
+        return Err(eyre!(
+            "public authentication is required for {}, but there are no active API keys; create one with `norted-server auth keys create --name <LABEL>` before serving",
+            status.bind
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct KeyStoreVerifier(ApiKeyStore);
+
+#[async_trait::async_trait]
+impl PublicAuthVerifier for KeyStoreVerifier {
+    async fn verify(&self, credential: &str) -> bool {
+        match self.0.verify(credential).await {
+            Ok(verified) => verified,
+            Err(error) => {
+                tracing::error!(%error, "public API-key verification failed closed");
+                false
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use norted_core::{AppPaths, PublicAuthMode, ServerConfig};
+
+    use super::{ServerStartupGuard, validate_public_auth_startup};
+
+    #[test]
+    fn required_auth_without_an_active_key_fails_before_server_binding() {
+        let status = ServerConfig {
+            host: "0.0.0.0".to_owned(),
+            port: 8742,
+            auth: PublicAuthMode::Auto,
+        }
+        .public_auth_status(0)
+        .expect("auth status");
+        let error = validate_public_auth_startup(&status).expect_err("must fail closed");
+        assert!(error.to_string().contains("auth keys create"));
+    }
+
+    #[test]
+    fn explicit_insecure_remote_override_is_allowed_but_marked() {
+        let status = ServerConfig {
+            host: "0.0.0.0".to_owned(),
+            port: 8742,
+            auth: PublicAuthMode::Disabled,
+        }
+        .public_auth_status(0)
+        .expect("auth status");
+        validate_public_auth_startup(&status).expect("explicit override");
+        assert!(status.insecure_remote);
+    }
+
+    #[tokio::test]
+    async fn startup_guard_serializes_the_observe_or_bind_decision() {
+        let paths = temporary_paths("startup-lock");
+        let first = ServerStartupGuard::acquire(&paths)
+            .await
+            .expect("first startup guard");
+        let second_paths = paths.clone();
+        let mut second =
+            tokio::spawn(async move { ServerStartupGuard::acquire(&second_paths).await });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "a second startup decision must wait for the first"
+        );
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second startup guard timeout")
+            .expect("second startup task")
+            .expect("second startup guard");
+        drop(second);
+        std::fs::remove_dir_all(&paths.state_dir).expect("remove temporary state directory");
+    }
+
+    fn temporary_paths(label: &str) -> AppPaths {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current time")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "norted-server-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        AppPaths {
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.toml"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            runtimes_dir: root.join("data/runtimes"),
+            runtime_cache_dir: root.join("cache/runtime-packs"),
+            runtime_selections_file: root.join("data/runtime-selections.json"),
+            load_profiles_file: root.join("data/load-profiles.json"),
+            load_profiles_lock_file: root.join("data/.load-profiles.lock"),
+        }
+    }
 }

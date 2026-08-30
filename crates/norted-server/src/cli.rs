@@ -36,9 +36,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Launch the interactive terminal interface
+    /// Launch the interactive interface, attaching to or owning the serving stack
     Tui,
-    /// Run the local HTTP API gateway until interrupted
+    /// Run the local HTTP API gateway headlessly until interrupted
     Serve,
     /// Inspect public authentication or manage Norted API keys
     Auth(AuthArgs),

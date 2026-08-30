@@ -13,6 +13,7 @@ path = "src/main.rs"
 async-trait.workspace = true
 clap.workspace = true
 color-eyre.workspace = true
+fs2.workspace = true
 norted-api = { path = "../norted-api" }
 norted-core = { path = "../norted-core" }
 norted-engine = { path = "../norted-engine" }
