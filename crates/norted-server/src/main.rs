@@ -67,7 +67,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Serve => {
             let services = composition::ApplicationServices::new(&core)?;
             let startup_guard = composition::ServerStartupGuard::acquire(&core.paths).await?;
-            let server = services.start_server(core).await?;
+            let server = services
+                .start_server(core, composition::ModelDiscoveryReadiness::RequireReady)
+                .await?;
             drop(startup_guard);
             report_insecure_remote(server.auth_status(), cli.json);
             if cli.json {
@@ -263,7 +265,13 @@ async fn run_tui(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
         return norted_tui::run(core, services.runtime_packs, load_setting_definitions).await;
     }
 
-    let server = match services.start_server(Arc::clone(&core)).await {
+    let server = match services
+        .start_server(
+            Arc::clone(&core),
+            composition::ModelDiscoveryReadiness::AllowPending,
+        )
+        .await
+    {
         Ok(server) => server,
         Err(startup_error) => {
             if composition::discover_existing_control(&core.paths)

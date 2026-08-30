@@ -32,6 +32,12 @@ pub struct ApplicationServices {
     pub runtime_packs: Arc<RuntimePackManager>,
 }
 
+#[derive(Clone, Copy)]
+pub enum ModelDiscoveryReadiness {
+    RequireReady,
+    AllowPending,
+}
+
 impl ApplicationServices {
     pub fn new(core: &ApplicationCore) -> Result<Self> {
         let registry = engine_registry(core)?;
@@ -53,9 +59,15 @@ impl ApplicationServices {
         .await
     }
 
-    pub async fn start_server(&self, core: Arc<ApplicationCore>) -> Result<RunningServer> {
+    pub async fn start_server(
+        &self,
+        core: Arc<ApplicationCore>,
+        model_discovery: ModelDiscoveryReadiness,
+    ) -> Result<RunningServer> {
         let (public_auth, auth_status) = public_auth(&core).await?;
-        core.ensure_model_discovery().await?;
+        if matches!(model_discovery, ModelDiscoveryReadiness::RequireReady) {
+            core.ensure_model_discovery().await?;
+        }
         let runtime = self.runtime_manager(Arc::clone(&core)).await;
         let server =
             match ApiServer::bind(Arc::clone(&core), Arc::clone(&runtime), public_auth).await {
@@ -105,7 +117,12 @@ pub fn runtime_pack_manager(
 
 pub async fn discover_existing_control(paths: &AppPaths) -> Result<Option<ControlClient>> {
     match ControlClient::discover(paths).await {
-        Ok(client) => Ok(Some(client)),
+        Ok(client) => {
+            client.status().await.wrap_err(
+                "a Norted Server passed its public identity probe, but its authenticated private control status could not be verified; refusing to attach or start a competing server",
+            )?;
+            Ok(Some(client))
+        }
         Err(ControlClientError::Unavailable) => Ok(None),
         Err(error) => Err(error).wrap_err(
             "could not safely determine whether a Norted Server instance is already running",
@@ -364,9 +381,11 @@ impl PublicAuthVerifier for KeyStoreVerifier {
 mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use norted_core::{AppPaths, PublicAuthMode, ServerConfig};
+    use norted_core::{AppPaths, PublicAuthMode, RuntimePublisher, ServerConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
-    use super::{ServerStartupGuard, validate_public_auth_startup};
+    use super::{ServerStartupGuard, discover_existing_control, validate_public_auth_startup};
 
     #[test]
     fn required_auth_without_an_active_key_fails_before_server_binding() {
@@ -418,6 +437,62 @@ mod tests {
             .expect("second startup guard");
         drop(second);
         std::fs::remove_dir_all(&paths.state_dir).expect("remove temporary state directory");
+    }
+
+    #[tokio::test]
+    async fn attach_admission_requires_private_control_status() {
+        let paths = temporary_paths("attach-control-status");
+        let public_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("public listener");
+        let control_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("control listener");
+        let mut publisher = RuntimePublisher::publish(
+            &paths,
+            public_listener.local_addr().expect("public address"),
+            control_listener.local_addr().expect("control address"),
+            "test-control-token".to_owned(),
+        )
+        .expect("runtime publisher");
+        let health = serde_json::json!({
+            "status": "ok",
+            "instance_id": publisher.instance_id(),
+        })
+        .to_string();
+        let public = tokio::spawn(respond_once(public_listener, "200 OK", health));
+        let control = tokio::spawn(respond_once(
+            control_listener,
+            "503 Service Unavailable",
+            serde_json::json!({ "error": "control is not ready" }).to_string(),
+        ));
+
+        let error = discover_existing_control(&paths)
+            .await
+            .expect_err("public health alone must not admit attachment");
+        assert!(
+            error
+                .to_string()
+                .contains("authenticated private control status could not be verified")
+        );
+        public.await.expect("public response task");
+        control.await.expect("control response task");
+        publisher.cleanup();
+        std::fs::remove_dir_all(&paths.state_dir).expect("remove temporary state directory");
+    }
+
+    async fn respond_once(listener: TcpListener, status: &str, body: String) {
+        let (mut stream, _) = listener.accept().await.expect("accept test request");
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request).await.expect("read test request");
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write test response");
     }
 
     fn temporary_paths(label: &str) -> AppPaths {
