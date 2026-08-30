@@ -16,12 +16,13 @@ use norted_core::{
     inspect_ninfer_container,
 };
 use norted_engine::{
-    ApiCapability, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
-    EngineCapabilities, EngineError, EngineFeature, EngineIdentity, EngineProbe,
-    GenerationSettingsPatch, InferenceOutput, InferenceRequest, InferenceStream, InstallationState,
-    LaunchRequest, LaunchSpec, NativeOption, OptionValueKind, PreparedModelInput,
-    ProcessDescriptor, UpdateState, capture_command, compatibility_for, isolated_cuda_environment,
-    prepare_norted_package_input, revalidate_norted_package_before_launch, visible_nvidia_devices,
+    ApiCapability, BackendLoadPhase, BackendLoadProgress, CompatibilityDecision,
+    EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError, EngineFeature,
+    EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceOutput, InferenceRequest,
+    InferenceStream, InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind,
+    PreparedModelInput, ProcessDescriptor, UpdateState, capture_command, compatibility_for,
+    isolated_cuda_environment, prepare_norted_package_input,
+    revalidate_norted_package_before_launch, visible_nvidia_devices,
 };
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -1179,6 +1180,10 @@ impl EngineAdapter for NinferAdapter {
         Ok(true)
     }
 
+    fn startup_progress(&self, stderr_tail: &[String]) -> Option<BackendLoadProgress> {
+        parse_ninfer_startup_progress(stderr_tail)
+    }
+
     async fn effective_generation_settings(
         &self,
         process: &ProcessDescriptor,
@@ -1447,6 +1452,44 @@ struct StartupEnvironment {
     gpu_uuid: String,
     compute_capability_major: u16,
     compute_capability_minor: u16,
+}
+
+/// Best-effort UX progress from ninfer-serve stderr. NInfer's authoritative
+/// startup contract is the private JSONL request log validated in `health`,
+/// not stderr; this parser only recognizes a few conservative, stable
+/// prefixes and degrades to `None` for unknown output. It never invents a
+/// fraction and is never an admission gate.
+fn parse_ninfer_startup_progress(stderr_tail: &[String]) -> Option<BackendLoadProgress> {
+    let mut progress = None;
+    for line in stderr_tail {
+        let line = line.trim();
+        if line.contains("listening on")
+            || line.contains("server started")
+            || line.contains("ninfer-serve ready")
+        {
+            progress = Some(BackendLoadProgress::with_message(
+                BackendLoadPhase::VerifyingStartup,
+                "Starting the NInfer server",
+            ));
+        } else if line.contains("loading model")
+            || line.contains("loading weights")
+            || line.contains("loading artifact")
+        {
+            progress = Some(BackendLoadProgress::with_message(
+                BackendLoadPhase::LoadingModel,
+                "Loading model weights",
+            ));
+        } else if line.contains("allocating kv")
+            || line.contains("allocating context")
+            || line.contains("initializing kv cache")
+        {
+            progress = Some(BackendLoadProgress::with_message(
+                BackendLoadPhase::AllocatingContext,
+                "Allocating context and KV cache",
+            ));
+        }
+    }
+    progress
 }
 
 async fn read_and_validate_startup_log(
@@ -1938,6 +1981,32 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_progress_is_conservative_and_never_invents_fractions() {
+        assert_eq!(parse_ninfer_startup_progress(&[]), None);
+        assert_eq!(
+            parse_ninfer_startup_progress(&["unrelated log line".to_owned()]),
+            None
+        );
+
+        let loading = parse_ninfer_startup_progress(&["loading model weights".to_owned()])
+            .expect("loading line yields a phase");
+        assert_eq!(loading.phase, BackendLoadPhase::LoadingModel);
+        assert_eq!(loading.fraction, None);
+
+        let context = parse_ninfer_startup_progress(&["allocating kv cache".to_owned()])
+            .expect("kv line yields a phase");
+        assert_eq!(context.phase, BackendLoadPhase::AllocatingContext);
+
+        let listening = parse_ninfer_startup_progress(&[
+            "loading model weights".to_owned(),
+            "allocating kv cache".to_owned(),
+            "ninfer-serve ready on 127.0.0.1:8080".to_owned(),
+        ])
+        .expect("ready line yields the latest phase");
+        assert_eq!(listening.phase, BackendLoadPhase::VerifyingStartup);
+    }
 
     #[test]
     fn native_arguments_are_strict_and_semantic_flags_are_reserved() {

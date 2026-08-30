@@ -24,6 +24,7 @@ pub struct Glyphs {
     pub up_down: &'static str,
     pub ellipsis: &'static str,
     pub border: border::Set<'static>,
+    pub unicode: bool,
 }
 
 impl Glyphs {
@@ -40,6 +41,7 @@ impl Glyphs {
                 up_down: "↑↓",
                 ellipsis: "…",
                 border: border::PLAIN,
+                unicode: true,
             }
         } else {
             Self {
@@ -53,6 +55,7 @@ impl Glyphs {
                 up_down: "Up/Dn",
                 ellipsis: "...",
                 border: ASCII_BORDER,
+                unicode: false,
             }
         }
     }

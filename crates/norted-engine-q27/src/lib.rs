@@ -24,16 +24,16 @@ use norted_core::{
     RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem, RuntimeSourceSnapshot,
 };
 use norted_engine::{
-    ApiCapability, CatalogError, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
-    EngineCapabilities, EngineError, EngineFeature, EngineIdentity, EngineProbe,
-    GenerationSettingsPatch, GitHubCommit, GitHubRelease, GitHubReleaseAsset, GitHubReleaseClient,
-    InferenceEvent, InferenceFinishReason, InferenceMessage, InferenceOutput, InferenceRequest,
-    InferenceRole, InferenceStream, InferenceUsage, InstallationState, LaunchRequest, LaunchSpec,
-    NativeOption, OptionValueKind, PreparedAuxiliaryArtifact, PreparedModelInput,
-    ProcessDescriptor, RuntimeCatalogProvider, StartupObservation, UpdateState, capture_command,
-    common_load_setting_definitions, compatibility_for, compatibility_for_nvidia_device,
-    isolated_cuda_environment, prepare_norted_package_input,
-    revalidate_norted_package_before_launch, visible_nvidia_devices,
+    ApiCapability, BackendLoadPhase, BackendLoadProgress, CatalogError, CompatibilityDecision,
+    EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError, EngineFeature,
+    EngineIdentity, EngineProbe, GenerationSettingsPatch, GitHubCommit, GitHubRelease,
+    GitHubReleaseAsset, GitHubReleaseClient, InferenceEvent, InferenceFinishReason,
+    InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
+    InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind,
+    PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
+    StartupObservation, UpdateState, capture_command, common_load_setting_definitions,
+    compatibility_for, compatibility_for_nvidia_device, isolated_cuda_environment,
+    prepare_norted_package_input, revalidate_norted_package_before_launch, visible_nvidia_devices,
 };
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -2695,6 +2695,10 @@ impl EngineAdapter for Q27Adapter {
         ])))
     }
 
+    fn startup_progress(&self, stderr_tail: &[String]) -> Option<BackendLoadProgress> {
+        parse_q27_startup_progress(stderr_tail)
+    }
+
     async fn effective_generation_settings(
         &self,
         process: &ProcessDescriptor,
@@ -3048,6 +3052,73 @@ fn parse_q27_startup_observation(
         fast_head,
         thinking,
     })
+}
+
+/// Best-effort UX progress from the exact q27 v0.10.0 startup lines. q27 does
+/// not expose a trustworthy numerator/denominator during model loading, so
+/// every observation is an indeterminate phase; the strict correctness checks
+/// remain in `parse_q27_startup_observation` and are unaffected by this.
+fn parse_q27_startup_progress(stderr_tail: &[String]) -> Option<BackendLoadProgress> {
+    if stderr_tail.len() > 80 || stderr_tail.iter().any(|line| line.len() > 4_096) {
+        return None;
+    }
+    if let Some(slot) = stderr_tail
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("slot 0 ready: ctx="))
+    {
+        let message = slot
+            .strip_prefix("slot 0 ready: ctx=")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map_or_else(
+                || "Verifying q27 startup profile".to_owned(),
+                |context| format!("Verifying q27 startup profile (context {context})"),
+            );
+        return Some(BackendLoadProgress::with_message(
+            BackendLoadPhase::VerifyingStartup,
+            message,
+        ));
+    }
+    if let Some(auto) = stderr_tail
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("--ctx auto:"))
+    {
+        let message = auto
+            .strip_prefix("--ctx auto:")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or_else(
+                || "Preparing slots".to_owned(),
+                |context| format!("Preparing slots (context {context})"),
+            );
+        return Some(BackendLoadProgress::with_message(
+            BackendLoadPhase::AllocatingContext,
+            message,
+        ));
+    }
+    if let Some(profile) = stderr_tail
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("profile:"))
+    {
+        let message = startup_token(profile, "kv=").map_or_else(
+            |_| "Resolving KV and context".to_owned(),
+            |kv| format!("Resolving context ({kv} KV)"),
+        );
+        return Some(BackendLoadProgress::with_message(
+            BackendLoadPhase::AllocatingContext,
+            message,
+        ));
+    }
+    if stderr_tail.is_empty() {
+        None
+    } else {
+        Some(BackendLoadProgress::with_message(
+            BackendLoadPhase::LoadingModel,
+            "Loading model weights",
+        ))
+    }
 }
 
 fn startup_token<'a>(line: &'a str, prefix: &str) -> Result<&'a str, EngineError> {
@@ -4722,6 +4793,55 @@ mod tests {
         assert_eq!(observation.compiled_w_max, 12);
         assert_eq!(observation.suffix_width, 12);
         assert!(observation.thinking);
+    }
+
+    #[test]
+    fn startup_progress_tracks_exact_startup_lines_without_inventing_fractions() {
+        assert_eq!(parse_q27_startup_progress(&[]), None);
+
+        let weights = parse_q27_startup_progress(&["q27 0.10.0 starting".to_owned()])
+            .expect("early startup output yields an indeterminate phase");
+        assert_eq!(weights.phase, BackendLoadPhase::LoadingModel);
+        assert_eq!(weights.fraction, None);
+        assert_eq!(weights.message.as_deref(), Some("Loading model weights"));
+
+        let profile = parse_q27_startup_progress(&[
+            "profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=0 think=1".to_owned(),
+        ])
+        .expect("profile line yields context resolution");
+        assert_eq!(profile.phase, BackendLoadPhase::AllocatingContext);
+        assert_eq!(profile.fraction, None);
+        assert_eq!(
+            profile.message.as_deref(),
+            Some("Resolving context (fp8 KV)")
+        );
+
+        let slots = parse_q27_startup_progress(&[
+            "profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=0 think=1".to_owned(),
+            "--ctx auto: 262144 (free 30.0GB post-weights, fp8 KV, W_MAX=12)".to_owned(),
+        ])
+        .expect("auto-context line yields slot preparation");
+        assert_eq!(slots.phase, BackendLoadPhase::AllocatingContext);
+        assert_eq!(
+            slots.message.as_deref(),
+            Some("Preparing slots (context 262144)")
+        );
+
+        let verifying = parse_q27_startup_progress(&[
+            "profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=0 think=1".to_owned(),
+            "--ctx auto: 262144 (free 30.0GB post-weights, fp8 KV, W_MAX=12)".to_owned(),
+            "slot 0 ready: ctx=262144".to_owned(),
+        ])
+        .expect("slot-ready line yields verification");
+        assert_eq!(verifying.phase, BackendLoadPhase::VerifyingStartup);
+        assert_eq!(verifying.fraction, None);
+        assert_eq!(
+            verifying.message.as_deref(),
+            Some("Verifying q27 startup profile (context 262144)")
+        );
+
+        let oversized = vec!["x".repeat(5_000)];
+        assert_eq!(parse_q27_startup_progress(&oversized), None);
     }
 
     #[tokio::test]

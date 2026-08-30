@@ -21,11 +21,11 @@ use norted_core::{
     RuntimeAcquisitionMethod, RuntimeId, RuntimeProbeObservation,
 };
 use norted_engine::{
-    ApiCapability, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
-    EngineCapabilities, EngineError, EngineFeature, EngineIdentity, EngineProbe,
-    GenerationSettingsPatch, InferenceEvent, InferenceFinishReason, InferenceMessage,
-    InferenceOutput, InferenceRequest, InferenceRole, InferenceStream, InferenceUsage,
-    InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind,
+    ApiCapability, BackendLoadPhase, BackendLoadProgress, CompatibilityDecision,
+    EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError, EngineFeature,
+    EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceEvent, InferenceFinishReason,
+    InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
+    InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, NativeOption, OptionValueKind,
     PreparedModelInput, ProcessDescriptor, UpdateState, capture_command,
     common_load_setting_definitions, prepare_norted_package_input,
     revalidate_norted_package_before_launch,
@@ -840,6 +840,10 @@ impl EngineAdapter for LlamaCppAdapter {
             .await
             .map_err(|error| EngineError::Operation(format!("invalid health response: {error}")))?;
         Ok(health.status == "ok")
+    }
+
+    fn startup_progress(&self, stderr_tail: &[String]) -> Option<BackendLoadProgress> {
+        parse_llama_startup_progress(stderr_tail)
     }
 
     async fn effective_generation_settings(
@@ -1716,6 +1720,43 @@ fn backend_error_message(error: &Value) -> String {
         .to_owned()
 }
 
+/// Best-effort UX progress from llama-server startup output. The supported
+/// upstream build does not emit a stable machine-readable loading fraction, so
+/// this reports truthful indeterminate phases from a few conservative line
+/// prefixes and degrades to `None` for unknown or changed log formats. This is
+/// never an admission gate: startup correctness stays with `health`.
+fn parse_llama_startup_progress(stderr_tail: &[String]) -> Option<BackendLoadProgress> {
+    let mut progress = None;
+    for line in stderr_tail {
+        let line = line.trim();
+        if line.starts_with("main: server is listening")
+            || line.starts_with("srv  init:")
+            || line.starts_with("srv init:")
+        {
+            progress = Some(BackendLoadProgress::with_message(
+                BackendLoadPhase::VerifyingStartup,
+                "Starting the llama.cpp server",
+            ));
+        } else if line.starts_with("llama_kv_cache") || line.starts_with("llama_context:") {
+            progress = Some(BackendLoadProgress::with_message(
+                BackendLoadPhase::AllocatingContext,
+                "Allocating context and KV cache",
+            ));
+        } else if line.starts_with("load_tensors:") {
+            progress = Some(BackendLoadProgress::with_message(
+                BackendLoadPhase::LoadingModel,
+                "Loading model tensors",
+            ));
+        } else if line.starts_with("llama_model_loader:") {
+            progress = Some(BackendLoadProgress::with_message(
+                BackendLoadPhase::LoadingModel,
+                "Reading model metadata",
+            ));
+        }
+    }
+    progress
+}
+
 fn command_detail(stdout: &str, stderr: &str) -> String {
     match (stdout.trim(), stderr.trim()) {
         ("", "") => "no output".to_owned(),
@@ -1743,6 +1784,59 @@ fn unix_timestamp() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod startup_progress_tests {
+    use super::*;
+
+    #[test]
+    fn unrecognized_output_yields_no_progress() {
+        assert_eq!(parse_llama_startup_progress(&[]), None);
+        assert_eq!(
+            parse_llama_startup_progress(&["completely unrelated log line".to_owned()]),
+            None
+        );
+    }
+
+    #[test]
+    fn known_prefixes_yield_indeterminate_phases_without_inventing_fractions() {
+        let metadata = parse_llama_startup_progress(&[
+            "llama_model_loader: - type f16:   1 tensors".to_owned(),
+        ])
+        .expect("model loader line yields a phase");
+        assert_eq!(metadata.phase, BackendLoadPhase::LoadingModel);
+        assert_eq!(metadata.fraction, None);
+        assert_eq!(metadata.message.as_deref(), Some("Reading model metadata"));
+
+        let tensors = parse_llama_startup_progress(&["load_tensors: layer 0 processed".to_owned()])
+            .expect("load_tensors line yields a phase");
+        assert_eq!(tensors.phase, BackendLoadPhase::LoadingModel);
+        assert_eq!(tensors.fraction, None);
+
+        let context =
+            parse_llama_startup_progress(&["llama_context: constructing llama_context".to_owned()])
+                .expect("context line yields a phase");
+        assert_eq!(context.phase, BackendLoadPhase::AllocatingContext);
+
+        let listening = parse_llama_startup_progress(&[
+            "main: server is listening on 127.0.0.1:8080".to_owned(),
+        ])
+        .expect("listening line yields a phase");
+        assert_eq!(listening.phase, BackendLoadPhase::VerifyingStartup);
+    }
+
+    #[test]
+    fn later_phase_wins_over_earlier_phase() {
+        let progress = parse_llama_startup_progress(&[
+            "llama_model_loader: - type f16:   1 tensors".to_owned(),
+            "load_tensors: layer 0 processed".to_owned(),
+            "llama_context: constructing llama_context".to_owned(),
+            "main: server is listening on 127.0.0.1:8080".to_owned(),
+        ])
+        .expect("multi-line startup yields the latest phase");
+        assert_eq!(progress.phase, BackendLoadPhase::VerifyingStartup);
+    }
 }
 
 #[cfg(test)]

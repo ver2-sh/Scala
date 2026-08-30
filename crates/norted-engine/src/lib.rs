@@ -42,8 +42,9 @@ pub use control::{
     ControlErrorResponse, ControlLoadRequest,
 };
 pub use manager::{
-    BackendLifecycle, BackendStatus, ControlStatus, EngineStatus, RuntimeError, RuntimeManager,
-    RuntimeManagerOptions, RuntimeNotice, RuntimeNoticeLevel,
+    BackendLifecycle, BackendLoadPhase, BackendLoadProgress, BackendStatus, ControlStatus,
+    EngineStatus, RuntimeError, RuntimeManager, RuntimeManagerOptions, RuntimeNotice,
+    RuntimeNoticeLevel,
 };
 pub use packs::{
     InstalledRuntimeStatus, RuntimeListSnapshot, RuntimeModelCandidate, RuntimePackError,
@@ -855,6 +856,15 @@ pub trait EngineAdapter: Send + Sync {
     ) -> Result<StartupObservation, EngineError> {
         Ok(StartupObservation::Ready(BTreeMap::new()))
     }
+    /// Interprets bounded startup output into an optional engine-neutral
+    /// load-progress observation while the manager waits for readiness. This
+    /// is UX evidence only, never an admission gate: adapters return `None`
+    /// for unrecognized or missing output, and startup must not fail solely
+    /// because progress is unavailable. Determinate values are allowed only
+    /// when the exact runtime output contains a trustworthy measurement.
+    fn startup_progress(&self, _stderr_tail: &[String]) -> Option<BackendLoadProgress> {
+        None
+    }
     async fn effective_generation_settings(
         &self,
         process: &ProcessDescriptor,
@@ -1015,6 +1025,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
+        BackendLifecycle, BackendLoadPhase, BackendLoadProgress, BackendStatus,
         CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter, EngineCapabilities,
         EngineError, EngineIdentity, EngineProbe, EngineRegistry, GenerationSettingsPatch,
         InferenceRole, InstallationState, LaunchRequest, LaunchSpec, NativeOption,
@@ -1473,5 +1484,148 @@ mod tests {
                 .is_err()
         );
         assert!(prepare_norted_package_input(artifact).await.is_err());
+    }
+
+    #[test]
+    fn backend_status_serializes_an_optional_load_progress_state() {
+        let with_progress = BackendStatus {
+            lifecycle: BackendLifecycle::Loading,
+            model_id: Some(ModelId("qwen3.8-27b".to_owned())),
+            engine_id: Some("q27".to_owned()),
+            runtime_id: None,
+            runtime_version: Some("0.10.0".to_owned()),
+            runtime_variant: Some("w12".to_owned()),
+            runtime_executable_sha256: None,
+            process_id: Some(4321),
+            private_endpoint: Some("http://127.0.0.1:4321".to_owned()),
+            load_progress: Some(BackendLoadProgress {
+                phase: BackendLoadPhase::LoadingModel,
+                fraction: Some(0.5),
+                current: Some(148),
+                total: Some(200),
+                message: Some("Loading tensors".to_owned()),
+            }),
+            failure: None,
+            provenance: None,
+        };
+        let value = serde_json::to_value(&with_progress).expect("serialize");
+        assert_eq!(value["lifecycle"], "loading");
+        assert_eq!(value["load_progress"]["phase"], "loading_model");
+        assert_eq!(value["load_progress"]["fraction"], 0.5);
+        assert_eq!(value["load_progress"]["current"], 148);
+        assert_eq!(value["load_progress"]["total"], 200);
+        assert_eq!(value["load_progress"]["message"], "Loading tensors");
+
+        let without_progress = BackendStatus {
+            load_progress: None,
+            ..with_progress
+        };
+        let value = serde_json::to_value(&without_progress).expect("serialize");
+        assert!(
+            value.get("load_progress").is_none(),
+            "absent progress is skipped, not null"
+        );
+
+        // Older descriptors that omit load_progress still deserialize.
+        let legacy = serde_json::json!({
+            "lifecycle": "stopped",
+            "model_id": null,
+            "engine_id": null,
+            "runtime_id": null,
+            "runtime_version": null,
+            "runtime_variant": null,
+            "runtime_executable_sha256": null,
+            "process_id": null,
+            "private_endpoint": null,
+            "failure": null,
+            "provenance": null,
+        });
+        let parsed: BackendStatus =
+            serde_json::from_value(legacy).expect("legacy status without load_progress");
+        assert_eq!(parsed.lifecycle, BackendLifecycle::Stopped);
+        assert_eq!(parsed.load_progress, None);
+    }
+
+    #[test]
+    fn load_progress_sanitization_rejects_untrustworthy_numeric_evidence() {
+        // Phase-only observations stay indeterminate.
+        let phase_only =
+            BackendLoadProgress::indeterminate(BackendLoadPhase::SpawningBackend).sanitized();
+        assert_eq!(phase_only.fraction, None);
+        assert_eq!(phase_only.current, None);
+        assert_eq!(phase_only.total, None);
+
+        // A trustworthy count derives a clamped fraction.
+        let determinate = BackendLoadProgress {
+            phase: BackendLoadPhase::LoadingModel,
+            fraction: None,
+            current: Some(50),
+            total: Some(200),
+            message: None,
+        }
+        .sanitized();
+        assert_eq!(determinate.current, Some(50));
+        assert_eq!(determinate.total, Some(200));
+        assert_eq!(determinate.fraction, Some(0.25));
+
+        // current > total is rejected, degrading to indeterminate.
+        let inverted = BackendLoadProgress {
+            phase: BackendLoadPhase::LoadingModel,
+            fraction: Some(0.5),
+            current: Some(300),
+            total: Some(200),
+            message: None,
+        }
+        .sanitized();
+        assert_eq!(inverted.current, None);
+        assert_eq!(inverted.total, None);
+        assert_eq!(inverted.fraction, None);
+
+        // A non-finite or out-of-range fraction is rejected.
+        let nan = BackendLoadProgress {
+            phase: BackendLoadPhase::LoadingModel,
+            fraction: Some(f32::NAN),
+            current: None,
+            total: None,
+            message: None,
+        }
+        .sanitized();
+        assert_eq!(nan.fraction, None);
+
+        let over_one = BackendLoadProgress {
+            phase: BackendLoadPhase::LoadingModel,
+            fraction: Some(1.5),
+            current: None,
+            total: None,
+            message: None,
+        }
+        .sanitized();
+        assert_eq!(over_one.fraction, None);
+
+        // A lone current without total is rejected.
+        let lone = BackendLoadProgress {
+            phase: BackendLoadPhase::LoadingModel,
+            fraction: None,
+            current: Some(10),
+            total: None,
+            message: None,
+        }
+        .sanitized();
+        assert_eq!(lone.current, None);
+        assert_eq!(lone.total, None);
+        assert_eq!(lone.fraction, None);
+
+        // A zero total is rejected.
+        let zero_total = BackendLoadProgress {
+            phase: BackendLoadPhase::LoadingModel,
+            fraction: None,
+            current: Some(0),
+            total: Some(0),
+            message: None,
+        }
+        .sanitized();
+        assert_eq!(zero_total.current, None);
+        assert_eq!(zero_total.total, None);
+        assert_eq!(zero_total.fraction, None);
     }
 }

@@ -71,21 +71,35 @@ pub async fn run(
     });
     let observer_core = Arc::clone(&core);
     let observer_paths = core.paths.clone();
-    let runtime_observer = tokio::spawn(async move {
-        let mut refresh = tokio::time::interval(Duration::from_secs(2));
-        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            refresh.tick().await;
-            let (_, observation) = tokio::join!(
-                observer_core.refresh_server_state(),
-                observe_control(&observer_paths)
-            );
-            if control_updates.send(observation).await.is_err() {
-                break;
+    let control_cadence = Arc::new(tokio::sync::Mutex::new(Duration::from_secs(2)));
+    let runtime_observer = tokio::spawn({
+        let cadence = Arc::clone(&control_cadence);
+        async move {
+            loop {
+                let delay = *cadence.lock().await;
+                tokio::time::sleep(delay).await;
+                let (_, observation) = tokio::join!(
+                    observer_core.refresh_server_state(),
+                    observe_control(&observer_paths)
+                );
+                let loading = observation
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.backend.lifecycle.is_loading());
+                *cadence.lock().await = if loading {
+                    Duration::from_millis(200)
+                } else {
+                    Duration::from_secs(2)
+                };
+                if control_updates.send(observation).await.is_err() {
+                    break;
+                }
             }
         }
     });
     let mut render = false;
+    let mut render_tick = tokio::time::interval(Duration::from_millis(150));
+    render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         if render {
@@ -159,6 +173,13 @@ pub async fn run(
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Update::Render,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => Update::None,
             },
+            _ = render_tick.tick() => {
+                if app.advance_load_animation() {
+                    Update::Render
+                } else {
+                    Update::None
+                }
+            }
         };
         if update == Update::Quit {
             break;

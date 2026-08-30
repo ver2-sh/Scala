@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 
 use crate::theme::{Glyphs, Theme};
+use norted_engine::BackendLoadProgress;
 
 pub fn section_title<'a>(title: &'a str, subtitle: &'a str, theme: &Theme) -> Paragraph<'a> {
     Paragraph::new(vec![
@@ -124,5 +125,300 @@ pub fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KiB", bytes / KIB)
     } else {
         format!("{bytes:.0} B")
+    }
+}
+
+/// Renders a polished model-load progress bar. Determinate when the runtime
+/// provides a trustworthy fraction; indeterminate (animated marquee) when it
+/// does not. Respects Unicode/ASCII mode and narrow widths.
+pub fn render_load_progress(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    progress: &BackendLoadProgress,
+    animation_frame: u32,
+    theme: &Theme,
+    glyphs: &Glyphs,
+) {
+    if area.height < 2 || area.width < 4 {
+        return;
+    }
+    let bar_area = Rect::new(area.x, area.y, area.width, 1);
+    let detail_area = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+
+    let bar = if let Some(fraction) = progress.fraction {
+        determinate_bar(fraction, bar_area.width, glyphs, theme)
+    } else {
+        indeterminate_bar(animation_frame, bar_area.width, glyphs, theme)
+    };
+    frame.render_widget(Paragraph::new(bar), bar_area);
+
+    let detail = progress_detail(progress, bar_area.width);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(detail, theme.muted))),
+        detail_area,
+    );
+}
+
+fn determinate_bar(fraction: f32, width: u16, glyphs: &Glyphs, theme: &Theme) -> Line<'static> {
+    let inner_width = (width as usize).saturating_sub(8);
+    let filled = if inner_width > 0 {
+        (fraction.clamp(0.0, 1.0) * inner_width as f32).round() as usize
+    } else {
+        0
+    };
+    let empty = inner_width.saturating_sub(filled);
+    let (full, empty_glyph) = if glyphs.unicode {
+        ("\u{2588}", "\u{2591}")
+    } else {
+        ("#", "-")
+    };
+    let bar: String = full.repeat(filled) + empty_glyph.repeat(empty).as_str();
+    let percent = (fraction.clamp(0.0, 1.0) * 100.0).round() as u32;
+    Line::from(vec![
+        Span::styled(bar, theme.accent),
+        Span::raw(" "),
+        Span::styled(format!("{percent:>3}%"), theme.text),
+    ])
+}
+
+fn indeterminate_bar(frame: u32, width: u16, glyphs: &Glyphs, theme: &Theme) -> Line<'static> {
+    let inner_width = (width as usize).saturating_sub(1);
+    if inner_width == 0 {
+        return Line::from(Span::styled(
+            if glyphs.unicode { "\u{2501}" } else { "-" },
+            theme.accent,
+        ));
+    }
+    let segment_len = if glyphs.unicode { 6 } else { 5 };
+    let segment_len = segment_len.min(inner_width);
+    let position = (frame as usize) % (inner_width + segment_len);
+    let start = position.saturating_sub(segment_len);
+    let end = position.min(inner_width);
+
+    let (track, head, segment) = if glyphs.unicode {
+        ("\u{2500}", "\u{2578}", "\u{2501}")
+    } else {
+        ("-", ">", "=")
+    };
+
+    let mut bar = String::with_capacity(inner_width);
+    bar.push_str(&track.repeat(start));
+    if start < end {
+        if start < position && position > segment_len {
+            bar.push_str(segment);
+        }
+        let seg_start = if position > segment_len {
+            start + 1
+        } else {
+            start
+        };
+        let seg_fill = end.saturating_sub(seg_start);
+        bar.push_str(&segment.repeat(seg_fill));
+        if end < inner_width && end == position {
+            bar.push_str(head);
+        }
+    }
+    let remaining = inner_width.saturating_sub(bar.chars().count());
+    bar.push_str(&track.repeat(remaining));
+
+    Line::from(vec![
+        Span::styled(bar, theme.muted),
+        Span::styled(head, theme.accent),
+    ])
+}
+
+fn progress_detail(progress: &BackendLoadProgress, width: u16) -> String {
+    let phase = progress.phase.label();
+    let mut detail = if let Some(message) = &progress.message {
+        if message.is_empty() {
+            phase.to_owned()
+        } else {
+            format!("{phase}: {message}")
+        }
+    } else {
+        phase.to_owned()
+    };
+    if let (Some(current), Some(total)) = (progress.current, progress.total) {
+        detail.push_str(&format!(" {current} / {total}"));
+    }
+    if detail.len() > width as usize {
+        truncate_middle(&detail, width as usize, "\u{2026}")
+    } else {
+        detail
+    }
+}
+
+/// Compact one-line progress for Overview or narrow layouts.
+pub fn load_progress_compact(
+    progress: &BackendLoadProgress,
+    animation_frame: u32,
+    width: u16,
+    glyphs: &Glyphs,
+) -> String {
+    let phase = progress.phase.label();
+    if let Some(fraction) = progress.fraction {
+        let inner_width = (width as usize).saturating_sub(phase.len() + 6);
+        let filled = if inner_width > 0 {
+            (fraction.clamp(0.0, 1.0) * inner_width as f32).round() as usize
+        } else {
+            0
+        };
+        let (full, empty) = if glyphs.unicode {
+            ("\u{2588}", "\u{2591}")
+        } else {
+            ("#", "-")
+        };
+        let bar: String = full.repeat(filled) + &empty.repeat(inner_width.saturating_sub(filled));
+        let percent = (fraction.clamp(0.0, 1.0) * 100.0).round() as u32;
+        format!("{phase} {bar} {percent}%")
+    } else {
+        let inner_width = (width as usize).saturating_sub(phase.len() + 2);
+        let position = (animation_frame as usize) % (inner_width.max(1) + 3);
+        let (track, head) = if glyphs.unicode {
+            ("\u{2500}", "\u{2578}")
+        } else {
+            ("-", ">")
+        };
+        let bar: String = track.repeat(position.min(inner_width)) + head;
+        let remaining = inner_width.saturating_sub(bar.chars().count());
+        let full_bar = bar + &track.repeat(remaining);
+        format!("{phase} {full_bar}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use norted_engine::BackendLoadPhase;
+
+    fn theme() -> Theme {
+        Theme::current(true)
+    }
+
+    fn glyphs() -> Glyphs {
+        Glyphs::current(true)
+    }
+
+    fn ascii_glyphs() -> Glyphs {
+        Glyphs::current(false)
+    }
+
+    #[test]
+    fn determinate_bar_renders_filled_and_empty_segments() {
+        let line = determinate_bar(0.5, 20, &glyphs(), &theme());
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('\u{2588}'));
+        assert!(text.contains('\u{2591}'));
+        assert!(text.contains("50%"));
+    }
+
+    #[test]
+    fn determinate_bar_ascii_mode_uses_hash_and_dash() {
+        let line = determinate_bar(0.25, 20, &ascii_glyphs(), &theme());
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('#'));
+        assert!(text.contains('-'));
+        assert!(text.contains("25%"));
+    }
+
+    #[test]
+    fn determinate_bar_clamps_above_100_percent() {
+        let line = determinate_bar(1.5, 20, &glyphs(), &theme());
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("100%"));
+    }
+
+    #[test]
+    fn determinate_bar_clamps_below_zero() {
+        let line = determinate_bar(-0.5, 20, &glyphs(), &theme());
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("0%"));
+    }
+
+    #[test]
+    fn indeterminate_bar_moves_with_animation_frame() {
+        let frame0 = indeterminate_bar(0, 30, &glyphs(), &theme());
+        let frame5 = indeterminate_bar(5, 30, &glyphs(), &theme());
+        let text0: String = frame0.spans.iter().map(|s| s.content.as_ref()).collect();
+        let text5: String = frame5.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_ne!(text0, text5);
+    }
+
+    #[test]
+    fn indeterminate_bar_ascii_mode_uses_ascii_characters() {
+        let line = indeterminate_bar(3, 30, &ascii_glyphs(), &theme());
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('-') || text.contains('>'));
+        assert!(!text.contains('\u{2500}'));
+    }
+
+    #[test]
+    fn indeterminate_bar_handles_narrow_width() {
+        let line = indeterminate_bar(0, 4, &glyphs(), &theme());
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!text.is_empty());
+    }
+
+    #[test]
+    fn progress_detail_includes_phase_and_message() {
+        let progress = BackendLoadProgress::with_message(
+            BackendLoadPhase::LoadingModel,
+            "Loading tensors 148 / 200",
+        );
+        let detail = progress_detail(&progress, 80);
+        assert!(detail.contains("Loading model"));
+        assert!(detail.contains("Loading tensors 148 / 200"));
+    }
+
+    #[test]
+    fn progress_detail_truncates_on_narrow_width() {
+        let progress = BackendLoadProgress::with_message(
+            BackendLoadPhase::LoadingModel,
+            "a very long message that exceeds the available width",
+        );
+        let detail = progress_detail(&progress, 20);
+        assert!(detail.contains('\u{2026}'));
+        assert!(detail.chars().count() <= 20);
+    }
+
+    #[test]
+    fn progress_detail_appends_count_when_present() {
+        let progress = BackendLoadProgress {
+            phase: BackendLoadPhase::LoadingModel,
+            fraction: Some(0.74),
+            current: Some(148),
+            total: Some(200),
+            message: Some("Loading tensors".to_owned()),
+        };
+        let detail = progress_detail(&progress, 80);
+        assert!(detail.contains("148 / 200"));
+    }
+
+    #[test]
+    fn compact_progress_determinate_shows_percentage() {
+        let progress = BackendLoadProgress {
+            phase: BackendLoadPhase::LoadingModel,
+            fraction: Some(0.67),
+            current: None,
+            total: None,
+            message: None,
+        };
+        let compact = load_progress_compact(&progress, 0, 40, &glyphs());
+        assert!(compact.contains("67%"));
+        assert!(compact.contains("Loading model"));
+    }
+
+    #[test]
+    fn compact_progress_indeterminate_shows_phase_and_bar() {
+        let progress = BackendLoadProgress::indeterminate(BackendLoadPhase::LoadingModel);
+        let compact = load_progress_compact(&progress, 3, 40, &glyphs());
+        assert!(compact.contains("Loading model"));
+    }
+
+    #[test]
+    fn compact_progress_ascii_mode_uses_ascii() {
+        let progress = BackendLoadProgress::indeterminate(BackendLoadPhase::LoadingModel);
+        let compact = load_progress_compact(&progress, 3, 40, &ascii_glyphs());
+        assert!(!compact.contains('\u{2500}'));
     }
 }

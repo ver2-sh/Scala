@@ -280,6 +280,7 @@ pub struct App {
     pub settings_runtime_id: Option<RuntimeId>,
     pub settings_validation_error: Option<String>,
     pub settings_input: Option<SettingsInput>,
+    pub load_animation_frame: u32,
     focus_before_command: FocusArea,
     pending_control_action: Option<ControlAction>,
     control_busy: bool,
@@ -374,6 +375,7 @@ impl App {
             settings_runtime_id: None,
             settings_validation_error: None,
             settings_input: None,
+            load_animation_frame: 0,
             focus_before_command: FocusArea::Navigation,
             pending_control_action: None,
             control_busy: false,
@@ -599,6 +601,24 @@ impl App {
 
     pub fn control_observation_pending(&self) -> bool {
         self.control.is_none() && self.control_observation_error.is_none()
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(|status| status.backend.lifecycle.is_loading())
+    }
+
+    pub fn advance_load_animation(&mut self) -> bool {
+        if !self.is_loading() {
+            if self.load_animation_frame != 0 {
+                self.load_animation_frame = 0;
+                return true;
+            }
+            return false;
+        }
+        self.load_animation_frame = self.load_animation_frame.wrapping_add(1);
+        true
     }
 
     pub fn take_control_action(&mut self) -> Option<ControlAction> {

@@ -265,6 +265,8 @@ Public Responses and Chat messages both become one ordered canonical `InferenceR
 
 `RuntimeManager` maintains one Stopped/Loading/Running/Stopping/Failed backend. Loading resolves the discovered primary model, exact runtime, and adapter, obtains a dynamic loopback address, builds a `LaunchSpec`, and delegates the child to `TokioProcessSupervisor`. The supervisor drains both pipes, includes runtime identity in process facts, observes unexpected exit, supports startup cancellation, and owns graceful/forced cleanup. A second load conflicts instead of implicitly replacing the active backend.
 
+While loading, `RuntimeManager` publishes an engine-neutral `BackendLoadProgress` through the private control status. Progress carries a generic phase (selecting runtime, resolving settings, loading model, verifying startup, etc.), an optional fraction/current/total when the exact runtime exposes trustworthy measurable progress, and an optional human-readable message. Percentages are never invented from phase transitions alone. Engine-specific log parsing stays inside each adapter via an optional `startup_progress` hook; the generic manager owns the progress state and sanitizes untrustworthy numeric values. Progress is cleared on Running, Failed, cancellation, and unload; an old load generation can never overwrite a newer load's progress. Both owned and attached TUI modes observe the same control status.
+
 Cross-process CLI/TUI control uses schema-version-2 descriptors under:
 
 ```text
