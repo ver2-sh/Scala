@@ -73,6 +73,15 @@ pub struct RuntimeInstallationLease {
     _file: std::fs::File,
 }
 
+impl Drop for RuntimeInstallationLease {
+    fn drop(&mut self) {
+        // Release explicitly before closing so a same-process waiter can
+        // reacquire deterministically even while unrelated tests/process work
+        // is running concurrently.
+        let _ = fs2::FileExt::unlock(&self._file);
+    }
+}
+
 #[derive(Debug)]
 pub struct RuntimeStaging {
     path: Option<PathBuf>,

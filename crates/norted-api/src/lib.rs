@@ -332,7 +332,7 @@ async fn control_load(
     State(state): State<ControlApiState>,
     headers: HeaderMap,
     payload: Result<Json<ControlLoadRequest>, JsonRejection>,
-) -> Result<Json<ControlStatus>, ControlApiError> {
+) -> Result<(StatusCode, Json<ControlStatus>), ControlApiError> {
     authorize(&headers, &state.token)?;
     let Json(request) = payload.map_err(|error| ControlApiError {
         status: StatusCode::BAD_REQUEST,
@@ -340,14 +340,14 @@ async fn control_load(
     })?;
     state
         .runtime
-        .load_with_settings(
+        .start_load_with_settings(
             request.model_id,
             request.runtime_id,
             request.profile,
             request.settings,
         )
         .await
-        .map(Json)
+        .map(|status| (StatusCode::ACCEPTED, Json(status)))
         .map_err(|error| ControlApiError {
             status: match error {
                 norted_engine::RuntimeError::ModelNotFound(_) => StatusCode::NOT_FOUND,
@@ -359,6 +359,7 @@ async fn control_load(
                 norted_engine::RuntimeError::EngineUnavailable(_) => {
                     StatusCode::SERVICE_UNAVAILABLE
                 }
+                norted_engine::RuntimeError::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
                 norted_engine::RuntimeError::StartupTimedOut(_) => StatusCode::GATEWAY_TIMEOUT,
                 norted_engine::RuntimeError::StartupFailed(_) => StatusCode::BAD_GATEWAY,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -438,8 +439,74 @@ impl IntoResponse for ControlApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::ApiModel;
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use norted_core::{AppPaths, ModelId};
+    use norted_engine::{
+        BackendLifecycle, EngineRegistry, RuntimeCatalogProvider, RuntimeManagerOptions,
+        RuntimePackManager, TokioProcessSupervisor,
+    };
     use serde_json::json;
+    use tower::ServiceExt;
+
+    async fn control_fixture() -> (tempfile::TempDir, Arc<RuntimeManager>, ModelId) {
+        let temporary = tempfile::tempdir().expect("temporary control fixture");
+        let root = temporary.path();
+        let model_dir = root.join("models");
+        std::fs::create_dir_all(&model_dir).expect("model directory");
+        std::fs::write(model_dir.join("fixture.gguf"), b"fixture").expect("model fixture");
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.toml"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            runtimes_dir: root.join("data/runtimes"),
+            runtime_cache_dir: root.join("cache/runtime-packs"),
+            runtime_selections_file: root.join("data/runtime-selections.json"),
+            load_profiles_file: root.join("data/load-profiles.json"),
+            load_profiles_lock_file: root.join("data/.load-profiles.lock"),
+        };
+        paths.ensure_required().expect("fixture paths");
+        std::fs::write(
+            &paths.config_file,
+            format!(
+                "version = 1\n\n[models]\npaths = [{}]\n",
+                serde_json::to_string(&model_dir).expect("model path string")
+            ),
+        )
+        .expect("fixture config");
+        let core = ApplicationCore::load_from_paths(paths.clone())
+            .await
+            .expect("fixture core");
+        core.refresh_models().await.expect("model discovery");
+        let model_id = core
+            .snapshot()
+            .await
+            .models
+            .into_iter()
+            .next()
+            .expect("discovered model")
+            .id;
+        let registry = EngineRegistry::default();
+        let packs = RuntimePackManager::new(
+            &paths,
+            registry.clone(),
+            Vec::<Arc<dyn RuntimeCatalogProvider>>::new(),
+        )
+        .expect("runtime packs");
+        let manager = RuntimeManager::initialize(
+            core,
+            registry,
+            packs,
+            Arc::new(TokioProcessSupervisor::default()),
+            RuntimeManagerOptions::default(),
+        )
+        .await;
+        (temporary, manager, model_id)
+    }
 
     #[test]
     fn model_object_contains_only_the_supported_openai_fields() {
@@ -491,5 +558,58 @@ mod tests {
         assert_eq!(responses.generation_settings.temperature, None);
         assert_eq!(responses.generation_settings.top_p, Some(0.75));
         assert_eq!(responses.stream, chat.stream);
+    }
+
+    #[tokio::test]
+    async fn control_load_returns_accepted_loading_and_outlives_the_response() {
+        let (_temporary, runtime, model_id) = control_fixture().await;
+        let router = control_routes(ControlApiState {
+            runtime: Arc::clone(&runtime),
+            token: Arc::from("fixture-token"),
+        });
+        let request = ControlLoadRequest {
+            model_id: model_id.clone(),
+            runtime_id: None,
+            profile: None,
+            settings: norted_core::LoadSettingsPatch::default(),
+        };
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            router.oneshot(
+                Request::post(CONTROL_LOAD_PATH)
+                    .header("authorization", "Bearer fixture-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&request).expect("load request JSON"),
+                    ))
+                    .expect("load request"),
+            ),
+        )
+        .await
+        .expect("load admission response")
+        .expect("control response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("response body");
+        let admitted: ControlStatus = serde_json::from_slice(&body).expect("control status");
+        assert_eq!(admitted.backend.lifecycle, BackendLifecycle::Loading);
+        assert_eq!(admitted.backend.model_id.as_ref(), Some(&model_id));
+
+        // The handler and response are gone, but the manager-owned task still
+        // records its eventual failure in authoritative state.
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = runtime.status().await;
+                if status.backend.lifecycle == BackendLifecycle::Failed {
+                    return status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background load completion");
+        assert_eq!(failed.backend.generation, admitted.backend.generation);
+        assert!(failed.backend.failure.is_some());
     }
 }

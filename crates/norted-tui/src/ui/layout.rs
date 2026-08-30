@@ -658,6 +658,7 @@ mod tests {
             running_engine_count: 1,
             engines: Vec::new(),
             backend: BackendStatus {
+                generation: 1,
                 lifecycle: BackendLifecycle::Loading,
                 model_id: Some(app.snapshot.models[model_index].id.clone()),
                 engine_id: Some("llama.cpp".to_owned()),

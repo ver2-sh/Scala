@@ -16,7 +16,9 @@ use norted_core::{
     ApiKeyStore, AppPaths, ApplicationCore, LoadProfilesStore, LoadSettingDefinition,
     LoadSettingsError, LoadSettingsPatch, PublicAuthStatus, ServerConfig,
 };
-use norted_engine::{ControlClient, ControlClientError, ControlStatus, RuntimePackManager};
+use norted_engine::{
+    BackendLifecycle, ControlClient, ControlClientError, ControlStatus, RuntimePackManager,
+};
 
 use app::{
     App, ControlAction, ModelSettingsInspection, RuntimeAction, RuntimeTaskResult, SettingsAction,
@@ -28,10 +30,20 @@ use ui::layout::UiLayout;
 const CONTROL_IDLE_CADENCE: Duration = Duration::from_secs(2);
 const CONTROL_LOADING_CADENCE: Duration = Duration::from_millis(200);
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+enum LocalLoadIntent {
+    #[default]
+    Idle,
+    PendingAdmission,
+    Accepted {
+        generation: u64,
+    },
+}
+
 #[derive(Debug, Default)]
 struct ControlPollState {
     initial_observation_pending: bool,
-    local_load_pending: bool,
+    local_load_intent: LocalLoadIntent,
     observed_loading: bool,
 }
 
@@ -52,16 +64,21 @@ impl ControlPollState {
         }
     }
 
-    fn set_local_load_pending(&mut self, pending: bool) {
-        self.local_load_pending = pending;
+    fn set_local_load_intent(&mut self, intent: LocalLoadIntent) {
+        self.local_load_intent = intent;
     }
 
-    fn record_observation(&mut self, loading: bool) {
-        self.observed_loading = loading;
+    fn record_observation(&mut self, observation: Option<(u64, BackendLifecycle)>) {
+        self.observed_loading = observation.is_some_and(|(_, lifecycle)| lifecycle.is_loading());
+        if let LocalLoadIntent::Accepted { generation } = self.local_load_intent
+            && observation.is_some_and(|(observed_generation, _)| observed_generation == generation)
+        {
+            self.local_load_intent = LocalLoadIntent::Idle;
+        }
     }
 
     fn cadence(&self) -> Duration {
-        if self.local_load_pending || self.observed_loading {
+        if self.local_load_intent != LocalLoadIntent::Idle || self.observed_loading {
             CONTROL_LOADING_CADENCE
         } else {
             CONTROL_IDLE_CADENCE
@@ -91,7 +108,8 @@ pub async fn run(
     core.start_model_discovery().await;
     let mut terminal_events = EventStream::new();
     let (control_updates, mut control_update_receiver) = tokio::sync::mpsc::channel(2);
-    let (control_results, mut control_result_receiver) = tokio::sync::mpsc::channel(2);
+    let (control_results, mut control_result_receiver) =
+        tokio::sync::mpsc::channel::<std::result::Result<ControlStatus, String>>(2);
     let (runtime_results, mut runtime_result_receiver) = tokio::sync::mpsc::channel(4);
     let (settings_results, mut settings_result_receiver) = tokio::sync::mpsc::channel(4);
     let (auth_updates, mut auth_update_receiver) = tokio::sync::mpsc::channel(2);
@@ -115,7 +133,8 @@ pub async fn run(
     });
     let observer_core = Arc::clone(&core);
     let observer_paths = core.paths.clone();
-    let (local_load_intent, mut local_load_intent_receiver) = tokio::sync::watch::channel(false);
+    let (local_load_intent, mut local_load_intent_receiver) =
+        tokio::sync::watch::channel(LocalLoadIntent::Idle);
     let runtime_observer = tokio::spawn(async move {
         let mut poll_state = ControlPollState::new();
         loop {
@@ -130,21 +149,21 @@ pub async fn run(
                 }
             }
 
-            poll_state.set_local_load_pending(*local_load_intent_receiver.borrow_and_update());
+            poll_state.set_local_load_intent(*local_load_intent_receiver.borrow_and_update());
             let (_, observation) = tokio::join!(
                 observer_core.refresh_server_state(),
                 observe_control(&observer_paths)
             );
+            // A local load can finish while the status request is outstanding.
+            // Consume the newest intent after the observation without allowing
+            // an early Stopped response to erase a still-pending load intent.
+            poll_state.set_local_load_intent(*local_load_intent_receiver.borrow_and_update());
             poll_state.record_observation(
                 observation
                     .status
                     .as_ref()
-                    .is_some_and(|status| status.backend.lifecycle.is_loading()),
+                    .map(|status| (status.backend.generation, status.backend.lifecycle)),
             );
-            // A local load can finish while the status request is outstanding.
-            // Consume the newest intent after the observation without allowing
-            // an early Stopped response to erase a still-pending load intent.
-            poll_state.set_local_load_pending(*local_load_intent_receiver.borrow_and_update());
             if control_updates.send(observation).await.is_err() {
                 break;
             }
@@ -192,7 +211,15 @@ pub async fn run(
             },
             result = control_result_receiver.recv() => match result {
                 Some(result) => {
-                    local_load_intent.send_replace(false);
+                    let intent = match &result {
+                        Ok(status) if status.backend.lifecycle.is_loading() => {
+                            LocalLoadIntent::Accepted {
+                                generation: status.backend.generation,
+                            }
+                        }
+                        _ => LocalLoadIntent::Idle,
+                    };
+                    local_load_intent.send_replace(intent);
                     app.handle_control_result(result);
                     Update::Render
                 }
@@ -240,7 +267,7 @@ pub async fn run(
         }
         if let Some(action) = app.take_control_action() {
             if matches!(action, ControlAction::Load(_)) {
-                local_load_intent.send_replace(true);
+                local_load_intent.send_replace(LocalLoadIntent::PendingAdmission);
             }
             let paths = core.paths.clone();
             let results = control_results.clone();
@@ -648,7 +675,7 @@ async fn execute_control(
         .await
         .map_err(|error| error.to_string())?;
     match action {
-        ControlAction::Load(model_id) => client.load(model_id).await,
+        ControlAction::Load(model_id) => client.start_load(model_id).await,
         ControlAction::Unload => client.unload().await,
     }
     .map_err(|error| error.to_string())
@@ -662,7 +689,7 @@ mod tests {
     fn control_polling_starts_with_an_immediate_observation() {
         let mut state = ControlPollState::new();
         assert_eq!(state.next_delay(), None);
-        state.record_observation(false);
+        state.record_observation(Some((0, BackendLifecycle::Stopped)));
         assert_eq!(state.next_delay(), Some(CONTROL_IDLE_CADENCE));
     }
 
@@ -670,21 +697,28 @@ mod tests {
     fn local_load_intent_immediately_enters_and_holds_fast_polling() {
         let mut state = ControlPollState::new();
         let _ = state.next_delay();
-        state.set_local_load_pending(true);
+        state.set_local_load_intent(LocalLoadIntent::PendingAdmission);
         assert_eq!(state.cadence(), CONTROL_LOADING_CADENCE);
 
-        state.record_observation(false);
+        state.record_observation(Some((4, BackendLifecycle::Stopped)));
         assert_eq!(
             state.cadence(),
             CONTROL_LOADING_CADENCE,
             "an early Stopped observation must not erase pending local load intent"
         );
 
-        state.record_observation(true);
-        state.set_local_load_pending(false);
+        state.set_local_load_intent(LocalLoadIntent::Accepted { generation: 5 });
+        state.record_observation(Some((4, BackendLifecycle::Stopped)));
+        assert_eq!(
+            state.cadence(),
+            CONTROL_LOADING_CADENCE,
+            "a stale Stopped observation must not clear an accepted admission"
+        );
+
+        state.record_observation(Some((5, BackendLifecycle::Loading)));
         assert_eq!(state.cadence(), CONTROL_LOADING_CADENCE);
 
-        state.record_observation(false);
+        state.record_observation(Some((5, BackendLifecycle::Running)));
         assert_eq!(state.cadence(), CONTROL_IDLE_CADENCE);
     }
 
@@ -692,10 +726,10 @@ mod tests {
     fn external_loading_observation_uses_fast_polling_until_completion() {
         let mut state = ControlPollState::new();
         let _ = state.next_delay();
-        state.record_observation(true);
+        state.record_observation(Some((9, BackendLifecycle::Loading)));
         assert_eq!(state.cadence(), CONTROL_LOADING_CADENCE);
 
-        state.record_observation(false);
+        state.record_observation(Some((9, BackendLifecycle::Failed)));
         assert_eq!(state.cadence(), CONTROL_IDLE_CADENCE);
         assert_eq!(state.next_delay(), Some(CONTROL_IDLE_CADENCE));
     }

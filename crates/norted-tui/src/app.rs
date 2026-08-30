@@ -647,6 +647,14 @@ impl App {
         match result {
             Ok(status) => {
                 let lifecycle = status.backend.lifecycle;
+                if lifecycle.is_loading() {
+                    self.notice = Some("Model load started".to_owned());
+                    self.push_log(LogLevel::Info, "Model load started".to_owned());
+                    self.ingest_control_events(&status);
+                    self.control = Some(status);
+                    self.control_observation_error = None;
+                    return;
+                }
                 let runtime = status.backend.runtime_id.as_ref().map(|runtime_id| {
                     status.backend.runtime_version.as_deref().map_or_else(
                         || runtime_id.to_string(),
