@@ -33,10 +33,130 @@ pub enum BackendLifecycle {
     Failed,
 }
 
+impl BackendLifecycle {
+    pub fn is_loading(self) -> bool {
+        self == Self::Loading
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineStatus {
     pub identity: EngineIdentity,
     pub probe: EngineProbe,
+}
+
+/// Generic model-load phases. These refine `BackendLifecycle::Loading`; they
+/// never replace the lifecycle itself.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendLoadPhase {
+    Starting,
+    SelectingRuntime,
+    ResolvingSettings,
+    AcquiringRuntime,
+    PreparingModel,
+    PreparingLaunch,
+    SpawningBackend,
+    LoadingModel,
+    AllocatingContext,
+    VerifyingStartup,
+}
+
+impl BackendLoadPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting model load",
+            Self::SelectingRuntime => "Selecting runtime",
+            Self::ResolvingSettings => "Resolving load settings",
+            Self::AcquiringRuntime => "Acquiring runtime",
+            Self::PreparingModel => "Preparing model input",
+            Self::PreparingLaunch => "Preparing launch",
+            Self::SpawningBackend => "Spawning backend",
+            Self::LoadingModel => "Loading model",
+            Self::AllocatingContext => "Allocating context",
+            Self::VerifyingStartup => "Verifying startup",
+        }
+    }
+
+    pub fn failure_label(self) -> &'static str {
+        match self {
+            Self::Starting => "starting the model load",
+            Self::SelectingRuntime => "selecting a runtime",
+            Self::ResolvingSettings => "resolving load settings",
+            Self::AcquiringRuntime => "acquiring the runtime",
+            Self::PreparingModel => "preparing the model input",
+            Self::PreparingLaunch => "preparing the launch",
+            Self::SpawningBackend => "spawning the backend",
+            Self::LoadingModel => "loading the model",
+            Self::AllocatingContext => "allocating context",
+            Self::VerifyingStartup => "verifying startup",
+        }
+    }
+}
+
+/// Engine-neutral model-load progress. A determinate fraction is present only
+/// when the exact runtime exposes trustworthy measurable progress; phase
+/// transitions alone never invent a percentage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackendLoadProgress {
+    pub phase: BackendLoadPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fraction: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl BackendLoadProgress {
+    pub fn indeterminate(phase: BackendLoadPhase) -> Self {
+        Self {
+            phase,
+            fraction: None,
+            current: None,
+            total: None,
+            message: None,
+        }
+    }
+
+    pub fn with_message(phase: BackendLoadPhase, message: impl Into<String>) -> Self {
+        Self {
+            message: Some(message.into()),
+            ..Self::indeterminate(phase)
+        }
+    }
+
+    /// Rejects untrustworthy numeric evidence instead of presenting it: a
+    /// non-finite or out-of-range fraction and inconsistent unit counts are
+    /// dropped, degrading the observation to an indeterminate phase.
+    pub fn sanitized(mut self) -> Self {
+        if let (Some(current), Some(total)) = (self.current, self.total)
+            && (total == 0 || current > total)
+        {
+            self.current = None;
+            self.total = None;
+            self.fraction = None;
+        }
+        if self.current.is_some() != self.total.is_some() {
+            self.current = None;
+            self.total = None;
+        }
+        if let Some(fraction) = self.fraction
+            && !(fraction.is_finite() && (0.0..=1.0).contains(&fraction))
+        {
+            self.fraction = None;
+        }
+        if self.fraction.is_none()
+            && let (Some(current), Some(total)) = (self.current, self.total)
+        {
+            #[allow(clippy::cast_precision_loss)]
+            let fraction = current as f32 / total as f32;
+            self.fraction = Some(fraction.clamp(0.0, 1.0));
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +170,8 @@ pub struct BackendStatus {
     pub runtime_executable_sha256: Option<String>,
     pub process_id: Option<u32>,
     pub private_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_progress: Option<BackendLoadProgress>,
     pub failure: Option<String>,
     pub provenance: Option<RuntimeProvenance>,
 }
@@ -151,10 +273,22 @@ struct ManagerState {
     loading_process: Option<ProcessDescriptor>,
     loading_runtime_lease: Option<RuntimeLease>,
     cancel_loading: bool,
+    load_progress: Option<BackendLoadProgress>,
     failure: Option<String>,
     provenance: Option<RuntimeProvenance>,
     generation: u64,
     notices: VecDeque<RuntimeNotice>,
+}
+
+impl ManagerState {
+    /// Applies a load-progress update only when it still belongs to the
+    /// current load generation; an observation from an older load can never
+    /// overwrite a newer load operation.
+    fn apply_load_progress(&mut self, generation: u64, progress: BackendLoadProgress) {
+        if self.generation == generation && self.lifecycle == BackendLifecycle::Loading {
+            self.load_progress = Some(progress.sanitized());
+        }
+    }
 }
 
 pub struct RuntimeManager {
@@ -196,6 +330,7 @@ impl RuntimeManager {
                 loading_process: None,
                 loading_runtime_lease: None,
                 cancel_loading: false,
+                load_progress: None,
                 failure: None,
                 provenance: None,
                 generation: 0,
@@ -289,6 +424,7 @@ impl RuntimeManager {
                             .map(|provenance| provenance.private_backend_endpoint.clone())
                     })
                 },
+                load_progress: state.load_progress.clone(),
                 failure: state.failure.clone(),
                 provenance: state.provenance.clone(),
             },
@@ -365,6 +501,9 @@ impl RuntimeManager {
             state.loading_process = None;
             state.loading_runtime_lease = None;
             state.cancel_loading = self.load_cancelled(cancellation_epoch);
+            state.load_progress = Some(BackendLoadProgress::indeterminate(
+                BackendLoadPhase::Starting,
+            ));
             state.provenance = None;
             push_notice(
                 &mut state,
@@ -379,6 +518,11 @@ impl RuntimeManager {
             return Err(RuntimeError::Operation(detail));
         }
 
+        self.set_load_progress(
+            generation,
+            BackendLoadProgress::indeterminate(BackendLoadPhase::SelectingRuntime),
+        )
+        .await;
         let (adapter, selection) = match self.select_runtime(&model, runtime_id.as_ref()).await {
             Ok(selection) => selection,
             Err(error) => {
@@ -398,6 +542,11 @@ impl RuntimeManager {
             self.fail_loading(generation, error.to_string(), None).await;
             return Err(error);
         }
+        self.set_load_progress(
+            generation,
+            BackendLoadProgress::indeterminate(BackendLoadPhase::ResolvingSettings),
+        )
+        .await;
         let profile_state = match self.load_profiles.read().await {
             Ok(state) => state,
             Err(error) => {
@@ -436,6 +585,11 @@ impl RuntimeManager {
             }
         };
         let selected_runtime_id = selection.runtime.manifest.runtime_id.clone();
+        self.set_load_progress(
+            generation,
+            BackendLoadProgress::indeterminate(BackendLoadPhase::AcquiringRuntime),
+        )
+        .await;
         let runtime_lease = match self.packs.acquire_runtime_lease(&selected_runtime_id).await {
             Ok(lease) => lease,
             Err(error) => {
@@ -475,6 +629,11 @@ impl RuntimeManager {
                 return Err(RuntimeError::Operation(detail));
             }
         };
+        self.set_load_progress(
+            generation,
+            BackendLoadProgress::indeterminate(BackendLoadPhase::PreparingModel),
+        )
+        .await;
         let prepared_model = match adapter.prepare_model_input(&model).await {
             Ok(model) => model,
             Err(error) => {
@@ -482,6 +641,11 @@ impl RuntimeManager {
                 return Err(RuntimeError::StartupFailed(error.to_string()));
             }
         };
+        self.set_load_progress(
+            generation,
+            BackendLoadProgress::indeterminate(BackendLoadPhase::PreparingLaunch),
+        )
+        .await;
         let launch_attempts = match adapter
             .build_launch_attempts(LaunchRequest {
                 model: prepared_model,
@@ -523,6 +687,11 @@ impl RuntimeManager {
                 self.fail_loading(generation, detail.clone(), None).await;
                 return Err(RuntimeError::Operation(detail));
             }
+            self.set_load_progress(
+                generation,
+                BackendLoadProgress::indeterminate(BackendLoadPhase::SpawningBackend),
+            )
+            .await;
             if let Err(error) = adapter.prepare_launch_attempt(&launch_spec).await {
                 cleanup_temporary_launch_files(&launch_spec.temporary_files).await;
                 cleanup_pending_launch_files(&launch_attempts).await;
@@ -642,8 +811,13 @@ impl RuntimeManager {
                     return Err(RuntimeError::StartupFailed(detail));
                 }
             };
+            self.set_load_progress(
+                generation,
+                BackendLoadProgress::indeterminate(BackendLoadPhase::LoadingModel),
+            )
+            .await;
             if let Err(error) = self
-                .wait_for_readiness(adapter.as_ref(), &process, &mut exit)
+                .wait_for_readiness(adapter.as_ref(), &process, &mut exit, generation)
                 .await
             {
                 cleanup_pending_launch_files(&launch_attempts).await;
@@ -654,6 +828,11 @@ impl RuntimeManager {
                     .await;
                 return Err(error);
             }
+            self.set_load_progress(
+                generation,
+                BackendLoadProgress::indeterminate(BackendLoadPhase::VerifyingStartup),
+            )
+            .await;
             let mut observation_poll = 0_u8;
             let observation = loop {
                 let stderr_tail = match self.supervisor.stderr_tail(&process).await {
@@ -715,6 +894,16 @@ impl RuntimeManager {
                     observed_context,
                     minimum_context,
                 } => {
+                    self.set_load_progress(
+                        generation,
+                        BackendLoadProgress::with_message(
+                            BackendLoadPhase::AllocatingContext,
+                            format!(
+                                "Retrying with the next KV mode: {kv_mode} served {observed_context} of the required {minimum_context} context tokens"
+                            ),
+                        ),
+                    )
+                    .await;
                     context_attempts.push((kv_mode, observed_context));
                     if let Err(error) = self.supervisor.terminate(&process).await {
                         cleanup_pending_launch_files(&launch_attempts).await;
@@ -803,6 +992,7 @@ impl RuntimeManager {
             state.lifecycle = BackendLifecycle::Running;
             state.loading_process = None;
             state.cancel_loading = false;
+            state.load_progress = None;
             if let Some(provenance) = state.provenance.as_mut() {
                 if let Some(package) = provenance.model.norted_package.as_mut() {
                     if startup_observation
@@ -940,6 +1130,7 @@ impl RuntimeManager {
         state.loading_process = None;
         state.loading_runtime_lease = None;
         state.cancel_loading = false;
+        state.load_progress = None;
         state.failure = None;
         push_notice(
             &mut state,
@@ -1007,6 +1198,13 @@ impl RuntimeManager {
         self.supervisor.shutdown().await;
     }
 
+    async fn set_load_progress(&self, generation: u64, progress: BackendLoadProgress) {
+        self.state
+            .write()
+            .await
+            .apply_load_progress(generation, progress);
+    }
+
     fn load_cancelled(&self, cancellation_epoch: u64) -> bool {
         self.shutting_down.load(Ordering::Acquire)
             || self.cancellation_epoch.load(Ordering::Acquire) != cancellation_epoch
@@ -1020,6 +1218,7 @@ impl RuntimeManager {
             }
             state.lifecycle = BackendLifecycle::Stopping;
             state.cancel_loading = true;
+            state.load_progress = None;
             push_notice(
                 &mut state,
                 RuntimeNoticeLevel::Info,
@@ -1100,8 +1299,10 @@ impl RuntimeManager {
         adapter: &dyn EngineAdapter,
         process: &ProcessDescriptor,
         exit: &mut tokio::sync::watch::Receiver<Option<ProcessExit>>,
+        generation: u64,
     ) -> Result<(), RuntimeError> {
         let deadline = tokio::time::Instant::now() + self.options.startup_timeout;
+        let mut published_progress: Option<BackendLoadProgress> = None;
         loop {
             if let Some(exit) = exit.borrow().clone() {
                 return Err(RuntimeError::StartupFailed(exit_detail(&exit)));
@@ -1115,6 +1316,17 @@ impl RuntimeManager {
                 | Err(EngineError::BackendUnavailable(_))
                 | Err(EngineError::Operation(_)) => {}
                 Err(error) => return Err(RuntimeError::StartupFailed(error.to_string())),
+            }
+            // Progress reporting is UX evidence only: an unreadable tail or an
+            // unrecognized output format never fails a valid startup.
+            if let Ok(stderr_tail) = self.supervisor.stderr_tail(process).await
+                && let Some(observed) = adapter.startup_progress(&stderr_tail)
+            {
+                let observed = observed.sanitized();
+                if published_progress.as_ref() != Some(&observed) {
+                    published_progress = Some(observed.clone());
+                    self.set_load_progress(generation, observed).await;
+                }
             }
             tokio::select! {
                 changed = exit.changed() => {
@@ -1139,6 +1351,19 @@ impl RuntimeManager {
         if state.generation != generation {
             return;
         }
+        let failed_phase = state
+            .load_progress
+            .take()
+            .map(|progress| progress.phase)
+            .filter(|_| {
+                !state.cancel_loading
+                    && state.lifecycle == BackendLifecycle::Loading
+                    && detail != "model load was cancelled"
+            });
+        let detail = match failed_phase {
+            Some(phase) => format!("failed while {}: {detail}", phase.failure_label()),
+            None => detail,
+        };
         state.lifecycle = BackendLifecycle::Failed;
         state.failure = Some(detail.clone());
         state.active = None;
@@ -1223,6 +1448,7 @@ impl RuntimeManager {
         state.failure = Some(detail.clone());
         state.active = None;
         state.runtime_id = None;
+        state.load_progress = None;
         push_notice(
             &mut state,
             RuntimeNoticeLevel::Error,
@@ -1291,6 +1517,7 @@ impl RuntimeManager {
                             .map(|provenance| provenance.private_backend_endpoint.clone())
                     })
                 },
+                load_progress: state.load_progress.clone(),
                 failure: state.failure.clone(),
                 provenance: state.provenance.clone(),
             },
@@ -1454,4 +1681,106 @@ fn unix_timestamp() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_state() -> ManagerState {
+        ManagerState {
+            public_endpoint: None,
+            engines: BTreeMap::new(),
+            lifecycle: BackendLifecycle::Loading,
+            model_id: None,
+            engine_id: None,
+            runtime_id: None,
+            active: None,
+            loading_process: None,
+            loading_runtime_lease: None,
+            cancel_loading: false,
+            load_progress: None,
+            failure: None,
+            provenance: None,
+            generation: 7,
+            notices: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn apply_load_progress_updates_the_current_generation() {
+        let mut state = empty_state();
+        state.apply_load_progress(
+            7,
+            BackendLoadProgress::indeterminate(BackendLoadPhase::SelectingRuntime),
+        );
+        let progress = state.load_progress.expect("progress was set");
+        assert_eq!(progress.phase, BackendLoadPhase::SelectingRuntime);
+        assert_eq!(progress.fraction, None);
+    }
+
+    #[test]
+    fn an_old_load_generation_cannot_overwrite_newer_load_progress() {
+        let mut state = empty_state();
+        state.apply_load_progress(
+            7,
+            BackendLoadProgress::indeterminate(BackendLoadPhase::LoadingModel),
+        );
+        // A newer load started under generation 8.
+        state.generation = 8;
+        state.apply_load_progress(
+            7,
+            BackendLoadProgress::indeterminate(BackendLoadPhase::SpawningBackend),
+        );
+        let progress = state.load_progress.expect("progress is unchanged");
+        assert_eq!(
+            progress.phase,
+            BackendLoadPhase::LoadingModel,
+            "stale generation must not overwrite newer progress"
+        );
+    }
+
+    #[test]
+    fn apply_load_progress_is_ignored_once_loading_is_no_longer_active() {
+        let mut state = empty_state();
+        state.lifecycle = BackendLifecycle::Running;
+        state.apply_load_progress(
+            7,
+            BackendLoadProgress::indeterminate(BackendLoadPhase::VerifyingStartup),
+        );
+        assert!(
+            state.load_progress.is_none(),
+            "progress is not attached once the backend is Running"
+        );
+
+        let mut state = empty_state();
+        state.lifecycle = BackendLifecycle::Failed;
+        state.apply_load_progress(
+            7,
+            BackendLoadProgress::indeterminate(BackendLoadPhase::VerifyingStartup),
+        );
+        assert!(
+            state.load_progress.is_none(),
+            "progress is not attached once the backend is Failed"
+        );
+    }
+
+    #[test]
+    fn apply_load_progress_sanitizes_untrustworthy_adapter_values() {
+        let mut state = empty_state();
+        state.apply_load_progress(
+            7,
+            BackendLoadProgress {
+                phase: BackendLoadPhase::LoadingModel,
+                fraction: Some(1.5),
+                current: Some(300),
+                total: Some(200),
+                message: None,
+            },
+        );
+        let progress = state.load_progress.expect("progress was sanitized");
+        assert_eq!(progress.fraction, None);
+        assert_eq!(progress.current, None);
+        assert_eq!(progress.total, None);
+    }
 }
