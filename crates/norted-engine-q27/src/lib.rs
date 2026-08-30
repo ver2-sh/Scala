@@ -20,11 +20,13 @@ use norted_core::{
     Q27PackagePolicy, RuntimeAcquisitionMethod, RuntimeAcquisitionPlan, RuntimeArchiveFormat,
     RuntimeCompatibility, RuntimeDigest, RuntimeDownload, RuntimeId, RuntimeIdentity,
     RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel, RuntimeRequirements,
+    RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites, RuntimeSourceBuildRecipe,
+    RuntimeSourceBuildSystem, RuntimeSourceSnapshot,
 };
 use norted_engine::{
     ApiCapability, CatalogError, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
     EngineCapabilities, EngineError, EngineFeature, EngineIdentity, EngineProbe,
-    GenerationSettingsPatch, GitHubRelease, GitHubReleaseAsset, GitHubReleaseClient,
+    GenerationSettingsPatch, GitHubCommit, GitHubRelease, GitHubReleaseAsset, GitHubReleaseClient,
     InferenceEvent, InferenceFinishReason, InferenceMessage, InferenceOutput, InferenceRequest,
     InferenceRole, InferenceStream, InferenceUsage, InstallationState, LaunchRequest, LaunchSpec,
     NativeOption, OptionValueKind, PreparedAuxiliaryArtifact, PreparedModelInput,
@@ -44,6 +46,10 @@ pub const UPSTREAM_REPOSITORY: &str = "https://github.com/signalnine/q27";
 pub const GITHUB_REPOSITORY: &str = "signalnine/q27";
 pub const PROVIDER_ID: &str = "q27-official-github";
 pub const PACKAGE_FAMILY: &str = "q27-official-release";
+pub const SOURCE_PACKAGE_FAMILY: &str = "q27-official-source";
+pub const SOURCE_RECIPE_VERSION: &str = "q27-upstream-make-v1";
+
+const SOURCE_METADATA_LIMIT: usize = 512 * 1024;
 
 mod model;
 
@@ -134,7 +140,7 @@ impl RuntimeCatalogProvider for Q27RuntimeCatalogProvider {
         github: &GitHubReleaseClient,
     ) -> Result<Vec<AvailableRuntime>, CatalogError> {
         let releases = github.releases(GITHUB_REPOSITORY).await?;
-        catalog_runtimes(&releases)
+        fetch_catalog_runtimes(github, &releases).await
     }
 
     async fn fetch_reference(
@@ -148,13 +154,37 @@ impl RuntimeCatalogProvider for Q27RuntimeCatalogProvider {
         let Some(release) = github.release_by_tag(GITHUB_REPOSITORY, &tag).await? else {
             return Ok(Vec::new());
         };
-        let mut runtimes = catalog_runtimes(&[release])?;
+        let mut runtimes = fetch_catalog_runtimes(github, &[release]).await?;
         for runtime in &mut runtimes {
             runtime
                 .channels
                 .retain(|channel| matches!(channel, RuntimeReleaseChannel::Prerelease));
         }
         Ok(runtimes)
+    }
+
+    async fn verify_candidate(
+        &self,
+        github: &GitHubReleaseClient,
+        candidate: &AvailableRuntime,
+    ) -> Result<Option<AvailableRuntime>, CatalogError> {
+        if candidate.identity.engine_id != ENGINE_ID
+            || candidate.identity.package.provider_id != PROVIDER_ID
+            || candidate.identity.package.repository.as_deref() != Some(GITHUB_REPOSITORY)
+        {
+            return Ok(None);
+        }
+        let Some(tag) = candidate.identity.package.release_tag.as_deref() else {
+            return Ok(None);
+        };
+        let Some(release) = github.release_by_tag(GITHUB_REPOSITORY, tag).await? else {
+            return Ok(None);
+        };
+        let live = fetch_catalog_runtimes(github, &[release])
+            .await?
+            .into_iter()
+            .find(|runtime| runtime.runtime_id == candidate.runtime_id);
+        Ok(live)
     }
 }
 
@@ -181,30 +211,52 @@ fn q27_tag_from_reference(reference: &str) -> Option<String> {
         .then(|| format!("v{}.{}.{}", version[0], version[1], version[2]))
 }
 
-struct QualifiedAsset<'a> {
+struct QualifiedRelease<'a> {
     release: &'a GitHubRelease,
-    asset: &'a GitHubReleaseAsset,
     version: String,
-    digest: RuntimeDigest,
+    binary: Option<(&'a GitHubReleaseAsset, RuntimeDigest)>,
+    source: Option<Q27SourceCapability>,
     published_at_unix: Option<i64>,
     ordinal: usize,
 }
 
-fn catalog_runtimes(releases: &[GitHubRelease]) -> Result<Vec<AvailableRuntime>, CatalogError> {
+#[derive(Clone)]
+struct Q27SourceCapability {
+    commit: GitHubCommit,
+    minimum_cuda_version: String,
+    supported_variant_ids: Vec<&'static str>,
+    supported_cuda_compute_capabilities: Vec<ComputeCapability>,
+    accelerator_target: String,
+}
+
+async fn fetch_catalog_runtimes(
+    github: &GitHubReleaseClient,
+    releases: &[GitHubRelease],
+) -> Result<Vec<AvailableRuntime>, CatalogError> {
     let mut qualified = Vec::new();
     for (ordinal, release) in releases.iter().enumerate() {
         if release.draft {
             continue;
         }
-        for asset in &release.assets {
-            let Some((version, digest)) = qualify_release_asset(release, asset) else {
-                continue;
-            };
-            qualified.push(QualifiedAsset {
+        let Some(version) = release_version(release) else {
+            continue;
+        };
+        let binary = release.assets.iter().find_map(|asset| {
+            qualify_release_asset(release, asset)
+                .map(|(asset_version, digest)| (asset, asset_version, digest))
+        });
+        let (version, binary, source) = if let Some((asset, asset_version, digest)) = binary {
+            (asset_version, Some((asset, digest)), None)
+        } else {
+            let source = inspect_source_capability(github, release).await?;
+            (version, None, source)
+        };
+        if binary.is_some() || source.is_some() {
+            qualified.push(QualifiedRelease {
                 release,
-                asset,
                 version,
-                digest,
+                binary,
+                source,
                 published_at_unix: release
                     .published_at
                     .as_deref()
@@ -214,6 +266,12 @@ fn catalog_runtimes(releases: &[GitHubRelease]) -> Result<Vec<AvailableRuntime>,
         }
     }
 
+    materialize_qualified_releases(qualified)
+}
+
+fn materialize_qualified_releases(
+    qualified: Vec<QualifiedRelease<'_>>,
+) -> Result<Vec<AvailableRuntime>, CatalogError> {
     let latest_release_id = qualified
         .iter()
         .max_by(|left, right| compare_qualified(left, right))
@@ -227,11 +285,26 @@ fn catalog_runtimes(releases: &[GitHubRelease]) -> Result<Vec<AvailableRuntime>,
     let mut runtimes = Vec::new();
     for qualified in qualified {
         for variant in variants_for(&qualified.version) {
+            if qualified.binary.is_none()
+                && !qualified
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.supported_variant_ids.contains(&variant.id))
+            {
+                continue;
+            }
+            let source_build = qualified.source.as_ref();
             let identity = RuntimeIdentity {
                 engine_id: ENGINE_ID.to_owned(),
-                package_family: PACKAGE_FAMILY.to_owned(),
+                package_family: if source_build.is_some() {
+                    format!("{SOURCE_PACKAGE_FAMILY}-{SOURCE_RECIPE_VERSION}")
+                } else {
+                    PACKAGE_FAMILY.to_owned()
+                },
                 version: qualified.version.clone(),
-                upstream_revision: exact_commit(&qualified.release.target_commitish),
+                upstream_revision: source_build
+                    .map(|source| source.commit.sha.clone())
+                    .or_else(|| exact_commit(&qualified.release.target_commitish)),
                 platform: "linux".to_owned(),
                 architecture: "x86_64".to_owned(),
                 accelerator: "cuda".to_owned(),
@@ -240,8 +313,14 @@ fn catalog_runtimes(releases: &[GitHubRelease]) -> Result<Vec<AvailableRuntime>,
                     provider_id: PROVIDER_ID.to_owned(),
                     repository: Some(GITHUB_REPOSITORY.to_owned()),
                     release_tag: Some(qualified.release.tag_name.clone()),
-                    asset_id: Some(qualified.asset.id.to_string()),
-                    asset_name: Some(qualified.asset.name.clone()),
+                    asset_id: qualified
+                        .binary
+                        .as_ref()
+                        .map(|(asset, _)| asset.id.to_string()),
+                    asset_name: qualified
+                        .binary
+                        .as_ref()
+                        .map(|(asset, _)| asset.name.clone()),
                     additional_assets: Vec::new(),
                 },
             };
@@ -259,26 +338,46 @@ fn catalog_runtimes(releases: &[GitHubRelease]) -> Result<Vec<AvailableRuntime>,
                 runtime_id: RuntimeId::from_identity(&identity),
                 identity,
                 display_name: format!(
-                    "q27 {} Linux x86_64 CUDA {}",
-                    qualified.version, variant.label
+                    "q27 {} Linux x86_64 CUDA {} {}",
+                    qualified.version,
+                    variant.label,
+                    if source_build.is_some() {
+                        "source build"
+                    } else {
+                        "upstream binary"
+                    }
                 ),
                 supported_formats: vec![ArtifactFormat::Q27],
-                source_url: qualified.release.html_url.clone(),
+                source_url: source_build.map_or_else(
+                    || qualified.release.html_url.clone(),
+                    |source| source.commit.html_url.clone(),
+                ),
                 published_at_unix: qualified.published_at_unix,
                 channels,
                 prerelease: qualified.release.prerelease,
-                acquisition: RuntimeAcquisitionPlan::ReleaseAsset {
-                    download: RuntimeDownload {
-                        url: qualified.asset.browser_download_url.clone(),
-                        size_bytes: qualified.asset.size,
-                        digest: Some(qualified.digest.clone()),
-                        archive_format: RuntimeArchiveFormat::TarGz,
-                        entrypoint_names: vec![variant.entrypoint.to_owned()],
-                    },
-                    additional_downloads: Vec::new(),
+                acquisition: if let Some((asset, digest)) = &qualified.binary {
+                    RuntimeAcquisitionPlan::ReleaseAsset {
+                        download: RuntimeDownload {
+                            url: asset.browser_download_url.clone(),
+                            size_bytes: asset.size,
+                            digest: Some(digest.clone()),
+                            archive_format: RuntimeArchiveFormat::TarGz,
+                            entrypoint_names: vec![variant.entrypoint.to_owned()],
+                        },
+                        additional_downloads: Vec::new(),
+                    }
+                } else {
+                    RuntimeAcquisitionPlan::SourceBuild(Box::new(q27_source_build_plan(
+                        qualified.release,
+                        source_build.expect("qualified source release has source evidence"),
+                        variant,
+                    )?))
                 },
                 supported_native_identities: Vec::new(),
-                requirements: requirements_for(&qualified.version, variant),
+                requirements: source_build.map_or_else(
+                    || requirements_for(&qualified.version, variant),
+                    |source| source_requirements_for(&qualified.version, variant, source),
+                ),
             };
             runtime.validate().map_err(|error| CatalogError::Provider {
                 provider: PROVIDER_ID.to_owned(),
@@ -291,6 +390,246 @@ fn catalog_runtimes(releases: &[GitHubRelease]) -> Result<Vec<AvailableRuntime>,
         }
     }
     Ok(runtimes)
+}
+
+#[cfg(test)]
+fn catalog_runtimes(releases: &[GitHubRelease]) -> Result<Vec<AvailableRuntime>, CatalogError> {
+    let qualified = releases
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, release)| {
+            if release.draft {
+                return None;
+            }
+            release.assets.iter().find_map(|asset| {
+                let (version, digest) = qualify_release_asset(release, asset)?;
+                Some(QualifiedRelease {
+                    release,
+                    version,
+                    binary: Some((asset, digest)),
+                    source: None,
+                    published_at_unix: release
+                        .published_at
+                        .as_deref()
+                        .and_then(parse_github_timestamp),
+                    ordinal,
+                })
+            })
+        })
+        .collect();
+    materialize_qualified_releases(qualified)
+}
+
+fn release_version(release: &GitHubRelease) -> Option<String> {
+    let version = release.tag_name.strip_prefix('v')?;
+    let numeric = version.split('.').collect::<Vec<_>>();
+    (numeric.len() == 3
+        && numeric
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && version_at_least(version, 0, 2, 0))
+    .then(|| version.to_owned())
+}
+
+async fn inspect_source_capability(
+    github: &GitHubReleaseClient,
+    release: &GitHubRelease,
+) -> Result<Option<Q27SourceCapability>, CatalogError> {
+    let commit = github.commit(GITHUB_REPOSITORY, &release.tag_name).await?;
+    if !norted_core::is_full_git_sha(&commit.sha)
+        || !norted_core::is_full_git_sha(&commit.commit.tree.sha)
+        || commit.html_url
+            != format!(
+                "https://github.com/{GITHUB_REPOSITORY}/commit/{}",
+                commit.sha
+            )
+    {
+        return Err(q27_provider_error(format!(
+            "release `{}` did not resolve to a canonical full commit/tree identity",
+            release.tag_name
+        )));
+    }
+    let raw_root = format!(
+        "https://raw.githubusercontent.com/{GITHUB_REPOSITORY}/{}",
+        commit.sha
+    );
+    let makefile = match github
+        .fetch_small_text(&format!("{raw_root}/Makefile"), SOURCE_METADATA_LIMIT)
+        .await
+    {
+        Ok(makefile) => makefile,
+        Err(CatalogError::Http { status: 404, .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let readme = match github
+        .fetch_small_text(&format!("{raw_root}/README.md"), SOURCE_METADATA_LIMIT)
+        .await
+    {
+        Ok(readme) => readme,
+        Err(CatalogError::Http { status: 404, .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(q27_source_capability_from_files(commit, &makefile, &readme))
+}
+
+fn q27_source_capability_from_files(
+    commit: GitHubCommit,
+    makefile: &str,
+    readme: &str,
+) -> Option<Q27SourceCapability> {
+    let cxx = make_variable_value(makefile, "CXX")?;
+    let nvcc = make_variable_value(makefile, "NVCC")?;
+    if cxx != "g++" || nvcc != "/usr/local/cuda/bin/nvcc" || !makefile.contains("-std=c++17") {
+        return None;
+    }
+    let supported_variant_ids = Q27_VARIANTS
+        .iter()
+        .filter(|variant| makefile_declares_target(makefile, variant.build_target))
+        .map(|variant| variant.id)
+        .collect::<Vec<_>>();
+    if supported_variant_ids.is_empty() {
+        return None;
+    }
+    let supported_cuda_compute_capabilities = [
+        ("code=sm_86", ComputeCapability::new(8, 6)),
+        ("code=sm_89", ComputeCapability::new(8, 9)),
+        ("code=sm_120", ComputeCapability::new(12, 0)),
+    ]
+    .into_iter()
+    .filter_map(|(evidence, capability)| makefile.contains(evidence).then_some(capability))
+    .collect::<Vec<_>>();
+    if supported_cuda_compute_capabilities.is_empty() {
+        return None;
+    }
+    let accelerator_target = supported_cuda_compute_capabilities
+        .iter()
+        .map(|capability| format!("sm_{}{}", capability.major, capability.minor))
+        .collect::<Vec<_>>()
+        .join("+");
+    Some(Q27SourceCapability {
+        commit,
+        minimum_cuda_version: readme_cuda_floor(readme)?,
+        supported_variant_ids,
+        supported_cuda_compute_capabilities,
+        accelerator_target,
+    })
+}
+
+fn make_variable_value<'a>(makefile: &'a str, name: &str) -> Option<&'a str> {
+    makefile.lines().find_map(|line| {
+        let (left, right) = line.split_once("?=")?;
+        (left.trim() == name).then(|| right.trim())
+    })
+}
+
+fn makefile_declares_target(makefile: &str, expected: &str) -> bool {
+    makefile.lines().any(|line| {
+        let line = line.trim_start();
+        !line.starts_with('#')
+            && line.split_once(':').is_some_and(|(targets, _)| {
+                targets.split_whitespace().any(|target| target == expected)
+            })
+    })
+}
+
+fn readme_cuda_floor(readme: &str) -> Option<String> {
+    let (_, tail) = readme.split_once("CUDA toolkit ")?;
+    let version = tail
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '.')
+        .collect::<String>();
+    (!version.is_empty() && tail.get(version.len()..)?.starts_with('+')).then_some(version)
+}
+
+fn q27_source_build_plan(
+    release: &GitHubRelease,
+    source: &Q27SourceCapability,
+    variant: &RuntimeVariant,
+) -> Result<RuntimeSourceBuildPlan, CatalogError> {
+    let commit_timestamp_unix = parse_github_timestamp(&source.commit.commit.committer.date)
+        .ok_or_else(|| {
+            q27_provider_error(format!(
+                "release `{}` resolved to a commit with an invalid timestamp",
+                release.tag_name
+            ))
+        })?;
+    Ok(RuntimeSourceBuildPlan {
+        source: RuntimeSourceSnapshot {
+            repository: GITHUB_REPOSITORY.to_owned(),
+            repository_url: format!("{UPSTREAM_REPOSITORY}.git"),
+            source_branch: release.tag_name.clone(),
+            commit_sha: source.commit.sha.clone(),
+            tree_sha: source.commit.commit.tree.sha.clone(),
+            commit_timestamp_unix,
+            source_provider: PROVIDER_ID.to_owned(),
+        },
+        recipe: RuntimeSourceBuildRecipe {
+            recipe_version: SOURCE_RECIPE_VERSION.to_owned(),
+            build_system: RuntimeSourceBuildSystem::Make,
+            cmake_configuration_arguments: Vec::new(),
+            build_target: variant.build_target.to_owned(),
+            entrypoint: variant.build_target.into(),
+            accelerator_target: source.accelerator_target.clone(),
+            rejected_build_environment: vec![
+                "CC".to_owned(),
+                "CXX".to_owned(),
+                "CUDACXX".to_owned(),
+                "CUDAHOSTCXX".to_owned(),
+                "CFLAGS".to_owned(),
+                "CPPFLAGS".to_owned(),
+                "CXXFLAGS".to_owned(),
+                "CUDAFLAGS".to_owned(),
+                "LDFLAGS".to_owned(),
+                "NVCC".to_owned(),
+                "NVCCFLAGS".to_owned(),
+                "NVCC_PREPEND_FLAGS".to_owned(),
+                "NVCC_APPEND_FLAGS".to_owned(),
+                "MAKEFLAGS".to_owned(),
+                "MFLAGS".to_owned(),
+            ],
+        },
+        prerequisites: RuntimeSourceBuildPrerequisites {
+            minimum_cmake_version: String::new(),
+            minimum_cuda_version: source.minimum_cuda_version.clone(),
+            requires_ninja: false,
+            requires_cpp20_compiler: false,
+            requires_make: true,
+            minimum_cpp_standard: Some(17),
+            cpp_compiler: Some("g++".to_owned()),
+            cuda_compiler: Some("/usr/local/cuda/bin/nvcc".into()),
+            requires_pkg_config: false,
+            pkg_config_modules: BTreeMap::new(),
+        },
+    })
+}
+
+fn source_requirements_for(
+    version: &str,
+    variant: &RuntimeVariant,
+    source: &Q27SourceCapability,
+) -> RuntimeRequirements {
+    let mut requirements = requirements_for(version, variant);
+    requirements.minimum_nvidia_driver = None;
+    requirements.supported_cuda_compute_capabilities =
+        source.supported_cuda_compute_capabilities.clone();
+    requirements
+        .advisories
+        .retain(|note| !note.contains("Prebuilt binaries"));
+    requirements
+        .unverified_requirements
+        .retain(|note| !note.contains("ELF requires"));
+    requirements.advisories.push(format!(
+        "Built locally from the exact upstream commit with CUDA toolkit {}+; this is not an upstream binary",
+        source.minimum_cuda_version
+    ));
+    requirements
+}
+
+fn q27_provider_error(message: String) -> CatalogError {
+    CatalogError::Provider {
+        provider: PROVIDER_ID.to_owned(),
+        message,
+    }
 }
 
 fn qualify_release_asset(
@@ -328,10 +667,9 @@ fn valid_version_component(version: &str) -> bool {
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
-fn compare_qualified(left: &QualifiedAsset<'_>, right: &QualifiedAsset<'_>) -> Ordering {
-    left.published_at_unix
-        .cmp(&right.published_at_unix)
-        .then_with(|| compare_versions(&left.version, &right.version))
+fn compare_qualified(left: &QualifiedRelease<'_>, right: &QualifiedRelease<'_>) -> Ordering {
+    compare_versions(&left.version, &right.version)
+        .then_with(|| left.published_at_unix.cmp(&right.published_at_unix))
         // GitHub returns releases newest first; a lower ordinal wins a final tie.
         .then_with(|| right.ordinal.cmp(&left.ordinal))
 }
@@ -364,6 +702,7 @@ struct RuntimeVariant {
     id: &'static str,
     label: &'static str,
     entrypoint: &'static str,
+    build_target: &'static str,
     minimum_vram_class_gib: Option<u16>,
     minimum_vram_exclusive_class_gib: Option<u16>,
 }
@@ -373,6 +712,7 @@ const Q27_VARIANTS: &[RuntimeVariant] = &[
         id: "w8",
         label: "W8",
         entrypoint: "q27-server-w8",
+        build_target: "build/q27-server-w8",
         minimum_vram_class_gib: Some(24),
         minimum_vram_exclusive_class_gib: None,
     },
@@ -380,6 +720,7 @@ const Q27_VARIANTS: &[RuntimeVariant] = &[
         id: "w12",
         label: "W12",
         entrypoint: "q27-server",
+        build_target: "build/q27-server",
         minimum_vram_class_gib: Some(32),
         minimum_vram_exclusive_class_gib: None,
     },
@@ -387,6 +728,7 @@ const Q27_VARIANTS: &[RuntimeVariant] = &[
         id: "w16",
         label: "W16",
         entrypoint: "q27-server-w16",
+        build_target: "build/q27-server-w16",
         minimum_vram_class_gib: None,
         // W16 is wider than the W12 build that already OOMs on 24 GiB. This is
         // a proven lower bound, not an invented exact W16 requirement.
@@ -4160,7 +4502,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_ignores_source_only_newer_releases_and_marks_installable_channels() {
+    fn catalog_admits_source_only_release_and_prefers_its_semantic_version() {
         let releases = vec![
             release(10, "v0.10.0", "2026-08-26T01:43:22Z", false, vec![]),
             release(
@@ -4175,34 +4517,161 @@ mod tests {
                 )],
             ),
         ];
-        let runtimes = catalog_runtimes(&releases).expect("valid catalog");
-        assert_eq!(runtimes.len(), 3);
-        assert!(runtimes.iter().all(|runtime| {
+        let commit: GitHubCommit = serde_json::from_value(serde_json::json!({
+            "sha": "a".repeat(40),
+            "html_url": format!("https://github.com/signalnine/q27/commit/{}", "a".repeat(40)),
+            "commit": {
+                "committer": {"date": "2026-08-25T20:13:34Z"},
+                "tree": {"sha": "b".repeat(40)}
+            }
+        }))
+        .expect("commit fixture");
+        let makefile = concat!(
+            "CXX ?= g++\n",
+            "CXXFLAGS ?= -O2 -std=c++17\n",
+            "NVCC ?= /usr/local/cuda/bin/nvcc\n",
+            "NVCCFLAGS ?= -std=c++17 -gencode arch=compute_86,code=sm_86 \\\n",
+            " -gencode arch=compute_89,code=sm_89 \\\n",
+            " -gencode arch=compute_120,code=sm_120\n",
+            "build/q27-server:\n\t$(NVCC) server.cu -o $@\n",
+            "build/q27-server-w8:\n\t$(NVCC) server.cu -o $@\n",
+            "build/q27-server-w16:\n\t$(NVCC) server.cu -o $@\n",
+        );
+        let source = q27_source_capability_from_files(
+            commit,
+            makefile,
+            "Requirements: CUDA toolkit 12.8+ at `/usr/local/cuda`, gcc.",
+        )
+        .expect("source capability");
+        let partial_makefile = makefile.replace("build/q27-server-w16:", "unsupported-w16:");
+        let partial = q27_source_capability_from_files(
+            source.commit.clone(),
+            &partial_makefile,
+            "Requirements: CUDA toolkit 12.8+ at `/usr/local/cuda`, gcc.",
+        )
+        .expect("partial source capability");
+        assert_eq!(partial.supported_variant_ids, ["w8", "w12"]);
+        let mut changed_source = source.clone();
+        changed_source.commit.sha = "c".repeat(40);
+        changed_source.commit.html_url = format!(
+            "https://github.com/signalnine/q27/commit/{}",
+            changed_source.commit.sha
+        );
+        changed_source.commit.commit.tree.sha = "d".repeat(40);
+        let qualified = vec![
+            QualifiedRelease {
+                release: &releases[0],
+                version: "0.10.0".to_owned(),
+                binary: None,
+                source: Some(source),
+                published_at_unix: releases[0]
+                    .published_at
+                    .as_deref()
+                    .and_then(parse_github_timestamp),
+                ordinal: 0,
+            },
+            QualifiedRelease {
+                release: &releases[1],
+                version: "0.6.2".to_owned(),
+                binary: Some((
+                    &releases[1].assets[0],
+                    RuntimeDigest::parse_github(
+                        releases[1].assets[0].digest.as_deref().expect("digest"),
+                    )
+                    .expect("valid digest"),
+                )),
+                source: None,
+                published_at_unix: releases[1]
+                    .published_at
+                    .as_deref()
+                    .and_then(parse_github_timestamp),
+                ordinal: 1,
+            },
+        ];
+        let runtimes = materialize_qualified_releases(qualified).expect("valid catalog");
+        assert_eq!(runtimes.len(), 6);
+        assert_eq!(compare_versions("0.10.0", "0.9.0"), Ordering::Greater);
+        assert_eq!(compare_versions("0.10.0", "0.6.2"), Ordering::Greater);
+        let source_runtimes = runtimes
+            .iter()
+            .filter(|runtime| runtime.identity.version == "0.10.0")
+            .collect::<Vec<_>>();
+        assert_eq!(source_runtimes.len(), 3);
+        assert!(source_runtimes.iter().all(|runtime| {
+            runtime.channels.contains(&RuntimeReleaseChannel::Stable)
+                && runtime.channels.contains(&RuntimeReleaseChannel::Latest)
+                && runtime.source_build().is_some()
+                && runtime.identity.upstream_revision.as_deref()
+                    == Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        }));
+        let targets = source_runtimes
+            .iter()
+            .map(|runtime| {
+                let plan = runtime.source_build().expect("source plan");
+                (
+                    runtime.identity.variant.as_str(),
+                    plan.recipe.build_target.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            targets,
+            [
+                ("w8", "build/q27-server-w8"),
+                ("w12", "build/q27-server"),
+                ("w16", "build/q27-server-w16"),
+            ]
+        );
+        let binary_runtimes = runtimes
+            .iter()
+            .filter(|runtime| runtime.identity.version == "0.6.2")
+            .collect::<Vec<_>>();
+        assert!(binary_runtimes.iter().all(|runtime| {
             let Some((download, _)) = runtime.release_assets() else {
                 return false;
             };
-            runtime.identity.version == "0.6.2"
-                && runtime.channels.contains(&RuntimeReleaseChannel::Stable)
-                && runtime.channels.contains(&RuntimeReleaseChannel::Latest)
+            runtime.channels.is_empty()
                 && download.archive_format == RuntimeArchiveFormat::TarGz
                 && download.digest.is_some()
         }));
+        let changed_runtimes = materialize_qualified_releases(vec![QualifiedRelease {
+            release: &releases[0],
+            version: "0.10.0".to_owned(),
+            binary: None,
+            source: Some(changed_source),
+            published_at_unix: releases[0]
+                .published_at
+                .as_deref()
+                .and_then(parse_github_timestamp),
+            ordinal: 0,
+        }])
+        .expect("changed source catalog");
+        let original_w12 = source_runtimes
+            .iter()
+            .find(|runtime| runtime.identity.variant == "w12")
+            .expect("original W12");
+        let changed_w12 = changed_runtimes
+            .iter()
+            .find(|runtime| runtime.identity.variant == "w12")
+            .expect("changed W12");
+        assert_ne!(original_w12.runtime_id, changed_w12.runtime_id);
         assert_eq!(
             runtimes
                 .iter()
+                .filter(|runtime| runtime.identity.version == "0.10.0")
                 .map(|runtime| runtime.identity.variant.as_str())
                 .collect::<Vec<_>>(),
             ["w8", "w12", "w16"]
         );
-        let w8 = runtimes
+        let w8 = source_runtimes
             .iter()
             .find(|runtime| runtime.identity.variant == "w8")
             .expect("W8");
-        let w12 = runtimes
+        let w12 = source_runtimes
             .iter()
             .find(|runtime| runtime.identity.variant == "w12")
             .expect("W12");
-        let w16 = runtimes
+        let w16 = source_runtimes
             .iter()
             .find(|runtime| runtime.identity.variant == "w16")
             .expect("W16");
@@ -4210,10 +4679,7 @@ mod tests {
         assert_eq!(w12.requirements.minimum_vram_class_gib, Some(32));
         assert_eq!(w16.requirements.minimum_vram_class_gib, None);
         assert_eq!(w16.requirements.minimum_vram_exclusive_class_gib, Some(24));
-        assert_eq!(
-            w8.requirements.minimum_nvidia_driver.as_deref(),
-            Some("580")
-        );
+        assert_eq!(w8.requirements.minimum_nvidia_driver, None);
         assert_eq!(
             w8.requirements.supported_cuda_compute_capabilities,
             vec![
@@ -4224,6 +4690,9 @@ mod tests {
         );
         assert!(w16.requirements.advisories.iter().any(|note| {
             note.contains("specialist") && note.contains("no separate W16 VRAM floor")
+        }));
+        assert!(binary_runtimes.iter().all(|runtime| {
+            runtime.requirements.minimum_nvidia_driver.as_deref() == Some("580")
         }));
     }
 

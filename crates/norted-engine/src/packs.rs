@@ -288,6 +288,11 @@ impl RuntimePackManager {
             fetched_at_unix,
         } = self.catalog.search(query, &host, force_refresh).await;
         let mut preferences = std::collections::BTreeMap::new();
+        let mut source_prerequisite_results = Vec::<(
+            norted_core::RuntimeSourceBuildSystem,
+            norted_core::RuntimeSourceBuildPrerequisites,
+            RuntimeCompatibility,
+        )>::new();
         for entry in &mut entries {
             entry.compatibility = match self.registry.get(&entry.available.identity.engine_id) {
                 Some(adapter) => match adapter.runtime_management_compatibility() {
@@ -328,6 +333,27 @@ impl RuntimePackManager {
                     "engine adapter is not registered".to_owned(),
                 ),
             };
+            if !matches!(entry.compatibility, RuntimeCompatibility::Incompatible(_))
+                && let Some(plan) = entry.available.source_build()
+            {
+                let compatibility = if let Some((_, _, compatibility)) = source_prerequisite_results
+                    .iter()
+                    .find(|(system, prerequisites, _)| {
+                        *system == plan.recipe.build_system && prerequisites == &plan.prerequisites
+                    }) {
+                    compatibility.clone()
+                } else {
+                    let compatibility = self.installer.source_build_compatibility(plan).await;
+                    source_prerequisite_results.push((
+                        plan.recipe.build_system,
+                        plan.prerequisites.clone(),
+                        compatibility.clone(),
+                    ));
+                    compatibility
+                };
+                entry.compatibility =
+                    combine_compatibility(entry.compatibility.clone(), compatibility);
+            }
         }
         if model.is_some() {
             entries.sort_by(|left, right| {
@@ -1398,6 +1424,7 @@ fn ensure_catalog_provenance_matches(
                 && manifest.source_build.as_ref().is_some_and(|provenance| {
                     provenance.source == plan.source
                         && provenance.recipe_version == plan.recipe.recipe_version
+                        && provenance.build_system == plan.recipe.build_system
                         && provenance.cmake_configuration_arguments
                             == plan.recipe.cmake_configuration_arguments
                         && provenance.build_target == plan.recipe.build_target
@@ -1586,8 +1613,9 @@ mod tests {
     use norted_core::{
         InstalledRuntime, RUNTIME_MANIFEST_SCHEMA_VERSION, RuntimeAcquisitionMethod, RuntimeId,
         RuntimeIdentity, RuntimeManifest, RuntimePackageIdentity, RuntimeProbeObservation,
-        RuntimeRequirements, RuntimeSourceBuildProvenance, RuntimeSourceBuildToolchain,
-        RuntimeSourceSnapshot, RuntimeUpdatePreference, RuntimeUpdateState,
+        RuntimeRequirements, RuntimeSourceBuildProvenance, RuntimeSourceBuildSystem,
+        RuntimeSourceBuildToolchain, RuntimeSourceSnapshot, RuntimeUpdatePreference,
+        RuntimeUpdateState,
     };
 
     use super::{compare_installed_recency, source_history_update_state};
@@ -1731,11 +1759,13 @@ mod tests {
                         source_provider: "github".to_owned(),
                     },
                     recipe_version: "fixture-v1".to_owned(),
+                    build_system: RuntimeSourceBuildSystem::Cmake,
                     cmake_configuration_arguments: Vec::new(),
                     build_target: "fixture".to_owned(),
                     toolchain: RuntimeSourceBuildToolchain {
                         cmake_version: "4.0".to_owned(),
                         ninja_version: "1.12".to_owned(),
+                        make_version: "not required".to_owned(),
                         cpp_compiler: "fixture-c++".to_owned(),
                         nvcc_version: "13.0".to_owned(),
                         pkg_config_version: "2.0".to_owned(),

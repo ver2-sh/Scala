@@ -5,7 +5,7 @@ use norted_core::{
     ArtifactFormat, AvailableRuntime, ComputeCapability, RuntimeAcquisitionPlan, RuntimeId,
     RuntimeIdentity, RuntimePackageIdentity, RuntimeReleaseChannel, RuntimeRequirements,
     RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites, RuntimeSourceBuildRecipe,
-    RuntimeSourceSnapshot,
+    RuntimeSourceBuildSystem, RuntimeSourceSnapshot,
 };
 use norted_engine::{CatalogError, GitHubCommit, GitHubReleaseClient, RuntimeCatalogProvider};
 
@@ -159,6 +159,7 @@ fn source_runtime(
             },
             recipe: RuntimeSourceBuildRecipe {
                 recipe_version: RECIPE_VERSION.to_owned(),
+                build_system: RuntimeSourceBuildSystem::Cmake,
                 cmake_configuration_arguments: vec![
                     "-G".to_owned(),
                     "Ninja".to_owned(),
@@ -197,6 +198,10 @@ fn source_runtime(
                 minimum_cuda_version: "13.1".to_owned(),
                 requires_ninja: true,
                 requires_cpp20_compiler: true,
+                requires_make: false,
+                minimum_cpp_standard: Some(20),
+                cpp_compiler: None,
+                cuda_compiler: None,
                 requires_pkg_config: true,
                 pkg_config_modules: BTreeMap::from([
                     ("libavformat".to_owned(), "60".to_owned()),

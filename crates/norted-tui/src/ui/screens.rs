@@ -1,4 +1,7 @@
-use norted_core::{ArtifactFormat, RegistryState, RuntimeCompatibility, RuntimeUpdateState};
+use norted_core::{
+    ArtifactFormat, RegistryState, RuntimeCompatibility, RuntimeSourceBuildSystem,
+    RuntimeUpdateState,
+};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -476,12 +479,20 @@ fn render_runtimes(
                 .source_build
                 .as_ref()
                 .map_or_else(String::new, |build| {
+                    let builder = match build.build_system {
+                        RuntimeSourceBuildSystem::Cmake => {
+                            format!("CMake {}", build.toolchain.cmake_version)
+                        }
+                        RuntimeSourceBuildSystem::Make => {
+                            format!("Make {}", build.toolchain.make_version)
+                        }
+                    };
                     format!(
-                        "  source {} tree {} · {} · CMake {} · CUDA {}",
+                        "  source {} tree {} · {} · {} · CUDA {}",
                         &build.source.commit_sha[..8],
                         &build.source.tree_sha[..8],
                         build.recipe_version,
-                        build.toolchain.cmake_version,
+                        builder,
                         build.toolchain.nvcc_version,
                     )
                 });

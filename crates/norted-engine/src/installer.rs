@@ -10,9 +10,10 @@ use flate2::read::GzDecoder;
 use futures_util::StreamExt;
 use norted_core::{
     AvailableRuntime, InstalledRuntime, RUNTIME_MANIFEST_SCHEMA_VERSION, RuntimeAcquisitionMethod,
-    RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeManifest, RuntimeOperationPhase,
-    RuntimeOperationProgress, RuntimeProbeObservation, RuntimeSourceBuildPlan,
-    RuntimeSourceBuildProvenance, RuntimeSourceBuildToolchain, is_safe_relative_path,
+    RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeCompatibility, RuntimeManifest,
+    RuntimeOperationPhase, RuntimeOperationProgress, RuntimeProbeObservation,
+    RuntimeSourceBuildPlan, RuntimeSourceBuildProvenance, RuntimeSourceBuildSystem,
+    RuntimeSourceBuildToolchain, is_safe_relative_path,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -97,6 +98,16 @@ impl RuntimeInstaller {
 
     pub fn subscribe(&self) -> broadcast::Receiver<RuntimeOperationProgress> {
         self.progress.subscribe()
+    }
+
+    pub async fn source_build_compatibility(
+        &self,
+        plan: &RuntimeSourceBuildPlan,
+    ) -> RuntimeCompatibility {
+        match check_source_build_prerequisites(plan).await {
+            Ok(_) => RuntimeCompatibility::Recommended,
+            Err(error) => RuntimeCompatibility::NeedsAttention(error.to_string()),
+        }
     }
 
     pub async fn install(
@@ -472,67 +483,99 @@ impl RuntimeInstaller {
                 &observed_tree,
             )?;
             let audit_root = source_root.clone();
-            tokio::task::spawn_blocking(move || inspect_build_dependency_contract(&audit_root))
-                .await
-                .map_err(|error| RuntimeInstallError::Task(error.to_string()))??;
+            let build_system = plan.recipe.build_system;
+            let build_target = plan.recipe.build_target.clone();
+            tokio::task::spawn_blocking(move || {
+                inspect_build_dependency_contract(&audit_root, build_system, &build_target)
+            })
+            .await
+            .map_err(|error| RuntimeInstallError::Task(error.to_string()))??;
             let supported_native_identities = adapter.source_native_identities(&source_root)?;
 
-            let build_root = source_root.join("build");
             let rejected_environment = plan
                 .recipe
                 .rejected_build_environment
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
-            self.emit(
-                available,
-                RuntimeOperationPhase::Configuring,
-                None,
-                None,
-                "Configuring the fixed Norted source-build recipe",
-            );
-            let source_text = source_root.to_string_lossy().into_owned();
-            let build_text = build_root.to_string_lossy().into_owned();
-            let mut configure_arguments = vec![
-                "-S".to_owned(),
-                source_text,
-                "-B".to_owned(),
-                build_text.clone(),
-            ];
-            configure_arguments.extend(plan.recipe.cmake_configuration_arguments.clone());
-            let configure_refs = configure_arguments
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>();
-            run_source_command(
-                "CMake configure",
-                "cmake",
-                &configure_refs,
-                None,
-                &rejected_environment,
-            )
-            .await?;
+            match plan.recipe.build_system {
+                RuntimeSourceBuildSystem::Cmake => {
+                    let build_root = source_root.join("build");
+                    self.emit(
+                        available,
+                        RuntimeOperationPhase::Configuring,
+                        None,
+                        None,
+                        "Configuring the fixed Norted source-build recipe",
+                    );
+                    let source_text = source_root.to_string_lossy().into_owned();
+                    let build_text = build_root.to_string_lossy().into_owned();
+                    let mut configure_arguments = vec![
+                        "-S".to_owned(),
+                        source_text,
+                        "-B".to_owned(),
+                        build_text.clone(),
+                    ];
+                    configure_arguments.extend(plan.recipe.cmake_configuration_arguments.clone());
+                    let configure_refs = configure_arguments
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>();
+                    run_source_command(
+                        "CMake configure",
+                        "cmake",
+                        &configure_refs,
+                        None,
+                        &rejected_environment,
+                    )
+                    .await?;
 
-            self.emit(
-                available,
-                RuntimeOperationPhase::Building,
-                None,
-                None,
-                "Building the required runtime target",
-            );
-            run_source_command(
-                "CMake build",
-                "cmake",
-                &[
-                    "--build",
-                    &build_text,
-                    "--target",
-                    &plan.recipe.build_target,
-                ],
-                None,
-                &rejected_environment,
-            )
-            .await?;
+                    self.emit(
+                        available,
+                        RuntimeOperationPhase::Building,
+                        None,
+                        None,
+                        "Building the required runtime target",
+                    );
+                    run_source_command(
+                        "CMake build",
+                        "cmake",
+                        &[
+                            "--build",
+                            &build_text,
+                            "--target",
+                            &plan.recipe.build_target,
+                        ],
+                        None,
+                        &rejected_environment,
+                    )
+                    .await?;
+                }
+                RuntimeSourceBuildSystem::Make => {
+                    self.emit(
+                        available,
+                        RuntimeOperationPhase::Configuring,
+                        None,
+                        None,
+                        "Validated the selected upstream Makefile target",
+                    );
+                    self.emit(
+                        available,
+                        RuntimeOperationPhase::Building,
+                        None,
+                        None,
+                        "Building only the selected upstream Makefile target",
+                    );
+                    run_source_command(
+                        "Make build",
+                        "make",
+                        &[&plan.recipe.build_target],
+                        Some(&source_root),
+                        &rejected_environment,
+                    )
+                    .await?;
+                }
+            }
 
             let relative_entrypoint = PathBuf::from("source").join(&plan.recipe.entrypoint);
             let entrypoint = staging.join(&relative_entrypoint);
@@ -548,6 +591,7 @@ impl RuntimeInstaller {
                     relative_entrypoint.display()
                 )));
             }
+            ensure_executable(&entrypoint)?;
             let entrypoint_sha256 = hash_file(&entrypoint)
                 .await
                 .map_err(|error| RuntimeInstallError::Entrypoint(error.to_string()))?;
@@ -555,6 +599,7 @@ impl RuntimeInstaller {
             let source_build = RuntimeSourceBuildProvenance {
                 source: plan.source.clone(),
                 recipe_version: plan.recipe.recipe_version.clone(),
+                build_system: plan.recipe.build_system,
                 cmake_configuration_arguments: plan.recipe.cmake_configuration_arguments.clone(),
                 build_target: plan.recipe.build_target.clone(),
                 toolchain,
@@ -961,29 +1006,46 @@ async fn check_source_build_prerequisites(
     }
 
     command_text("git", &["--version"], None).await?;
-    let cmake_identity = command_text("cmake", &["--version"], None).await?;
-    let cmake_version = first_version(&cmake_identity).ok_or_else(|| {
-        RuntimeInstallError::Prerequisite("could not parse `cmake --version`".to_owned())
-    })?;
-    require_minimum_version(
-        "CMake",
-        &cmake_version,
-        &plan.prerequisites.minimum_cmake_version,
-    )?;
+    let cmake_version = if plan.recipe.build_system == RuntimeSourceBuildSystem::Cmake {
+        let identity = command_text("cmake", &["--version"], None).await?;
+        let version = first_version(&identity).ok_or_else(|| {
+            RuntimeInstallError::Prerequisite("could not parse `cmake --version`".to_owned())
+        })?;
+        require_minimum_version("CMake", &version, &plan.prerequisites.minimum_cmake_version)?;
+        version
+    } else {
+        "not required".to_owned()
+    };
 
     let ninja_identity = if plan.prerequisites.requires_ninja {
         command_text("ninja", &["--version"], None).await?
     } else {
         "not required".to_owned()
     };
-    let compiler_identity = if plan.prerequisites.requires_cpp20_compiler {
-        let identity = command_text("c++", &["--version"], None).await?;
-        probe_cpp20_compiler().await?;
+    let make_identity = if plan.prerequisites.requires_make {
+        command_text("make", &["--version"], None).await?
+    } else {
+        "not required".to_owned()
+    };
+    let cpp_standard = plan
+        .prerequisites
+        .minimum_cpp_standard
+        .or(plan.prerequisites.requires_cpp20_compiler.then_some(20));
+    let cpp_program = plan.prerequisites.cpp_compiler.as_deref().unwrap_or("c++");
+    let compiler_identity = if let Some(standard) = cpp_standard {
+        let identity = command_text(cpp_program, &["--version"], None).await?;
+        probe_cpp_compiler(cpp_program, standard).await?;
         identity
     } else {
         "not required".to_owned()
     };
-    let nvcc_identity = command_text("nvcc", &["--version"], None).await?;
+    let nvcc_program = plan
+        .prerequisites
+        .cuda_compiler
+        .as_deref()
+        .and_then(Path::to_str)
+        .unwrap_or("nvcc");
+    let nvcc_identity = command_text(nvcc_program, &["--version"], None).await?;
     let nvcc_version = version_after(&nvcc_identity, "release")
         .or_else(|| first_version(&nvcc_identity))
         .ok_or_else(|| {
@@ -1017,6 +1079,7 @@ async fn check_source_build_prerequisites(
     Ok(RuntimeSourceBuildToolchain {
         cmake_version,
         ninja_version: first_line(&ninja_identity),
+        make_version: first_line(&make_identity),
         cpp_compiler: compact_identity(&compiler_identity),
         nvcc_version,
         pkg_config_version: first_line(&pkg_config_identity),
@@ -1024,30 +1087,44 @@ async fn check_source_build_prerequisites(
     })
 }
 
-async fn probe_cpp20_compiler() -> Result<(), RuntimeInstallError> {
-    let mut command = tokio::process::Command::new("c++");
+async fn probe_cpp_compiler(program: &str, standard: u16) -> Result<(), RuntimeInstallError> {
+    let mut command = tokio::process::Command::new(program);
     command
-        .args(["-std=c++20", "-x", "c++", "-fsyntax-only", "-"])
+        .args([
+            format!("-std=c++{standard}"),
+            "-x".to_owned(),
+            "c++".to_owned(),
+            "-fsyntax-only".to_owned(),
+            "-".to_owned(),
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
     configure_source_process_group(&mut command);
     let mut child = command.spawn().map_err(|error| {
-        RuntimeInstallError::Prerequisite(format!("could not start C++20 compiler probe: {error}"))
+        RuntimeInstallError::Prerequisite(format!(
+            "could not start C++{standard} compiler probe with `{program}`: {error}"
+        ))
     })?;
     #[cfg(unix)]
     let mut process_group = SourceProcessGroup::for_child(&child)?;
     if let Some(mut stdin) = child.stdin.take() {
+        let probe = if standard >= 20 {
+            b"#include <span>\nint main(){int x[1]{}; std::span<int> s{x}; return int(s.size())-1;}\n".as_slice()
+        } else {
+            b"#include <optional>\nint main(){std::optional<int> value{1}; return *value-1;}\n"
+                .as_slice()
+        };
         stdin
-            .write_all(b"#include <span>\nint main(){int x[1]{}; std::span<int> s{x}; return int(s.size())-1;}\n")
+            .write_all(probe)
             .await
             .map_err(|error| RuntimeInstallError::Prerequisite(error.to_string()))?;
     }
     let status = tokio::time::timeout(SOURCE_PROBE_TIMEOUT, child.wait())
         .await
         .map_err(|_| {
-            RuntimeInstallError::Prerequisite("C++20 compiler probe timed out".to_owned())
+            RuntimeInstallError::Prerequisite(format!("C++{standard} compiler probe timed out"))
         })?
         .map_err(|error| RuntimeInstallError::Prerequisite(error.to_string()))?;
     // Once the compiler driver is fully reaped, disarm immediately so a
@@ -1055,9 +1132,9 @@ async fn probe_cpp20_compiler() -> Result<(), RuntimeInstallError> {
     #[cfg(unix)]
     process_group.disarm();
     if !status.success() {
-        return Err(RuntimeInstallError::Prerequisite(
-            "the host C++ compiler did not accept a C++20 probe".to_owned(),
-        ));
+        return Err(RuntimeInstallError::Prerequisite(format!(
+            "the host `{program}` compiler did not accept a C++{standard} probe"
+        )));
     }
     Ok(())
 }
@@ -1277,7 +1354,14 @@ fn verify_source_checkout(
     Ok(())
 }
 
-fn inspect_build_dependency_contract(source_root: &Path) -> Result<(), RuntimeInstallError> {
+fn inspect_build_dependency_contract(
+    source_root: &Path,
+    build_system: RuntimeSourceBuildSystem,
+    build_target: &str,
+) -> Result<(), RuntimeInstallError> {
+    if build_system == RuntimeSourceBuildSystem::Make {
+        return inspect_make_build_contract(source_root, build_target);
+    }
     let mut files = 0_usize;
     let mut bytes = 0_u64;
     for entry in walkdir::WalkDir::new(source_root).follow_links(false) {
@@ -1334,6 +1418,72 @@ fn inspect_build_dependency_contract(source_root: &Path) -> Result<(), RuntimeIn
         return Err(RuntimeInstallError::SourceBuild(
             "source snapshot contains no CMake build definition".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn inspect_make_build_contract(
+    source_root: &Path,
+    build_target: &str,
+) -> Result<(), RuntimeInstallError> {
+    let makefile = source_root.join("Makefile");
+    let metadata = std::fs::symlink_metadata(&makefile)
+        .map_err(|error| RuntimeInstallError::SourceBuild(error.to_string()))?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CMAKE_CONTRACT_BYTES {
+        return Err(RuntimeInstallError::SourceBuild(
+            "source Makefile is missing, non-regular, or exceeds the bounded audit size".to_owned(),
+        ));
+    }
+    let contents = std::fs::read_to_string(&makefile)
+        .map_err(|error| RuntimeInstallError::SourceBuild(error.to_string()))?;
+    if !makefile_declares_target(&contents, build_target) {
+        return Err(RuntimeInstallError::SourceBuild(format!(
+            "source Makefile does not declare the selected target `{build_target}`"
+        )));
+    }
+    for line in contents
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| !line.starts_with('#'))
+    {
+        let normalized = line.to_ascii_lowercase();
+        if ["git clone", "curl ", "wget ", "http://", "https://"]
+            .iter()
+            .any(|directive| normalized.contains(directive))
+        {
+            return Err(RuntimeInstallError::SourceBuild(format!(
+                "source Makefile dependency audit rejected a network command in target `{build_target}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn makefile_declares_target(makefile: &str, expected: &str) -> bool {
+    makefile.lines().any(|line| {
+        let line = line.trim_start();
+        !line.starts_with('#')
+            && line.split_once(':').is_some_and(|(targets, _)| {
+                targets.split_whitespace().any(|target| target == expected)
+            })
+    })
+}
+
+fn ensure_executable(path: &Path) -> Result<(), RuntimeInstallError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(path)
+            .map_err(|error| RuntimeInstallError::Entrypoint(error.to_string()))?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            return Err(RuntimeInstallError::Entrypoint(format!(
+                "source-built entrypoint `{}` is not executable",
+                path.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -1983,7 +2133,7 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use norted_core::{AppPaths, RuntimeArchiveFormat};
+    use norted_core::{AppPaths, RuntimeArchiveFormat, RuntimeSourceBuildSystem};
     use tokio::sync::oneshot;
 
     use crate::store::RuntimeStore;
@@ -2138,7 +2288,8 @@ mod tests {
             "cmake_minimum_required(VERSION 3.28)\nproject(local LANGUAGES CXX)\n",
         )
         .expect("safe CMake fixture");
-        inspect_build_dependency_contract(safe.path()).expect("local-only CMake tree");
+        inspect_build_dependency_contract(safe.path(), RuntimeSourceBuildSystem::Cmake, "fixture")
+            .expect("local-only CMake tree");
 
         let networked = tempfile::tempdir().expect("networked CMake fixture");
         std::fs::write(
@@ -2147,8 +2298,33 @@ mod tests {
         )
         .expect("networked CMake fixture");
         assert!(matches!(
-            inspect_build_dependency_contract(networked.path()),
+            inspect_build_dependency_contract(
+                networked.path(),
+                RuntimeSourceBuildSystem::Cmake,
+                "fixture",
+            ),
             Err(RuntimeInstallError::SourceBuild(message)) if message.contains("dependency audit rejected")
+        ));
+
+        let make = tempfile::tempdir().expect("Makefile fixture");
+        std::fs::write(
+            make.path().join("Makefile"),
+            "build/q27-server:\n\t$(NVCC) server.cu -o $@\n",
+        )
+        .expect("Makefile fixture");
+        inspect_build_dependency_contract(
+            make.path(),
+            RuntimeSourceBuildSystem::Make,
+            "build/q27-server",
+        )
+        .expect("declared local-only Make target");
+        assert!(matches!(
+            inspect_build_dependency_contract(
+                make.path(),
+                RuntimeSourceBuildSystem::Make,
+                "build/q27-server-w8",
+            ),
+            Err(RuntimeInstallError::SourceBuild(message)) if message.contains("does not declare")
         ));
     }
 

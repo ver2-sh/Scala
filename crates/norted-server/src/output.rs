@@ -584,21 +584,21 @@ pub fn runtimes_search(
         println!("No upstream runtime packs matched the query.");
     } else {
         println!(
-            "{:<52} {:<11} {:<13} {:<10} {:>10}",
+            "{:<52} {:<11} {:<13} {:<10} {:>20}",
             "RUNTIME ID", "ENGINE", "BACKEND", "VERSION", "ACQUISITION"
         );
         for result in &snapshot.results {
             let runtime = &result.entry.available;
             let installed = if result.installed { " installed" } else { "" };
             println!(
-                "{:<52} {:<11} {:<13} {:<10} {:>10}{}",
+                "{:<52} {:<11} {:<13} {:<10} {:>20}{}",
                 runtime.runtime_id,
                 runtime.identity.engine_id,
                 runtime.identity.accelerator,
                 runtime.identity.version,
                 runtime
                     .download_size_bytes()
-                    .map(format_bytes)
+                    .map(|bytes| format!("upstream binary {}", format_bytes(bytes)))
                     .unwrap_or_else(|| "source build".to_owned()),
                 installed
             );

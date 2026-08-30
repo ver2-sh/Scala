@@ -1,4 +1,4 @@
-use norted_core::{RuntimeCompatibility, RuntimeOperationPhase};
+use norted_core::{RuntimeCompatibility, RuntimeOperationPhase, RuntimeSourceBuildSystem};
 use ratatui::Frame;
 use ratatui::layout::Position;
 use ratatui::text::{Line, Span};
@@ -148,6 +148,11 @@ fn render_results(
             .map(|format| format.as_str().to_ascii_uppercase())
             .collect::<Vec<_>>()
             .join("/");
+        let acquisition = if available.source_build().is_some() {
+            "source build"
+        } else {
+            "upstream binary"
+        };
         let mut style = if app.selected_runtime_search_result == Some(*index) {
             theme.selected
         } else {
@@ -165,11 +170,12 @@ fn render_results(
             Line::from(vec![
                 Span::styled(
                     format!(
-                        "{}  {} / {}  {}",
+                        "{}  {} / {}  {} · {}",
                         available.identity.version,
                         available.identity.accelerator,
                         available.identity.variant,
                         formats,
+                        acquisition,
                     ),
                     theme.muted,
                 ),
@@ -256,16 +262,39 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
             &source_build.recipe.recipe_version,
             theme,
         ));
+        lines.push(key_value(
+            "BUILD TARGET",
+            &source_build.recipe.build_target,
+            theme,
+        ));
+        let build_needs = match source_build.recipe.build_system {
+            RuntimeSourceBuildSystem::Cmake => format!(
+                "CMake >= {}, CUDA >= {}, Ninja, C++20, pkg-config",
+                source_build.prerequisites.minimum_cmake_version,
+                source_build.prerequisites.minimum_cuda_version
+            ),
+            RuntimeSourceBuildSystem::Make => format!(
+                "Make, CUDA >= {} via {}, {} with C++{}",
+                source_build.prerequisites.minimum_cuda_version,
+                source_build
+                    .prerequisites
+                    .cuda_compiler
+                    .as_deref()
+                    .map_or_else(|| "nvcc".to_owned(), |path| path.display().to_string()),
+                source_build
+                    .prerequisites
+                    .cpp_compiler
+                    .as_deref()
+                    .unwrap_or("c++"),
+                source_build
+                    .prerequisites
+                    .minimum_cpp_standard
+                    .unwrap_or(17),
+            ),
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("{:<12}", "BUILD NEEDS"), theme.hint),
-            Span::styled(
-                format!(
-                    "CMake >= {}, CUDA >= {}, Ninja, C++20, pkg-config",
-                    source_build.prerequisites.minimum_cmake_version,
-                    source_build.prerequisites.minimum_cuda_version
-                ),
-                theme.text,
-            ),
+            Span::styled(build_needs, theme.text),
         ]));
     }
     match &result.entry.compatibility {

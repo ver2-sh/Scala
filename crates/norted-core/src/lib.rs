@@ -59,7 +59,7 @@ pub use runtime_pack::{
     RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel, RuntimeRequirements,
     RuntimeSelection, RuntimeSelectionSource, RuntimeSelections, RuntimeSourceBuildPlan,
     RuntimeSourceBuildPrerequisites, RuntimeSourceBuildProvenance, RuntimeSourceBuildRecipe,
-    RuntimeSourceBuildToolchain, RuntimeSourceSnapshot, RuntimeUpdatePreference,
-    RuntimeUpdateState, is_full_git_sha, is_safe_relative_path,
+    RuntimeSourceBuildSystem, RuntimeSourceBuildToolchain, RuntimeSourceSnapshot,
+    RuntimeUpdatePreference, RuntimeUpdateState, is_full_git_sha, is_safe_relative_path,
 };
 pub use state::{AppSnapshot, ApplicationCore, RegistryState, ServerState};

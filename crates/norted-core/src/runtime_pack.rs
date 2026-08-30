@@ -290,6 +290,8 @@ pub struct RuntimeSourceSnapshot {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeSourceBuildRecipe {
     pub recipe_version: String,
+    #[serde(default)]
+    pub build_system: RuntimeSourceBuildSystem,
     pub cmake_configuration_arguments: Vec<String>,
     pub build_target: String,
     pub entrypoint: PathBuf,
@@ -298,12 +300,28 @@ pub struct RuntimeSourceBuildRecipe {
     pub rejected_build_environment: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeSourceBuildSystem {
+    #[default]
+    Cmake,
+    Make,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeSourceBuildPrerequisites {
     pub minimum_cmake_version: String,
     pub minimum_cuda_version: String,
     pub requires_ninja: bool,
     pub requires_cpp20_compiler: bool,
+    #[serde(default)]
+    pub requires_make: bool,
+    #[serde(default)]
+    pub minimum_cpp_standard: Option<u16>,
+    #[serde(default)]
+    pub cpp_compiler: Option<String>,
+    #[serde(default)]
+    pub cuda_compiler: Option<PathBuf>,
     pub requires_pkg_config: bool,
     #[serde(default)]
     pub pkg_config_modules: BTreeMap<String, String>,
@@ -320,6 +338,8 @@ pub struct RuntimeSourceBuildPlan {
 pub struct RuntimeSourceBuildToolchain {
     pub cmake_version: String,
     pub ninja_version: String,
+    #[serde(default)]
+    pub make_version: String,
     pub cpp_compiler: String,
     pub nvcc_version: String,
     pub pkg_config_version: String,
@@ -331,6 +351,8 @@ pub struct RuntimeSourceBuildToolchain {
 pub struct RuntimeSourceBuildProvenance {
     pub source: RuntimeSourceSnapshot,
     pub recipe_version: String,
+    #[serde(default)]
+    pub build_system: RuntimeSourceBuildSystem,
     pub cmake_configuration_arguments: Vec<String>,
     pub build_target: String,
     pub toolchain: RuntimeSourceBuildToolchain,
@@ -840,7 +862,10 @@ fn has_complete_source_package_identity(package: &RuntimePackageIdentity) -> boo
         .repository
         .as_deref()
         .is_some_and(|value| !value.is_empty())
-        && package.release_tag.is_none()
+        && package
+            .release_tag
+            .as_deref()
+            .is_none_or(|value| !value.trim().is_empty())
         && package.asset_id.is_none()
         && package.asset_name.is_none()
         && package.additional_assets.is_empty()
@@ -867,6 +892,11 @@ fn validate_source_build_plan(
         || identity.package.repository.as_deref() != Some(plan.source.repository.as_str())
         || identity.package.provider_id != plan.source.source_provider
         || identity.upstream_revision.as_deref() != Some(plan.source.commit_sha.as_str())
+        || identity
+            .package
+            .release_tag
+            .as_deref()
+            .is_some_and(|tag| tag != plan.source.source_branch)
     {
         return Err(RuntimeManifestError::InvalidSourceBuild(
             "source snapshot does not match the runtime/provider identity".to_owned(),
@@ -875,10 +905,7 @@ fn validate_source_build_plan(
     let recipe = &plan.recipe;
     if recipe.recipe_version.trim().is_empty()
         || recipe.build_target.trim().is_empty()
-        || !recipe
-            .build_target
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || !valid_build_target(recipe.build_system, &recipe.build_target)
         || recipe.accelerator_target.trim().is_empty()
         || !is_safe_relative_path(&recipe.entrypoint)
         || recipe
@@ -895,8 +922,21 @@ fn validate_source_build_plan(
         ));
     }
     let prerequisites = &plan.prerequisites;
-    if prerequisites.minimum_cmake_version.trim().is_empty()
+    if (recipe.build_system == RuntimeSourceBuildSystem::Cmake
+        && prerequisites.minimum_cmake_version.trim().is_empty())
+        || (recipe.build_system == RuntimeSourceBuildSystem::Make && !prerequisites.requires_make)
         || prerequisites.minimum_cuda_version.trim().is_empty()
+        || prerequisites
+            .minimum_cpp_standard
+            .is_some_and(|standard| standard < 11)
+        || prerequisites
+            .cpp_compiler
+            .as_deref()
+            .is_some_and(|compiler| compiler.trim().is_empty() || compiler.contains('\0'))
+        || prerequisites
+            .cuda_compiler
+            .as_deref()
+            .is_some_and(|compiler| !compiler.is_absolute())
         || prerequisites
             .pkg_config_modules
             .iter()
@@ -912,6 +952,20 @@ fn validate_source_build_plan(
         ));
     }
     Ok(())
+}
+
+fn valid_build_target(system: RuntimeSourceBuildSystem, target: &str) -> bool {
+    if target.contains('\0') || target.chars().any(char::is_whitespace) {
+        return false;
+    }
+    match system {
+        RuntimeSourceBuildSystem::Cmake => target
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+        RuntimeSourceBuildSystem::Make => {
+            !target.contains(':') && is_safe_relative_path(Path::new(target))
+        }
+    }
 }
 
 fn validate_source_snapshot(source: &RuntimeSourceSnapshot) -> Result<(), RuntimeManifestError> {
@@ -941,10 +995,16 @@ fn validate_source_build_provenance(
     RuntimeDigest::sha256(provenance.entrypoint_sha256.clone())?;
     let fields_complete = !provenance.recipe_version.trim().is_empty()
         && !provenance.build_target.trim().is_empty()
+        && valid_build_target(provenance.build_system, &provenance.build_target)
         && !provenance.accelerator_target.trim().is_empty()
         && provenance.built_at_unix > 0
-        && !provenance.toolchain.cmake_version.trim().is_empty()
-        && !provenance.toolchain.ninja_version.trim().is_empty()
+        && match provenance.build_system {
+            RuntimeSourceBuildSystem::Cmake => {
+                !provenance.toolchain.cmake_version.trim().is_empty()
+                    && !provenance.toolchain.ninja_version.trim().is_empty()
+            }
+            RuntimeSourceBuildSystem::Make => !provenance.toolchain.make_version.trim().is_empty(),
+        }
         && !provenance.toolchain.cpp_compiler.trim().is_empty()
         && !provenance.toolchain.nvcc_version.trim().is_empty()
         && !provenance.toolchain.pkg_config_version.trim().is_empty()
@@ -1013,8 +1073,8 @@ mod tests {
     use super::{
         ArtifactFormat, ArtifactNativeIdentity, RuntimeAcquisitionMethod, RuntimeDigest, RuntimeId,
         RuntimeIdentity, RuntimeManifest, RuntimePackageIdentity, RuntimeProbeObservation,
-        RuntimeRequirements, RuntimeSourceBuildProvenance, RuntimeSourceBuildToolchain,
-        RuntimeSourceSnapshot, is_safe_relative_path,
+        RuntimeRequirements, RuntimeSourceBuildProvenance, RuntimeSourceBuildSystem,
+        RuntimeSourceBuildToolchain, RuntimeSourceSnapshot, is_safe_relative_path,
     };
     use std::path::Path;
 
@@ -1171,11 +1231,13 @@ mod tests {
             source_build: Some(RuntimeSourceBuildProvenance {
                 source,
                 recipe_version: "ninfer-serve-v1".to_owned(),
+                build_system: RuntimeSourceBuildSystem::Cmake,
                 cmake_configuration_arguments: vec!["-G".to_owned(), "Ninja".to_owned()],
                 build_target: "ninfer-serve".to_owned(),
                 toolchain: RuntimeSourceBuildToolchain {
                     cmake_version: "3.31.0".to_owned(),
                     ninja_version: "1.12.1".to_owned(),
+                    make_version: "not required".to_owned(),
                     cpp_compiler: "GNU C++ 14.2".to_owned(),
                     nvcc_version: "13.1".to_owned(),
                     pkg_config_version: "2.3.0".to_owned(),

@@ -55,7 +55,7 @@ The public listener is configurable and defaults to `127.0.0.1:8742`. `auto` aut
 - `norted-core` owns platform paths, schema-version-1 configuration, public-auth policy, the versioned atomic API-key store, the typed load-setting/profile domain and five-layer resolver, the versioned atomic profile store, model/auxiliary-artifact discovery, stable IDs, runtime identity/manifest/preferences data, host-independent provenance, application state, and process descriptors.
 - `norted-engine` owns `EngineAdapter`, `EngineRegistry`, the provider/catalog/cache, secure installer, runtime store and resolver, runtime/backend manager, generic process supervisor, control client, and normalized inference types.
 - `norted-engine-llama-cpp` owns official llama.cpp asset classification, binary probes, flags/environment policy, readiness and `/props`, and Chat Completions JSON/SSE translation.
-- `norted-engine-q27` owns official q27 asset/variant classification, tokenizer requirements, usage-signature probes, flags/environment policy, readiness, provable sampler settings, and Chat Completions JSON/SSE translation.
+- `norted-engine-q27` owns official q27 binary/source capability classification, exact Makefile target recipes, tokenizer requirements, usage-signature probes, flags/environment policy, readiness, provable sampler settings, and Chat Completions JSON/SSE translation.
 - `norted-engine-ninfer` owns the canonical source-snapshot catalog, exact target-registry enumeration, `.ninfer` compatibility, source/external runtime probes, settings and GPU policy, startup-log observation, and private Chat JSON/SSE translation.
 - `norted-api` owns public bearer/request middleware, the shared sanitized error contract, Responses and Chat Completions text surfaces, and the private authenticated control HTTP surface. It does not construct upstream flags or expose backend-native bytes.
 - `norted-tui` owns terminal lifecycle, responsive rendering, runtime search/install/selection interaction, the generic schema-driven load-settings editor, and normalized control observation.
@@ -102,7 +102,7 @@ The application-data store is versioned side by side:
   .staging/<random-id>/...
 ```
 
-`runtime.json` schema 2 adds acquisition-specific provenance while continuing to read schema-1 release manifests unchanged. Release and preseeded records retain verified primary/additional archive SHA-256 values and complete release-asset identity. A source-build record instead has `acquisition_method = source_build`, no archive digest, and an exact source/build block: repository URL and source line, full commit/tree SHAs and timestamp, recipe version/CMake arguments/target, observed CMake/Ninja/C++/CUDA/pkg-config/system-library versions, build platform/architecture/accelerator target and time, and matching relative entrypoint/SHA-256. `RuntimeIdentity` itself did not gain fields, so existing canonical serialization, `RuntimeId`s, selections, and installation paths remain stable. An explicitly configured external binary remains an in-memory external manifest with an absolute canonical entrypoint, no fabricated source/release/install-time fields, and unverified repository provenance.
+`runtime.json` schema 2 adds acquisition-specific provenance while continuing to read schema-1 release manifests unchanged. Release and preseeded records retain verified primary/additional archive SHA-256 values and complete release-asset identity. A source-build record instead has `acquisition_method = source_build`, no archive digest, and an exact source/build block: repository URL and source ref, full commit/tree SHAs and timestamp, recipe version/build system/arguments/target, observed Make or CMake/Ninja plus C++/CUDA/pkg-config/system-library versions, build platform/architecture/accelerator target and time, and matching relative entrypoint/SHA-256. `RuntimeIdentity` itself did not gain fields, so existing canonical serialization, `RuntimeId`s, selections, and installation paths remain stable. An explicitly configured external binary remains an in-memory external manifest with an absolute canonical entrypoint, no fabricated source/release/install-time fields, and unverified repository provenance.
 
 Scanning validates every manifest, canonicalizes the root and entrypoint, and rejects containment failures, duplicate IDs, invalid schemas, failed probe records, and unsafe staging paths. Removal recomputes the expected directory from the manifest, canonicalizes it under the runtime root, rejects staging/external targets, and removes only that exact owned directory.
 
@@ -122,7 +122,7 @@ Initial supported families include Windows x86_64 CPU/CUDA/Vulkan and Linux x86_
 
 ### q27
 
-The provider accepts only exact uploaded `q27-v<version>-linux-x86_64.tar.gz` assets under a matching `v<version>` release and with GitHub SHA-256 metadata. Managed support begins at v0.2.0 because v0.1.x streaming omits the terminal finish reason required to distinguish stop from maximum-output truncation truthfully. It exposes real q27-server W8/W12/W16 executables as distinct variants, with authoritative CUDA driver/VRAM notes. Releases with source but no package are ignored, so Stable/Latest refer to the newest installable release. There is no fabricated Windows pack or source builder.
+The provider evaluates two independent acquisition capabilities for every exact `v<version>` release from v0.2.0 onward. An uploaded `q27-v<version>-linux-x86_64.tar.gz` with matching GitHub URL and SHA-256 yields upstream-binary variants. Without that route, the provider resolves the tag to a full commit/tree, bounds exact-revision `Makefile` and `README.md` reads, and admits only targets and toolchain facts proven by those files. W12 maps to `build/q27-server`, W8 to `build/q27-server-w8`, and W16 to `build/q27-server-w16`; an absent target is not advertised. A verified binary wins over a source candidate for the same release/variant. Stable/Latest are computed across admitted releases, so a newer source-only semantic release is not hidden behind an older archive. Source identities include the recipe family and immutable commit, while binary identities retain asset ID/name/digest. There is no fabricated Windows route.
 
 ### NInfer
 
@@ -163,7 +163,22 @@ After extraction the installer requires exactly one regular file with the provid
 
 Activation refuses an existing different runtime ID and also scans for a different digest under the same claimed repository/tag/assets identity. All error paths clean staging. Shared per-runtime file leases span backend loading and execution; removal requires an exclusive lease, so another Norted process cannot race an active load. Thus extraction alone never produces local truth, failed probes cannot be selected, and updates cannot damage an older installation.
 
-Source build is a parallel generic acquisition arm, not an NInfer branch in the runtime manager:
+Source build is a parallel generic acquisition arm, not a provider branch in the runtime manager. For q27 it is:
+
+```text
+q27 release tag
+  → exact canonical Git commit/tree + bounded Makefile/README evidence
+  → Linux/x86_64/Git/Make/C++/nvcc prerequisite validation
+  → transactional exact-commit checkout and tree verification
+  → selected upstream Makefile target only
+  → executable bit + SHA-256 + q27 adapter probe
+  → source-build runtime manifest
+  → atomic runtime activation
+```
+
+The Makefile audit verifies the selected declared target and rejects recipe commands that perform network acquisition. Environment overrides for compilers, CUDA flags, link flags, and Make flags are removed so the upstream target is authoritative. The recipe records tag, commit/tree, width/target, CUDA architecture set and floor, compiler identities, Make identity, build host/time, and result digest. Search performs only bounded metadata reads and prerequisite probes; clone and compilation occur only during install.
+
+For NInfer the same arm is:
 
 ```text
 NInfer catalog provider
