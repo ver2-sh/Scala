@@ -176,7 +176,7 @@ q27 release tag
   → atomic runtime activation
 ```
 
-The Makefile audit verifies the selected declared target and rejects recipe commands that perform network acquisition. Environment overrides for compilers, CUDA flags, link flags, and Make flags are removed so the upstream target is authoritative. The recipe records tag, commit/tree, width/target, CUDA architecture set and floor, compiler identities, Make identity, build host/time, and result digest. Search performs only bounded metadata reads and prerequisite probes; clone and compilation occur only during install.
+The q27 Make contract is a provider-reviewed exact dependency/command closure, represented by the immutable Makefile SHA-256 in the v2 recipe. Discovery admits only a recognized closure; installation hashes the checked-out Makefile again before invoking Make. This fail-closed binding covers includes, sub-makes, and helper commands without pretending to implement a partial GNU Make parser: any upstream build-definition change needs a new provider audit and recipe identity before it can run. Environment overrides for compilers, CUDA flags, link flags, and Make flags are removed so the upstream target is authoritative. The recipe records tag, commit/tree, audited Makefile digest, width/target, CUDA architecture set and floor, compiler identities, Make identity, build host/time, and result digest. Search performs only bounded exact-revision reads and prerequisite probes; clone and compilation occur only during install.
 
 For NInfer the same arm is:
 

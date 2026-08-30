@@ -485,8 +485,14 @@ impl RuntimeInstaller {
             let audit_root = source_root.clone();
             let build_system = plan.recipe.build_system;
             let build_target = plan.recipe.build_target.clone();
+            let build_definition_sha256 = plan.recipe.build_definition_sha256.clone();
             tokio::task::spawn_blocking(move || {
-                inspect_build_dependency_contract(&audit_root, build_system, &build_target)
+                inspect_build_dependency_contract(
+                    &audit_root,
+                    build_system,
+                    &build_target,
+                    build_definition_sha256.as_deref(),
+                )
             })
             .await
             .map_err(|error| RuntimeInstallError::Task(error.to_string()))??;
@@ -569,7 +575,11 @@ impl RuntimeInstaller {
                     run_source_command(
                         "Make build",
                         "make",
-                        &[&plan.recipe.build_target],
+                        &[
+                            "--no-builtin-rules",
+                            "--no-builtin-variables",
+                            &plan.recipe.build_target,
+                        ],
                         Some(&source_root),
                         &rejected_environment,
                     )
@@ -600,6 +610,7 @@ impl RuntimeInstaller {
                 source: plan.source.clone(),
                 recipe_version: plan.recipe.recipe_version.clone(),
                 build_system: plan.recipe.build_system,
+                build_definition_sha256: plan.recipe.build_definition_sha256.clone(),
                 cmake_configuration_arguments: plan.recipe.cmake_configuration_arguments.clone(),
                 build_target: plan.recipe.build_target.clone(),
                 toolchain,
@@ -1358,9 +1369,19 @@ fn inspect_build_dependency_contract(
     source_root: &Path,
     build_system: RuntimeSourceBuildSystem,
     build_target: &str,
+    build_definition_sha256: Option<&str>,
 ) -> Result<(), RuntimeInstallError> {
     if build_system == RuntimeSourceBuildSystem::Make {
-        return inspect_make_build_contract(source_root, build_target);
+        return inspect_make_build_contract(
+            source_root,
+            build_target,
+            build_definition_sha256.ok_or_else(|| {
+                RuntimeInstallError::SourceBuild(
+                    "Make source build is missing its provider-audited build-definition digest"
+                        .to_owned(),
+                )
+            })?,
+        );
     }
     let mut files = 0_usize;
     let mut bytes = 0_u64;
@@ -1425,7 +1446,19 @@ fn inspect_build_dependency_contract(
 fn inspect_make_build_contract(
     source_root: &Path,
     build_target: &str,
+    expected_makefile_sha256: &str,
 ) -> Result<(), RuntimeInstallError> {
+    for alternate in ["GNUmakefile", "makefile"] {
+        match std::fs::symlink_metadata(source_root.join(alternate)) {
+            Ok(_) => {
+                return Err(RuntimeInstallError::SourceBuild(format!(
+                    "source tree contains alternate Make entrypoint `{alternate}` outside the provider-audited closure"
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(RuntimeInstallError::SourceBuild(error.to_string())),
+        }
+    }
     let makefile = source_root.join("Makefile");
     let metadata = std::fs::symlink_metadata(&makefile)
         .map_err(|error| RuntimeInstallError::SourceBuild(error.to_string()))?;
@@ -1436,6 +1469,12 @@ fn inspect_make_build_contract(
     }
     let contents = std::fs::read_to_string(&makefile)
         .map_err(|error| RuntimeInstallError::SourceBuild(error.to_string()))?;
+    let observed_makefile_sha256 = hex_digest(Sha256::digest(contents.as_bytes()));
+    if observed_makefile_sha256 != expected_makefile_sha256 {
+        return Err(RuntimeInstallError::SourceBuild(format!(
+            "source Makefile does not match the provider-audited dependency/command closure: expected {expected_makefile_sha256}, observed {observed_makefile_sha256}"
+        )));
+    }
     if !makefile_declares_target(&contents, build_target) {
         return Err(RuntimeInstallError::SourceBuild(format!(
             "source Makefile does not declare the selected target `{build_target}`"
@@ -2134,12 +2173,13 @@ mod tests {
     use std::time::Duration;
 
     use norted_core::{AppPaths, RuntimeArchiveFormat, RuntimeSourceBuildSystem};
+    use sha2::{Digest, Sha256};
     use tokio::sync::oneshot;
 
     use crate::store::RuntimeStore;
 
     use super::{
-        RuntimeInstallError, extract_archive, inspect_build_dependency_contract,
+        RuntimeInstallError, extract_archive, hex_digest, inspect_build_dependency_contract,
         run_owned_staging_operation, run_source_command, validate_relative_link_target,
         verify_package_digest, verify_source_checkout,
     };
@@ -2281,15 +2321,20 @@ mod tests {
     }
 
     #[test]
-    fn source_dependency_audit_rejects_networked_cmake() {
+    fn source_dependency_audit_rejects_networked_or_changed_build_contracts() {
         let safe = tempfile::tempdir().expect("safe CMake fixture");
         std::fs::write(
             safe.path().join("CMakeLists.txt"),
             "cmake_minimum_required(VERSION 3.28)\nproject(local LANGUAGES CXX)\n",
         )
         .expect("safe CMake fixture");
-        inspect_build_dependency_contract(safe.path(), RuntimeSourceBuildSystem::Cmake, "fixture")
-            .expect("local-only CMake tree");
+        inspect_build_dependency_contract(
+            safe.path(),
+            RuntimeSourceBuildSystem::Cmake,
+            "fixture",
+            None,
+        )
+        .expect("local-only CMake tree");
 
         let networked = tempfile::tempdir().expect("networked CMake fixture");
         std::fs::write(
@@ -2302,6 +2347,7 @@ mod tests {
                 networked.path(),
                 RuntimeSourceBuildSystem::Cmake,
                 "fixture",
+                None,
             ),
             Err(RuntimeInstallError::SourceBuild(message)) if message.contains("dependency audit rejected")
         ));
@@ -2316,6 +2362,9 @@ mod tests {
             make.path(),
             RuntimeSourceBuildSystem::Make,
             "build/q27-server",
+            Some(&hex_digest(Sha256::digest(
+                b"build/q27-server:\n\t$(NVCC) server.cu -o $@\n",
+            ))),
         )
         .expect("declared local-only Make target");
         assert!(matches!(
@@ -2323,8 +2372,35 @@ mod tests {
                 make.path(),
                 RuntimeSourceBuildSystem::Make,
                 "build/q27-server-w8",
+                Some(&hex_digest(Sha256::digest(
+                    b"build/q27-server:\n\t$(NVCC) server.cu -o $@\n",
+                ))),
             ),
             Err(RuntimeInstallError::SourceBuild(message)) if message.contains("does not declare")
+        ));
+
+        let audited_makefile = "build/q27-server:\n\t$(NVCC) server.cu -o $@\n";
+        let audited_digest = hex_digest(Sha256::digest(audited_makefile.as_bytes()));
+        std::fs::create_dir_all(make.path().join("tools")).expect("helper directory");
+        std::fs::write(
+            make.path().join("tools/fetch_dependency.py"),
+            "import urllib.request\nurllib.request.urlopen('https://example.invalid/dep')\n",
+        )
+        .expect("network helper");
+        std::fs::write(
+            make.path().join("Makefile"),
+            "build/q27-server:\n\tpython3 tools/fetch_dependency.py\n\t$(NVCC) server.cu -o $@\n",
+        )
+        .expect("indirect network Makefile");
+        assert!(matches!(
+            inspect_build_dependency_contract(
+                make.path(),
+                RuntimeSourceBuildSystem::Make,
+                "build/q27-server",
+                Some(&audited_digest),
+            ),
+            Err(RuntimeInstallError::SourceBuild(message))
+                if message.contains("provider-audited dependency/command closure")
         ));
     }
 

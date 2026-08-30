@@ -160,6 +160,7 @@ fn source_runtime(
             recipe: RuntimeSourceBuildRecipe {
                 recipe_version: RECIPE_VERSION.to_owned(),
                 build_system: RuntimeSourceBuildSystem::Cmake,
+                build_definition_sha256: None,
                 cmake_configuration_arguments: vec![
                     "-G".to_owned(),
                     "Ninja".to_owned(),

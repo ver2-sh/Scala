@@ -20,8 +20,8 @@ use norted_core::{
     Q27PackagePolicy, RuntimeAcquisitionMethod, RuntimeAcquisitionPlan, RuntimeArchiveFormat,
     RuntimeCompatibility, RuntimeDigest, RuntimeDownload, RuntimeId, RuntimeIdentity,
     RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel, RuntimeRequirements,
-    RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites, RuntimeSourceBuildRecipe,
-    RuntimeSourceBuildSystem, RuntimeSourceSnapshot,
+    RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites, RuntimeSourceBuildProvenance,
+    RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem, RuntimeSourceSnapshot,
 };
 use norted_engine::{
     ApiCapability, CatalogError, CompatibilityDecision, EffectiveGenerationSettings, EngineAdapter,
@@ -47,7 +47,24 @@ pub const GITHUB_REPOSITORY: &str = "signalnine/q27";
 pub const PROVIDER_ID: &str = "q27-official-github";
 pub const PACKAGE_FAMILY: &str = "q27-official-release";
 pub const SOURCE_PACKAGE_FAMILY: &str = "q27-official-source";
-pub const SOURCE_RECIPE_VERSION: &str = "q27-upstream-make-v1";
+pub const SOURCE_RECIPE_VERSION: &str = "q27-upstream-make-v2-4770e05";
+const SOURCE_RUNTIME_ONLY_RECIPE_VERSION: &str = "q27-upstream-make-v2-runtime-only";
+
+// Provider-reviewed immutable source contract for q27 v0.10.0. Discovery
+// re-reads the bounded files from this exact commit, installation rechecks the
+// exact commit/tree and Makefile digest, and the resulting facts persist in
+// RuntimeSourceBuildProvenance. A new upstream tree must receive a new audited
+// contract before it can gain Norted-package capabilities.
+const PACKAGE_SOURCE_COMMIT: &str = "4770e053656af9aababdc49c81f280ad21b74986";
+const PACKAGE_SOURCE_TREE: &str = "ff712f78fd17b5fe12149679114b6def003f16a6";
+const PACKAGE_MAKEFILE_SHA256: &str =
+    "f68397c2fdedc6e28ec22b0d50b04d9e4dc0fa7b569fa38366e63f742b250dc2";
+const PACKAGE_README_SHA256: &str =
+    "7f5a25c3a87ef49c152ef2304e6afc905477c61053e3b46a71057bc131a50bdc";
+const PACKAGE_SERVER_SHA256: &str =
+    "a49aa5780e3b54ef97246c565799a68b043e1907dbd6427fb4b5d12d0ff90ee2";
+const PACKAGE_ENGINE_SHA256: &str =
+    "5005f5926f24855b31c3bb3d9d5adf9e211a87c201d833dd54a194074e493aec";
 
 const SOURCE_METADATA_LIMIT: usize = 512 * 1024;
 
@@ -223,6 +240,8 @@ struct QualifiedRelease<'a> {
 #[derive(Clone)]
 struct Q27SourceCapability {
     commit: GitHubCommit,
+    makefile_sha256: String,
+    package_contract: bool,
     minimum_cuda_version: String,
     supported_variant_ids: Vec<&'static str>,
     supported_cuda_compute_capabilities: Vec<ComputeCapability>,
@@ -294,10 +313,20 @@ fn materialize_qualified_releases(
                 continue;
             }
             let source_build = qualified.source.as_ref();
+            let source_recipe_version = source_build.map(|source| {
+                if source.package_contract {
+                    SOURCE_RECIPE_VERSION
+                } else {
+                    SOURCE_RUNTIME_ONLY_RECIPE_VERSION
+                }
+            });
             let identity = RuntimeIdentity {
                 engine_id: ENGINE_ID.to_owned(),
                 package_family: if source_build.is_some() {
-                    format!("{SOURCE_PACKAGE_FAMILY}-{SOURCE_RECIPE_VERSION}")
+                    format!(
+                        "{SOURCE_PACKAGE_FAMILY}-{}",
+                        source_recipe_version.expect("source recipe version")
+                    )
                 } else {
                     PACKAGE_FAMILY.to_owned()
                 },
@@ -370,6 +399,7 @@ fn materialize_qualified_releases(
                     RuntimeAcquisitionPlan::SourceBuild(Box::new(q27_source_build_plan(
                         qualified.release,
                         source_build.expect("qualified source release has source evidence"),
+                        source_recipe_version.expect("source recipe version"),
                         variant,
                     )?))
                 },
@@ -469,7 +499,23 @@ async fn inspect_source_capability(
         Err(CatalogError::Http { status: 404, .. }) => return Ok(None),
         Err(error) => return Err(error),
     };
-    Ok(q27_source_capability_from_files(commit, &makefile, &readme))
+    let Some(mut capability) = q27_source_capability_from_files(commit, &makefile, &readme) else {
+        return Ok(None);
+    };
+    if capability.makefile_sha256 != PACKAGE_MAKEFILE_SHA256 {
+        // The Make dependency/command closure is deliberately provider-audited
+        // rather than guessed with a partial GNU Make parser.
+        return Ok(None);
+    }
+    let server = github
+        .fetch_small_text(&format!("{raw_root}/src/server.cu"), SOURCE_METADATA_LIMIT)
+        .await?;
+    let engine = github
+        .fetch_small_text(&format!("{raw_root}/src/engine.cuh"), SOURCE_METADATA_LIMIT)
+        .await?;
+    capability.package_contract =
+        q27_source_package_contract(&capability.commit, &makefile, &readme, &server, &engine);
+    Ok(Some(capability))
 }
 
 fn q27_source_capability_from_files(
@@ -508,11 +554,49 @@ fn q27_source_capability_from_files(
         .join("+");
     Some(Q27SourceCapability {
         commit,
+        makefile_sha256: sha256_text(makefile),
+        package_contract: false,
         minimum_cuda_version: readme_cuda_floor(readme)?,
         supported_variant_ids,
         supported_cuda_compute_capabilities,
         accelerator_target,
     })
+}
+
+fn sha256_text(contents: &str) -> String {
+    let digest = Sha256::digest(contents.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn q27_source_package_contract(
+    commit: &GitHubCommit,
+    makefile: &str,
+    readme: &str,
+    server: &str,
+    engine: &str,
+) -> bool {
+    q27_source_package_contract_from_digests(
+        commit,
+        &sha256_text(makefile),
+        &sha256_text(readme),
+        &sha256_text(server),
+        &sha256_text(engine),
+    )
+}
+
+fn q27_source_package_contract_from_digests(
+    commit: &GitHubCommit,
+    makefile_sha256: &str,
+    readme_sha256: &str,
+    server_sha256: &str,
+    engine_sha256: &str,
+) -> bool {
+    commit.sha == PACKAGE_SOURCE_COMMIT
+        && commit.commit.tree.sha == PACKAGE_SOURCE_TREE
+        && makefile_sha256 == PACKAGE_MAKEFILE_SHA256
+        && readme_sha256 == PACKAGE_README_SHA256
+        && server_sha256 == PACKAGE_SERVER_SHA256
+        && engine_sha256 == PACKAGE_ENGINE_SHA256
 }
 
 fn make_variable_value<'a>(makefile: &'a str, name: &str) -> Option<&'a str> {
@@ -544,6 +628,7 @@ fn readme_cuda_floor(readme: &str) -> Option<String> {
 fn q27_source_build_plan(
     release: &GitHubRelease,
     source: &Q27SourceCapability,
+    recipe_version: &str,
     variant: &RuntimeVariant,
 ) -> Result<RuntimeSourceBuildPlan, CatalogError> {
     let commit_timestamp_unix = parse_github_timestamp(&source.commit.commit.committer.date)
@@ -564,8 +649,9 @@ fn q27_source_build_plan(
             source_provider: PROVIDER_ID.to_owned(),
         },
         recipe: RuntimeSourceBuildRecipe {
-            recipe_version: SOURCE_RECIPE_VERSION.to_owned(),
+            recipe_version: recipe_version.to_owned(),
             build_system: RuntimeSourceBuildSystem::Make,
+            build_definition_sha256: Some(source.makefile_sha256.clone()),
             cmake_configuration_arguments: Vec::new(),
             build_target: variant.build_target.to_owned(),
             entrypoint: variant.build_target.into(),
@@ -585,7 +671,11 @@ fn q27_source_build_plan(
                 "NVCC_PREPEND_FLAGS".to_owned(),
                 "NVCC_APPEND_FLAGS".to_owned(),
                 "MAKEFLAGS".to_owned(),
+                "GNUMAKEFLAGS".to_owned(),
+                "MAKEFILES".to_owned(),
+                "MAKEOVERRIDES".to_owned(),
                 "MFLAGS".to_owned(),
+                "SHELL".to_owned(),
             ],
         },
         prerequisites: RuntimeSourceBuildPrerequisites {
@@ -829,21 +919,123 @@ fn q27_runtime_preference(variant: &str, device: Option<&AcceleratorDevice>) -> 
     }
 }
 
-/// The official q27 Makefile builds W8/W16 with explicit Q27_W_MAX defines
-/// and the ordinary server with engine.cuh's Q27_W_MAX=12 default. This is an
-/// exact package-identity capability, not a filename or model-name guess.
-fn q27_compiled_w_max(identity: &RuntimeIdentity, external: bool) -> Option<u64> {
-    if external
-        || identity.engine_id != ENGINE_ID
-        || identity.package.repository.as_deref() != Some(GITHUB_REPOSITORY)
-        || identity.version != "0.6.2"
+#[derive(Debug, Clone, Copy)]
+enum Q27SourceBuildEvidence<'a> {
+    Plan(&'a RuntimeSourceBuildPlan),
+    Provenance(&'a RuntimeSourceBuildProvenance),
+}
+
+impl<'a> Q27SourceBuildEvidence<'a> {
+    fn source(self) -> &'a RuntimeSourceSnapshot {
+        match self {
+            Self::Plan(plan) => &plan.source,
+            Self::Provenance(provenance) => &provenance.source,
+        }
+    }
+
+    fn recipe_version(self) -> &'a str {
+        match self {
+            Self::Plan(plan) => &plan.recipe.recipe_version,
+            Self::Provenance(provenance) => &provenance.recipe_version,
+        }
+    }
+
+    fn build_system(self) -> RuntimeSourceBuildSystem {
+        match self {
+            Self::Plan(plan) => plan.recipe.build_system,
+            Self::Provenance(provenance) => provenance.build_system,
+        }
+    }
+
+    fn build_definition_sha256(self) -> Option<&'a str> {
+        match self {
+            Self::Plan(plan) => plan.recipe.build_definition_sha256.as_deref(),
+            Self::Provenance(provenance) => provenance.build_definition_sha256.as_deref(),
+        }
+    }
+
+    fn build_target(self) -> &'a str {
+        match self {
+            Self::Plan(plan) => &plan.recipe.build_target,
+            Self::Provenance(provenance) => &provenance.build_target,
+        }
+    }
+
+    fn entrypoint_matches_target(self) -> bool {
+        match self {
+            Self::Plan(plan) => plan.recipe.entrypoint == Path::new(&plan.recipe.build_target),
+            Self::Provenance(provenance) => {
+                provenance.entrypoint == Path::new("source").join(&provenance.build_target)
+            }
+        }
+    }
+}
+
+fn q27_source_package_contract_is_trusted(
+    identity: &RuntimeIdentity,
+    evidence: Q27SourceBuildEvidence<'_>,
+) -> bool {
+    let source = evidence.source();
+    identity.engine_id == ENGINE_ID
+        && identity.platform == "linux"
+        && identity.architecture == "x86_64"
+        && identity.accelerator == "cuda"
+        && identity.package_family == format!("{SOURCE_PACKAGE_FAMILY}-{SOURCE_RECIPE_VERSION}")
+        && identity.package.provider_id == PROVIDER_ID
+        && identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
+        && identity.package.release_tag.as_deref() == Some(source.source_branch.as_str())
+        && identity.upstream_revision.as_deref() == Some(source.commit_sha.as_str())
+        && source.repository == GITHUB_REPOSITORY
+        && source.source_provider == PROVIDER_ID
+        && source.commit_sha == PACKAGE_SOURCE_COMMIT
+        && source.tree_sha == PACKAGE_SOURCE_TREE
+        && evidence.recipe_version() == SOURCE_RECIPE_VERSION
+        && evidence.build_system() == RuntimeSourceBuildSystem::Make
+        && evidence.build_definition_sha256() == Some(PACKAGE_MAKEFILE_SHA256)
+        && evidence.entrypoint_matches_target()
+}
+
+/// Binary W_MAX is historical release evidence. Source W_MAX comes only from
+/// the exact selected build target inside the immutable provider-reviewed
+/// source recipe; the variant is checked as a consistency constraint rather
+/// than used as the proof itself.
+fn q27_compiled_w_max(
+    identity: &RuntimeIdentity,
+    acquisition: &RuntimeAcquisitionMethod,
+    source_evidence: Option<Q27SourceBuildEvidence<'_>>,
+) -> Option<u64> {
+    let official_v062 = matches!(
+        acquisition,
+        RuntimeAcquisitionMethod::OfficialReleaseAsset
+            | RuntimeAcquisitionMethod::PreseededOfficialPack
+    ) && identity.engine_id == ENGINE_ID
+        && identity.platform == "linux"
+        && identity.architecture == "x86_64"
+        && identity.accelerator == "cuda"
+        && identity.package_family == PACKAGE_FAMILY
+        && identity.package.provider_id == PROVIDER_ID
+        && identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
+        && identity.package.release_tag.as_deref() == Some("v0.6.2")
+        && identity.version == "0.6.2";
+    if official_v062 {
+        return match identity.variant.as_str() {
+            "w8" => Some(8),
+            "w12" => Some(12),
+            "w16" => Some(16),
+            _ => None,
+        };
+    }
+
+    let evidence = source_evidence?;
+    if acquisition != &RuntimeAcquisitionMethod::SourceBuild
+        || !q27_source_package_contract_is_trusted(identity, evidence)
     {
         return None;
     }
-    match identity.variant.as_str() {
-        "w8" => Some(8),
-        "w12" => Some(12),
-        "w16" => Some(16),
+    match (evidence.build_target(), identity.variant.as_str()) {
+        ("build/q27-server-w8", "w8") => Some(8),
+        ("build/q27-server", "w12") => Some(12),
+        ("build/q27-server-w16", "w16") => Some(16),
         _ => None,
     }
 }
@@ -891,37 +1083,47 @@ struct Q27PackageRuntimeCapabilities {
 fn q27_package_capabilities(
     identity: &RuntimeIdentity,
     acquisition: &RuntimeAcquisitionMethod,
+    source_evidence: Option<Q27SourceBuildEvidence<'_>>,
 ) -> Q27PackageRuntimeCapabilities {
-    let external = acquisition == &RuntimeAcquisitionMethod::ExternalBinary;
     let exact_managed_v062 = matches!(
         acquisition,
         RuntimeAcquisitionMethod::OfficialReleaseAsset
             | RuntimeAcquisitionMethod::PreseededOfficialPack
     ) && identity.engine_id == ENGINE_ID
+        && identity.platform == "linux"
+        && identity.architecture == "x86_64"
+        && identity.accelerator == "cuda"
         && identity.package_family == PACKAGE_FAMILY
         && identity.package.provider_id == PROVIDER_ID
         && identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
         && identity.package.release_tag.as_deref() == Some("v0.6.2")
         && identity.version == "0.6.2";
+    let exact_source_contract = acquisition == &RuntimeAcquisitionMethod::SourceBuild
+        && source_evidence
+            .is_some_and(|evidence| q27_source_package_contract_is_trusted(identity, evidence));
+    let trustworthy_identity = exact_managed_v062 || exact_source_contract;
     Q27PackageRuntimeCapabilities {
-        trustworthy_identity: exact_managed_v062,
-        // These are proven directly from q27 v0.6.2 source. New runtime
-        // identities remain unknown until their own provenance/probe is wired.
-        raw_completions: exact_managed_v062,
-        exact_sharp_renderer: exact_managed_v062,
-        thinking: exact_managed_v062,
+        trustworthy_identity,
+        // Sharp rendering is Norted-owned. The runtime facts below are proven
+        // by either the historical binary contract or the immutable v2 source
+        // contract admitted from the exact source file fingerprints.
+        raw_completions: trustworthy_identity,
+        exact_sharp_renderer: trustworthy_identity,
+        thinking: trustworthy_identity,
         // v0.6.2 has no separate thinking-budget limiter: the ordinary
         // max-token limit is the only generation bound on its raw route.
-        unlimited_think_budget: exact_managed_v062,
-        temperature_top_p: exact_managed_v062,
-        top_k_min_p: false,
-        mtp_environment: exact_managed_v062,
-        fast_head_control: exact_managed_v062,
-        bounded_startup_observation: exact_managed_v062,
-        compiled_w_max: q27_compiled_w_max(identity, external),
+        unlimited_think_budget: trustworthy_identity,
+        temperature_top_p: trustworthy_identity,
+        top_k_min_p: exact_source_contract,
+        mtp_environment: trustworthy_identity,
+        fast_head_control: trustworthy_identity,
+        bounded_startup_observation: trustworthy_identity,
+        compiled_w_max: q27_compiled_w_max(identity, acquisition, source_evidence),
         // q27 v0.6.2 source contains fp8 and turbo3. It does not contain the
         // package policy's intermediate turbo5k mode.
-        supported_kv_modes: if exact_managed_v062 {
+        supported_kv_modes: if exact_source_contract {
+            &Q27PackageKvMode::QUALITY_ORDER
+        } else if exact_managed_v062 {
             Q27_V062_PACKAGE_KV_MODES
         } else {
             &[]
@@ -1777,6 +1979,11 @@ impl EngineAdapter for Q27Adapter {
                 evaluate_q27_package_runtime(q27_package_capabilities(
                     &runtime.manifest.identity,
                     &runtime.manifest.acquisition_method,
+                    runtime
+                        .manifest
+                        .source_build
+                        .as_ref()
+                        .map(Q27SourceBuildEvidence::Provenance),
                 )),
             )
         } else {
@@ -1813,11 +2020,15 @@ impl EngineAdapter for Q27Adapter {
         let capabilities = q27_package_capabilities(
             &runtime.manifest.identity,
             &runtime.manifest.acquisition_method,
+            runtime
+                .manifest
+                .source_build
+                .as_ref()
+                .map(Q27SourceBuildEvidence::Provenance),
         );
         Some(if !capabilities.trustworthy_identity {
             RuntimeCompatibility::Incompatible(
-                "external Sharp/raw-prompt capability is unproven for this exact q27 executable"
-                    .to_owned(),
+                "Sharp/raw-prompt capability is unproven for this exact q27 executable".to_owned(),
             )
         } else if capabilities.exact_sharp_renderer && capabilities.raw_completions {
             RuntimeCompatibility::Compatible
@@ -1863,6 +2074,12 @@ impl EngineAdapter for Q27Adapter {
                 evaluate_q27_package_runtime(q27_package_capabilities(
                     &runtime.identity,
                     &acquisition,
+                    match &runtime.acquisition {
+                        RuntimeAcquisitionPlan::SourceBuild(plan) => {
+                            Some(Q27SourceBuildEvidence::Plan(plan))
+                        }
+                        RuntimeAcquisitionPlan::ReleaseAsset { .. } => None,
+                    },
                 )),
             )
         } else {
@@ -2115,6 +2332,12 @@ impl EngineAdapter for Q27Adapter {
             q27_package_capabilities(
                 &request.runtime.manifest.identity,
                 &request.runtime.manifest.acquisition_method,
+                request
+                    .runtime
+                    .manifest
+                    .source_build
+                    .as_ref()
+                    .map(Q27SourceBuildEvidence::Provenance),
             )
         });
         if let Some(capabilities) = package_capabilities {
@@ -2292,6 +2515,12 @@ impl EngineAdapter for Q27Adapter {
             q27_package_capabilities(
                 &request.runtime.manifest.identity,
                 &request.runtime.manifest.acquisition_method,
+                request
+                    .runtime
+                    .manifest
+                    .source_build
+                    .as_ref()
+                    .map(Q27SourceBuildEvidence::Provenance),
             )
         });
         let first = self.build_launch_spec(request).await?;
@@ -2333,6 +2562,11 @@ impl EngineAdapter for Q27Adapter {
         let capabilities = q27_package_capabilities(
             &spec.runtime.manifest.identity,
             &spec.runtime.manifest.acquisition_method,
+            spec.runtime
+                .manifest
+                .source_build
+                .as_ref()
+                .map(Q27SourceBuildEvidence::Provenance),
         );
         validate_q27_package_prelaunch(capabilities).map_err(|reason| {
             EngineError::InvalidConfiguration(format!(
@@ -3883,6 +4117,45 @@ mod tests {
         }
     }
 
+    fn current_source_runtimes() -> Vec<AvailableRuntime> {
+        let release = release(10, "v0.10.0", "2026-08-26T01:43:22Z", false, vec![]);
+        let commit: GitHubCommit = serde_json::from_value(json!({
+            "sha": PACKAGE_SOURCE_COMMIT,
+            "html_url": format!(
+                "https://github.com/{GITHUB_REPOSITORY}/commit/{PACKAGE_SOURCE_COMMIT}"
+            ),
+            "commit": {
+                "committer": {"date": "2026-08-25T20:13:34Z"},
+                "tree": {"sha": PACKAGE_SOURCE_TREE}
+            }
+        }))
+        .expect("current q27 commit fixture");
+        materialize_qualified_releases(vec![QualifiedRelease {
+            release: &release,
+            version: "0.10.0".to_owned(),
+            binary: None,
+            source: Some(Q27SourceCapability {
+                commit,
+                makefile_sha256: PACKAGE_MAKEFILE_SHA256.to_owned(),
+                package_contract: true,
+                minimum_cuda_version: "12.8".to_owned(),
+                supported_variant_ids: vec!["w8", "w12", "w16"],
+                supported_cuda_compute_capabilities: vec![
+                    ComputeCapability::new(8, 6),
+                    ComputeCapability::new(8, 9),
+                    ComputeCapability::new(12, 0),
+                ],
+                accelerator_target: "sm_86+sm_89+sm_120".to_owned(),
+            }),
+            published_at_unix: release
+                .published_at
+                .as_deref()
+                .and_then(parse_github_timestamp),
+            ordinal: 0,
+        }])
+        .expect("current source runtimes")
+    }
+
     fn q27_package_fixture() -> NortedPackageBinding {
         NortedPackageBinding {
             kind: norted_core::NortedPackageKind::Q27,
@@ -3953,12 +4226,36 @@ mod tests {
                 additional_assets: Vec::new(),
             },
         };
-        assert_eq!(q27_compiled_w_max(&identity, false), Some(8));
+        assert_eq!(
+            q27_compiled_w_max(
+                &identity,
+                &RuntimeAcquisitionMethod::OfficialReleaseAsset,
+                None
+            ),
+            Some(8)
+        );
         identity.variant = "w12".to_owned();
-        assert_eq!(q27_compiled_w_max(&identity, false), Some(12));
+        assert_eq!(
+            q27_compiled_w_max(
+                &identity,
+                &RuntimeAcquisitionMethod::OfficialReleaseAsset,
+                None
+            ),
+            Some(12)
+        );
         identity.variant = "w16".to_owned();
-        assert_eq!(q27_compiled_w_max(&identity, false), Some(16));
-        assert_eq!(q27_compiled_w_max(&identity, true), None);
+        assert_eq!(
+            q27_compiled_w_max(
+                &identity,
+                &RuntimeAcquisitionMethod::OfficialReleaseAsset,
+                None
+            ),
+            Some(16)
+        );
+        assert_eq!(
+            q27_compiled_w_max(&identity, &RuntimeAcquisitionMethod::ExternalBinary, None),
+            None
+        );
     }
 
     #[test]
@@ -3967,6 +4264,7 @@ mod tests {
         let compatibility = evaluate_q27_package_runtime(q27_package_capabilities(
             &identity,
             &RuntimeAcquisitionMethod::OfficialReleaseAsset,
+            None,
         ));
         assert!(matches!(
             compatibility,
@@ -4014,6 +4312,7 @@ mod tests {
                 ..identity
             },
             &RuntimeAcquisitionMethod::ExternalBinary,
+            None,
         );
         let untrusted_compatibility = evaluate_q27_package_runtime(untrusted);
         assert!(matches!(
@@ -4023,6 +4322,130 @@ mod tests {
         ));
         assert!(!untrusted_compatibility.is_usable());
         assert!(validate_q27_package_prelaunch(untrusted).is_err());
+    }
+
+    #[test]
+    fn immutable_current_source_contract_admits_package_capabilities_and_exact_widths() {
+        let runtimes = current_source_runtimes();
+        for (variant, expected_w_max, expected_target) in [
+            ("w8", 8, "build/q27-server-w8"),
+            ("w12", 12, "build/q27-server"),
+            ("w16", 16, "build/q27-server-w16"),
+        ] {
+            let runtime = runtimes
+                .iter()
+                .find(|runtime| runtime.identity.variant == variant)
+                .expect("source variant");
+            let plan = runtime.source_build().expect("source plan");
+            assert_eq!(plan.source.commit_sha, PACKAGE_SOURCE_COMMIT);
+            assert_eq!(plan.source.tree_sha, PACKAGE_SOURCE_TREE);
+            assert_eq!(plan.recipe.recipe_version, SOURCE_RECIPE_VERSION);
+            assert_eq!(
+                plan.recipe.build_definition_sha256.as_deref(),
+                Some(PACKAGE_MAKEFILE_SHA256)
+            );
+            assert_eq!(plan.recipe.build_target, expected_target);
+            let capabilities = q27_package_capabilities(
+                &runtime.identity,
+                &RuntimeAcquisitionMethod::SourceBuild,
+                Some(Q27SourceBuildEvidence::Plan(plan)),
+            );
+            assert!(validate_q27_package_prelaunch(capabilities).is_ok());
+            assert_eq!(capabilities.compiled_w_max, Some(expected_w_max));
+            assert_eq!(
+                capabilities.supported_kv_modes,
+                Q27PackageKvMode::QUALITY_ORDER
+            );
+            let provenance = RuntimeSourceBuildProvenance {
+                source: plan.source.clone(),
+                recipe_version: plan.recipe.recipe_version.clone(),
+                build_system: plan.recipe.build_system,
+                build_definition_sha256: plan.recipe.build_definition_sha256.clone(),
+                cmake_configuration_arguments: Vec::new(),
+                build_target: plan.recipe.build_target.clone(),
+                toolchain: norted_core::RuntimeSourceBuildToolchain {
+                    cmake_version: "not required".to_owned(),
+                    ninja_version: "not required".to_owned(),
+                    make_version: "GNU Make 4.4".to_owned(),
+                    cpp_compiler: "g++".to_owned(),
+                    nvcc_version: "Cuda compilation tools, release 12.8".to_owned(),
+                    pkg_config_version: "not required".to_owned(),
+                    system_dependencies: BTreeMap::new(),
+                },
+                build_platform: "linux".to_owned(),
+                build_architecture: "x86_64".to_owned(),
+                accelerator_target: plan.recipe.accelerator_target.clone(),
+                built_at_unix: 1_788_000_000,
+                entrypoint: Path::new("source").join(&plan.recipe.entrypoint),
+                entrypoint_sha256: "a".repeat(64),
+            };
+            let installed_capabilities = q27_package_capabilities(
+                &runtime.identity,
+                &RuntimeAcquisitionMethod::SourceBuild,
+                Some(Q27SourceBuildEvidence::Provenance(&provenance)),
+            );
+            assert!(validate_q27_package_prelaunch(installed_capabilities).is_ok());
+            assert_eq!(installed_capabilities.compiled_w_max, Some(expected_w_max));
+        }
+    }
+
+    #[test]
+    fn source_capability_fingerprint_requires_every_exact_revision_digest() {
+        let commit: GitHubCommit = serde_json::from_value(json!({
+            "sha": PACKAGE_SOURCE_COMMIT,
+            "html_url": format!(
+                "https://github.com/{GITHUB_REPOSITORY}/commit/{PACKAGE_SOURCE_COMMIT}"
+            ),
+            "commit": {
+                "committer": {"date": "2026-08-25T20:13:34Z"},
+                "tree": {"sha": PACKAGE_SOURCE_TREE}
+            }
+        }))
+        .expect("current commit");
+        assert!(q27_source_package_contract_from_digests(
+            &commit,
+            PACKAGE_MAKEFILE_SHA256,
+            PACKAGE_README_SHA256,
+            PACKAGE_SERVER_SHA256,
+            PACKAGE_ENGINE_SHA256,
+        ));
+        assert!(!q27_source_package_contract_from_digests(
+            &commit,
+            PACKAGE_MAKEFILE_SHA256,
+            PACKAGE_README_SHA256,
+            PACKAGE_SERVER_SHA256,
+            &"0".repeat(64),
+        ));
+    }
+
+    #[test]
+    fn source_package_capabilities_fail_closed_on_recipe_or_target_mismatch() {
+        let mut runtime = current_source_runtimes()
+            .into_iter()
+            .find(|runtime| runtime.identity.variant == "w12")
+            .expect("W12 source runtime");
+        let RuntimeAcquisitionPlan::SourceBuild(plan) = &mut runtime.acquisition else {
+            panic!("source plan")
+        };
+        plan.recipe.build_target = "build/q27-server-w8".to_owned();
+        plan.recipe.entrypoint = "build/q27-server-w8".into();
+        let capabilities = q27_package_capabilities(
+            &runtime.identity,
+            &RuntimeAcquisitionMethod::SourceBuild,
+            Some(Q27SourceBuildEvidence::Plan(plan)),
+        );
+        assert!(!capabilities.trustworthy_identity || capabilities.compiled_w_max.is_none());
+        assert!(validate_q27_package_prelaunch(capabilities).is_err());
+
+        plan.recipe.build_target = "build/q27-server".to_owned();
+        plan.recipe.entrypoint = "build/q27-server".into();
+        plan.recipe.recipe_version = "q27-upstream-make-v1".to_owned();
+        let capabilities = q27_package_capabilities(
+            &runtime.identity,
+            &RuntimeAcquisitionMethod::SourceBuild,
+            Some(Q27SourceBuildEvidence::Plan(plan)),
+        );
+        assert!(!capabilities.trustworthy_identity);
     }
 
     #[test]
@@ -4053,6 +4476,7 @@ mod tests {
         let exact = q27_package_capabilities(
             &q27_runtime_identity("w12"),
             &RuntimeAcquisitionMethod::OfficialReleaseAsset,
+            None,
         );
         assert_eq!(
             q27_package_kv_attempt_modes(exact, policy),
@@ -5190,6 +5614,29 @@ mod tests {
             adapter.available_runtime_model_compatibility(w12, &q4, &host_24),
             RuntimeCompatibility::Incompatible(_)
         ));
+    }
+
+    #[test]
+    fn current_source_w12_is_model_aware_usable_for_a_valid_package_on_sm120() {
+        let runtime = current_source_runtimes()
+            .into_iter()
+            .find(|runtime| runtime.identity.variant == "w12")
+            .expect("current W12 source runtime");
+        let (_directory, mut model) = q27_model_fixture("q4s-v1", Some(true), None);
+        model.norted_package = Some(q27_package_fixture());
+        let adapter = Q27Adapter::from_config(None, Path::new("."));
+        let host = host_with_vram(32);
+        let compatibility = adapter.available_runtime_model_compatibility(&runtime, &model, &host);
+        assert!(matches!(
+            compatibility,
+            RuntimeCompatibility::NeedsAttention(ref reason)
+                if reason.contains("bounded startup observation")
+        ));
+        assert!(compatibility.is_usable());
+        assert_eq!(
+            adapter.available_runtime_model_preference(&runtime, &model, &host),
+            0
+        );
     }
 
     #[tokio::test]

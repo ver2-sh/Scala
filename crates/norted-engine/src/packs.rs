@@ -889,7 +889,6 @@ impl RuntimePackManager {
                     .iter()
                     .filter(|result| result.entry.compatibility.is_usable())
                     .filter(|result| same_update_line(identity, &result.entry.available))
-                    .filter(|result| result.entry.available.source_build().is_some())
                     .collect::<Vec<_>>();
                 let channel_available = update_line.iter().any(|result| {
                     update_channel_matches(&preference, None, &result.entry.available)
@@ -901,7 +900,13 @@ impl RuntimePackManager {
                         matches!(preference, RuntimeUpdatePreference::Pinned)
                             || update_channel_matches(&preference, None, &result.entry.available)
                     })
-                    .max_by_key(|result| result.entry.available.published_at_unix);
+                    .max_by(|left, right| {
+                        compare_source_update_candidates(
+                            identity,
+                            &left.entry.available,
+                            &right.entry.available,
+                        )
+                    });
                 let state = if let Some(error) = provider_error {
                     if error.using_stale_cache {
                         RuntimeUpdateState::ProviderError(error.message.clone())
@@ -941,6 +946,18 @@ impl RuntimePackManager {
                                 ),
                                 Err(error) => RuntimeUpdateState::ProviderError(error.to_string()),
                             }
+                        }
+                        (Some(_), None)
+                            if q27_semantic_release_identity(identity)
+                                && q27_semantic_release_identity(
+                                    &candidate.entry.available.identity,
+                                ) =>
+                        {
+                            semantic_release_update_state(
+                                &preference,
+                                identity,
+                                &candidate.entry.available,
+                            )
                         }
                         _ => RuntimeUpdateState::ProviderError(
                             "source-built runtime or update candidate is missing source provenance"
@@ -1485,12 +1502,83 @@ fn acquisition_rank(runtime: &InstalledRuntime) -> u8 {
 fn same_update_line(identity: &RuntimeIdentity, candidate: &AvailableRuntime) -> bool {
     let candidate = &candidate.identity;
     candidate.engine_id == identity.engine_id
-        && candidate.package_family == identity.package_family
+        && (candidate.package_family == identity.package_family
+            || q27_logical_update_family(identity, candidate))
         && candidate.platform == identity.platform
         && candidate.architecture == identity.architecture
         && candidate.accelerator == identity.accelerator
         && candidate.variant == identity.variant
         && candidate.package.provider_id == identity.package.provider_id
+}
+
+fn q27_logical_update_family(left: &RuntimeIdentity, right: &RuntimeIdentity) -> bool {
+    fn family(identity: &RuntimeIdentity) -> bool {
+        identity.package_family == "q27-official-release"
+            || identity
+                .package_family
+                .starts_with("q27-official-source-q27-upstream-make-")
+    }
+
+    left.engine_id == "q27"
+        && right.engine_id == "q27"
+        && left.package.provider_id == "q27-official-github"
+        && right.package.provider_id == "q27-official-github"
+        && left.package.repository.as_deref() == Some("signalnine/q27")
+        && right.package.repository.as_deref() == Some("signalnine/q27")
+        && family(left)
+        && family(right)
+}
+
+fn q27_semantic_release_identity(identity: &RuntimeIdentity) -> bool {
+    q27_logical_update_family(identity, identity)
+        && identity
+            .package
+            .release_tag
+            .as_deref()
+            .and_then(|tag| tag.strip_prefix('v'))
+            == Some(identity.version.as_str())
+}
+
+fn compare_source_update_candidates(
+    installed: &RuntimeIdentity,
+    left: &AvailableRuntime,
+    right: &AvailableRuntime,
+) -> Ordering {
+    if q27_semantic_release_identity(installed)
+        && q27_semantic_release_identity(&left.identity)
+        && q27_semantic_release_identity(&right.identity)
+    {
+        return compare_versions(&left.identity.version, &right.identity.version)
+            .then_with(|| left.published_at_unix.cmp(&right.published_at_unix));
+    }
+    left.published_at_unix.cmp(&right.published_at_unix)
+}
+
+fn semantic_release_update_state(
+    preference: &RuntimeUpdatePreference,
+    installed: &RuntimeIdentity,
+    candidate: &AvailableRuntime,
+) -> RuntimeUpdateState {
+    if compare_versions(&candidate.identity.version, &installed.version) == Ordering::Greater {
+        if matches!(preference, RuntimeUpdatePreference::Pinned) {
+            RuntimeUpdateState::Pinned {
+                newer_runtime_id: Some(candidate.runtime_id.clone()),
+                newer_version: Some(candidate.identity.version.clone()),
+            }
+        } else {
+            RuntimeUpdateState::NewerCompatibleVersion {
+                runtime_id: candidate.runtime_id.clone(),
+                version: candidate.identity.version.clone(),
+            }
+        }
+    } else if matches!(preference, RuntimeUpdatePreference::Pinned) {
+        RuntimeUpdateState::Pinned {
+            newer_runtime_id: None,
+            newer_version: None,
+        }
+    } else {
+        RuntimeUpdateState::Current
+    }
 }
 
 fn source_history_update_state(
@@ -1557,7 +1645,8 @@ fn compare_installed_recency(left: &InstalledRuntime, right: &InstalledRuntime) 
     let left_manifest = &left.manifest;
     let right_manifest = &right.manifest;
     let same_update_line = left_manifest.identity.engine_id == right_manifest.identity.engine_id
-        && left_manifest.identity.package_family == right_manifest.identity.package_family
+        && (left_manifest.identity.package_family == right_manifest.identity.package_family
+            || q27_logical_update_family(&left_manifest.identity, &right_manifest.identity))
         && left_manifest.identity.platform == right_manifest.identity.platform
         && left_manifest.identity.architecture == right_manifest.identity.architecture
         && left_manifest.identity.accelerator == right_manifest.identity.accelerator
@@ -1611,14 +1700,18 @@ mod tests {
     use std::path::PathBuf;
 
     use norted_core::{
-        InstalledRuntime, RUNTIME_MANIFEST_SCHEMA_VERSION, RuntimeAcquisitionMethod, RuntimeId,
-        RuntimeIdentity, RuntimeManifest, RuntimePackageIdentity, RuntimeProbeObservation,
-        RuntimeRequirements, RuntimeSourceBuildProvenance, RuntimeSourceBuildSystem,
-        RuntimeSourceBuildToolchain, RuntimeSourceSnapshot, RuntimeUpdatePreference,
-        RuntimeUpdateState,
+        ArtifactFormat, AvailableRuntime, InstalledRuntime, RUNTIME_MANIFEST_SCHEMA_VERSION,
+        RuntimeAcquisitionMethod, RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeDownload,
+        RuntimeId, RuntimeIdentity, RuntimeManifest, RuntimePackageIdentity,
+        RuntimeProbeObservation, RuntimeReleaseChannel, RuntimeRequirements,
+        RuntimeSourceBuildProvenance, RuntimeSourceBuildSystem, RuntimeSourceBuildToolchain,
+        RuntimeSourceSnapshot, RuntimeUpdatePreference, RuntimeUpdateState,
     };
 
-    use super::{compare_installed_recency, source_history_update_state};
+    use super::{
+        compare_installed_recency, same_update_line, semantic_release_update_state,
+        source_history_update_state,
+    };
     use crate::{GitHubCompare, GitHubComparisonStatus};
 
     #[test]
@@ -1693,6 +1786,64 @@ mod tests {
     }
 
     #[test]
+    fn q27_binary_and_source_releases_share_only_their_exact_logical_update_line() {
+        let installed_binary = q27_identity("0.6.2", "w12", "q27-official-release");
+        let source = available_fixture(q27_identity(
+            "0.10.0",
+            "w12",
+            "q27-official-source-q27-upstream-make-v2-4770e05",
+        ));
+        assert!(same_update_line(&installed_binary, &source));
+        assert!(matches!(
+            semantic_release_update_state(
+                &RuntimeUpdatePreference::Latest,
+                &installed_binary,
+                &source,
+            ),
+            RuntimeUpdateState::NewerCompatibleVersion { ref runtime_id, ref version }
+                if runtime_id == &source.runtime_id && version == "0.10.0"
+        ));
+        assert!(matches!(
+            semantic_release_update_state(
+                &RuntimeUpdatePreference::Pinned,
+                &installed_binary,
+                &source,
+            ),
+            RuntimeUpdateState::Pinned { newer_runtime_id: Some(ref runtime_id), .. }
+                if runtime_id == &source.runtime_id
+        ));
+
+        let installed_source = q27_identity(
+            "0.10.0",
+            "w12",
+            "q27-official-source-q27-upstream-make-v2-4770e05",
+        );
+        let newer_binary = available_fixture(q27_identity("0.11.0", "w12", "q27-official-release"));
+        assert!(same_update_line(&installed_source, &newer_binary));
+        assert!(matches!(
+            semantic_release_update_state(
+                &RuntimeUpdatePreference::Stable,
+                &installed_source,
+                &newer_binary,
+            ),
+            RuntimeUpdateState::NewerCompatibleVersion { ref runtime_id, .. }
+                if runtime_id == &newer_binary.runtime_id
+        ));
+
+        let w8 = available_fixture(q27_identity(
+            "0.10.0",
+            "w8",
+            "q27-official-source-q27-upstream-make-v2-4770e05",
+        ));
+        assert!(!same_update_line(&installed_binary, &w8));
+
+        let mut other_provider = source.clone();
+        other_provider.identity.package.provider_id = "another-provider".to_owned();
+        other_provider.runtime_id = RuntimeId::from_identity(&other_provider.identity);
+        assert!(!same_update_line(&installed_binary, &other_provider));
+    }
+
+    #[test]
     fn same_day_source_fallback_uses_commit_recency_not_sha_digits() {
         let older = installed_fixture(
             "git-20260828-99999999",
@@ -1760,6 +1911,7 @@ mod tests {
                     },
                     recipe_version: "fixture-v1".to_owned(),
                     build_system: RuntimeSourceBuildSystem::Cmake,
+                    build_definition_sha256: None,
                     cmake_configuration_arguments: Vec::new(),
                     build_target: "fixture".to_owned(),
                     toolchain: RuntimeSourceBuildToolchain {
@@ -1809,6 +1961,55 @@ mod tests {
                 },
             },
             installation_root: PathBuf::new(),
+        }
+    }
+
+    fn q27_identity(version: &str, variant: &str, package_family: &str) -> RuntimeIdentity {
+        RuntimeIdentity {
+            engine_id: "q27".to_owned(),
+            package_family: package_family.to_owned(),
+            version: version.to_owned(),
+            upstream_revision: package_family.contains("source").then(|| "a".repeat(40)),
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            accelerator: "cuda".to_owned(),
+            variant: variant.to_owned(),
+            package: RuntimePackageIdentity {
+                provider_id: "q27-official-github".to_owned(),
+                repository: Some("signalnine/q27".to_owned()),
+                release_tag: Some(format!("v{version}")),
+                asset_id: (!package_family.contains("source")).then(|| "1".to_owned()),
+                asset_name: (!package_family.contains("source"))
+                    .then(|| format!("q27-v{version}-linux-x86_64.tar.gz")),
+                additional_assets: Vec::new(),
+            },
+        }
+    }
+
+    fn available_fixture(identity: RuntimeIdentity) -> AvailableRuntime {
+        AvailableRuntime {
+            runtime_id: RuntimeId::from_identity(&identity),
+            identity,
+            display_name: "fixture".to_owned(),
+            supported_formats: vec![ArtifactFormat::Q27],
+            source_url: "https://github.com/signalnine/q27".to_owned(),
+            published_at_unix: Some(1),
+            channels: vec![RuntimeReleaseChannel::Stable, RuntimeReleaseChannel::Latest],
+            prerelease: false,
+            acquisition: RuntimeAcquisitionPlan::ReleaseAsset {
+                download: RuntimeDownload {
+                    url:
+                        "https://github.com/signalnine/q27/releases/download/fixture/runtime.tar.gz"
+                            .to_owned(),
+                    size_bytes: 1,
+                    digest: None,
+                    archive_format: RuntimeArchiveFormat::TarGz,
+                    entrypoint_names: vec!["q27-server".to_owned()],
+                },
+                additional_downloads: Vec::new(),
+            },
+            supported_native_identities: Vec::new(),
+            requirements: RuntimeRequirements::default(),
         }
     }
 }

@@ -292,6 +292,11 @@ pub struct RuntimeSourceBuildRecipe {
     pub recipe_version: String,
     #[serde(default)]
     pub build_system: RuntimeSourceBuildSystem,
+    /// Digest of the provider-audited root build definition. Make recipes use
+    /// this to bind the locally executed dependency/command graph to the exact
+    /// definition admitted during catalog discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_definition_sha256: Option<String>,
     pub cmake_configuration_arguments: Vec<String>,
     pub build_target: String,
     pub entrypoint: PathBuf,
@@ -353,6 +358,8 @@ pub struct RuntimeSourceBuildProvenance {
     pub recipe_version: String,
     #[serde(default)]
     pub build_system: RuntimeSourceBuildSystem,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_definition_sha256: Option<String>,
     pub cmake_configuration_arguments: Vec<String>,
     pub build_target: String,
     pub toolchain: RuntimeSourceBuildToolchain,
@@ -916,6 +923,12 @@ fn validate_source_build_plan(
             .rejected_build_environment
             .iter()
             .any(|name| name.trim().is_empty() || name.contains('=') || name.contains('\0'))
+        || recipe
+            .build_definition_sha256
+            .as_ref()
+            .is_some_and(|digest| RuntimeDigest::sha256(digest.clone()).is_err())
+        || (recipe.build_system == RuntimeSourceBuildSystem::Make
+            && recipe.build_definition_sha256.is_none())
     {
         return Err(RuntimeManifestError::InvalidSourceBuild(
             "build recipe fields are incomplete or unsafe".to_owned(),
@@ -993,6 +1006,9 @@ fn validate_source_build_provenance(
 ) -> Result<(), RuntimeManifestError> {
     validate_source_snapshot(&provenance.source)?;
     RuntimeDigest::sha256(provenance.entrypoint_sha256.clone())?;
+    if let Some(digest) = &provenance.build_definition_sha256 {
+        RuntimeDigest::sha256(digest.clone())?;
+    }
     let fields_complete = !provenance.recipe_version.trim().is_empty()
         && !provenance.build_target.trim().is_empty()
         && valid_build_target(provenance.build_system, &provenance.build_target)
@@ -1232,6 +1248,7 @@ mod tests {
                 source,
                 recipe_version: "ninfer-serve-v1".to_owned(),
                 build_system: RuntimeSourceBuildSystem::Cmake,
+                build_definition_sha256: None,
                 cmake_configuration_arguments: vec!["-G".to_owned(), "Ninja".to_owned()],
                 build_target: "ninfer-serve".to_owned(),
                 toolchain: RuntimeSourceBuildToolchain {
