@@ -18,13 +18,44 @@ use crate::catalog::{
 use crate::{ENGINE_ID, UPSTREAM_REPOSITORY};
 
 const PACKAGE_FAMILY: &str = "llama-cpp-managed-source";
-const RECIPE_VERSION: &str = "managed-portable-v3";
+const CUDA12_RECIPE_VERSION: &str = "managed-portable-v3";
+const CUDA13_RECIPE_VERSION: &str = "managed-portable-cuda13-v1";
 const CUDA_ARCHITECTURES: &str = "75-real;80-real;86-real;89-real;90-real;120a-real";
-const CUDA_TOOLKIT_FLOOR: &str = "12.8";
-const CUDA_TOOLKIT_CEILING_EXCLUSIVE: &str = "13.0";
-const NVIDIA_DRIVER_FLOOR: &str = "525.60.13";
 const ACCELERATOR_TARGET: &str = "sm_75+sm_80+sm_86+sm_89+sm_90+sm_120a";
 const SOURCE_CONTRACT_FILE_LIMIT: usize = 512 * 1024;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ManagedCudaRecipe {
+    variant: &'static str,
+    display_name: &'static str,
+    minimum_cuda: &'static str,
+    maximum_cuda_exclusive: &'static str,
+    minimum_driver: &'static str,
+}
+
+const CUDA12_RECIPE: ManagedCudaRecipe = ManagedCudaRecipe {
+    variant: CUDA12_RECIPE_VERSION,
+    display_name: "llama.cpp CUDA managed source (Linux x86_64)",
+    minimum_cuda: "12.8",
+    maximum_cuda_exclusive: "13.0",
+    minimum_driver: "525.60.13",
+};
+const CUDA13_RECIPE: ManagedCudaRecipe = ManagedCudaRecipe {
+    variant: CUDA13_RECIPE_VERSION,
+    display_name: "llama.cpp CUDA 13 managed source (Linux x86_64)",
+    minimum_cuda: "13.0",
+    maximum_cuda_exclusive: "14.0",
+    minimum_driver: "580.65.06",
+};
+const MANAGED_CUDA_RECIPES: [ManagedCudaRecipe; 2] = [CUDA12_RECIPE, CUDA13_RECIPE];
+
+impl ManagedCudaRecipe {
+    fn from_variant(variant: &str) -> Option<Self> {
+        MANAGED_CUDA_RECIPES
+            .into_iter()
+            .find(|recipe| recipe.variant == variant)
+    }
+}
 
 pub const LLAMA_CPP_SOURCE_RUNTIME_PROVIDER_ID: &str = "llama-cpp-managed-source-github";
 
@@ -66,7 +97,7 @@ impl RuntimeCatalogProvider for LlamaCppSourceRuntimeCatalogProvider {
         releases.sort_by_key(|(build, _)| std::cmp::Reverse(*build));
         for (_, release) in releases {
             if let Some(commit) = admit_source_revision(github, &release).await? {
-                return Ok(vec![source_runtime(&release, commit)?]);
+                return source_runtimes(&release, &commit);
             }
         }
         Err(provider_error(
@@ -92,7 +123,7 @@ impl RuntimeCatalogProvider for LlamaCppSourceRuntimeCatalogProvider {
         let Some(commit) = admit_source_revision(github, &release).await? else {
             return Ok(Vec::new());
         };
-        Ok(vec![source_runtime(&release, commit)?])
+        source_runtimes(&release, &commit)
     }
 
     async fn verify_candidate(
@@ -103,7 +134,14 @@ impl RuntimeCatalogProvider for LlamaCppSourceRuntimeCatalogProvider {
         let RuntimeAcquisitionPlan::SourceBuild(plan) = &candidate.acquisition else {
             return Ok(None);
         };
+        let Some(recipe) = ManagedCudaRecipe::from_variant(&candidate.identity.variant) else {
+            return Ok(None);
+        };
         if candidate.identity.engine_id != ENGINE_ID
+            || candidate.identity.package_family != PACKAGE_FAMILY
+            || candidate.identity.platform != "linux"
+            || candidate.identity.architecture != "x86_64"
+            || candidate.identity.accelerator != "cuda"
             || candidate.identity.package.provider_id != LLAMA_CPP_SOURCE_RUNTIME_PROVIDER_ID
             || candidate.identity.package.repository.as_deref() != Some(GITHUB_REPOSITORY)
             || candidate.identity.package.release_tag.as_deref()
@@ -133,7 +171,7 @@ impl RuntimeCatalogProvider for LlamaCppSourceRuntimeCatalogProvider {
                 "selected source commit/tree metadata differs from the live canonical repository",
             ));
         }
-        let live = source_runtime(&release, commit)?;
+        let live = source_runtime(&release, &commit, recipe)?;
         if live.runtime_id != candidate.runtime_id
             || live.identity != candidate.identity
             || live.display_name != candidate.display_name
@@ -395,9 +433,20 @@ async fn resolve_release_commit(
     Ok(commit)
 }
 
+fn source_runtimes(
+    release: &GitHubRelease,
+    commit: &GitHubCommit,
+) -> Result<Vec<AvailableRuntime>, CatalogError> {
+    MANAGED_CUDA_RECIPES
+        .into_iter()
+        .map(|recipe| source_runtime(release, commit, recipe))
+        .collect()
+}
+
 fn source_runtime(
     release: &GitHubRelease,
-    commit: GitHubCommit,
+    commit: &GitHubCommit,
+    recipe: ManagedCudaRecipe,
 ) -> Result<AvailableRuntime, CatalogError> {
     let build = nightly_number(&release.tag_name)
         .ok_or_else(|| provider_error("source release is not a valid nightly build"))?;
@@ -412,7 +461,7 @@ fn source_runtime(
         platform: "linux".to_owned(),
         architecture: "x86_64".to_owned(),
         accelerator: "cuda".to_owned(),
-        variant: RECIPE_VERSION.to_owned(),
+        variant: recipe.variant.to_owned(),
         package: RuntimePackageIdentity {
             provider_id: LLAMA_CPP_SOURCE_RUNTIME_PROVIDER_ID.to_owned(),
             repository: Some(GITHUB_REPOSITORY.to_owned()),
@@ -425,12 +474,16 @@ fn source_runtime(
     let runtime = AvailableRuntime {
         runtime_id: RuntimeId::from_identity(&identity),
         identity,
-        display_name: "llama.cpp CUDA managed source (Linux x86_64)".to_owned(),
+        display_name: recipe.display_name.to_owned(),
         supported_formats: vec![ArtifactFormat::Gguf],
-        source_url: commit.html_url,
+        source_url: commit.html_url.clone(),
         published_at_unix: Some(timestamp),
         channels: std::iter::once(RuntimeReleaseChannel::Latest)
-            .chain(release.prerelease.then_some(RuntimeReleaseChannel::Prerelease))
+            .chain(
+                release
+                    .prerelease
+                    .then_some(RuntimeReleaseChannel::Prerelease),
+            )
             .collect(),
         prerelease: release.prerelease,
         acquisition: RuntimeAcquisitionPlan::SourceBuild(Box::new(RuntimeSourceBuildPlan {
@@ -438,13 +491,13 @@ fn source_runtime(
                 repository: GITHUB_REPOSITORY.to_owned(),
                 repository_url: format!("{UPSTREAM_REPOSITORY}.git"),
                 source_branch: release.tag_name.clone(),
-                commit_sha: commit.sha,
-                tree_sha: commit.commit.tree.sha,
+                commit_sha: commit.sha.clone(),
+                tree_sha: commit.commit.tree.sha.clone(),
                 commit_timestamp_unix: timestamp,
                 source_provider: LLAMA_CPP_SOURCE_RUNTIME_PROVIDER_ID.to_owned(),
             },
             recipe: RuntimeSourceBuildRecipe {
-                recipe_version: RECIPE_VERSION.to_owned(),
+                recipe_version: recipe.variant.to_owned(),
                 build_system: RuntimeSourceBuildSystem::Cmake,
                 build_definition_sha256: None,
                 cmake_configuration_arguments: vec![
@@ -504,10 +557,8 @@ fn source_runtime(
             },
             prerequisites: RuntimeSourceBuildPrerequisites {
                 minimum_cmake_version: "3.18".to_owned(),
-                minimum_cuda_version: Some(CUDA_TOOLKIT_FLOOR.to_owned()),
-                maximum_cuda_version_exclusive: Some(
-                    CUDA_TOOLKIT_CEILING_EXCLUSIVE.to_owned(),
-                ),
+                minimum_cuda_version: Some(recipe.minimum_cuda.to_owned()),
+                maximum_cuda_version_exclusive: Some(recipe.maximum_cuda_exclusive.to_owned()),
                 requires_ninja: true,
                 requires_cpp20_compiler: false,
                 requires_make: false,
@@ -521,7 +572,7 @@ fn source_runtime(
         supported_native_identities: Vec::new(),
         requirements: RuntimeRequirements {
             requires_nvidia_gpu: true,
-            minimum_nvidia_driver: Some(NVIDIA_DRIVER_FLOOR.to_owned()),
+            minimum_nvidia_driver: Some(recipe.minimum_driver.to_owned()),
             minimum_vram_bytes: None,
             minimum_vram_class_gib: None,
             minimum_vram_exclusive_class_gib: None,
@@ -535,16 +586,7 @@ fn source_runtime(
             ],
             required_nvidia_device_names: Vec::new(),
             notes: Vec::new(),
-            advisories: vec![
-                "Norted builds this runtime from the exact official llama.cpp source revision; it is not an upstream CUDA binary"
-                    .to_owned(),
-                "The managed build contains fixed real-code CUDA targets for compute capabilities 7.5, 8.0, 8.6, 8.9, 9.0, and 12.0"
-                    .to_owned(),
-                "CUDA Toolkit 12.8 through 12.x is required: 12.8 first supports the fixed Blackwell sm_120a target, while CUDA 13.x has a different driver contract"
-                    .to_owned(),
-                "NVIDIA documents Linux driver 525.60.13 as the CUDA 12.x minor-version compatibility floor"
-                    .to_owned(),
-            ],
+            advisories: managed_cuda_advisories(recipe),
             unverified_requirements: Vec::new(),
         },
     };
@@ -552,6 +594,27 @@ fn source_runtime(
         .validate()
         .map_err(|error| provider_error(&error.to_string()))?;
     Ok(runtime)
+}
+
+fn managed_cuda_advisories(recipe: ManagedCudaRecipe) -> Vec<String> {
+    let toolkit = if recipe == CUDA12_RECIPE {
+        "CUDA Toolkit 12.8 through 12.x is required: 12.8 first supports the fixed Blackwell sm_120a target, while CUDA 13.x has a different driver contract"
+    } else {
+        "CUDA Toolkit 13.0 through 13.x is required; this is an intentional parallel variant and does not replace the immutable CUDA-12 V3 recipe"
+    };
+    let driver = if recipe == CUDA12_RECIPE {
+        "NVIDIA documents Linux driver 525.60.13 as the CUDA 12.x minor-version compatibility floor"
+    } else {
+        "NVIDIA documents Linux driver 580.65.06 as the CUDA 13.0 GA driver floor"
+    };
+    vec![
+        "Norted builds this runtime from the exact official llama.cpp source revision; it is not an upstream CUDA binary"
+            .to_owned(),
+        "The managed build contains fixed real-code CUDA targets for compute capabilities 7.5, 8.0, 8.6, 8.9, 9.0, and 12.0"
+            .to_owned(),
+        toolkit.to_owned(),
+        driver.to_owned(),
+    ]
 }
 
 fn provider_error(message: &str) -> CatalogError {
@@ -709,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn source_runtime_exposes_the_v3_cuda_driver_and_relocation_policy() {
+    fn source_runtimes_expose_distinct_immutable_cuda12_and_cuda13_contracts() {
         let release = GitHubRelease {
             id: 1,
             tag_name: "b12345".to_owned(),
@@ -731,53 +794,70 @@ mod tests {
         }))
         .expect("commit fixture");
 
-        let runtime = source_runtime(&release, commit).expect("valid source runtime");
-        let RuntimeAcquisitionPlan::SourceBuild(plan) = &runtime.acquisition else {
-            panic!("expected source build");
-        };
-        assert_eq!(runtime.identity.variant, RECIPE_VERSION);
-        assert_eq!(plan.recipe.recipe_version, RECIPE_VERSION);
+        let runtimes = source_runtimes(&release, &commit).expect("valid source runtimes");
+        assert_eq!(runtimes.len(), 2);
+        assert_ne!(runtimes[0].runtime_id, runtimes[1].runtime_id);
         assert_eq!(
-            plan.prerequisites.minimum_cuda_version.as_deref(),
-            Some(CUDA_TOOLKIT_FLOOR)
+            runtimes[0].display_name,
+            "llama.cpp CUDA managed source (Linux x86_64)"
         );
-        assert_eq!(
-            plan.prerequisites.maximum_cuda_version_exclusive.as_deref(),
-            Some(CUDA_TOOLKIT_CEILING_EXCLUSIVE)
-        );
-        assert_eq!(
-            runtime.requirements.minimum_nvidia_driver.as_deref(),
-            Some(NVIDIA_DRIVER_FLOOR)
-        );
-        assert_eq!(plan.recipe.accelerator_target, ACCELERATOR_TARGET);
-        assert!(
-            plan.recipe
-                .cmake_configuration_arguments
-                .contains(&"-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON".to_owned())
-        );
-        assert!(
-            plan.recipe
-                .cmake_configuration_arguments
-                .contains(&format!("-DCMAKE_CUDA_ARCHITECTURES={CUDA_ARCHITECTURES}"))
-        );
-        assert_eq!(
-            runtime.requirements.supported_cuda_compute_capabilities,
-            vec![
-                ComputeCapability::new(7, 5),
-                ComputeCapability::new(8, 0),
-                ComputeCapability::new(8, 6),
-                ComputeCapability::new(8, 9),
-                ComputeCapability::new(9, 0),
-                ComputeCapability::new(12, 0),
-            ]
-        );
+
+        for (runtime, recipe) in runtimes.iter().zip(MANAGED_CUDA_RECIPES) {
+            let RuntimeAcquisitionPlan::SourceBuild(plan) = &runtime.acquisition else {
+                panic!("expected source build");
+            };
+            assert_eq!(runtime.identity.variant, recipe.variant);
+            assert_eq!(plan.recipe.recipe_version, recipe.variant);
+            assert_eq!(
+                plan.prerequisites.minimum_cuda_version.as_deref(),
+                Some(recipe.minimum_cuda)
+            );
+            assert_eq!(
+                plan.prerequisites.maximum_cuda_version_exclusive.as_deref(),
+                Some(recipe.maximum_cuda_exclusive)
+            );
+            assert_eq!(
+                runtime.requirements.minimum_nvidia_driver.as_deref(),
+                Some(recipe.minimum_driver)
+            );
+            assert_eq!(plan.recipe.accelerator_target, ACCELERATOR_TARGET);
+            assert_eq!(
+                plan.source.commit_sha,
+                "1111111111111111111111111111111111111111"
+            );
+            assert_eq!(
+                plan.source.tree_sha,
+                "2222222222222222222222222222222222222222"
+            );
+            assert!(
+                plan.recipe
+                    .cmake_configuration_arguments
+                    .contains(&"-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON".to_owned())
+            );
+            assert!(
+                plan.recipe
+                    .cmake_configuration_arguments
+                    .contains(&format!("-DCMAKE_CUDA_ARCHITECTURES={CUDA_ARCHITECTURES}"))
+            );
+            assert_eq!(
+                runtime.requirements.supported_cuda_compute_capabilities,
+                vec![
+                    ComputeCapability::new(7, 5),
+                    ComputeCapability::new(8, 0),
+                    ComputeCapability::new(8, 6),
+                    ComputeCapability::new(8, 9),
+                    ComputeCapability::new(9, 0),
+                    ComputeCapability::new(12, 0),
+                ]
+            );
+        }
     }
 
     #[test]
     fn fixed_cuda_policy_is_conservative_for_observed_devices() {
         let requirements = RuntimeRequirements {
             requires_nvidia_gpu: true,
-            minimum_nvidia_driver: Some(NVIDIA_DRIVER_FLOOR.to_owned()),
+            minimum_nvidia_driver: Some(CUDA12_RECIPE.minimum_driver.to_owned()),
             supported_cuda_compute_capabilities: vec![
                 ComputeCapability::new(7, 5),
                 ComputeCapability::new(8, 0),
@@ -812,7 +892,7 @@ mod tests {
                 &requirements,
                 &host(
                     Some(ComputeCapability::new(12, 0)),
-                    Some(NVIDIA_DRIVER_FLOOR),
+                    Some(CUDA12_RECIPE.minimum_driver),
                 ),
             ),
             RuntimeCompatibility::Recommended
@@ -825,7 +905,7 @@ mod tests {
                 &requirements,
                 &host(
                     Some(ComputeCapability::new(8, 7)),
-                    Some(NVIDIA_DRIVER_FLOOR),
+                    Some(CUDA12_RECIPE.minimum_driver),
                 ),
             ),
             RuntimeCompatibility::Incompatible(_)
@@ -836,7 +916,7 @@ mod tests {
                 "x86_64",
                 "cuda",
                 &requirements,
-                &host(None, Some(NVIDIA_DRIVER_FLOOR)),
+                &host(None, Some(CUDA12_RECIPE.minimum_driver)),
             ),
             RuntimeCompatibility::NeedsAttention(_)
         ));
@@ -859,6 +939,34 @@ mod tests {
                 &host(Some(ComputeCapability::new(12, 0)), None),
             ),
             RuntimeCompatibility::NeedsAttention(_)
+        ));
+
+        let cuda13_requirements = RuntimeRequirements {
+            minimum_nvidia_driver: Some(CUDA13_RECIPE.minimum_driver.to_owned()),
+            ..requirements.clone()
+        };
+        assert_eq!(
+            compatibility_for(
+                "linux",
+                "x86_64",
+                "cuda",
+                &cuda13_requirements,
+                &host(
+                    Some(ComputeCapability::new(12, 0)),
+                    Some(CUDA13_RECIPE.minimum_driver),
+                ),
+            ),
+            RuntimeCompatibility::Recommended
+        );
+        assert!(matches!(
+            compatibility_for(
+                "linux",
+                "x86_64",
+                "cuda",
+                &cuda13_requirements,
+                &host(Some(ComputeCapability::new(12, 0)), Some("580.65.05")),
+            ),
+            RuntimeCompatibility::Incompatible(_)
         ));
 
         let no_nvidia = HostCapabilities {

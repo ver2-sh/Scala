@@ -44,11 +44,45 @@ use tokio::io::AsyncReadExt;
 pub const ENGINE_ID: &str = "llama.cpp";
 pub const UPSTREAM_REPOSITORY: &str = "https://github.com/ggml-org/llama.cpp";
 
+const MANAGED_LLAMA_PACKAGE_FAMILY: &str = "llama-cpp-managed-source";
+const MANAGED_LLAMA_REPOSITORY: &str = "ggml-org/llama.cpp";
+const MANAGED_CUDA12_FUNCTIONAL_VARIANT: &str = "managed-linux-x86_64-cuda12-portable";
+const MANAGED_CUDA13_FUNCTIONAL_VARIANT: &str = "managed-linux-x86_64-cuda13-portable";
+
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const PROPS_TIMEOUT: Duration = Duration::from_secs(2);
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SSE_FRAME_LIMIT: usize = 1024 * 1024;
+
+fn is_managed_llama_linux_cuda(identity: &RuntimeIdentity) -> bool {
+    identity.engine_id == ENGINE_ID
+        && identity.package_family == MANAGED_LLAMA_PACKAGE_FAMILY
+        && identity.platform == "linux"
+        && identity.architecture == "x86_64"
+        && identity.accelerator == "cuda"
+        && identity.package.provider_id == LLAMA_CPP_SOURCE_RUNTIME_PROVIDER_ID
+        && identity.package.repository.as_deref() == Some(MANAGED_LLAMA_REPOSITORY)
+}
+
+fn managed_llama_variant_update_identity(
+    identity: &RuntimeIdentity,
+) -> Option<RuntimeVariantUpdateIdentity> {
+    if !is_managed_llama_linux_cuda(identity) {
+        return None;
+    }
+    let (functional_variant, generation) = match identity.variant.as_str() {
+        "managed-portable-v1" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 1),
+        "managed-portable-v2" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 2),
+        "managed-portable-v3" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 3),
+        "managed-portable-cuda13-v1" => (MANAGED_CUDA13_FUNCTIONAL_VARIANT, 1),
+        _ => return None,
+    };
+    Some(RuntimeVariantUpdateIdentity {
+        functional_variant: functional_variant.to_owned(),
+        source_recipe_generation: Some(generation),
+    })
+}
 
 // These variables select semantics that Norted must own for its private backend.
 // Keep ordinary llama.cpp tuning variables inherited and available to users.
@@ -454,31 +488,8 @@ impl EngineAdapter for LlamaCppAdapter {
         &self,
         identity: &RuntimeIdentity,
     ) -> RuntimeVariantUpdateIdentity {
-        let is_managed_linux_cuda = identity.engine_id == ENGINE_ID
-            && identity.package_family == "llama-cpp-managed-source"
-            && identity.platform == "linux"
-            && identity.architecture == "x86_64"
-            && identity.accelerator == "cuda"
-            && identity.package.provider_id == LLAMA_CPP_SOURCE_RUNTIME_PROVIDER_ID
-            && identity.package.repository.as_deref() == Some("ggml-org/llama.cpp");
-        let managed_generation = if is_managed_linux_cuda {
-            match identity.variant.as_str() {
-                "managed-portable-v1" => Some(1),
-                "managed-portable-v2" => Some(2),
-                "managed-portable-v3" => Some(3),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if let Some(generation) = managed_generation {
-            RuntimeVariantUpdateIdentity {
-                functional_variant: "managed-linux-x86_64-cuda-portable".to_owned(),
-                source_recipe_generation: Some(generation),
-            }
-        } else {
-            RuntimeVariantUpdateIdentity::exact(identity)
-        }
+        managed_llama_variant_update_identity(identity)
+            .unwrap_or_else(|| RuntimeVariantUpdateIdentity::exact(identity))
     }
 
     fn validate_generation_settings(
@@ -517,6 +528,18 @@ impl EngineAdapter for LlamaCppAdapter {
         } else if let Some(error) = &self.configuration_error {
             CompatibilityDecision::Unsupported {
                 reason: error.clone(),
+            }
+        } else {
+            CompatibilityDecision::Supported
+        }
+    }
+
+    fn runtime_compatibility(&self, runtime: &InstalledRuntime) -> CompatibilityDecision {
+        let identity = &runtime.manifest.identity;
+        if is_managed_llama_linux_cuda(identity) && identity.variant == "managed-portable-v1" {
+            CompatibilityDecision::Unsupported {
+                reason: "legacy managed llama.cpp source recipe `managed-portable-v1` has a known relocation defect from stale build-tree shared-library paths; replace it with a current managed recipe"
+                    .to_owned(),
             }
         } else {
             CompatibilityDecision::Supported
@@ -2080,7 +2103,10 @@ fn unix_timestamp() -> i64 {
 
 #[cfg(test)]
 mod recipe_update_tests {
-    use norted_core::{RuntimeIdentity, RuntimePackageIdentity};
+    use norted_core::{
+        RUNTIME_MANIFEST_SCHEMA_VERSION, RuntimeAcquisitionMethod, RuntimeIdentity,
+        RuntimeManifest, RuntimePackageIdentity, RuntimeProbeObservation, RuntimeRequirements,
+    };
 
     use super::*;
 
@@ -2105,6 +2131,37 @@ mod recipe_update_tests {
         }
     }
 
+    fn installed(identity: RuntimeIdentity) -> InstalledRuntime {
+        let runtime_id = RuntimeId::from_identity(&identity);
+        InstalledRuntime {
+            manifest: RuntimeManifest {
+                schema_version: RUNTIME_MANIFEST_SCHEMA_VERSION,
+                runtime_id,
+                identity,
+                supported_formats: vec![ArtifactFormat::Gguf],
+                supported_native_identities: Vec::new(),
+                requirements: RuntimeRequirements::default(),
+                acquisition_method: RuntimeAcquisitionMethod::SourceBuild,
+                source_url: None,
+                downloaded_archive_sha256: None,
+                additional_downloaded_archive_sha256: Vec::new(),
+                source_build: None,
+                entrypoint: "llama-server".into(),
+                entrypoint_sha256: "a".repeat(64),
+                installed_at_unix: Some(1),
+                probe: RuntimeProbeObservation {
+                    compatible: true,
+                    observed_engine_id: ENGINE_ID.to_owned(),
+                    observed_version: Some("b12345".to_owned()),
+                    observed_revision: None,
+                    detail: "fixture".to_owned(),
+                    observed_at_unix: 1,
+                },
+            },
+            installation_root: PathBuf::new(),
+        }
+    }
+
     #[test]
     fn managed_cuda_recipe_generations_have_explicit_update_identity() {
         let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
@@ -2116,11 +2173,76 @@ mod recipe_update_tests {
             assert_eq!(
                 adapter.runtime_variant_update_identity(&identity(variant, "cuda")),
                 RuntimeVariantUpdateIdentity {
-                    functional_variant: "managed-linux-x86_64-cuda-portable".to_owned(),
+                    functional_variant: MANAGED_CUDA12_FUNCTIONAL_VARIANT.to_owned(),
                     source_recipe_generation: Some(generation),
                 }
             );
         }
+    }
+
+    #[test]
+    fn cuda13_is_an_intentional_parallel_functional_variant() {
+        let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
+        let cuda12 =
+            adapter.runtime_variant_update_identity(&identity("managed-portable-v3", "cuda"));
+        let cuda13 = adapter
+            .runtime_variant_update_identity(&identity("managed-portable-cuda13-v1", "cuda"));
+
+        assert_eq!(cuda12.functional_variant, MANAGED_CUDA12_FUNCTIONAL_VARIANT);
+        assert_eq!(cuda12.source_recipe_generation, Some(3));
+        assert_eq!(cuda13.functional_variant, MANAGED_CUDA13_FUNCTIONAL_VARIANT);
+        assert_eq!(cuda13.source_recipe_generation, Some(1));
+        assert_ne!(cuda12.functional_variant, cuda13.functional_variant);
+    }
+
+    #[test]
+    fn known_bad_v1_is_not_servable_but_retains_the_v3_update_line() {
+        let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
+        let v1_identity = identity("managed-portable-v1", "cuda");
+        let v3_identity = identity("managed-portable-v3", "cuda");
+        let CompatibilityDecision::Unsupported { reason } =
+            adapter.runtime_compatibility(&installed(v1_identity.clone()))
+        else {
+            panic!("managed V1 must fail closed");
+        };
+        assert!(reason.contains("known relocation defect"));
+
+        let v1_update = adapter.runtime_variant_update_identity(&v1_identity);
+        let v3_update = adapter.runtime_variant_update_identity(&v3_identity);
+        assert_eq!(v1_update.functional_variant, v3_update.functional_variant);
+        assert!(v3_update.source_recipe_generation > v1_update.source_recipe_generation);
+
+        let mut external = v1_identity;
+        external.package.provider_id = "external-runtime".to_owned();
+        assert_eq!(
+            adapter.runtime_compatibility(&installed(external)),
+            CompatibilityDecision::Supported
+        );
+        assert_eq!(
+            adapter.runtime_compatibility(&installed(identity("managed-portable-v1", "vulkan"))),
+            CompatibilityDecision::Supported
+        );
+        assert_eq!(
+            adapter.runtime_compatibility(&installed(identity("managed-portable-v1", "cpu"))),
+            CompatibilityDecision::Supported
+        );
+        let mut windows_cuda = identity("managed-portable-v1", "cuda");
+        windows_cuda.platform = "windows".to_owned();
+        assert_eq!(
+            adapter.runtime_compatibility(&installed(windows_cuda)),
+            CompatibilityDecision::Supported
+        );
+        let mut official = identity("managed-portable-v1", "cuda");
+        official.package_family = "llama-cpp-official-release".to_owned();
+        official.package.provider_id = LLAMA_CPP_RUNTIME_PROVIDER_ID.to_owned();
+        assert_eq!(
+            adapter.runtime_compatibility(&installed(official)),
+            CompatibilityDecision::Supported
+        );
+        assert_eq!(
+            adapter.runtime_compatibility(&installed(identity("unrelated-v1", "cuda"))),
+            CompatibilityDecision::Supported
+        );
     }
 
     #[test]
