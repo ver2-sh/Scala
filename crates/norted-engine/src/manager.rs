@@ -286,7 +286,7 @@ struct AdmittedLoad {
 
 struct ResolvedServeProfileSelection {
     profile: Option<ServeProfile>,
-    local_load_profile: Option<ServeProfileName>,
+    local_serve_profile: Option<ServeProfileName>,
     suppress_persisted_local_profile: bool,
 }
 
@@ -327,21 +327,21 @@ async fn resolve_serve_profile(
         if name.as_str() == "none" {
             return Ok(ResolvedServeProfileSelection {
                 profile: None,
-                local_load_profile: None,
+                local_serve_profile: None,
                 suppress_persisted_local_profile: true,
             });
         }
         if let Some(profile) = local(name) {
             return Ok(ResolvedServeProfileSelection {
                 profile: Some(profile),
-                local_load_profile: Some(name.clone()),
+                local_serve_profile: Some(name.clone()),
                 suppress_persisted_local_profile: true,
             });
         }
         if let Some(profile) = builder_profiles.get(name.as_str()) {
             return Ok(ResolvedServeProfileSelection {
                 profile: Some(profile.clone()),
-                local_load_profile: None,
+                local_serve_profile: None,
                 suppress_persisted_local_profile: true,
             });
         }
@@ -351,7 +351,7 @@ async fn resolve_serve_profile(
     if state.raw_profile_models.contains(&model.id) {
         return Ok(ResolvedServeProfileSelection {
             profile: None,
-            local_load_profile: None,
+            local_serve_profile: None,
             suppress_persisted_local_profile: true,
         });
     }
@@ -360,7 +360,7 @@ async fn resolve_serve_profile(
             profile: Some(
                 local(name).ok_or_else(|| format!("Serve Profile `{name}` does not exist"))?,
             ),
-            local_load_profile: None,
+            local_serve_profile: None,
             suppress_persisted_local_profile: false,
         });
     }
@@ -371,7 +371,7 @@ async fn resolve_serve_profile(
                     "assigned Builder Serve Profile `{profile_id}` is unavailable; its source package may have moved or been removed"
                 )
             })?),
-            local_load_profile: None,
+            local_serve_profile: None,
             suppress_persisted_local_profile: true,
         });
     }
@@ -380,7 +380,7 @@ async fn resolve_serve_profile(
             .norted_package
             .as_ref()
             .and_then(|package| package.recommended_serve_profile.clone()),
-        local_load_profile: None,
+        local_serve_profile: None,
         suppress_persisted_local_profile: true,
     })
 }
@@ -463,7 +463,7 @@ pub struct RuntimeManager {
     operation: Arc<Mutex<()>>,
     cancellation_epoch: AtomicU64,
     shutting_down: AtomicBool,
-    load_profiles: ServeProfilesStore,
+    serve_profiles: ServeProfilesStore,
     #[cfg(test)]
     load_start_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
@@ -476,7 +476,7 @@ impl RuntimeManager {
         supervisor: Arc<dyn ProcessSupervisor>,
         options: RuntimeManagerOptions,
     ) -> Arc<Self> {
-        let load_profiles = ServeProfilesStore::new(&core.paths);
+        let serve_profiles = ServeProfilesStore::new(&core.paths);
         let manager = Arc::new(Self {
             core,
             registry,
@@ -503,7 +503,7 @@ impl RuntimeManager {
             operation: Arc::new(Mutex::new(())),
             cancellation_epoch: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
-            load_profiles,
+            serve_profiles,
             #[cfg(test)]
             load_start_gate: Mutex::new(None),
         });
@@ -777,7 +777,7 @@ impl RuntimeManager {
             BackendLoadProgress::indeterminate(BackendLoadPhase::SelectingRuntime),
         )
         .await;
-        let profile_state = match self.load_profiles.read().await {
+        let profile_state = match self.serve_profiles.read().await {
             Ok(state) => state,
             Err(error) => {
                 self.fail_loading(generation, error.to_string(), None).await;
@@ -837,7 +837,7 @@ impl RuntimeManager {
         let mut resolved_load_settings = match load_state.resolve(
             &model_id,
             &engine_id,
-            profile_selection.local_load_profile.as_ref(),
+            profile_selection.local_serve_profile.as_ref(),
             &invocation_settings,
             &self.core.paths.data_dir,
         ) {
@@ -1247,7 +1247,7 @@ impl RuntimeManager {
                             .collect::<Vec<_>>()
                             .join(", ");
                         let detail = format!(
-                            "no exact-runtime-supported package KV mode met the {minimum_context}-token minimum; attempted modes and observed contexts: {attempts}"
+                            "no exact-runtime-supported Serve Profile KV mode met the {minimum_context}-token minimum; attempted modes and observed contexts: {attempts}"
                         );
                         self.fail_loading(generation, detail.clone(), None).await;
                         return Err(RuntimeError::StartupFailed(detail));
@@ -2082,7 +2082,7 @@ fn retry_context_capacity_message(
     minimum_context: u64,
 ) -> String {
     format!(
-        "KV mode {kv_mode} served {observed_context} of the required {minimum_context} context tokens; retrying with the next policy KV mode"
+        "KV mode {kv_mode} served {observed_context} of the required {minimum_context} context tokens; retrying with the next Serve Profile KV mode"
     )
 }
 
@@ -2462,7 +2462,7 @@ mod tests {
         let message = retry_context_capacity_message("fp8", 180_000, 200_000);
         assert_eq!(
             message,
-            "KV mode fp8 served 180000 of the required 200000 context tokens; retrying with the next policy KV mode"
+            "KV mode fp8 served 180000 of the required 200000 context tokens; retrying with the next Serve Profile KV mode"
         );
         assert!(!message.contains("next KV mode: fp8"));
     }

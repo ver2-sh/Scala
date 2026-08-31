@@ -556,7 +556,6 @@ fn auxiliary_role_label(role: &AuxiliaryArtifactRole) -> &str {
         AuxiliaryArtifactRole::Tokenizer => "tokenizer",
         AuxiliaryArtifactRole::Projector => "projector",
         AuxiliaryArtifactRole::Sharp => "Sharp template",
-        AuxiliaryArtifactRole::RuntimePolicy => "runtime policy",
         AuxiliaryArtifactRole::ServeProfile => "Serve Profile",
         AuxiliaryArtifactRole::Other(name) => name,
     }
@@ -1031,8 +1030,8 @@ pub trait EngineAdapter: Send + Sync {
     }
     async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError>;
     /// Returns the narrowly ordered process attempts for one launch. Most
-    /// adapters have exactly one attempt. q27 package execution uses this to
-    /// enumerate only exact-runtime-proven KV modes in package quality order.
+    /// adapters have exactly one attempt. q27 Serve Profile execution uses
+    /// this to enumerate only exact-runtime-proven KV modes in profile order.
     async fn build_launch_attempts(
         &self,
         request: LaunchRequest,

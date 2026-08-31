@@ -145,8 +145,8 @@ pub struct RuntimeProvenance {
     pub serve_profile: ServeProfileRuntimeIdentity,
     #[serde(default)]
     pub load_settings: LoadSettingsProvenance,
-    /// Adapter/runtime and generation facts retained for compatibility. This
-    /// is intentionally distinct from structured load-setting provenance.
+    /// Current adapter/runtime and generation facts. This is intentionally
+    /// distinct from structured load-setting provenance.
     pub normalized_settings: BTreeMap<String, serde_json::Value>,
     pub native_arguments: Vec<NativeArgumentProvenance>,
     pub native_environment: Vec<EnvironmentVariableProvenance>,

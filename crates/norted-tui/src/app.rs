@@ -293,9 +293,9 @@ pub struct App {
     pub runtime_picker_candidates: Vec<RuntimeModelCandidate>,
     pub runtime_picker_loading: bool,
     pub runtime_picker_error: Option<String>,
-    pub load_profiles: Option<ServeProfilesState>,
-    pub load_profiles_error: Option<String>,
-    pub load_profiles_loading: bool,
+    pub serve_profiles: Option<ServeProfilesState>,
+    pub serve_profiles_error: Option<String>,
+    pub serve_profiles_loading: bool,
     pub load_setting_definitions: Vec<LoadSettingDefinition>,
     serve_profile_definitions: Vec<LoadSettingDefinition>,
     pub settings_scope_index: usize,
@@ -389,9 +389,9 @@ impl App {
             runtime_picker_candidates: Vec::new(),
             runtime_picker_loading: false,
             runtime_picker_error: None,
-            load_profiles: None,
-            load_profiles_error: None,
-            load_profiles_loading: true,
+            serve_profiles: None,
+            serve_profiles_error: None,
+            serve_profiles_loading: true,
             load_setting_definitions,
             serve_profile_definitions: serve_profile_editor_definitions(),
             settings_scope_index: 0,
@@ -696,23 +696,23 @@ impl App {
 
     pub fn handle_settings_task_result(&mut self, result: SettingsTaskResult) {
         self.settings_busy = false;
-        self.load_profiles_loading = false;
+        self.serve_profiles_loading = false;
         match result {
             SettingsTaskResult::Loaded(result) => match result {
                 Ok(state) => {
-                    self.load_profiles = Some(state);
-                    self.load_profiles_error = None;
+                    self.serve_profiles = Some(state);
+                    self.serve_profiles_error = None;
                     self.reconcile_settings_selection();
                 }
                 Err(error) => {
-                    self.load_profiles_error = Some(error.clone());
+                    self.serve_profiles_error = Some(error.clone());
                     self.notice = Some(error);
                 }
             },
             SettingsTaskResult::Stored(result) => match result {
                 Ok(state) => {
-                    self.load_profiles = Some(state);
-                    self.load_profiles_error = None;
+                    self.serve_profiles = Some(state);
+                    self.serve_profiles_error = None;
                     self.notice =
                         Some("Load settings saved; changes apply on the next load".to_owned());
                     self.reconcile_settings_selection();
@@ -721,7 +721,7 @@ impl App {
                     }
                 }
                 Err(error) => {
-                    self.load_profiles_error = Some(error.clone());
+                    self.serve_profiles_error = Some(error.clone());
                     self.notice = Some(error);
                 }
             },
@@ -731,8 +731,8 @@ impl App {
                 }
                 match result {
                     Ok(inspection) => {
-                        self.load_profiles = Some(inspection.profiles);
-                        self.load_profiles_error = None;
+                        self.serve_profiles = Some(inspection.profiles);
+                        self.serve_profiles_error = None;
                         self.settings_runtime_id = Some(inspection.runtime_id);
                         self.settings_schema = Some(inspection.schema);
                         self.settings_resolved = Some(inspection.resolved);
@@ -762,11 +762,11 @@ impl App {
             })
             .collect::<BTreeSet<_>>();
         scopes.extend(engines.into_iter().map(SettingsScope::Engine));
-        if let Some(state) = &self.load_profiles {
+        if let Some(state) = &self.serve_profiles {
             scopes.extend(state.profiles.keys().cloned().map(SettingsScope::Profile));
         }
         let local_ids = self
-            .load_profiles
+            .serve_profiles
             .as_ref()
             .map(|state| {
                 state
@@ -846,7 +846,7 @@ impl App {
     }
 
     pub fn settings_value_display(&self, id: &LoadSettingId) -> (String, String, bool) {
-        let Some(state) = &self.load_profiles else {
+        let Some(state) = &self.serve_profiles else {
             return ("loading".to_owned(), "state".to_owned(), false);
         };
         let Some(scope) = self.selected_settings_scope() else {
@@ -939,7 +939,7 @@ impl App {
         &self,
         model: &ModelArtifact,
     ) -> Option<norted_core::ServeProfile> {
-        let state = self.load_profiles.as_ref()?;
+        let state = self.serve_profiles.as_ref()?;
         if state.raw_profile_models.contains(&model.id) {
             return None;
         }
@@ -979,7 +979,7 @@ impl App {
     }
 
     pub fn serve_profile_status_for_model(&self, model: &ModelArtifact) -> &'static str {
-        let Some(state) = &self.load_profiles else {
+        let Some(state) = &self.serve_profiles else {
             return "loading";
         };
         if state.raw_profile_models.contains(&model.id) {
@@ -1948,7 +1948,7 @@ impl App {
     }
 
     fn current_layer_value(&self, id: &LoadSettingId) -> Option<LoadSettingValue> {
-        let state = self.load_profiles.as_ref()?;
+        let state = self.serve_profiles.as_ref()?;
         if is_serve_profile_editor_field(id) {
             return match self.selected_settings_scope()? {
                 SettingsScope::Profile(name) => state
@@ -2073,7 +2073,7 @@ impl App {
             self.notice = Some("Open load settings from a selected model first".to_owned());
             return Update::Render;
         };
-        let Some(state) = &self.load_profiles else {
+        let Some(state) = &self.serve_profiles else {
             return Update::None;
         };
         let local = state.profiles.keys().cloned().collect::<Vec<_>>();

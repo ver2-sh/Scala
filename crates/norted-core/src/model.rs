@@ -138,7 +138,6 @@ pub enum AuxiliaryArtifactRole {
     Tokenizer,
     Projector,
     Sharp,
-    RuntimePolicy,
     ServeProfile,
     Other(String),
 }
@@ -694,6 +693,7 @@ mod tests {
         ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifactRole, ModelRegistry,
         NinferContainerError, inspect_ninfer_container,
     };
+    use crate::{ExternalTemplateReference, PromptMode, ServeProfile, ServeProfileSource};
 
     #[test]
     fn q27_primary_keeps_its_id_and_owns_the_tokenizer_companion() {
@@ -752,6 +752,119 @@ mod tests {
                 warning.contains("rebuild this artifact with the current Norted Builder")
             }));
         }
+    }
+
+    #[test]
+    fn q27_recommended_profile_must_bind_the_manifest_sharp() {
+        let temporary = tempfile::tempdir().expect("q27 package fixture");
+        let root = temporary.path();
+        let model_bytes = b"current q27";
+        let sharp_a = b"manifest Sharp";
+        let sharp_b = b"different valid template";
+        let mut tokenizer_bytes = b"Q27T".to_vec();
+        tokenizer_bytes.extend_from_slice(&1_u32.to_le_bytes());
+        std::fs::write(root.join("model.q27"), model_bytes).unwrap();
+        std::fs::write(root.join("tokenizer.tok"), &tokenizer_bytes).unwrap();
+        std::fs::write(root.join("sharp-a.jinja"), sharp_a).unwrap();
+        std::fs::write(root.join("sharp-b.jinja"), sharp_b).unwrap();
+
+        let mut profile = ServeProfile::local("builder-q27");
+        profile.display_name = "Builder q27".to_owned();
+        profile.source = ServeProfileSource::BuilderRecommended;
+        profile.read_only = true;
+        profile.applicability.artifact_formats = vec![ArtifactFormat::Q27];
+        profile.prompt.mode = PromptMode::ExternalTemplate;
+        profile.prompt.template = Some(ExternalTemplateReference {
+            identity: "sharp".to_owned(),
+            path: "sharp-a.jinja".into(),
+            sha256: sha(sharp_a),
+        });
+        profile.validate().expect("current Builder profile");
+        let profile_path = root.join("SERVE-PROFILE.json");
+        std::fs::write(&profile_path, serde_json::to_vec(&profile).unwrap()).unwrap();
+
+        let mut lineage = serde_json::json!({"builder": "fixture"});
+        let lineage_key = sha(&serde_json::to_vec(&lineage).unwrap());
+        lineage["key"] = serde_json::Value::String(lineage_key.clone());
+        let mut manifest = serde_json::json!({
+            "schema": 5,
+            "source_lineage": lineage.clone(),
+            "sharp": {
+                "filename": "sharp-a.jinja",
+                "template_sha256": sha(sharp_a),
+                "resolved_commit": "fixture-commit",
+                "version": "fixture-version"
+            },
+            "tokenizer": {
+                "filename": "tokenizer.tok",
+                "size": tokenizer_bytes.len(),
+                "sha256": sha(&tokenizer_bytes)
+            },
+            "serve_profile": {
+                "filename": "SERVE-PROFILE.json",
+                "size": profile_path.metadata().unwrap().len(),
+                "sha256": sha(&std::fs::read(&profile_path).unwrap()),
+                "profile_id": profile.id,
+                "schema": profile.schema,
+                "schema_version": profile.schema_version
+            },
+            "outputs": {
+                "q6": {
+                    "filename": "model.q27",
+                    "size": model_bytes.len(),
+                    "sha256": sha(model_bytes),
+                    "source_lineage": lineage,
+                    "tokenizer_sha256": sha(&tokenizer_bytes)
+                }
+            }
+        });
+        let manifest_path = root.join("Q27-MANIFEST.json");
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let registry = ModelRegistry::discover(&[root.to_path_buf()]);
+        let package = registry
+            .artifacts()
+            .iter()
+            .find(|artifact| artifact.norted_package.is_some())
+            .unwrap_or_else(|| panic!("current q27 package: {:?}", registry.warnings()));
+        let template = package
+            .norted_package
+            .as_ref()
+            .unwrap()
+            .recommended_serve_profile
+            .as_ref()
+            .unwrap()
+            .prompt
+            .template
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            template.path,
+            root.join("sharp-a.jinja").canonicalize().unwrap()
+        );
+        assert_eq!(template.sha256, sha(sharp_a));
+
+        profile.prompt.template = Some(ExternalTemplateReference {
+            identity: "sharp".to_owned(),
+            path: "sharp-b.jinja".into(),
+            sha256: sha(sharp_b),
+        });
+        std::fs::write(&profile_path, serde_json::to_vec(&profile).unwrap()).unwrap();
+        manifest["serve_profile"]["size"] = profile_path.metadata().unwrap().len().into();
+        manifest["serve_profile"]["sha256"] = sha(&std::fs::read(&profile_path).unwrap()).into();
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let registry = ModelRegistry::discover(&[root.to_path_buf()]);
+        assert!(
+            registry
+                .artifacts()
+                .iter()
+                .all(|artifact| artifact.norted_package.is_none())
+        );
+        assert!(registry.warnings().iter().any(|warning| {
+            warning.contains("disagrees with manifest-bound Sharp")
+                && warning.contains("rebuild this artifact")
+        }));
     }
 
     #[test]
