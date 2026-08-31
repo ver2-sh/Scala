@@ -14,7 +14,7 @@ use norted_core::{
     RuntimeOperationPhase, RuntimeOperationProgress, RuntimeProbeObservation,
     RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites, RuntimeSourceBuildProvenance,
     RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem, RuntimeSourceBuildToolchain,
-    is_safe_relative_path,
+    effective_cmake_configuration_arguments, is_safe_relative_path,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -77,6 +77,11 @@ pub struct RuntimeInstaller {
 pub(crate) struct SourceBuildPrerequisiteEvaluationKey {
     recipe: RuntimeSourceBuildRecipe,
     prerequisites: RuntimeSourceBuildPrerequisites,
+}
+
+struct CheckedSourceBuildPrerequisites {
+    toolchain: RuntimeSourceBuildToolchain,
+    effective_cmake_configuration_arguments: Option<Vec<String>>,
 }
 
 impl SourceBuildPrerequisiteEvaluationKey {
@@ -397,7 +402,10 @@ impl RuntimeInstaller {
             None,
             "Checking source-build prerequisites",
         );
-        let toolchain = check_source_build_prerequisites(plan).await?;
+        let prerequisite_check = check_source_build_prerequisites(plan).await?;
+        let toolchain = prerequisite_check.toolchain;
+        let effective_cmake_configuration_arguments =
+            prerequisite_check.effective_cmake_configuration_arguments;
 
         let repository = self
             .github
@@ -540,10 +548,15 @@ impl RuntimeInstaller {
                         "-B".to_owned(),
                         build_text.clone(),
                     ];
-                    configure_arguments.extend(plan.recipe.cmake_configuration_arguments.clone());
-                    if let Some(cuda_compiler) = cmake_cuda_compiler_configuration(plan)? {
-                        configure_arguments.push(cuda_compiler);
-                    }
+                    configure_arguments.extend(
+                        effective_cmake_configuration_arguments
+                            .clone()
+                            .ok_or_else(|| {
+                                RuntimeInstallError::SourceBuild(
+                                    "CMake source plan has no effective configuration".to_owned(),
+                                )
+                            })?,
+                    );
                     let configure_refs = configure_arguments
                         .iter()
                         .map(String::as_str)
@@ -633,6 +646,7 @@ impl RuntimeInstaller {
                 build_system: plan.recipe.build_system,
                 build_definition_sha256: plan.recipe.build_definition_sha256.clone(),
                 cmake_configuration_arguments: plan.recipe.cmake_configuration_arguments.clone(),
+                effective_cmake_configuration_arguments,
                 build_target: plan.recipe.build_target.clone(),
                 toolchain,
                 build_platform: available.identity.platform.clone(),
@@ -1024,7 +1038,7 @@ const MAX_CMAKE_CONTRACT_FILES: usize = 4_096;
 
 async fn check_source_build_prerequisites(
     plan: &RuntimeSourceBuildPlan,
-) -> Result<RuntimeSourceBuildToolchain, RuntimeInstallError> {
+) -> Result<CheckedSourceBuildPrerequisites, RuntimeInstallError> {
     if !cfg!(target_os = "linux") {
         return Err(RuntimeInstallError::Prerequisite(
             "the selected official source recipe requires Linux".to_owned(),
@@ -1037,11 +1051,12 @@ async fn check_source_build_prerequisites(
         )));
     }
 
-    // Validate the generic CMake binding before probing the compiler. The same
-    // typed prerequisite path is appended to configure as
-    // CMAKE_CUDA_COMPILER, so admission and build execution cannot select
-    // different nvcc programs through ambient PATH or CUDACXX.
-    cmake_cuda_compiler_configuration(plan)?;
+    // Construct the effective configuration before probing the compiler. This
+    // exact value is subsequently supplied to CMake and persisted, so
+    // admission, execution, and provenance cannot select different nvcc
+    // programs through ambient PATH or CUDACXX.
+    let effective_cmake_configuration_arguments = effective_cmake_configuration_arguments(plan)
+        .map_err(|error| RuntimeInstallError::Prerequisite(error.to_string()))?;
 
     command_text("git", &["--version"], None).await?;
     let cmake_version = if plan.recipe.build_system == RuntimeSourceBuildSystem::Cmake {
@@ -1095,8 +1110,9 @@ async fn check_source_build_prerequisites(
     if let Some(maximum) = &plan.prerequisites.maximum_cuda_version_exclusive {
         require_version_below("CUDA Toolkit", &nvcc_version, maximum)?;
     }
-    verify_explicit_cuda_architectures(nvcc_program, &plan.recipe.cmake_configuration_arguments)
-        .await?;
+    if let Some(arguments) = &effective_cmake_configuration_arguments {
+        verify_explicit_cuda_architectures(nvcc_program, arguments).await?;
+    }
 
     let pkg_config_identity = if plan.prerequisites.requires_pkg_config {
         command_text("pkg-config", &["--version"], None).await?
@@ -1117,43 +1133,18 @@ async fn check_source_build_prerequisites(
         system_dependencies.insert(module.clone(), observed);
     }
 
-    Ok(RuntimeSourceBuildToolchain {
-        cmake_version,
-        ninja_version: first_line(&ninja_identity),
-        make_version: first_line(&make_identity),
-        cpp_compiler: compact_identity(&compiler_identity),
-        nvcc_version,
-        pkg_config_version: first_line(&pkg_config_identity),
-        system_dependencies,
+    Ok(CheckedSourceBuildPrerequisites {
+        toolchain: RuntimeSourceBuildToolchain {
+            cmake_version,
+            ninja_version: first_line(&ninja_identity),
+            make_version: first_line(&make_identity),
+            cpp_compiler: compact_identity(&compiler_identity),
+            nvcc_version,
+            pkg_config_version: first_line(&pkg_config_identity),
+            system_dependencies,
+        },
+        effective_cmake_configuration_arguments,
     })
-}
-
-fn cmake_cuda_compiler_configuration(
-    plan: &RuntimeSourceBuildPlan,
-) -> Result<Option<String>, RuntimeInstallError> {
-    if plan.recipe.build_system != RuntimeSourceBuildSystem::Cmake {
-        return Ok(None);
-    }
-    if plan
-        .recipe
-        .cmake_configuration_arguments
-        .iter()
-        .any(|argument| argument.contains("CMAKE_CUDA_COMPILER"))
-    {
-        return Err(RuntimeInstallError::Prerequisite(
-            "source recipes must declare the CUDA compiler through the typed `cuda_compiler` prerequisite, not a competing CMake argument"
-                .to_owned(),
-        ));
-    }
-    let Some(compiler) = plan.prerequisites.cuda_compiler.as_deref() else {
-        return Ok(None);
-    };
-    let compiler = compiler.to_str().ok_or_else(|| {
-        RuntimeInstallError::Prerequisite(
-            "the configured CUDA compiler path is not valid UTF-8".to_owned(),
-        )
-    })?;
-    Ok(Some(format!("-DCMAKE_CUDA_COMPILER={compiler}")))
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -2389,6 +2380,7 @@ mod tests {
     use norted_core::{
         AppPaths, RuntimeArchiveFormat, RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites,
         RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem, RuntimeSourceSnapshot,
+        effective_cmake_configuration_arguments,
     };
     use sha2::{Digest, Sha256};
     use tokio::sync::oneshot;
@@ -2396,8 +2388,7 @@ mod tests {
     use crate::store::RuntimeStore;
 
     use super::{
-        RuntimeInstallError, SourceBuildPrerequisiteEvaluationKey,
-        cmake_cuda_compiler_configuration, extract_archive, hex_digest,
+        RuntimeInstallError, SourceBuildPrerequisiteEvaluationKey, extract_archive, hex_digest,
         inspect_build_dependency_contract, require_cuda_compiler_targets, require_minimum_version,
         require_version_below, required_cuda_compiler_targets, run_owned_staging_operation,
         run_source_command, validate_relative_link_target, verify_package_digest,
@@ -2517,21 +2508,24 @@ mod tests {
             SourceBuildPrerequisiteEvaluationKey::from_plan(&explicit_compiler)
         );
         assert_eq!(
-            cmake_cuda_compiler_configuration(&explicit_compiler)
+            effective_cmake_configuration_arguments(&explicit_compiler)
                 .expect("typed CUDA compiler binding"),
-            Some("-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc".to_owned())
+            Some(vec![
+                "-DCMAKE_CUDA_ARCHITECTURES=75-real".to_owned(),
+                "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc".to_owned(),
+            ])
         );
 
         explicit_compiler
             .recipe
             .cmake_configuration_arguments
             .push("-DCMAKE_CUDA_COMPILER=/other/nvcc".to_owned());
-        assert!(cmake_cuda_compiler_configuration(&explicit_compiler).is_err());
+        assert!(effective_cmake_configuration_arguments(&explicit_compiler).is_err());
 
         explicit_compiler.recipe.cmake_configuration_arguments.pop();
         explicit_compiler.recipe.build_system = RuntimeSourceBuildSystem::Make;
         assert_eq!(
-            cmake_cuda_compiler_configuration(&explicit_compiler)
+            effective_cmake_configuration_arguments(&explicit_compiler)
                 .expect("Make recipes retain their own compiler contract"),
             None
         );

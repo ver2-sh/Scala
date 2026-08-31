@@ -346,6 +346,45 @@ pub struct RuntimeSourceBuildPlan {
     pub prerequisites: RuntimeSourceBuildPrerequisites,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum RuntimeSourceBuildConfigurationError {
+    #[error(
+        "source recipes must declare the CUDA compiler through the typed `cuda_compiler` prerequisite, not a competing CMake argument"
+    )]
+    CompetingCmakeCudaCompiler,
+    #[error("the configured CUDA compiler path is not valid UTF-8")]
+    InvalidCudaCompilerPath,
+}
+
+/// Reconstructs the complete CMake configuration that a source-build plan
+/// supplies to CMake. Recipe arguments remain provider-owned; typed bindings
+/// are appended here so validation, execution, and provenance share one
+/// authority. A non-CMake plan has no effective CMake configuration.
+pub fn effective_cmake_configuration_arguments(
+    plan: &RuntimeSourceBuildPlan,
+) -> Result<Option<Vec<String>>, RuntimeSourceBuildConfigurationError> {
+    if plan.recipe.build_system != RuntimeSourceBuildSystem::Cmake {
+        return Ok(None);
+    }
+    if plan
+        .recipe
+        .cmake_configuration_arguments
+        .iter()
+        .any(|argument| argument.contains("CMAKE_CUDA_COMPILER"))
+    {
+        return Err(RuntimeSourceBuildConfigurationError::CompetingCmakeCudaCompiler);
+    }
+
+    let mut arguments = plan.recipe.cmake_configuration_arguments.clone();
+    if let Some(compiler) = plan.prerequisites.cuda_compiler.as_deref() {
+        let compiler = compiler
+            .to_str()
+            .ok_or(RuntimeSourceBuildConfigurationError::InvalidCudaCompilerPath)?;
+        arguments.push(format!("-DCMAKE_CUDA_COMPILER={compiler}"));
+    }
+    Ok(Some(arguments))
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeSourceBuildToolchain {
     pub cmake_version: String,
@@ -367,7 +406,14 @@ pub struct RuntimeSourceBuildProvenance {
     pub build_system: RuntimeSourceBuildSystem,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_definition_sha256: Option<String>,
+    /// Provider-owned recipe arguments. Historical schema-2 manifests record
+    /// only this field and remain truthful about what their provider declared.
     pub cmake_configuration_arguments: Vec<String>,
+    /// Complete arguments actually supplied to CMake, including generated
+    /// typed bindings. `None` identifies legacy manifests that did not retain
+    /// this distinction; it must not be inferred or rewritten on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_cmake_configuration_arguments: Option<Vec<String>>,
     pub build_target: String,
     pub toolchain: RuntimeSourceBuildToolchain,
     pub build_platform: String,
@@ -922,6 +968,8 @@ fn validate_source_build_plan(
         ));
     }
     let recipe = &plan.recipe;
+    effective_cmake_configuration_arguments(plan)
+        .map_err(|error| RuntimeManifestError::InvalidSourceBuild(error.to_string()))?;
     if recipe.recipe_version.trim().is_empty()
         || recipe.build_target.trim().is_empty()
         || !valid_build_target(recipe.build_system, &recipe.build_target)
@@ -1046,7 +1094,16 @@ fn validate_source_build_provenance(
         && provenance
             .cmake_configuration_arguments
             .iter()
-            .all(|argument| !argument.is_empty() && !argument.contains('\0'));
+            .all(|argument| !argument.is_empty() && !argument.contains('\0'))
+        && provenance
+            .effective_cmake_configuration_arguments
+            .as_ref()
+            .is_none_or(|arguments| {
+                provenance.build_system == RuntimeSourceBuildSystem::Cmake
+                    && arguments
+                        .iter()
+                        .all(|argument| !argument.is_empty() && !argument.contains('\0'))
+            });
     let identity_matches = manifest.identity.package.repository.as_deref()
         == Some(provenance.source.repository.as_str())
         && manifest.identity.package.provider_id == provenance.source.source_provider
@@ -1269,6 +1326,7 @@ mod tests {
                 build_system: RuntimeSourceBuildSystem::Cmake,
                 build_definition_sha256: None,
                 cmake_configuration_arguments: vec!["-G".to_owned(), "Ninja".to_owned()],
+                effective_cmake_configuration_arguments: None,
                 build_target: "ninfer-serve".to_owned(),
                 toolchain: RuntimeSourceBuildToolchain {
                     cmake_version: "3.31.0".to_owned(),
@@ -1302,6 +1360,27 @@ mod tests {
             },
         };
         manifest.validate().expect("truthful source manifest");
+
+        let legacy_json = serde_json::to_value(&manifest).expect("serialize source manifest");
+        assert!(
+            legacy_json["source_build"]
+                .get("effective_cmake_configuration_arguments")
+                .is_none(),
+            "legacy provenance must not fabricate an effective argument list"
+        );
+        let legacy_manifest: RuntimeManifest =
+            serde_json::from_value(legacy_json).expect("read legacy schema-two source manifest");
+        assert!(
+            legacy_manifest
+                .source_build
+                .as_ref()
+                .is_some_and(|provenance| provenance
+                    .effective_cmake_configuration_arguments
+                    .is_none())
+        );
+        legacy_manifest
+            .validate()
+            .expect("legacy schema-two source manifest remains valid");
 
         let mut with_fake_archive = manifest;
         with_fake_archive.downloaded_archive_sha256 = Some("d".repeat(64));
