@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ENGINE_ID;
 
-const GITHUB_REPOSITORY: &str = "ggml-org/llama.cpp";
+pub(crate) const GITHUB_REPOSITORY: &str = "ggml-org/llama.cpp";
 const PACKAGE_FAMILY: &str = "llama-cpp-official-release";
 const NIGHTLY_POINTER_ASSET: &str = "nightly-tag.txt";
 const NIGHTLY_POINTER_MAXIMUM_BYTES: usize = 64;
@@ -87,7 +87,7 @@ impl RuntimeCatalogProvider for LlamaCppRuntimeCatalogProvider {
     }
 }
 
-fn nightly_tag_from_reference(reference: &str) -> Option<String> {
+pub(crate) fn nightly_tag_from_reference(reference: &str) -> Option<String> {
     reference
         .split(|character: char| !character.is_ascii_alphanumeric())
         .find(|part| nightly_number(part).is_some())
@@ -480,7 +480,7 @@ async fn verified_stable_nightly(
     Some(nightly_tag.to_owned())
 }
 
-fn nightly_number(tag: &str) -> Option<u64> {
+pub(crate) fn nightly_number(tag: &str) -> Option<u64> {
     let number = tag.strip_prefix('b')?;
     if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -519,7 +519,7 @@ fn display_platform(platform: &str) -> &str {
     }
 }
 
-fn parse_github_timestamp(value: &str) -> Option<i64> {
+pub(crate) fn parse_github_timestamp(value: &str) -> Option<i64> {
     let bytes = value.as_bytes();
     if bytes.len() != 20
         || bytes[4] != b'-'

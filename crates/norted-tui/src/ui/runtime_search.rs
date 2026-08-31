@@ -73,6 +73,28 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         layout.runtime_search_submit,
     );
 
+    let toggle_style = if app.runtime_search_focus == RuntimeSearchFocus::IncompatibleToggle {
+        theme.focused
+    } else if app.hover == Some(HoverTarget::RuntimeSearchIncompatibleToggle) {
+        theme.hovered
+    } else {
+        theme.text
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "[{}] Show incompatible",
+                if app.runtime_search_show_incompatible {
+                    "x"
+                } else {
+                    " "
+                }
+            ),
+            toggle_style,
+        ))),
+        layout.runtime_search_incompatible_toggle,
+    );
+
     render_results(frame, app, theme, glyphs, layout, result_count);
     render_details(frame, app, theme, layout);
     render_action(frame, app, theme, layout);
@@ -108,10 +130,18 @@ fn render_results(
         return;
     };
     if result_count == 0 {
-        let detail = if app.runtime_search_query.is_empty() {
-            "No compatible runtime candidates were returned by the configured providers."
+        let hidden = app.runtime_search_hidden_incompatible_count();
+        let detail = if hidden > 0 {
+            format!(
+                "{hidden} incompatible result{} hidden. Enable Show incompatible to reveal {}.",
+                if hidden == 1 { " is" } else { "s are" },
+                if hidden == 1 { "it" } else { "them" }
+            )
+        } else if app.runtime_search_query.is_empty() {
+            "No runtime candidates were returned by the configured providers.".to_owned()
         } else {
             "No fetched runtime matches this filter. Press Enter to search providers with it."
+                .to_owned()
         };
         frame.render_widget(
             Paragraph::new(vec![
@@ -268,14 +298,44 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
             theme,
         ));
         let build_needs = match source_build.recipe.build_system {
-            RuntimeSourceBuildSystem::Cmake => format!(
-                "CMake >= {}, CUDA >= {}, Ninja, C++20, pkg-config",
-                source_build.prerequisites.minimum_cmake_version,
-                source_build.prerequisites.minimum_cuda_version
-            ),
+            RuntimeSourceBuildSystem::Cmake => {
+                let mut needs = vec![
+                    format!(
+                        "CMake >= {}",
+                        source_build.prerequisites.minimum_cmake_version
+                    ),
+                    source_build
+                        .prerequisites
+                        .minimum_cuda_version
+                        .as_deref()
+                        .map_or_else(
+                            || "CUDA toolkit/nvcc".to_owned(),
+                            |version| format!("CUDA >= {version}"),
+                        ),
+                ];
+                if source_build.prerequisites.requires_ninja {
+                    needs.push("Ninja".to_owned());
+                }
+                if let Some(standard) = source_build.prerequisites.minimum_cpp_standard {
+                    needs.push(format!("C++{standard}"));
+                } else if source_build.prerequisites.requires_cpp20_compiler {
+                    needs.push("C++20".to_owned());
+                }
+                if source_build.prerequisites.requires_pkg_config {
+                    needs.push("pkg-config".to_owned());
+                }
+                needs.join(", ")
+            }
             RuntimeSourceBuildSystem::Make => format!(
-                "Make, CUDA >= {} via {}, {} with C++{}",
-                source_build.prerequisites.minimum_cuda_version,
+                "Make, {} via {}, {} with C++{}",
+                source_build
+                    .prerequisites
+                    .minimum_cuda_version
+                    .as_deref()
+                    .map_or_else(
+                        || "CUDA toolkit".to_owned(),
+                        |version| format!("CUDA >= {version}"),
+                    ),
                 source_build
                     .prerequisites
                     .cuda_compiler
@@ -371,7 +431,7 @@ fn render_action(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLay
     } else {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "Tab focus  Up/Down or j/k select  F5 refresh  Esc close",
+                "Tab focus  Space toggle  Up/Down or j/k select  F5 refresh  Esc close",
                 theme.hint,
             ))),
             layout.runtime_operation_status,

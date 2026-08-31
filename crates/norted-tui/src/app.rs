@@ -12,7 +12,8 @@ use norted_core::{
 };
 use norted_engine::{
     BackendLifecycle, BackendLoadProgress, ControlStatus, RuntimeListSnapshot,
-    RuntimeModelCandidate, RuntimeNoticeLevel, RuntimeSearchSnapshot, RuntimeUpdateCheck,
+    RuntimeModelCandidate, RuntimeNoticeLevel, RuntimeSearchResult, RuntimeSearchSnapshot,
+    RuntimeUpdateCheck,
 };
 use ratatui::layout::Position;
 
@@ -68,6 +69,7 @@ pub enum Overlay {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum RuntimeSearchFocus {
     Query,
+    IncompatibleToggle,
     Results,
 }
 
@@ -296,6 +298,7 @@ pub struct App {
     pub runtime_search_query: String,
     pub runtime_search_cursor: usize,
     pub runtime_search_focus: RuntimeSearchFocus,
+    pub runtime_search_show_incompatible: bool,
     pub selected_runtime_search_result: Option<usize>,
     pub runtime_search_scroll: usize,
     pub runtime_search_context: Option<String>,
@@ -394,6 +397,7 @@ impl App {
             runtime_search_query: String::new(),
             runtime_search_cursor: 0,
             runtime_search_focus: RuntimeSearchFocus::Query,
+            runtime_search_show_incompatible: false,
             selected_runtime_search_result: None,
             runtime_search_scroll: 0,
             runtime_search_context: None,
@@ -1170,41 +1174,68 @@ impl App {
         let Some(search) = &self.runtime_search else {
             return Vec::new();
         };
-        let terms = self
-            .runtime_search_query
-            .split_whitespace()
-            .map(str::to_ascii_lowercase)
-            .collect::<Vec<_>>();
         search
             .results
             .iter()
             .enumerate()
             .filter_map(|(index, result)| {
-                let available = &result.entry.available;
-                let formats = available
-                    .supported_formats
-                    .iter()
-                    .map(|format| format.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let haystack = format!(
-                    "{} {} {} {} {} {} {} {}",
-                    available.display_name,
-                    available.runtime_id,
-                    available.identity.engine_id,
-                    available.identity.package_family,
-                    available.identity.version,
-                    available.identity.accelerator,
-                    available.identity.variant,
-                    formats,
-                )
-                .to_ascii_lowercase();
-                terms
-                    .iter()
-                    .all(|term| haystack.contains(term))
-                    .then_some(index)
+                (self.runtime_search_show_incompatible
+                    || !matches!(
+                        result.entry.compatibility,
+                        RuntimeCompatibility::Incompatible(_)
+                    ))
+                .then_some(())
+                .filter(|_| self.runtime_search_result_matches_query(result))
+                .map(|_| index)
             })
             .collect()
+    }
+
+    pub fn runtime_search_hidden_incompatible_count(&self) -> usize {
+        if self.runtime_search_show_incompatible {
+            return 0;
+        }
+        self.runtime_search
+            .as_ref()
+            .map(|search| {
+                search
+                    .results
+                    .iter()
+                    .filter(|result| {
+                        matches!(
+                            result.entry.compatibility,
+                            RuntimeCompatibility::Incompatible(_)
+                        ) && self.runtime_search_result_matches_query(result)
+                    })
+                    .count()
+            })
+            .unwrap_or_default()
+    }
+
+    fn runtime_search_result_matches_query(&self, result: &RuntimeSearchResult) -> bool {
+        let available = &result.entry.available;
+        let formats = available
+            .supported_formats
+            .iter()
+            .map(|format| format.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let haystack = format!(
+            "{} {} {} {} {} {} {} {}",
+            available.display_name,
+            available.runtime_id,
+            available.identity.engine_id,
+            available.identity.package_family,
+            available.identity.version,
+            available.identity.accelerator,
+            available.identity.variant,
+            formats,
+        )
+        .to_ascii_lowercase();
+        self.runtime_search_query
+            .split_whitespace()
+            .map(str::to_ascii_lowercase)
+            .all(|term| haystack.contains(&term))
     }
 
     pub fn runtime_picker_indices(&self) -> Vec<usize> {
@@ -2264,6 +2295,7 @@ impl App {
             }
             Some(
                 HoverTarget::RuntimeSearchInput
+                | HoverTarget::RuntimeSearchIncompatibleToggle
                 | HoverTarget::RuntimeSearchResult(_)
                 | HoverTarget::RuntimeSearchSubmit
                 | HoverTarget::RuntimeInstall
@@ -2310,14 +2342,30 @@ impl App {
                 Update::Render
             }
             KeyCode::Tab | KeyCode::BackTab => {
-                self.runtime_search_focus = match self.runtime_search_focus {
-                    RuntimeSearchFocus::Query => RuntimeSearchFocus::Results,
-                    RuntimeSearchFocus::Results => RuntimeSearchFocus::Query,
+                self.runtime_search_focus = match (key.code, self.runtime_search_focus) {
+                    (KeyCode::Tab, RuntimeSearchFocus::Query) => {
+                        RuntimeSearchFocus::IncompatibleToggle
+                    }
+                    (KeyCode::Tab, RuntimeSearchFocus::IncompatibleToggle) => {
+                        RuntimeSearchFocus::Results
+                    }
+                    (KeyCode::Tab, RuntimeSearchFocus::Results) => RuntimeSearchFocus::Query,
+                    (KeyCode::BackTab, RuntimeSearchFocus::Query) => RuntimeSearchFocus::Results,
+                    (KeyCode::BackTab, RuntimeSearchFocus::IncompatibleToggle) => {
+                        RuntimeSearchFocus::Query
+                    }
+                    (KeyCode::BackTab, RuntimeSearchFocus::Results) => {
+                        RuntimeSearchFocus::IncompatibleToggle
+                    }
+                    _ => unreachable!("runtime search handles only Tab and BackTab here"),
                 };
                 Update::Render
             }
             _ => match self.runtime_search_focus {
                 RuntimeSearchFocus::Query => self.handle_runtime_search_query_key(key),
+                RuntimeSearchFocus::IncompatibleToggle => {
+                    self.handle_runtime_search_toggle_key(key, layout)
+                }
                 RuntimeSearchFocus::Results => self.handle_runtime_search_result_key(key, layout),
             },
         }
@@ -2606,6 +2654,22 @@ impl App {
         }
     }
 
+    fn handle_runtime_search_toggle_key(&mut self, key: KeyEvent, layout: &UiLayout) -> Update {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_runtime_search_incompatible(layout),
+            KeyCode::Up => {
+                self.runtime_search_focus = RuntimeSearchFocus::Query;
+                Update::Render
+            }
+            KeyCode::Down if !self.runtime_search_indices().is_empty() => {
+                self.runtime_search_focus = RuntimeSearchFocus::Results;
+                Update::Render
+            }
+            KeyCode::F(5) => self.request_runtime_search(true),
+            _ => Update::None,
+        }
+    }
+
     fn handle_runtime_search_click(&mut self, position: Position, layout: &UiLayout) -> Update {
         match layout.hit_test(position) {
             Some(HoverTarget::RuntimeSearchInput) => {
@@ -2618,6 +2682,9 @@ impl App {
                 Update::Render
             }
             Some(HoverTarget::RuntimeSearchSubmit) => self.request_runtime_search(false),
+            Some(HoverTarget::RuntimeSearchIncompatibleToggle) => {
+                self.toggle_runtime_search_incompatible(layout)
+            }
             Some(HoverTarget::RuntimeInstall) => self.request_runtime_install(),
             _ => Update::None,
         }
@@ -2631,6 +2698,8 @@ impl App {
             self.runtime_search_query.clear();
         }
         self.runtime_search_model = None;
+        self.runtime_search_show_incompatible = false;
+        self.reconcile_runtime_search_selection();
         self.overlay = Some(Overlay::RuntimeSearch);
         self.pending_runtime_remove_confirmation = None;
         self.hover = None;
@@ -2660,6 +2729,7 @@ impl App {
             model.display_name
         ));
         self.runtime_search_model = Some(Box::new(model));
+        self.runtime_search_show_incompatible = false;
         self.runtime_search_query = format;
         self.runtime_search_cursor = self.runtime_search_query.chars().count();
         self.reconcile_runtime_search_selection();
@@ -2909,6 +2979,46 @@ impl App {
         self.runtime_search_scroll = self
             .runtime_search_scroll
             .min(indices.len().saturating_sub(1));
+    }
+
+    fn toggle_runtime_search_incompatible(&mut self, layout: &UiLayout) -> Update {
+        let previous = self.selected_runtime_search_result;
+        self.runtime_search_show_incompatible = !self.runtime_search_show_incompatible;
+        let indices = self.runtime_search_indices();
+        if indices.is_empty() {
+            self.selected_runtime_search_result = None;
+            self.runtime_search_scroll = 0;
+            self.runtime_search_focus = RuntimeSearchFocus::IncompatibleToggle;
+            return Update::Render;
+        }
+
+        let selected = previous
+            .filter(|selected| indices.contains(selected))
+            .or_else(|| {
+                previous.and_then(|selected| {
+                    indices
+                        .iter()
+                        .copied()
+                        .min_by_key(|candidate| candidate.abs_diff(selected))
+                })
+            })
+            .or_else(|| indices.first().copied());
+        self.selected_runtime_search_result = selected;
+
+        let capacity = layout.runtime_search_capacity().max(1);
+        let max_scroll = indices.len().saturating_sub(capacity);
+        self.runtime_search_scroll = self.runtime_search_scroll.min(max_scroll);
+        if let Some(position) = selected
+            .and_then(|selected| indices.iter().position(|candidate| *candidate == selected))
+        {
+            if position < self.runtime_search_scroll {
+                self.runtime_search_scroll = position;
+            } else if position >= self.runtime_search_scroll + capacity {
+                self.runtime_search_scroll = position + 1 - capacity;
+            }
+        }
+        self.runtime_search_focus = RuntimeSearchFocus::IncompatibleToggle;
+        Update::Render
     }
 
     fn move_runtime_search_selection(&mut self, direction: isize, layout: &UiLayout) -> Update {

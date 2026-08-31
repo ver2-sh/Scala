@@ -486,12 +486,14 @@ impl RuntimeInstaller {
             let build_system = plan.recipe.build_system;
             let build_target = plan.recipe.build_target.clone();
             let build_definition_sha256 = plan.recipe.build_definition_sha256.clone();
+            let cmake_configuration_arguments = plan.recipe.cmake_configuration_arguments.clone();
             tokio::task::spawn_blocking(move || {
                 inspect_build_dependency_contract(
                     &audit_root,
                     build_system,
                     &build_target,
                     build_definition_sha256.as_deref(),
+                    &cmake_configuration_arguments,
                 )
             })
             .await
@@ -1062,11 +1064,9 @@ async fn check_source_build_prerequisites(
         .ok_or_else(|| {
             RuntimeInstallError::Prerequisite("could not parse `nvcc --version`".to_owned())
         })?;
-    require_minimum_version(
-        "CUDA Toolkit",
-        &nvcc_version,
-        &plan.prerequisites.minimum_cuda_version,
-    )?;
+    if let Some(minimum) = &plan.prerequisites.minimum_cuda_version {
+        require_minimum_version("CUDA Toolkit", &nvcc_version, minimum)?;
+    }
 
     let pkg_config_identity = if plan.prerequisites.requires_pkg_config {
         command_text("pkg-config", &["--version"], None).await?
@@ -1370,6 +1370,7 @@ fn inspect_build_dependency_contract(
     build_system: RuntimeSourceBuildSystem,
     build_target: &str,
     build_definition_sha256: Option<&str>,
+    cmake_configuration_arguments: &[String],
 ) -> Result<(), RuntimeInstallError> {
     if build_system == RuntimeSourceBuildSystem::Make {
         return inspect_make_build_contract(
@@ -1383,6 +1384,12 @@ fn inspect_build_dependency_contract(
             })?,
         );
     }
+    let fetch_content_disconnected = cmake_configuration_arguments
+        .iter()
+        .any(|argument| argument == "-DFETCHCONTENT_FULLY_DISCONNECTED=ON")
+        && cmake_configuration_arguments
+            .iter()
+            .any(|argument| argument == "-DFETCHCONTENT_UPDATES_DISCONNECTED=ON");
     let mut files = 0_usize;
     let mut bytes = 0_u64;
     for entry in walkdir::WalkDir::new(source_root).follow_links(false) {
@@ -1416,23 +1423,25 @@ fn inspect_build_dependency_contract(
         let contents = std::fs::read_to_string(path)
             .map_err(|error| RuntimeInstallError::SourceBuild(error.to_string()))?;
         let normalized = contents.to_ascii_lowercase();
-        let forbidden = [
-            "fetchcontent",
-            "externalproject",
-            "file(download",
-            "git clone",
-            "http://",
-            "https://",
-        ];
-        if let Some(directive) = forbidden
-            .iter()
-            .find(|directive| normalized.contains(**directive))
-        {
-            return Err(RuntimeInstallError::SourceBuild(format!(
-                "source build dependency audit rejected `{}` in {}",
-                directive,
-                path.strip_prefix(source_root).unwrap_or(path).display()
-            )));
+        if !fetch_content_disconnected {
+            let forbidden = [
+                "fetchcontent",
+                "externalproject",
+                "file(download",
+                "git clone",
+                "http://",
+                "https://",
+            ];
+            if let Some(directive) = forbidden
+                .iter()
+                .find(|directive| normalized.contains(**directive))
+            {
+                return Err(RuntimeInstallError::SourceBuild(format!(
+                    "source build dependency audit rejected `{}` in {}",
+                    directive,
+                    path.strip_prefix(source_root).unwrap_or(path).display()
+                )));
+            }
         }
     }
     if files == 0 {
@@ -2335,6 +2344,7 @@ mod tests {
             RuntimeSourceBuildSystem::Cmake,
             "fixture",
             None,
+            &[],
         )
         .expect("local-only CMake tree");
 
@@ -2350,6 +2360,7 @@ mod tests {
                 RuntimeSourceBuildSystem::Cmake,
                 "fixture",
                 None,
+                &[],
             ),
             Err(RuntimeInstallError::SourceBuild(message)) if message.contains("dependency audit rejected")
         ));
@@ -2367,6 +2378,7 @@ mod tests {
             Some(&hex_digest(Sha256::digest(
                 b"build/q27-server:\n\t$(NVCC) server.cu -o $@\n",
             ))),
+            &[],
         )
         .expect("declared local-only Make target");
         assert!(matches!(
@@ -2377,6 +2389,7 @@ mod tests {
                 Some(&hex_digest(Sha256::digest(
                     b"build/q27-server:\n\t$(NVCC) server.cu -o $@\n",
                 ))),
+                &[],
             ),
             Err(RuntimeInstallError::SourceBuild(message)) if message.contains("does not declare")
         ));
@@ -2400,6 +2413,7 @@ mod tests {
                 RuntimeSourceBuildSystem::Make,
                 "build/q27-server",
                 Some(&audited_digest),
+                &[],
             ),
             Err(RuntimeInstallError::SourceBuild(message))
                 if message.contains("provider-audited dependency/command closure")

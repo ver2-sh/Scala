@@ -1385,6 +1385,7 @@ fn ninfer_device_evaluation(
                 platform: host.platform.clone(),
                 architecture: host.architecture.clone(),
                 accelerators: vec![device.clone()],
+                nvidia_gpu_absence_confirmed: false,
                 cuda_visible_devices: None,
                 observations: Vec::new(),
             };

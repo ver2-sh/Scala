@@ -16,6 +16,7 @@ pub enum HoverTarget {
     RuntimeSearchAction,
     RuntimeUpdateAction,
     RuntimeSearchInput,
+    RuntimeSearchIncompatibleToggle,
     RuntimeSearchResult(usize),
     RuntimeSearchSubmit,
     RuntimeInstall,
@@ -49,6 +50,7 @@ pub struct UiLayout {
     pub runtime_update_action: Rect,
     pub runtime_search_popup: Option<Rect>,
     pub runtime_search_input: Rect,
+    pub runtime_search_incompatible_toggle: Rect,
     pub runtime_search_results: Rect,
     pub runtime_search_rows: Vec<(usize, Rect)>,
     pub runtime_search_details: Rect,
@@ -215,6 +217,7 @@ impl UiLayout {
 
         let mut runtime_search_popup = None;
         let mut runtime_search_input = Rect::default();
+        let mut runtime_search_incompatible_toggle = Rect::default();
         let mut runtime_search_results = Rect::default();
         let mut runtime_search_details = Rect::default();
         let mut runtime_search_submit = Rect::default();
@@ -257,6 +260,12 @@ impl UiLayout {
                     inner.y,
                     submit_width,
                     u16::from(inner.height > 0),
+                );
+                runtime_search_incompatible_toggle = Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(1),
+                    inner.width.min(24),
+                    u16::from(inner.height > 1),
                 );
             }
             let body = Rect::new(
@@ -426,6 +435,7 @@ impl UiLayout {
             runtime_update_action,
             runtime_search_popup,
             runtime_search_input,
+            runtime_search_incompatible_toggle,
             runtime_search_results,
             runtime_search_rows,
             runtime_search_details,
@@ -457,6 +467,11 @@ impl UiLayout {
             }
             if !self.runtime_picker_active && contains(self.runtime_search_submit, position) {
                 return Some(HoverTarget::RuntimeSearchSubmit);
+            }
+            if !self.runtime_picker_active
+                && contains(self.runtime_search_incompatible_toggle, position)
+            {
+                return Some(HoverTarget::RuntimeSearchIncompatibleToggle);
             }
             if contains(self.runtime_install_action, position) {
                 return Some(if self.runtime_picker_active {

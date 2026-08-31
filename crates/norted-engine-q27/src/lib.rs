@@ -654,7 +654,7 @@ fn q27_source_build_plan(
         },
         prerequisites: RuntimeSourceBuildPrerequisites {
             minimum_cmake_version: String::new(),
-            minimum_cuda_version: source.minimum_cuda_version.clone(),
+            minimum_cuda_version: Some(source.minimum_cuda_version.clone()),
             requires_ninja: false,
             requires_cpp20_compiler: false,
             requires_make: true,
@@ -1266,6 +1266,7 @@ fn q27_device_evaluation(
                 platform: host.platform.clone(),
                 architecture: host.architecture.clone(),
                 accelerators: vec![device.clone()],
+                nvidia_gpu_absence_confirmed: false,
                 cuda_visible_devices: None,
                 observations: Vec::new(),
             };
