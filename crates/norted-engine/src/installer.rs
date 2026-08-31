@@ -1067,6 +1067,8 @@ async fn check_source_build_prerequisites(
     if let Some(minimum) = &plan.prerequisites.minimum_cuda_version {
         require_minimum_version("CUDA Toolkit", &nvcc_version, minimum)?;
     }
+    verify_explicit_cuda_architectures(nvcc_program, &plan.recipe.cmake_configuration_arguments)
+        .await?;
 
     let pkg_config_identity = if plan.prerequisites.requires_pkg_config {
         command_text("pkg-config", &["--version"], None).await?
@@ -1096,6 +1098,106 @@ async fn check_source_build_prerequisites(
         pkg_config_version: first_line(&pkg_config_identity),
         system_dependencies,
     })
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct RequiredCudaCompilerTargets {
+    real: Vec<String>,
+    virtual_targets: Vec<String>,
+}
+
+async fn verify_explicit_cuda_architectures(
+    nvcc_program: &str,
+    cmake_arguments: &[String],
+) -> Result<(), RuntimeInstallError> {
+    let Some(required) = required_cuda_compiler_targets(cmake_arguments)? else {
+        return Ok(());
+    };
+    if !required.real.is_empty() {
+        let supported = command_text(nvcc_program, &["--list-gpu-code"], None).await?;
+        require_cuda_compiler_targets("real", &required.real, &supported)?;
+    }
+    if !required.virtual_targets.is_empty() {
+        let supported = command_text(nvcc_program, &["--list-gpu-arch"], None).await?;
+        require_cuda_compiler_targets("virtual", &required.virtual_targets, &supported)?;
+    }
+    Ok(())
+}
+
+fn required_cuda_compiler_targets(
+    cmake_arguments: &[String],
+) -> Result<Option<RequiredCudaCompilerTargets>, RuntimeInstallError> {
+    const PREFIX: &str = "-DCMAKE_CUDA_ARCHITECTURES=";
+    let configured = cmake_arguments
+        .iter()
+        .filter_map(|argument| argument.strip_prefix(PREFIX))
+        .collect::<Vec<_>>();
+    let [architectures] = configured.as_slice() else {
+        return if configured.is_empty() {
+            Ok(None)
+        } else {
+            Err(RuntimeInstallError::Prerequisite(
+                "the source recipe contains multiple CMAKE_CUDA_ARCHITECTURES policies".to_owned(),
+            ))
+        };
+    };
+    if matches!(
+        architectures.to_ascii_lowercase().as_str(),
+        "all" | "all-major" | "native" | "off"
+    ) {
+        return Ok(None);
+    }
+
+    let mut required = RequiredCudaCompilerTargets::default();
+    for configured in architectures.split(';') {
+        let (architecture, real, virtual_target) =
+            if let Some(architecture) = configured.strip_suffix("-real") {
+                (architecture, true, false)
+            } else if let Some(architecture) = configured.strip_suffix("-virtual") {
+                (architecture, false, true)
+            } else {
+                (configured, true, true)
+            };
+        let numeric = architecture.trim_end_matches(['a', 'f']);
+        if numeric.is_empty()
+            || architecture.len().saturating_sub(numeric.len()) > 1
+            || !numeric.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(RuntimeInstallError::Prerequisite(format!(
+                "source recipe has unsupported explicit CUDA architecture `{configured}`"
+            )));
+        }
+        if real {
+            required.real.push(format!("sm_{architecture}"));
+        }
+        if virtual_target {
+            required
+                .virtual_targets
+                .push(format!("compute_{architecture}"));
+        }
+    }
+    Ok(Some(required))
+}
+
+fn require_cuda_compiler_targets(
+    kind: &str,
+    required: &[String],
+    supported: &str,
+) -> Result<(), RuntimeInstallError> {
+    let supported = supported.split_whitespace().collect::<HashSet<_>>();
+    let missing = required
+        .iter()
+        .filter(|target| !supported.contains(target.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(RuntimeInstallError::Prerequisite(format!(
+            "the installed CUDA compiler cannot build required {kind} target(s): {}",
+            missing.join(", ")
+        )))
+    }
 }
 
 async fn probe_cpp_compiler(program: &str, standard: u16) -> Result<(), RuntimeInstallError> {
@@ -2189,9 +2291,44 @@ mod tests {
 
     use super::{
         RuntimeInstallError, extract_archive, hex_digest, inspect_build_dependency_contract,
-        run_owned_staging_operation, run_source_command, validate_relative_link_target,
-        verify_package_digest, verify_source_checkout,
+        require_cuda_compiler_targets, required_cuda_compiler_targets, run_owned_staging_operation,
+        run_source_command, validate_relative_link_target, verify_package_digest,
+        verify_source_checkout,
     };
+
+    #[test]
+    fn explicit_cuda_architectures_are_checked_against_nvcc_targets() {
+        let arguments = vec![
+            "-G".to_owned(),
+            "Ninja".to_owned(),
+            "-DCMAKE_CUDA_ARCHITECTURES=75-real;90-virtual;120a".to_owned(),
+        ];
+        let required = required_cuda_compiler_targets(&arguments)
+            .expect("valid CUDA policy")
+            .expect("explicit CUDA policy");
+        assert_eq!(required.real, ["sm_75", "sm_120a"]);
+        assert_eq!(required.virtual_targets, ["compute_90", "compute_120a"]);
+        require_cuda_compiler_targets("real", &required.real, "sm_75\nsm_90\nsm_120a\n")
+            .expect("all real targets supported");
+        assert!(matches!(
+            require_cuda_compiler_targets("real", &required.real, "sm_75\nsm_90\n"),
+            Err(RuntimeInstallError::Prerequisite(message))
+                if message.contains("sm_120a")
+        ));
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_cuda_architecture_policies_fail_closed() {
+        for architecture in ["", "120aa", "sm_120", "75-real;"] {
+            let arguments = [format!("-DCMAKE_CUDA_ARCHITECTURES={architecture}")];
+            assert!(required_cuda_compiler_targets(&arguments).is_err());
+        }
+        let duplicate = [
+            "-DCMAKE_CUDA_ARCHITECTURES=75-real".to_owned(),
+            "-DCMAKE_CUDA_ARCHITECTURES=120a-real".to_owned(),
+        ];
+        assert!(required_cuda_compiler_targets(&duplicate).is_err());
+    }
 
     #[tokio::test]
     async fn blocking_staging_writer_retains_cleanup_ownership_after_caller_cancellation() {
