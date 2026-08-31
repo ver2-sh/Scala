@@ -226,6 +226,31 @@ cargo run -p norted-server
 cargo run -p norted-server -- tui
 ```
 
+### Root helper scripts
+
+The repository includes small wrappers for common build, run, and validation commands. The normal
+production workflow is:
+
+```console
+./build-production.sh
+./run-tui-production.sh
+```
+
+Production helpers use Cargo's release profile; development helpers use the development profile:
+
+```console
+./build-development.sh
+./run-tui-development.sh
+./run-server-production.sh
+./run-server-development.sh
+./validate.sh
+```
+
+The TUI normally owns the serving stack automatically, so it does not require a separate `serve`
+process. Use `run-server-production.sh` or `run-server-development.sh` only when intentionally
+running headless. Build options can be passed to the build helpers, and run options are forwarded
+after the `tui` or `serve` subcommand.
+
 Development builds optimize the SHA-256 dependency used for package verification, but production
 Norted Server builds should still use the release profile:
 
