@@ -996,10 +996,12 @@ fn render_settings(
             );
             let strategy = if let Some(q27) = &profile.engine.q27 {
                 format!(
-                    "q27 KV {} · fast-head {} (override {}) · MTP {} pmin {} · suffix {} / W_MAX {}",
+                    "q27 KV {} · fast-head {} (override {}) · MTP enabled {} / required {} / max {} / pmin {} · suffix {} / W_MAX {}",
                     q27.kv_quality_order.join(" → "),
                     q27.fast_head.default,
                     q27.fast_head.user_override_allowed,
+                    q27.mtp.enabled,
+                    q27.mtp.required,
                     q27.mtp.maximum_depth,
                     q27.mtp.minimum_probability,
                     q27.suffix_drafting,

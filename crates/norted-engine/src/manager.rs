@@ -1337,6 +1337,11 @@ impl RuntimeManager {
                         .get("sharp_application")
                         .and_then(serde_json::Value::as_str)
                         == Some("pretokenized-raw-prompt")
+                        && selected_serve_profile
+                            .as_ref()
+                            .and_then(|profile| profile.prompt.template.as_ref())
+                            .zip(package.binding.sharp.as_ref())
+                            .is_some_and(|(selected, packaged)| selected.sha256 == packaged.sha256)
                     {
                         package.sharp_applied = Some(true);
                     }
