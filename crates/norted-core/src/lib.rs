@@ -10,6 +10,7 @@ mod norted_package;
 mod provenance;
 mod runtime;
 mod runtime_pack;
+mod serve_profile;
 mod state;
 
 pub use auth::{
@@ -37,13 +38,12 @@ pub use model::{
 pub use norted_package::{
     NinferBenchmarkProfile, NinferPackagePolicy, NortedPackageBinding, NortedPackageFile,
     NortedPackageKind, NortedPackagePolicy, NortedPackageStatus, Q27PackagePolicy,
-    apply_norted_package_load_policy,
 };
 pub use provenance::{
-    AcquisitionMethod, AuxiliaryRuntimeIdentity, BuildProvenance, EngineInstallation,
-    EngineRevision, EnvironmentVariableProvenance, LoadSettingsProvenance, ModelRuntimeIdentity,
-    NativeArgumentProvenance, NortedPackageRuntimeIdentity, ProcessIdentity, RuntimeProvenance,
-    ToolchainProvenance,
+    AcquisitionMethod, AuxiliaryRuntimeIdentity, BuildProvenance, BuilderRecommendationStatus,
+    EngineInstallation, EngineRevision, EnvironmentVariableProvenance, LoadSettingsProvenance,
+    ModelRuntimeIdentity, NativeArgumentProvenance, NortedPackageRuntimeIdentity, ProcessIdentity,
+    RuntimeProvenance, ServeProfileRuntimeIdentity, ToolchainProvenance,
 };
 pub use runtime::{
     RuntimeDescriptor, RuntimeObservationError, RuntimePublisher, observe_runtime,
@@ -61,5 +61,13 @@ pub use runtime_pack::{
     RuntimeSourceBuildPrerequisites, RuntimeSourceBuildProvenance, RuntimeSourceBuildRecipe,
     RuntimeSourceBuildSystem, RuntimeSourceBuildToolchain, RuntimeSourceSnapshot,
     RuntimeUpdatePreference, RuntimeUpdateState, is_full_git_sha, is_safe_relative_path,
+};
+pub use serve_profile::{
+    ContextPolicy, ExternalTemplateReference, GenerationDefaults, NinferServeStrategy,
+    NinferSpeculativeProfile, PromptDelivery, PromptMode, Q27MtpStrategy, Q27ServeStrategy,
+    ResponseFilter, SERVE_PROFILE_SCHEMA, SERVE_PROFILE_SCHEMA_VERSION, ServeCapability,
+    ServeEngineProfiles, ServeGenerationProfile, ServeLoadProfile, ServeProfile,
+    ServeProfileApplicability, ServeProfileSource, ServePromptProfile, ThinkingPolicy,
+    ToggleOverridePolicy, apply_serve_profile_load_policy, validate_profile_id,
 };
 pub use state::{AppSnapshot, ApplicationCore, RegistryState, ServerState};

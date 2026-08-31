@@ -746,22 +746,178 @@ pub fn profiles(
     json_output: bool,
 ) -> Result<()> {
     if json_output {
-        let profile = selected.and_then(|name| state.profiles.get(name).map(|value| (name, value)));
+        let profile = selected.and_then(|name| {
+            state.profiles.get(name).map(|value| {
+                let serve = value.effective_serve_profile(name);
+                let effective_requirements = serve.effective_requirements();
+                json!({
+                    "name": name,
+                    "serve_profile": serve,
+                    "effective_requirements": effective_requirements,
+                })
+            })
+        });
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "operation": operation,
                 "state_version": state.version,
-                "profile": profile.map(|(name, value)| json!({"name": name, "settings": value.settings})),
+                "profile": profile,
                 "profiles": state.profiles,
                 "model_assignments": state.model_assignments,
+                "builder_profile_assignments": state.builder_profile_assignments,
+                "raw_profile_models": state.raw_profile_models,
             }))?
         );
         return Ok(());
     }
     if let Some(name) = selected {
         let profile = &state.profiles[name];
-        println!("Profile {name}");
+        let serve = profile.effective_serve_profile(name);
+        println!("Serve Profile {} ({})", serve.display_name, serve.id);
+        println!("  Source:             {}", serve.source);
+        println!(
+            "  Access:             {}",
+            if serve.read_only {
+                "read-only"
+            } else {
+                "mutable"
+            }
+        );
+        if let Some(description) = &serve.description {
+            println!("  Description:        {description}");
+        }
+        println!(
+            "  Applicability:      {}{}{}",
+            if serve.applicability.artifact_formats.is_empty() {
+                "any format".to_owned()
+            } else {
+                serve
+                    .applicability
+                    .artifact_formats
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            serve
+                .applicability
+                .architecture
+                .as_ref()
+                .map(|value| format!(" · architecture {value}"))
+                .unwrap_or_default(),
+            serve
+                .applicability
+                .family
+                .as_ref()
+                .map(|value| format!(" · family {value}"))
+                .unwrap_or_default(),
+        );
+        println!(
+            "  Prompt:             {:?} · {:?} · template {} · generation-prompt={} · filter={:?}",
+            serve.prompt.mode,
+            serve.prompt.delivery,
+            serve
+                .prompt
+                .template
+                .as_ref()
+                .map(|template| format!("{} ({})", template.identity, template.path.display()))
+                .unwrap_or_else(|| "runtime/upstream default".to_owned()),
+            serve.prompt.render_generation_prompt,
+            serve.prompt.response_filter,
+        );
+        println!(
+            "  Generation:         temperature={} top_p={} top_k={} min_p={} reasoning={} thinking={}{}",
+            optional_value(serve.generation.defaults.temperature),
+            optional_value(serve.generation.defaults.top_p),
+            optional_value(serve.generation.defaults.top_k),
+            optional_value(serve.generation.defaults.min_p),
+            serve
+                .generation
+                .defaults
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("runtime default"),
+            serve.generation.thinking.default,
+            if serve.generation.thinking.required {
+                " (required)"
+            } else {
+                ""
+            },
+        );
+        println!(
+            "  Context:            preferred={} minimum={}",
+            optional_value(serve.load.context.preferred),
+            optional_value(serve.load.context.minimum),
+        );
+        if let Some(q27) = &serve.engine.q27 {
+            println!(
+                "  q27 strategy:       KV {} · MTP {} / pmin {} · suffix={} W_MAX={} · fast-head={} override={}",
+                q27.kv_quality_order.join(" -> "),
+                q27.mtp.maximum_depth,
+                q27.mtp.minimum_probability,
+                q27.suffix_drafting,
+                q27.suffix_width_from_runtime_w_max,
+                q27.fast_head.default,
+                q27.fast_head.user_override_allowed,
+            );
+        }
+        if let Some(ninfer) = &serve.engine.ninfer {
+            println!(
+                "  NInfer strategy:    KV {}/{} · CUDA graph={} · prefix reuse={} · default strategy={} · speculative profiles={}",
+                ninfer.kv_cache,
+                ninfer.kv_dtype,
+                ninfer.cuda_graph_required,
+                ninfer.prefix_reuse_required,
+                ninfer.default_speculative_profile,
+                ninfer
+                    .speculative_profiles
+                    .iter()
+                    .map(|(name, profile)| format!(
+                        "{name}={}",
+                        if profile.speculative_decoding {
+                            format!(
+                                "{}/{}{}",
+                                profile.backend.as_deref().unwrap_or("missing-backend"),
+                                profile
+                                    .draft_tokens
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "missing-drafts".to_owned()),
+                                if profile.optimized_proposal_head == Some(true) {
+                                    "/lm-head-draft"
+                                } else {
+                                    ""
+                                }
+                            )
+                        } else {
+                            "off".to_owned()
+                        }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        let requirements = serve.effective_requirements();
+        println!(
+            "  Requirements:       {}",
+            if requirements.is_empty() {
+                "none".to_owned()
+            } else {
+                requirements
+                    .iter()
+                    .map(|value| format!("{value:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
+        println!(
+            "  Allowed overrides:  {}",
+            if serve.generation.allowed_user_overrides.is_empty() {
+                "none".to_owned()
+            } else {
+                serve.generation.allowed_user_overrides.join(", ")
+            }
+        );
         if profile.settings.is_empty() {
             println!("  No overrides; all values inherit.");
         } else {
@@ -769,11 +925,19 @@ pub fn profiles(
                 println!("  {id:<38} {value}");
             }
         }
-        let models = state
+        let mut models = state
             .model_assignments
             .iter()
             .filter_map(|(model, assigned)| (assigned == name).then_some(model))
             .collect::<Vec<_>>();
+        models.extend(
+            state
+                .builder_profile_assignments
+                .iter()
+                .filter_map(|(model, assigned)| (assigned == name.as_str()).then_some(model)),
+        );
+        models.sort();
+        models.dedup();
         if !models.is_empty() {
             println!(
                 "  Assigned models: {}",
@@ -785,17 +949,74 @@ pub fn profiles(
             );
         }
     } else if state.profiles.is_empty() {
-        println!("No load profiles exist.");
+        println!("No Serve Profiles exist.");
     } else {
-        println!("{:<32} {:>9}  ASSIGNED MODELS", "PROFILE", "SETTINGS");
+        println!(
+            "{:<32} {:<18} {:<10} ASSIGNED MODELS",
+            "SERVE PROFILE", "SOURCE", "ACCESS"
+        );
         for (name, profile) in &state.profiles {
             let assigned = state
                 .model_assignments
                 .values()
                 .filter(|candidate| *candidate == name)
-                .count();
-            println!("{name:<32} {:>9}  {assigned}", profile.settings.0.len());
+                .count()
+                + state
+                    .builder_profile_assignments
+                    .values()
+                    .filter(|candidate| candidate.as_str() == name.as_str())
+                    .count();
+            let serve = profile.effective_serve_profile(name);
+            println!(
+                "{name:<32} {:<18} {:<10} {assigned}",
+                serve.source,
+                if serve.read_only {
+                    "read-only"
+                } else {
+                    "mutable"
+                },
+            );
         }
+        if !state.raw_profile_models.is_empty() {
+            println!(
+                "None / Raw runtime defaults: {} model(s)",
+                state.raw_profile_models.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn optional_value<T: ToString>(value: Option<T>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "runtime default".to_owned())
+}
+
+pub fn profile_compatibility(
+    profile: &norted_core::ServeProfile,
+    model: &norted_core::ModelArtifact,
+    selection: &norted_core::RuntimeSelection,
+    compatibility: &norted_core::RuntimeCompatibility,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "model_id": model.id,
+                "artifact_format": model.format,
+                "profile": profile,
+                "runtime_id": selection.runtime.manifest.runtime_id,
+                "compatibility": compatibility,
+            }))?
+        );
+    } else {
+        println!("Serve Profile compatibility");
+        println!("  Model:       {} ({})", model.display_name, model.format);
+        println!("  Profile:     {} ({})", profile.display_name, profile.id);
+        println!("  Runtime:     {}", selection.runtime.manifest.runtime_id);
+        println!("  Status:      {compatibility:?}");
     }
     Ok(())
 }

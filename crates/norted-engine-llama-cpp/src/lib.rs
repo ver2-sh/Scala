@@ -15,10 +15,11 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use norted_core::{
-    AcquisitionMethod, ArtifactFormat, EngineConfig, EngineInstallation, EngineRevision,
-    GpuOffload, HostCapabilities, InstalledRuntime, LoadSettingDefinition, LoadSettingId,
-    LoadSettingKind, LoadSettingScope, LoadSettingValue, LoadSettingsSchema, ModelArtifact,
-    RuntimeAcquisitionMethod, RuntimeId, RuntimeProbeObservation,
+    AcquisitionMethod, ArtifactFormat, AvailableRuntime, EngineConfig, EngineInstallation,
+    EngineRevision, GpuOffload, HostCapabilities, InstalledRuntime, LoadSettingDefinition,
+    LoadSettingId, LoadSettingKind, LoadSettingScope, LoadSettingValue, LoadSettingsSchema,
+    ModelArtifact, RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId,
+    RuntimeProbeObservation,
 };
 use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CompatibilityDecision,
@@ -76,6 +77,30 @@ const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &[
     "LLAMA_ARG_TOOLS",
     "LLAMA_ARG_MCP_CONFIG",
 ];
+
+fn llama_profile_compatibility(
+    artifact: CompatibilityDecision,
+    model: &ModelArtifact,
+    serve_profile: Option<&norted_core::ServeProfile>,
+) -> RuntimeCompatibility {
+    if let CompatibilityDecision::Unsupported { reason } = artifact {
+        return RuntimeCompatibility::Incompatible(reason);
+    }
+    let Some(profile) = serve_profile else {
+        return RuntimeCompatibility::Compatible;
+    };
+    if let Err(reason) = profile.basic_applicability(model) {
+        return RuntimeCompatibility::Incompatible(reason);
+    }
+    if profile.requires_runtime_recipe() {
+        RuntimeCompatibility::Incompatible(format!(
+            "Serve Profile `{}` requires prompt/generation/strategy capabilities that the llama.cpp adapter does not yet implement; choose None/raw defaults or a load-only Serve Profile",
+            profile.display_name
+        ))
+    } else {
+        RuntimeCompatibility::Compatible
+    }
+}
 
 const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "-m",
@@ -492,6 +517,26 @@ impl EngineAdapter for LlamaCppAdapter {
         }
     }
 
+    fn runtime_model_compatibility(
+        &self,
+        _runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        _host: &HostCapabilities,
+        serve_profile: Option<&norted_core::ServeProfile>,
+    ) -> RuntimeCompatibility {
+        llama_profile_compatibility(self.compatibility(model), model, serve_profile)
+    }
+
+    fn available_runtime_model_compatibility(
+        &self,
+        _runtime: &AvailableRuntime,
+        model: &ModelArtifact,
+        _host: &HostCapabilities,
+        serve_profile: Option<&norted_core::ServeProfile>,
+    ) -> RuntimeCompatibility {
+        llama_profile_compatibility(self.compatibility(model), model, serve_profile)
+    }
+
     fn native_options(&self) -> Vec<NativeOption> {
         vec![NativeOption {
             name: "arguments".to_owned(),
@@ -526,6 +571,7 @@ impl EngineAdapter for LlamaCppAdapter {
         runtime: &InstalledRuntime,
         _model: &ModelArtifact,
         _host: &HostCapabilities,
+        _serve_profile: Option<&norted_core::ServeProfile>,
     ) -> Result<LoadSettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
         let help = self.cached_runtime_help(runtime).await?;
@@ -820,6 +866,7 @@ impl EngineAdapter for LlamaCppAdapter {
             runtime: request.runtime,
             model: request.model,
             accelerator: request.accelerator,
+            serve_profile: request.serve_profile,
         })
     }
 
@@ -1899,6 +1946,7 @@ mod generation_settings_tests {
             &request(GenerationSettingsPatch {
                 temperature: Some(0.25),
                 top_p: Some(0.8),
+                reasoning_effort: None,
             }),
             false,
         );
@@ -1916,6 +1964,7 @@ mod generation_settings_tests {
                     &GenerationSettingsPatch {
                         temperature: Some(2.0),
                         top_p: Some(0.0),
+                        reasoning_effort: None,
                     },
                     &EffectiveGenerationSettings {
                         temperature: 0.8,
@@ -1928,18 +1977,22 @@ mod generation_settings_tests {
             GenerationSettingsPatch {
                 temperature: Some(-0.1),
                 top_p: None,
+                reasoning_effort: None,
             },
             GenerationSettingsPatch {
                 temperature: Some(2.1),
                 top_p: None,
+                reasoning_effort: None,
             },
             GenerationSettingsPatch {
                 temperature: None,
                 top_p: Some(1.1),
+                reasoning_effort: None,
             },
             GenerationSettingsPatch {
                 temperature: Some(f64::NAN),
                 top_p: None,
+                reasoning_effort: None,
             },
         ] {
             assert!(matches!(

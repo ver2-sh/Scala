@@ -100,6 +100,7 @@ pub enum RuntimeAction {
         query: String,
         force_refresh: bool,
         model: Option<Box<ModelArtifact>>,
+        serve_profile: Option<Box<norted_core::ServeProfile>>,
     },
     Install(RuntimeId),
     CheckUpdates,
@@ -109,6 +110,7 @@ pub enum RuntimeAction {
     },
     ModelCandidates {
         model: Box<ModelArtifact>,
+        serve_profile: Option<Box<norted_core::ServeProfile>>,
     },
     SelectFormat {
         format: ArtifactFormat,
@@ -163,6 +165,7 @@ pub enum SettingsScope {
     Global,
     Engine(String),
     Profile(LoadProfileName),
+    BuilderProfile(String),
     Model(ModelId),
 }
 
@@ -179,12 +182,26 @@ pub enum SettingsAction {
         id: LoadSettingId,
     },
     CreateProfile(LoadProfileName),
+    ForkBuilderProfile {
+        source: Box<norted_core::ServeProfile>,
+        name: LoadProfileName,
+    },
     DeleteProfile(LoadProfileName),
     AssignProfile {
         model_id: ModelId,
         profile: Option<LoadProfileName>,
     },
-    InspectModel(Box<ModelArtifact>),
+    AssignBuilderProfile {
+        model_id: ModelId,
+        profile_id: String,
+    },
+    InheritRecommendedProfile {
+        model_id: ModelId,
+    },
+    InspectModel {
+        model: Box<ModelArtifact>,
+        serve_profile: Option<Box<norted_core::ServeProfile>>,
+    },
 }
 
 #[derive(Debug)]
@@ -208,6 +225,7 @@ pub enum SettingsTaskResult {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SettingsInputKind {
     ProfileName,
+    ForkProfile,
     SettingValue,
 }
 
@@ -743,6 +761,36 @@ impl App {
         if let Some(state) = &self.load_profiles {
             scopes.extend(state.profiles.keys().cloned().map(SettingsScope::Profile));
         }
+        let local_ids = self
+            .load_profiles
+            .as_ref()
+            .map(|state| {
+                state
+                    .profiles
+                    .keys()
+                    .map(ToString::to_string)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let builder_ids = self
+            .snapshot
+            .models
+            .iter()
+            .filter_map(|model| {
+                model
+                    .norted_package
+                    .as_ref()?
+                    .recommended_serve_profile
+                    .as_ref()
+                    .map(|profile| profile.id.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        scopes.extend(
+            builder_ids
+                .into_iter()
+                .filter(|id| !local_ids.contains(id))
+                .map(SettingsScope::BuilderProfile),
+        );
         if let Some(model) = &self.settings_model {
             scopes.push(SettingsScope::Model(model.clone()));
         }
@@ -773,7 +821,11 @@ impl App {
                     LoadSettingScope::Common => true,
                     LoadSettingScope::Engine { engine_id } => engine_id == selected,
                 },
-                Some(SettingsScope::Profile(_) | SettingsScope::Model(_)) => true,
+                Some(
+                    SettingsScope::Profile(_)
+                    | SettingsScope::BuilderProfile(_)
+                    | SettingsScope::Model(_),
+                ) => true,
                 None => false,
             })
             .collect()
@@ -800,6 +852,9 @@ impl App {
                 .profiles
                 .get(profile)
                 .and_then(|profile| profile.settings.0.get(id)),
+            SettingsScope::BuilderProfile(profile_id) => self
+                .builder_serve_profile(profile_id)
+                .and_then(|profile| profile.load.settings.0.get(id)),
             SettingsScope::Model(model) => state
                 .model_defaults
                 .get(model)
@@ -845,9 +900,72 @@ impl App {
         )
     }
 
-    pub fn assigned_profile_for_settings_model(&self) -> Option<&LoadProfileName> {
-        let model = self.settings_model.as_ref()?;
-        self.load_profiles.as_ref()?.model_assignments.get(model)
+    pub fn effective_serve_profile_for_model(
+        &self,
+        model: &ModelArtifact,
+    ) -> Option<norted_core::ServeProfile> {
+        let state = self.load_profiles.as_ref()?;
+        if state.raw_profile_models.contains(&model.id) {
+            return None;
+        }
+        if let Some(name) = state.model_assignments.get(&model.id) {
+            return state
+                .profiles
+                .get(name)
+                .map(|profile| profile.effective_serve_profile(name));
+        }
+        if let Some(profile_id) = state.builder_profile_assignments.get(&model.id) {
+            return self
+                .snapshot
+                .models
+                .iter()
+                .filter_map(|candidate| {
+                    candidate
+                        .norted_package
+                        .as_ref()?
+                        .recommended_serve_profile
+                        .as_ref()
+                })
+                .find(|profile| &profile.id == profile_id)
+                .cloned();
+        }
+        model
+            .norted_package
+            .as_ref()
+            .and_then(|package| package.recommended_serve_profile.clone())
+    }
+
+    fn builder_serve_profile(&self, profile_id: &str) -> Option<&norted_core::ServeProfile> {
+        self.snapshot.models.iter().find_map(|model| {
+            let profile = model
+                .norted_package
+                .as_ref()?
+                .recommended_serve_profile
+                .as_ref()?;
+            (profile.id == profile_id).then_some(profile)
+        })
+    }
+
+    pub fn serve_profile_status_for_model(&self, model: &ModelArtifact) -> &'static str {
+        let Some(state) = &self.load_profiles else {
+            return "loading";
+        };
+        if state.raw_profile_models.contains(&model.id) {
+            "None / Raw runtime defaults"
+        } else if state.model_assignments.contains_key(&model.id) {
+            "User / customized"
+        } else if state.builder_profile_assignments.contains_key(&model.id) {
+            "Builder profile from registry"
+        } else if model
+            .norted_package
+            .as_ref()
+            .and_then(|package| package.recommended_serve_profile.as_ref())
+            .is_some()
+        {
+            "Recommended / canonical"
+        } else {
+            "None / Raw runtime defaults"
+        }
     }
 
     pub fn runtime_mutation_busy(&self) -> bool {
@@ -1580,6 +1698,7 @@ impl App {
                 Update::Render
             }
             KeyCode::Char('d') => self.delete_selected_profile(),
+            KeyCode::Char('f') => self.fork_selected_builder_profile(),
             KeyCode::Char('p') => self.cycle_model_profile(),
             KeyCode::Char('r') => self.refresh_model_settings(),
             _ => Update::None,
@@ -1661,6 +1780,30 @@ impl App {
                     Update::Render
                 }
             },
+            SettingsInputKind::ForkProfile => match LoadProfileName::new(input.text) {
+                Ok(name) => {
+                    let Some(SettingsScope::BuilderProfile(profile_id)) =
+                        self.selected_settings_scope()
+                    else {
+                        self.notice =
+                            Some("The Builder Serve Profile is no longer selected".to_owned());
+                        return Update::Render;
+                    };
+                    let Some(source) = self.builder_serve_profile(&profile_id).cloned() else {
+                        self.notice =
+                            Some("The Builder Serve Profile source is unavailable".to_owned());
+                        return Update::Render;
+                    };
+                    self.queue_settings_action(SettingsAction::ForkBuilderProfile {
+                        source: Box::new(source),
+                        name,
+                    })
+                }
+                Err(error) => {
+                    self.notice = Some(error.to_string());
+                    Update::Render
+                }
+            },
             SettingsInputKind::SettingValue => {
                 let Some(id) = input.setting_id else {
                     return Update::None;
@@ -1686,6 +1829,16 @@ impl App {
     }
 
     fn edit_selected_setting(&mut self) -> Update {
+        if matches!(
+            self.selected_settings_scope(),
+            Some(SettingsScope::BuilderProfile(_))
+        ) {
+            self.notice = Some(
+                "Builder Serve Profiles are read-only; press f to fork a mutable local copy"
+                    .to_owned(),
+            );
+            return Update::Render;
+        }
         let definition = self
             .settings_definitions()
             .get(self.settings_setting_index)
@@ -1768,6 +1921,9 @@ impl App {
             SettingsScope::Global => state.global_defaults.0.get(id),
             SettingsScope::Engine(engine) => state.engine_defaults.get(&engine)?.0.get(id),
             SettingsScope::Profile(profile) => state.profiles.get(&profile)?.settings.0.get(id),
+            SettingsScope::BuilderProfile(profile_id) => self
+                .builder_serve_profile(&profile_id)
+                .and_then(|profile| profile.load.settings.0.get(id)),
             SettingsScope::Model(model) => state.model_defaults.get(&model)?.0.get(id),
         }
     }
@@ -1829,11 +1985,35 @@ impl App {
     }
 
     fn delete_selected_profile(&mut self) -> Update {
+        if matches!(
+            self.selected_settings_scope(),
+            Some(SettingsScope::BuilderProfile(_))
+        ) {
+            self.notice = Some(
+                "Builder Serve Profiles are read-only and cannot be deleted; press f to fork"
+                    .to_owned(),
+            );
+            return Update::Render;
+        }
         let Some(SettingsScope::Profile(profile)) = self.selected_settings_scope() else {
             self.notice = Some("Select a named profile before deleting it".to_owned());
             return Update::Render;
         };
         self.queue_settings_action(SettingsAction::DeleteProfile(profile))
+    }
+
+    fn fork_selected_builder_profile(&mut self) -> Update {
+        let Some(SettingsScope::BuilderProfile(_)) = self.selected_settings_scope() else {
+            self.notice = Some("Select a read-only Builder Serve Profile to fork".to_owned());
+            return Update::Render;
+        };
+        self.settings_input = Some(SettingsInput {
+            kind: SettingsInputKind::ForkProfile,
+            text: String::new(),
+            cursor: 0,
+            setting_id: None,
+        });
+        Update::Render
     }
 
     fn cycle_model_profile(&mut self) -> Update {
@@ -1844,20 +2024,77 @@ impl App {
         let Some(state) = &self.load_profiles else {
             return Update::None;
         };
-        let profiles = state.profiles.keys().cloned().collect::<Vec<_>>();
-        if profiles.is_empty() {
-            self.notice = Some("Create a named profile first".to_owned());
-            return Update::Render;
+        let local = state.profiles.keys().cloned().collect::<Vec<_>>();
+        let builder = self
+            .snapshot
+            .models
+            .iter()
+            .filter_map(|model| {
+                model
+                    .norted_package
+                    .as_ref()?
+                    .recommended_serve_profile
+                    .as_ref()
+                    .map(|profile| profile.id.clone())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if !state.raw_profile_models.contains(&model_id)
+            && !state.model_assignments.contains_key(&model_id)
+            && !state.builder_profile_assignments.contains_key(&model_id)
+        {
+            return self.queue_settings_action(SettingsAction::AssignProfile {
+                model_id,
+                profile: None,
+            });
         }
-        let current = state.model_assignments.get(&model_id);
-        let next = current
-            .and_then(|current| profiles.iter().position(|profile| profile == current))
-            .and_then(|index| profiles.get(index + 1).cloned())
-            .or_else(|| current.is_none().then(|| profiles[0].clone()));
-        self.queue_settings_action(SettingsAction::AssignProfile {
-            model_id,
-            profile: next,
-        })
+        if state.raw_profile_models.contains(&model_id) {
+            if let Some(profile) = local.first() {
+                return self.queue_settings_action(SettingsAction::AssignProfile {
+                    model_id,
+                    profile: Some(profile.clone()),
+                });
+            }
+            if let Some(profile_id) = builder.first() {
+                return self.queue_settings_action(SettingsAction::AssignBuilderProfile {
+                    model_id,
+                    profile_id: profile_id.clone(),
+                });
+            }
+            return self
+                .queue_settings_action(SettingsAction::InheritRecommendedProfile { model_id });
+        }
+        if let Some(current) = state.model_assignments.get(&model_id) {
+            if let Some(next) = local
+                .iter()
+                .position(|profile| profile == current)
+                .and_then(|index| local.get(index + 1))
+            {
+                return self.queue_settings_action(SettingsAction::AssignProfile {
+                    model_id,
+                    profile: Some(next.clone()),
+                });
+            }
+            if let Some(profile_id) = builder.first() {
+                return self.queue_settings_action(SettingsAction::AssignBuilderProfile {
+                    model_id,
+                    profile_id: profile_id.clone(),
+                });
+            }
+        }
+        if let Some(current) = state.builder_profile_assignments.get(&model_id)
+            && let Some(next) = builder
+                .iter()
+                .position(|profile| profile == current)
+                .and_then(|index| builder.get(index + 1))
+        {
+            return self.queue_settings_action(SettingsAction::AssignBuilderProfile {
+                model_id,
+                profile_id: next.clone(),
+            });
+        }
+        self.queue_settings_action(SettingsAction::InheritRecommendedProfile { model_id })
     }
 
     fn refresh_model_settings(&mut self) -> Update {
@@ -1871,7 +2108,11 @@ impl App {
         let Some(model) = model else {
             return Update::Render;
         };
-        self.pending_settings_action = Some(SettingsAction::InspectModel(Box::new(model)));
+        let serve_profile = self.effective_serve_profile_for_model(&model).map(Box::new);
+        self.pending_settings_action = Some(SettingsAction::InspectModel {
+            model: Box::new(model),
+            serve_profile,
+        });
         self.settings_busy = true;
         self.settings_validation_error = None;
         Update::Render
@@ -1896,7 +2137,11 @@ impl App {
             .unwrap_or(0);
         self.settings_setting_index = 0;
         self.settings_scroll = 0;
-        self.pending_settings_action = Some(SettingsAction::InspectModel(Box::new(model)));
+        let serve_profile = self.effective_serve_profile_for_model(&model).map(Box::new);
+        self.pending_settings_action = Some(SettingsAction::InspectModel {
+            model: Box::new(model),
+            serve_profile,
+        });
         self.settings_busy = true;
         self.notice = Some("Inspecting exact-runtime load settings…".to_owned());
         Update::Render
@@ -2109,8 +2354,10 @@ impl App {
         self.runtime_picker_loading = true;
         self.runtime_picker_candidates.clear();
         self.runtime_picker_error = None;
+        let serve_profile = self.effective_serve_profile_for_model(&model).map(Box::new);
         self.pending_runtime_action = Some(RuntimeAction::ModelCandidates {
             model: Box::new(model),
+            serve_profile,
         });
         self.notice = Some("Checking installed runtime compatibility…".to_owned());
         Update::Render
@@ -2523,10 +2770,16 @@ impl App {
         }
         self.runtime_search_loading = true;
         self.runtime_search_error = None;
+        let serve_profile = self
+            .runtime_search_model
+            .as_deref()
+            .and_then(|model| self.effective_serve_profile_for_model(model))
+            .map(Box::new);
         self.pending_runtime_action = Some(RuntimeAction::Search {
             query: self.runtime_search_query.clone(),
             force_refresh,
             model: self.runtime_search_model.clone(),
+            serve_profile,
         });
         Update::Render
     }

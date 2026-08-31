@@ -19,7 +19,8 @@ use crate::auth::RequestCorrelation;
 use crate::error::{OpenAiError, runtime_error};
 use crate::input::{
     NormalizedRequest, generation_settings, object, optional_bool, optional_positive_u32,
-    optional_string, reject_unknown_fields, require_null_or, required_string, role, text_content,
+    optional_reasoning_effort, optional_string, reject_unknown_fields, require_null_or,
+    required_string, role, text_content,
 };
 use crate::{PublicApiState, unix_timestamp};
 
@@ -131,7 +132,8 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
     let model = required_string(object, "model")?;
     let instructions = optional_string(object, "instructions")?;
     let max_output_tokens = optional_positive_u32(object, "max_output_tokens")?;
-    let generation_settings = generation_settings(object)?;
+    let mut generation_settings = generation_settings(object)?;
+    generation_settings.reasoning_effort = responses_reasoning_effort(object.get("reasoning"))?;
     let input = object.get("input").ok_or_else(|| {
         OpenAiError::invalid(
             "Missing required field: input",
@@ -274,7 +276,6 @@ fn validate_identity_fields(
         "previous_response_id",
         "prompt_cache_key",
         "prompt_cache_retention",
-        "reasoning",
     ] {
         require_null_or(object, field, |_| false, "`null`")?;
     }
@@ -283,6 +284,23 @@ fn validate_identity_fields(
     }
     validate_text_format(object.get("text"))?;
     validate_stream_options(object.get("stream_options"), stream)
+}
+
+fn responses_reasoning_effort(
+    value: Option<&Value>,
+) -> Result<Option<norted_engine::ReasoningEffort>, OpenAiError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let reasoning = value.as_object().ok_or_else(|| {
+        OpenAiError::invalid(
+            "`reasoning` must be an object.",
+            Some("reasoning"),
+            "invalid_type",
+        )
+    })?;
+    reject_unknown_fields(reasoning, &["effort"], "reasoning")?;
+    optional_reasoning_effort(reasoning.get("effort"), "reasoning.effort")
 }
 
 fn validate_text_format(value: Option<&Value>) -> Result<(), OpenAiError> {
@@ -667,7 +685,7 @@ mod tests {
     use futures_util::stream;
     use norted_engine::{
         EffectiveGenerationSettings, EngineError, InferenceEvent, InferenceFinishReason,
-        InferenceRole, InferenceStream, InferenceUsage,
+        InferenceRole, InferenceStream, InferenceUsage, ReasoningEffort,
     };
     use serde_json::{Value, json};
 
@@ -683,6 +701,7 @@ mod tests {
             "input": "Hello",
             "temperature": 0.25,
             "top_p": 0.9,
+            "reasoning": {"effort": "low"},
         }))
         .expect("valid string input");
         assert_eq!(string.normalized.messages.len(), 2);
@@ -693,6 +712,10 @@ mod tests {
             Some(0.25)
         );
         assert_eq!(string.normalized.generation_settings.top_p, Some(0.9));
+        assert_eq!(
+            string.normalized.generation_settings.reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
 
         let messages = parse_request(json!({
             "model": "local/model",

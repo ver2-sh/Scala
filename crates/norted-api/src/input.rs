@@ -1,5 +1,7 @@
 use norted_core::ModelId;
-use norted_engine::{GenerationSettingsPatch, InferenceMessage, InferenceRequest, InferenceRole};
+use norted_engine::{
+    GenerationSettingsPatch, InferenceMessage, InferenceRequest, InferenceRole, ReasoningEffort,
+};
 use serde_json::{Map, Value};
 
 use crate::error::OpenAiError;
@@ -143,7 +145,32 @@ pub(crate) fn generation_settings(
     Ok(GenerationSettingsPatch {
         temperature: optional_f64(object, "temperature", 0.0, 2.0)?,
         top_p: optional_f64(object, "top_p", 0.0, 1.0)?,
+        reasoning_effort: None,
     })
+}
+
+pub(crate) fn optional_reasoning_effort(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<ReasoningEffort>, OpenAiError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => match value.as_str() {
+            "low" => Ok(Some(ReasoningEffort::Low)),
+            "medium" => Ok(Some(ReasoningEffort::Medium)),
+            "high" => Ok(Some(ReasoningEffort::High)),
+            _ => Err(OpenAiError::invalid(
+                format!("`{field}` must be `low`, `medium`, or `high`."),
+                Some(field),
+                "invalid_value",
+            )),
+        },
+        Some(_) => Err(OpenAiError::invalid(
+            format!("`{field}` must be a string."),
+            Some(field),
+            "invalid_type",
+        )),
+    }
 }
 
 fn optional_f64(

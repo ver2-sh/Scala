@@ -8,8 +8,11 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifact, AuxiliaryArtifactRole,
-    LoadSettingId, LoadSettingSource, LoadSettingValue, ModelArtifact, NinferArtifactIdentity,
-    ResolvedLoadSetting, ResolvedLoadSettings, inspect_ninfer_container,
+    LoadSettingId, LoadSettingValue, NinferArtifactIdentity, NinferServeStrategy,
+    NinferSpeculativeProfile, PromptDelivery, PromptMode, Q27MtpStrategy, Q27ServeStrategy,
+    ResponseFilter, ServeCapability, ServeEngineProfiles, ServeGenerationProfile, ServeLoadProfile,
+    ServeProfile, ServeProfileApplicability, ServeProfileSource, ServePromptProfile,
+    ThinkingPolicy, ToggleOverridePolicy, inspect_ninfer_container,
 };
 
 pub(crate) const MAX_PACKAGE_JSON_BYTES: u64 = 16 * 1024 * 1024;
@@ -118,6 +121,10 @@ pub struct NortedPackageBinding {
     pub quant_recipe_key: Option<String>,
     pub canonical_source_lineage_key: Option<String>,
     pub runtime_policy: Option<NortedPackageFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve_profile: Option<NortedPackageFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_serve_profile: Option<ServeProfile>,
     pub runtime_policy_id: Option<String>,
     pub runtime_policy_profile: Option<String>,
     pub sharp: Option<NortedPackageFile>,
@@ -151,230 +158,6 @@ pub(crate) enum PackageDirectory {
     },
 }
 
-pub fn apply_norted_package_load_policy(
-    model: &ModelArtifact,
-    settings: &mut ResolvedLoadSettings,
-) -> Result<(), String> {
-    let Some(package) = &model.norted_package else {
-        return Ok(());
-    };
-    let policy_id = package
-        .runtime_policy_id
-        .clone()
-        .or_else(|| package.runtime_policy_profile.clone())
-        .unwrap_or_else(|| format!("{}-v{}", package.manifest_schema, package.manifest_version));
-    let source = LoadSettingSource::NortedPackagePolicy { policy_id };
-    match &package.policy {
-        NortedPackagePolicy::Gguf => {}
-        NortedPackagePolicy::Q27(policy) => {
-            enforce_context(
-                settings,
-                policy.minimum_context_tokens,
-                policy.preferred_context_tokens,
-                &source,
-            )?;
-            if settings.value("q27.kv_fp16").is_some() {
-                return Err(
-                    "Norted q27 package KV mode is selected by its quality-order policy and cannot be forced to FP16"
-                        .to_owned(),
-                );
-            }
-            let fast_head = setting_id("q27.fast_head")?;
-            match settings
-                .effective
-                .get(&fast_head)
-                .map(|setting| &setting.value)
-            {
-                Some(LoadSettingValue::Toggle(true)) if policy.fast_head_override_allowed => {}
-                Some(LoadSettingValue::Toggle(false)) => {}
-                Some(_) => {
-                    return Err(
-                        "q27.fast_head has an invalid value for the package policy".to_owned()
-                    );
-                }
-                None => {
-                    settings.effective.insert(
-                        fast_head,
-                        ResolvedLoadSetting {
-                            value: LoadSettingValue::Toggle(policy.fast_head_default),
-                            source,
-                        },
-                    );
-                }
-            }
-        }
-        NortedPackagePolicy::Ninfer(policy) => {
-            enforce_context(
-                settings,
-                policy.minimum_context_tokens,
-                policy.minimum_context_tokens,
-                &source,
-            )?;
-            reject_enabled_flag(
-                settings,
-                "ninfer.no_thinking",
-                "NInfer package requires thinking enabled",
-            )?;
-            reject_enabled_flag(
-                settings,
-                "ninfer.no_cuda_graph",
-                "NInfer package requires CUDA graph decode",
-            )?;
-            reject_enabled_flag(
-                settings,
-                "ninfer.no_prefix_reuse",
-                "NInfer package requires compatible prefix reuse",
-            )?;
-            enforce_ninfer_package_choice(settings, "ninfer.kv_dtype", &policy.kv_dtype, &source)?;
-            let selected_profile = settings.value("ninfer.package_profile").cloned();
-            if selected_profile.is_none()
-                && [
-                    "ninfer.speculative_backend",
-                    "ninfer.draft_tokens",
-                    "ninfer.lm_head_draft",
-                ]
-                .iter()
-                .any(|id| settings.value(id).is_some())
-            {
-                return Err(
-                    "Norted NInfer package speculation must be selected through ninfer.package_profile (mtp0 or mtp3); DFlash and ad-hoc speculative combinations are not declared by the Builder policy"
-                        .to_owned(),
-                );
-            }
-            if let Some(profile) = selected_profile {
-                let LoadSettingValue::Choice(profile) = profile else {
-                    return Err("ninfer.package_profile must be a choice".to_owned());
-                };
-                match profile.as_str() {
-                    "mtp0" => {
-                        settings
-                            .effective
-                            .remove(&setting_id("ninfer.speculative_backend")?);
-                        settings
-                            .effective
-                            .remove(&setting_id("ninfer.draft_tokens")?);
-                        settings
-                            .effective
-                            .remove(&setting_id("ninfer.lm_head_draft")?);
-                    }
-                    "mtp3" => {
-                        insert_package_value(
-                            settings,
-                            "ninfer.speculative_backend",
-                            LoadSettingValue::Choice("mtp".to_owned()),
-                            &source,
-                        )?;
-                        insert_package_value(
-                            settings,
-                            "ninfer.draft_tokens",
-                            LoadSettingValue::UnsignedInteger(3),
-                            &source,
-                        )?;
-                        insert_package_value(
-                            settings,
-                            "ninfer.lm_head_draft",
-                            LoadSettingValue::FlagEnabled,
-                            &source,
-                        )?;
-                    }
-                    other => {
-                        return Err(format!(
-                            "unsupported NInfer package benchmark profile `{other}`"
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn enforce_context(
-    settings: &mut ResolvedLoadSettings,
-    minimum: u64,
-    default: u64,
-    source: &LoadSettingSource,
-) -> Result<(), String> {
-    match settings.value("context_length") {
-        Some(LoadSettingValue::UnsignedInteger(value)) if *value >= minimum => Ok(()),
-        Some(LoadSettingValue::UnsignedInteger(value)) => Err(format!(
-            "Norted package requires at least {minimum} served tokens; requested {value}"
-        )),
-        Some(_) => Err("context_length has an invalid value for the Norted package".to_owned()),
-        None => insert_package_value(
-            settings,
-            "context_length",
-            LoadSettingValue::UnsignedInteger(default),
-            source,
-        ),
-    }
-}
-
-fn reject_enabled_flag(
-    settings: &ResolvedLoadSettings,
-    id: &str,
-    message: &str,
-) -> Result<(), String> {
-    if settings.value(id).is_some() {
-        Err(message.to_owned())
-    } else {
-        Ok(())
-    }
-}
-
-fn enforce_ninfer_package_choice(
-    settings: &mut ResolvedLoadSettings,
-    id: &str,
-    required: &str,
-    source: &LoadSettingSource,
-) -> Result<(), String> {
-    let id = setting_id(id)?;
-    match settings.effective.get_mut(&id) {
-        Some(setting) => match &setting.value {
-            LoadSettingValue::Choice(requested) if requested == required => {
-                setting.source = source.clone();
-                Ok(())
-            }
-            LoadSettingValue::Choice(requested) => Err(format!(
-                "Norted NInfer package requires {id}={required}; requested {requested}"
-            )),
-            _ => Err(format!(
-                "Norted NInfer package requires {id}={required}; resolved value has an invalid type"
-            )),
-        },
-        None => {
-            settings.effective.insert(
-                id,
-                ResolvedLoadSetting {
-                    value: LoadSettingValue::Choice(required.to_owned()),
-                    source: source.clone(),
-                },
-            );
-            Ok(())
-        }
-    }
-}
-
-fn insert_package_value(
-    settings: &mut ResolvedLoadSettings,
-    id: &str,
-    value: LoadSettingValue,
-    source: &LoadSettingSource,
-) -> Result<(), String> {
-    settings.effective.insert(
-        setting_id(id)?,
-        ResolvedLoadSetting {
-            value,
-            source: source.clone(),
-        },
-    );
-    Ok(())
-}
-
-fn setting_id(value: &str) -> Result<LoadSettingId, String> {
-    LoadSettingId::new(value).map_err(|error| error.to_string())
-}
-
 #[derive(Debug, Deserialize)]
 struct FileRecord {
     filename: String,
@@ -388,6 +171,8 @@ struct Q27Manifest {
     sharp: Q27Sharp,
     tokenizer: FileRecord,
     runtime_policy: ManifestPolicyRecord,
+    #[serde(default)]
+    serve_profile: Option<ServeProfileRecord>,
     outputs: BTreeMap<String, Q27Output>,
 }
 
@@ -410,6 +195,16 @@ struct ManifestPolicyRecord {
     sha256: String,
     #[serde(default)]
     policy_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServeProfileRecord {
+    filename: String,
+    size: u64,
+    sha256: String,
+    profile_id: String,
+    schema: String,
+    schema_version: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -520,6 +315,8 @@ struct NinferManifest {
     outputs: BTreeMap<String, NinferOutput>,
     sharp: NinferSharp,
     runtime_policy: ManifestPolicyRecord,
+    #[serde(default)]
+    serve_profile: Option<ServeProfileRecord>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -661,6 +458,269 @@ struct BuildOutput {
     projector_key: Option<String>,
 }
 
+fn explicit_serve_profile(
+    root: &Path,
+    record: &ServeProfileRecord,
+) -> Result<(NortedPackageFile, ServeProfile), String> {
+    if record.schema != crate::SERVE_PROFILE_SCHEMA
+        || record.schema_version != crate::SERVE_PROFILE_SCHEMA_VERSION
+    {
+        return Err(format!(
+            "manifest binds unsupported Serve Profile schema {} v{}",
+            record.schema, record.schema_version
+        ));
+    }
+    let file = resolve_file(
+        root,
+        &record.filename,
+        Some(record.size),
+        &record.sha256,
+        true,
+    )?;
+    let (mut profile, observed_sha): (ServeProfile, _) = read_json(&file.path)?;
+    if observed_sha != file.sha256
+        || profile.id != record.profile_id
+        || profile.schema != record.schema
+        || profile.schema_version != record.schema_version
+    {
+        return Err("manifest Serve Profile binding disagrees with its sidecar".to_owned());
+    }
+    profile.validate()?;
+    if profile.source != ServeProfileSource::BuilderRecommended || !profile.read_only {
+        return Err("Builder Serve Profile must be builder_recommended and read-only".to_owned());
+    }
+    profile.source_profile_sha256 = Some(file.sha256.clone());
+    profile.resolve_builder_template(root)?;
+    Ok((file, profile))
+}
+
+fn q27_serve_profile_from_legacy(
+    policy: &Q27RuntimePolicy,
+    sharp: &NortedPackageFile,
+    source: ServeProfileSource,
+) -> ServeProfile {
+    ServeProfile {
+        schema: crate::SERVE_PROFILE_SCHEMA.to_owned(),
+        schema_version: crate::SERVE_PROFILE_SCHEMA_VERSION,
+        id: "dirk-quality-q27-v1".to_owned(),
+        display_name: "Dirk Quality".to_owned(),
+        description: Some(
+            "Builder-recommended Dirk quality recipe for compatible Qwen3.8 27B q27 artifacts"
+                .to_owned(),
+        ),
+        source,
+        read_only: true,
+        source_profile_sha256: None,
+        applicability: ServeProfileApplicability {
+            artifact_formats: vec![ArtifactFormat::Q27],
+            architecture: Some("qwen35".to_owned()),
+            family: Some("qwen3.8-27b".to_owned()),
+            required_model_capabilities: vec!["mtp_layer_1".to_owned(), "text_only".to_owned()],
+            native_model_ids: Vec::new(),
+        },
+        prompt: ServePromptProfile {
+            mode: PromptMode::ExternalTemplate,
+            delivery: PromptDelivery::RawCompletions,
+            template: Some(crate::ExternalTemplateReference {
+                identity: "dirk-sharp".to_owned(),
+                path: sharp.path.clone(),
+                sha256: sharp.sha256.clone(),
+            }),
+            render_generation_prompt: true,
+            thinking_enabled: policy.reasoning.thinking_enabled,
+            response_filter: ResponseFilter::DirkSharpReasoning,
+        },
+        generation: ServeGenerationProfile {
+            defaults: crate::GenerationDefaults {
+                temperature: Some(policy.sampling.temperature),
+                top_p: Some(policy.sampling.top_p),
+                top_k: Some(policy.sampling.top_k),
+                min_p: Some(policy.sampling.min_p),
+                reasoning_effort: Some(policy.reasoning.default_effort.clone()),
+            },
+            thinking: ThinkingPolicy {
+                default: policy.reasoning.thinking_enabled,
+                required: policy.reasoning.thinking_enabled,
+            },
+            allowed_user_overrides: vec![
+                "temperature".to_owned(),
+                "top_p".to_owned(),
+                "reasoning_effort".to_owned(),
+                "q27.fast_head".to_owned(),
+            ],
+        },
+        load: ServeLoadProfile {
+            settings: Default::default(),
+            context: crate::ContextPolicy {
+                preferred: Some(policy.context.preferred_served_tokens),
+                minimum: Some(policy.context.minimum_required_served_tokens),
+            },
+        },
+        requirements: vec![
+            ServeCapability::RawCompletionPromptInput,
+            ServeCapability::ExternalTemplateApplication,
+            ServeCapability::Thinking,
+            ServeCapability::UnlimitedThinkingBudget,
+            ServeCapability::TemperatureTopP,
+            ServeCapability::TopKMinP,
+            ServeCapability::Mtp,
+            ServeCapability::SuffixDrafting,
+            ServeCapability::ObservedWMax,
+            ServeCapability::FastHeadControl,
+            ServeCapability::StartupBannerObservation,
+            ServeCapability::ServedContextProof,
+            ServeCapability::KvModeProof,
+        ],
+        engine: ServeEngineProfiles {
+            q27: Some(Q27ServeStrategy {
+                mtp: Q27MtpStrategy {
+                    required: policy.mtp.required,
+                    depth_policy: policy.mtp.runtime_depth_policy.clone(),
+                    maximum_depth: policy.mtp.adaptive.maximum_depth.clone(),
+                    minimum_probability: policy.mtp.adaptive.confidence_gate.minimum_probability,
+                },
+                suffix_drafting: policy.mtp.adaptive.suffix_drafting,
+                suffix_width_from_runtime_w_max: policy.mtp.adaptive.suffix_width.policy
+                    == "runtime-compiled-maximum",
+                fast_head: ToggleOverridePolicy {
+                    default: policy.quality.fast_head_default,
+                    user_override_allowed: policy
+                        .quality
+                        .fast_head_allowed_only_by_explicit_override,
+                },
+                kv_quality_order: policy.context.kv_cache_resolution.quality_order.clone(),
+            }),
+            ninfer: None,
+        },
+    }
+}
+
+fn ninfer_serve_profile_from_legacy(
+    policy: &NinferRuntimePolicy,
+    sharp: &NortedPackageFile,
+    source: ServeProfileSource,
+) -> ServeProfile {
+    let mut native_model_ids = policy
+        .artifact_identities
+        .iter()
+        .map(|identity| identity.model_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    native_model_ids.sort();
+    let speculative_profiles = policy
+        .benchmark_profiles
+        .iter()
+        .map(|(id, value)| {
+            (
+                id.clone(),
+                NinferSpeculativeProfile {
+                    speculative_decoding: value.speculative_decoding,
+                    backend: value.backend.clone(),
+                    draft_tokens: value.draft_tokens,
+                    optimized_proposal_head: value.optimized_proposal_head,
+                },
+            )
+        })
+        .collect();
+    ServeProfile {
+        schema: crate::SERVE_PROFILE_SCHEMA.to_owned(),
+        schema_version: crate::SERVE_PROFILE_SCHEMA_VERSION,
+        id: "dirk-quality-ninfer-v1".to_owned(),
+        display_name: "Dirk Quality (NInfer)".to_owned(),
+        description: Some(
+            "Builder-recommended Dirk quality recipe for compatible NInfer containers".to_owned(),
+        ),
+        source,
+        read_only: true,
+        source_profile_sha256: None,
+        applicability: ServeProfileApplicability {
+            artifact_formats: vec![ArtifactFormat::Ninfer],
+            architecture: Some("qwen35".to_owned()),
+            family: Some("qwen3.8-27b".to_owned()),
+            required_model_capabilities: vec!["mtp_layer_1".to_owned(), "text_only".to_owned()],
+            native_model_ids,
+        },
+        prompt: ServePromptProfile {
+            mode: PromptMode::ExternalTemplate,
+            delivery: PromptDelivery::RawCompletions,
+            template: Some(crate::ExternalTemplateReference {
+                identity: "dirk-sharp".to_owned(),
+                path: sharp.path.clone(),
+                sha256: sharp.sha256.clone(),
+            }),
+            render_generation_prompt: true,
+            thinking_enabled: policy.serving.thinking_enabled,
+            response_filter: ResponseFilter::DirkSharpReasoning,
+        },
+        generation: ServeGenerationProfile {
+            defaults: crate::GenerationDefaults {
+                temperature: Some(policy.sampler.temperature),
+                top_p: Some(policy.sampler.top_p),
+                top_k: Some(policy.sampler.top_k),
+                min_p: Some(policy.sampler.min_p),
+                reasoning_effort: Some("medium".to_owned()),
+            },
+            thinking: ThinkingPolicy {
+                default: policy.serving.thinking_enabled,
+                required: policy.serving.thinking_enabled,
+            },
+            allowed_user_overrides: vec![
+                "temperature".to_owned(),
+                "top_p".to_owned(),
+                "ninfer.package_profile".to_owned(),
+            ],
+        },
+        load: ServeLoadProfile {
+            settings: crate::LoadSettingsPatch(BTreeMap::from([(
+                LoadSettingId::new("ninfer.kv_dtype").expect("static setting ID"),
+                LoadSettingValue::Choice(policy.serving.kv_cli[1].clone()),
+            )])),
+            context: crate::ContextPolicy {
+                preferred: Some(policy.context.hard_minimum_served_tokens),
+                minimum: Some(policy.context.hard_minimum_served_tokens),
+            },
+        },
+        requirements: vec![
+            ServeCapability::ExternalTemplateApplication,
+            ServeCapability::RawCompletionPromptInput,
+            ServeCapability::Thinking,
+            ServeCapability::TemperatureTopP,
+            ServeCapability::TopKMinP,
+            ServeCapability::ServedContextProof,
+            ServeCapability::NinferCudaGraph,
+            ServeCapability::NinferPrefixReuse,
+            ServeCapability::NinferStartupObservation,
+        ],
+        engine: ServeEngineProfiles {
+            q27: None,
+            ninfer: Some(NinferServeStrategy {
+                kv_cache: policy.serving.kv_preference.clone(),
+                kv_dtype: policy.serving.kv_cli[1].clone(),
+                cuda_graph_required: policy.serving.cuda_graph_decode,
+                prefix_reuse_required: policy.serving.compatible_prefix_reuse,
+                text_only_default: !policy.serving.vision_loaded,
+                default_speculative_profile: "mtp0".to_owned(),
+                speculative_profiles,
+            }),
+        },
+    }
+}
+
+fn ensure_profile_matches_legacy(
+    explicit: &ServeProfile,
+    mut expected: ServeProfile,
+) -> Result<(), String> {
+    expected.source = ServeProfileSource::BuilderRecommended;
+    expected.source_profile_sha256 = explicit.source_profile_sha256.clone();
+    if explicit != &expected {
+        return Err(
+            "Builder Serve Profile contradicts the retained legacy runtime policy".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn discover_package_directory(
     root: &Path,
     format: ArtifactFormat,
@@ -694,9 +754,9 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
         .get("schema")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "Q27-MANIFEST schema must be an integer".to_owned())?;
-    if observed_schema != 3 {
+    if !matches!(observed_schema, 3 | 4) {
         return Err(format!(
-            "unsupported Q27-MANIFEST schema {observed_schema}; expected 3"
+            "unsupported Q27-MANIFEST schema {observed_schema}; expected 3 or 4"
         ));
     }
     validate_lineage_value(
@@ -704,7 +764,10 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
         "q27 package source lineage",
     )?;
     let manifest: Q27Manifest = serde_json::from_value(manifest_value.clone())
-        .map_err(|error| format!("invalid schema-3 Q27-MANIFEST: {error}"))?;
+        .map_err(|error| format!("invalid Q27-MANIFEST v{observed_schema}: {error}"))?;
+    if observed_schema == 4 && manifest.serve_profile.is_none() {
+        return Err("Q27-MANIFEST v4 does not bind a Serve Profile".to_owned());
+    }
     validate_sha(&manifest.source_lineage.key, "q27 source lineage key")?;
     let tokenizer = resolve_file(
         &root,
@@ -733,11 +796,20 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
         &manifest.runtime_policy.sha256,
         true,
     )?;
-    require_distinct_files(&[
+    let explicit_profile = manifest
+        .serve_profile
+        .as_ref()
+        .map(|record| explicit_serve_profile(&root, record))
+        .transpose()?;
+    let mut sidecars = vec![
         ("tokenizer", &tokenizer.path),
         ("Sharp", &sharp.path),
         ("runtime policy", &runtime.path),
-    ])?;
+    ];
+    if let Some((file, _)) = &explicit_profile {
+        sidecars.push(("Serve Profile", &file.path));
+    }
+    require_distinct_files(&sidecars)?;
     let (policy_value, observed_policy_sha): (serde_json::Value, _) = read_json(&runtime.path)?;
     if observed_policy_sha != runtime.sha256 {
         return Err("q27 runtime policy SHA256 changed while parsing".to_owned());
@@ -745,6 +817,15 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
     let policy: Q27RuntimePolicy = serde_json::from_value(policy_value)
         .map_err(|error| format!("invalid q27 runtime policy: {error}"))?;
     validate_q27_policy(&policy, &manifest, &sharp)?;
+    let legacy_profile =
+        q27_serve_profile_from_legacy(&policy, &sharp, ServeProfileSource::BuilderLegacyPolicy);
+    let (serve_profile_file, recommended_serve_profile) = match explicit_profile {
+        Some((file, profile)) => {
+            ensure_profile_matches_legacy(&profile, legacy_profile.clone())?;
+            (Some(file), profile)
+        }
+        None => (None, legacy_profile),
+    };
     let mut members = HashMap::new();
     let mut bound = HashSet::new();
     for (target, output) in &manifest.outputs {
@@ -777,6 +858,9 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
             runtime.path.as_path(),
         ]
         .contains(&primary.path.as_path())
+            || serve_profile_file
+                .as_ref()
+                .is_some_and(|profile| profile.path == primary.path)
         {
             return Err(format!(
                 "q27 output `{target}` is ambiguously also bound as a sidecar"
@@ -812,7 +896,7 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
         let binding = NortedPackageBinding {
             kind: NortedPackageKind::Q27,
             manifest_schema: "norted.q27-manifest".to_owned(),
-            manifest_version: 3,
+            manifest_version: observed_schema as u32,
             package_root: root.clone(),
             manifest_path: manifest_path.clone(),
             manifest_sha256: manifest_sha.clone(),
@@ -824,6 +908,8 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
             quant_recipe_key: None,
             canonical_source_lineage_key: Some(manifest.source_lineage.key.clone()),
             runtime_policy: Some(runtime.clone()),
+            serve_profile: serve_profile_file.clone(),
+            recommended_serve_profile: Some(recommended_serve_profile.clone()),
             runtime_policy_id: None,
             runtime_policy_profile: Some(policy.profile.clone()),
             sharp: Some(sharp.clone()),
@@ -840,16 +926,23 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
             ],
             status: NortedPackageStatus::Valid,
         };
+        let mut auxiliary = vec![
+            as_auxiliary(&tokenizer, AuxiliaryArtifactRole::Tokenizer),
+            as_auxiliary(&sharp, AuxiliaryArtifactRole::Sharp),
+            as_auxiliary(&runtime, AuxiliaryArtifactRole::RuntimePolicy),
+        ];
+        if let Some(file) = &serve_profile_file {
+            auxiliary.push(as_auxiliary(file, AuxiliaryArtifactRole::ServeProfile));
+        }
+        auxiliary.push(as_auxiliary(
+            &manifest_file,
+            AuxiliaryArtifactRole::Manifest,
+        ));
         members.insert(
             primary.path,
             PackageMember {
                 binding,
-                auxiliary: vec![
-                    as_auxiliary(&tokenizer, AuxiliaryArtifactRole::Tokenizer),
-                    as_auxiliary(&sharp, AuxiliaryArtifactRole::Sharp),
-                    as_auxiliary(&runtime, AuxiliaryArtifactRole::RuntimePolicy),
-                    as_auxiliary(&manifest_file, AuxiliaryArtifactRole::Manifest),
-                ],
+                auxiliary,
                 native_identity: None,
             },
         );
@@ -921,13 +1014,16 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    if observed_schema != "norted.ninfer-manifest" || observed_version != 3 {
+    if observed_schema != "norted.ninfer-manifest" || !matches!(observed_version, 3 | 4) {
         return Err(format!(
-            "unsupported NINFER-MANIFEST schema {observed_schema} v{observed_version}; expected norted.ninfer-manifest v3"
+            "unsupported NINFER-MANIFEST schema {observed_schema} v{observed_version}; expected norted.ninfer-manifest v3 or v4"
         ));
     }
     let manifest: NinferManifest = serde_json::from_value(manifest_value.clone())
-        .map_err(|error| format!("invalid NINFER-MANIFEST v3: {error}"))?;
+        .map_err(|error| format!("invalid NINFER-MANIFEST v{observed_version}: {error}"))?;
+    if observed_version == 4 && manifest.serve_profile.is_none() {
+        return Err("NINFER-MANIFEST v4 does not bind a Serve Profile".to_owned());
+    }
     validate_sha(
         &manifest.canonical_source_lineage_key,
         "NInfer canonical source lineage key",
@@ -946,7 +1042,16 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
         &manifest.runtime_policy.sha256,
         true,
     )?;
-    require_distinct_files(&[("Sharp", &sharp.path), ("runtime policy", &runtime.path)])?;
+    let explicit_profile = manifest
+        .serve_profile
+        .as_ref()
+        .map(|record| explicit_serve_profile(&root, record))
+        .transpose()?;
+    let mut sidecars = vec![("Sharp", &sharp.path), ("runtime policy", &runtime.path)];
+    if let Some((file, _)) = &explicit_profile {
+        sidecars.push(("Serve Profile", &file.path));
+    }
+    require_distinct_files(&sidecars)?;
     let (policy_value, policy_sha): (serde_json::Value, _) = read_json(&runtime.path)?;
     if policy_sha != runtime.sha256 {
         return Err("NInfer runtime policy SHA256 changed while parsing".to_owned());
@@ -957,6 +1062,15 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
         return Err("NInfer runtime policy_id does not match its canonical content".to_owned());
     }
     validate_ninfer_policy(&policy, &manifest, &sharp)?;
+    let legacy_profile =
+        ninfer_serve_profile_from_legacy(&policy, &sharp, ServeProfileSource::BuilderLegacyPolicy);
+    let (serve_profile_file, recommended_serve_profile) = match explicit_profile {
+        Some((file, profile)) => {
+            ensure_profile_matches_legacy(&profile, legacy_profile.clone())?;
+            (Some(file), profile)
+        }
+        None => (None, legacy_profile),
+    };
     let benchmark_profiles = policy
         .benchmark_profiles
         .iter()
@@ -1013,6 +1127,14 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
                 "NInfer output `{weights_key}` is ambiguously also bound as a sidecar"
             ));
         }
+        if serve_profile_file
+            .as_ref()
+            .is_some_and(|profile| profile.path == primary.path)
+        {
+            return Err(format!(
+                "NInfer output `{weights_key}` is ambiguously also bound as the Serve Profile"
+            ));
+        }
         if !bound.insert(primary.path.clone()) {
             return Err(format!(
                 "NInfer manifest ambiguously binds {}",
@@ -1043,7 +1165,7 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
         let binding = NortedPackageBinding {
             kind: NortedPackageKind::Ninfer,
             manifest_schema: manifest.schema.clone(),
-            manifest_version: 3,
+            manifest_version: observed_version as u32,
             package_root: root.clone(),
             manifest_path: manifest_path.clone(),
             manifest_sha256: manifest_sha.clone(),
@@ -1055,6 +1177,8 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
             quant_recipe_key: None,
             canonical_source_lineage_key: Some(manifest.canonical_source_lineage_key.clone()),
             runtime_policy: Some(runtime.clone()),
+            serve_profile: serve_profile_file.clone(),
+            recommended_serve_profile: Some(recommended_serve_profile.clone()),
             runtime_policy_id: Some(policy.policy_id.clone()),
             runtime_policy_profile: None,
             sharp: Some(sharp.clone()),
@@ -1070,15 +1194,22 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
             ],
             status: NortedPackageStatus::Valid,
         };
+        let mut auxiliary = vec![
+            as_auxiliary(&sharp, AuxiliaryArtifactRole::Sharp),
+            as_auxiliary(&runtime, AuxiliaryArtifactRole::RuntimePolicy),
+        ];
+        if let Some(file) = &serve_profile_file {
+            auxiliary.push(as_auxiliary(file, AuxiliaryArtifactRole::ServeProfile));
+        }
+        auxiliary.push(as_auxiliary(
+            &manifest_file,
+            AuxiliaryArtifactRole::Manifest,
+        ));
         members.insert(
             primary.path,
             PackageMember {
                 binding,
-                auxiliary: vec![
-                    as_auxiliary(&sharp, AuxiliaryArtifactRole::Sharp),
-                    as_auxiliary(&runtime, AuxiliaryArtifactRole::RuntimePolicy),
-                    as_auxiliary(&manifest_file, AuxiliaryArtifactRole::Manifest),
-                ],
+                auxiliary,
                 native_identity: Some(ArtifactNativeIdentity::Ninfer(expected)),
             },
         );
@@ -1255,6 +1386,8 @@ fn discover_gguf(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, 
             }),
             canonical_source_lineage_key: lineage_key,
             runtime_policy: None,
+            serve_profile: None,
+            recommended_serve_profile: None,
             runtime_policy_id: None,
             runtime_policy_profile: None,
             sharp: None,

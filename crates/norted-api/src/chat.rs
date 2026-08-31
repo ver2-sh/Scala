@@ -18,7 +18,8 @@ use crate::auth::RequestCorrelation;
 use crate::error::{OpenAiError, runtime_error};
 use crate::input::{
     NormalizedRequest, generation_settings, object, optional_bool, optional_positive_u32,
-    reject_unknown_fields, require_null_or, required_string, role, text_content,
+    optional_reasoning_effort, reject_unknown_fields, require_null_or, required_string, role,
+    text_content,
 };
 use crate::{PublicApiState, unix_timestamp};
 
@@ -119,7 +120,9 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
     let include_usage = validate_identity_fields(object, stream)?;
     validate_n(object.get("n"))?;
     let max_output_tokens = token_limit(object)?;
-    let generation_settings = generation_settings(object)?;
+    let mut generation_settings = generation_settings(object)?;
+    generation_settings.reasoning_effort =
+        optional_reasoning_effort(object.get("reasoning_effort"), "reasoning_effort")?;
     let messages = object
         .get("messages")
         .and_then(Value::as_array)
@@ -302,7 +305,6 @@ fn validate_identity_fields(
     for field in [
         "audio",
         "prediction",
-        "reasoning_effort",
         "seed",
         "stop",
         "verbosity",
@@ -563,6 +565,7 @@ mod tests {
     use futures_util::stream;
     use norted_engine::{
         InferenceEvent, InferenceFinishReason, InferenceRole, InferenceStream, InferenceUsage,
+        ReasoningEffort,
     };
     use serde_json::json;
 
@@ -580,6 +583,7 @@ mod tests {
             ],
             "temperature": 0.2,
             "top_p": 0.8,
+            "reasoning_effort": "high",
             "n": 1,
             "tools": [],
             "tool_choice": "none",
@@ -591,6 +595,10 @@ mod tests {
         assert_eq!(parsed.normalized.max_output_tokens, Some(42));
         assert_eq!(parsed.normalized.generation_settings.temperature, Some(0.2));
         assert_eq!(parsed.normalized.generation_settings.top_p, Some(0.8));
+        assert_eq!(
+            parsed.normalized.generation_settings.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
     }
 
     #[test]

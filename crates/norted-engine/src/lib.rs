@@ -557,6 +557,7 @@ fn auxiliary_role_label(role: &AuxiliaryArtifactRole) -> &str {
         AuxiliaryArtifactRole::Projector => "projector",
         AuxiliaryArtifactRole::Sharp => "Sharp template",
         AuxiliaryArtifactRole::RuntimePolicy => "runtime policy",
+        AuxiliaryArtifactRole::ServeProfile => "Serve Profile",
         AuxiliaryArtifactRole::Other(name) => name,
     }
 }
@@ -610,7 +611,7 @@ impl PreparedModelInput {
             norted_package: self.primary.norted_package.clone().map(|binding| {
                 let sharp_applied = binding.sharp.as_ref().map(|_| false);
                 norted_core::NortedPackageRuntimeIdentity {
-                    selected_package_profile: binding.runtime_policy_profile.clone(),
+                    selected_package_profile: None,
                     binding,
                     sharp_applied,
                     proven_served_context_tokens: None,
@@ -628,6 +629,7 @@ pub struct LaunchRequest {
     pub backend_address: SocketAddr,
     pub load_settings: ResolvedLoadSettings,
     pub load_settings_schema: LoadSettingsSchema,
+    pub serve_profile: Option<norted_core::ServeProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -649,6 +651,7 @@ pub struct LaunchSpec {
     pub runtime: InstalledRuntime,
     pub model: PreparedModelInput,
     pub accelerator: Option<AcceleratorDevice>,
+    pub serve_profile: Option<norted_core::ServeProfile>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -788,15 +791,40 @@ pub struct InferenceMessage {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+impl std::fmt::Display for ReasoningEffort {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct GenerationSettingsPatch {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl GenerationSettingsPatch {
     pub fn is_empty(&self) -> bool {
-        self.temperature.is_none() && self.top_p.is_none()
+        self.temperature.is_none() && self.top_p.is_none() && self.reasoning_effort.is_none()
     }
 }
 
@@ -919,6 +947,7 @@ pub trait EngineAdapter: Send + Sync {
         _runtime: &InstalledRuntime,
         model: &ModelArtifact,
         _host: &HostCapabilities,
+        _serve_profile: Option<&norted_core::ServeProfile>,
     ) -> RuntimeCompatibility {
         match self.compatibility(model) {
             CompatibilityDecision::Supported => RuntimeCompatibility::Compatible,
@@ -955,6 +984,7 @@ pub trait EngineAdapter: Send + Sync {
         _runtime: &AvailableRuntime,
         model: &ModelArtifact,
         _host: &HostCapabilities,
+        _serve_profile: Option<&norted_core::ServeProfile>,
     ) -> RuntimeCompatibility {
         match self.compatibility(model) {
             CompatibilityDecision::Supported => RuntimeCompatibility::Compatible,
@@ -1013,6 +1043,7 @@ pub trait EngineAdapter: Send + Sync {
         runtime: &InstalledRuntime,
         _model: &ModelArtifact,
         _host: &HostCapabilities,
+        _serve_profile: Option<&norted_core::ServeProfile>,
     ) -> Result<LoadSettingsSchema, EngineError> {
         Ok(LoadSettingsSchema {
             engine_id: self.identity().id,
@@ -1278,6 +1309,7 @@ mod tests {
         let override_temperature = GenerationSettingsPatch {
             temperature: Some(0.2),
             top_p: None,
+            reasoning_effort: None,
         };
 
         assert_eq!(
@@ -1554,6 +1586,7 @@ mod tests {
                 &GenerationSettingsPatch {
                     temperature: Some(0.5),
                     top_p: None,
+                    reasoning_effort: None,
                 },
                 &EffectiveGenerationSettings {
                     temperature: 0.0,
@@ -1694,6 +1727,7 @@ mod tests {
                 &runtime,
                 &model,
                 &HostCapabilities::current_without_accelerator_probe(),
+                None,
             ),
             RuntimeCompatibility::Compatible
         ));
