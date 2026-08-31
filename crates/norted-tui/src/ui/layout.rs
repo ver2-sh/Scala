@@ -356,7 +356,7 @@ impl UiLayout {
         let mut settings_list = Rect::default();
         let mut settings_scope_rows = Vec::new();
         let mut settings_rows = Vec::new();
-        if app.screen == Screen::Settings {
+        if matches!(app.screen, Screen::Settings | Screen::ModelProfiles) {
             settings_scopes = Rect::new(screen_body.x, screen_body.y, screen_body.width, 2);
             settings_list = Rect::new(
                 screen_body.x,
@@ -364,18 +364,23 @@ impl UiLayout {
                 screen_body.width,
                 screen_body.height.saturating_sub(6),
             );
-            let scopes = app.settings_scopes();
+            let labels = if app.screen == Screen::ModelProfiles {
+                app.model_profile_values()
+                    .into_iter()
+                    .map(|profile| profile.id.to_string())
+                    .collect::<Vec<_>>()
+            } else {
+                app.settings_scopes()
+                    .into_iter()
+                    .map(|scope| match scope {
+                        crate::app::SettingsScope::Global => "Global".to_owned(),
+                        crate::app::SettingsScope::Engine(engine) => engine,
+                        crate::app::SettingsScope::ModelProfile(profile) => profile.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+            };
             let mut x = settings_scopes.x;
-            for (index, scope) in scopes.iter().enumerate() {
-                let label = match scope {
-                    crate::app::SettingsScope::Global => "Global".to_owned(),
-                    crate::app::SettingsScope::Engine(engine) => engine.clone(),
-                    crate::app::SettingsScope::Profile(profile) => profile.to_string(),
-                    crate::app::SettingsScope::BuilderProfile(profile) => {
-                        format!("{profile} · Builder")
-                    }
-                    crate::app::SettingsScope::Model(_) => "Selected model".to_owned(),
-                };
+            for (index, label) in labels.iter().enumerate() {
                 let width = (label.chars().count() as u16 + 2)
                     .min(settings_scopes.right().saturating_sub(x));
                 if width == 0 {
@@ -661,6 +666,7 @@ mod tests {
             running_engine_count: 1,
             engines: Vec::new(),
             backend: BackendStatus {
+                model_profile_id: None,
                 generation: 1,
                 lifecycle: BackendLifecycle::Loading,
                 model_id: Some(app.snapshot.models[model_index].id.clone()),

@@ -6,10 +6,10 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use norted_core::{
-    ApplicationCore, BuilderRecommendationStatus, EnvironmentVariableProvenance, LoadSettingsPatch,
-    LoadSettingsProvenance, ModelArtifact, ModelId, NativeArgumentProvenance, ProcessIdentity,
-    RuntimeId, RuntimeProvenance, RuntimeSelection, ServeProfile, ServeProfileName,
-    ServeProfileRuntimeIdentity, ServeProfilesState, ServeProfilesStore,
+    ApplicationCore, EnvironmentVariableProvenance, ModelId, ModelProfile, ModelProfileId,
+    ModelProfileRuntimeIdentity, ModelProfilesStore, NativeArgumentProvenance, ProcessIdentity,
+    RuntimeId, RuntimeProvenance, RuntimeSelection, SettingsPatch, SettingsProvenance,
+    SettingsStore,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,8 +17,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, oneshot};
 
 use crate::{
     EffectiveGenerationSettings, EngineAdapter, EngineError, EngineIdentity, EngineProbe,
-    EngineRegistry, GenerationSettingsPatch, InferenceRequest, InstallationState, LaunchRequest,
-    LoadProgressReporter, ProcessDescriptor, ProcessExit, ProcessSupervisor, RoutedInferenceOutput,
+    EngineRegistry, InferenceRequest, InstallationState, LaunchRequest, LoadProgressReporter,
+    ProcessDescriptor, ProcessExit, ProcessSupervisor, RoutedInferenceOutput,
     RoutedInferenceStream, RuntimeLease, RuntimePackError, RuntimePackManager, StartupObservation,
 };
 
@@ -68,7 +68,7 @@ impl BackendLoadPhase {
         match self {
             Self::Starting => "Starting model load",
             Self::SelectingRuntime => "Selecting runtime",
-            Self::ResolvingSettings => "Resolving load settings",
+            Self::ResolvingSettings => "Resolving settings",
             Self::AcquiringRuntime => "Acquiring runtime",
             Self::PreparingModel => "Preparing model input",
             Self::PreparingLaunch => "Preparing launch",
@@ -83,7 +83,7 @@ impl BackendLoadPhase {
         match self {
             Self::Starting => "starting the model load",
             Self::SelectingRuntime => "selecting a runtime",
-            Self::ResolvingSettings => "resolving load settings",
+            Self::ResolvingSettings => "resolving settings",
             Self::AcquiringRuntime => "acquiring the runtime",
             Self::PreparingModel => "preparing the model input",
             Self::PreparingLaunch => "preparing the launch",
@@ -167,6 +167,7 @@ pub struct BackendStatus {
     #[serde(default)]
     pub generation: u64,
     pub lifecycle: BackendLifecycle,
+    pub model_profile_id: Option<ModelProfileId>,
     pub model_id: Option<ModelId>,
     pub engine_id: Option<String>,
     pub runtime_id: Option<RuntimeId>,
@@ -224,10 +225,19 @@ impl Default for RuntimeManagerOptions {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
+    #[error("Model Profile `{0}` does not exist")]
+    ModelProfileNotFound(ModelProfileId),
+    #[error(
+        "Model Profile `{profile_id}` is unavailable because bound model `{model_id}` is missing"
+    )]
+    BoundModelMissing {
+        profile_id: ModelProfileId,
+        model_id: ModelId,
+    },
     #[error("model `{0}` does not exist in the discovered registry")]
     ModelNotFound(ModelId),
-    #[error("model `{0}` is not loaded")]
-    ModelNotLoaded(ModelId),
+    #[error("Model Profile `{0}` is not loaded")]
+    ModelProfileNotLoaded(ModelProfileId),
     #[error("model `{model_id}` is already active with engine `{engine_id}`")]
     AlreadyActive {
         model_id: ModelId,
@@ -262,11 +272,11 @@ pub enum RuntimeError {
 struct ActiveBackend {
     adapter: Arc<dyn EngineAdapter>,
     process: ProcessDescriptor,
+    model_profile_id: ModelProfileId,
     model_id: ModelId,
     engine_id: String,
     endpoint: String,
     effective_generation_settings: EffectiveGenerationSettings,
-    serve_profile: Option<ServeProfile>,
     _runtime_lease: RuntimeLease,
 }
 
@@ -276,158 +286,19 @@ struct LoadAdmission {
 }
 
 struct AdmittedLoad {
+    model_profile: ModelProfile,
     model: norted_core::ModelArtifact,
     runtime_id: Option<RuntimeId>,
-    profile: Option<ServeProfileName>,
-    settings: LoadSettingsPatch,
+    settings: SettingsPatch,
     cancellation_epoch: u64,
     generation: u64,
-}
-
-struct ResolvedServeProfileSelection {
-    profile: Option<ServeProfile>,
-    local_serve_profile: Option<ServeProfileName>,
-    suppress_persisted_local_profile: bool,
-}
-
-async fn resolve_serve_profile(
-    core: &ApplicationCore,
-    model: &ModelArtifact,
-    state: &ServeProfilesState,
-    invocation: Option<&ServeProfileName>,
-) -> Result<ResolvedServeProfileSelection, String> {
-    let builder_profiles = core
-        .snapshot()
-        .await
-        .models
-        .into_iter()
-        .filter_map(|candidate| {
-            candidate
-                .norted_package
-                .and_then(|package| package.recommended_serve_profile)
-        })
-        .try_fold(
-            BTreeMap::<String, ServeProfile>::new(),
-            |mut profiles, profile| {
-                if let Some(existing) = profiles.get(&profile.id)
-                    && existing.content_hash() != profile.content_hash()
-                {
-                    return Err(format!(
-                        "discovered Builder Serve Profiles reuse ID `{}` with different content",
-                        profile.id
-                    ));
-                }
-                profiles.entry(profile.id.clone()).or_insert(profile);
-                Ok(profiles)
-            },
-        )?;
-
-    let local = |name: &ServeProfileName| state.profiles.get(name).cloned();
-    if let Some(name) = invocation {
-        if name.as_str() == "none" {
-            return Ok(ResolvedServeProfileSelection {
-                profile: None,
-                local_serve_profile: None,
-                suppress_persisted_local_profile: true,
-            });
-        }
-        if let Some(profile) = local(name) {
-            return Ok(ResolvedServeProfileSelection {
-                profile: Some(profile),
-                local_serve_profile: Some(name.clone()),
-                suppress_persisted_local_profile: true,
-            });
-        }
-        if let Some(profile) = builder_profiles.get(name.as_str()) {
-            return Ok(ResolvedServeProfileSelection {
-                profile: Some(profile.clone()),
-                local_serve_profile: None,
-                suppress_persisted_local_profile: true,
-            });
-        }
-        return Err(format!("Serve Profile `{name}` does not exist"));
-    }
-
-    if state.raw_profile_models.contains(&model.id) {
-        return Ok(ResolvedServeProfileSelection {
-            profile: None,
-            local_serve_profile: None,
-            suppress_persisted_local_profile: true,
-        });
-    }
-    if let Some(name) = state.model_assignments.get(&model.id) {
-        return Ok(ResolvedServeProfileSelection {
-            profile: Some(
-                local(name).ok_or_else(|| format!("Serve Profile `{name}` does not exist"))?,
-            ),
-            local_serve_profile: None,
-            suppress_persisted_local_profile: false,
-        });
-    }
-    if let Some(profile_id) = state.builder_profile_assignments.get(&model.id) {
-        return Ok(ResolvedServeProfileSelection {
-            profile: Some(builder_profiles.get(profile_id).cloned().ok_or_else(|| {
-                format!(
-                    "assigned Builder Serve Profile `{profile_id}` is unavailable; its source package may have moved or been removed"
-                )
-            })?),
-            local_serve_profile: None,
-            suppress_persisted_local_profile: true,
-        });
-    }
-    Ok(ResolvedServeProfileSelection {
-        profile: model
-            .norted_package
-            .as_ref()
-            .and_then(|package| package.recommended_serve_profile.clone()),
-        local_serve_profile: None,
-        suppress_persisted_local_profile: true,
-    })
-}
-
-fn serve_profile_runtime_identity(
-    selected: Option<&ServeProfile>,
-    model: &norted_core::ModelRuntimeIdentity,
-) -> ServeProfileRuntimeIdentity {
-    let recommended = model
-        .norted_package
-        .as_ref()
-        .and_then(|package| package.binding.recommended_serve_profile.as_ref());
-    let status = match (recommended, selected) {
-        (None, _) => BuilderRecommendationStatus::NotApplicable,
-        (Some(_), None) => BuilderRecommendationStatus::Disabled,
-        (Some(recommended), Some(selected))
-            if recommended.id == selected.id
-                && recommended.content_hash() == selected.content_hash() =>
-        {
-            BuilderRecommendationStatus::Canonical
-        }
-        (Some(_), Some(_)) => BuilderRecommendationStatus::Replaced,
-    };
-    let template = selected.and_then(|profile| profile.prompt.template.as_ref());
-    ServeProfileRuntimeIdentity {
-        profile_id: selected.map(|profile| profile.id.clone()),
-        display_name: selected.map(|profile| profile.display_name.clone()),
-        source: selected.map(|profile| profile.source),
-        schema: selected.map(|profile| profile.schema.clone()),
-        schema_version: selected.map(|profile| profile.schema_version),
-        content_sha256: selected.map(|profile| {
-            profile
-                .source_profile_sha256
-                .clone()
-                .unwrap_or_else(|| profile.content_hash())
-        }),
-        builder_recommended_profile_id: recommended.map(|profile| profile.id.clone()),
-        builder_recommendation_status: status,
-        effective_template_identity: template.map(|template| template.identity.clone()),
-        effective_template_sha256: template.map(|template| template.sha256.clone()),
-    }
 }
 
 struct ManagerState {
     public_endpoint: Option<String>,
     engines: BTreeMap<String, EngineStatus>,
     lifecycle: BackendLifecycle,
+    model_profile_id: Option<ModelProfileId>,
     model_id: Option<ModelId>,
     engine_id: Option<String>,
     runtime_id: Option<RuntimeId>,
@@ -463,7 +334,8 @@ pub struct RuntimeManager {
     operation: Arc<Mutex<()>>,
     cancellation_epoch: AtomicU64,
     shutting_down: AtomicBool,
-    serve_profiles: ServeProfilesStore,
+    settings: SettingsStore,
+    model_profiles: ModelProfilesStore,
     #[cfg(test)]
     load_start_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
@@ -476,7 +348,8 @@ impl RuntimeManager {
         supervisor: Arc<dyn ProcessSupervisor>,
         options: RuntimeManagerOptions,
     ) -> Arc<Self> {
-        let serve_profiles = ServeProfilesStore::new(&core.paths);
+        let settings = SettingsStore::new(&core.paths);
+        let model_profiles = ModelProfilesStore::new(&core.paths);
         let manager = Arc::new(Self {
             core,
             registry,
@@ -487,6 +360,7 @@ impl RuntimeManager {
                 public_endpoint: None,
                 engines: BTreeMap::new(),
                 lifecycle: BackendLifecycle::Stopped,
+                model_profile_id: None,
                 model_id: None,
                 engine_id: None,
                 runtime_id: None,
@@ -503,7 +377,8 @@ impl RuntimeManager {
             operation: Arc::new(Mutex::new(())),
             cancellation_epoch: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
-            serve_profiles,
+            settings,
+            model_profiles,
             #[cfg(test)]
             load_start_gate: Mutex::new(None),
         });
@@ -562,6 +437,7 @@ impl RuntimeManager {
             backend: BackendStatus {
                 generation: state.generation,
                 lifecycle: state.lifecycle,
+                model_profile_id: state.model_profile_id.clone(),
                 model_id: state.model_id.clone(),
                 engine_id: state.engine_id.clone(),
                 runtime_id: state.runtime_id.clone(),
@@ -599,28 +475,30 @@ impl RuntimeManager {
         }
     }
 
-    pub async fn load(self: &Arc<Self>, model_id: ModelId) -> Result<ControlStatus, RuntimeError> {
-        self.load_with_runtime(model_id, None).await
+    pub async fn load(
+        self: &Arc<Self>,
+        profile_id: ModelProfileId,
+    ) -> Result<ControlStatus, RuntimeError> {
+        self.load_with_runtime(profile_id, None).await
     }
 
     pub async fn load_with_runtime(
         self: &Arc<Self>,
-        model_id: ModelId,
+        profile_id: ModelProfileId,
         runtime_id: Option<RuntimeId>,
     ) -> Result<ControlStatus, RuntimeError> {
-        self.load_with_settings(model_id, runtime_id, None, LoadSettingsPatch::default())
+        self.load_with_settings(profile_id, runtime_id, SettingsPatch::default())
             .await
     }
 
     pub async fn load_with_settings(
         self: &Arc<Self>,
-        model_id: ModelId,
+        profile_id: ModelProfileId,
         runtime_id: Option<RuntimeId>,
-        profile: Option<ServeProfileName>,
-        settings: LoadSettingsPatch,
+        settings: SettingsPatch,
     ) -> Result<ControlStatus, RuntimeError> {
         let admission = self
-            .admit_load_with_settings(model_id, runtime_id, profile, settings)
+            .admit_load_with_settings(profile_id, runtime_id, settings)
             .await?;
         admission.completion.await.map_err(|_| {
             RuntimeError::Operation("server-owned load task ended without a result".to_owned())
@@ -629,17 +507,17 @@ impl RuntimeManager {
 
     pub async fn start_load(
         self: &Arc<Self>,
-        model_id: ModelId,
+        profile_id: ModelProfileId,
     ) -> Result<ControlStatus, RuntimeError> {
-        self.start_load_with_runtime(model_id, None).await
+        self.start_load_with_runtime(profile_id, None).await
     }
 
     pub async fn start_load_with_runtime(
         self: &Arc<Self>,
-        model_id: ModelId,
+        profile_id: ModelProfileId,
         runtime_id: Option<RuntimeId>,
     ) -> Result<ControlStatus, RuntimeError> {
-        self.start_load_with_settings(model_id, runtime_id, None, LoadSettingsPatch::default())
+        self.start_load_with_settings(profile_id, runtime_id, SettingsPatch::default())
             .await
     }
 
@@ -648,43 +526,74 @@ impl RuntimeManager {
     /// this future (or its caller) is dropped.
     pub async fn start_load_with_settings(
         self: &Arc<Self>,
-        model_id: ModelId,
+        profile_id: ModelProfileId,
         runtime_id: Option<RuntimeId>,
-        profile: Option<ServeProfileName>,
-        settings: LoadSettingsPatch,
+        settings: SettingsPatch,
     ) -> Result<ControlStatus, RuntimeError> {
         let admission = self
-            .admit_load_with_settings(model_id, runtime_id, profile, settings)
+            .admit_load_with_settings(profile_id, runtime_id, settings)
             .await?;
         Ok(admission.status)
     }
 
     async fn admit_load_with_settings(
         self: &Arc<Self>,
-        model_id: ModelId,
+        profile_id: ModelProfileId,
         runtime_id: Option<RuntimeId>,
-        profile: Option<ServeProfileName>,
-        settings: LoadSettingsPatch,
+        settings: SettingsPatch,
     ) -> Result<LoadAdmission, RuntimeError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(RuntimeError::ShuttingDown);
         }
-        // Capture before acquiring/validating so a concurrent unload that
-        // begins anywhere during admission invalidates this reservation.
-        let cancellation_epoch = self.cancellation_epoch.load(Ordering::Acquire);
         let operation = Arc::clone(&self.operation)
             .try_lock_owned()
             .map_err(|_| RuntimeError::Busy(self.current_lifecycle()))?;
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(RuntimeError::ShuttingDown);
         }
+        let active = self.state.read().await.active.as_ref().map(|active| {
+            (
+                active.model_profile_id.clone(),
+                active.model_id.clone(),
+                active.engine_id.clone(),
+            )
+        });
+        if let Some((active_profile_id, active_model_id, active_engine_id)) = active {
+            if active_profile_id == profile_id {
+                return Err(RuntimeError::AlreadyActive {
+                    model_id: active_model_id,
+                    engine_id: active_engine_id,
+                });
+            }
+            self.cancellation_epoch.fetch_add(1, Ordering::AcqRel);
+            self.stop_backend_with_operation_held().await?;
+        }
+        // Capture after a profile switch has cleanly stopped the previous
+        // backend. A concurrent unload beginning from here invalidates this
+        // reservation.
+        let cancellation_epoch = self.cancellation_epoch.load(Ordering::Acquire);
         self.ensure_idle_for_load().await?;
+        let profiles = self
+            .model_profiles
+            .read()
+            .await
+            .map_err(|error| RuntimeError::Operation(error.to_string()))?;
+        let model_profile = profiles
+            .profiles
+            .get(&profile_id)
+            .cloned()
+            .ok_or_else(|| RuntimeError::ModelProfileNotFound(profile_id.clone()))?;
         let model = self
             .core
-            .model(&model_id)
+            .model(&model_profile.model_id)
             .await
-            .ok_or_else(|| RuntimeError::ModelNotFound(model_id.clone()))?;
-        let generation = self.reserve_loading(&model_id, cancellation_epoch).await?;
+            .ok_or_else(|| RuntimeError::BoundModelMissing {
+                profile_id: profile_id.clone(),
+                model_id: model_profile.model_id.clone(),
+            })?;
+        let generation = self
+            .reserve_loading(&profile_id, &model.id, cancellation_epoch)
+            .await?;
         let status = self.status().await;
         let (completion_sender, completion) = oneshot::channel();
         let manager = Arc::clone(self);
@@ -692,9 +601,9 @@ impl RuntimeManager {
             let result = manager
                 .load_admitted(
                     AdmittedLoad {
+                        model_profile,
                         model,
                         runtime_id,
-                        profile,
                         settings,
                         cancellation_epoch,
                         generation,
@@ -709,6 +618,7 @@ impl RuntimeManager {
 
     async fn reserve_loading(
         &self,
+        profile_id: &ModelProfileId,
         model_id: &ModelId,
         cancellation_epoch: u64,
     ) -> Result<u64, RuntimeError> {
@@ -722,6 +632,7 @@ impl RuntimeManager {
         let mut state = self.state.write().await;
         state.generation = state.generation.wrapping_add(1);
         state.lifecycle = BackendLifecycle::Loading;
+        state.model_profile_id = Some(profile_id.clone());
         state.model_id = Some(model_id.clone());
         state.engine_id = None;
         state.runtime_id = None;
@@ -737,7 +648,7 @@ impl RuntimeManager {
         push_notice(
             &mut state,
             RuntimeNoticeLevel::Info,
-            format!("Loading model {model_id}"),
+            format!("Loading Model Profile {profile_id} (artifact {model_id})"),
         );
         Ok(state.generation)
     }
@@ -754,13 +665,14 @@ impl RuntimeManager {
         _operation: OwnedMutexGuard<()>,
     ) -> Result<ControlStatus, RuntimeError> {
         let AdmittedLoad {
+            model_profile,
             model,
             runtime_id,
-            profile,
             settings: invocation_settings,
             cancellation_epoch,
             generation,
         } = admitted;
+        let profile_id = model_profile.id.clone();
         let model_id = model.id.clone();
         #[cfg(test)]
         if let Some(gate) = self.load_start_gate.lock().await.clone() {
@@ -774,28 +686,28 @@ impl RuntimeManager {
 
         self.set_load_progress(
             generation,
-            BackendLoadProgress::indeterminate(BackendLoadPhase::SelectingRuntime),
+            BackendLoadProgress::indeterminate(BackendLoadPhase::ResolvingSettings),
         )
         .await;
-        let profile_state = match self.serve_profiles.read().await {
+        let settings_state = match self.settings.read().await {
             Ok(state) => state,
             Err(error) => {
                 self.fail_loading(generation, error.to_string(), None).await;
                 return Err(RuntimeError::Operation(error.to_string()));
             }
         };
-        let profile_selection =
-            match resolve_serve_profile(&self.core, &model, &profile_state, profile.as_ref()).await
-            {
-                Ok(selection) => selection,
-                Err(error) => {
-                    self.fail_loading(generation, error.clone(), None).await;
-                    return Err(RuntimeError::Operation(error));
-                }
-            };
-        let serve_profile = profile_selection.profile;
-        if let Some(profile) = &serve_profile
-            && let Err(reason) = profile.basic_applicability(&model)
+        let engine_id = model_profile.engine_id.to_string();
+        let adapter = match self.registry.get(&engine_id) {
+            Some(adapter) => adapter,
+            None => {
+                let error = RuntimeError::EngineUnavailable(format!(
+                    "Model Profile `{profile_id}` binds unregistered engine `{engine_id}`"
+                ));
+                self.fail_loading(generation, error.to_string(), None).await;
+                return Err(error);
+            }
+        };
+        if let crate::CompatibilityDecision::Unsupported { reason } = adapter.compatibility(&model)
         {
             self.fail_loading(generation, reason.clone(), None).await;
             return Err(RuntimeError::Incompatible {
@@ -803,41 +715,21 @@ impl RuntimeManager {
                 reason,
             });
         }
-        let (adapter, selection) = match self
-            .select_runtime(&model, runtime_id.as_ref(), serve_profile.as_ref())
-            .await
-        {
-            Ok(selection) => selection,
-            Err(error) => {
-                self.fail_loading(generation, error.to_string(), None).await;
-                return Err(error);
-            }
-        };
-        let engine_id = adapter.identity().id;
         if let Some(id) = invocation_settings
             .0
             .keys()
             .find(|id| !id.applies_to_engine(&engine_id))
         {
             let error = RuntimeError::Operation(format!(
-                "invocation load setting `{id}` does not apply to selected engine `{engine_id}`"
+                "invocation setting `{id}` does not apply to selected engine `{engine_id}`"
             ));
             self.fail_loading(generation, error.to_string(), None).await;
             return Err(error);
         }
-        self.set_load_progress(
-            generation,
-            BackendLoadProgress::indeterminate(BackendLoadPhase::ResolvingSettings),
-        )
-        .await;
-        let mut load_state = profile_state.clone();
-        if profile_selection.suppress_persisted_local_profile {
-            load_state.model_assignments.remove(&model_id);
-        }
-        let mut resolved_load_settings = match load_state.resolve(
-            &model_id,
+        let resolved_settings = match settings_state.resolve(
+            &profile_id,
             &engine_id,
-            profile_selection.local_serve_profile.as_ref(),
+            &model_profile.overrides,
             &invocation_settings,
             &self.core.paths.data_dir,
         ) {
@@ -847,16 +739,29 @@ impl RuntimeManager {
                 return Err(RuntimeError::Operation(error.to_string()));
             }
         };
-        if let Err(error) = norted_core::apply_serve_profile_load_policy(
-            serve_profile.as_ref(),
-            &mut resolved_load_settings,
-        ) {
-            self.fail_loading(generation, error.clone(), None).await;
-            return Err(RuntimeError::Operation(error));
-        }
+        self.set_load_progress(
+            generation,
+            BackendLoadProgress::indeterminate(BackendLoadPhase::SelectingRuntime),
+        )
+        .await;
+        let (_, selection) = match self
+            .select_runtime(
+                &model,
+                &engine_id,
+                runtime_id.as_ref(),
+                Some(&resolved_settings),
+            )
+            .await
+        {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.fail_loading(generation, error.to_string(), None).await;
+                return Err(error);
+            }
+        };
         let host = self.packs.host_capabilities().await;
-        let load_settings_schema = match adapter
-            .load_settings_schema(&selection.runtime, &model, &host, serve_profile.as_ref())
+        let settings_schema = match adapter
+            .settings_schema(&selection.runtime, &model, &host)
             .await
         {
             Ok(schema) => schema,
@@ -939,9 +844,8 @@ impl RuntimeManager {
                 runtime: selection.runtime.clone(),
                 accelerator: selection.accelerator.clone(),
                 backend_address,
-                load_settings: resolved_load_settings,
-                load_settings_schema,
-                serve_profile: serve_profile.clone(),
+                settings: resolved_settings,
+                settings_schema,
             })
             .await
         {
@@ -964,14 +868,7 @@ impl RuntimeManager {
             return Err(RuntimeError::Operation(detail));
         }
         let mut context_attempts = Vec::new();
-        let (
-            process,
-            endpoint,
-            exit,
-            mut startup_observation,
-            effective_generation_settings,
-            selected_serve_profile,
-        ) = loop {
+        let (process, endpoint, exit, mut startup_observation, effective_generation_settings) = loop {
             let launch_spec = launch_attempts
                 .pop_front()
                 .expect("launch attempts were checked as non-empty");
@@ -1022,8 +919,7 @@ impl RuntimeManager {
             let selected_accelerator = launch_spec.accelerator.clone();
             let model_identity = launch_spec.model.runtime_identity();
             let normalized_settings = launch_spec.normalized_settings.clone();
-            let load_settings = launch_spec.load_settings.clone();
-            let selected_serve_profile = launch_spec.serve_profile.clone();
+            let settings = launch_spec.settings.clone();
             let native_arguments = launch_spec.native_arguments.clone();
             let inherits_parent_environment = launch_spec.inherits_parent_environment;
             let native_environment = environment_provenance(
@@ -1088,8 +984,6 @@ impl RuntimeManager {
                     return Err(RuntimeError::StartupFailed(detail));
                 }
             };
-            let serve_profile_identity =
-                serve_profile_runtime_identity(selected_serve_profile.as_ref(), &model_identity);
             let provenance = RuntimeProvenance {
                 model: model_identity,
                 runtime: selected_runtime.manifest.clone(),
@@ -1097,9 +991,15 @@ impl RuntimeManager {
                 selection_source: selection.source,
                 accelerator: selected_accelerator,
                 installation,
-                serve_profile: serve_profile_identity,
-                load_settings: LoadSettingsProvenance {
-                    effective: load_settings.effective,
+                model_profile: ModelProfileRuntimeIdentity {
+                    model_profile_id: model_profile.id.clone(),
+                    display_name: model_profile.display_name.clone(),
+                    content_sha256: model_profile.content_hash(),
+                    bound_model_id: model_profile.model_id.clone(),
+                    bound_engine_id: model_profile.engine_id.clone(),
+                },
+                settings: SettingsProvenance {
+                    effective: settings.effective,
                 },
                 normalized_settings,
                 native_arguments: native_argument_provenance(native_arguments),
@@ -1201,14 +1101,7 @@ impl RuntimeManager {
                             return Err(RuntimeError::StartupFailed(detail));
                         }
                     };
-                    break (
-                        process,
-                        endpoint,
-                        exit,
-                        observation,
-                        settings,
-                        selected_serve_profile,
-                    );
+                    break (process, endpoint, exit, observation, settings);
                 }
                 StartupObservation::RetryContextCapacity {
                     kv_mode,
@@ -1247,7 +1140,7 @@ impl RuntimeManager {
                             .collect::<Vec<_>>()
                             .join(", ");
                         let detail = format!(
-                            "no exact-runtime-supported Serve Profile KV mode met the {minimum_context}-token minimum; attempted modes and observed contexts: {attempts}"
+                            "no exact-runtime-supported automatic KV mode met the {minimum_context}-token minimum; attempted modes and observed contexts: {attempts}"
                         );
                         self.fail_loading(generation, detail.clone(), None).await;
                         return Err(RuntimeError::StartupFailed(detail));
@@ -1267,7 +1160,7 @@ impl RuntimeManager {
             let mode = mode.to_owned();
             context_attempts.push((mode.clone(), context));
             startup_observation.insert(
-                "serve_profile_kv_attempts".to_owned(),
+                "automatic_kv_attempts".to_owned(),
                 serde_json::Value::Array(
                     context_attempts
                         .iter()
@@ -1334,17 +1227,17 @@ impl RuntimeManager {
             state.active = Some(ActiveBackend {
                 adapter,
                 process: process.clone(),
+                model_profile_id: profile_id.clone(),
                 model_id: model_id.clone(),
                 engine_id: engine_id.clone(),
                 endpoint,
                 effective_generation_settings,
-                serve_profile: selected_serve_profile,
                 _runtime_lease: runtime_lease,
             });
             push_notice(
                 &mut state,
                 RuntimeNoticeLevel::Info,
-                format!("Model {model_id} is ready"),
+                format!("Model Profile {profile_id} is ready (artifact {model_id})"),
             );
         }
         spawn_exit_monitor(Arc::downgrade(self), generation, process, exit);
@@ -1364,6 +1257,10 @@ impl RuntimeManager {
 
     async fn unload_inner(&self) -> Result<ControlStatus, RuntimeError> {
         let _operation = self.operation.lock().await;
+        self.stop_backend_with_operation_held().await
+    }
+
+    async fn stop_backend_with_operation_held(&self) -> Result<ControlStatus, RuntimeError> {
         let (process, adapter) = {
             let mut state = self.state.write().await;
             match state.lifecycle {
@@ -1432,6 +1329,7 @@ impl RuntimeManager {
         }
         let mut state = self.state.write().await;
         state.lifecycle = BackendLifecycle::Stopped;
+        state.model_profile_id = None;
         state.model_id = None;
         state.engine_id = None;
         state.runtime_id = None;
@@ -1453,13 +1351,8 @@ impl RuntimeManager {
         &self,
         request: InferenceRequest,
     ) -> Result<RoutedInferenceOutput, RuntimeError> {
-        let (adapter, endpoint, backend_generation_settings, serve_profile) =
-            self.inference_target(&request.model_id).await?;
-        validate_profile_generation_overrides(
-            serve_profile.as_ref(),
-            &request.generation_settings,
-            adapter.identity().id.as_str(),
-        )?;
+        let (adapter, endpoint, backend_generation_settings) =
+            self.inference_target(&request.model_profile_id).await?;
         adapter
             .validate_generation_settings(
                 &request.generation_settings,
@@ -1482,13 +1375,8 @@ impl RuntimeManager {
         &self,
         request: InferenceRequest,
     ) -> Result<RoutedInferenceStream, RuntimeError> {
-        let (adapter, endpoint, backend_generation_settings, serve_profile) =
-            self.inference_target(&request.model_id).await?;
-        validate_profile_generation_overrides(
-            serve_profile.as_ref(),
-            &request.generation_settings,
-            adapter.identity().id.as_str(),
-        )?;
+        let (adapter, endpoint, backend_generation_settings) =
+            self.inference_target(&request.model_profile_id).await?;
         adapter
             .validate_generation_settings(
                 &request.generation_settings,
@@ -1619,12 +1507,13 @@ impl RuntimeManager {
     async fn select_runtime(
         &self,
         model: &norted_core::ModelArtifact,
+        engine_id: &str,
         explicit_runtime: Option<&RuntimeId>,
-        serve_profile: Option<&ServeProfile>,
+        settings: Option<&norted_core::ResolvedSettings>,
     ) -> Result<(Arc<dyn EngineAdapter>, RuntimeSelection), RuntimeError> {
         let selection = self
             .packs
-            .resolve_with_profile(model, explicit_runtime, serve_profile)
+            .resolve_for_engine_with_settings(model, engine_id, explicit_runtime, settings)
             .await
             .map_err(|error| match error {
                 RuntimePackError::Incompatible { reason, .. } => RuntimeError::Incompatible {
@@ -1633,10 +1522,10 @@ impl RuntimeManager {
                 },
                 error => RuntimeError::EngineUnavailable(error.to_string()),
             })?;
-        let engine_id = &selection.runtime.manifest.identity.engine_id;
-        let adapter = self.registry.get(engine_id).ok_or_else(|| {
+        let selected_engine_id = &selection.runtime.manifest.identity.engine_id;
+        let adapter = self.registry.get(selected_engine_id).ok_or_else(|| {
             RuntimeError::EngineUnavailable(format!(
-                "selected runtime uses unregistered engine `{engine_id}`"
+                "selected runtime uses unregistered engine `{selected_engine_id}`"
             ))
         })?;
         Ok((adapter, selection))
@@ -1749,34 +1638,26 @@ impl RuntimeManager {
 
     async fn inference_target(
         &self,
-        model_id: &ModelId,
-    ) -> Result<
-        (
-            Arc<dyn EngineAdapter>,
-            String,
-            EffectiveGenerationSettings,
-            Option<ServeProfile>,
-        ),
-        RuntimeError,
-    > {
-        if self.core.model(model_id).await.is_none() {
-            return Err(RuntimeError::ModelNotFound(model_id.clone()));
-        }
+        requested_alias: &ModelProfileId,
+    ) -> Result<(Arc<dyn EngineAdapter>, String, EffectiveGenerationSettings), RuntimeError> {
         let state = self.state.read().await;
         match (&state.lifecycle, &state.active) {
-            (BackendLifecycle::Running, Some(active)) if &active.model_id == model_id => Ok((
-                Arc::clone(&active.adapter),
-                active.endpoint.clone(),
-                active.effective_generation_settings,
-                active.serve_profile.clone(),
-            )),
+            (BackendLifecycle::Running, Some(active))
+                if active.model_profile_id == *requested_alias =>
+            {
+                Ok((
+                    Arc::clone(&active.adapter),
+                    active.endpoint.clone(),
+                    active.effective_generation_settings,
+                ))
+            }
             (BackendLifecycle::Failed, _) => Err(RuntimeError::BackendCrashed(
                 state
                     .failure
                     .clone()
                     .unwrap_or_else(|| "backend is in a failed state".to_owned()),
             )),
-            _ => Err(RuntimeError::ModelNotLoaded(model_id.clone())),
+            _ => Err(RuntimeError::ModelProfileNotLoaded(requested_alias.clone())),
         }
     }
 
@@ -1846,6 +1727,7 @@ impl RuntimeManager {
             backend: BackendStatus {
                 generation: state.generation,
                 lifecycle: state.lifecycle,
+                model_profile_id: state.model_profile_id.clone(),
                 model_id: state.model_id.clone(),
                 engine_id: state.engine_id.clone(),
                 runtime_id: state.runtime_id.clone(),
@@ -2022,41 +1904,6 @@ fn map_inference_error(error: EngineError) -> RuntimeError {
     }
 }
 
-fn validate_profile_generation_overrides(
-    profile: Option<&ServeProfile>,
-    settings: &GenerationSettingsPatch,
-    engine_id: &str,
-) -> Result<(), RuntimeError> {
-    if settings.reasoning_effort.is_some()
-        && (engine_id != "q27"
-            || !profile.is_some_and(|profile| {
-                profile.prompt.mode == norted_core::PromptMode::ExternalTemplate
-                    && profile.prompt.delivery == norted_core::PromptDelivery::RawCompletions
-            }))
-    {
-        return Err(RuntimeError::InvalidGenerationSettings(
-            "request-time reasoning_effort requires a selected q27 external-template Serve Profile"
-                .to_owned(),
-        ));
-    }
-    let Some(profile) = profile else {
-        return Ok(());
-    };
-    for (name, present) in [
-        ("temperature", settings.temperature.is_some()),
-        ("top_p", settings.top_p.is_some()),
-        ("reasoning_effort", settings.reasoning_effort.is_some()),
-    ] {
-        if present && !profile.generation.allows_override(name) {
-            return Err(RuntimeError::InvalidGenerationSettings(format!(
-                "Serve Profile `{}` does not allow request-time `{name}` overrides",
-                profile.display_name
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn push_notice(state: &mut ManagerState, level: RuntimeNoticeLevel, message: String) {
     if state.notices.len() == NOTICE_LIMIT {
         state.notices.pop_front();
@@ -2082,7 +1929,7 @@ fn retry_context_capacity_message(
     minimum_context: u64,
 ) -> String {
     format!(
-        "KV mode {kv_mode} served {observed_context} of the required {minimum_context} context tokens; retrying with the next Serve Profile KV mode"
+        "KV mode {kv_mode} served {observed_context} of the required {minimum_context} context tokens; retrying with the next configured automatic KV mode"
     )
 }
 
@@ -2093,6 +1940,7 @@ mod tests {
     struct ManagerFixture {
         _temporary: tempfile::TempDir,
         manager: Arc<RuntimeManager>,
+        profile_id: ModelProfileId,
         model_id: ModelId,
     }
 
@@ -2112,8 +1960,10 @@ mod tests {
             runtimes_dir: root.join("data/runtimes"),
             runtime_cache_dir: root.join("cache/runtime-packs"),
             runtime_selections_file: root.join("data/runtime-selections.json"),
-            serve_profiles_file: root.join("data/serve-profiles.json"),
-            serve_profiles_lock_file: root.join("data/.serve-profiles.lock"),
+            settings_file: root.join("data/settings.json"),
+            settings_lock_file: root.join("data/.settings.lock"),
+            model_profiles_file: root.join("data/model-profiles.json"),
+            model_profiles_lock_file: root.join("data/.model-profiles.lock"),
         };
         paths.ensure_required().expect("fixture paths");
         std::fs::write(
@@ -2136,6 +1986,23 @@ mod tests {
             .next()
             .expect("discovered model")
             .id;
+        let profile_id = ModelProfileId::new("fixture").expect("profile ID");
+        norted_core::ModelProfilesStore::new(&paths)
+            .update({
+                let profile_id = profile_id.clone();
+                let model_id = model_id.clone();
+                move |state| {
+                    state.create(
+                        profile_id.clone(),
+                        "Fixture",
+                        model_id,
+                        norted_core::EngineId::new("llama.cpp").expect("engine ID"),
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("model profile fixture");
         let registry = EngineRegistry::default();
         let packs = RuntimePackManager::new(
             &paths,
@@ -2154,6 +2021,7 @@ mod tests {
         ManagerFixture {
             _temporary: temporary,
             manager,
+            profile_id,
             model_id,
         }
     }
@@ -2180,6 +2048,7 @@ mod tests {
             public_endpoint: None,
             engines: BTreeMap::new(),
             lifecycle: BackendLifecycle::Loading,
+            model_profile_id: None,
             model_id: None,
             engine_id: None,
             runtime_id: None,
@@ -2203,10 +2072,14 @@ mod tests {
 
         let admitted = fixture
             .manager
-            .start_load(fixture.model_id.clone())
+            .start_load(fixture.profile_id.clone())
             .await
             .expect("load admission");
         assert_eq!(admitted.backend.lifecycle, BackendLifecycle::Loading);
+        assert_eq!(
+            admitted.backend.model_profile_id.as_ref(),
+            Some(&fixture.profile_id)
+        );
         assert_eq!(admitted.backend.model_id.as_ref(), Some(&fixture.model_id));
         assert_eq!(
             fixture.manager.status().await.backend.generation,
@@ -2224,13 +2097,13 @@ mod tests {
         *fixture.manager.load_start_gate.lock().await = Some(Arc::clone(&gate));
         fixture
             .manager
-            .start_load(fixture.model_id.clone())
+            .start_load(fixture.profile_id.clone())
             .await
             .expect("first admission");
 
         let error = fixture
             .manager
-            .start_load(fixture.model_id.clone())
+            .start_load(fixture.profile_id.clone())
             .await
             .expect_err("second admission must be rejected");
         assert!(matches!(
@@ -2253,7 +2126,7 @@ mod tests {
 
         let error = fixture
             .manager
-            .reserve_loading(&fixture.model_id, stale_epoch)
+            .reserve_loading(&fixture.profile_id, &fixture.model_id, stale_epoch)
             .await
             .expect_err("stale admission epoch");
         assert!(error.to_string().contains("cancelled before admission"));
@@ -2268,7 +2141,7 @@ mod tests {
         let fixture = manager_fixture().await;
         let admitted = fixture
             .manager
-            .start_load(fixture.model_id.clone())
+            .start_load(fixture.profile_id.clone())
             .await
             .expect("load admission");
         let failed = wait_for_lifecycle(&fixture.manager, BackendLifecycle::Failed).await;
@@ -2290,7 +2163,7 @@ mod tests {
         *fixture.manager.load_start_gate.lock().await = Some(Arc::clone(&gate));
         fixture
             .manager
-            .start_load(fixture.model_id.clone())
+            .start_load(fixture.profile_id.clone())
             .await
             .expect("load admission");
 
@@ -2310,7 +2183,7 @@ mod tests {
         *fixture.manager.load_start_gate.lock().await = Some(Arc::clone(&gate));
         fixture
             .manager
-            .start_load(fixture.model_id.clone())
+            .start_load(fixture.profile_id.clone())
             .await
             .expect("load admission");
 
@@ -2462,7 +2335,7 @@ mod tests {
         let message = retry_context_capacity_message("fp8", 180_000, 200_000);
         assert_eq!(
             message,
-            "KV mode fp8 served 180000 of the required 200000 context tokens; retrying with the next Serve Profile KV mode"
+            "KV mode fp8 served 180000 of the required 200000 context tokens; retrying with the next configured automatic KV mode"
         );
         assert!(!message.contains("next KV mode: fp8"));
     }

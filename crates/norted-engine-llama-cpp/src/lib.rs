@@ -16,10 +16,9 @@ use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use norted_core::{
     AcquisitionMethod, ArtifactFormat, AvailableRuntime, EngineConfig, EngineInstallation,
-    EngineRevision, GpuOffload, HostCapabilities, InstalledRuntime, LoadSettingDefinition,
-    LoadSettingId, LoadSettingKind, LoadSettingScope, LoadSettingValue, LoadSettingsSchema,
-    ModelArtifact, RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId,
-    RuntimeProbeObservation,
+    EngineRevision, GpuOffload, HostCapabilities, InstalledRuntime, ModelArtifact,
+    RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId, RuntimeProbeObservation,
+    SettingDefinition, SettingId, SettingKind, SettingScope, SettingValue, SettingsSchema,
 };
 use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CompatibilityDecision,
@@ -28,7 +27,7 @@ use norted_engine::{
     InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
     InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter,
     NativeOption, OptionValueKind, PreparedModelInput, ProcessDescriptor, UpdateState,
-    capture_command, common_load_setting_definitions, prepare_norted_package_input,
+    capture_command, common_setting_definitions, prepare_norted_package_input,
     prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
     revalidate_norted_package_before_launch_with_progress,
 };
@@ -78,36 +77,10 @@ const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &[
     "LLAMA_ARG_MCP_CONFIG",
 ];
 
-fn llama_profile_compatibility(
-    artifact: CompatibilityDecision,
-    model: &ModelArtifact,
-    serve_profile: Option<&norted_core::ServeProfile>,
-) -> RuntimeCompatibility {
-    if let CompatibilityDecision::Unsupported { reason } = artifact {
-        return RuntimeCompatibility::Incompatible(reason);
-    }
-    let Some(profile) = serve_profile else {
-        return RuntimeCompatibility::Compatible;
-    };
-    if let Err(reason) = profile.basic_applicability(model) {
-        return RuntimeCompatibility::Incompatible(reason);
-    }
-    if profile.applicability.architecture.is_some()
-        || profile.applicability.family.is_some()
-        || !profile.applicability.required_model_capabilities.is_empty()
-    {
-        return RuntimeCompatibility::Incompatible(format!(
-            "Serve Profile `{}` declares architecture/family/model-capability constraints that the bounded llama.cpp GGUF integration cannot prove",
-            profile.display_name
-        ));
-    }
-    if profile.requires_runtime_recipe() {
-        RuntimeCompatibility::Incompatible(format!(
-            "Serve Profile `{}` requires prompt/generation/strategy capabilities that the llama.cpp adapter does not yet implement; choose None/raw defaults or a load-only Serve Profile",
-            profile.display_name
-        ))
-    } else {
-        RuntimeCompatibility::Compatible
+fn llama_model_compatibility(artifact: CompatibilityDecision) -> RuntimeCompatibility {
+    match artifact {
+        CompatibilityDecision::Supported => RuntimeCompatibility::Compatible,
+        CompatibilityDecision::Unsupported { reason } => RuntimeCompatibility::Incompatible(reason),
     }
 }
 
@@ -434,7 +407,7 @@ impl LlamaCppAdapter {
     fn backend_request(&self, request: &InferenceRequest, stream: bool) -> Value {
         let messages = backend_messages(&request.messages);
         let mut body = json!({
-            "model": request.model_id.0,
+            "model": request.model_profile_id.as_str(),
             "messages": messages,
             "stream": stream,
         });
@@ -531,9 +504,9 @@ impl EngineAdapter for LlamaCppAdapter {
         _runtime: &InstalledRuntime,
         model: &ModelArtifact,
         _host: &HostCapabilities,
-        serve_profile: Option<&norted_core::ServeProfile>,
+        _settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
-        llama_profile_compatibility(self.compatibility(model), model, serve_profile)
+        llama_model_compatibility(self.compatibility(model))
     }
 
     fn available_runtime_model_compatibility(
@@ -541,9 +514,9 @@ impl EngineAdapter for LlamaCppAdapter {
         _runtime: &AvailableRuntime,
         model: &ModelArtifact,
         _host: &HostCapabilities,
-        serve_profile: Option<&norted_core::ServeProfile>,
+        _settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
-        llama_profile_compatibility(self.compatibility(model), model, serve_profile)
+        llama_model_compatibility(self.compatibility(model))
     }
 
     fn native_options(&self) -> Vec<NativeOption> {
@@ -571,20 +544,19 @@ impl EngineAdapter for LlamaCppAdapter {
         prepare_norted_package_input_with_progress(model, &progress).await
     }
 
-    fn load_setting_definitions(&self) -> Vec<LoadSettingDefinition> {
-        llama_load_setting_definitions()
+    fn setting_definitions(&self) -> Vec<SettingDefinition> {
+        llama_setting_definitions()
     }
 
-    async fn load_settings_schema(
+    async fn settings_schema(
         &self,
         runtime: &InstalledRuntime,
         _model: &ModelArtifact,
         _host: &HostCapabilities,
-        _serve_profile: Option<&norted_core::ServeProfile>,
-    ) -> Result<LoadSettingsSchema, EngineError> {
+    ) -> Result<SettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
         let help = self.cached_runtime_help(runtime).await?;
-        let mut definitions = llama_load_setting_definitions();
+        let mut definitions = llama_setting_definitions();
         for definition in &mut definitions {
             let requirements = llama_setting_contract(definition.id.as_str());
             let missing = requirements
@@ -639,7 +611,7 @@ impl EngineAdapter for LlamaCppAdapter {
                                 .to_owned(),
                         );
                     } else {
-                        definition.kind = LoadSettingKind::Choice { choices };
+                        definition.kind = SettingKind::Choice { choices };
                     }
                 }
                 "llama.cpp.load_mode" => {
@@ -651,13 +623,13 @@ impl EngineAdapter for LlamaCppAdapter {
                                 .to_owned(),
                         );
                     } else {
-                        definition.kind = LoadSettingKind::Choice { choices };
+                        definition.kind = SettingKind::Choice { choices };
                     }
                 }
                 _ => {}
             }
         }
-        Ok(LoadSettingsSchema {
+        Ok(SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
             definitions,
@@ -808,14 +780,11 @@ impl EngineAdapter for LlamaCppAdapter {
             ));
         }
         request
-            .load_settings_schema
-            .validate(&request.load_settings)
+            .settings_schema
+            .validate(&request.settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
-        let structured = translate_llama_load_settings(
-            &request.load_settings,
-            &self.native_arguments,
-            &self.environment,
-        )?;
+        let structured =
+            translate_llama_settings(&request.settings, &self.native_arguments, &self.environment)?;
         let observation = self.probe_runtime(&request.runtime).await?;
         let binary_path = request.runtime.entrypoint_path();
         let manifest = &request.runtime.manifest;
@@ -843,11 +812,16 @@ impl EngineAdapter for LlamaCppAdapter {
             acquired_at_unix: manifest.installed_at_unix,
             observed_at_unix: observation.observed_at_unix,
         });
+        let public_model_id = request.settings.model_profile_id.as_ref().ok_or_else(|| {
+            EngineError::InvalidConfiguration(
+                "resolved settings do not identify the loaded Model Profile".to_owned(),
+            )
+        })?;
         let arguments = vec![
             OsString::from("--model"),
             request.model.primary.path.as_os_str().to_owned(),
             OsString::from("--alias"),
-            OsString::from(request.model.primary.id.0.clone()),
+            OsString::from(public_model_id.as_str()),
             OsString::from("--host"),
             OsString::from(request.backend_address.ip().to_string()),
             OsString::from("--port"),
@@ -869,13 +843,12 @@ impl EngineAdapter for LlamaCppAdapter {
             temporary_files: Vec::new(),
             endpoint: Some(http_endpoint(request.backend_address)),
             normalized_settings: BTreeMap::new(),
-            load_settings: request.load_settings,
+            settings: request.settings,
             native_arguments: self.native_arguments.clone(),
             installation: (*installation).clone(),
             runtime: request.runtime,
             model: request.model,
             accelerator: request.accelerator,
-            serve_profile: request.serve_profile,
         })
     }
 
@@ -1321,14 +1294,14 @@ fn invalid_probe(reason: String) -> EngineProbe {
     }
 }
 
-fn llama_load_setting_definitions() -> Vec<LoadSettingDefinition> {
-    let mut definitions = common_load_setting_definitions();
+fn llama_setting_definitions() -> Vec<SettingDefinition> {
+    let mut definitions = common_setting_definitions();
     definitions.extend([
         llama_definition(
             "llama.cpp.threads",
             "CPU threads",
             "CPU threads used during token generation",
-            LoadSettingKind::UnsignedInteger {
+            SettingKind::UnsignedInteger {
                 minimum: Some(1),
                 maximum: None,
             },
@@ -1338,7 +1311,7 @@ fn llama_load_setting_definitions() -> Vec<LoadSettingDefinition> {
             "llama.cpp.batch_size",
             "Batch size",
             "Logical maximum prompt-processing batch size",
-            LoadSettingKind::UnsignedInteger {
+            SettingKind::UnsignedInteger {
                 minimum: Some(1),
                 maximum: None,
             },
@@ -1348,7 +1321,7 @@ fn llama_load_setting_definitions() -> Vec<LoadSettingDefinition> {
             "llama.cpp.micro_batch_size",
             "Micro-batch size",
             "Physical maximum prompt-processing batch size",
-            LoadSettingKind::UnsignedInteger {
+            SettingKind::UnsignedInteger {
                 minimum: Some(1),
                 maximum: None,
             },
@@ -1358,14 +1331,14 @@ fn llama_load_setting_definitions() -> Vec<LoadSettingDefinition> {
             "llama.cpp.gpu_offload",
             "GPU offload",
             "Weight layers placed in VRAM: none, auto, all, or an exact count",
-            LoadSettingKind::GpuOffload,
+            SettingKind::GpuOffload,
             Some("auto in current runtimes"),
         ),
         llama_definition(
             "llama.cpp.flash_attention",
             "Flash attention",
             "Explicit llama.cpp Flash Attention mode",
-            LoadSettingKind::Choice {
+            SettingKind::Choice {
                 choices: vec!["auto".to_owned(), "on".to_owned(), "off".to_owned()],
             },
             Some("auto in current runtimes"),
@@ -1374,7 +1347,7 @@ fn llama_load_setting_definitions() -> Vec<LoadSettingDefinition> {
             "llama.cpp.kv_cache_k",
             "K-cache type",
             "Key cache storage type",
-            LoadSettingKind::Choice {
+            SettingKind::Choice {
                 choices: llama_cache_types(),
             },
             Some("runtime-selected"),
@@ -1383,7 +1356,7 @@ fn llama_load_setting_definitions() -> Vec<LoadSettingDefinition> {
             "llama.cpp.kv_cache_v",
             "V-cache type",
             "Value cache storage type",
-            LoadSettingKind::Choice {
+            SettingKind::Choice {
                 choices: llama_cache_types(),
             },
             Some("runtime-selected"),
@@ -1392,7 +1365,7 @@ fn llama_load_setting_definitions() -> Vec<LoadSettingDefinition> {
             "llama.cpp.load_mode",
             "Model load mode",
             "One unambiguous llama.cpp model-loading mode",
-            LoadSettingKind::Choice {
+            SettingKind::Choice {
                 choices: llama_load_modes(),
             },
             Some("runtime-selected; omission preserves the exact runtime default"),
@@ -1405,22 +1378,28 @@ fn llama_definition(
     id: &str,
     label: &str,
     description: &str,
-    kind: LoadSettingKind,
+    kind: SettingKind,
     upstream_default: Option<&str>,
-) -> LoadSettingDefinition {
-    LoadSettingDefinition {
-        id: LoadSettingId::new(id).expect("static llama.cpp setting ID"),
+) -> SettingDefinition {
+    SettingDefinition {
+        id: SettingId::new(id).expect("static llama.cpp setting ID"),
         label: label.to_owned(),
         description: description.to_owned(),
         kind,
-        scope: LoadSettingScope::Engine {
+        scope: SettingScope::Engine {
             engine_id: ENGINE_ID.to_owned(),
+        },
+        category: if id.contains("kv_cache") || id.contains("flash_attention") {
+            norted_core::SettingCategory::KvMemory
+        } else if id.contains("cache") {
+            norted_core::SettingCategory::Cache
+        } else {
+            norted_core::SettingCategory::Load
         },
         supported: true,
         unsupported_reason: None,
         unit: None,
         upstream_default: upstream_default.map(str::to_owned),
-        recommendation: None,
     }
 }
 
@@ -1543,8 +1522,8 @@ struct LlamaStructuredArguments {
     environment_remove: Vec<OsString>,
 }
 
-fn translate_llama_load_settings(
-    settings: &norted_core::ResolvedLoadSettings,
+fn translate_llama_settings(
+    settings: &norted_core::ResolvedSettings,
     native_arguments: &[String],
     configured_environment: &BTreeMap<String, String>,
 ) -> Result<LlamaStructuredArguments, EngineError> {
@@ -1554,7 +1533,7 @@ fn translate_llama_load_settings(
         let (aliases, environment_names) = llama_setting_collision_contract(id.as_str());
         if let Some(argument) = find_native_option(native_arguments, aliases) {
             return Err(EngineError::InvalidConfiguration(format!(
-                "structured load setting `{id}` conflicts with native llama.cpp argument `{argument}`"
+                "structured setting `{id}` conflicts with native llama.cpp argument `{argument}`"
             )));
         }
         if let Some(name) = configured_environment.keys().find(|name| {
@@ -1563,27 +1542,27 @@ fn translate_llama_load_settings(
                 .any(|owned| name.eq_ignore_ascii_case(owned))
         }) {
             return Err(EngineError::InvalidConfiguration(format!(
-                "structured load setting `{id}` conflicts with configured llama.cpp environment variable `{name}`"
+                "structured setting `{id}` conflicts with configured llama.cpp environment variable `{name}`"
             )));
         }
         environment_remove.extend(environment_names.iter().map(OsString::from));
         match (id.as_str(), &resolved.value) {
-            ("context_length", LoadSettingValue::UnsignedInteger(value)) => {
+            ("context_length", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--ctx-size", *value);
             }
-            ("parallel_requests", LoadSettingValue::UnsignedInteger(value)) => {
+            ("parallel_requests", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--parallel", *value);
             }
-            ("llama.cpp.threads", LoadSettingValue::UnsignedInteger(value)) => {
+            ("llama.cpp.threads", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--threads", *value);
             }
-            ("llama.cpp.batch_size", LoadSettingValue::UnsignedInteger(value)) => {
+            ("llama.cpp.batch_size", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--batch-size", *value);
             }
-            ("llama.cpp.micro_batch_size", LoadSettingValue::UnsignedInteger(value)) => {
+            ("llama.cpp.micro_batch_size", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--ubatch-size", *value);
             }
-            ("llama.cpp.gpu_offload", LoadSettingValue::GpuOffload(value)) => {
+            ("llama.cpp.gpu_offload", SettingValue::GpuOffload(value)) => {
                 arguments.push(OsString::from("--n-gpu-layers"));
                 arguments.push(OsString::from(match value {
                     GpuOffload::None => "0".to_owned(),
@@ -1592,22 +1571,22 @@ fn translate_llama_load_settings(
                     GpuOffload::Layers(value) => value.to_string(),
                 }));
             }
-            ("llama.cpp.flash_attention", LoadSettingValue::Choice(value)) => {
+            ("llama.cpp.flash_attention", SettingValue::Choice(value)) => {
                 push_value_argument(&mut arguments, "--flash-attn", value);
             }
-            ("llama.cpp.kv_cache_k", LoadSettingValue::Choice(value)) => {
+            ("llama.cpp.kv_cache_k", SettingValue::Choice(value)) => {
                 push_value_argument(&mut arguments, "--cache-type-k", value);
             }
-            ("llama.cpp.kv_cache_v", LoadSettingValue::Choice(value)) => {
+            ("llama.cpp.kv_cache_v", SettingValue::Choice(value)) => {
                 push_value_argument(&mut arguments, "--cache-type-v", value);
             }
-            ("llama.cpp.load_mode", LoadSettingValue::Choice(value)) => {
+            ("llama.cpp.load_mode", SettingValue::Choice(value)) => {
                 arguments.push(OsString::from("--load-mode"));
                 arguments.push(OsString::from(value));
             }
             _ => {
                 return Err(EngineError::InvalidConfiguration(format!(
-                    "load setting `{id}` has an invalid value for llama.cpp"
+                    "setting `{id}` has an invalid value for llama.cpp"
                 )));
             }
         }
@@ -1926,13 +1905,13 @@ mod startup_progress_tests {
 
 #[cfg(test)]
 mod generation_settings_tests {
-    use norted_core::ModelId;
+    use norted_core::ModelProfileId;
 
     use super::*;
 
     fn request(generation_settings: GenerationSettingsPatch) -> InferenceRequest {
         InferenceRequest {
-            model_id: ModelId("model".to_owned()),
+            model_profile_id: ModelProfileId::new("model").expect("profile ID"),
             messages: vec![InferenceMessage {
                 role: InferenceRole::User,
                 text: "hello".to_owned(),
@@ -2019,25 +1998,25 @@ mod generation_settings_tests {
 }
 
 #[cfg(test)]
-mod load_settings_tests {
-    use norted_core::{LoadSettingSource, ResolvedLoadSetting, ResolvedLoadSettings};
+mod settings_tests {
+    use norted_core::{ResolvedSetting, ResolvedSettings, SettingSource};
 
     use super::*;
 
-    fn resolved(values: &[(&str, LoadSettingValue)]) -> ResolvedLoadSettings {
+    fn resolved(values: &[(&str, SettingValue)]) -> ResolvedSettings {
         let mut effective = BTreeMap::new();
         for (id, value) in values {
             effective.insert(
-                LoadSettingId::new(*id).expect("setting ID"),
-                ResolvedLoadSetting {
+                SettingId::new(*id).expect("setting ID"),
+                ResolvedSetting {
                     value: value.clone(),
-                    source: LoadSettingSource::Invocation,
+                    source: SettingSource::Invocation,
                 },
             );
         }
-        ResolvedLoadSettings {
+        ResolvedSettings {
             engine_id: ENGINE_ID.to_owned(),
-            selected_profile: None,
+            model_profile_id: None,
             effective,
         }
     }
@@ -2051,7 +2030,7 @@ mod load_settings_tests {
 
     #[test]
     fn omitted_settings_emit_no_llama_arguments() {
-        let translated = translate_llama_load_settings(&resolved(&[]), &[], &BTreeMap::new())
+        let translated = translate_llama_settings(&resolved(&[]), &[], &BTreeMap::new())
             .expect("empty translation");
         assert!(translated.arguments.is_empty());
         assert!(translated.environment_remove.is_empty());
@@ -2059,13 +2038,13 @@ mod load_settings_tests {
 
     #[test]
     fn common_and_kv_settings_translate_independently() {
-        let translated = translate_llama_load_settings(
+        let translated = translate_llama_settings(
             &resolved(&[
-                ("context_length", LoadSettingValue::UnsignedInteger(131_072)),
-                ("parallel_requests", LoadSettingValue::UnsignedInteger(3)),
+                ("context_length", SettingValue::UnsignedInteger(131_072)),
+                ("parallel_requests", SettingValue::UnsignedInteger(3)),
                 (
                     "llama.cpp.kv_cache_k",
-                    LoadSettingValue::Choice("q8_0".to_owned()),
+                    SettingValue::Choice("q8_0".to_owned()),
                 ),
             ]),
             &[],
@@ -2099,10 +2078,10 @@ mod load_settings_tests {
         assert_eq!(advertised_llama_load_modes(help), llama_load_modes());
         assert!(help_has_option(help, "--load-mode"));
 
-        let translated = translate_llama_load_settings(
+        let translated = translate_llama_settings(
             &resolved(&[(
                 "llama.cpp.load_mode",
-                LoadSettingValue::Choice("mmap+mlock".to_owned()),
+                SettingValue::Choice("mmap+mlock".to_owned()),
             )]),
             &[],
             &BTreeMap::new(),
@@ -2115,7 +2094,7 @@ mod load_settings_tests {
     fn structured_load_mode_owns_every_equivalent_native_argument() {
         let settings = resolved(&[(
             "llama.cpp.load_mode",
-            LoadSettingValue::Choice("mmap".to_owned()),
+            SettingValue::Choice("mmap".to_owned()),
         )]);
         for argument in [
             "-lm",
@@ -2130,7 +2109,7 @@ mod load_settings_tests {
             "--no-direct-io=true",
         ] {
             let error =
-                translate_llama_load_settings(&settings, &[argument.to_owned()], &BTreeMap::new())
+                translate_llama_settings(&settings, &[argument.to_owned()], &BTreeMap::new())
                     .expect_err("native load-mode collision");
             assert!(error.to_string().contains(argument), "{error}");
         }
@@ -2140,7 +2119,7 @@ mod load_settings_tests {
     fn structured_load_mode_owns_equivalent_environment_only_when_active() {
         let settings = resolved(&[(
             "llama.cpp.load_mode",
-            LoadSettingValue::Choice("dio".to_owned()),
+            SettingValue::Choice("dio".to_owned()),
         )]);
         let equivalent = [
             "LLAMA_ARG_LOAD_MODE",
@@ -2151,7 +2130,7 @@ mod load_settings_tests {
             "LLAMA_ARG_NO_DIO",
         ];
         for name in equivalent {
-            let error = translate_llama_load_settings(
+            let error = translate_llama_settings(
                 &settings,
                 &[],
                 &BTreeMap::from([(name.to_owned(), "1".to_owned())]),
@@ -2161,13 +2140,13 @@ mod load_settings_tests {
         }
 
         let translated =
-            translate_llama_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
+            translate_llama_settings(&settings, &[], &BTreeMap::new()).expect("translation");
         assert_eq!(
             translated.environment_remove,
             equivalent.map(OsString::from)
         );
 
-        let absent = translate_llama_load_settings(
+        let absent = translate_llama_settings(
             &resolved(&[]),
             &["--load-mode=none".to_owned()],
             &BTreeMap::from([("LLAMA_ARG_MMAP".to_owned(), "0".to_owned())]),
@@ -2179,12 +2158,12 @@ mod load_settings_tests {
 
     #[test]
     fn structured_llama_setting_rejects_both_native_argument_forms() {
-        let settings = resolved(&[("context_length", LoadSettingValue::UnsignedInteger(8192))]);
+        let settings = resolved(&[("context_length", SettingValue::UnsignedInteger(8192))]);
         for native in [
             vec!["--ctx-size=4096".to_owned()],
             vec!["-c".to_owned(), "4096".to_owned()],
         ] {
-            let error = translate_llama_load_settings(&settings, &native, &BTreeMap::new())
+            let error = translate_llama_settings(&settings, &native, &BTreeMap::new())
                 .expect_err("native collision");
             assert!(error.to_string().contains("conflicts"));
         }
@@ -2192,7 +2171,7 @@ mod load_settings_tests {
 
     #[test]
     fn malformed_values_are_rejected_by_the_definition() {
-        let definition = llama_load_setting_definitions()
+        let definition = llama_setting_definitions()
             .into_iter()
             .find(|definition| definition.id.as_str() == "context_length")
             .expect("context definition");

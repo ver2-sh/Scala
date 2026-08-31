@@ -3,20 +3,19 @@ mod composition;
 mod doctor;
 mod output;
 
-use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
 use cli::{
-    AuthCommand, AuthKeysCommand, Cli, Command, ConfigCommand, EnginesCommand, ModelsCommand,
-    ProfilesCommand, RuntimesCommand, SettingsCommand, SettingsMutationArgs, SettingsUnsetArgs,
+    AuthCommand, AuthKeysCommand, Cli, Command, ConfigCommand, EnginesCommand,
+    ModelProfilesCommand, ModelsCommand, RuntimesCommand, SettingsCommand, SettingsMutationArgs,
+    SettingsUnsetArgs,
 };
 use color_eyre::Result;
 use norted_core::{
-    ApiKeyStore, AppPaths, ApplicationCore, LoadSettingId, LoadSettingScope, LoadSettingsError,
-    LoadSettingsPatch, ModelId, PromptDelivery, PromptMode, PublicAuthStatus, ResponseFilter,
-    RuntimeId, ServeProfile, ServeProfileName, ServeProfileSource, ServeProfilesStore,
+    ApiKeyStore, AppPaths, ApplicationCore, EngineId, ModelId, ModelProfileId, ModelProfilesStore,
+    PublicAuthStatus, RuntimeId, SettingId, SettingsError, SettingsPatch, SettingsStore,
 };
 use norted_engine::{ControlClient, ControlClientError, EngineRegistry};
 use tracing_subscriber::EnvFilter;
@@ -98,18 +97,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             handle_auth(&core, args.command, cli.json).await?;
         }
         Command::Load {
-            model_id,
+            model_profile_id,
             runtime,
-            profile,
             settings,
         } => {
             let registry = composition::engine_registry(&core)?;
-            let settings = registry.parse_load_settings(&settings)?;
+            let settings = registry.parse_settings(&settings)?;
             let client = ControlClient::discover(&core.paths).await?;
             let runtime = runtime.map(RuntimeId::new).transpose()?;
-            let profile = profile.map(ServeProfileName::new).transpose()?;
             let status = client
-                .load_with_settings(ModelId(model_id), runtime, profile, settings)
+                .load_with_settings(ModelProfileId::new(model_profile_id)?, runtime, settings)
                 .await?;
             output::control_operation("load", &status, cli.json)?;
         }
@@ -239,8 +236,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
             }
         }
-        Command::Profiles(args) => {
-            handle_profiles(Arc::clone(&core), args.command, cli.json).await?;
+        Command::ModelProfiles(args) => {
+            handle_model_profiles(Arc::clone(&core), args.command, cli.json).await?;
         }
         Command::Settings(args) => {
             handle_settings(Arc::clone(&core), args.command, cli.json).await?;
@@ -255,7 +252,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
 
 async fn run_tui(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
     let services = composition::ApplicationServices::new(&core)?;
-    let load_setting_definitions = services.registry.load_setting_definitions()?;
+    let setting_definitions = services.registry.setting_definitions()?;
     let startup_guard = composition::ServerStartupGuard::acquire(&core.paths).await?;
 
     if composition::discover_existing_control(&core.paths)
@@ -264,7 +261,7 @@ async fn run_tui(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
     {
         drop(startup_guard);
         let _ = core.refresh_server_state().await;
-        return norted_tui::run(core, services.runtime_packs, load_setting_definitions).await;
+        return norted_tui::run(core, services.runtime_packs, setting_definitions).await;
     }
 
     let server = match services
@@ -282,8 +279,7 @@ async fn run_tui(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
             {
                 drop(startup_guard);
                 let _ = core.refresh_server_state().await;
-                return norted_tui::run(core, services.runtime_packs, load_setting_definitions)
-                    .await;
+                return norted_tui::run(core, services.runtime_packs, setting_definitions).await;
             }
             return Err(startup_error);
         }
@@ -294,7 +290,7 @@ async fn run_tui(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
         .run_while(norted_tui::run(
             core,
             services.runtime_packs,
-            load_setting_definitions,
+            setting_definitions,
         ))
         .await
 }
@@ -342,14 +338,8 @@ async fn model_info(
     };
     let registry = composition::engine_registry(&core)?;
     let packs = composition::runtime_pack_manager(&core, registry)?;
-    let profile_state = ServeProfilesStore::new(&core.paths).read().await?;
-    let serve_profile = effective_serve_profile(&core, &profile_state, &model).await?;
     let capabilities = packs
-        .model_serving_capabilities_with_profile(
-            &model,
-            active_model.as_ref(),
-            serve_profile.as_ref(),
-        )
+        .model_serving_capabilities(&model, active_model.as_ref())
         .await?;
     output::model_info(&capabilities, json_output)?;
     Ok(())
@@ -382,272 +372,251 @@ async fn handle_auth(
     Ok(())
 }
 
-async fn handle_profiles(
+async fn handle_model_profiles(
     core: Arc<ApplicationCore>,
-    command: ProfilesCommand,
+    command: ModelProfilesCommand,
     json_output: bool,
 ) -> Result<()> {
-    let store = ServeProfilesStore::new(&core.paths);
+    let store = ModelProfilesStore::new(&core.paths);
     match command {
-        ProfilesCommand::List => {
+        ModelProfilesCommand::List => {
             core.ensure_model_discovery().await?;
-            let state = profile_view(&core, store.read().await?).await?;
-            output::profiles("list", &state, None, json_output)?;
+            let state = store.read().await?;
+            output::model_profiles(
+                "list",
+                &state,
+                None,
+                &core.snapshot().await.models,
+                json_output,
+            )?;
         }
-        ProfilesCommand::Show { name } => {
-            let name = ServeProfileName::new(name)?;
+        ModelProfilesCommand::Show { profile } => {
+            let profile_id = ModelProfileId::new(profile)?;
             core.ensure_model_discovery().await?;
-            let state = profile_view(&core, store.read().await?).await?;
-            if !state.profiles.contains_key(&name) {
-                return Err(LoadSettingsError::ProfileNotFound(name).into());
-            }
-            output::profiles("show", &state, Some(&name), json_output)?;
-        }
-        ProfilesCommand::Create { name } => {
-            let name = ServeProfileName::new(name)?;
-            core.ensure_model_discovery().await?;
-            if discovered_builder_profiles(&core)
-                .await?
-                .contains_key(&name)
-            {
-                return Err(LoadSettingsError::ProfileAlreadyExists(name).into());
-            }
-            let selected = name.clone();
-            let state = store
-                .update(move |state| {
-                    state.create_profile(name)?;
-                    Ok(state.clone())
-                })
-                .await?;
-            output::profiles("create", &state, Some(&selected), json_output)?;
-        }
-        ProfilesCommand::Duplicate { source, name } => {
-            core.ensure_model_discovery().await?;
-            let source = ServeProfileName::new(source)?;
-            let name = ServeProfileName::new(name)?;
-            let view = profile_view(&core, store.read().await?).await?;
-            if view.profiles.contains_key(&name) {
-                return Err(LoadSettingsError::ProfileAlreadyExists(name).into());
-            }
-            let source_profile = view
+            let profiles = store.read().await?;
+            let profile = profiles
                 .profiles
-                .get(&source)
-                .ok_or_else(|| LoadSettingsError::ProfileNotFound(source.clone()))?
-                .clone();
-            let fork = source_profile.fork_local(name.as_str(), name.as_str());
-            let selected = name.clone();
-            let state = store
-                .update(move |state| {
-                    state.create_profile(name.clone())?;
-                    state.profiles.insert(name, fork);
-                    Ok(state.clone())
-                })
-                .await?;
-            output::profiles("duplicate", &state, Some(&selected), json_output)?;
+                .get(&profile_id)
+                .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+            let settings = SettingsStore::new(&core.paths).read().await?;
+            let resolved = settings.resolve(
+                &profile.id,
+                profile.engine_id.as_str(),
+                &profile.overrides,
+                &SettingsPatch::default(),
+                &core.paths.data_dir,
+            )?;
+            output::model_profile(
+                "show",
+                profile,
+                core.model(&profile.model_id).await.as_ref(),
+                &resolved,
+                json_output,
+            )?;
         }
-        ProfilesCommand::Delete { name } => {
-            let name = ServeProfileName::new(name)?;
-            let state = store
-                .update(move |state| {
-                    state.delete_profile(&name)?;
-                    Ok(state.clone())
-                })
-                .await?;
-            output::profiles("delete", &state, None, json_output)?;
-        }
-        ProfilesCommand::Set { name, settings } => {
-            let name = ServeProfileName::new(name)?;
-            let registry = composition::engine_registry(&core)?;
-            let patch = registry.parse_load_settings(&settings)?;
-            let selected = name.clone();
-            let state = store
-                .update(move |state| {
-                    let profile = state
-                        .profiles
-                        .get_mut(&name)
-                        .ok_or_else(|| LoadSettingsError::ProfileNotFound(name.clone()))?;
-                    profile.load.settings.0.extend(patch.0);
-                    Ok(state.clone())
-                })
-                .await?;
-            output::profiles("set", &state, Some(&selected), json_output)?;
-        }
-        ProfilesCommand::Unset { name, settings } => {
-            let name = ServeProfileName::new(name)?;
-            let registry = composition::engine_registry(&core)?;
-            let ids = parse_known_setting_ids(&registry, &settings)?;
-            let selected = name.clone();
-            let state = store
-                .update(move |state| {
-                    let profile = state
-                        .profiles
-                        .get_mut(&name)
-                        .ok_or_else(|| LoadSettingsError::ProfileNotFound(name.clone()))?;
-                    for id in &ids {
-                        profile.load.settings.remove(id);
-                    }
-                    Ok(state.clone())
-                })
-                .await?;
-            output::profiles("unset", &state, Some(&selected), json_output)?;
-        }
-        ProfilesCommand::SetGeneration { name, values } => {
-            let name = ServeProfileName::new(name)?;
-            let selected = name.clone();
-            let state = store
-                .update(move |state| {
-                    let profile = state
-                        .profiles
-                        .get_mut(&name)
-                        .ok_or_else(|| LoadSettingsError::ProfileNotFound(name.clone()))?;
-                    ensure_mutable_profile(profile)?;
-                    apply_generation_values(profile, &values)?;
-                    Ok(state.clone())
-                })
-                .await?;
-            output::profiles("set_generation", &state, Some(&selected), json_output)?;
-        }
-        ProfilesCommand::SetPromptRuntimeDefault { name } => {
-            let name = ServeProfileName::new(name)?;
-            let selected = name.clone();
-            let state = store
-                .update(move |state| {
-                    let profile = state
-                        .profiles
-                        .get_mut(&name)
-                        .ok_or_else(|| LoadSettingsError::ProfileNotFound(name.clone()))?;
-                    ensure_mutable_profile(profile)?;
-                    profile.prompt = norted_core::ServePromptProfile::default();
-                    Ok(state.clone())
-                })
-                .await?;
-            output::profiles("set_prompt", &state, Some(&selected), json_output)?;
-        }
-        ProfilesCommand::SetPromptExternal {
-            name,
-            template,
-            template_id,
-            template_sha256,
-        } => {
-            let name = ServeProfileName::new(name)?;
-            let template = std::fs::canonicalize(&template).map_err(|error| {
-                color_eyre::eyre::eyre!(
-                    "could not resolve template {}: {error}",
-                    template.display()
-                )
-            })?;
-            let selected = name.clone();
-            let state = store
-                .update(move |state| {
-                    let profile = state
-                        .profiles
-                        .get_mut(&name)
-                        .ok_or_else(|| LoadSettingsError::ProfileNotFound(name.clone()))?;
-                    ensure_mutable_profile(profile)?;
-                    profile.prompt = norted_core::ServePromptProfile {
-                        mode: PromptMode::ExternalTemplate,
-                        delivery: PromptDelivery::RawCompletions,
-                        template: Some(norted_core::ExternalTemplateReference {
-                            identity: template_id,
-                            path: template,
-                            sha256: template_sha256,
-                        }),
-                        render_generation_prompt: true,
-                        thinking_enabled: profile.generation.thinking.default,
-                        response_filter: ResponseFilter::None,
-                    };
-                    profile
-                        .validate()
-                        .map_err(LoadSettingsError::InvalidServeProfile)?;
-                    Ok(state.clone())
-                })
-                .await?;
-            output::profiles("set_prompt", &state, Some(&selected), json_output)?;
-        }
-        ProfilesCommand::Assign { model, name } => {
-            core.ensure_model_discovery().await?;
-            let model = ModelId(model);
-            ensure_model(&core, &model).await?;
-            let name = ServeProfileName::new(name)?;
-            let selected = name.clone();
-            let builder = discovered_builder_profiles(&core).await?;
-            let state = store
-                .update(move |state| {
-                    if state.profiles.contains_key(&name) {
-                        state.assign_profile(model, Some(name))?;
-                    } else if builder.contains_key(&name) {
-                        state.assign_builder_profile(model, name.to_string());
-                    } else {
-                        return Err(LoadSettingsError::ProfileNotFound(name));
-                    }
-                    Ok(state.clone())
-                })
-                .await?;
-            let state = profile_view(&core, state).await?;
-            output::profiles("assign", &state, Some(&selected), json_output)?;
-        }
-        ProfilesCommand::ClearAssignment { model } => {
-            let model = ModelId(model);
-            let state = store
-                .update(move |state| {
-                    state.assign_profile(model, None)?;
-                    Ok(state.clone())
-                })
-                .await?;
-            output::profiles("clear_assignment", &state, None, json_output)?;
-        }
-        ProfilesCommand::UseRecommended { model } => {
-            let model = ModelId(model);
-            ensure_model(&core, &model).await?;
-            let state = store
-                .update(move |state| {
-                    state.inherit_recommended_profile(&model);
-                    Ok(state.clone())
-                })
-                .await?;
-            output::profiles("use_recommended", &state, None, json_output)?;
-        }
-        ProfilesCommand::Compatibility {
-            name,
+        ModelProfilesCommand::Create {
+            profile,
             model,
-            runtime,
+            engine,
         } => {
-            core.ensure_model_discovery().await?;
+            let profile_id = ModelProfileId::new(profile)?;
             let model_id = ModelId(model);
-            let model = core
-                .model(&model_id)
-                .await
-                .ok_or_else(|| color_eyre::eyre::eyre!("model `{model_id}` does not exist"))?;
-            let name = ServeProfileName::new(name)?;
-            let view = profile_view(&core, store.read().await?).await?;
-            let profile = view
-                .profiles
-                .get(&name)
-                .ok_or_else(|| LoadSettingsError::ProfileNotFound(name.clone()))?
-                .clone();
-            profile
-                .basic_applicability(&model)
-                .map_err(color_eyre::eyre::Report::msg)?;
+            let engine_id = EngineId::new(engine)?;
+            core.ensure_model_discovery().await?;
+            let model = require_model(&core, &model_id).await?;
             let registry = composition::engine_registry(&core)?;
-            let packs = composition::runtime_pack_manager(&core, registry.clone())?;
-            let runtime_id = runtime.map(RuntimeId::new).transpose()?;
-            let selection = packs
-                .resolve_with_profile(&model, runtime_id.as_ref(), Some(&profile))
+            require_compatible_engine(&registry, &model, engine_id.as_str())?;
+            let selected = profile_id.clone();
+            let state = store
+                .update(move |state| {
+                    state.create(profile_id.clone(), profile_id.as_str(), model_id, engine_id)?;
+                    Ok(state.clone())
+                })
                 .await?;
-            let host = packs.host_capabilities().await;
-            let adapter = registry
-                .get(&selection.runtime.manifest.identity.engine_id)
-                .ok_or_else(|| color_eyre::eyre::eyre!("selected engine is unavailable"))?;
-            let compatibility = adapter.runtime_model_compatibility(
-                &selection.runtime,
-                &model,
-                &host,
-                Some(&profile),
-            );
-            output::profile_compatibility(
+            let created = &state.profiles[&selected];
+            let resolved = SettingsStore::new(&core.paths).read().await?.resolve(
+                &created.id,
+                created.engine_id.as_str(),
+                &created.overrides,
+                &SettingsPatch::default(),
+                &core.paths.data_dir,
+            )?;
+            output::model_profile("create", created, Some(&model), &resolved, json_output)?;
+        }
+        ModelProfilesCommand::Duplicate { source, profile } => {
+            let source = ModelProfileId::new(source)?;
+            let profile = ModelProfileId::new(profile)?;
+            let selected = profile.clone();
+            let state = store
+                .update(move |state| {
+                    state.duplicate(&source, profile.clone(), profile.as_str())?;
+                    Ok(state.clone())
+                })
+                .await?;
+            let duplicated = &state.profiles[&selected];
+            let resolved = SettingsStore::new(&core.paths).read().await?.resolve(
+                &duplicated.id,
+                duplicated.engine_id.as_str(),
+                &duplicated.overrides,
+                &SettingsPatch::default(),
+                &core.paths.data_dir,
+            )?;
+            output::model_profile(
+                "duplicate",
+                duplicated,
+                core.model(&duplicated.model_id).await.as_ref(),
+                &resolved,
+                json_output,
+            )?;
+        }
+        ModelProfilesCommand::Delete { profile } => {
+            let profile_id = ModelProfileId::new(profile)?;
+            if let Ok(client) = ControlClient::discover(&core.paths).await
+                && client.status().await?.backend.model_profile_id.as_ref() == Some(&profile_id)
+            {
+                return Err(color_eyre::eyre::eyre!(
+                    "cannot delete active Model Profile `{profile_id}`; unload it first"
+                ));
+            }
+            let deleted = store.update(move |state| state.delete(&profile_id)).await?;
+            output::model_profile_deleted(&deleted.id, json_output)?;
+        }
+        ModelProfilesCommand::SetModel { profile, model } => {
+            let profile_id = ModelProfileId::new(profile)?;
+            let model_id = ModelId(model);
+            core.ensure_model_discovery().await?;
+            let model = require_model(&core, &model_id).await?;
+            let registry = composition::engine_registry(&core)?;
+            let current = store.read().await?;
+            let existing = current
+                .profiles
+                .get(&profile_id)
+                .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+            require_compatible_engine(&registry, &model, existing.engine_id.as_str())?;
+            let selected = profile_id.clone();
+            let state = store
+                .update(move |state| {
+                    state
+                        .profiles
+                        .get_mut(&profile_id)
+                        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?
+                        .model_id = model_id;
+                    Ok(state.clone())
+                })
+                .await?;
+            output_model_profile_mutation(&core, "set-model", &state, &selected, json_output)
+                .await?;
+        }
+        ModelProfilesCommand::SetEngine { profile, engine } => {
+            let profile_id = ModelProfileId::new(profile)?;
+            let engine_id = EngineId::new(engine)?;
+            core.ensure_model_discovery().await?;
+            let current = store.read().await?;
+            let existing = current
+                .profiles
+                .get(&profile_id)
+                .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+            let model = require_model(&core, &existing.model_id).await?;
+            let registry = composition::engine_registry(&core)?;
+            require_compatible_engine(&registry, &model, engine_id.as_str())?;
+            let selected = profile_id.clone();
+            let state = store
+                .update(move |state| {
+                    let profile = state
+                        .profiles
+                        .get_mut(&profile_id)
+                        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+                    profile.engine_id = engine_id;
+                    profile
+                        .overrides
+                        .0
+                        .retain(|id, _| id.applies_to_engine(profile.engine_id.as_str()));
+                    Ok(state.clone())
+                })
+                .await?;
+            output_model_profile_mutation(&core, "set-engine", &state, &selected, json_output)
+                .await?;
+        }
+        ModelProfilesCommand::Set { profile, settings } => {
+            let profile_id = ModelProfileId::new(profile)?;
+            let registry = composition::engine_registry(&core)?;
+            let mut patch = registry.parse_settings(&settings)?;
+            norted_engine::record_local_file_setting_identity(
+                &mut patch,
+                "q27.template_path",
+                "q27.template_sha256",
+                &core.paths.data_dir,
+                4 * 1024 * 1024,
+            )
+            .await?;
+            let current = store.read().await?;
+            let existing = current
+                .profiles
+                .get(&profile_id)
+                .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+            validate_patch_for_engine(&patch, existing.engine_id.as_str())?;
+            let selected = profile_id.clone();
+            let state = store
+                .update(move |state| {
+                    state
+                        .profiles
+                        .get_mut(&profile_id)
+                        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?
+                        .overrides
+                        .0
+                        .extend(patch.0);
+                    Ok(state.clone())
+                })
+                .await?;
+            output_model_profile_mutation(&core, "set", &state, &selected, json_output).await?;
+        }
+        ModelProfilesCommand::Unset { profile, settings } => {
+            let profile_id = ModelProfileId::new(profile)?;
+            let registry = composition::engine_registry(&core)?;
+            let mut ids = parse_known_setting_ids(&registry, &settings)?;
+            if ids.iter().any(|id| id.as_str() == "q27.template_path") {
+                ids.push(SettingId::new("q27.template_sha256")?);
+            }
+            let selected = profile_id.clone();
+            let state = store
+                .update(move |state| {
+                    let profile = state
+                        .profiles
+                        .get_mut(&profile_id)
+                        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+                    for id in &ids {
+                        profile.overrides.remove(id);
+                    }
+                    Ok(state.clone())
+                })
+                .await?;
+            output_model_profile_mutation(&core, "unset", &state, &selected, json_output).await?;
+        }
+        ModelProfilesCommand::Load {
+            profile,
+            runtime,
+            settings,
+        } => {
+            let profile_id = ModelProfileId::new(profile)?;
+            let registry = composition::engine_registry(&core)?;
+            let settings = registry.parse_settings(&settings)?;
+            let runtime = runtime.map(RuntimeId::new).transpose()?;
+            let status = ControlClient::discover(&core.paths)
+                .await?
+                .load_with_settings(profile_id, runtime, settings)
+                .await?;
+            output::control_operation("load", &status, json_output)?;
+        }
+        ModelProfilesCommand::Compatibility { profile, runtime } => {
+            let profile_id = ModelProfileId::new(profile)?;
+            let (profile, model, selection, schema, resolved, compatibility) =
+                exact_model_profile_context(&core, &profile_id, runtime).await?;
+            output::model_profile_compatibility(
                 &profile,
                 &model,
                 &selection,
+                &schema,
+                &resolved,
                 &compatibility,
                 json_output,
             )?;
@@ -656,167 +625,88 @@ async fn handle_profiles(
     Ok(())
 }
 
-async fn discovered_builder_profiles(
+async fn output_model_profile_mutation(
     core: &ApplicationCore,
-) -> Result<BTreeMap<ServeProfileName, ServeProfile>> {
-    let mut profiles: BTreeMap<ServeProfileName, ServeProfile> = BTreeMap::new();
-    for model in core.snapshot().await.models {
-        let Some(profile) = model
-            .norted_package
-            .and_then(|package| package.recommended_serve_profile)
-        else {
-            continue;
-        };
-        let name = ServeProfileName::new(profile.id.clone())?;
-        if let Some(existing) = profiles.get(&name)
-            && existing.content_hash() != profile.content_hash()
-        {
-            return Err(color_eyre::eyre::eyre!(
-                "discovered Builder Serve Profiles reuse `{name}` with different content"
-            ));
-        }
-        profiles.entry(name).or_insert(profile);
-    }
-    Ok(profiles)
+    operation: &str,
+    state: &norted_core::ModelProfilesState,
+    selected: &ModelProfileId,
+    json_output: bool,
+) -> Result<()> {
+    let profile = &state.profiles[selected];
+    let resolved = SettingsStore::new(&core.paths).read().await?.resolve(
+        &profile.id,
+        profile.engine_id.as_str(),
+        &profile.overrides,
+        &SettingsPatch::default(),
+        &core.paths.data_dir,
+    )?;
+    output::model_profile(
+        operation,
+        profile,
+        core.model(&profile.model_id).await.as_ref(),
+        &resolved,
+        json_output,
+    )
 }
 
-async fn effective_serve_profile(
-    core: &ApplicationCore,
-    state: &norted_core::ServeProfilesState,
-    model: &norted_core::ModelArtifact,
-) -> Result<Option<ServeProfile>> {
-    if state.raw_profile_models.contains(&model.id) {
-        return Ok(None);
-    }
-    if let Some(name) = state.model_assignments.get(&model.id) {
-        return state
-            .profiles
-            .get(name)
-            .map(|profile| Some(profile.clone()))
-            .ok_or_else(|| LoadSettingsError::ProfileNotFound(name.clone()).into());
-    }
-    if let Some(profile_id) = state.builder_profile_assignments.get(&model.id) {
-        let name = ServeProfileName::new(profile_id.clone())?;
-        return discovered_builder_profiles(core)
-            .await?
-            .remove(&name)
-            .map(Some)
-            .ok_or_else(|| {
-                color_eyre::eyre::eyre!(
-                    "assigned Builder Serve Profile `{profile_id}` is unavailable; its source package may have moved or been removed"
-                )
-            });
-    }
-    Ok(model
-        .norted_package
-        .as_ref()
-        .and_then(|package| package.recommended_serve_profile.clone()))
-}
-
-async fn profile_view(
-    core: &ApplicationCore,
-    mut state: norted_core::ServeProfilesState,
-) -> Result<norted_core::ServeProfilesState> {
-    for (name, profile) in discovered_builder_profiles(core).await? {
-        if state.profiles.contains_key(&name) {
-            return Err(color_eyre::eyre::eyre!(
-                "local Serve Profile `{name}` conflicts with a discovered read-only Builder profile ID"
-            ));
-        }
-        state.profiles.insert(name, profile);
-    }
-    Ok(state)
-}
-
-fn ensure_mutable_profile(profile: &ServeProfile) -> Result<(), LoadSettingsError> {
-    if profile.read_only || profile.source != ServeProfileSource::UserLocal {
-        return Err(LoadSettingsError::InvalidServeProfile(format!(
-            "Serve Profile `{}` is read-only; duplicate/fork it before editing",
-            profile.display_name
-        )));
-    }
-    Ok(())
-}
-
-fn apply_generation_values(
-    profile: &mut ServeProfile,
-    values: &[String],
-) -> Result<(), LoadSettingsError> {
-    for raw in values {
-        let (field, value) = raw.split_once('=').ok_or_else(|| {
-            LoadSettingsError::InvalidServeProfile(format!(
-                "generation edit `{raw}` must use FIELD=VALUE"
-            ))
-        })?;
-        let number = |label: &str| {
-            value.parse::<f64>().map_err(|_| {
-                LoadSettingsError::InvalidServeProfile(format!(
-                    "generation field `{label}` requires a number"
-                ))
-            })
-        };
-        match field {
-            "temperature" => profile.generation.defaults.temperature = Some(number(field)?),
-            "top_p" => profile.generation.defaults.top_p = Some(number(field)?),
-            "top_k" => {
-                profile.generation.defaults.top_k = Some(value.parse::<u64>().map_err(|_| {
-                    LoadSettingsError::InvalidServeProfile(
-                        "generation field `top_k` requires a non-negative integer".to_owned(),
-                    )
-                })?)
-            }
-            "min_p" => profile.generation.defaults.min_p = Some(number(field)?),
-            "reasoning_effort" => {
-                if value.is_empty() {
-                    return Err(LoadSettingsError::InvalidServeProfile(
-                        "reasoning_effort cannot be empty".to_owned(),
-                    ));
-                }
-                profile.generation.defaults.reasoning_effort = Some(value.to_owned());
-            }
-            "thinking_default" => {
-                profile.generation.thinking.default = parse_profile_bool(field, value)?
-            }
-            "thinking_required" => {
-                profile.generation.thinking.required = parse_profile_bool(field, value)?
-            }
-            "allow_override" => {
-                if !profile
-                    .generation
-                    .allowed_user_overrides
-                    .iter()
-                    .any(|candidate| candidate == value)
-                {
-                    profile
-                        .generation
-                        .allowed_user_overrides
-                        .push(value.to_owned());
-                }
-            }
-            "forbid_override" => profile
-                .generation
-                .allowed_user_overrides
-                .retain(|candidate| candidate != value),
-            _ => {
-                return Err(LoadSettingsError::InvalidServeProfile(format!(
-                    "unknown generation field `{field}`; expected temperature, top_p, top_k, min_p, reasoning_effort, thinking_default, thinking_required, allow_override, or forbid_override"
-                )));
-            }
-        }
-    }
-    profile
-        .validate()
-        .map_err(LoadSettingsError::InvalidServeProfile)
-}
-
-fn parse_profile_bool(field: &str, value: &str) -> Result<bool, LoadSettingsError> {
-    match value {
-        "true" | "on" => Ok(true),
-        "false" | "off" => Ok(false),
-        _ => Err(LoadSettingsError::InvalidServeProfile(format!(
-            "generation field `{field}` requires true/false"
-        ))),
-    }
+async fn exact_model_profile_context(
+    core: &Arc<ApplicationCore>,
+    profile_id: &ModelProfileId,
+    runtime: Option<String>,
+) -> Result<(
+    norted_core::ModelProfile,
+    norted_core::ModelArtifact,
+    norted_core::RuntimeSelection,
+    norted_core::SettingsSchema,
+    norted_core::ResolvedSettings,
+    norted_core::RuntimeCompatibility,
+)> {
+    core.ensure_model_discovery().await?;
+    let profile = ModelProfilesStore::new(&core.paths)
+        .read()
+        .await?
+        .profiles
+        .get(profile_id)
+        .cloned()
+        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+    let model = require_model(core, &profile.model_id).await.map_err(|_| {
+        color_eyre::eyre::eyre!(
+            "Model Profile `{}` is unavailable because bound model `{}` is missing",
+            profile.id,
+            profile.model_id
+        )
+    })?;
+    let registry = composition::engine_registry(core)?;
+    require_compatible_engine(&registry, &model, profile.engine_id.as_str())?;
+    let settings = SettingsStore::new(&core.paths).read().await?;
+    let resolved = settings.resolve(
+        &profile.id,
+        profile.engine_id.as_str(),
+        &profile.overrides,
+        &SettingsPatch::default(),
+        &core.paths.data_dir,
+    )?;
+    let packs = composition::runtime_pack_manager(core, registry.clone())?;
+    let runtime = runtime.map(RuntimeId::new).transpose()?;
+    let selection = packs
+        .resolve_for_engine_with_settings(
+            &model,
+            profile.engine_id.as_str(),
+            runtime.as_ref(),
+            Some(&resolved),
+        )
+        .await?;
+    let host = packs.host_capabilities().await;
+    let adapter = registry.get(profile.engine_id.as_str()).ok_or_else(|| {
+        color_eyre::eyre::eyre!("bound engine `{}` is not registered", profile.engine_id)
+    })?;
+    let schema = adapter
+        .settings_schema(&selection.runtime, &model, &host)
+        .await?;
+    schema.validate(&resolved)?;
+    let compatibility =
+        adapter.runtime_model_compatibility(&selection.runtime, &model, &host, Some(&resolved));
+    Ok((profile, model, selection, schema, resolved, compatibility))
 }
 
 async fn handle_settings(
@@ -824,117 +714,30 @@ async fn handle_settings(
     command: SettingsCommand,
     json_output: bool,
 ) -> Result<()> {
+    let store = SettingsStore::new(&core.paths);
     match command {
-        SettingsCommand::Show {
-            model,
-            runtime,
-            profile,
-        } => {
-            let profile = profile.map(ServeProfileName::new).transpose()?;
-            let (runtime_id, schema, resolved) =
-                exact_settings_context(&core, ModelId(model), runtime, profile.as_ref()).await?;
-            output::effective_settings(&runtime_id, &schema, &resolved, json_output)?;
+        SettingsCommand::Show { global, engine } => {
+            let scope = defaults_scope(global, engine);
+            let state = store.read().await?;
+            output::settings_defaults("show", &scope.to_string(), &state, json_output)?;
         }
-        SettingsCommand::Schema { model, runtime } => {
-            let (_, schema, _) =
-                exact_settings_context(&core, ModelId(model), runtime, None).await?;
-            output::settings_schema(&schema, json_output)?;
-        }
-        SettingsCommand::Set(args) => {
-            mutate_defaults(&core, args, json_output).await?;
-        }
-        SettingsCommand::Unset(args) => {
-            unset_defaults(&core, args, json_output).await?;
-        }
+        SettingsCommand::Set(args) => mutate_defaults(&core, args, json_output).await?,
+        SettingsCommand::Unset(args) => unset_defaults(&core, args, json_output).await?,
     }
     Ok(())
-}
-
-async fn exact_settings_context(
-    core: &Arc<ApplicationCore>,
-    model_id: ModelId,
-    runtime: Option<String>,
-    profile: Option<&ServeProfileName>,
-) -> Result<(
-    RuntimeId,
-    norted_core::LoadSettingsSchema,
-    norted_core::ResolvedLoadSettings,
-)> {
-    core.ensure_model_discovery().await?;
-    let model = core.model(&model_id).await.ok_or_else(|| {
-        color_eyre::eyre::eyre!("model `{model_id}` does not exist in the discovered registry")
-    })?;
-    let registry = composition::engine_registry(core)?;
-    let packs = composition::runtime_pack_manager(core, registry.clone())?;
-    packs.refresh_host_capabilities().await;
-    let runtime = runtime.map(RuntimeId::new).transpose()?;
-    let state = ServeProfilesStore::new(&core.paths).read().await?;
-    let (serve_profile, local_profile) = if let Some(name) = profile {
-        if name.as_str() == "none" {
-            (None, None)
-        } else if let Some(local) = state.profiles.get(name) {
-            (Some(local.clone()), Some(name.clone()))
-        } else {
-            let builder = discovered_builder_profiles(core).await?;
-            (
-                Some(
-                    builder
-                        .get(name)
-                        .cloned()
-                        .ok_or_else(|| LoadSettingsError::ProfileNotFound(name.clone()))?,
-                ),
-                None,
-            )
-        }
-    } else {
-        (effective_serve_profile(core, &state, &model).await?, None)
-    };
-    let selection = packs
-        .resolve_with_profile(&model, runtime.as_ref(), serve_profile.as_ref())
-        .await
-        .map_err(|error| {
-            color_eyre::eyre::eyre!(
-                "no compatible installed runtime is available to validate these settings: {error}"
-            )
-        })?;
-    let runtime_id = selection.runtime.manifest.runtime_id.clone();
-    let engine_id = selection.runtime.manifest.identity.engine_id.clone();
-    let adapter = registry.get(&engine_id).ok_or_else(|| {
-        color_eyre::eyre::eyre!("selected runtime uses unregistered engine `{engine_id}`")
-    })?;
-    let host = packs.host_capabilities().await;
-    let schema = adapter
-        .load_settings_schema(&selection.runtime, &model, &host, serve_profile.as_ref())
-        .await?;
-    let mut load_state = state;
-    if profile.is_some() && local_profile.is_none() {
-        load_state.model_assignments.remove(&model_id);
-    }
-    let mut resolved = load_state.resolve(
-        &model_id,
-        &engine_id,
-        local_profile.as_ref(),
-        &LoadSettingsPatch::default(),
-        &core.paths.data_dir,
-    )?;
-    norted_core::apply_serve_profile_load_policy(serve_profile.as_ref(), &mut resolved)
-        .map_err(color_eyre::eyre::Report::msg)?;
-    Ok((runtime_id, schema, resolved))
 }
 
 #[derive(Clone)]
 enum DefaultsScope {
     Global,
     Engine(String),
-    Model(ModelId),
 }
 
 impl std::fmt::Display for DefaultsScope {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Global => formatter.write_str("global defaults"),
-            Self::Engine(engine) => write!(formatter, "engine defaults:{engine}"),
-            Self::Model(model) => write!(formatter, "model defaults:{model}"),
+            Self::Global => formatter.write_str("global"),
+            Self::Engine(engine) => write!(formatter, "engine:{engine}"),
         }
     }
 }
@@ -945,17 +748,25 @@ async fn mutate_defaults(
     json_output: bool,
 ) -> Result<()> {
     let registry = composition::engine_registry(core)?;
-    let patch = registry.parse_load_settings(&args.settings)?;
-    let scope = defaults_scope(args.global, args.engine, args.model);
-    validate_default_scope(core, &registry, &scope, &patch).await?;
+    let mut patch = registry.parse_settings(&args.settings)?;
+    norted_engine::record_local_file_setting_identity(
+        &mut patch,
+        "q27.template_path",
+        "q27.template_sha256",
+        &core.paths.data_dir,
+        4 * 1024 * 1024,
+    )
+    .await?;
+    let scope = defaults_scope(args.global, args.engine);
+    validate_default_scope(&registry, &scope, &patch)?;
     let label = scope.to_string();
-    let state = ServeProfilesStore::new(&core.paths)
+    let state = SettingsStore::new(&core.paths)
         .update(move |state| {
             default_patch_mut(state, &scope).0.extend(patch.0);
             Ok(state.clone())
         })
         .await?;
-    output::settings_mutation("set", &label, &state, json_output)?;
+    output::settings_defaults("set", &label, &state, json_output)?;
     Ok(())
 }
 
@@ -965,127 +776,104 @@ async fn unset_defaults(
     json_output: bool,
 ) -> Result<()> {
     let registry = composition::engine_registry(core)?;
-    let ids = parse_known_setting_ids(&registry, &args.settings)?;
-    let scope = defaults_scope(args.global, args.engine, args.model);
-    let patch = LoadSettingsPatch(
+    let mut ids = parse_known_setting_ids(&registry, &args.settings)?;
+    if ids.iter().any(|id| id.as_str() == "q27.template_path") {
+        ids.push(SettingId::new("q27.template_sha256")?);
+    }
+    let scope = defaults_scope(args.global, args.engine);
+    let patch = SettingsPatch(
         ids.iter()
             .cloned()
-            .map(|id| (id, norted_core::LoadSettingValue::FlagEnabled))
+            .map(|id| (id, norted_core::SettingValue::FlagEnabled))
             .collect(),
     );
-    validate_default_scope(core, &registry, &scope, &patch).await?;
+    validate_default_scope(&registry, &scope, &patch)?;
     let label = scope.to_string();
-    let state = ServeProfilesStore::new(&core.paths)
+    let state = SettingsStore::new(&core.paths)
         .update(move |state| {
             let target = default_patch_mut(state, &scope);
             for id in &ids {
                 target.remove(id);
             }
-            match &scope {
-                DefaultsScope::Engine(engine)
-                    if state
-                        .engine_defaults
-                        .get(engine)
-                        .is_some_and(LoadSettingsPatch::is_empty) =>
-                {
-                    state.engine_defaults.remove(engine);
-                }
-                DefaultsScope::Model(model)
-                    if state
-                        .model_defaults
-                        .get(model)
-                        .is_some_and(LoadSettingsPatch::is_empty) =>
-                {
-                    state.model_defaults.remove(model);
-                }
-                _ => {}
+            if let DefaultsScope::Engine(engine) = &scope
+                && state
+                    .engine_defaults
+                    .get(engine)
+                    .is_some_and(SettingsPatch::is_empty)
+            {
+                state.engine_defaults.remove(engine);
             }
             Ok(state.clone())
         })
         .await?;
-    output::settings_mutation("unset", &label, &state, json_output)?;
+    output::settings_defaults("unset", &label, &state, json_output)?;
     Ok(())
 }
 
-fn defaults_scope(global: bool, engine: Option<String>, model: Option<String>) -> DefaultsScope {
+fn defaults_scope(global: bool, engine: Option<String>) -> DefaultsScope {
     if global {
         DefaultsScope::Global
-    } else if let Some(engine) = engine {
-        DefaultsScope::Engine(engine)
     } else {
-        DefaultsScope::Model(ModelId(model.expect("clap requires one settings scope")))
+        DefaultsScope::Engine(engine.expect("clap requires one settings scope"))
     }
 }
 
 fn default_patch_mut<'a>(
-    state: &'a mut norted_core::ServeProfilesState,
+    state: &'a mut norted_core::SettingsState,
     scope: &DefaultsScope,
-) -> &'a mut LoadSettingsPatch {
+) -> &'a mut SettingsPatch {
     match scope {
         DefaultsScope::Global => &mut state.global_defaults,
         DefaultsScope::Engine(engine) => state.engine_defaults.entry(engine.clone()).or_default(),
-        DefaultsScope::Model(model) => state.model_defaults.entry(model.clone()).or_default(),
     }
 }
 
-async fn validate_default_scope(
-    core: &Arc<ApplicationCore>,
+fn validate_default_scope(
     registry: &EngineRegistry,
     scope: &DefaultsScope,
-    patch: &LoadSettingsPatch,
+    patch: &SettingsPatch,
 ) -> Result<()> {
-    let definitions = registry
-        .load_setting_definitions()?
-        .into_iter()
-        .map(|definition| (definition.id.clone(), definition))
-        .collect::<std::collections::BTreeMap<_, _>>();
     match scope {
         DefaultsScope::Global => {
             if let Some(id) = patch.0.keys().find(|id| id.namespace().is_some()) {
-                return Err(LoadSettingsError::InvalidGlobalSetting(id.clone()).into());
+                return Err(SettingsError::InvalidGlobalSetting(id.clone()).into());
             }
         }
         DefaultsScope::Engine(engine) => {
             if registry.get(engine).is_none() {
                 return Err(color_eyre::eyre::eyre!("unknown engine `{engine}`"));
             }
-            for id in patch.0.keys() {
-                let definition = &definitions[id];
-                if matches!(
-                    &definition.scope,
-                    LoadSettingScope::Engine { engine_id } if engine_id != engine
-                ) {
-                    return Err(LoadSettingsError::WrongEngineScope {
-                        setting_id: id.clone(),
-                        engine_id: engine.clone(),
-                    }
-                    .into());
-                }
-            }
-        }
-        DefaultsScope::Model(model) => {
-            core.ensure_model_discovery().await?;
-            ensure_model(core, model).await?;
+            validate_patch_for_engine(patch, engine)?;
         }
     }
     Ok(())
 }
 
-fn parse_known_setting_ids(
-    registry: &EngineRegistry,
-    values: &[String],
-) -> Result<Vec<LoadSettingId>> {
+fn validate_patch_for_engine(patch: &SettingsPatch, engine: &str) -> Result<()> {
+    for id in patch.0.keys() {
+        if !id.applies_to_engine(engine) {
+            return Err(SettingsError::WrongEngineScope {
+                setting_id: id.clone(),
+                engine_id: engine.to_owned(),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn parse_known_setting_ids(registry: &EngineRegistry, values: &[String]) -> Result<Vec<SettingId>> {
     let known = registry
-        .load_setting_definitions()?
+        .setting_definitions()?
         .into_iter()
         .map(|definition| definition.id)
         .collect::<std::collections::BTreeSet<_>>();
     values
         .iter()
         .map(|value| {
-            let id = LoadSettingId::new(value.clone())?;
+            let id = SettingId::new(value.clone())?;
             if !known.contains(&id) {
-                return Err(LoadSettingsError::UnknownSetting(id));
+                return Err(SettingsError::UnknownSetting(id));
             }
             Ok(id)
         })
@@ -1093,10 +881,30 @@ fn parse_known_setting_ids(
         .map_err(Into::into)
 }
 
-async fn ensure_model(core: &ApplicationCore, model: &ModelId) -> Result<()> {
-    if core.model(model).await.is_none() {
+async fn require_model(
+    core: &ApplicationCore,
+    model_id: &ModelId,
+) -> Result<norted_core::ModelArtifact> {
+    core.model(model_id).await.ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "model `{model_id}` does not exist in the discovered artifact registry"
+        )
+    })
+}
+
+fn require_compatible_engine(
+    registry: &EngineRegistry,
+    model: &norted_core::ModelArtifact,
+    engine_id: &str,
+) -> Result<()> {
+    let adapter = registry
+        .get(engine_id)
+        .ok_or_else(|| color_eyre::eyre::eyre!("unknown engine `{engine_id}`"))?;
+    if !adapter.compatibility(model).is_supported() {
         return Err(color_eyre::eyre::eyre!(
-            "model `{model}` does not exist in the discovered registry"
+            "engine `{engine_id}` is incompatible with model `{}` ({})",
+            model.id,
+            model.format
         ));
     }
     Ok(())

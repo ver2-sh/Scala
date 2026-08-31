@@ -14,9 +14,9 @@ use futures_util::Stream;
 use norted_core::{
     AcceleratorDevice, ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifactRole,
     AvailableRuntime, EngineInstallation, EngineRevision, HostCapabilities, InstalledRuntime,
-    LoadSettingDefinition, LoadSettingId, LoadSettingsError, LoadSettingsPatch, LoadSettingsSchema,
-    ModelArtifact, ModelId, ModelRuntimeIdentity, ResolvedLoadSettings, RuntimeCompatibility,
-    RuntimeId, RuntimeProbeObservation,
+    ModelArtifact, ModelId, ModelRuntimeIdentity, ResolvedSettings, RuntimeCompatibility,
+    RuntimeId, RuntimeProbeObservation, SettingDefinition, SettingId, SettingsError, SettingsPatch,
+    SettingsSchema,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -151,39 +151,152 @@ pub enum OptionValueKind {
     Path,
 }
 
-pub fn common_load_setting_definitions() -> Vec<LoadSettingDefinition> {
+pub fn common_setting_definitions() -> Vec<SettingDefinition> {
     vec![
-        LoadSettingDefinition {
-            id: LoadSettingId::new("context_length").expect("static setting ID"),
+        SettingDefinition {
+            id: SettingId::new("context_length").expect("static setting ID"),
             label: "Context length".to_owned(),
             description: "Explicit context window requested from the selected runtime".to_owned(),
-            kind: norted_core::LoadSettingKind::UnsignedInteger {
+            kind: norted_core::SettingKind::UnsignedInteger {
                 minimum: Some(1),
                 maximum: None,
             },
-            scope: norted_core::LoadSettingScope::Common,
+            scope: norted_core::SettingScope::Common,
+            category: norted_core::SettingCategory::General,
             supported: true,
             unsupported_reason: None,
             unit: Some("tokens".to_owned()),
             upstream_default: Some("runtime/model automatic behavior".to_owned()),
-            recommendation: None,
         },
-        LoadSettingDefinition {
-            id: LoadSettingId::new("parallel_requests").expect("static setting ID"),
+        SettingDefinition {
+            id: SettingId::new("parallel_requests").expect("static setting ID"),
             label: "Parallel requests".to_owned(),
             description: "Number of concurrent server slots".to_owned(),
-            kind: norted_core::LoadSettingKind::UnsignedInteger {
+            kind: norted_core::SettingKind::UnsignedInteger {
                 minimum: Some(1),
                 maximum: None,
             },
-            scope: norted_core::LoadSettingScope::Common,
+            scope: norted_core::SettingScope::Common,
+            category: norted_core::SettingCategory::General,
             supported: true,
             unsupported_reason: None,
             unit: Some("slots".to_owned()),
             upstream_default: Some("runtime-selected".to_owned()),
-            recommendation: None,
+        },
+        SettingDefinition {
+            id: SettingId::new("temperature").expect("static setting ID"),
+            label: "Temperature".to_owned(),
+            description: "Configured generation temperature; request values may override it"
+                .to_owned(),
+            kind: norted_core::SettingKind::Float {
+                minimum: Some(0.0),
+                maximum: None,
+            },
+            scope: norted_core::SettingScope::Common,
+            category: norted_core::SettingCategory::Generation,
+            supported: true,
+            unsupported_reason: None,
+            unit: None,
+            upstream_default: Some("runtime default".to_owned()),
+        },
+        SettingDefinition {
+            id: SettingId::new("top_p").expect("static setting ID"),
+            label: "Top P".to_owned(),
+            description: "Configured nucleus-sampling probability".to_owned(),
+            kind: norted_core::SettingKind::Float {
+                minimum: Some(0.0),
+                maximum: Some(1.0),
+            },
+            scope: norted_core::SettingScope::Common,
+            category: norted_core::SettingCategory::Generation,
+            supported: true,
+            unsupported_reason: None,
+            unit: None,
+            upstream_default: Some("runtime default".to_owned()),
+        },
+        SettingDefinition {
+            id: SettingId::new("top_k").expect("static setting ID"),
+            label: "Top K".to_owned(),
+            description: "Configured top-k sampler cutoff".to_owned(),
+            kind: norted_core::SettingKind::UnsignedInteger {
+                minimum: Some(0),
+                maximum: None,
+            },
+            scope: norted_core::SettingScope::Common,
+            category: norted_core::SettingCategory::Generation,
+            supported: true,
+            unsupported_reason: None,
+            unit: None,
+            upstream_default: Some("runtime default".to_owned()),
+        },
+        SettingDefinition {
+            id: SettingId::new("min_p").expect("static setting ID"),
+            label: "Min P".to_owned(),
+            description: "Configured minimum-token probability threshold".to_owned(),
+            kind: norted_core::SettingKind::Float {
+                minimum: Some(0.0),
+                maximum: Some(1.0),
+            },
+            scope: norted_core::SettingScope::Common,
+            category: norted_core::SettingCategory::Generation,
+            supported: true,
+            unsupported_reason: None,
+            unit: None,
+            upstream_default: Some("runtime default".to_owned()),
+        },
+        SettingDefinition {
+            id: SettingId::new("reasoning_effort").expect("static setting ID"),
+            label: "Reasoning effort".to_owned(),
+            description: "Default reasoning effort when the selected engine supports it".to_owned(),
+            kind: norted_core::SettingKind::Choice {
+                choices: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
+            },
+            scope: norted_core::SettingScope::Common,
+            category: norted_core::SettingCategory::Reasoning,
+            supported: true,
+            unsupported_reason: None,
+            unit: None,
+            upstream_default: Some("runtime default".to_owned()),
         },
     ]
+}
+
+pub async fn record_local_file_setting_identity(
+    patch: &mut SettingsPatch,
+    path_setting: &str,
+    sha256_setting: &str,
+    path_base: &Path,
+    maximum_bytes: u64,
+) -> Result<(), SettingsError> {
+    let path_id = SettingId::new(path_setting)?;
+    let Some(norted_core::SettingValue::Path(path)) = patch.0.get(&path_id) else {
+        return Ok(());
+    };
+    let observed =
+        norted_core::bounded_setting_file_sha256(&path_id, path, path_base, maximum_bytes).await?;
+    let sha256_id = SettingId::new(sha256_setting)?;
+    if let Some(configured) = patch.0.get(&sha256_id) {
+        match configured {
+            norted_core::SettingValue::String(configured)
+                if configured.eq_ignore_ascii_case(&observed) => {}
+            norted_core::SettingValue::String(configured) => {
+                return Err(SettingsError::InvalidValue {
+                    setting_id: sha256_id,
+                    value: configured.clone(),
+                    reason: format!("does not match the selected file (observed {observed})"),
+                });
+            }
+            configured => {
+                return Err(SettingsError::InvalidValue {
+                    setting_id: sha256_id,
+                    value: configured.to_string(),
+                    reason: "expected a SHA-256 string".to_owned(),
+                });
+            }
+        }
+    }
+    patch.insert(sha256_id, norted_core::SettingValue::String(observed));
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -556,7 +669,6 @@ fn auxiliary_role_label(role: &AuxiliaryArtifactRole) -> &str {
         AuxiliaryArtifactRole::Tokenizer => "tokenizer",
         AuxiliaryArtifactRole::Projector => "projector",
         AuxiliaryArtifactRole::Sharp => "Sharp template",
-        AuxiliaryArtifactRole::ServeProfile => "Serve Profile",
         AuxiliaryArtifactRole::Other(name) => name,
     }
 }
@@ -622,9 +734,8 @@ pub struct LaunchRequest {
     pub runtime: InstalledRuntime,
     pub accelerator: Option<AcceleratorDevice>,
     pub backend_address: SocketAddr,
-    pub load_settings: ResolvedLoadSettings,
-    pub load_settings_schema: LoadSettingsSchema,
-    pub serve_profile: Option<norted_core::ServeProfile>,
+    pub settings: ResolvedSettings,
+    pub settings_schema: SettingsSchema,
 }
 
 #[derive(Debug, Clone)]
@@ -640,13 +751,12 @@ pub struct LaunchSpec {
     pub temporary_files: Vec<PathBuf>,
     pub endpoint: Option<String>,
     pub normalized_settings: BTreeMap<String, serde_json::Value>,
-    pub load_settings: ResolvedLoadSettings,
+    pub settings: ResolvedSettings,
     pub native_arguments: Vec<String>,
     pub installation: EngineInstallation,
     pub runtime: InstalledRuntime,
     pub model: PreparedModelInput,
     pub accelerator: Option<AcceleratorDevice>,
-    pub serve_profile: Option<norted_core::ServeProfile>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -799,7 +909,7 @@ impl GenerationSettingsPatch {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
-    pub model_id: norted_core::ModelId,
+    pub model_profile_id: norted_core::ModelProfileId,
     pub messages: Vec<InferenceMessage>,
     pub generation_settings: GenerationSettingsPatch,
     pub max_output_tokens: Option<u32>,
@@ -916,7 +1026,7 @@ pub trait EngineAdapter: Send + Sync {
         _runtime: &InstalledRuntime,
         model: &ModelArtifact,
         _host: &HostCapabilities,
-        _serve_profile: Option<&norted_core::ServeProfile>,
+        _settings: Option<&ResolvedSettings>,
     ) -> RuntimeCompatibility {
         match self.compatibility(model) {
             CompatibilityDecision::Supported => RuntimeCompatibility::Compatible,
@@ -943,7 +1053,7 @@ pub trait EngineAdapter: Send + Sync {
         _runtime: &AvailableRuntime,
         model: &ModelArtifact,
         _host: &HostCapabilities,
-        _serve_profile: Option<&norted_core::ServeProfile>,
+        _settings: Option<&ResolvedSettings>,
     ) -> RuntimeCompatibility {
         match self.compatibility(model) {
             CompatibilityDecision::Supported => RuntimeCompatibility::Compatible,
@@ -993,21 +1103,20 @@ pub trait EngineAdapter: Send + Sync {
     fn native_options(&self) -> Vec<NativeOption>;
     /// Returns every stable setting this adapter understands, independent of
     /// whether one exact installed runtime currently supports it.
-    fn load_setting_definitions(&self) -> Vec<LoadSettingDefinition> {
+    fn setting_definitions(&self) -> Vec<SettingDefinition> {
         Vec::new()
     }
     /// Gates the curated semantic settings against one exact runtime contract.
-    async fn load_settings_schema(
+    async fn settings_schema(
         &self,
         runtime: &InstalledRuntime,
         _model: &ModelArtifact,
         _host: &HostCapabilities,
-        _serve_profile: Option<&norted_core::ServeProfile>,
-    ) -> Result<LoadSettingsSchema, EngineError> {
-        Ok(LoadSettingsSchema {
+    ) -> Result<SettingsSchema, EngineError> {
+        Ok(SettingsSchema {
             engine_id: self.identity().id,
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
-            definitions: self.load_setting_definitions(),
+            definitions: self.setting_definitions(),
         })
     }
     /// Reports the legacy/flexible-entry runtime configured directly for this
@@ -1030,8 +1139,8 @@ pub trait EngineAdapter: Send + Sync {
     }
     async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError>;
     /// Returns the narrowly ordered process attempts for one launch. Most
-    /// adapters have exactly one attempt. q27 Serve Profile execution uses
-    /// this to enumerate only exact-runtime-proven KV modes in profile order.
+    /// adapters have exactly one attempt. q27 automatic KV configuration may
+    /// enumerate exact-runtime-proven fallback modes.
     async fn build_launch_attempts(
         &self,
         request: LaunchRequest,
@@ -1166,10 +1275,10 @@ impl EngineRegistry {
             .collect()
     }
 
-    pub fn load_setting_definitions(&self) -> Result<Vec<LoadSettingDefinition>, EngineError> {
-        let mut definitions = BTreeMap::<LoadSettingId, LoadSettingDefinition>::new();
+    pub fn setting_definitions(&self) -> Result<Vec<SettingDefinition>, EngineError> {
+        let mut definitions = BTreeMap::<SettingId, SettingDefinition>::new();
         for adapter in self.adapters.values() {
-            for definition in adapter.load_setting_definitions() {
+            for definition in adapter.setting_definitions() {
                 match definitions.entry(definition.id.clone()) {
                     Entry::Vacant(entry) => {
                         entry.insert(definition);
@@ -1177,7 +1286,7 @@ impl EngineRegistry {
                     Entry::Occupied(entry) if entry.get() == &definition => {}
                     Entry::Occupied(entry) => {
                         return Err(EngineError::InvalidConfiguration(format!(
-                            "load setting `{}` has conflicting adapter definitions",
+                            "setting `{}` has conflicting adapter definitions",
                             entry.key()
                         )));
                     }
@@ -1187,27 +1296,24 @@ impl EngineRegistry {
         Ok(definitions.into_values().collect())
     }
 
-    pub fn parse_load_settings(
-        &self,
-        assignments: &[String],
-    ) -> Result<LoadSettingsPatch, EngineError> {
+    pub fn parse_settings(&self, assignments: &[String]) -> Result<SettingsPatch, EngineError> {
         let definitions = self
-            .load_setting_definitions()?
+            .setting_definitions()?
             .into_iter()
             .map(|definition| (definition.id.clone(), definition))
             .collect::<BTreeMap<_, _>>();
-        let mut patch = LoadSettingsPatch::default();
+        let mut patch = SettingsPatch::default();
         for assignment in assignments {
             let (raw_id, raw_value) = assignment.split_once('=').ok_or_else(|| {
                 EngineError::InvalidConfiguration(format!(
-                    "load setting `{assignment}` must use SETTING_ID=VALUE"
+                    "setting `{assignment}` must use SETTING_ID=VALUE"
                 ))
             })?;
-            let id = LoadSettingId::new(raw_id.to_owned())
+            let id = SettingId::new(raw_id.to_owned())
                 .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
             let definition = definitions.get(&id).ok_or_else(|| {
                 EngineError::InvalidConfiguration(
-                    LoadSettingsError::UnknownSetting(id.clone()).to_string(),
+                    SettingsError::UnknownSetting(id.clone()).to_string(),
                 )
             })?;
             let value = definition
@@ -1238,7 +1344,7 @@ mod tests {
         AppPaths, ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime, HostCapabilities,
         ModelArtifact, ModelId, ModelRegistry, RuntimeArchiveFormat, RuntimeCompatibility,
         RuntimeDigest, RuntimeDownload, RuntimeIdentity, RuntimePackageIdentity,
-        RuntimeReleaseChannel, RuntimeRequirements,
+        RuntimeReleaseChannel, RuntimeRequirements, SettingId, SettingValue, SettingsPatch,
     };
     use sha2::{Digest, Sha256};
 
@@ -1249,7 +1355,8 @@ mod tests {
         InferenceRole, InstallationState, LaunchRequest, LaunchSpec, NativeOption,
         PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
         RuntimePackManager, UpdateState, hash_file_with_progress, prepare_norted_package_input,
-        prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
+        prepare_norted_package_input_with_progress, record_local_file_setting_identity,
+        revalidate_norted_package_before_launch,
         revalidate_norted_package_before_launch_with_progress,
     };
 
@@ -1284,6 +1391,43 @@ mod tests {
         );
         assert_eq!(backend_defaults.temperature, 0.7);
         assert_eq!(backend_defaults.top_p, 0.9);
+    }
+
+    #[tokio::test]
+    async fn local_file_setting_identity_is_recorded_and_mismatches_fail() {
+        let temporary = tempfile::tempdir().expect("template fixture");
+        let template = temporary.path().join("custom.jinja");
+        std::fs::write(&template, b"template").expect("template");
+        let path_id = SettingId::new("q27.template_path").expect("path setting ID");
+        let sha_id = SettingId::new("q27.template_sha256").expect("SHA setting ID");
+        let mut patch = SettingsPatch::default();
+        patch.insert(path_id.clone(), SettingValue::Path(template));
+        record_local_file_setting_identity(
+            &mut patch,
+            path_id.as_str(),
+            sha_id.as_str(),
+            temporary.path(),
+            1024,
+        )
+        .await
+        .expect("record template identity");
+        assert_eq!(
+            patch.0[&sha_id],
+            SettingValue::String(format!("{:x}", Sha256::digest(b"template")))
+        );
+
+        patch.insert(sha_id, SettingValue::String("0".repeat(64)));
+        assert!(
+            record_local_file_setting_identity(
+                &mut patch,
+                path_id.as_str(),
+                "q27.template_sha256",
+                temporary.path(),
+                1024,
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1570,8 +1714,10 @@ mod tests {
             runtimes_dir: root.join("data/runtimes"),
             runtime_cache_dir: root.join("cache/runtime-packs"),
             runtime_selections_file: root.join("data/runtime-selections.json"),
-            serve_profiles_file: root.join("data/serve-profiles.json"),
-            serve_profiles_lock_file: root.join("data/.serve-profiles.lock"),
+            settings_file: root.join("data/settings.json"),
+            settings_lock_file: root.join("data/.settings.lock"),
+            model_profiles_file: root.join("data/model-profiles.json"),
+            model_profiles_lock_file: root.join("data/.model-profiles.lock"),
         };
         paths.ensure_required().expect("application paths");
 
@@ -1847,6 +1993,9 @@ mod tests {
         let with_progress = BackendStatus {
             generation: 9,
             lifecycle: BackendLifecycle::Loading,
+            model_profile_id: Some(
+                norted_core::ModelProfileId::new("qwen-quality").expect("profile ID"),
+            ),
             model_id: Some(ModelId("qwen3.8-27b".to_owned())),
             engine_id: Some("q27".to_owned()),
             runtime_id: None,

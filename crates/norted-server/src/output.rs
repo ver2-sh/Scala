@@ -77,7 +77,17 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
             );
             println!("  Backend:         {:?}", control.backend.lifecycle);
             println!(
-                "  Active model:    {}",
+                "  Active profile:  {}",
+                control
+                    .backend
+                    .model_profile_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref()
+                    .unwrap_or("none")
+            );
+            println!(
+                "  Artifact model:  {}",
                 control
                     .backend
                     .model_id
@@ -103,7 +113,8 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
             }
         } else {
             println!("  Adapters:        unavailable (no private control observation)");
-            println!("  Active model:    unavailable");
+            println!("  Active profile:  unavailable");
+            println!("  Artifact model:  unavailable");
         }
     }
     Ok(())
@@ -709,264 +720,142 @@ fn truncate(value: &str, width: usize) -> String {
     }
 }
 
-pub fn profiles(
+pub fn model_profiles(
     operation: &str,
-    state: &norted_core::ServeProfilesState,
-    selected: Option<&norted_core::ServeProfileName>,
+    state: &norted_core::ModelProfilesState,
+    selected: Option<&norted_core::ModelProfileId>,
+    models: &[norted_core::ModelArtifact],
     json_output: bool,
 ) -> Result<()> {
+    if let Some(id) = selected {
+        let profile = state
+            .profiles
+            .get(id)
+            .ok_or_else(|| color_eyre::eyre::eyre!("Model Profile `{id}` does not exist"))?;
+        let model = models.iter().find(|model| model.id == profile.model_id);
+        let resolved = norted_core::ResolvedSettings::default();
+        return model_profile(operation, profile, model, &resolved, json_output);
+    }
     if json_output {
-        let profile = selected.and_then(|name| {
-            state.profiles.get(name).map(|value| {
-                let serve = value.clone();
-                let effective_requirements = serve.effective_requirements();
+        let rows = state
+            .profiles
+            .values()
+            .map(|profile| {
                 json!({
-                    "name": name,
-                    "serve_profile": serve,
-                    "effective_requirements": effective_requirements,
+                    "profile": profile,
+                    "content_hash": profile.content_hash(),
+                    "model_available": models.iter().any(|model| model.id == profile.model_id),
                 })
             })
-        });
+            .collect::<Vec<_>>();
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "operation": operation,
                 "state_version": state.version,
-                "profile": profile,
-                "profiles": state.profiles,
-                "model_assignments": state.model_assignments,
-                "builder_profile_assignments": state.builder_profile_assignments,
-                "raw_profile_models": state.raw_profile_models,
+                "data": rows,
             }))?
         );
-        return Ok(());
-    }
-    if let Some(name) = selected {
-        let profile = &state.profiles[name];
-        let serve = profile.clone();
-        println!("Serve Profile {} ({})", serve.display_name, serve.id);
-        println!("  Source:             {}", serve.source);
-        println!(
-            "  Access:             {}",
-            if serve.read_only {
-                "read-only"
-            } else {
-                "mutable"
-            }
-        );
-        if let Some(description) = &serve.description {
-            println!("  Description:        {description}");
-        }
-        println!(
-            "  Applicability:      {}{}{}",
-            if serve.applicability.artifact_formats.is_empty() {
-                "any format".to_owned()
-            } else {
-                serve
-                    .applicability
-                    .artifact_formats
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            },
-            serve
-                .applicability
-                .architecture
-                .as_ref()
-                .map(|value| format!(" · architecture {value}"))
-                .unwrap_or_default(),
-            serve
-                .applicability
-                .family
-                .as_ref()
-                .map(|value| format!(" · family {value}"))
-                .unwrap_or_default(),
-        );
-        println!(
-            "  Prompt:             {:?} · {:?} · template {} · generation-prompt={} · filter={:?}",
-            serve.prompt.mode,
-            serve.prompt.delivery,
-            serve
-                .prompt
-                .template
-                .as_ref()
-                .map(|template| format!("{} ({})", template.identity, template.path.display()))
-                .unwrap_or_else(|| "runtime/upstream default".to_owned()),
-            serve.prompt.render_generation_prompt,
-            serve.prompt.response_filter,
-        );
-        println!(
-            "  Generation:         temperature={} top_p={} top_k={} min_p={} reasoning={} thinking={}{}",
-            optional_value(serve.generation.defaults.temperature),
-            optional_value(serve.generation.defaults.top_p),
-            optional_value(serve.generation.defaults.top_k),
-            optional_value(serve.generation.defaults.min_p),
-            serve
-                .generation
-                .defaults
-                .reasoning_effort
-                .as_deref()
-                .unwrap_or("runtime default"),
-            serve.generation.thinking.default,
-            if serve.generation.thinking.required {
-                " (required)"
-            } else {
-                ""
-            },
-        );
-        println!(
-            "  Context:            preferred={} minimum={}",
-            optional_value(serve.load.context.preferred),
-            optional_value(serve.load.context.minimum),
-        );
-        if let Some(q27) = &serve.engine.q27 {
-            println!(
-                "  q27 strategy:       KV {} · MTP {} / pmin {} · suffix={} W_MAX={} · fast-head={} override={}",
-                q27.kv_quality_order.join(" -> "),
-                q27.mtp.maximum_depth,
-                q27.mtp.minimum_probability,
-                q27.suffix_drafting,
-                q27.suffix_width_from_runtime_w_max,
-                q27.fast_head.default,
-                q27.fast_head.user_override_allowed,
-            );
-        }
-        if let Some(ninfer) = &serve.engine.ninfer {
-            println!(
-                "  NInfer strategy:    KV {}/{} · CUDA graph={} · prefix reuse={} · default strategy={} · speculative profiles={}",
-                ninfer.kv_cache,
-                ninfer.kv_dtype,
-                ninfer.cuda_graph_required,
-                ninfer.prefix_reuse_required,
-                ninfer.default_speculative_profile,
-                ninfer
-                    .speculative_profiles
-                    .iter()
-                    .map(|(name, profile)| format!(
-                        "{name}={}",
-                        if profile.speculative_decoding {
-                            format!(
-                                "{}/{}{}",
-                                profile.backend.as_deref().unwrap_or("missing-backend"),
-                                profile
-                                    .draft_tokens
-                                    .map(|value| value.to_string())
-                                    .unwrap_or_else(|| "missing-drafts".to_owned()),
-                                if profile.optimized_proposal_head == Some(true) {
-                                    "/lm-head-draft"
-                                } else {
-                                    ""
-                                }
-                            )
-                        } else {
-                            "off".to_owned()
-                        }
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
-        }
-        let requirements = serve.effective_requirements();
-        println!(
-            "  Requirements:       {}",
-            if requirements.is_empty() {
-                "none".to_owned()
-            } else {
-                requirements
-                    .iter()
-                    .map(|value| format!("{value:?}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            }
-        );
-        println!(
-            "  Allowed overrides:  {}",
-            if serve.generation.allowed_user_overrides.is_empty() {
-                "none".to_owned()
-            } else {
-                serve.generation.allowed_user_overrides.join(", ")
-            }
-        );
-        if profile.load.settings.is_empty() {
-            println!("  No overrides; all values inherit.");
-        } else {
-            for (id, value) in profile.load.settings.iter() {
-                println!("  {id:<38} {value}");
-            }
-        }
-        let mut models = state
-            .model_assignments
-            .iter()
-            .filter_map(|(model, assigned)| (assigned == name).then_some(model))
-            .collect::<Vec<_>>();
-        models.extend(
-            state
-                .builder_profile_assignments
-                .iter()
-                .filter_map(|(model, assigned)| (assigned == name.as_str()).then_some(model)),
-        );
-        models.sort();
-        models.dedup();
-        if !models.is_empty() {
-            println!(
-                "  Assigned models: {}",
-                models
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
     } else if state.profiles.is_empty() {
-        println!("No Serve Profiles exist.");
+        println!("No Model Profiles exist. Create one from a discovered model artifact.");
     } else {
         println!(
-            "{:<32} {:<18} {:<10} ASSIGNED MODELS",
-            "SERVE PROFILE", "SOURCE", "ACCESS"
+            "{:<30} {:<12} {:<36} STATE",
+            "MODEL PROFILE", "ENGINE", "MODEL ID"
         );
-        for (name, profile) in &state.profiles {
-            let assigned = state
-                .model_assignments
-                .values()
-                .filter(|candidate| *candidate == name)
-                .count()
-                + state
-                    .builder_profile_assignments
-                    .values()
-                    .filter(|candidate| candidate.as_str() == name.as_str())
-                    .count();
-            let serve = profile.clone();
+        for profile in state.profiles.values() {
+            let available = models.iter().any(|model| model.id == profile.model_id);
             println!(
-                "{name:<32} {:<18} {:<10} {assigned}",
-                serve.source,
-                if serve.read_only {
-                    "read-only"
-                } else {
-                    "mutable"
-                },
-            );
-        }
-        if !state.raw_profile_models.is_empty() {
-            println!(
-                "None / Raw runtime defaults: {} model(s)",
-                state.raw_profile_models.len()
+                "{:<30} {:<12} {:<36} {}",
+                profile.id,
+                profile.engine_id,
+                truncate(&profile.model_id.to_string(), 36),
+                if available { "available" } else { "missing" }
             );
         }
     }
     Ok(())
 }
 
-fn optional_value<T: ToString>(value: Option<T>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "runtime default".to_owned())
+pub fn model_profile(
+    operation: &str,
+    profile: &norted_core::ModelProfile,
+    model: Option<&norted_core::ModelArtifact>,
+    resolved: &norted_core::ResolvedSettings,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "operation": operation,
+                "profile": profile,
+                "content_hash": profile.content_hash(),
+                "model": model,
+                "model_available": model.is_some(),
+                "effective_settings": resolved,
+            }))?
+        );
+        return Ok(());
+    }
+    println!("Model Profile: {} ({})", profile.display_name, profile.id);
+    println!("  Model ID:       {}", profile.model_id);
+    println!(
+        "  Model state:    {}",
+        if model.is_some() {
+            "available"
+        } else {
+            "missing"
+        }
+    );
+    if let Some(model) = model {
+        println!("  Artifact:       {}", model.path.display());
+        println!("  Format:         {}", model.format);
+    }
+    println!("  Engine:         {}", profile.engine_id);
+    println!("  Content SHA:    {}", profile.content_hash());
+    if profile.overrides.is_empty() {
+        println!("  Overrides:      none (Global + engine defaults only)");
+    } else {
+        println!("  Overrides:");
+        for (id, value) in profile.overrides.iter() {
+            println!("    {id:<36} {value}");
+        }
+    }
+    if !resolved.effective.is_empty() {
+        println!("  Effective settings:");
+        for (id, setting) in &resolved.effective {
+            println!("    {id:<36} {:<18} {}", setting.value, setting.source);
+        }
+    }
+    Ok(())
 }
 
-pub fn profile_compatibility(
-    profile: &norted_core::ServeProfile,
+pub fn model_profile_deleted(
+    profile_id: &norted_core::ModelProfileId,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "operation": "delete",
+                "model_profile_id": profile_id,
+                "deleted": true,
+            }))?
+        );
+    } else {
+        println!("Deleted Model Profile `{profile_id}`.");
+    }
+    Ok(())
+}
+
+pub fn model_profile_compatibility(
+    profile: &norted_core::ModelProfile,
     model: &norted_core::ModelArtifact,
     selection: &norted_core::RuntimeSelection,
+    schema: &norted_core::SettingsSchema,
+    resolved: &norted_core::ResolvedSettings,
     compatibility: &norted_core::RuntimeCompatibility,
     json_output: bool,
 ) -> Result<()> {
@@ -974,135 +863,31 @@ pub fn profile_compatibility(
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "model_id": model.id,
+                "model_profile": profile,
+                "model_profile_content_hash": profile.content_hash(),
+                "artifact_model_id": model.id,
                 "artifact_format": model.format,
-                "profile": profile,
                 "runtime_id": selection.runtime.manifest.runtime_id,
+                "settings_schema": schema,
+                "effective_settings": resolved,
                 "compatibility": compatibility,
             }))?
         );
     } else {
-        println!("Serve Profile compatibility");
-        println!("  Model:       {} ({})", model.display_name, model.format);
-        println!("  Profile:     {} ({})", profile.display_name, profile.id);
-        println!("  Runtime:     {}", selection.runtime.manifest.runtime_id);
-        println!("  Status:      {compatibility:?}");
+        println!("Model Profile compatibility");
+        println!("  Profile:    {} ({})", profile.display_name, profile.id);
+        println!("  Model:      {} ({})", model.display_name, model.format);
+        println!("  Engine:     {}", profile.engine_id);
+        println!("  Runtime:    {}", selection.runtime.manifest.runtime_id);
+        println!("  Status:     {compatibility:?}");
     }
     Ok(())
 }
 
-pub fn settings_schema(schema: &norted_core::LoadSettingsSchema, json_output: bool) -> Result<()> {
-    if json_output {
-        println!("{}", serde_json::to_string_pretty(schema)?);
-    } else {
-        println!(
-            "Load settings for {} / {}",
-            schema.engine_id,
-            schema
-                .runtime_id
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref()
-                .unwrap_or("no exact runtime")
-        );
-        for definition in &schema.definitions {
-            let support = if definition.supported {
-                "supported".to_owned()
-            } else {
-                format!(
-                    "unsupported: {}",
-                    definition
-                        .unsupported_reason
-                        .as_deref()
-                        .unwrap_or("unknown reason")
-                )
-            };
-            println!(
-                "  {:<38} {:<11} {}",
-                definition.id, support, definition.label
-            );
-        }
-    }
-    Ok(())
-}
-
-pub fn effective_settings(
-    runtime_id: &norted_core::RuntimeId,
-    schema: &norted_core::LoadSettingsSchema,
-    resolved: &norted_core::ResolvedLoadSettings,
-    json_output: bool,
-) -> Result<()> {
-    let rows = schema
-        .definitions
-        .iter()
-        .map(|definition| {
-            let effective = resolved.effective.get(&definition.id);
-            json!({
-                "id": definition.id,
-                "label": definition.label,
-                "value": effective.map(|setting| &setting.value),
-                "source": effective.map(|setting| &setting.source),
-                "state": if effective.is_some() { "configured" } else { "upstream_default" },
-                "supported": definition.supported,
-                "unsupported_reason": definition.unsupported_reason,
-            })
-        })
-        .collect::<Vec<_>>();
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "runtime_id": runtime_id,
-                "engine_id": schema.engine_id,
-                "selected_profile": resolved.selected_profile,
-                "settings": rows,
-            }))?
-        );
-    } else {
-        println!("Runtime: {runtime_id}");
-        println!("Engine:  {}", schema.engine_id);
-        println!(
-            "Profile: {}",
-            resolved
-                .selected_profile
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref()
-                .unwrap_or("none")
-        );
-        println!("{:<38} {:<20} SOURCE", "SETTING", "VALUE");
-        for definition in &schema.definitions {
-            if let Some(setting) = resolved.effective.get(&definition.id) {
-                let suffix = if definition.supported {
-                    String::new()
-                } else {
-                    format!(
-                        " [incompatible: {}]",
-                        definition
-                            .unsupported_reason
-                            .as_deref()
-                            .unwrap_or("unsupported")
-                    )
-                };
-                println!(
-                    "{:<38} {:<20} {}{}",
-                    definition.id, setting.value, setting.source, suffix
-                );
-            } else {
-                println!(
-                    "{:<38} {:<20} upstream",
-                    definition.id, "<upstream default>"
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn settings_mutation(
+pub fn settings_defaults(
     operation: &str,
     scope: &str,
-    state: &norted_core::ServeProfilesState,
+    state: &norted_core::SettingsState,
     json_output: bool,
 ) -> Result<()> {
     if json_output {
@@ -1114,9 +899,24 @@ pub fn settings_mutation(
                 "state": state,
             }))?
         );
-    } else {
-        println!("Load settings {operation}: {scope}");
-        println!("Changes apply on the next model load.");
+        return Ok(());
     }
+    println!("Settings {operation}: {scope}");
+    let patch = if scope == "global" {
+        Some(&state.global_defaults)
+    } else {
+        scope
+            .strip_prefix("engine:")
+            .and_then(|engine| state.engine_defaults.get(engine))
+    };
+    match patch {
+        Some(patch) if !patch.is_empty() => {
+            for (id, value) in patch.iter() {
+                println!("  {id:<38} {value}");
+            }
+        }
+        _ => println!("  No configured defaults; values inherit the runtime/upstream default."),
+    }
+    println!("Changes apply on the next Model Profile load.");
     Ok(())
 }

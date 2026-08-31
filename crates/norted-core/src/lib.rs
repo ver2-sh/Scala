@@ -4,13 +4,13 @@ mod auth;
 mod config;
 mod error;
 mod event;
-mod load_settings;
 mod model;
+mod model_profile;
 mod norted_package;
 mod provenance;
 mod runtime;
 mod runtime_pack;
-mod serve_profile;
+mod settings;
 mod state;
 
 pub use auth::{
@@ -24,23 +24,21 @@ pub use config::{
 };
 pub use error::{CoreError, Result};
 pub use event::{AppEvent, LogLevel};
-pub use load_settings::{
-    GpuOffload, LoadSettingDefinition, LoadSettingId, LoadSettingKind, LoadSettingScope,
-    LoadSettingSource, LoadSettingValue, LoadSettingsError, LoadSettingsPatch, LoadSettingsSchema,
-    ResolvedLoadSetting, ResolvedLoadSettings, SERVE_PROFILES_STATE_VERSION, ServeProfileName,
-    ServeProfilesError, ServeProfilesState, ServeProfilesStore, UnsignedIntegerOrChoiceValue,
-};
 pub use model::{
     ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifact, AuxiliaryArtifactRole,
     ModelArtifact, ModelArtifactProvenance, ModelId, ModelRegistry, NinferArtifactIdentity,
     NinferContainerError, NinferContainerMetadata, inspect_ninfer_container,
 };
+pub use model_profile::{
+    EngineId, MODEL_PROFILES_STATE_VERSION, ModelProfile, ModelProfileId, ModelProfilesState,
+    ModelProfilesStore, validate_engine_id,
+};
 pub use norted_package::{NortedPackageBinding, NortedPackageFile, NortedPackageKind};
 pub use provenance::{
-    AcquisitionMethod, AuxiliaryRuntimeIdentity, BuildProvenance, BuilderRecommendationStatus,
-    EngineInstallation, EngineRevision, EnvironmentVariableProvenance, LoadSettingsProvenance,
+    AcquisitionMethod, AuxiliaryRuntimeIdentity, BuildProvenance, EngineInstallation,
+    EngineRevision, EnvironmentVariableProvenance, ModelProfileRuntimeIdentity,
     ModelRuntimeIdentity, NativeArgumentProvenance, NortedPackageRuntimeIdentity, ProcessIdentity,
-    RuntimeProvenance, ServeProfileRuntimeIdentity, ToolchainProvenance,
+    RuntimeProvenance, SettingsProvenance, ToolchainProvenance,
 };
 pub use runtime::{
     RuntimeDescriptor, RuntimeObservationError, RuntimePublisher, observe_runtime,
@@ -59,12 +57,10 @@ pub use runtime_pack::{
     RuntimeSourceBuildSystem, RuntimeSourceBuildToolchain, RuntimeSourceSnapshot,
     RuntimeUpdatePreference, RuntimeUpdateState, is_full_git_sha, is_safe_relative_path,
 };
-pub use serve_profile::{
-    ContextPolicy, ExternalTemplateReference, GenerationDefaults, NinferServeStrategy,
-    NinferSpeculativeProfile, PromptDelivery, PromptMode, Q27MtpStrategy, Q27ServeStrategy,
-    ResponseFilter, SERVE_PROFILE_SCHEMA, SERVE_PROFILE_SCHEMA_VERSION, ServeCapability,
-    ServeEngineProfiles, ServeGenerationProfile, ServeLoadDefaults, ServeProfile,
-    ServeProfileApplicability, ServeProfileSource, ServePromptProfile, ThinkingPolicy,
-    ToggleOverridePolicy, apply_serve_profile_load_policy, validate_profile_id,
+pub use settings::{
+    GpuOffload, ResolvedSetting, ResolvedSettings, SETTINGS_STATE_VERSION, SettingCategory,
+    SettingDefinition, SettingId, SettingKind, SettingScope, SettingSource, SettingValue,
+    SettingsError, SettingsPatch, SettingsSchema, SettingsState, SettingsStore, StateStoreError,
+    UnsignedIntegerOrChoiceValue, bounded_setting_file_sha256,
 };
 pub use state::{AppSnapshot, ApplicationCore, RegistryState, ServerState};

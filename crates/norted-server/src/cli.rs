@@ -44,17 +44,14 @@ pub enum Command {
     Auth(AuthArgs),
     /// Show current server, model, and engine state
     Status,
-    /// Load a discovered model through the running Norted Server instance
+    /// Load a user-created Model Profile through the running Norted Server instance
     Load {
-        /// Stable model ID from `norted-server models list`
-        model_id: String,
+        /// Model Profile ID from `norted-server model-profiles list`
+        model_profile_id: String,
         /// Exact installed runtime ID; overrides model and format selections
         #[arg(long)]
         runtime: Option<String>,
-        /// Serve Profile ID for this invocation, or `none` for raw runtime defaults
-        #[arg(long)]
-        profile: Option<String>,
-        /// Ephemeral structured load override (repeatable SETTING_ID=VALUE)
+        /// Ephemeral serving override (repeatable SETTING_ID=VALUE)
         #[arg(long = "set", value_name = "SETTING_ID=VALUE")]
         settings: Vec<String>,
     },
@@ -66,9 +63,9 @@ pub enum Command {
     Engines(EnginesArgs),
     /// Search, install, select, update, and remove concrete runtime packs
     Runtimes(RuntimesArgs),
-    /// Create, edit, assign, and inspect reusable Serve Profiles
-    Profiles(ProfilesArgs),
-    /// Manage defaults and inspect exact-runtime load settings
+    /// Create, edit, load, and inspect user-owned Model Profiles
+    ModelProfiles(ModelProfilesArgs),
+    /// Manage Global and engine serving defaults
     Settings(SettingsArgs),
     /// Inspect resolved application configuration
     Config(ConfigArgs),
@@ -197,74 +194,56 @@ pub enum ConfigCommand {
 }
 
 #[derive(Debug, Args)]
-pub struct ProfilesArgs {
+pub struct ModelProfilesArgs {
     #[command(subcommand)]
-    pub command: ProfilesCommand,
+    pub command: ModelProfilesCommand,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum ProfilesCommand {
-    /// List local and discovered Builder Serve Profiles and model assignments
+pub enum ModelProfilesCommand {
+    /// List user-owned Model Profiles
     List,
-    /// Show one complete Serve Profile
-    Show { name: String },
-    /// Create an empty mutable local Serve Profile
-    Create { name: String },
-    /// Duplicate/fork a profile into a mutable local Serve Profile
-    Duplicate { source: String, name: String },
-    /// Delete an unassigned mutable local Serve Profile
-    Delete { name: String },
-    /// Set one or more values in a named profile
+    /// Show one Model Profile and its effective settings
+    Show { profile: String },
+    /// Create a Model Profile bound to one concrete model and engine
+    Create {
+        profile: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        engine: String,
+    },
+    /// Duplicate a Model Profile under a new ID
+    Duplicate { source: String, profile: String },
+    /// Delete an inactive Model Profile
+    Delete { profile: String },
+    /// Change the concrete model binding
+    SetModel { profile: String, model: String },
+    /// Change the engine binding
+    SetEngine { profile: String, engine: String },
+    /// Set one or more Model Profile overrides
     Set {
-        name: String,
+        profile: String,
         #[arg(required = true, value_name = "SETTING_ID=VALUE")]
         settings: Vec<String>,
     },
-    /// Remove values from a named profile so they inherit again
+    /// Clear overrides so values inherit Global/engine defaults again
     Unset {
-        name: String,
+        profile: String,
         #[arg(required = true, value_name = "SETTING_ID")]
         settings: Vec<String>,
     },
-    /// Set typed generation defaults in a mutable local Serve Profile
-    SetGeneration {
-        name: String,
-        #[arg(required = true, value_name = "FIELD=VALUE")]
-        values: Vec<String>,
+    /// Load the Model Profile through the running control server
+    Load {
+        profile: String,
+        #[arg(long)]
+        runtime: Option<String>,
+        #[arg(long = "set", value_name = "SETTING_ID=VALUE")]
+        settings: Vec<String>,
     },
-    /// Select runtime-default prompt handling for a mutable local Serve Profile
-    SetPromptRuntimeDefault { name: String },
-    /// Bind a local template and raw-completions delivery to a mutable Serve Profile
-    SetPromptExternal {
-        name: String,
-        #[arg(long)]
-        template: std::path::PathBuf,
-        #[arg(long)]
-        template_id: String,
-        #[arg(long)]
-        template_sha256: String,
-    },
-    /// Persist one named profile assignment for a model
-    Assign {
-        #[arg(long)]
-        model: String,
-        name: String,
-    },
-    /// Clear a model's named profile assignment
-    ClearAssignment {
-        #[arg(long)]
-        model: String,
-    },
-    /// Remove an explicit selection and inherit the Builder recommendation again
-    UseRecommended {
-        #[arg(long)]
-        model: String,
-    },
-    /// Evaluate model + exact runtime + Serve Profile compatibility
+    /// Evaluate the bound model + engine + settings against a runtime
     Compatibility {
-        name: String,
-        #[arg(long)]
-        model: String,
+        profile: String,
         #[arg(long)]
         runtime: Option<String>,
     },
@@ -278,21 +257,12 @@ pub struct SettingsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SettingsCommand {
-    /// Show effective values and their precedence sources for an exact runtime
+    /// Show persisted Global or engine defaults
     Show {
-        #[arg(long)]
-        model: String,
-        #[arg(long)]
-        runtime: Option<String>,
-        #[arg(long)]
-        profile: Option<String>,
-    },
-    /// Show the exact selected runtime's structured setting schema
-    Schema {
-        #[arg(long)]
-        model: String,
-        #[arg(long)]
-        runtime: Option<String>,
+        #[arg(long, conflicts_with = "engine", required_unless_present = "engine")]
+        global: bool,
+        #[arg(long, conflicts_with = "global", required_unless_present = "global")]
+        engine: Option<String>,
     },
     /// Set one or more persisted defaults
     Set(SettingsMutationArgs),
@@ -305,7 +275,7 @@ pub enum SettingsCommand {
     ArgGroup::new("scope")
         .required(true)
         .multiple(false)
-        .args(["global", "engine", "model"])
+        .args(["global", "engine"])
 ))]
 pub struct SettingsMutationArgs {
     #[arg(long)]
@@ -313,7 +283,6 @@ pub struct SettingsMutationArgs {
     #[arg(long)]
     pub engine: Option<String>,
     #[arg(long)]
-    pub model: Option<String>,
     #[arg(required = true, value_name = "SETTING_ID=VALUE")]
     pub settings: Vec<String>,
 }
@@ -323,7 +292,7 @@ pub struct SettingsMutationArgs {
     ArgGroup::new("scope")
         .required(true)
         .multiple(false)
-        .args(["global", "engine", "model"])
+        .args(["global", "engine"])
 ))]
 pub struct SettingsUnsetArgs {
     #[arg(long)]
@@ -331,7 +300,6 @@ pub struct SettingsUnsetArgs {
     #[arg(long)]
     pub engine: Option<String>,
     #[arg(long)]
-    pub model: Option<String>,
     #[arg(required = true, value_name = "SETTING_ID")]
     pub settings: Vec<String>,
 }
