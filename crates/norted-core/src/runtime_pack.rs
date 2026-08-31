@@ -320,6 +320,10 @@ pub struct RuntimeSourceBuildPrerequisites {
     /// still requires a working nvcc, but does not invent an upstream floor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimum_cuda_version: Option<String>,
+    /// Exclusive upper CUDA Toolkit bound owned by the source recipe. `None`
+    /// preserves historical unbounded prerequisite semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_cuda_version_exclusive: Option<String>,
     pub requires_ninja: bool,
     pub requires_cpp20_compiler: bool,
     #[serde(default)]
@@ -948,6 +952,10 @@ fn validate_source_build_plan(
         || (recipe.build_system == RuntimeSourceBuildSystem::Make && !prerequisites.requires_make)
         || prerequisites
             .minimum_cuda_version
+            .as_deref()
+            .is_some_and(|version| version.trim().is_empty())
+        || prerequisites
+            .maximum_cuda_version_exclusive
             .as_deref()
             .is_some_and(|version| version.trim().is_empty())
         || prerequisites

@@ -18,9 +18,11 @@ use crate::catalog::{
 use crate::{ENGINE_ID, UPSTREAM_REPOSITORY};
 
 const PACKAGE_FAMILY: &str = "llama-cpp-managed-source";
-const RECIPE_VERSION: &str = "managed-portable-v2";
+const RECIPE_VERSION: &str = "managed-portable-v3";
 const CUDA_ARCHITECTURES: &str = "75-real;80-real;86-real;89-real;90-real;120a-real";
 const CUDA_TOOLKIT_FLOOR: &str = "12.8";
+const CUDA_TOOLKIT_CEILING_EXCLUSIVE: &str = "13.0";
+const NVIDIA_DRIVER_FLOOR: &str = "525.60.13";
 const ACCELERATOR_TARGET: &str = "sm_75+sm_80+sm_86+sm_89+sm_90+sm_120a";
 const SOURCE_CONTRACT_FILE_LIMIT: usize = 512 * 1024;
 
@@ -503,6 +505,9 @@ fn source_runtime(
             prerequisites: RuntimeSourceBuildPrerequisites {
                 minimum_cmake_version: "3.18".to_owned(),
                 minimum_cuda_version: Some(CUDA_TOOLKIT_FLOOR.to_owned()),
+                maximum_cuda_version_exclusive: Some(
+                    CUDA_TOOLKIT_CEILING_EXCLUSIVE.to_owned(),
+                ),
                 requires_ninja: true,
                 requires_cpp20_compiler: false,
                 requires_make: false,
@@ -516,7 +521,7 @@ fn source_runtime(
         supported_native_identities: Vec::new(),
         requirements: RuntimeRequirements {
             requires_nvidia_gpu: true,
-            minimum_nvidia_driver: None,
+            minimum_nvidia_driver: Some(NVIDIA_DRIVER_FLOOR.to_owned()),
             minimum_vram_bytes: None,
             minimum_vram_class_gib: None,
             minimum_vram_exclusive_class_gib: None,
@@ -535,7 +540,9 @@ fn source_runtime(
                     .to_owned(),
                 "The managed build contains fixed real-code CUDA targets for compute capabilities 7.5, 8.0, 8.6, 8.9, 9.0, and 12.0"
                     .to_owned(),
-                "CUDA 12.8 is the minimum build Toolkit because the fixed policy includes Blackwell sm_120a"
+                "CUDA Toolkit 12.8 through 12.x is required: 12.8 first supports the fixed Blackwell sm_120a target, while CUDA 13.x has a different driver contract"
+                    .to_owned(),
+                "NVIDIA documents Linux driver 525.60.13 as the CUDA 12.x minor-version compatibility floor"
                     .to_owned(),
             ],
             unverified_requirements: Vec::new(),
@@ -702,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn source_runtime_exposes_the_v2_cuda_and_relocation_policy() {
+    fn source_runtime_exposes_the_v3_cuda_driver_and_relocation_policy() {
         let release = GitHubRelease {
             id: 1,
             tag_name: "b12345".to_owned(),
@@ -734,6 +741,14 @@ mod tests {
             plan.prerequisites.minimum_cuda_version.as_deref(),
             Some(CUDA_TOOLKIT_FLOOR)
         );
+        assert_eq!(
+            plan.prerequisites.maximum_cuda_version_exclusive.as_deref(),
+            Some(CUDA_TOOLKIT_CEILING_EXCLUSIVE)
+        );
+        assert_eq!(
+            runtime.requirements.minimum_nvidia_driver.as_deref(),
+            Some(NVIDIA_DRIVER_FLOOR)
+        );
         assert_eq!(plan.recipe.accelerator_target, ACCELERATOR_TARGET);
         assert!(
             plan.recipe
@@ -762,6 +777,7 @@ mod tests {
     fn fixed_cuda_policy_is_conservative_for_observed_devices() {
         let requirements = RuntimeRequirements {
             requires_nvidia_gpu: true,
+            minimum_nvidia_driver: Some(NVIDIA_DRIVER_FLOOR.to_owned()),
             supported_cuda_compute_capabilities: vec![
                 ComputeCapability::new(7, 5),
                 ComputeCapability::new(8, 0),
@@ -772,7 +788,7 @@ mod tests {
             ],
             ..RuntimeRequirements::default()
         };
-        let host = |compute_capability| HostCapabilities {
+        let host = |compute_capability, driver_version: Option<&str>| HostCapabilities {
             platform: "linux".to_owned(),
             architecture: "x86_64".to_owned(),
             accelerators: vec![AcceleratorDevice {
@@ -780,7 +796,7 @@ mod tests {
                 stable_id: Some("GPU-fixture".to_owned()),
                 name: Some("NVIDIA fixture".to_owned()),
                 vram_bytes: None,
-                driver_version: None,
+                driver_version: driver_version.map(ToOwned::to_owned),
                 compute_capability,
             }],
             nvidia_gpu_absence_confirmed: false,
@@ -794,7 +810,10 @@ mod tests {
                 "x86_64",
                 "cuda",
                 &requirements,
-                &host(Some(ComputeCapability::new(12, 0))),
+                &host(
+                    Some(ComputeCapability::new(12, 0)),
+                    Some(NVIDIA_DRIVER_FLOOR),
+                ),
             ),
             RuntimeCompatibility::Recommended
         );
@@ -804,12 +823,41 @@ mod tests {
                 "x86_64",
                 "cuda",
                 &requirements,
-                &host(Some(ComputeCapability::new(8, 7))),
+                &host(
+                    Some(ComputeCapability::new(8, 7)),
+                    Some(NVIDIA_DRIVER_FLOOR),
+                ),
             ),
             RuntimeCompatibility::Incompatible(_)
         ));
         assert!(matches!(
-            compatibility_for("linux", "x86_64", "cuda", &requirements, &host(None),),
+            compatibility_for(
+                "linux",
+                "x86_64",
+                "cuda",
+                &requirements,
+                &host(None, Some(NVIDIA_DRIVER_FLOOR)),
+            ),
+            RuntimeCompatibility::NeedsAttention(_)
+        ));
+        assert!(matches!(
+            compatibility_for(
+                "linux",
+                "x86_64",
+                "cuda",
+                &requirements,
+                &host(Some(ComputeCapability::new(12, 0)), Some("525.60.12")),
+            ),
+            RuntimeCompatibility::Incompatible(_)
+        ));
+        assert!(matches!(
+            compatibility_for(
+                "linux",
+                "x86_64",
+                "cuda",
+                &requirements,
+                &host(Some(ComputeCapability::new(12, 0)), None),
+            ),
             RuntimeCompatibility::NeedsAttention(_)
         ));
 

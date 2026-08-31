@@ -197,6 +197,7 @@ fn source_runtime(
             prerequisites: RuntimeSourceBuildPrerequisites {
                 minimum_cmake_version: "3.28".to_owned(),
                 minimum_cuda_version: Some("13.1".to_owned()),
+                maximum_cuda_version_exclusive: None,
                 requires_ninja: true,
                 requires_cpp20_compiler: true,
                 requires_make: false,

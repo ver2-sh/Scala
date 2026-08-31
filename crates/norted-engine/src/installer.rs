@@ -12,8 +12,9 @@ use norted_core::{
     AvailableRuntime, InstalledRuntime, RUNTIME_MANIFEST_SCHEMA_VERSION, RuntimeAcquisitionMethod,
     RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeCompatibility, RuntimeManifest,
     RuntimeOperationPhase, RuntimeOperationProgress, RuntimeProbeObservation,
-    RuntimeSourceBuildPlan, RuntimeSourceBuildProvenance, RuntimeSourceBuildSystem,
-    RuntimeSourceBuildToolchain, is_safe_relative_path,
+    RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites, RuntimeSourceBuildProvenance,
+    RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem, RuntimeSourceBuildToolchain,
+    is_safe_relative_path,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -70,6 +71,21 @@ pub struct RuntimeInstaller {
     github: GitHubReleaseClient,
     authorities: BTreeMap<String, RuntimeProviderAuthority>,
     progress: broadcast::Sender<RuntimeOperationProgress>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct SourceBuildPrerequisiteEvaluationKey {
+    recipe: RuntimeSourceBuildRecipe,
+    prerequisites: RuntimeSourceBuildPrerequisites,
+}
+
+impl SourceBuildPrerequisiteEvaluationKey {
+    pub(crate) fn from_plan(plan: &RuntimeSourceBuildPlan) -> Self {
+        Self {
+            recipe: plan.recipe.clone(),
+            prerequisites: plan.prerequisites.clone(),
+        }
+    }
 }
 
 impl RuntimeInstaller {
@@ -1067,6 +1083,9 @@ async fn check_source_build_prerequisites(
     if let Some(minimum) = &plan.prerequisites.minimum_cuda_version {
         require_minimum_version("CUDA Toolkit", &nvcc_version, minimum)?;
     }
+    if let Some(maximum) = &plan.prerequisites.maximum_cuda_version_exclusive {
+        require_version_below("CUDA Toolkit", &nvcc_version, maximum)?;
+    }
     verify_explicit_cuda_architectures(nvcc_program, &plan.recipe.cmake_configuration_arguments)
         .await?;
 
@@ -1648,6 +1667,21 @@ fn require_minimum_version(
     if observed_parts.is_empty() || minimum_parts.is_empty() || observed_parts < minimum_parts {
         return Err(RuntimeInstallError::Prerequisite(format!(
             "{name} >= {minimum} is required; observed {observed}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_version_below(
+    name: &str,
+    observed: &str,
+    maximum_exclusive: &str,
+) -> Result<(), RuntimeInstallError> {
+    let observed_parts = numeric_version(observed);
+    let maximum_parts = numeric_version(maximum_exclusive);
+    if observed_parts.is_empty() || maximum_parts.is_empty() || observed_parts >= maximum_parts {
+        return Err(RuntimeInstallError::Prerequisite(format!(
+            "{name} < {maximum_exclusive} is required; observed {observed}"
         )));
     }
     Ok(())
@@ -2279,21 +2313,25 @@ fn unix_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::Path;
     use std::time::Duration;
 
-    use norted_core::{AppPaths, RuntimeArchiveFormat, RuntimeSourceBuildSystem};
+    use norted_core::{
+        AppPaths, RuntimeArchiveFormat, RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites,
+        RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem, RuntimeSourceSnapshot,
+    };
     use sha2::{Digest, Sha256};
     use tokio::sync::oneshot;
 
     use crate::store::RuntimeStore;
 
     use super::{
-        RuntimeInstallError, extract_archive, hex_digest, inspect_build_dependency_contract,
-        require_cuda_compiler_targets, required_cuda_compiler_targets, run_owned_staging_operation,
-        run_source_command, validate_relative_link_target, verify_package_digest,
-        verify_source_checkout,
+        RuntimeInstallError, SourceBuildPrerequisiteEvaluationKey, extract_archive, hex_digest,
+        inspect_build_dependency_contract, require_cuda_compiler_targets, require_version_below,
+        required_cuda_compiler_targets, run_owned_staging_operation, run_source_command,
+        validate_relative_link_target, verify_package_digest, verify_source_checkout,
     };
 
     #[test]
@@ -2328,6 +2366,64 @@ mod tests {
             "-DCMAKE_CUDA_ARCHITECTURES=120a-real".to_owned(),
         ];
         assert!(required_cuda_compiler_targets(&duplicate).is_err());
+    }
+
+    #[test]
+    fn exclusive_cuda_toolkit_ceiling_rejects_the_next_major() {
+        require_version_below("CUDA Toolkit", "12.8", "13.0").expect("CUDA 12.8 is admitted");
+        require_version_below("CUDA Toolkit", "12.9.1", "13.0")
+            .expect("all CUDA 12.x releases are admitted");
+        assert!(require_version_below("CUDA Toolkit", "13.0", "13.0").is_err());
+        assert!(require_version_below("CUDA Toolkit", "14.0", "13.0").is_err());
+    }
+
+    #[test]
+    fn prerequisite_evaluation_key_includes_explicit_cuda_architectures() {
+        let plan = RuntimeSourceBuildPlan {
+            source: RuntimeSourceSnapshot {
+                repository: "owner/repository".to_owned(),
+                repository_url: "https://github.com/owner/repository.git".to_owned(),
+                source_branch: "main".to_owned(),
+                commit_sha: "a".repeat(40),
+                tree_sha: "b".repeat(40),
+                commit_timestamp_unix: 1,
+                source_provider: "fixture".to_owned(),
+            },
+            recipe: RuntimeSourceBuildRecipe {
+                recipe_version: "fixture-v1".to_owned(),
+                build_system: RuntimeSourceBuildSystem::Cmake,
+                build_definition_sha256: None,
+                cmake_configuration_arguments: vec![
+                    "-DCMAKE_CUDA_ARCHITECTURES=75-real".to_owned(),
+                ],
+                build_target: "server".to_owned(),
+                entrypoint: "build/server".into(),
+                accelerator_target: "sm_75".to_owned(),
+                rejected_build_environment: Vec::new(),
+            },
+            prerequisites: RuntimeSourceBuildPrerequisites {
+                minimum_cmake_version: "3.18".to_owned(),
+                minimum_cuda_version: Some("12.8".to_owned()),
+                maximum_cuda_version_exclusive: Some("13.0".to_owned()),
+                requires_ninja: true,
+                requires_cpp20_compiler: false,
+                requires_make: false,
+                minimum_cpp_standard: Some(17),
+                cpp_compiler: None,
+                cuda_compiler: None,
+                requires_pkg_config: false,
+                pkg_config_modules: BTreeMap::new(),
+            },
+        };
+        let mut different_targets = plan.clone();
+        different_targets.recipe.cmake_configuration_arguments =
+            vec!["-DCMAKE_CUDA_ARCHITECTURES=120a-real".to_owned()];
+
+        assert_eq!(plan.prerequisites, different_targets.prerequisites);
+        assert_ne!(
+            SourceBuildPrerequisiteEvaluationKey::from_plan(&plan),
+            SourceBuildPrerequisiteEvaluationKey::from_plan(&different_targets)
+        );
     }
 
     #[tokio::test]

@@ -18,7 +18,9 @@ use crate::catalog::{
     CatalogError, GitHubComparisonStatus, RuntimeCatalog, RuntimeCatalogEntry,
     RuntimeCatalogProvider, RuntimeCatalogSnapshot, compatibility_for, detect_host_capabilities,
 };
-use crate::installer::{RuntimeInstallError, RuntimeInstaller};
+use crate::installer::{
+    RuntimeInstallError, RuntimeInstaller, SourceBuildPrerequisiteEvaluationKey,
+};
 use crate::store::{RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreSnapshot};
 use crate::{
     CompatibilityDecision, EngineError, EngineRegistry, InstallationState, ModelServingCapabilities,
@@ -358,11 +360,8 @@ impl RuntimePackManager {
             fetched_at_unix,
         } = self.catalog.search(query, &host, force_refresh).await;
         let mut preferences = std::collections::BTreeMap::new();
-        let mut source_prerequisite_results = Vec::<(
-            norted_core::RuntimeSourceBuildSystem,
-            norted_core::RuntimeSourceBuildPrerequisites,
-            RuntimeCompatibility,
-        )>::new();
+        let mut source_prerequisite_results =
+            Vec::<(SourceBuildPrerequisiteEvaluationKey, RuntimeCompatibility)>::new();
         for entry in &mut entries {
             entry.compatibility = match self.registry.get(&entry.available.identity.engine_id) {
                 Some(adapter) => match adapter.runtime_management_compatibility() {
@@ -407,19 +406,15 @@ impl RuntimePackManager {
             if !matches!(entry.compatibility, RuntimeCompatibility::Incompatible(_))
                 && let Some(plan) = entry.available.source_build()
             {
-                let compatibility = if let Some((_, _, compatibility)) = source_prerequisite_results
+                let prerequisite_key = SourceBuildPrerequisiteEvaluationKey::from_plan(plan);
+                let compatibility = if let Some((_, compatibility)) = source_prerequisite_results
                     .iter()
-                    .find(|(system, prerequisites, _)| {
-                        *system == plan.recipe.build_system && prerequisites == &plan.prerequisites
-                    }) {
+                    .find(|(key, _)| key == &prerequisite_key)
+                {
                     compatibility.clone()
                 } else {
                     let compatibility = self.installer.source_build_compatibility(plan).await;
-                    source_prerequisite_results.push((
-                        plan.recipe.build_system,
-                        plan.prerequisites.clone(),
-                        compatibility.clone(),
-                    ));
+                    source_prerequisite_results.push((prerequisite_key, compatibility.clone()));
                     compatibility
                 };
                 entry.compatibility =
@@ -974,6 +969,7 @@ impl RuntimePackManager {
                 continue;
             }
             let identity = &status.runtime.manifest.identity;
+            let adapter = self.registry.get(&identity.engine_id);
             let provider_error = catalog
                 .provider_errors
                 .iter()
@@ -989,7 +985,16 @@ impl RuntimePackManager {
                     .results
                     .iter()
                     .filter(|result| result.entry.compatibility.is_usable())
-                    .filter(|result| same_update_line(identity, &result.entry.available))
+                    .filter(|result| {
+                        same_update_line(identity, &result.entry.available, adapter.as_deref())
+                    })
+                    .filter(|result| {
+                        source_recipe_ordering(
+                            identity,
+                            &result.entry.available.identity,
+                            adapter.as_deref(),
+                        ) != Ordering::Less
+                    })
                     .collect::<Vec<_>>();
                 let channel_available = update_line.iter().any(|result| {
                     update_channel_matches(&preference, None, &result.entry.available)
@@ -1006,6 +1011,7 @@ impl RuntimePackManager {
                             identity,
                             &left.entry.available,
                             &right.entry.available,
+                            adapter.as_deref(),
                         )
                     });
                 let state = if let Some(error) = provider_error {
@@ -1044,6 +1050,11 @@ impl RuntimePackManager {
                                     &candidate.entry.available.runtime_id,
                                     &candidate.entry.available.identity.version,
                                     &comparison,
+                                    source_recipe_ordering(
+                                        identity,
+                                        &candidate.entry.available.identity,
+                                        adapter.as_deref(),
+                                    ),
                                 ),
                                 Err(error) => RuntimeUpdateState::ProviderError(error.to_string()),
                             }
@@ -1103,7 +1114,9 @@ impl RuntimePackManager {
                 .results
                 .iter()
                 .filter(|result| result.entry.compatibility.is_usable())
-                .filter(|result| same_update_line(identity, &result.entry.available))
+                .filter(|result| {
+                    same_update_line(identity, &result.entry.available, adapter.as_deref())
+                })
                 .collect::<Vec<_>>();
             let channel_available = update_line.iter().any(|result| {
                 update_channel_matches(&preference, published.as_ref(), &result.entry.available)
@@ -1112,7 +1125,9 @@ impl RuntimePackManager {
                 .results
                 .iter()
                 .filter(|result| result.entry.compatibility.is_usable())
-                .filter(|result| same_update_line(identity, &result.entry.available))
+                .filter(|result| {
+                    same_update_line(identity, &result.entry.available, adapter.as_deref())
+                })
                 .filter(|result| {
                     update_channel_matches(&preference, published.as_ref(), &result.entry.available)
                 })
@@ -1612,16 +1627,53 @@ fn acquisition_rank(runtime: &InstalledRuntime) -> u8 {
     }
 }
 
-fn same_update_line(identity: &RuntimeIdentity, candidate: &AvailableRuntime) -> bool {
+fn same_update_line(
+    identity: &RuntimeIdentity,
+    candidate: &AvailableRuntime,
+    adapter: Option<&dyn crate::EngineAdapter>,
+) -> bool {
     let candidate = &candidate.identity;
+    let installed_variant = adapter.map_or_else(
+        || crate::RuntimeVariantUpdateIdentity::exact(identity),
+        |adapter| adapter.runtime_variant_update_identity(identity),
+    );
+    let candidate_variant = adapter.map_or_else(
+        || crate::RuntimeVariantUpdateIdentity::exact(candidate),
+        |adapter| adapter.runtime_variant_update_identity(candidate),
+    );
     candidate.engine_id == identity.engine_id
         && (candidate.package_family == identity.package_family
             || q27_logical_update_family(identity, candidate))
         && candidate.platform == identity.platform
         && candidate.architecture == identity.architecture
         && candidate.accelerator == identity.accelerator
-        && candidate.variant == identity.variant
+        && candidate_variant.functional_variant == installed_variant.functional_variant
         && candidate.package.provider_id == identity.package.provider_id
+}
+
+fn source_recipe_ordering(
+    installed: &RuntimeIdentity,
+    candidate: &RuntimeIdentity,
+    adapter: Option<&dyn crate::EngineAdapter>,
+) -> Ordering {
+    let installed = adapter.map_or_else(
+        || crate::RuntimeVariantUpdateIdentity::exact(installed),
+        |adapter| adapter.runtime_variant_update_identity(installed),
+    );
+    let candidate = adapter.map_or_else(
+        || crate::RuntimeVariantUpdateIdentity::exact(candidate),
+        |adapter| adapter.runtime_variant_update_identity(candidate),
+    );
+    if installed.functional_variant != candidate.functional_variant {
+        return Ordering::Equal;
+    }
+    match (
+        candidate.source_recipe_generation,
+        installed.source_recipe_generation,
+    ) {
+        (Some(candidate), Some(installed)) => candidate.cmp(&installed),
+        _ => Ordering::Equal,
+    }
 }
 
 fn q27_logical_update_family(left: &RuntimeIdentity, right: &RuntimeIdentity) -> bool {
@@ -1656,6 +1708,7 @@ fn compare_source_update_candidates(
     installed: &RuntimeIdentity,
     left: &AvailableRuntime,
     right: &AvailableRuntime,
+    adapter: Option<&dyn crate::EngineAdapter>,
 ) -> Ordering {
     if q27_semantic_release_identity(installed)
         && q27_semantic_release_identity(&left.identity)
@@ -1664,7 +1717,8 @@ fn compare_source_update_candidates(
         return compare_versions(&left.identity.version, &right.identity.version)
             .then_with(|| left.published_at_unix.cmp(&right.published_at_unix));
     }
-    left.published_at_unix.cmp(&right.published_at_unix)
+    source_recipe_ordering(&right.identity, &left.identity, adapter)
+        .then_with(|| left.published_at_unix.cmp(&right.published_at_unix))
 }
 
 fn semantic_release_update_state(
@@ -1699,12 +1753,25 @@ fn source_history_update_state(
     candidate_runtime_id: &RuntimeId,
     candidate_version: &str,
     comparison: &crate::GitHubCompare,
+    recipe_ordering: Ordering,
 ) -> RuntimeUpdateState {
     match comparison.status {
         GitHubComparisonStatus::Identical
             if comparison.ahead_by == 0 && comparison.behind_by == 0 =>
         {
-            if matches!(preference, RuntimeUpdatePreference::Pinned) {
+            if recipe_ordering == Ordering::Greater {
+                if matches!(preference, RuntimeUpdatePreference::Pinned) {
+                    RuntimeUpdateState::Pinned {
+                        newer_runtime_id: Some(candidate_runtime_id.clone()),
+                        newer_version: Some(candidate_version.to_owned()),
+                    }
+                } else {
+                    RuntimeUpdateState::NewerCompatibleVersion {
+                        runtime_id: candidate_runtime_id.clone(),
+                        version: candidate_version.to_owned(),
+                    }
+                }
+            } else if matches!(preference, RuntimeUpdatePreference::Pinned) {
                 RuntimeUpdateState::Pinned {
                     newer_runtime_id: None,
                     newer_version: None,
@@ -1827,13 +1894,14 @@ mod tests {
 
     use super::{
         compare_installed_recency, same_update_line, semantic_release_update_state,
-        source_history_update_state,
+        source_history_update_state, source_recipe_ordering,
     };
     use crate::{
         EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError,
         EngineIdentity, EngineProbe, EngineRegistry, GitHubCompare, GitHubComparisonStatus,
         InferenceOutput, InferenceRequest, InferenceStream, InstallationState, LaunchRequest,
-        LaunchSpec, NativeOption, ProcessDescriptor, RuntimeCatalogProvider, UpdateState,
+        LaunchSpec, NativeOption, ProcessDescriptor, RuntimeCatalogProvider,
+        RuntimeVariantUpdateIdentity, UpdateState,
     };
 
     struct BoundSchemaAdapter {
@@ -1855,6 +1923,25 @@ mod tests {
                 artifact_formats: vec![ArtifactFormat::Gguf],
                 ..EngineCapabilities::default()
             }
+        }
+
+        fn runtime_variant_update_identity(
+            &self,
+            identity: &RuntimeIdentity,
+        ) -> RuntimeVariantUpdateIdentity {
+            let generation = match identity.variant.as_str() {
+                "recipe-v1" => Some(1),
+                "recipe-v2" => Some(2),
+                "recipe-v3" => Some(3),
+                _ => None,
+            };
+            generation.map_or_else(
+                || RuntimeVariantUpdateIdentity::exact(identity),
+                |source_recipe_generation| RuntimeVariantUpdateIdentity {
+                    functional_variant: "fixture-functional-variant".to_owned(),
+                    source_recipe_generation: Some(source_recipe_generation),
+                },
+            )
         }
 
         fn native_options(&self) -> Vec<NativeOption> {
@@ -2024,6 +2111,7 @@ mod tests {
                     ahead_by: 0,
                     behind_by: 0,
                 },
+                std::cmp::Ordering::Equal,
             ),
             RuntimeUpdateState::Current
         );
@@ -2037,6 +2125,7 @@ mod tests {
                     ahead_by: 3,
                     behind_by: 0,
                 },
+                std::cmp::Ordering::Equal,
             ),
             RuntimeUpdateState::NewerCompatibleVersion { runtime_id, .. }
                 if runtime_id == candidate
@@ -2055,6 +2144,7 @@ mod tests {
                         ahead_by: 0,
                         behind_by: 1,
                     },
+                    std::cmp::Ordering::Equal,
                 ),
                 RuntimeUpdateState::ProviderError(_)
             ));
@@ -2074,11 +2164,78 @@ mod tests {
                     ahead_by: 1,
                     behind_by: 0,
                 },
+                std::cmp::Ordering::Equal,
             ),
             RuntimeUpdateState::Pinned {
                 newer_runtime_id: Some(runtime_id),
                 ..
             } if runtime_id == candidate
+        ));
+    }
+
+    #[test]
+    fn newer_recipe_generation_updates_an_identical_source_revision() {
+        let candidate = RuntimeId::new("llama-candidate").expect("runtime ID");
+        assert!(matches!(
+            source_history_update_state(
+                &RuntimeUpdatePreference::Latest,
+                &candidate,
+                "b12345",
+                &GitHubCompare {
+                    status: GitHubComparisonStatus::Identical,
+                    ahead_by: 0,
+                    behind_by: 0,
+                },
+                std::cmp::Ordering::Greater,
+            ),
+            RuntimeUpdateState::NewerCompatibleVersion { runtime_id, .. }
+                if runtime_id == candidate
+        ));
+        assert!(matches!(
+            source_history_update_state(
+                &RuntimeUpdatePreference::Pinned,
+                &candidate,
+                "b12345",
+                &GitHubCompare {
+                    status: GitHubComparisonStatus::Identical,
+                    ahead_by: 0,
+                    behind_by: 0,
+                },
+                std::cmp::Ordering::Greater,
+            ),
+            RuntimeUpdateState::Pinned {
+                newer_runtime_id: Some(runtime_id),
+                ..
+            } if runtime_id == candidate
+        ));
+    }
+
+    #[test]
+    fn recipe_update_lines_are_explicit_and_never_offer_a_downgrade() {
+        let adapter = BoundSchemaAdapter { id: "fixture" };
+        let installed_v1 = q27_identity("1.0.0", "recipe-v1", "fixture-family");
+        let installed_v3 = q27_identity("1.0.0", "recipe-v3", "fixture-family");
+        let candidate_v2 = available_fixture(q27_identity("1.0.0", "recipe-v2", "fixture-family"));
+        let candidate_v3 = available_fixture(installed_v3.clone());
+        let unknown_v4 = available_fixture(q27_identity("1.0.0", "recipe-v4", "fixture-family"));
+
+        assert!(same_update_line(
+            &installed_v1,
+            &candidate_v3,
+            Some(&adapter)
+        ));
+        assert_eq!(
+            source_recipe_ordering(&installed_v1, &candidate_v3.identity, Some(&adapter)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            source_recipe_ordering(&installed_v3, &candidate_v2.identity, Some(&adapter)),
+            std::cmp::Ordering::Less
+        );
+        assert!(!same_update_line(
+            &installed_v3,
+            &unknown_v4,
+            Some(&adapter)
         ));
     }
 
@@ -2090,7 +2247,7 @@ mod tests {
             "w12",
             "q27-official-source-q27-upstream-make-v2-4770e05",
         ));
-        assert!(same_update_line(&installed_binary, &source));
+        assert!(same_update_line(&installed_binary, &source, None));
         assert!(matches!(
             semantic_release_update_state(
                 &RuntimeUpdatePreference::Latest,
@@ -2116,7 +2273,7 @@ mod tests {
             "q27-official-source-q27-upstream-make-v2-4770e05",
         );
         let newer_binary = available_fixture(q27_identity("0.11.0", "w12", "q27-official-release"));
-        assert!(same_update_line(&installed_source, &newer_binary));
+        assert!(same_update_line(&installed_source, &newer_binary, None));
         assert!(matches!(
             semantic_release_update_state(
                 &RuntimeUpdatePreference::Stable,
@@ -2132,12 +2289,12 @@ mod tests {
             "w8",
             "q27-official-source-q27-upstream-make-v2-4770e05",
         ));
-        assert!(!same_update_line(&installed_binary, &w8));
+        assert!(!same_update_line(&installed_binary, &w8, None));
 
         let mut other_provider = source.clone();
         other_provider.identity.package.provider_id = "another-provider".to_owned();
         other_provider.runtime_id = RuntimeId::from_identity(&other_provider.identity);
-        assert!(!same_update_line(&installed_binary, &other_provider));
+        assert!(!same_update_line(&installed_binary, &other_provider, None));
     }
 
     #[test]

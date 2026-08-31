@@ -21,8 +21,9 @@ use futures_util::{StreamExt, stream};
 use norted_core::{
     AcquisitionMethod, ArtifactFormat, AvailableRuntime, EngineConfig, EngineInstallation,
     EngineRevision, GpuOffload, HostCapabilities, InstalledRuntime, ModelArtifact,
-    RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId, RuntimeProbeObservation,
-    SettingDefinition, SettingId, SettingKind, SettingScope, SettingValue, SettingsSchema,
+    RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId, RuntimeIdentity,
+    RuntimeProbeObservation, SettingDefinition, SettingId, SettingKind, SettingScope, SettingValue,
+    SettingsSchema,
 };
 use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CompatibilityDecision,
@@ -30,10 +31,10 @@ use norted_engine::{
     EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceEvent, InferenceFinishReason,
     InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
     InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter,
-    NativeOption, OptionValueKind, PreparedModelInput, ProcessDescriptor, UpdateState,
-    capture_command, common_setting_definitions, prepare_norted_package_input,
-    prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
-    revalidate_norted_package_before_launch_with_progress,
+    NativeOption, OptionValueKind, PreparedModelInput, ProcessDescriptor,
+    RuntimeVariantUpdateIdentity, UpdateState, capture_command, common_setting_definitions,
+    prepare_norted_package_input, prepare_norted_package_input_with_progress,
+    revalidate_norted_package_before_launch, revalidate_norted_package_before_launch_with_progress,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -446,6 +447,37 @@ impl EngineAdapter for LlamaCppAdapter {
             artifact_formats: vec![ArtifactFormat::Gguf],
             api: vec![ApiCapability::ChatCompletions],
             features: vec![EngineFeature::TextGeneration],
+        }
+    }
+
+    fn runtime_variant_update_identity(
+        &self,
+        identity: &RuntimeIdentity,
+    ) -> RuntimeVariantUpdateIdentity {
+        let is_managed_linux_cuda = identity.engine_id == ENGINE_ID
+            && identity.package_family == "llama-cpp-managed-source"
+            && identity.platform == "linux"
+            && identity.architecture == "x86_64"
+            && identity.accelerator == "cuda"
+            && identity.package.provider_id == LLAMA_CPP_SOURCE_RUNTIME_PROVIDER_ID
+            && identity.package.repository.as_deref() == Some("ggml-org/llama.cpp");
+        let managed_generation = if is_managed_linux_cuda {
+            match identity.variant.as_str() {
+                "managed-portable-v1" => Some(1),
+                "managed-portable-v2" => Some(2),
+                "managed-portable-v3" => Some(3),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(generation) = managed_generation {
+            RuntimeVariantUpdateIdentity {
+                functional_variant: "managed-linux-x86_64-cuda-portable".to_owned(),
+                source_recipe_generation: Some(generation),
+            }
+        } else {
+            RuntimeVariantUpdateIdentity::exact(identity)
         }
     }
 
@@ -2044,6 +2076,66 @@ fn unix_timestamp() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod recipe_update_tests {
+    use norted_core::{RuntimeIdentity, RuntimePackageIdentity};
+
+    use super::*;
+
+    fn identity(variant: &str, accelerator: &str) -> RuntimeIdentity {
+        RuntimeIdentity {
+            engine_id: ENGINE_ID.to_owned(),
+            package_family: "llama-cpp-managed-source".to_owned(),
+            version: "b12345".to_owned(),
+            upstream_revision: Some("a".repeat(40)),
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            accelerator: accelerator.to_owned(),
+            variant: variant.to_owned(),
+            package: RuntimePackageIdentity {
+                provider_id: LLAMA_CPP_SOURCE_RUNTIME_PROVIDER_ID.to_owned(),
+                repository: Some("ggml-org/llama.cpp".to_owned()),
+                release_tag: Some("b12345".to_owned()),
+                asset_id: None,
+                asset_name: None,
+                additional_assets: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn managed_cuda_recipe_generations_have_explicit_update_identity() {
+        let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
+        for (variant, generation) in [
+            ("managed-portable-v1", 1),
+            ("managed-portable-v2", 2),
+            ("managed-portable-v3", 3),
+        ] {
+            assert_eq!(
+                adapter.runtime_variant_update_identity(&identity(variant, "cuda")),
+                RuntimeVariantUpdateIdentity {
+                    functional_variant: "managed-linux-x86_64-cuda-portable".to_owned(),
+                    source_recipe_generation: Some(generation),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_generations_and_other_accelerators_do_not_cross_update() {
+        let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
+        for runtime in [
+            identity("managed-portable-v4", "cuda"),
+            identity("managed-portable-v3", "vulkan"),
+        ] {
+            assert_eq!(
+                adapter.runtime_variant_update_identity(&runtime),
+                RuntimeVariantUpdateIdentity::exact(&runtime)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
