@@ -157,7 +157,13 @@ pub fn render_command_bar(
 }
 
 pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, glyphs: &Glyphs) {
-    let line = if app.overlay == Some(crate::app::Overlay::ModelRuntime) {
+    let line = if app.overlay == Some(crate::app::Overlay::ProfileEngine) {
+        vec![
+            hint(glyphs.up_down, "select engine", theme),
+            hint("Enter", "create", theme),
+            hint("Esc", "cancel", theme),
+        ]
+    } else if app.overlay == Some(crate::app::Overlay::ModelRuntime) {
         vec![
             hint(glyphs.up_down, "select", theme),
             hint("Enter", "apply / search", theme),
@@ -195,13 +201,21 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
             ],
             (FocusArea::Content, crate::app::Screen::Models) => vec![
                 hint(glyphs.up_down, "select", theme),
-                hint("Enter", "load", theme),
-                hint("u", "unload", theme),
+                hint("Enter/c", "create profile", theme),
+                hint("u", "unload active", theme),
                 hint("v", "runtime override", theme),
-                hint("p", "load settings", theme),
                 hint("wheel", "scroll", theme),
                 hint("Tab", "focus", theme),
                 hint("/", "commands", theme),
+            ],
+            (FocusArea::Content, crate::app::Screen::ModelProfiles) => vec![
+                hint("Left/Right", "profile", theme),
+                hint(glyphs.up_down, "setting", theme),
+                hint("Enter", "edit/cycle", theme),
+                hint("Delete", "inherit", theme),
+                hint("l", "load profile", theme),
+                hint("u", "unload active", theme),
+                hint("e", "change engine", theme),
             ],
             (FocusArea::Content, crate::app::Screen::Logs) => vec![
                 hint(glyphs.up_down, "scroll", theme),
@@ -226,8 +240,6 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
                 hint(glyphs.up_down, "setting", theme),
                 hint("Enter", "edit/cycle", theme),
                 hint("Delete", "inherit", theme),
-                hint("n", "new profile", theme),
-                hint("d", "delete profile", theme),
             ],
             _ => vec![
                 hint("Tab", "change focus", theme),

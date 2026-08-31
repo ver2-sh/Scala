@@ -638,6 +638,11 @@ impl EngineAdapter for NinferAdapter {
         if let CompatibilityDecision::Unsupported { reason } = self.runtime_compatibility(runtime) {
             return RuntimeCompatibility::Incompatible(reason);
         }
+        if let Some(settings) = settings
+            && let Err(reason) = settings::validate_model_settings(settings, model)
+        {
+            return RuntimeCompatibility::Incompatible(reason);
+        }
         let native = native_compatibility(
             &runtime.manifest.supported_native_identities,
             model
@@ -686,6 +691,11 @@ impl EngineAdapter for NinferAdapter {
         }
         if let CompatibilityDecision::Unsupported { reason } =
             self.available_runtime_compatibility(runtime)
+        {
+            return RuntimeCompatibility::Incompatible(reason);
+        }
+        if let Some(settings) = settings
+            && let Err(reason) = settings::validate_model_settings(settings, model)
         {
             return RuntimeCompatibility::Incompatible(reason);
         }
@@ -845,10 +855,19 @@ impl EngineAdapter for NinferAdapter {
         settings::definitions()
     }
 
+    fn model_setting_definitions(
+        &self,
+        model: &ModelArtifact,
+    ) -> Result<Vec<norted_core::SettingDefinition>, EngineError> {
+        let mut definitions = settings::definitions();
+        settings::apply_model_capabilities(&mut definitions, model);
+        Ok(definitions)
+    }
+
     async fn settings_schema(
         &self,
         runtime: &InstalledRuntime,
-        _model: &ModelArtifact,
+        model: &ModelArtifact,
         _host: &HostCapabilities,
     ) -> Result<norted_core::SettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
@@ -861,7 +880,7 @@ impl EngineAdapter for NinferAdapter {
             .ok_or_else(|| {
                 EngineError::Operation("NInfer help observation was not cached".to_owned())
             })?;
-        let mut definitions = settings::definitions();
+        let mut definitions = self.model_setting_definitions(model)?;
         settings::apply_runtime_bounds(&mut definitions);
         for definition in &mut definitions {
             if definition.id.as_str() == "reasoning_effort" {
@@ -1621,7 +1640,7 @@ async fn read_and_validate_startup_log(
     }
     if startup.server.public_model_id != pending.public_model_id.as_str() {
         return Err(EngineError::Operation(
-            "NInfer startup public model ID differs from the Norted model ID".to_owned(),
+            "NInfer startup public model ID differs from the Model Profile/public alias".to_owned(),
         ));
     }
     if startup.artifact.target != pending.native_identity.model_id

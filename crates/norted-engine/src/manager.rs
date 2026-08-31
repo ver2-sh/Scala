@@ -1076,8 +1076,9 @@ impl RuntimeManager {
                 Ok(observation) => observation,
                 Err(error) => {
                     cleanup_pending_launch_files(&launch_attempts).await;
-                    let detail =
-                        format!("engine startup did not prove the selected model policy: {error}");
+                    let detail = format!(
+                        "engine startup did not prove the effective settings/startup contract: {error}"
+                    );
                     let retained = self.terminate_or_retain(&process).await;
                     adapter.clear_launch_state(Some(&endpoint)).await;
                     self.fail_loading(generation, detail.clone(), retained.as_ref())

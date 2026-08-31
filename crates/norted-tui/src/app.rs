@@ -4,11 +4,11 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use norted_core::{
-    AppEvent, AppSnapshot, ArtifactFormat, LogLevel, ModelArtifact, ModelId, ModelProfile,
-    ModelProfileId, ModelProfilesState, PublicAuthStatus, RegistryState, ResolvedSettings,
-    RuntimeCompatibility, RuntimeId, RuntimeOperationPhase, RuntimeOperationProgress,
-    RuntimeUpdateState, SettingDefinition, SettingId, SettingScope, SettingValue, SettingsSchema,
-    SettingsState,
+    AppEvent, AppSnapshot, ArtifactFormat, EngineId, LogLevel, ModelArtifact, ModelId,
+    ModelProfile, ModelProfileId, ModelProfilesState, PublicAuthStatus, RegistryState,
+    ResolvedSettings, RuntimeCompatibility, RuntimeId, RuntimeOperationPhase,
+    RuntimeOperationProgress, RuntimeUpdateState, SettingDefinition, SettingId, SettingScope,
+    SettingValue, SettingsSchema, SettingsState,
 };
 use norted_engine::{
     BackendLifecycle, BackendLoadProgress, ControlStatus, RuntimeListSnapshot,
@@ -62,6 +62,7 @@ pub enum Overlay {
     Help,
     RuntimeSearch,
     ModelRuntime,
+    ProfileEngine,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -177,6 +178,7 @@ pub enum SettingsAction {
         scope: SettingsScope,
         id: SettingId,
         value: SettingValue,
+        model: Option<Box<ModelArtifact>>,
     },
     Unset {
         scope: SettingsScope,
@@ -186,6 +188,7 @@ pub enum SettingsAction {
         id: ModelProfileId,
         display_name: String,
         model: Box<ModelArtifact>,
+        engine_id: Option<EngineId>,
     },
     DuplicateProfile {
         source: ModelProfileId,
@@ -210,18 +213,29 @@ pub enum SettingsAction {
 pub struct ModelSettingsInspection {
     pub state: SettingsState,
     pub profiles: ModelProfilesState,
-    pub runtime_id: RuntimeId,
+    pub runtime_id: Option<RuntimeId>,
     pub schema: SettingsSchema,
     pub resolved: ResolvedSettings,
+    pub validation_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileEngineSelection {
+    pub id: ModelProfileId,
+    pub display_name: String,
+    pub model: Box<ModelArtifact>,
+    pub engines: Vec<EngineId>,
+    pub selected: usize,
 }
 
 #[derive(Debug)]
 pub enum SettingsTaskResult {
     Loaded(Result<(SettingsState, ModelProfilesState), String>),
     Stored(Result<(SettingsState, ModelProfilesState), String>),
+    ChooseProfileEngine(ProfileEngineSelection),
     Inspected {
         model_id: ModelId,
-        result: Result<ModelSettingsInspection, String>,
+        result: Box<Result<ModelSettingsInspection, String>>,
     },
 }
 
@@ -309,6 +323,7 @@ pub struct App {
     pub settings_runtime_id: Option<RuntimeId>,
     pub settings_validation_error: Option<String>,
     pub settings_input: Option<SettingsInput>,
+    pub profile_engine_selection: Option<ProfileEngineSelection>,
     pub load_animation_frame: u32,
     focus_before_command: FocusArea,
     pending_control_action: Option<ControlAction>,
@@ -406,6 +421,7 @@ impl App {
             settings_runtime_id: None,
             settings_validation_error: None,
             settings_input: None,
+            profile_engine_selection: None,
             load_animation_frame: 0,
             focus_before_command: FocusArea::Navigation,
             pending_control_action: None,
@@ -444,6 +460,7 @@ impl App {
                 },
                 Overlay::RuntimeSearch => self.handle_runtime_search_key(key, layout),
                 Overlay::ModelRuntime => self.handle_model_runtime_key(key, layout),
+                Overlay::ProfileEngine => self.handle_profile_engine_key(key),
             };
         }
         if self.command_active {
@@ -509,16 +526,19 @@ impl App {
                 MouseEventKind::Down(MouseButton::Left) => match overlay {
                     Overlay::RuntimeSearch => self.handle_runtime_search_click(position, layout),
                     Overlay::ModelRuntime => self.handle_model_runtime_click(position, layout),
+                    Overlay::ProfileEngine => Update::None,
                     Overlay::Help => Update::None,
                 },
                 MouseEventKind::ScrollUp => match overlay {
                     Overlay::RuntimeSearch => self.scroll_runtime_search(-3, layout),
                     Overlay::ModelRuntime => self.scroll_model_runtime_picker(-3, layout),
+                    Overlay::ProfileEngine => Update::None,
                     Overlay::Help => Update::None,
                 },
                 MouseEventKind::ScrollDown => match overlay {
                     Overlay::RuntimeSearch => self.scroll_runtime_search(3, layout),
                     Overlay::ModelRuntime => self.scroll_model_runtime_picker(3, layout),
+                    Overlay::ProfileEngine => Update::None,
                     Overlay::Help => Update::None,
                 },
                 _ => Update::None,
@@ -729,6 +749,11 @@ impl App {
                     self.notice = Some(error);
                 }
             },
+            SettingsTaskResult::ChooseProfileEngine(selection) => {
+                self.profile_engine_selection = Some(selection);
+                self.overlay = Some(Overlay::ProfileEngine);
+                self.notice = Some("Choose the engine bound to this Model Profile".to_owned());
+            }
             SettingsTaskResult::Inspected { model_id, result } => {
                 if self
                     .selected_model_profile_value()
@@ -736,15 +761,15 @@ impl App {
                 {
                     return;
                 }
-                match result {
+                match *result {
                     Ok(inspection) => {
                         self.settings_state = Some(inspection.state);
                         self.model_profiles = Some(inspection.profiles);
                         self.settings_error = None;
-                        self.settings_runtime_id = Some(inspection.runtime_id);
+                        self.settings_runtime_id = inspection.runtime_id;
                         self.settings_schema = Some(inspection.schema);
                         self.settings_resolved = Some(inspection.resolved);
-                        self.settings_validation_error = None;
+                        self.settings_validation_error = inspection.validation_error;
                     }
                     Err(error) => {
                         self.settings_schema = None;
@@ -789,7 +814,7 @@ impl App {
         } else {
             &self.setting_definitions
         };
-        source
+        let mut definitions = source
             .iter()
             .filter(|definition| match &scope {
                 _ if self.screen == Screen::ModelProfiles => self
@@ -808,7 +833,13 @@ impl App {
                 Some(SettingsScope::ModelProfile(_)) => true,
                 None => false,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        definitions.sort_by(|left, right| {
+            left.category
+                .cmp(&right.category)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        definitions
     }
 
     pub fn settings_value_display(&self, id: &SettingId) -> (String, String, bool) {
@@ -1747,6 +1778,7 @@ impl App {
                         id,
                         display_name: input.text,
                         model: Box::new(model),
+                        engine_id: None,
                     })
                 }
                 Err(error) => {
@@ -1849,18 +1881,65 @@ impl App {
     }
 
     fn set_selected_setting(&mut self, id: SettingId, value: SettingValue) -> Update {
-        let scope = if self.screen == Screen::ModelProfiles {
+        let (scope, model) = if self.screen == Screen::ModelProfiles {
             let Some(profile) = self.selected_model_profile_value() else {
                 return Update::None;
             };
-            SettingsScope::ModelProfile(profile.id.clone())
+            (
+                SettingsScope::ModelProfile(profile.id.clone()),
+                self.selected_profile_model().cloned().map(Box::new),
+            )
         } else {
             let Some(scope) = self.selected_settings_scope() else {
                 return Update::None;
             };
-            scope
+            (scope, None)
         };
-        self.queue_settings_action(SettingsAction::Set { scope, id, value })
+        self.queue_settings_action(SettingsAction::Set {
+            scope,
+            id,
+            value,
+            model,
+        })
+    }
+
+    fn handle_profile_engine_key(&mut self, key: KeyEvent) -> Update {
+        let Some(selection) = self.profile_engine_selection.as_mut() else {
+            self.overlay = None;
+            return Update::Render;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.overlay = None;
+                self.profile_engine_selection = None;
+                self.notice = Some("Model Profile creation cancelled".to_owned());
+                Update::Render
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                selection.selected = selection.selected.saturating_sub(1);
+                Update::Render
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selection.selected =
+                    (selection.selected + 1).min(selection.engines.len().saturating_sub(1));
+                Update::Render
+            }
+            KeyCode::Enter => {
+                let Some(engine_id) = selection.engines.get(selection.selected).cloned() else {
+                    return Update::None;
+                };
+                let action = SettingsAction::CreateProfile {
+                    id: selection.id.clone(),
+                    display_name: selection.display_name.clone(),
+                    model: selection.model.clone(),
+                    engine_id: Some(engine_id),
+                };
+                self.overlay = None;
+                self.profile_engine_selection = None;
+                self.queue_settings_action(action)
+            }
+            _ => Update::None,
+        }
     }
 
     fn clear_selected_setting(&mut self) -> Update {
@@ -3086,12 +3165,12 @@ impl App {
             return Update::Render;
         };
         if matches!(control.backend.lifecycle, BackendLifecycle::Stopped) {
-            self.notice = Some("No model is currently loaded".to_owned());
+            self.notice = Some("No Model Profile is currently loaded".to_owned());
             return Update::Render;
         }
         self.pending_control_action = Some(ControlAction::Unload);
         self.control_busy = true;
-        self.notice = Some("Unloading the active model…".to_owned());
+        self.notice = Some("Unloading the active Model Profile…".to_owned());
         Update::Render
     }
 }
@@ -3105,13 +3184,20 @@ fn byte_index(value: &str, character_index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use norted_core::{
-        AppSnapshot, EffectivePublicAuthMode, EngineId, ModelId, ModelProfile, ModelProfileId,
-        ModelProfilesState, PublicAuthMode, PublicAuthStatus, RegistryState, ServerState,
-        SettingCategory, SettingDefinition, SettingId, SettingKind, SettingScope, SettingsSchema,
+        AppSnapshot, ArtifactFormat, EffectivePublicAuthMode, EngineId, ModelArtifact, ModelId,
+        ModelProfile, ModelProfileId, ModelProfilesState, PublicAuthMode, PublicAuthStatus,
+        RegistryState, ServerState, SettingCategory, SettingDefinition, SettingId, SettingKind,
+        SettingScope, SettingsSchema,
     };
 
-    use super::{App, Screen, SettingsScope};
+    use super::{
+        App, Overlay, ProfileEngineSelection, Screen, SettingsAction, SettingsScope,
+        SettingsTaskResult,
+    };
 
     fn definition(id: &str, scope: SettingScope) -> SettingDefinition {
         SettingDefinition {
@@ -3120,7 +3206,13 @@ mod tests {
             description: id.to_owned(),
             kind: SettingKind::Toggle,
             scope,
-            category: SettingCategory::General,
+            category: if id == "temperature" {
+                SettingCategory::Generation
+            } else if id.contains("mtp") || id.contains("speculation") {
+                SettingCategory::Speculation
+            } else {
+                SettingCategory::General
+            },
             supported: true,
             unsupported_reason: None,
             unit: None,
@@ -3227,5 +3319,49 @@ mod tests {
             .map(|definition| definition.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, ["temperature", "q27.mtp"]);
+    }
+
+    #[test]
+    fn multi_engine_profile_creation_selects_an_engine_inside_the_tui() {
+        let mut app = test_app(Vec::new());
+        let model = ModelArtifact {
+            id: ModelId("artifact".to_owned()),
+            display_name: "Artifact".to_owned(),
+            path: PathBuf::from("artifact.gguf"),
+            format: ArtifactFormat::Gguf,
+            size_bytes: 1,
+            created: 1,
+            hash: None,
+            architecture: None,
+            context_length: None,
+            provenance: None,
+            native_identity: None,
+            auxiliary_artifacts: Vec::new(),
+            norted_package: None,
+        };
+        app.handle_settings_task_result(SettingsTaskResult::ChooseProfileEngine(
+            ProfileEngineSelection {
+                id: ModelProfileId::new("quality").expect("profile ID"),
+                display_name: "Quality".to_owned(),
+                model: Box::new(model),
+                engines: vec![
+                    EngineId::new("fake-a").expect("engine ID"),
+                    EngineId::new("fake-b").expect("engine ID"),
+                ],
+                selected: 0,
+            },
+        ));
+        assert_eq!(app.overlay, Some(Overlay::ProfileEngine));
+
+        app.handle_profile_engine_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_profile_engine_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.overlay, None);
+        assert!(matches!(
+            app.take_settings_action(),
+            Some(SettingsAction::CreateProfile {
+                engine_id: Some(engine),
+                ..
+            }) if engine.as_str() == "fake-b"
+        ));
     }
 }

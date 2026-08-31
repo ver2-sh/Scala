@@ -1106,17 +1106,25 @@ pub trait EngineAdapter: Send + Sync {
     fn setting_definitions(&self) -> Vec<SettingDefinition> {
         Vec::new()
     }
+    /// Gates stable engine settings using facts proved by one concrete model.
+    /// This boundary must not depend on an installed runtime.
+    fn model_setting_definitions(
+        &self,
+        _model: &ModelArtifact,
+    ) -> Result<Vec<SettingDefinition>, EngineError> {
+        Ok(self.setting_definitions())
+    }
     /// Gates the curated semantic settings against one exact runtime contract.
     async fn settings_schema(
         &self,
         runtime: &InstalledRuntime,
-        _model: &ModelArtifact,
+        model: &ModelArtifact,
         _host: &HostCapabilities,
     ) -> Result<SettingsSchema, EngineError> {
         Ok(SettingsSchema {
             engine_id: self.identity().id,
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
-            definitions: self.setting_definitions(),
+            definitions: self.model_setting_definitions(model)?,
         })
     }
     /// Reports the legacy/flexible-entry runtime configured directly for this

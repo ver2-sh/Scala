@@ -2156,6 +2156,11 @@ impl EngineAdapter for Q27Adapter {
             Ok(facts) => facts,
             Err(reason) => return RuntimeCompatibility::Incompatible(reason),
         };
+        if let Some(settings) = settings
+            && let Err(reason) = validate_q27_model_settings(&facts, settings)
+        {
+            return RuntimeCompatibility::Incompatible(reason);
+        }
         let evaluation = q27_device_evaluation(
             &runtime.manifest.identity.platform,
             &runtime.manifest.identity.architecture,
@@ -2223,6 +2228,11 @@ impl EngineAdapter for Q27Adapter {
             Ok(facts) => facts,
             Err(reason) => return RuntimeCompatibility::Incompatible(reason),
         };
+        if let Some(settings) = settings
+            && let Err(reason) = validate_q27_model_settings(&facts, settings)
+        {
+            return RuntimeCompatibility::Incompatible(reason);
+        }
         let evaluation = q27_device_evaluation(
             &runtime.identity.platform,
             &runtime.identity.architecture,
@@ -2331,6 +2341,13 @@ impl EngineAdapter for Q27Adapter {
         q27_setting_definitions()
     }
 
+    fn model_setting_definitions(
+        &self,
+        model: &ModelArtifact,
+    ) -> Result<Vec<SettingDefinition>, EngineError> {
+        q27_model_setting_definitions(model)
+    }
+
     async fn settings_schema(
         &self,
         runtime: &InstalledRuntime,
@@ -2359,18 +2376,7 @@ impl EngineAdapter for Q27Adapter {
             &usage,
         );
         let facts = inspect_q27_model(&model.path).map_err(EngineError::InvalidConfiguration)?;
-        if !facts.capabilities.contains("mtp_layer_1") {
-            for definition in &mut schema.definitions {
-                if definition.id.as_str().starts_with("q27.mtp")
-                    || definition.id.as_str().starts_with("q27.suffix")
-                {
-                    definition.supported = false;
-                    definition.unsupported_reason = Some(
-                        "bounded q27 inspection did not prove an MTP prediction layer".to_owned(),
-                    );
-                }
-            }
-        }
+        apply_q27_model_capabilities(&mut schema.definitions, &facts);
         Ok(schema)
     }
 
@@ -4091,6 +4097,53 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
     definitions
 }
 
+fn q27_model_setting_definitions(
+    model: &ModelArtifact,
+) -> Result<Vec<SettingDefinition>, EngineError> {
+    let facts = inspect_q27_model(&model.path).map_err(EngineError::InvalidConfiguration)?;
+    let mut definitions = q27_setting_definitions();
+    apply_q27_model_capabilities(&mut definitions, &facts);
+    Ok(definitions)
+}
+
+fn apply_q27_model_capabilities(
+    definitions: &mut [SettingDefinition],
+    facts: &model::Q27ModelFacts,
+) {
+    if facts.capabilities.contains("mtp_layer_1") {
+        return;
+    }
+    for definition in definitions {
+        if definition.id.as_str().starts_with("q27.mtp")
+            || definition.id.as_str().starts_with("q27.suffix")
+        {
+            definition.supported = false;
+            definition.unsupported_reason = Some(
+                "bounded q27 artifact inspection did not prove an MTP prediction layer".to_owned(),
+            );
+        }
+    }
+}
+
+fn validate_q27_model_settings(
+    facts: &model::Q27ModelFacts,
+    settings: &norted_core::ResolvedSettings,
+) -> Result<(), String> {
+    if facts.capabilities.contains("mtp_layer_1") {
+        return Ok(());
+    }
+    let contradicted = settings
+        .effective
+        .keys()
+        .find(|id| id.as_str().starts_with("q27.mtp") || id.as_str().starts_with("q27.suffix"));
+    match contradicted {
+        Some(id) => Err(format!(
+            "q27 setting `{id}` requires an MTP prediction layer, but bounded artifact inspection did not prove one"
+        )),
+        None => Ok(()),
+    }
+}
+
 fn q27_definition(
     id: &str,
     label: &str,
@@ -4587,6 +4640,36 @@ mod tests {
             validate_q27_settings_prelaunch(&resolved(&[]), capabilities).is_ok(),
             "an omitted setting must not invent a capability requirement"
         );
+    }
+
+    #[test]
+    fn no_mtp_model_disables_and_rejects_mtp_dependent_settings_before_runtime() {
+        let facts = model::Q27ModelFacts {
+            tier: None,
+            capabilities: std::collections::BTreeSet::from(["text_only"]),
+        };
+        let mut definitions = q27_setting_definitions();
+        apply_q27_model_capabilities(&mut definitions, &facts);
+        for id in [
+            "q27.mtp",
+            "q27.mtp_max_depth",
+            "q27.mtp_min_probability",
+            "q27.suffix_drafting",
+            "q27.suffix_width_mode",
+        ] {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.id.as_str() == id)
+                .expect("MTP-dependent definition");
+            assert!(!definition.supported, "{id} must be model-gated");
+        }
+        let settings = resolved(&[("q27.mtp", SettingValue::Toggle(true))]);
+        assert!(
+            validate_q27_model_settings(&facts, &settings)
+                .unwrap_err()
+                .contains("did not prove")
+        );
+        assert!(validate_q27_model_settings(&facts, &resolved(&[])).is_ok());
     }
 
     #[test]

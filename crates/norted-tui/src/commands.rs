@@ -19,12 +19,12 @@ pub struct SlashCommand {
 pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/load",
-        description: "Load the selected model through the running server",
+        description: "Load the selected Model Profile through the running server",
         action: CommandAction::LoadSelected,
     },
     SlashCommand {
         name: "/unload",
-        description: "Unload the active model",
+        description: "Unload the active Model Profile",
         action: CommandAction::Unload,
     },
     SlashCommand {
@@ -34,8 +34,13 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/models",
-        description: "Open the model registry",
+        description: "Open discovered model artifact inventory",
         action: CommandAction::Navigate(Screen::Models),
+    },
+    SlashCommand {
+        name: "/model-profiles",
+        description: "Open user-created Model Profiles",
+        action: CommandAction::Navigate(Screen::ModelProfiles),
     },
     SlashCommand {
         name: "/runtimes",
@@ -59,7 +64,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/settings",
-        description: "Open resolved settings",
+        description: "Open Global and engine setting defaults",
         action: CommandAction::Navigate(Screen::Settings),
     },
     SlashCommand {

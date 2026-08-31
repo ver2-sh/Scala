@@ -87,7 +87,8 @@ value.
 Runtime selection receives the profile's explicit engine and cannot switch engines. Existing
 resolution order remains explicit runtime, persisted model/runtime choice when applicable,
 engine/format default, then best compatible installed runtime. Adapters expose a typed category-aware
-schema for common plus their own namespace and validate the exact effective settings. Capability
+schema for common plus their own namespace, gate it first with facts proved by the bound model, and
+then gate it with the exact runtime contract before validating effective settings. Capability
 requirements are consequences of selected settings. q27 retains exact source fingerprints and
 bounded context/KV/W_MAX startup proof; NInfer retains native-container and schema-18 startup proof;
 llama.cpp uses exact help evidence.
@@ -246,7 +247,7 @@ llama-server --model <canonical-gguf> --alias <stable-id>
              --host 127.0.0.1 --port <dynamic> [allowed native arguments]
 ```
 
-The adapter polls `/health`, then obtains authoritative effective `temperature` and `top_p` from `/props` before Running. It maps internal `/v1/chat/completions` responses/SSE to normalized inference output/events.
+The adapter polls `/health`, then obtains authoritative effective `temperature` and `top_p` from `/props` before Running. Configured `temperature`, `top_p`, `top_k`, and `min_p` are emitted only through exact help-advertised process-default controls; omission preserves upstream behavior, while request-time `temperature` and `top_p` are explicit request fields that override those defaults. It maps internal `/v1/chat/completions` responses/SSE to normalized inference output/events.
 
 ### q27
 

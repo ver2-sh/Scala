@@ -1029,17 +1029,28 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
             }
             _ => definition.label.clone(),
         };
+        let starts_category = index == &0
+            || definitions
+                .get(index.saturating_sub(1))
+                .is_none_or(|previous| previous.category != definition.category);
+        let heading = if starts_category {
+            format!("{}  ──  {label}", definition.category)
+        } else {
+            format!("              {label}")
+        };
         let lines = vec![
+            Line::from(Span::styled(
+                heading,
+                if starts_category {
+                    theme.hint
+                } else {
+                    theme.muted
+                },
+            )),
             Line::from(vec![
-                Span::styled(
-                    format!("{} · {:<28}  ", definition.category, definition.id),
-                    theme.text,
-                ),
+                Span::styled(format!("  {:<28}  ", definition.id), theme.text),
                 Span::styled(format!("{value:<16}  "), theme.accent),
                 Span::styled(source, theme.muted),
-            ]),
-            Line::from(vec![
-                Span::styled(format!("  {label}"), theme.muted),
                 Span::styled(
                     format!("  {support}"),
                     if definition.supported {
@@ -1068,22 +1079,28 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         Line::from(Span::styled("NAVIGATION", theme.hint)),
         key_value("Tab / Shift+Tab", "change focus", theme),
         key_value("Left / Right", "move navigation focus", theme),
-        key_value("Enter", "open navigation or load selected model", theme),
-        key_value("u", "unload the active model from Models", theme),
-        key_value("v", "choose a model-specific runtime override", theme),
-        key_value("p", "open model settings/profile management", theme),
-        key_value(
-            "x / Delete",
-            "clear an override from the model runtime picker",
-            theme,
-        ),
+        key_value("Enter", "open the focused page", theme),
         key_value("Mouse", "click pages and interactive rows", theme),
         Line::default(),
-        Line::from(Span::styled("CURRENT VIEW", theme.hint)),
-        key_value("Up/Down or j/k", "select or scroll", theme),
-        key_value("PageUp/PageDown", "scroll logs or model list", theme),
-        key_value("Wheel", "scroll the current view", theme),
-        key_value("End", "follow newest logs", theme),
+        Line::from(Span::styled("MODELS AND MODEL PROFILES", theme.hint)),
+        key_value(
+            "Models",
+            "artifact inventory; Enter/c creates a Model Profile",
+            theme,
+        ),
+        key_value(
+            "Model Profiles",
+            "normal load and per-profile override screen",
+            theme,
+        ),
+        key_value("l", "load the selected Model Profile", theme),
+        key_value("u", "unload the active Model Profile", theme),
+        key_value("e", "change the selected profile's bound engine", theme),
+        key_value("Delete", "clear an override so it inherits", theme),
+        Line::default(),
+        Line::from(Span::styled("SETTINGS AND RUNTIMES", theme.hint)),
+        key_value("Settings", "Global and per-engine defaults", theme),
+        key_value("Up/Down or j/k", "select or scroll the current page", theme),
         key_value("s", "search available runtimes from Runtimes", theme),
         key_value("g / Q / N", "select runtime for GGUF / Q27 / NInfer", theme),
         key_value("u", "check for runtime updates", theme),
@@ -1109,7 +1126,7 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         key_value("Ctrl+C", "exit cleanly", theme),
         Line::default(),
         Line::from(Span::styled(
-            "Slash commands: /load /unload /status /models /runtimes /server /logs /settings /help /quit",
+            "Slash commands: /load /unload /status /models /model-profiles /runtimes /server /logs /settings /help /quit",
             theme.muted,
         )),
     ]

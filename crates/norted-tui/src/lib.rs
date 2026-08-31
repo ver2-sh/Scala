@@ -21,8 +21,8 @@ use norted_engine::{
 };
 
 use app::{
-    App, ControlAction, ModelSettingsInspection, RuntimeAction, RuntimeTaskResult, SettingsAction,
-    SettingsScope, SettingsTaskResult, Update,
+    App, ControlAction, ModelSettingsInspection, ProfileEngineSelection, RuntimeAction,
+    RuntimeTaskResult, SettingsAction, SettingsScope, SettingsTaskResult, Update,
 };
 use terminal::TerminalSession;
 use ui::layout::UiLayout;
@@ -345,6 +345,32 @@ async fn read_tui_settings(
     ))
 }
 
+fn resolved_patch(
+    engine_id: &str,
+    profile_id: &norted_core::ModelProfileId,
+    patch: &SettingsPatch,
+) -> norted_core::ResolvedSettings {
+    norted_core::ResolvedSettings {
+        engine_id: engine_id.to_owned(),
+        model_profile_id: Some(profile_id.clone()),
+        effective: patch
+            .0
+            .iter()
+            .map(|(id, value)| {
+                (
+                    id.clone(),
+                    norted_core::ResolvedSetting {
+                        value: value.clone(),
+                        source: norted_core::SettingSource::ModelProfile {
+                            model_profile_id: profile_id.clone(),
+                        },
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
 async fn execute_settings_action(
     runtime_packs: Arc<RuntimePackManager>,
     paths: &AppPaths,
@@ -356,7 +382,12 @@ async fn execute_settings_action(
         SettingsAction::Refresh => {
             SettingsTaskResult::Loaded(read_tui_settings(&settings_store, &profiles_store).await)
         }
-        SettingsAction::Set { scope, id, value } => {
+        SettingsAction::Set {
+            scope,
+            id,
+            value,
+            model,
+        } => {
             let mut patch = SettingsPatch::default();
             patch.insert(id, value);
             if patch.0.keys().any(|id| id.as_str() == "q27.template_path")
@@ -370,6 +401,42 @@ async fn execute_settings_action(
                 .await
             {
                 return SettingsTaskResult::Stored(Err(error.to_string()));
+            }
+            if let SettingsScope::ModelProfile(profile_id) = &scope {
+                let Some(model) = model.as_deref() else {
+                    return SettingsTaskResult::Stored(Err(format!(
+                        "Bound model for Model Profile `{profile_id}` is unavailable"
+                    )));
+                };
+                let profiles = match profiles_store.read().await {
+                    Ok(profiles) => profiles,
+                    Err(error) => {
+                        return SettingsTaskResult::Stored(Err(error.to_string()));
+                    }
+                };
+                let Some(profile) = profiles.profiles.get(profile_id) else {
+                    return SettingsTaskResult::Stored(Err(SettingsError::ModelProfileNotFound(
+                        profile_id.clone(),
+                    )
+                    .to_string()));
+                };
+                let schema = match runtime_packs
+                    .model_settings_schema_for_engine(model, profile.engine_id.as_str())
+                {
+                    Ok(schema) => schema,
+                    Err(error) => {
+                        return SettingsTaskResult::Stored(Err(error.to_string()));
+                    }
+                };
+                let mut candidate = profile.overrides.clone();
+                candidate.0.extend(patch.0.clone());
+                if let Err(error) = schema.validate(&resolved_patch(
+                    profile.engine_id.as_str(),
+                    &profile.id,
+                    &candidate,
+                )) {
+                    return SettingsTaskResult::Stored(Err(error.to_string()));
+                }
             }
             let result = match scope {
                 SettingsScope::Global | SettingsScope::Engine(_) => settings_store
@@ -481,26 +548,46 @@ async fn execute_settings_action(
             id,
             display_name,
             model,
+            engine_id,
         } => {
-            let engines = runtime_packs.compatible_engine_ids(&model);
-            let result = match engines.as_slice() {
-                [] => Err(format!(
-                    "No registered engine is compatible with model `{}`",
-                    model.id
-                )),
-                [engine] => match EngineId::new(engine.clone()) {
-                    Ok(engine_id) => profiles_store
-                        .update(move |state| state.create(id, display_name, model.id, engine_id))
-                        .await
-                        .map_err(|error| error.to_string()),
-                    Err(error) => Err(error.to_string()),
-                },
-                _ => Err(format!(
-                    "Model `{}` has multiple compatible engines ({}); create the profile with an explicit engine in the CLI",
-                    model.id,
-                    engines.join(", ")
-                )),
+            let engines = match runtime_packs
+                .compatible_engine_ids(&model)
+                .into_iter()
+                .map(EngineId::new)
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(engines) => engines,
+                Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
             };
+            let engine_id = match (engine_id, engines.as_slice()) {
+                (_, []) => {
+                    return SettingsTaskResult::Stored(Err(format!(
+                        "No registered engine is compatible with model `{}`",
+                        model.id
+                    )));
+                }
+                (Some(engine_id), _) if engines.contains(&engine_id) => engine_id,
+                (Some(engine_id), _) => {
+                    return SettingsTaskResult::Stored(Err(format!(
+                        "Engine `{engine_id}` is not compatible with model `{}`",
+                        model.id
+                    )));
+                }
+                (None, [engine_id]) => engine_id.clone(),
+                (None, _) => {
+                    return SettingsTaskResult::ChooseProfileEngine(ProfileEngineSelection {
+                        id,
+                        display_name,
+                        model,
+                        engines,
+                        selected: 0,
+                    });
+                }
+            };
+            let result = profiles_store
+                .update(move |state| state.create(id, display_name, model.id, engine_id))
+                .await
+                .map_err(|error| error.to_string());
             SettingsTaskResult::Stored(match result {
                 Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
                 Err(error) => Err(error),
@@ -546,6 +633,29 @@ async fn execute_settings_action(
         }
         SettingsAction::SetProfileModel { profile_id, model } => {
             let compatible = runtime_packs.compatible_engine_ids(&model);
+            let current = match profiles_store.read().await {
+                Ok(profiles) => profiles,
+                Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
+            };
+            let Some(existing) = current.profiles.get(&profile_id) else {
+                return SettingsTaskResult::Stored(Err(SettingsError::ModelProfileNotFound(
+                    profile_id,
+                )
+                .to_string()));
+            };
+            let schema = match runtime_packs
+                .model_settings_schema_for_engine(&model, existing.engine_id.as_str())
+            {
+                Ok(schema) => schema,
+                Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
+            };
+            if let Err(error) = schema.validate(&resolved_patch(
+                existing.engine_id.as_str(),
+                &existing.id,
+                &existing.overrides,
+            )) {
+                return SettingsTaskResult::Stored(Err(error.to_string()));
+            }
             let result = profiles_store
                 .update(move |state| {
                     let profile = state
@@ -617,32 +727,70 @@ async fn execute_settings_action(
                         &paths.data_dir,
                     )
                     .map_err(|error| error.to_string())?;
-                runtime_packs.refresh_host_capabilities().await;
-                let (selection, schema) = runtime_packs
-                    .settings_schema_for_model_with_settings(&model, None, Some(&resolved))
-                    .await
-                    .map_err(|error| {
-                        format!(
-                            "No installed runtime is compatible with Model Profile `{}`: {error}",
-                            profile.id
+                let model_schema = runtime_packs
+                    .model_settings_schema_for_engine(&model, profile.engine_id.as_str())
+                    .map_err(|error| error.to_string())?;
+                let model_validation_error = model_schema
+                    .validate(&resolved)
+                    .err()
+                    .map(|error| error.to_string());
+                let (runtime_id, schema, validation_error) = if let Some(error) =
+                    model_validation_error
+                {
+                    (
+                        None,
+                        model_schema,
+                        Some(format!(
+                            "Model Profile `{}` contradicts capabilities proved by bound model `{}`: {error}",
+                            profile.id, model.id
+                        )),
+                    )
+                } else {
+                    runtime_packs.refresh_host_capabilities().await;
+                    match runtime_packs
+                        .settings_schema_for_model_for_engine_with_settings(
+                            &model,
+                            profile.engine_id.as_str(),
+                            None,
+                            Some(&resolved),
                         )
-                    })?;
-                if selection.runtime.manifest.identity.engine_id != profile.engine_id.as_str() {
-                    return Err(format!(
-                        "runtime resolver selected engine `{}` instead of profile engine `{}`",
-                        selection.runtime.manifest.identity.engine_id, profile.engine_id
-                    ));
-                }
+                        .await
+                    {
+                        Ok((selection, schema)) => {
+                            let validation_error = schema
+                                .validate(&resolved)
+                                .err()
+                                .map(|error| error.to_string());
+                            (
+                                Some(selection.runtime.manifest.runtime_id),
+                                schema,
+                                validation_error,
+                            )
+                        }
+                        Err(error) => (
+                            None,
+                            model_schema,
+                            Some(format!(
+                                "No installed runtime is compatible with Model Profile `{}` on bound engine `{}`: {error}",
+                                profile.id, profile.engine_id
+                            )),
+                        ),
+                    }
+                };
                 Ok(ModelSettingsInspection {
                     state,
                     profiles,
-                    runtime_id: selection.runtime.manifest.runtime_id,
+                    runtime_id,
                     schema,
                     resolved,
+                    validation_error,
                 })
             }
             .await;
-            SettingsTaskResult::Inspected { model_id, result }
+            SettingsTaskResult::Inspected {
+                model_id,
+                result: Box::new(result),
+            }
         }
     }
 }

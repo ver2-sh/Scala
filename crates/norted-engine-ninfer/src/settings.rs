@@ -168,6 +168,47 @@ pub(crate) fn apply_runtime_bounds(definitions: &mut [SettingDefinition]) {
     }
 }
 
+pub(crate) fn apply_model_capabilities(
+    definitions: &mut [SettingDefinition],
+    model: &ModelArtifact,
+) {
+    if dflash_target(model) {
+        return;
+    }
+    if let Some(definition) = definitions
+        .iter_mut()
+        .find(|definition| definition.id.as_str() == "ninfer.speculative_backend")
+        && let SettingKind::Choice { choices } = &mut definition.kind
+    {
+        choices.retain(|choice| choice != "dflash");
+    }
+}
+
+pub(crate) fn validate_model_settings(
+    settings: &ResolvedSettings,
+    model: &ModelArtifact,
+) -> Result<(), String> {
+    if choice_value(settings, "ninfer.speculative_backend").map_err(|error| error.to_string())?
+        == Some("dflash")
+        && !dflash_target(model)
+    {
+        return Err(
+            "NInfer DFlash is supported only for the exact qwen3.6-35b-a3b/groupwise-int text target"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn dflash_target(model: &ModelArtifact) -> bool {
+    matches!(
+        model.native_identity.as_ref(),
+        Some(ArtifactNativeIdentity::Ninfer(identity))
+            if identity.model_id == "qwen3.6-35b-a3b"
+                && identity.weights_id == "groupwise-int"
+    )
+}
+
 fn choices(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
@@ -334,13 +375,7 @@ pub(crate) fn translate(
                     "NInfer DFlash requires ninfer.draft_tokens in 1..=15".to_owned(),
                 ));
             }
-            let exact_target = matches!(
-                model.native_identity.as_ref(),
-                Some(ArtifactNativeIdentity::Ninfer(identity))
-                    if identity.model_id == "qwen3.6-35b-a3b"
-                        && identity.weights_id == "groupwise-int"
-            );
-            if !exact_target {
+            if !dflash_target(model) {
                 return Err(EngineError::InvalidConfiguration(
                     "NInfer DFlash is supported only for the exact qwen3.6-35b-a3b/groupwise-int text target"
                         .to_owned(),
@@ -700,6 +735,46 @@ mod tests {
                 .any(|pair| pair == ["--draft-tokens", "5"])
         );
         assert!(valid_mtp.iter().any(|value| value == "--lm-head-draft"));
+    }
+
+    #[test]
+    fn model_capabilities_filter_and_reject_dflash_for_non_target_models() {
+        let non_target = model("qwen3.6-27b");
+        let mut non_target_definitions = definitions();
+        apply_model_capabilities(&mut non_target_definitions, &non_target);
+        let choices = non_target_definitions
+            .iter()
+            .find(|definition| definition.id.as_str() == "ninfer.speculative_backend")
+            .and_then(|definition| match &definition.kind {
+                SettingKind::Choice { choices } => Some(choices.as_slice()),
+                _ => None,
+            })
+            .expect("speculative backend choices");
+        assert_eq!(choices, ["mtp"]);
+
+        let dflash = settings(&[(
+            "ninfer.speculative_backend",
+            SettingValue::Choice("dflash".to_owned()),
+        )]);
+        assert!(
+            validate_model_settings(&dflash, &non_target)
+                .unwrap_err()
+                .contains("exact qwen3.6-35b-a3b/groupwise-int")
+        );
+
+        let target = model("qwen3.6-35b-a3b");
+        let mut target_definitions = definitions();
+        apply_model_capabilities(&mut target_definitions, &target);
+        let target_choices = target_definitions
+            .iter()
+            .find(|definition| definition.id.as_str() == "ninfer.speculative_backend")
+            .and_then(|definition| match &definition.kind {
+                SettingKind::Choice { choices } => Some(choices.as_slice()),
+                _ => None,
+            })
+            .expect("target speculative backend choices");
+        assert_eq!(target_choices, ["mtp", "dflash"]);
+        assert!(validate_model_settings(&dflash, &target).is_ok());
     }
 
     #[test]
