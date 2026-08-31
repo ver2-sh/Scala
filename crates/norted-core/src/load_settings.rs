@@ -149,6 +149,9 @@ pub enum LoadSettingKind {
     },
     String,
     Choice {
+        /// An empty list is an unresolved/open choice at the generic adapter
+        /// layer. Exact schemas replace it with a non-empty, closed list or
+        /// mark the setting unsupported before validating resolved settings.
         choices: Vec<String>,
     },
     Path,
@@ -232,7 +235,9 @@ impl LoadSettingKind {
                 }
             }
             Self::Choice { choices } => {
-                if choices.iter().any(|choice| choice == raw) {
+                if (choices.is_empty() && !raw.is_empty() && !raw.contains('\0'))
+                    || choices.iter().any(|choice| choice == raw)
+                {
                     Ok(LoadSettingValue::Choice(raw.to_owned()))
                 } else {
                     Err(invalid(format!("expected one of: {}", choices.join(", "))))
@@ -310,7 +315,10 @@ impl LoadSettingKind {
                     true
                 }
             }
-            (Self::Choice { choices }, LoadSettingValue::Choice(value)) => choices.contains(value),
+            (Self::Choice { choices }, LoadSettingValue::Choice(value)) => {
+                (choices.is_empty() && !value.is_empty() && !value.contains('\0'))
+                    || choices.contains(value)
+            }
             _ => false,
         };
         valid

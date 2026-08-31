@@ -2255,6 +2255,7 @@ mod tests {
         LoadSettingId, LoadSettingKind, LoadSettingSource, ResolvedLoadSetting,
         ResolvedLoadSettings, ServeProfile, apply_serve_profile_load_policy,
     };
+    use norted_engine::EngineRegistry;
 
     use super::*;
 
@@ -2310,7 +2311,25 @@ mod tests {
     }
 
     #[test]
-    fn speculative_strategy_selector_is_derived_from_the_selected_serve_profile() {
+    fn speculative_strategy_selector_is_open_before_and_closed_after_profile_resolution() {
+        let mut registry = EngineRegistry::default();
+        registry
+            .register(std::sync::Arc::new(NinferAdapter::from_config(
+                None,
+                Path::new("."),
+            )))
+            .expect("register NInfer adapter");
+        let selector_id = LoadSettingId::new("ninfer.speculative_profile").unwrap();
+        for strategy_name in ["mtp3", "quality-mtp"] {
+            let patch = registry
+                .parse_load_settings(&[format!("ninfer.speculative_profile={strategy_name}")])
+                .expect("generic CLI parser accepts unresolved strategy name");
+            assert_eq!(
+                patch.0.get(&selector_id),
+                Some(&LoadSettingValue::Choice(strategy_name.to_owned()))
+            );
+        }
+
         let mut profile = ninfer_serve_profile_fixture();
         let strategy = profile.engine.ninfer.as_mut().expect("NInfer strategy");
         strategy.default_speculative_profile = "quality-mtp".to_owned();
@@ -2332,7 +2351,6 @@ mod tests {
             runtime_id: None,
             definitions,
         };
-        let selector_id = LoadSettingId::new("ninfer.speculative_profile").unwrap();
         let selector = schema.definition(&selector_id).expect("strategy selector");
         assert!(selector.supported);
         assert_eq!(
@@ -2358,7 +2376,7 @@ mod tests {
             )]),
         };
         assert!(schema.validate(&selected("quality-mtp")).is_ok());
-        assert!(schema.validate(&selected("undeclared")).is_err());
+        assert!(schema.validate(&selected("mtp3")).is_err());
 
         let mut without_profile = settings::definitions();
         settings::apply_speculative_profile_schema(&mut without_profile, None);

@@ -1895,7 +1895,7 @@ impl App {
             norted_core::LoadSettingKind::OneWayFlag => {
                 self.set_selected_setting(definition.id, LoadSettingValue::FlagEnabled)
             }
-            norted_core::LoadSettingKind::Choice { choices } => {
+            norted_core::LoadSettingKind::Choice { choices } if !choices.is_empty() => {
                 let current = match current {
                     Some(LoadSettingValue::Choice(value)) => choices
                         .iter()
@@ -1904,10 +1904,7 @@ impl App {
                     _ => None,
                 }
                 .unwrap_or(0);
-                let Some(value) = choices.get(current).cloned() else {
-                    self.notice = Some("This enum has no available choices".to_owned());
-                    return Update::Render;
-                };
+                let value = choices[current].clone();
                 self.set_selected_setting(definition.id, LoadSettingValue::Choice(value))
             }
             _ => {
