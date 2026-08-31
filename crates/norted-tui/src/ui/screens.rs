@@ -347,29 +347,32 @@ fn render_models(
                     Span::styled(format!("  {path}"), theme.hint),
                 ])
             },
-            Line::from(model.norted_package.as_ref().map_or_else(
-                || Span::styled("Package: Raw", theme.muted),
-                |package| {
-                    let status = match &package.status {
-                        norted_core::NortedPackageStatus::Valid => "valid",
-                        norted_core::NortedPackageStatus::NeedsRuntimeCapability { .. } => {
-                            "needs runtime capability"
-                        }
-                    };
-                    Span::styled(
-                        format!(
-                            "Package: {}  {status}  schema {}  profile {}  runtime: evaluated separately",
-                            package.kind,
-                            package.manifest_version,
-                            package
-                                .runtime_policy_profile
-                                .as_deref()
-                                .or(package.runtime_policy_id.as_deref())
-                                .unwrap_or("n/a")
-                        ),
-                        theme.hint,
+            Line::from(Span::styled(
+                {
+                    let recommended = model
+                        .norted_package
+                        .as_ref()
+                        .and_then(|package| package.recommended_serve_profile.as_ref())
+                        .map(|profile| profile.display_name.as_str())
+                        .unwrap_or("none");
+                    let selected = app
+                        .effective_serve_profile_for_model(model)
+                        .map(|profile| profile.display_name)
+                        .unwrap_or_else(|| "None / Raw runtime defaults".to_owned());
+                    format!(
+                        "Artifact: {} · Source: {} · Recommended Serve Profile: {} · Selected: {} · {}",
+                        model.format,
+                        if model.norted_package.is_some() {
+                            "Norted Builder"
+                        } else {
+                            "raw/local"
+                        },
+                        recommended,
+                        selected,
+                        app.serve_profile_status_for_model(model),
                     )
                 },
+                theme.hint,
             )),
         ])
         .style(style)
@@ -831,7 +834,7 @@ fn render_settings(
     frame.render_widget(
         section_title(
             "Settings",
-            "Load defaults, reusable profiles, and exact-runtime validation",
+            "Load defaults, Serve Profiles, and exact-runtime validation",
             theme,
         ),
         layout[0],
@@ -845,6 +848,9 @@ fn render_settings(
             crate::app::SettingsScope::Global => "Global".to_owned(),
             crate::app::SettingsScope::Engine(engine) => engine.clone(),
             crate::app::SettingsScope::Profile(profile) => profile.to_string(),
+            crate::app::SettingsScope::BuilderProfile(profile) => {
+                format!("{profile} · Builder · read-only")
+            }
             crate::app::SettingsScope::Model(_) => "Selected model".to_owned(),
         };
         let style = if app.settings_scope_index == *index {
@@ -861,12 +867,13 @@ fn render_settings(
         ui_layout.settings_scopes.x,
         ui_layout.settings_scopes.y.saturating_add(1),
         ui_layout.settings_scopes.width,
-        3,
+        5,
     );
     let mut info = Vec::new();
     if let Some(input) = &app.settings_input {
         let prompt = match input.kind {
-            crate::app::SettingsInputKind::ProfileName => "New profile",
+            crate::app::SettingsInputKind::ProfileName => "New Serve Profile",
+            crate::app::SettingsInputKind::ForkProfile => "Fork as local profile",
             crate::app::SettingsInputKind::SettingValue => "Value",
         };
         info.push(Line::from(vec![
@@ -879,15 +886,33 @@ fn render_settings(
             theme.muted,
         )));
     } else if let Some(model) = &app.settings_model {
+        let selected_model = app
+            .snapshot
+            .models
+            .iter()
+            .find(|candidate| &candidate.id == model);
+        let serve_profile =
+            selected_model.and_then(|model| app.effective_serve_profile_for_model(model));
         info.push(Line::from(vec![
             Span::styled(format!("Model {model}"), theme.text),
             Span::styled(
                 format!(
-                    "  profile: {}",
-                    app.assigned_profile_for_settings_model()
-                        .map(ToString::to_string)
-                        .as_deref()
-                        .unwrap_or("none")
+                    "  Serve Profile: {}{}",
+                    serve_profile
+                        .as_ref()
+                        .map(|profile| profile.display_name.as_str())
+                        .unwrap_or("None / Raw runtime defaults"),
+                    serve_profile.as_ref().map_or_else(String::new, |profile| {
+                        format!(
+                            " · {}{}",
+                            profile.source,
+                            if profile.read_only {
+                                " · read-only"
+                            } else {
+                                " · mutable"
+                            }
+                        )
+                    })
                 ),
                 theme.accent,
             ),
@@ -903,11 +928,139 @@ fn render_settings(
                 theme.muted,
             ),
         ]));
+        if let Some(profile) = &serve_profile {
+            info.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "Prompt {:?}/{:?} · template {} · gen-prompt {} · filter {:?} · thinking {}{} · reasoning {} · temp {} top-p {} top-k {} min-p {}",
+                        profile.prompt.mode,
+                        profile.prompt.delivery,
+                        profile
+                            .prompt
+                            .template
+                            .as_ref()
+                            .map(|template| template.identity.as_str())
+                            .unwrap_or("runtime default"),
+                        profile.prompt.render_generation_prompt,
+                        profile.prompt.response_filter,
+                        profile.generation.thinking.default,
+                        if profile.generation.thinking.required { " required" } else { "" },
+                        profile
+                            .generation
+                            .defaults
+                            .reasoning_effort
+                            .as_deref()
+                            .unwrap_or("default"),
+                        profile
+                            .generation
+                            .defaults
+                            .temperature
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "default".to_owned()),
+                        profile
+                            .generation
+                            .defaults
+                            .top_p
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "default".to_owned()),
+                        profile
+                            .generation
+                            .defaults
+                            .top_k
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "default".to_owned()),
+                        profile
+                            .generation
+                            .defaults
+                            .min_p
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "default".to_owned()),
+                    ),
+                    theme.muted,
+                ),
+            ]));
+            let context = format!(
+                "context preferred {} / minimum {}",
+                profile
+                    .load
+                    .context
+                    .preferred
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "runtime default".to_owned()),
+                profile
+                    .load
+                    .context
+                    .minimum
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_owned())
+            );
+            let strategy = if let Some(q27) = &profile.engine.q27 {
+                format!(
+                    "q27 KV {} · fast-head {} (override {}) · MTP {} pmin {} · suffix {} / W_MAX {}",
+                    q27.kv_quality_order.join(" → "),
+                    q27.fast_head.default,
+                    q27.fast_head.user_override_allowed,
+                    q27.mtp.maximum_depth,
+                    q27.mtp.minimum_probability,
+                    q27.suffix_drafting,
+                    q27.suffix_width_from_runtime_w_max,
+                )
+            } else if let Some(ninfer) = &profile.engine.ninfer {
+                format!(
+                    "NInfer KV {}/{} · CUDA graph {} · prefix reuse {} · strategy {} · profiles {}",
+                    ninfer.kv_cache,
+                    ninfer.kv_dtype,
+                    ninfer.cuda_graph_required,
+                    ninfer.prefix_reuse_required,
+                    ninfer.default_speculative_profile,
+                    ninfer
+                        .speculative_profiles
+                        .iter()
+                        .map(|(name, profile)| if profile.speculative_decoding {
+                            format!(
+                                "{name}={}/{}{}",
+                                profile.backend.as_deref().unwrap_or("?"),
+                                profile
+                                    .draft_tokens
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "?".to_owned()),
+                                if profile.optimized_proposal_head == Some(true) {
+                                    "/lm-head"
+                                } else {
+                                    ""
+                                }
+                            )
+                        } else {
+                            format!("{name}=off")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+            } else {
+                "load-only profile".to_owned()
+            };
+            info.push(Line::from(Span::styled(
+                format!("{context} · {strategy}"),
+                theme.muted,
+            )));
+            info.push(Line::from(Span::styled(
+                format!(
+                    "Requirements: {}",
+                    profile
+                        .effective_requirements()
+                        .into_iter()
+                        .map(|requirement| format!("{requirement:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                theme.hint,
+            )));
+        }
         if let Some(error) = &app.settings_validation_error {
             info.push(Line::from(Span::styled(error, theme.warning)));
         } else {
             info.push(Line::from(Span::styled(
-                "p cycles/clears the assigned profile · r revalidates the exact runtime",
+                "p cycles profiles/None · f forks Builder profiles · r revalidates the exact runtime",
                 theme.hint,
             )));
         }

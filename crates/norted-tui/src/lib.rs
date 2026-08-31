@@ -375,6 +375,11 @@ async fn execute_settings_action(
                                 .settings
                                 .insert(id, value);
                         }
+                        SettingsScope::BuilderProfile(profile_id) => {
+                            return Err(LoadSettingsError::InvalidServeProfile(format!(
+                                "Builder Serve Profile `{profile_id}` is read-only; fork it before editing"
+                            )));
+                        }
                         SettingsScope::Model(model) => {
                             state
                                 .model_defaults
@@ -405,6 +410,11 @@ async fn execute_settings_action(
                                 .ok_or_else(|| LoadSettingsError::ProfileNotFound(profile.clone()))?
                                 .settings
                         }
+                        SettingsScope::BuilderProfile(profile_id) => {
+                            return Err(LoadSettingsError::InvalidServeProfile(format!(
+                                "Builder Serve Profile `{profile_id}` is read-only; fork it before editing"
+                            )));
+                        }
                         SettingsScope::Model(model) => {
                             state.model_defaults.entry(model).or_default()
                         }
@@ -418,7 +428,9 @@ async fn execute_settings_action(
                             SettingsScope::Model(model) => {
                                 state.model_defaults.remove(&model);
                             }
-                            SettingsScope::Global | SettingsScope::Profile(_) => {}
+                            SettingsScope::Global
+                            | SettingsScope::Profile(_)
+                            | SettingsScope::BuilderProfile(_) => {}
                         }
                     }
                     Ok(state.clone())
@@ -431,6 +443,26 @@ async fn execute_settings_action(
             let result = store
                 .update(move |state| {
                     state.create_profile(profile)?;
+                    Ok(state.clone())
+                })
+                .await
+                .map_err(|error| error.to_string());
+            SettingsTaskResult::Stored(result)
+        }
+        SettingsAction::ForkBuilderProfile { source, name } => {
+            let result = store
+                .update(move |state| {
+                    if state.profiles.contains_key(&name) {
+                        return Err(LoadSettingsError::ProfileAlreadyExists(name));
+                    }
+                    let fork = source.fork_local(name.as_str(), name.as_str());
+                    state.profiles.insert(
+                        name,
+                        norted_core::LoadProfile {
+                            settings: fork.load.settings.clone(),
+                            serve_profile: Some(fork),
+                        },
+                    );
                     Ok(state.clone())
                 })
                 .await
@@ -457,19 +489,49 @@ async fn execute_settings_action(
                 .map_err(|error| error.to_string());
             SettingsTaskResult::Stored(result)
         }
-        SettingsAction::InspectModel(model) => {
+        SettingsAction::AssignBuilderProfile {
+            model_id,
+            profile_id,
+        } => {
+            let result = store
+                .update(move |state| {
+                    state.assign_builder_profile(model_id, profile_id);
+                    Ok(state.clone())
+                })
+                .await
+                .map_err(|error| error.to_string());
+            SettingsTaskResult::Stored(result)
+        }
+        SettingsAction::InheritRecommendedProfile { model_id } => {
+            let result = store
+                .update(move |state| {
+                    state.inherit_recommended_profile(&model_id);
+                    Ok(state.clone())
+                })
+                .await
+                .map_err(|error| error.to_string());
+            SettingsTaskResult::Stored(result)
+        }
+        SettingsAction::InspectModel {
+            model,
+            serve_profile,
+        } => {
             let model_id = model.id.clone();
             let result = async {
                 let profiles = store.read().await.map_err(|error| error.to_string())?;
                 runtime_packs.refresh_host_capabilities().await;
                 let (selection, schema) = runtime_packs
-                    .load_settings_schema_for_model(&model, None)
+                    .load_settings_schema_for_model_with_profile(
+                        &model,
+                        None,
+                        serve_profile.as_deref(),
+                    )
                     .await
                     .map_err(|error| format!(
-                        "No compatible installed runtime is available to validate these settings. Open Runtimes search to install one: {error}"
+                        "No installed runtime is compatible with the selected Serve Profile. Open Runtimes search to install one or select None/raw defaults: {error}"
                     ))?;
                 let engine_id = &selection.runtime.manifest.identity.engine_id;
-                let resolved = profiles
+                let mut resolved = profiles
                     .resolve(
                         &model.id,
                         engine_id,
@@ -478,6 +540,10 @@ async fn execute_settings_action(
                         &paths.data_dir,
                     )
                     .map_err(|error| error.to_string())?;
+                norted_core::apply_serve_profile_load_policy(
+                    serve_profile.as_deref(),
+                    &mut resolved,
+                )?;
                 Ok(ModelSettingsInspection {
                     profiles,
                     runtime_id: selection.runtime.manifest.runtime_id,
@@ -522,12 +588,18 @@ async fn execute_runtime_action(
             query,
             force_refresh,
             model,
+            serve_profile,
         } => {
             runtime_packs.refresh_host_capabilities().await;
             let result = match model {
                 Some(model) => {
                     runtime_packs
-                        .search_for_model(&query, &model, force_refresh)
+                        .search_for_model_with_profile(
+                            &query,
+                            &model,
+                            force_refresh,
+                            serve_profile.as_deref(),
+                        )
                         .await
                 }
                 None => runtime_packs.search(&query, force_refresh).await,
@@ -599,12 +671,15 @@ async fn execute_runtime_action(
             };
             RuntimeTaskResult::Removed { runtime_id, result }
         }
-        RuntimeAction::ModelCandidates { model } => {
+        RuntimeAction::ModelCandidates {
+            model,
+            serve_profile,
+        } => {
             let model_id = model.id.clone();
             RuntimeTaskResult::ModelCandidates {
                 model_id,
                 result: runtime_packs
-                    .compatible_installed_for_model(&model)
+                    .compatible_installed_for_model_with_profile(&model, serve_profile.as_deref())
                     .await
                     .map_err(|error| error.to_string()),
             }

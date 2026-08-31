@@ -6,9 +6,10 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use norted_core::{
-    ApplicationCore, EnvironmentVariableProvenance, LoadProfileName, LoadProfilesStore,
-    LoadSettingsPatch, LoadSettingsProvenance, ModelId, NativeArgumentProvenance, ProcessIdentity,
-    RuntimeId, RuntimeProvenance, RuntimeSelection,
+    ApplicationCore, BuilderRecommendationStatus, EnvironmentVariableProvenance, LoadProfileName,
+    LoadProfilesState, LoadProfilesStore, LoadSettingsPatch, LoadSettingsProvenance, ModelArtifact,
+    ModelId, NativeArgumentProvenance, ProcessIdentity, RuntimeId, RuntimeProvenance,
+    RuntimeSelection, ServeProfile, ServeProfileRuntimeIdentity,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,8 +17,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, oneshot};
 
 use crate::{
     EffectiveGenerationSettings, EngineAdapter, EngineError, EngineIdentity, EngineProbe,
-    EngineRegistry, InferenceRequest, InstallationState, LaunchRequest, LoadProgressReporter,
-    ProcessDescriptor, ProcessExit, ProcessSupervisor, RoutedInferenceOutput,
+    EngineRegistry, GenerationSettingsPatch, InferenceRequest, InstallationState, LaunchRequest,
+    LoadProgressReporter, ProcessDescriptor, ProcessExit, ProcessSupervisor, RoutedInferenceOutput,
     RoutedInferenceStream, RuntimeLease, RuntimePackError, RuntimePackManager, StartupObservation,
 };
 
@@ -265,6 +266,7 @@ struct ActiveBackend {
     engine_id: String,
     endpoint: String,
     effective_generation_settings: EffectiveGenerationSettings,
+    serve_profile: Option<ServeProfile>,
     _runtime_lease: RuntimeLease,
 }
 
@@ -280,6 +282,151 @@ struct AdmittedLoad {
     settings: LoadSettingsPatch,
     cancellation_epoch: u64,
     generation: u64,
+}
+
+struct ResolvedServeProfileSelection {
+    profile: Option<ServeProfile>,
+    local_load_profile: Option<LoadProfileName>,
+    suppress_persisted_local_profile: bool,
+}
+
+async fn resolve_serve_profile(
+    core: &ApplicationCore,
+    model: &ModelArtifact,
+    state: &LoadProfilesState,
+    invocation: Option<&LoadProfileName>,
+) -> Result<ResolvedServeProfileSelection, String> {
+    let builder_profiles = core
+        .snapshot()
+        .await
+        .models
+        .into_iter()
+        .filter_map(|candidate| {
+            candidate
+                .norted_package
+                .and_then(|package| package.recommended_serve_profile)
+        })
+        .try_fold(
+            BTreeMap::<String, ServeProfile>::new(),
+            |mut profiles, profile| {
+                if let Some(existing) = profiles.get(&profile.id)
+                    && existing.content_hash() != profile.content_hash()
+                {
+                    return Err(format!(
+                        "discovered Builder Serve Profiles reuse ID `{}` with different content",
+                        profile.id
+                    ));
+                }
+                profiles.entry(profile.id.clone()).or_insert(profile);
+                Ok(profiles)
+            },
+        )?;
+
+    let local = |name: &LoadProfileName| {
+        state
+            .profiles
+            .get(name)
+            .map(|profile| profile.effective_serve_profile(name))
+    };
+    if let Some(name) = invocation {
+        if name.as_str() == "none" {
+            return Ok(ResolvedServeProfileSelection {
+                profile: None,
+                local_load_profile: None,
+                suppress_persisted_local_profile: true,
+            });
+        }
+        if let Some(profile) = local(name) {
+            return Ok(ResolvedServeProfileSelection {
+                profile: Some(profile),
+                local_load_profile: Some(name.clone()),
+                suppress_persisted_local_profile: true,
+            });
+        }
+        if let Some(profile) = builder_profiles.get(name.as_str()) {
+            return Ok(ResolvedServeProfileSelection {
+                profile: Some(profile.clone()),
+                local_load_profile: None,
+                suppress_persisted_local_profile: true,
+            });
+        }
+        return Err(format!("Serve Profile `{name}` does not exist"));
+    }
+
+    if state.raw_profile_models.contains(&model.id) {
+        return Ok(ResolvedServeProfileSelection {
+            profile: None,
+            local_load_profile: None,
+            suppress_persisted_local_profile: true,
+        });
+    }
+    if let Some(name) = state.model_assignments.get(&model.id) {
+        return Ok(ResolvedServeProfileSelection {
+            profile: Some(
+                local(name).ok_or_else(|| format!("Serve Profile `{name}` does not exist"))?,
+            ),
+            local_load_profile: None,
+            suppress_persisted_local_profile: false,
+        });
+    }
+    if let Some(profile_id) = state.builder_profile_assignments.get(&model.id) {
+        return Ok(ResolvedServeProfileSelection {
+            profile: Some(builder_profiles.get(profile_id).cloned().ok_or_else(|| {
+                format!(
+                    "assigned Builder Serve Profile `{profile_id}` is unavailable; its source package may have moved or been removed"
+                )
+            })?),
+            local_load_profile: None,
+            suppress_persisted_local_profile: true,
+        });
+    }
+    Ok(ResolvedServeProfileSelection {
+        profile: model
+            .norted_package
+            .as_ref()
+            .and_then(|package| package.recommended_serve_profile.clone()),
+        local_load_profile: None,
+        suppress_persisted_local_profile: true,
+    })
+}
+
+fn serve_profile_runtime_identity(
+    selected: Option<&ServeProfile>,
+    model: &norted_core::ModelRuntimeIdentity,
+) -> ServeProfileRuntimeIdentity {
+    let recommended = model
+        .norted_package
+        .as_ref()
+        .and_then(|package| package.binding.recommended_serve_profile.as_ref());
+    let status = match (recommended, selected) {
+        (None, _) => BuilderRecommendationStatus::NotApplicable,
+        (Some(_), None) => BuilderRecommendationStatus::Disabled,
+        (Some(recommended), Some(selected))
+            if recommended.id == selected.id
+                && recommended.content_hash() == selected.content_hash() =>
+        {
+            BuilderRecommendationStatus::Canonical
+        }
+        (Some(_), Some(_)) => BuilderRecommendationStatus::Replaced,
+    };
+    let template = selected.and_then(|profile| profile.prompt.template.as_ref());
+    ServeProfileRuntimeIdentity {
+        profile_id: selected.map(|profile| profile.id.clone()),
+        display_name: selected.map(|profile| profile.display_name.clone()),
+        source: selected.map(|profile| profile.source),
+        schema: selected.map(|profile| profile.schema.clone()),
+        schema_version: selected.map(|profile| profile.schema_version),
+        content_sha256: selected.map(|profile| {
+            profile
+                .source_profile_sha256
+                .clone()
+                .unwrap_or_else(|| profile.content_hash())
+        }),
+        builder_recommended_profile_id: recommended.map(|profile| profile.id.clone()),
+        builder_recommendation_status: status,
+        effective_template_identity: template.map(|template| template.identity.clone()),
+        effective_template_sha256: template.map(|template| template.sha256.clone()),
+    }
 }
 
 struct ManagerState {
@@ -635,7 +782,36 @@ impl RuntimeManager {
             BackendLoadProgress::indeterminate(BackendLoadPhase::SelectingRuntime),
         )
         .await;
-        let (adapter, selection) = match self.select_runtime(&model, runtime_id.as_ref()).await {
+        let profile_state = match self.load_profiles.read().await {
+            Ok(state) => state,
+            Err(error) => {
+                self.fail_loading(generation, error.to_string(), None).await;
+                return Err(RuntimeError::Operation(error.to_string()));
+            }
+        };
+        let profile_selection =
+            match resolve_serve_profile(&self.core, &model, &profile_state, profile.as_ref()).await
+            {
+                Ok(selection) => selection,
+                Err(error) => {
+                    self.fail_loading(generation, error.clone(), None).await;
+                    return Err(RuntimeError::Operation(error));
+                }
+            };
+        let serve_profile = profile_selection.profile;
+        if let Some(profile) = &serve_profile
+            && let Err(reason) = profile.basic_applicability(&model)
+        {
+            self.fail_loading(generation, reason.clone(), None).await;
+            return Err(RuntimeError::Incompatible {
+                model_id: model_id.clone(),
+                reason,
+            });
+        }
+        let (adapter, selection) = match self
+            .select_runtime(&model, runtime_id.as_ref(), serve_profile.as_ref())
+            .await
+        {
             Ok(selection) => selection,
             Err(error) => {
                 self.fail_loading(generation, error.to_string(), None).await;
@@ -659,17 +835,14 @@ impl RuntimeManager {
             BackendLoadProgress::indeterminate(BackendLoadPhase::ResolvingSettings),
         )
         .await;
-        let profile_state = match self.load_profiles.read().await {
-            Ok(state) => state,
-            Err(error) => {
-                self.fail_loading(generation, error.to_string(), None).await;
-                return Err(RuntimeError::Operation(error.to_string()));
-            }
-        };
-        let mut resolved_load_settings = match profile_state.resolve(
+        let mut load_state = profile_state.clone();
+        if profile_selection.suppress_persisted_local_profile {
+            load_state.model_assignments.remove(&model_id);
+        }
+        let mut resolved_load_settings = match load_state.resolve(
             &model_id,
             &engine_id,
-            profile.as_ref(),
+            profile_selection.local_load_profile.as_ref(),
             &invocation_settings,
             &self.core.paths.data_dir,
         ) {
@@ -679,15 +852,16 @@ impl RuntimeManager {
                 return Err(RuntimeError::Operation(error.to_string()));
             }
         };
-        if let Err(error) =
-            norted_core::apply_norted_package_load_policy(&model, &mut resolved_load_settings)
-        {
+        if let Err(error) = norted_core::apply_serve_profile_load_policy(
+            serve_profile.as_ref(),
+            &mut resolved_load_settings,
+        ) {
             self.fail_loading(generation, error.clone(), None).await;
             return Err(RuntimeError::Operation(error));
         }
         let host = self.packs.host_capabilities().await;
         let load_settings_schema = match adapter
-            .load_settings_schema(&selection.runtime, &model, &host)
+            .load_settings_schema(&selection.runtime, &model, &host, serve_profile.as_ref())
             .await
         {
             Ok(schema) => schema,
@@ -772,6 +946,7 @@ impl RuntimeManager {
                 backend_address,
                 load_settings: resolved_load_settings,
                 load_settings_schema,
+                serve_profile: serve_profile.clone(),
             })
             .await
         {
@@ -794,7 +969,14 @@ impl RuntimeManager {
             return Err(RuntimeError::Operation(detail));
         }
         let mut context_attempts = Vec::new();
-        let (process, endpoint, exit, mut startup_observation, effective_generation_settings) = loop {
+        let (
+            process,
+            endpoint,
+            exit,
+            mut startup_observation,
+            effective_generation_settings,
+            selected_serve_profile,
+        ) = loop {
             let launch_spec = launch_attempts
                 .pop_front()
                 .expect("launch attempts were checked as non-empty");
@@ -846,6 +1028,7 @@ impl RuntimeManager {
             let mut model_identity = launch_spec.model.runtime_identity();
             let normalized_settings = launch_spec.normalized_settings.clone();
             let load_settings = launch_spec.load_settings.clone();
+            let selected_serve_profile = launch_spec.serve_profile.clone();
             if let Some(package) = &mut model_identity.norted_package
                 && let Some(norted_core::LoadSettingValue::Choice(profile)) =
                     load_settings.value("ninfer.package_profile")
@@ -916,6 +1099,8 @@ impl RuntimeManager {
                     return Err(RuntimeError::StartupFailed(detail));
                 }
             };
+            let serve_profile_identity =
+                serve_profile_runtime_identity(selected_serve_profile.as_ref(), &model_identity);
             let provenance = RuntimeProvenance {
                 model: model_identity,
                 runtime: selected_runtime.manifest.clone(),
@@ -927,6 +1112,7 @@ impl RuntimeManager {
                     .selected_profile
                     .as_ref()
                     .map(ToString::to_string),
+                serve_profile: serve_profile_identity,
                 load_settings: LoadSettingsProvenance {
                     effective: load_settings.effective,
                 },
@@ -1030,7 +1216,14 @@ impl RuntimeManager {
                             return Err(RuntimeError::StartupFailed(detail));
                         }
                     };
-                    break (process, endpoint, exit, observation, settings);
+                    break (
+                        process,
+                        endpoint,
+                        exit,
+                        observation,
+                        settings,
+                        selected_serve_profile,
+                    );
                 }
                 StartupObservation::RetryContextCapacity {
                     kv_mode,
@@ -1175,6 +1368,7 @@ impl RuntimeManager {
                 engine_id: engine_id.clone(),
                 endpoint,
                 effective_generation_settings,
+                serve_profile: selected_serve_profile,
                 _runtime_lease: runtime_lease,
             });
             push_notice(
@@ -1289,8 +1483,13 @@ impl RuntimeManager {
         &self,
         request: InferenceRequest,
     ) -> Result<RoutedInferenceOutput, RuntimeError> {
-        let (adapter, endpoint, backend_generation_settings) =
+        let (adapter, endpoint, backend_generation_settings, serve_profile) =
             self.inference_target(&request.model_id).await?;
+        validate_profile_generation_overrides(
+            serve_profile.as_ref(),
+            &request.generation_settings,
+            adapter.identity().id.as_str(),
+        )?;
         adapter
             .validate_generation_settings(
                 &request.generation_settings,
@@ -1313,8 +1512,13 @@ impl RuntimeManager {
         &self,
         request: InferenceRequest,
     ) -> Result<RoutedInferenceStream, RuntimeError> {
-        let (adapter, endpoint, backend_generation_settings) =
+        let (adapter, endpoint, backend_generation_settings, serve_profile) =
             self.inference_target(&request.model_id).await?;
+        validate_profile_generation_overrides(
+            serve_profile.as_ref(),
+            &request.generation_settings,
+            adapter.identity().id.as_str(),
+        )?;
         adapter
             .validate_generation_settings(
                 &request.generation_settings,
@@ -1446,10 +1650,11 @@ impl RuntimeManager {
         &self,
         model: &norted_core::ModelArtifact,
         explicit_runtime: Option<&RuntimeId>,
+        serve_profile: Option<&ServeProfile>,
     ) -> Result<(Arc<dyn EngineAdapter>, RuntimeSelection), RuntimeError> {
         let selection = self
             .packs
-            .resolve(model, explicit_runtime)
+            .resolve_with_profile(model, explicit_runtime, serve_profile)
             .await
             .map_err(|error| match error {
                 RuntimePackError::Incompatible { reason, .. } => RuntimeError::Incompatible {
@@ -1575,7 +1780,15 @@ impl RuntimeManager {
     async fn inference_target(
         &self,
         model_id: &ModelId,
-    ) -> Result<(Arc<dyn EngineAdapter>, String, EffectiveGenerationSettings), RuntimeError> {
+    ) -> Result<
+        (
+            Arc<dyn EngineAdapter>,
+            String,
+            EffectiveGenerationSettings,
+            Option<ServeProfile>,
+        ),
+        RuntimeError,
+    > {
         if self.core.model(model_id).await.is_none() {
             return Err(RuntimeError::ModelNotFound(model_id.clone()));
         }
@@ -1585,6 +1798,7 @@ impl RuntimeManager {
                 Arc::clone(&active.adapter),
                 active.endpoint.clone(),
                 active.effective_generation_settings,
+                active.serve_profile.clone(),
             )),
             (BackendLifecycle::Failed, _) => Err(RuntimeError::BackendCrashed(
                 state
@@ -1836,6 +2050,41 @@ fn map_inference_error(error: EngineError) -> RuntimeError {
         EngineError::BackendUnavailable(message) => RuntimeError::InferenceUnavailable(message),
         error => RuntimeError::Inference(error.to_string()),
     }
+}
+
+fn validate_profile_generation_overrides(
+    profile: Option<&ServeProfile>,
+    settings: &GenerationSettingsPatch,
+    engine_id: &str,
+) -> Result<(), RuntimeError> {
+    if settings.reasoning_effort.is_some()
+        && (engine_id != "q27"
+            || !profile.is_some_and(|profile| {
+                profile.prompt.mode == norted_core::PromptMode::ExternalTemplate
+                    && profile.prompt.delivery == norted_core::PromptDelivery::RawCompletions
+            }))
+    {
+        return Err(RuntimeError::InvalidGenerationSettings(
+            "request-time reasoning_effort requires a selected q27 external-template Serve Profile"
+                .to_owned(),
+        ));
+    }
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    for (name, present) in [
+        ("temperature", settings.temperature.is_some()),
+        ("top_p", settings.top_p.is_some()),
+        ("reasoning_effort", settings.reasoning_effort.is_some()),
+    ] {
+        if present && !profile.generation.allows_override(name) {
+            return Err(RuntimeError::InvalidGenerationSettings(format!(
+                "Serve Profile `{}` does not allow request-time `{name}` overrides",
+                profile.display_name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn push_notice(state: &mut ManagerState, level: RuntimeNoticeLevel, message: String) {

@@ -158,7 +158,25 @@ impl RuntimePackManager {
         ),
         RuntimePackError,
     > {
-        let selection = self.resolve(model, explicit_runtime).await?;
+        self.load_settings_schema_for_model_with_profile(model, explicit_runtime, None)
+            .await
+    }
+
+    pub async fn load_settings_schema_for_model_with_profile(
+        &self,
+        model: &norted_core::ModelArtifact,
+        explicit_runtime: Option<&norted_core::RuntimeId>,
+        serve_profile: Option<&norted_core::ServeProfile>,
+    ) -> Result<
+        (
+            norted_core::RuntimeSelection,
+            norted_core::LoadSettingsSchema,
+        ),
+        RuntimePackError,
+    > {
+        let selection = self
+            .resolve_with_profile(model, explicit_runtime, serve_profile)
+            .await?;
         let engine_id = &selection.runtime.manifest.identity.engine_id;
         let adapter = self.registry.get(engine_id).ok_or_else(|| {
             RuntimePackError::Selection(format!(
@@ -167,7 +185,7 @@ impl RuntimePackManager {
         })?;
         let host = self.host_capabilities().await;
         let schema = adapter
-            .load_settings_schema(&selection.runtime, model, &host)
+            .load_settings_schema(&selection.runtime, model, &host, serve_profile)
             .await
             .map_err(RuntimePackError::Adapter)?;
         Ok((selection, schema))
@@ -271,7 +289,18 @@ impl RuntimePackManager {
         model: &ModelArtifact,
         force_refresh: bool,
     ) -> Result<RuntimeSearchSnapshot, RuntimePackError> {
-        self.search_internal(query, force_refresh, Some(model))
+        self.search_for_model_with_profile(query, model, force_refresh, None)
+            .await
+    }
+
+    pub async fn search_for_model_with_profile(
+        &self,
+        query: &str,
+        model: &ModelArtifact,
+        force_refresh: bool,
+        serve_profile: Option<&norted_core::ServeProfile>,
+    ) -> Result<RuntimeSearchSnapshot, RuntimePackError> {
+        self.search_internal(query, force_refresh, Some((model, serve_profile)))
             .await
     }
 
@@ -279,7 +308,7 @@ impl RuntimePackManager {
         &self,
         query: &str,
         force_refresh: bool,
-        model: Option<&ModelArtifact>,
+        model: Option<(&ModelArtifact, Option<&norted_core::ServeProfile>)>,
     ) -> Result<RuntimeSearchSnapshot, RuntimePackError> {
         let host = self.host.read().await.clone();
         let RuntimeCatalogSnapshot {
@@ -299,7 +328,7 @@ impl RuntimePackManager {
                     CompatibilityDecision::Supported => {
                         match adapter.available_runtime_compatibility(&entry.available) {
                             CompatibilityDecision::Supported => {
-                                if let Some(model) = model {
+                                if let Some((model, serve_profile)) = model {
                                     preferences.insert(
                                         entry.available.runtime_id.clone(),
                                         adapter.available_runtime_model_preference(
@@ -314,6 +343,7 @@ impl RuntimePackManager {
                                             &entry.available,
                                             model,
                                             &host,
+                                            serve_profile,
                                         ),
                                     )
                                 } else {
@@ -565,7 +595,7 @@ impl RuntimePackManager {
             .installed(&runtime_id)
             .await?
             .ok_or_else(|| RuntimePackError::NotInstalled(runtime_id.clone()))?;
-        self.validate_model_candidate(&runtime, model, &host)?;
+        self.validate_model_candidate(&runtime, model, &host, None)?;
         let mut selections = self.store.selections().await?;
         let previous = selections
             .model_overrides
@@ -625,15 +655,25 @@ impl RuntimePackManager {
         model: &ModelArtifact,
         explicit: Option<&RuntimeId>,
     ) -> Result<RuntimeSelection, RuntimePackError> {
+        self.resolve_with_profile(model, explicit, None).await
+    }
+
+    pub async fn resolve_with_profile(
+        &self,
+        model: &ModelArtifact,
+        explicit: Option<&RuntimeId>,
+        serve_profile: Option<&norted_core::ServeProfile>,
+    ) -> Result<RuntimeSelection, RuntimePackError> {
         self.refresh_host_capabilities().await;
         let list = self.list().await?;
-        self.resolve_from_snapshot(model, explicit, &list)
+        self.resolve_from_snapshot(model, explicit, serve_profile, &list)
     }
 
     fn resolve_from_snapshot(
         &self,
         model: &ModelArtifact,
         explicit: Option<&RuntimeId>,
+        serve_profile: Option<&norted_core::ServeProfile>,
         list: &RuntimeListSnapshot,
     ) -> Result<RuntimeSelection, RuntimePackError> {
         let host = list.host.clone();
@@ -649,7 +689,7 @@ impl RuntimePackManager {
                     reason: reason.clone(),
                 });
             }
-            self.validate_model_candidate(&status.runtime, model, &host)?;
+            self.validate_model_candidate(&status.runtime, model, &host, serve_profile)?;
             return Ok(RuntimeSelection {
                 runtime: status.runtime.clone(),
                 source: RuntimeSelectionSource::Invocation,
@@ -659,7 +699,7 @@ impl RuntimePackManager {
         }
         let mut notices = Vec::new();
         if let Some(runtime_id) = list.selections.model_overrides.get(&model.id) {
-            match self.selected_candidate(list, runtime_id, model) {
+            match self.selected_candidate(list, runtime_id, model, serve_profile) {
                 Ok(runtime) => {
                     return Ok(RuntimeSelection {
                         accelerator: self.model_candidate_accelerator(&runtime, model, &list.host),
@@ -674,7 +714,7 @@ impl RuntimePackManager {
             }
         }
         if let Some(runtime_id) = list.selections.format_defaults.get(&model.format) {
-            match self.selected_candidate(list, runtime_id, model) {
+            match self.selected_candidate(list, runtime_id, model, serve_profile) {
                 Ok(runtime) => {
                     return Ok(RuntimeSelection {
                         accelerator: self.model_candidate_accelerator(&runtime, model, &list.host),
@@ -704,7 +744,7 @@ impl RuntimePackManager {
                 rejected.push(format!("{}: {reason}", status.runtime.manifest.runtime_id));
                 continue;
             }
-            match self.model_candidate_compatibility(&status.runtime, model, &host) {
+            match self.model_candidate_compatibility(&status.runtime, model, &host, serve_profile) {
                 Ok(compatibility) if compatibility.is_usable() => compatible.push((
                     status,
                     compatibility,
@@ -763,6 +803,16 @@ impl RuntimePackManager {
         model: &ModelArtifact,
         active_model: Option<&ModelId>,
     ) -> Result<ModelServingCapabilities, RuntimePackError> {
+        self.model_serving_capabilities_with_profile(model, active_model, None)
+            .await
+    }
+
+    pub async fn model_serving_capabilities_with_profile(
+        &self,
+        model: &ModelArtifact,
+        active_model: Option<&ModelId>,
+        serve_profile: Option<&norted_core::ServeProfile>,
+    ) -> Result<ModelServingCapabilities, RuntimePackError> {
         self.refresh_host_capabilities().await;
         let list = self.list().await?;
 
@@ -786,17 +836,22 @@ impl RuntimePackManager {
                     .contains(&model.format)
             })
             .filter_map(|status| {
-                self.model_candidate_compatibility(&status.runtime, model, &list.host)
-                    .ok()
-                    .filter(RuntimeCompatibility::is_usable)
-                    .map(|_| status.runtime.manifest.runtime_id.clone())
+                self.model_candidate_compatibility(
+                    &status.runtime,
+                    model,
+                    &list.host,
+                    serve_profile,
+                )
+                .ok()
+                .filter(RuntimeCompatibility::is_usable)
+                .map(|_| status.runtime.manifest.runtime_id.clone())
             })
             .collect::<Vec<_>>();
         compatible_installed_runtime_ids.sort();
         compatible_installed_runtime_ids.dedup();
 
         let selected_runtime_id = self
-            .resolve_from_snapshot(model, None, &list)
+            .resolve_from_snapshot(model, None, serve_profile, &list)
             .ok()
             .map(|selection| selection.runtime.manifest.runtime_id);
 
@@ -811,8 +866,13 @@ impl RuntimePackManager {
                         .contains(&model.format)
                 })
                 .filter_map(|status| {
-                    self.model_candidate_compatibility(&status.runtime, model, &list.host)
-                        .ok()
+                    self.model_candidate_compatibility(
+                        &status.runtime,
+                        model,
+                        &list.host,
+                        serve_profile,
+                    )
+                    .ok()
                 })
                 .min_by_key(RuntimeCompatibility::preference_rank)
         });
@@ -1112,6 +1172,15 @@ impl RuntimePackManager {
         &self,
         model: &ModelArtifact,
     ) -> Result<Vec<RuntimeModelCandidate>, RuntimePackError> {
+        self.compatible_installed_for_model_with_profile(model, None)
+            .await
+    }
+
+    pub async fn compatible_installed_for_model_with_profile(
+        &self,
+        model: &ModelArtifact,
+        serve_profile: Option<&norted_core::ServeProfile>,
+    ) -> Result<Vec<RuntimeModelCandidate>, RuntimePackError> {
         let host = self.refresh_host_capabilities().await;
         let list = self.list().await?;
         let mut compatible = Vec::new();
@@ -1125,7 +1194,7 @@ impl RuntimePackManager {
             {
                 continue;
             }
-            match self.model_candidate_compatibility(&status.runtime, model, &host) {
+            match self.model_candidate_compatibility(&status.runtime, model, &host, serve_profile) {
                 Ok(compatibility) if compatibility.is_usable() => compatible.push((
                     status,
                     compatibility,
@@ -1181,6 +1250,7 @@ impl RuntimePackManager {
         list: &RuntimeListSnapshot,
         runtime_id: &RuntimeId,
         model: &ModelArtifact,
+        serve_profile: Option<&norted_core::ServeProfile>,
     ) -> Result<InstalledRuntime, RuntimePackError> {
         let status = list
             .installed
@@ -1193,7 +1263,7 @@ impl RuntimePackManager {
                 reason: reason.clone(),
             });
         }
-        self.validate_model_candidate(&status.runtime, model, &list.host)?;
+        self.validate_model_candidate(&status.runtime, model, &list.host, serve_profile)?;
         Ok(status.runtime.clone())
     }
 
@@ -1253,8 +1323,10 @@ impl RuntimePackManager {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
+        serve_profile: Option<&norted_core::ServeProfile>,
     ) -> Result<(), RuntimePackError> {
-        let compatibility = self.model_candidate_compatibility(runtime, model, host)?;
+        let compatibility =
+            self.model_candidate_compatibility(runtime, model, host, serve_profile)?;
         if let RuntimeCompatibility::Incompatible(reason) = compatibility {
             return Err(RuntimePackError::Incompatible {
                 runtime_id: runtime.manifest.runtime_id.clone(),
@@ -1269,6 +1341,7 @@ impl RuntimePackManager {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
+        serve_profile: Option<&norted_core::ServeProfile>,
     ) -> Result<RuntimeCompatibility, RuntimePackError> {
         self.validate_format_candidate(runtime, model.format, host)?;
         let adapter = self
@@ -1283,7 +1356,7 @@ impl RuntimePackManager {
         }
         Ok(combine_compatibility(
             compatibility_for_installed(runtime, host),
-            adapter.runtime_model_compatibility(runtime, model, host),
+            adapter.runtime_model_compatibility(runtime, model, host, serve_profile),
         ))
     }
 

@@ -360,9 +360,9 @@ impl UiLayout {
             settings_scopes = Rect::new(screen_body.x, screen_body.y, screen_body.width, 2);
             settings_list = Rect::new(
                 screen_body.x,
-                screen_body.y.saturating_add(4),
+                screen_body.y.saturating_add(6),
                 screen_body.width,
-                screen_body.height.saturating_sub(4),
+                screen_body.height.saturating_sub(6),
             );
             let scopes = app.settings_scopes();
             let mut x = settings_scopes.x;
@@ -371,6 +371,9 @@ impl UiLayout {
                     crate::app::SettingsScope::Global => "Global".to_owned(),
                     crate::app::SettingsScope::Engine(engine) => engine.clone(),
                     crate::app::SettingsScope::Profile(profile) => profile.to_string(),
+                    crate::app::SettingsScope::BuilderProfile(profile) => {
+                        format!("{profile} · Builder")
+                    }
                     crate::app::SettingsScope::Model(_) => "Selected model".to_owned(),
                 };
                 let width = (label.chars().count() as u16 + 2)

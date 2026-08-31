@@ -53,8 +53,8 @@ pub(crate) fn definitions() -> Vec<LoadSettingDefinition> {
         ),
         definition(
             "ninfer.package_profile",
-            "Norted package profile",
-            "Select a Builder-declared NInfer benchmark policy; this maps into the existing speculative settings",
+            "Serve Profile strategy",
+            "Select a speculative strategy declared by the active NInfer Serve Profile",
             LoadSettingKind::Choice {
                 choices: choices(&["mtp0", "mtp3"]),
             },

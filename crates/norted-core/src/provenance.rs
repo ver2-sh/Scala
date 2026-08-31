@@ -8,6 +8,29 @@ use crate::{
     ResolvedLoadSetting, RuntimeManifest, RuntimeSelectionSource,
 };
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuilderRecommendationStatus {
+    NotApplicable,
+    Canonical,
+    Replaced,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServeProfileRuntimeIdentity {
+    pub profile_id: Option<String>,
+    pub display_name: Option<String>,
+    pub source: Option<crate::ServeProfileSource>,
+    pub schema: Option<String>,
+    pub schema_version: Option<u32>,
+    pub content_sha256: Option<String>,
+    pub builder_recommended_profile_id: Option<String>,
+    pub builder_recommendation_status: BuilderRecommendationStatus,
+    pub effective_template_identity: Option<String>,
+    pub effective_template_sha256: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineRevision {
     pub engine_id: String,
@@ -126,6 +149,7 @@ pub struct RuntimeProvenance {
     pub accelerator: Option<AcceleratorDevice>,
     pub installation: EngineInstallation,
     pub profile: Option<String>,
+    pub serve_profile: ServeProfileRuntimeIdentity,
     #[serde(default)]
     pub load_settings: LoadSettingsProvenance,
     /// Adapter/runtime and generation facts retained for compatibility. This

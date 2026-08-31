@@ -139,6 +139,7 @@ pub enum AuxiliaryArtifactRole {
     Projector,
     Sharp,
     RuntimePolicy,
+    ServeProfile,
     Other(String),
 }
 
@@ -695,8 +696,20 @@ mod tests {
     };
     use crate::{
         LoadSettingId, LoadSettingSource, LoadSettingValue, ResolvedLoadSetting,
-        ResolvedLoadSettings, apply_norted_package_load_policy,
+        ResolvedLoadSettings, apply_serve_profile_load_policy,
     };
+
+    fn apply_recommended_profile(
+        artifact: &super::ModelArtifact,
+        settings: &mut ResolvedLoadSettings,
+    ) -> Result<(), String> {
+        let profile = artifact
+            .norted_package
+            .as_ref()
+            .and_then(|package| package.recommended_serve_profile.as_ref())
+            .expect("fixture has a recommended Serve Profile");
+        apply_serve_profile_load_policy(Some(profile), settings)
+    }
 
     #[test]
     fn q27_primary_keeps_its_id_and_owns_the_tokenizer_companion() {
@@ -771,6 +784,17 @@ mod tests {
         );
         let package = artifact.norted_package.as_ref().expect("package binding");
         assert_eq!(package.output_key, "q6");
+        let legacy_profile = package
+            .recommended_serve_profile
+            .as_ref()
+            .expect("synthesized legacy Serve Profile");
+        assert_eq!(
+            legacy_profile.source,
+            crate::ServeProfileSource::BuilderLegacyPolicy
+        );
+        assert!(legacy_profile.read_only);
+        assert_eq!(legacy_profile.display_name, "Dirk Quality");
+        assert!(package.serve_profile.is_none());
         assert_eq!(
             artifact.auxiliary_artifacts[0].path,
             root.join("model.tok").canonicalize().unwrap()
@@ -779,7 +803,7 @@ mod tests {
             engine_id: "q27".to_owned(),
             ..Default::default()
         };
-        apply_norted_package_load_policy(artifact, &mut settings).expect("q27 package settings");
+        apply_recommended_profile(artifact, &mut settings).expect("q27 Serve Profile settings");
         assert_eq!(
             settings.value("context_length"),
             Some(&LoadSettingValue::UnsignedInteger(262144))
@@ -790,8 +814,59 @@ mod tests {
         );
         assert!(matches!(
             settings.effective.values().next().unwrap().source,
-            LoadSettingSource::NortedPackagePolicy { .. }
+            LoadSettingSource::ServeProfile { .. }
         ));
+
+        let mut explicit_profile = legacy_profile.clone();
+        explicit_profile.source = crate::ServeProfileSource::BuilderRecommended;
+        explicit_profile.source_profile_sha256 = None;
+        explicit_profile
+            .prompt
+            .template
+            .as_mut()
+            .expect("Sharp template")
+            .path = std::path::PathBuf::from("Sharp.jinja");
+        let profile_bytes = serde_json::to_vec_pretty(&explicit_profile).unwrap();
+        std::fs::write(root.join("SERVE-PROFILE.json"), &profile_bytes).unwrap();
+        let mut current_manifest = manifest.clone();
+        current_manifest["schema"] = serde_json::json!(4);
+        current_manifest["serve_profile"] = serde_json::json!({
+            "filename": "SERVE-PROFILE.json",
+            "size": profile_bytes.len(),
+            "sha256": sha(&profile_bytes),
+            "profile_id": explicit_profile.id,
+            "schema": explicit_profile.schema,
+            "schema_version": explicit_profile.schema_version,
+        });
+        std::fs::write(
+            root.join("Q27-MANIFEST.json"),
+            serde_json::to_vec(&current_manifest).unwrap(),
+        )
+        .unwrap();
+        let explicit_registry = ModelRegistry::discover(&[root.to_path_buf()]);
+        let explicit_package = explicit_registry
+            .artifacts()
+            .iter()
+            .find_map(|artifact| artifact.norted_package.as_ref())
+            .expect("schema-four package");
+        assert!(explicit_package.serve_profile.is_some());
+        assert_eq!(
+            explicit_package
+                .recommended_serve_profile
+                .as_ref()
+                .unwrap()
+                .source,
+            crate::ServeProfileSource::BuilderRecommended
+        );
+        assert_eq!(
+            legacy_profile.content_hash(),
+            explicit_package
+                .recommended_serve_profile
+                .as_ref()
+                .unwrap()
+                .content_hash(),
+            "legacy synthesis and the explicit sidecar must identify one recipe"
+        );
 
         std::fs::write(root.join("q27-runtime.json"), b"{}").expect("break runtime policy");
         let rejected = ModelRegistry::discover(&[root.to_path_buf()]);
@@ -999,6 +1074,27 @@ mod tests {
         };
         assert_eq!(policy.kv_cache, "int8-group64");
         assert_eq!(policy.kv_dtype, "int8");
+        let synthesized = artifact
+            .norted_package
+            .as_ref()
+            .unwrap()
+            .recommended_serve_profile
+            .as_ref()
+            .expect("synthesized NInfer Serve Profile");
+        assert_eq!(
+            synthesized.source,
+            crate::ServeProfileSource::BuilderLegacyPolicy
+        );
+        assert!(synthesized.read_only);
+        assert_eq!(
+            synthesized
+                .engine
+                .ninfer
+                .as_ref()
+                .unwrap()
+                .default_speculative_profile,
+            "mtp0"
+        );
         let mut dflash = ResolvedLoadSettings {
             engine_id: "ninfer".to_owned(),
             ..Default::default()
@@ -1010,7 +1106,7 @@ mod tests {
                 source: LoadSettingSource::Invocation,
             },
         );
-        assert!(apply_norted_package_load_policy(artifact, &mut dflash).is_err());
+        assert!(apply_recommended_profile(artifact, &mut dflash).is_err());
         let profile_id = LoadSettingId::new("ninfer.package_profile").unwrap();
         let mut settings = ResolvedLoadSettings {
             engine_id: "ninfer".to_owned(),
@@ -1023,7 +1119,7 @@ mod tests {
                 source: LoadSettingSource::Invocation,
             },
         );
-        apply_norted_package_load_policy(artifact, &mut settings).expect("NInfer package settings");
+        apply_recommended_profile(artifact, &mut settings).expect("NInfer Serve Profile settings");
         assert_eq!(
             settings.value("ninfer.speculative_backend"),
             Some(&LoadSettingValue::Choice("mtp".to_owned()))
@@ -1046,7 +1142,7 @@ mod tests {
                 .get(&LoadSettingId::new("ninfer.kv_dtype").unwrap())
                 .expect("package-owned KV dtype")
                 .source,
-            LoadSettingSource::NortedPackagePolicy { .. }
+            LoadSettingSource::ServeProfile { .. }
         ));
 
         let kv_dtype_id = LoadSettingId::new("ninfer.kv_dtype").unwrap();
@@ -1061,8 +1157,8 @@ mod tests {
                 source: LoadSettingSource::Invocation,
             },
         );
-        apply_norted_package_load_policy(artifact, &mut explicit_int8)
-            .expect("package-compatible explicit KV dtype");
+        apply_recommended_profile(artifact, &mut explicit_int8)
+            .expect("profile-compatible explicit KV dtype");
         assert_eq!(
             explicit_int8.value("ninfer.kv_dtype"),
             Some(&LoadSettingValue::Choice("int8".to_owned()))
@@ -1073,7 +1169,7 @@ mod tests {
                 .get(&kv_dtype_id)
                 .expect("explicit package-owned KV dtype")
                 .source,
-            LoadSettingSource::NortedPackagePolicy { .. }
+            LoadSettingSource::Invocation
         ));
 
         for conflicting in ["fp8", "bf16"] {
@@ -1088,12 +1184,10 @@ mod tests {
                     source: LoadSettingSource::Invocation,
                 },
             );
-            assert_eq!(
-                apply_norted_package_load_policy(artifact, &mut settings),
-                Err(format!(
-                    "Norted NInfer package requires ninfer.kv_dtype=int8; requested {conflicting}"
-                ))
-            );
+            let error = apply_recommended_profile(artifact, &mut settings)
+                .expect_err("conflicting KV dtype must fail");
+            assert!(error.contains("requires ninfer.kv_dtype=int8"));
+            assert!(error.contains(conflicting));
         }
 
         let mut wrong_kv_type = ResolvedLoadSettings {
@@ -1107,22 +1201,15 @@ mod tests {
                 source: LoadSettingSource::Invocation,
             },
         );
-        assert_eq!(
-            apply_norted_package_load_policy(artifact, &mut wrong_kv_type),
-            Err(
-                "Norted NInfer package requires ninfer.kv_dtype=int8; resolved value has an invalid type"
-                    .to_owned()
-            )
-        );
+        assert!(apply_recommended_profile(artifact, &mut wrong_kv_type).is_err());
         settings
             .effective
             .get_mut(&LoadSettingId::new("ninfer.package_profile").unwrap())
             .unwrap()
             .value = LoadSettingValue::Choice("mtp0".to_owned());
-        apply_norted_package_load_policy(artifact, &mut settings).expect("NInfer mtp0 settings");
-        assert!(settings.value("ninfer.speculative_backend").is_none());
-        assert!(settings.value("ninfer.draft_tokens").is_none());
-        assert!(settings.value("ninfer.lm_head_draft").is_none());
+        let error = apply_recommended_profile(artifact, &mut settings)
+            .expect_err("changing to mtp0 must not silently ignore conflicting mtp3 settings");
+        assert!(error.contains("disables speculation"));
 
         let mut wrong = manifest;
         wrong["outputs"]["groupwise-int"]["artifact"]["weights_id"] = serde_json::json!("nvfp4");

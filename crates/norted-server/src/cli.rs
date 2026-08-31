@@ -51,7 +51,7 @@ pub enum Command {
         /// Exact installed runtime ID; overrides model and format selections
         #[arg(long)]
         runtime: Option<String>,
-        /// Named load profile for this invocation; replaces the model assignment
+        /// Serve Profile ID for this invocation, or `none` for raw runtime defaults
         #[arg(long)]
         profile: Option<String>,
         /// Ephemeral structured load override (repeatable SETTING_ID=VALUE)
@@ -66,7 +66,7 @@ pub enum Command {
     Engines(EnginesArgs),
     /// Search, install, select, update, and remove concrete runtime packs
     Runtimes(RuntimesArgs),
-    /// Create, edit, assign, and inspect reusable load profiles
+    /// Create, edit, assign, and inspect reusable Serve Profiles
     Profiles(ProfilesArgs),
     /// Manage defaults and inspect exact-runtime load settings
     Settings(SettingsArgs),
@@ -204,13 +204,15 @@ pub struct ProfilesArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ProfilesCommand {
-    /// List named profiles and model assignments
+    /// List local and discovered Builder Serve Profiles and model assignments
     List,
-    /// Show one named profile
+    /// Show one complete Serve Profile
     Show { name: String },
-    /// Create an empty named profile
+    /// Create an empty mutable local Serve Profile
     Create { name: String },
-    /// Delete an unassigned named profile
+    /// Duplicate/fork a profile into a mutable local Serve Profile
+    Duplicate { source: String, name: String },
+    /// Delete an unassigned mutable local Serve Profile
     Delete { name: String },
     /// Set one or more values in a named profile
     Set {
@@ -224,6 +226,24 @@ pub enum ProfilesCommand {
         #[arg(required = true, value_name = "SETTING_ID")]
         settings: Vec<String>,
     },
+    /// Set typed generation defaults in a mutable local Serve Profile
+    SetGeneration {
+        name: String,
+        #[arg(required = true, value_name = "FIELD=VALUE")]
+        values: Vec<String>,
+    },
+    /// Select runtime-default prompt handling for a mutable local Serve Profile
+    SetPromptRuntimeDefault { name: String },
+    /// Bind a local template and raw-completions delivery to a mutable Serve Profile
+    SetPromptExternal {
+        name: String,
+        #[arg(long)]
+        template: std::path::PathBuf,
+        #[arg(long)]
+        template_id: String,
+        #[arg(long)]
+        template_sha256: String,
+    },
     /// Persist one named profile assignment for a model
     Assign {
         #[arg(long)]
@@ -234,6 +254,19 @@ pub enum ProfilesCommand {
     ClearAssignment {
         #[arg(long)]
         model: String,
+    },
+    /// Remove an explicit selection and inherit the Builder recommendation again
+    UseRecommended {
+        #[arg(long)]
+        model: String,
+    },
+    /// Evaluate model + exact runtime + Serve Profile compatibility
+    Compatibility {
+        name: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        runtime: Option<String>,
     },
 }
 
