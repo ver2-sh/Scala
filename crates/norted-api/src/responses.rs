@@ -65,7 +65,7 @@ pub(super) async fn create(
     let response_id = format!("resp_{}", Uuid::new_v4().simple());
     let message_id = format!("msg_{}", Uuid::new_v4().simple());
     let created_at = unix_timestamp();
-    let inference = parsed.normalized.inference_request();
+    let inference = parsed.normalized.inference_request()?;
     let public_model = parsed.normalized.model.clone();
     let max_output_tokens = parsed.normalized.max_output_tokens;
     if parsed.normalized.stream {

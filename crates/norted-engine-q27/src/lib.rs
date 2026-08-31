@@ -15,13 +15,13 @@ use minijinja::{Environment, ErrorKind, context};
 use norted_core::{
     AcceleratorDevice, AcquisitionMethod, ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime,
     ComputeCapability, EngineConfig, EngineInstallation, EngineRevision, HostCapabilities,
-    InstalledRuntime, LoadSettingDefinition, LoadSettingId, LoadSettingKind, LoadSettingScope,
-    LoadSettingValue, LoadSettingsSchema, ModelArtifact, RuntimeAcquisitionMethod,
-    RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest,
-    RuntimeDownload, RuntimeId, RuntimeIdentity, RuntimePackageIdentity, RuntimeProbeObservation,
-    RuntimeReleaseChannel, RuntimeRequirements, RuntimeSourceBuildPlan,
-    RuntimeSourceBuildPrerequisites, RuntimeSourceBuildProvenance, RuntimeSourceBuildRecipe,
-    RuntimeSourceBuildSystem, RuntimeSourceSnapshot,
+    InstalledRuntime, ModelArtifact, RuntimeAcquisitionMethod, RuntimeAcquisitionPlan,
+    RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest, RuntimeDownload, RuntimeId,
+    RuntimeIdentity, RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel,
+    RuntimeRequirements, RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites,
+    RuntimeSourceBuildProvenance, RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem,
+    RuntimeSourceSnapshot, SettingCategory, SettingDefinition, SettingId, SettingKind,
+    SettingScope, SettingValue, SettingsSchema,
 };
 use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CatalogError, CompatibilityDecision,
@@ -32,7 +32,7 @@ use norted_engine::{
     InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter,
     NativeOption, OptionValueKind, PreparedAuxiliaryArtifact, PreparedModelInput,
     ProcessDescriptor, RuntimeCatalogProvider, StartupObservation, UpdateState, capture_command,
-    common_load_setting_definitions, compatibility_for, compatibility_for_nvidia_device,
+    common_setting_definitions, compatibility_for, compatibility_for_nvidia_device,
     isolated_cuda_environment, prepare_norted_package_input,
     prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
     revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
@@ -72,7 +72,7 @@ const SOURCE_METADATA_LIMIT: usize = 512 * 1024;
 
 mod model;
 
-use model::{Q27ModelFacts, Q27Tier, inspect_q27_model};
+use model::{Q27Tier, inspect_q27_model};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -422,34 +422,6 @@ fn materialize_qualified_releases(
         }
     }
     Ok(runtimes)
-}
-
-#[cfg(test)]
-fn catalog_runtimes(releases: &[GitHubRelease]) -> Result<Vec<AvailableRuntime>, CatalogError> {
-    let qualified = releases
-        .iter()
-        .enumerate()
-        .filter_map(|(ordinal, release)| {
-            if release.draft {
-                return None;
-            }
-            release.assets.iter().find_map(|asset| {
-                let (version, digest) = qualify_release_asset(release, asset)?;
-                Some(QualifiedRelease {
-                    release,
-                    version,
-                    binary: Some((asset, digest)),
-                    source: None,
-                    published_at_unix: release
-                        .published_at
-                        .as_deref()
-                        .and_then(parse_github_timestamp),
-                    ordinal,
-                })
-            })
-        })
-        .collect();
-    materialize_qualified_releases(qualified)
 }
 
 fn release_version(release: &GitHubRelease) -> Option<String> {
@@ -1047,6 +1019,7 @@ enum Q27KvMode {
     Fp8,
     Turbo5k,
     Turbo3,
+    Fp16,
 }
 
 impl Q27KvMode {
@@ -1057,14 +1030,12 @@ impl Q27KvMode {
             Self::Fp8 => "fp8",
             Self::Turbo5k => "turbo5k",
             Self::Turbo3 => "turbo3",
+            Self::Fp16 => "fp16",
         }
     }
 }
 
-const Q27_V062_PROFILE_KV_MODES: &[Q27KvMode] = &[Q27KvMode::Fp8, Q27KvMode::Turbo3];
-#[cfg(test)]
-const ALL_Q27_KV_MODES: &[Q27KvMode] = &Q27KvMode::QUALITY_ORDER;
-
+const Q27_V062_KV_MODES: &[Q27KvMode] = &[Q27KvMode::Fp8, Q27KvMode::Turbo3, Q27KvMode::Fp16];
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct Q27RuntimeCapabilities {
     trustworthy_identity: bool,
@@ -1106,7 +1077,7 @@ fn q27_runtime_capabilities(
     let trustworthy_identity = exact_managed_v062 || exact_source_contract;
     Q27RuntimeCapabilities {
         trustworthy_identity,
-        // Sharp rendering is Norted-owned. The runtime facts below are proven
+        // Sharp rendering is Server-owned. The runtime facts below are proven
         // by either the historical binary contract or the immutable v2 source
         // contract admitted from the exact source file fingerprints.
         raw_completions: trustworthy_identity,
@@ -1125,76 +1096,24 @@ fn q27_runtime_capabilities(
         bounded_startup_observation: trustworthy_identity,
         compiled_w_max: q27_compiled_w_max(identity, acquisition, source_evidence),
         // q27 v0.6.2 source contains fp8 and turbo3. It does not contain the
-        // Serve Profile's intermediate turbo5k mode.
+        // automatic quality sequence's intermediate turbo5k mode.
         supported_kv_modes: if exact_source_contract {
             &Q27KvMode::QUALITY_ORDER
         } else if exact_managed_v062 {
-            Q27_V062_PROFILE_KV_MODES
+            Q27_V062_KV_MODES
         } else {
             &[]
         },
     }
 }
 
-#[cfg(test)]
-fn q27_runtime_contract_failures(capabilities: Q27RuntimeCapabilities) -> Vec<&'static str> {
-    let mut reasons = Vec::new();
-    if !capabilities.raw_completions {
-        reasons.push("raw /v1/completions prompt handling is unproven");
-    }
-    if !capabilities.exact_sharp_renderer {
-        reasons.push("exact manifest-bound Sharp application is unproven");
-    }
-    if !capabilities.thinking {
-        reasons.push("thinking-enabled Serve Profile execution is unproven");
-    }
-    if !capabilities.unlimited_think_budget {
-        reasons.push("unlimited thinking budget is unsupported/unproven");
-    }
-    if !capabilities.temperature_top_p {
-        reasons.push("temperature/top-p Serve Profile defaults are unsupported/unproven");
-    }
-    if !capabilities.top_k_min_p {
-        reasons.push("top-k/min-p Serve Profile defaults are unsupported/unproven");
-    }
-    if !capabilities.mtp_environment {
-        reasons.push("Q27_MAXD/Q27_PMIN/Q27_SUFFIX Serve Profile is unproven");
-    }
-    if !capabilities.fast_head_control {
-        reasons.push("fast-head Serve Profile control is unproven");
-    }
-    if !capabilities.bounded_startup_observation {
-        reasons.push("served context/KV startup observation is unproven");
-    }
-    if capabilities.compiled_w_max.is_none() {
-        reasons.push("numeric compiled W_MAX is unproven");
-    }
-    if capabilities.supported_kv_modes.is_empty() {
-        reasons.push("no Serve Profile KV mode is proven for this executable");
-    }
-    reasons
-}
-
-#[cfg(test)]
-fn evaluate_q27_runtime_contract(capabilities: Q27RuntimeCapabilities) -> RuntimeCompatibility {
-    match validate_q27_runtime_contract(capabilities) {
-        Ok(()) => RuntimeCompatibility::NeedsAttention(
-            "pre-launch q27 Serve Profile capabilities are proven; actual served context, KV mode, and W_MAX still require bounded startup observation"
-                .to_owned(),
-        ),
-        Err(reason) => RuntimeCompatibility::Incompatible(format!(
-            "{reason}; actual served context and selected KV mode are not yet proven because startup cannot proceed"
-        )),
-    }
-}
-
-fn evaluate_q27_profile_runtime(
-    profile: &norted_core::ServeProfile,
+fn evaluate_q27_configured_runtime(
+    settings: &norted_core::ResolvedSettings,
     capabilities: Q27RuntimeCapabilities,
 ) -> RuntimeCompatibility {
-    match validate_q27_profile_prelaunch(profile, capabilities) {
+    match validate_q27_settings_prelaunch(settings, capabilities) {
         Ok(()) => RuntimeCompatibility::NeedsAttention(
-            "the exact runtime satisfies the Serve Profile's pre-launch capabilities; actual served context, KV mode, and W_MAX still require bounded startup observation"
+            "the exact runtime satisfies the configured q27 controls; actual served context, KV mode, and W_MAX still require bounded startup observation"
                 .to_owned(),
         ),
         Err(reason) => RuntimeCompatibility::Incompatible(format!(
@@ -1203,91 +1122,79 @@ fn evaluate_q27_profile_runtime(
     }
 }
 
-fn validate_q27_profile_prelaunch(
-    profile: &norted_core::ServeProfile,
+fn validate_q27_settings_prelaunch(
+    settings: &norted_core::ResolvedSettings,
     capabilities: Q27RuntimeCapabilities,
 ) -> Result<(), String> {
     if !capabilities.trustworthy_identity {
         return Err(
-            "the exact q27 executable has no trustworthy Serve Profile capability observation; external binaries are not credited from filenames or upstream version assumptions"
+            "the exact q27 executable has no trustworthy capability observation; external binaries are not credited from filenames or upstream version assumptions"
                 .to_owned(),
         );
     }
     let mut failures = Vec::new();
-    if let Some(strategy) = profile.engine.q27.as_ref()
-        && !strategy.mtp.enabled
-        && !capabilities.mtp_disable_control
-    {
+    if setting_toggle(settings, "q27.mtp") == Some(false) && !capabilities.mtp_disable_control {
         failures.push(
             "the exact q27 runtime always uses its NextN/MTP speculative engine and exposes no proven MTP-disable control",
         );
     }
-    match (profile.prompt.mode, profile.prompt.delivery) {
-        (norted_core::PromptMode::RuntimeDefault, norted_core::PromptDelivery::RuntimeChat)
-        | (
-            norted_core::PromptMode::ExternalTemplate,
-            norted_core::PromptDelivery::RawCompletions,
-        ) => {}
-        _ => failures
-            .push("the q27 adapter cannot prove the selected prompt-mode/delivery combination"),
+    let prompt_mode = setting_choice(settings, "q27.prompt_mode").unwrap_or("runtime_default");
+    let delivery = setting_choice(settings, "q27.prompt_delivery").unwrap_or("runtime_chat");
+    if !matches!(
+        (prompt_mode, delivery),
+        ("runtime_default", "runtime_chat") | ("external_template", "raw_completions")
+    ) {
+        failures.push("the q27 adapter cannot apply the selected prompt mode/delivery combination");
     }
-    if profile.prompt.response_filter != norted_core::ResponseFilter::None
-        && profile.prompt.mode != norted_core::PromptMode::ExternalTemplate
+    if setting_choice(settings, "q27.response_filter").is_some_and(|value| value != "none")
+        && prompt_mode != "external_template"
     {
         failures.push("q27 response filtering requires an externally rendered raw prompt");
     }
-    for requirement in profile.effective_requirements() {
-        use norted_core::ServeCapability;
-        let failure = match requirement {
-            ServeCapability::RawCompletionPromptInput if !capabilities.raw_completions => {
-                Some("raw /v1/completions prompt handling is unproven")
-            }
-            ServeCapability::ExternalTemplateApplication if !capabilities.exact_sharp_renderer => {
-                Some("external template application is unproven")
-            }
-            ServeCapability::Thinking if !capabilities.thinking => {
-                Some("thinking-enabled execution is unproven")
-            }
-            ServeCapability::UnlimitedThinkingBudget if !capabilities.unlimited_think_budget => {
-                Some("unlimited thinking budget is unsupported/unproven")
-            }
-            ServeCapability::TemperatureTopP if !capabilities.temperature_top_p => {
-                Some("temperature/top-p controls are unsupported/unproven")
-            }
-            ServeCapability::TopKMinP if !capabilities.top_k_min_p => {
-                Some("top-k/min-p controls are unsupported/unproven")
-            }
-            ServeCapability::Mtp | ServeCapability::SuffixDrafting
-                if !capabilities.mtp_environment =>
-            {
-                Some("MTP/suffix strategy controls are unproven")
-            }
-            ServeCapability::ObservedWMax if capabilities.compiled_w_max.is_none() => {
-                Some("numeric compiled W_MAX is unproven")
-            }
-            ServeCapability::FastHeadControl if !capabilities.fast_head_control => {
-                Some("fast-head control is unproven")
-            }
-            ServeCapability::StartupBannerObservation | ServeCapability::ServedContextProof
-                if !capabilities.bounded_startup_observation =>
-            {
-                Some("served context/startup observation is unproven")
-            }
-            ServeCapability::KvModeProof if capabilities.supported_kv_modes.is_empty() => {
-                Some("no Serve Profile KV mode is proven for this executable")
-            }
-            ServeCapability::NinferCudaGraph
-            | ServeCapability::NinferPrefixReuse
-            | ServeCapability::NinferStartupObservation => {
-                Some("the Serve Profile requires an NInfer-only capability")
-            }
-            _ => None,
-        };
-        if let Some(failure) = failure
-            && !failures.contains(&failure)
-        {
-            failures.push(failure);
-        }
+    if prompt_mode == "external_template"
+        && (!capabilities.raw_completions || !capabilities.exact_sharp_renderer)
+    {
+        failures.push("external template rendering/raw completion delivery is unproven");
+    }
+    if settings.value("q27.thinking").is_some() && !capabilities.thinking {
+        failures.push("thinking control is unproven");
+    }
+    if settings.value("q27.thinking_budget").is_some() && !capabilities.unlimited_think_budget {
+        failures.push("thinking budget control is unproven");
+    }
+    if (settings.value("temperature").is_some() || settings.value("top_p").is_some())
+        && !capabilities.temperature_top_p
+    {
+        failures.push("temperature/top-p controls are unproven");
+    }
+    if (settings.value("top_k").is_some() || settings.value("min_p").is_some())
+        && !capabilities.top_k_min_p
+    {
+        failures.push("top-k/min-p controls are unproven");
+    }
+    if [
+        "q27.mtp",
+        "q27.mtp_max_depth",
+        "q27.mtp_min_probability",
+        "q27.suffix_drafting",
+        "q27.suffix_width_mode",
+    ]
+    .into_iter()
+    .any(|id| settings.value(id).is_some())
+        && !capabilities.mtp_environment
+    {
+        failures.push("MTP/suffix controls are unproven");
+    }
+    if setting_choice(settings, "q27.suffix_width_mode") == Some("runtime_w_max")
+        && capabilities.compiled_w_max.is_none()
+    {
+        failures.push("numeric compiled W_MAX is unproven");
+    }
+    if settings.value("q27.fast_head").is_some() && !capabilities.fast_head_control {
+        failures.push("fast-head control is unproven");
+    }
+    if settings.value("q27.kv_mode").is_some() && capabilities.supported_kv_modes.is_empty() {
+        failures.push("no configurable KV mode is proven for this executable");
     }
     if failures.is_empty() {
         Ok(())
@@ -1296,36 +1203,23 @@ fn validate_q27_profile_prelaunch(
     }
 }
 
-#[cfg(test)]
-fn validate_q27_runtime_contract(capabilities: Q27RuntimeCapabilities) -> Result<(), String> {
-    if !capabilities.trustworthy_identity {
-        return Err(
-            "the exact q27 executable has no trustworthy package-capability observation; external binaries are not credited from filenames or upstream version assumptions"
-                .to_owned(),
-        );
-    }
-    let failures = q27_runtime_contract_failures(capabilities);
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(failures.join("; "))
-    }
-}
-
-fn q27_profile_kv_attempt_modes(
+fn q27_configured_kv_attempt_modes(
     capabilities: Q27RuntimeCapabilities,
-    strategy: &norted_core::Q27ServeStrategy,
+    settings: &norted_core::ResolvedSettings,
 ) -> Vec<Q27KvMode> {
-    Q27KvMode::QUALITY_ORDER
-        .into_iter()
-        .filter(|mode| capabilities.supported_kv_modes.contains(mode))
-        .filter(|mode| {
-            strategy
-                .kv_quality_order
-                .iter()
-                .any(|declared| declared == mode.as_str())
-        })
-        .collect()
+    match setting_choice(settings, "q27.kv_mode") {
+        None | Some("runtime_default") => Vec::new(),
+        Some("auto") => Q27KvMode::QUALITY_ORDER
+            .into_iter()
+            .filter(|mode| capabilities.supported_kv_modes.contains(mode))
+            .collect(),
+        Some(selected) => capabilities
+            .supported_kv_modes
+            .iter()
+            .copied()
+            .filter(|mode| mode.as_str() == selected)
+            .collect(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1533,230 +1427,166 @@ pub struct Q27Adapter {
     configuration_error: Option<String>,
     client: reqwest::Client,
     capability_cache: tokio::sync::RwLock<BTreeMap<String, String>>,
-    profile_executions: tokio::sync::RwLock<BTreeMap<String, Q27ProfileExecution>>,
+    configured_executions: tokio::sync::RwLock<BTreeMap<String, Q27ConfiguredExecution>>,
 }
 
 #[derive(Debug, Clone)]
-struct Q27ProfileExecution {
-    profile: norted_core::ServeProfile,
+struct Q27ConfiguredExecution {
+    settings: norted_core::ResolvedSettings,
     sharp_template: Option<String>,
     compiled_w_max: Option<u64>,
-    expected_fast_head: bool,
-    selected_kv_mode: Q27KvMode,
+    selected_kv_mode: Option<Q27KvMode>,
 }
 
 #[derive(Debug)]
-struct Q27ProfileLaunchConfiguration {
+struct Q27ConfiguredLaunch {
     arguments: Vec<OsString>,
     environment: BTreeMap<String, String>,
     normalized_settings: BTreeMap<String, Value>,
 }
 
-fn q27_profile_applicability(
-    profile: &norted_core::ServeProfile,
-    model: &ModelArtifact,
-    facts: &Q27ModelFacts,
-) -> Result<(), String> {
-    profile.basic_applicability(model)?;
-    if profile.requires_runtime_recipe() && profile.engine.q27.is_none() {
-        return Err(format!(
-            "Serve Profile `{}` defines execution behavior but has no q27 strategy",
-            profile.display_name
-        ));
-    }
-    if let Some(required) = profile.applicability.architecture.as_deref()
-        && required != facts.architecture
-    {
-        return Err(format!(
-            "Serve Profile `{}` requires architecture `{required}`, but q27 proved `{}`",
-            profile.display_name, facts.architecture
-        ));
-    }
-    if let Some(required) = profile.applicability.family.as_deref() {
-        match facts.family {
-            Some(observed) if observed == required => {}
-            Some(observed) => {
-                return Err(format!(
-                    "Serve Profile `{}` requires family `{required}`, but q27 proved `{observed}`",
-                    profile.display_name
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "Serve Profile `{}` requires family `{required}`, but the bounded q27 metadata does not prove a published family",
-                    profile.display_name
-                ));
-            }
-        }
-    }
-    for required in &profile.applicability.required_model_capabilities {
-        if !facts.capabilities.contains(required.as_str()) {
-            return Err(format!(
-                "Serve Profile `{}` requires model capability `{required}`, which the bounded q27 artifact inspection did not prove",
-                profile.display_name
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn q27_profile_has_execution_recipe(profile: &norted_core::ServeProfile) -> bool {
-    profile.requires_runtime_recipe()
-}
-
-fn q27_selected_fast_head(
-    settings: &norted_core::ResolvedLoadSettings,
-    strategy: &norted_core::Q27ServeStrategy,
-) -> Result<bool, EngineError> {
-    match settings.value("q27.fast_head") {
-        Some(LoadSettingValue::Toggle(value)) => Ok(*value),
-        None => Ok(strategy.fast_head.default),
-        Some(_) => Err(EngineError::InvalidConfiguration(
-            "q27.fast_head has an invalid Serve Profile value".to_owned(),
-        )),
+fn setting_toggle(settings: &norted_core::ResolvedSettings, id: &str) -> Option<bool> {
+    match settings.value(id) {
+        Some(SettingValue::Toggle(value)) => Some(*value),
+        _ => None,
     }
 }
 
-fn q27_profile_launch_configuration(
-    profile: &norted_core::ServeProfile,
+fn setting_unsigned(settings: &norted_core::ResolvedSettings, id: &str) -> Option<u64> {
+    match settings.value(id) {
+        Some(SettingValue::UnsignedInteger(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn setting_float(settings: &norted_core::ResolvedSettings, id: &str) -> Option<f64> {
+    match settings.value(id) {
+        Some(SettingValue::Float(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn setting_choice<'a>(settings: &'a norted_core::ResolvedSettings, id: &str) -> Option<&'a str> {
+    match settings.value(id) {
+        Some(SettingValue::Choice(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn q27_has_configured_execution(settings: &norted_core::ResolvedSettings) -> bool {
+    settings.effective.keys().any(|id| {
+        matches!(
+            id.as_str(),
+            "context_length"
+                | "temperature"
+                | "top_p"
+                | "top_k"
+                | "min_p"
+                | "reasoning_effort"
+                | "q27.thinking"
+                | "q27.thinking_budget"
+                | "q27.fast_head"
+                | "q27.kv_mode"
+                | "q27.mtp"
+                | "q27.mtp_max_depth"
+                | "q27.mtp_min_probability"
+                | "q27.suffix_drafting"
+                | "q27.suffix_width_mode"
+                | "q27.prompt_mode"
+                | "q27.prompt_delivery"
+                | "q27.template_path"
+                | "q27.template_sha256"
+                | "q27.render_generation_prompt"
+                | "q27.template_thinking"
+                | "q27.response_filter"
+        )
+    })
+}
+
+fn settings_require_selected_kv(settings: &norted_core::ResolvedSettings) -> bool {
+    setting_choice(settings, "q27.kv_mode").is_some_and(|value| value != "runtime_default")
+}
+
+fn q27_configured_launch(
+    settings: &norted_core::ResolvedSettings,
     compiled_w_max: Option<u64>,
-    fast_head: bool,
-    kv_mode: Q27KvMode,
-) -> Result<Q27ProfileLaunchConfiguration, EngineError> {
-    let strategy = profile.engine.q27.as_ref().ok_or_else(|| {
-        EngineError::InvalidConfiguration(format!(
-            "Serve Profile `{}` has no q27 strategy",
-            profile.display_name
-        ))
-    })?;
-    let mut arguments = vec![OsString::from(if profile.generation.thinking.default {
-        "--think"
-    } else {
-        "--no-think"
-    })];
-    let unlimited_thinking = profile
-        .requirements
-        .contains(&norted_core::ServeCapability::UnlimitedThinkingBudget);
-    if unlimited_thinking {
-        arguments.extend([OsString::from("--think-budget"), OsString::from("0")]);
+    selected_kv_mode: Option<Q27KvMode>,
+) -> Result<Q27ConfiguredLaunch, EngineError> {
+    let mut arguments = Vec::new();
+    if let Some(thinking) = setting_toggle(settings, "q27.thinking") {
+        arguments.push(OsString::from(if thinking {
+            "--think"
+        } else {
+            "--no-think"
+        }));
+    }
+    if let Some(budget) = setting_unsigned(settings, "q27.thinking_budget") {
+        arguments.extend([
+            OsString::from("--think-budget"),
+            OsString::from(budget.to_string()),
+        ]);
     }
     for (option, value) in [
         (
             "--temp",
-            profile
-                .generation
-                .defaults
-                .temperature
-                .map(|value| value.to_string()),
+            setting_float(settings, "temperature").map(|value| value.to_string()),
         ),
         (
             "--top-p",
-            profile
-                .generation
-                .defaults
-                .top_p
-                .map(|value| value.to_string()),
+            setting_float(settings, "top_p").map(|value| value.to_string()),
         ),
         (
             "--top-k",
-            profile
-                .generation
-                .defaults
-                .top_k
-                .map(|value| value.to_string()),
+            setting_unsigned(settings, "top_k").map(|value| value.to_string()),
         ),
         (
             "--min-p",
-            profile
-                .generation
-                .defaults
-                .min_p
-                .map(|value| value.to_string()),
+            setting_float(settings, "min_p").map(|value| value.to_string()),
         ),
     ] {
         if let Some(value) = value {
             arguments.extend([OsString::from(option), OsString::from(value)]);
         }
     }
-    let mut environment = BTreeMap::from([("Q27_KV".to_owned(), kv_mode.as_str().to_owned())]);
-    if strategy.mtp.enabled {
-        environment.insert("Q27_MAXD".to_owned(), strategy.mtp.maximum_depth.clone());
-        environment.insert(
-            "Q27_PMIN".to_owned(),
-            strategy.mtp.minimum_probability.to_string(),
-        );
-        environment.insert(
-            "Q27_SUFFIX".to_owned(),
-            u8::from(strategy.suffix_drafting).to_string(),
-        );
-        if strategy.suffix_width_from_runtime_w_max {
+    let mut environment = BTreeMap::new();
+    if let Some(kv_mode) = selected_kv_mode {
+        if kv_mode == Q27KvMode::Fp16 {
+            arguments.push(OsString::from("--kv-fp16"));
+        } else {
+            environment.insert("Q27_KV".to_owned(), kv_mode.as_str().to_owned());
+        }
+    }
+    if setting_toggle(settings, "q27.mtp") != Some(false) {
+        if let Some(depth) = setting_unsigned(settings, "q27.mtp_max_depth") {
+            environment.insert("Q27_MAXD".to_owned(), depth.to_string());
+        }
+        if let Some(probability) = setting_float(settings, "q27.mtp_min_probability") {
+            environment.insert("Q27_PMIN".to_owned(), probability.to_string());
+        }
+        if let Some(suffix) = setting_toggle(settings, "q27.suffix_drafting") {
+            environment.insert("Q27_SUFFIX".to_owned(), u8::from(suffix).to_string());
+        }
+        if setting_choice(settings, "q27.suffix_width_mode") == Some("runtime_w_max") {
             let compiled_w_max = compiled_w_max.ok_or_else(|| {
                 EngineError::InvalidConfiguration(
-                    "q27 Serve Profile suffix drafting has no proven numeric compiled W_MAX"
-                        .to_owned(),
+                    "q27 suffix drafting has no proven numeric compiled W_MAX".to_owned(),
                 )
             })?;
             environment.insert("Q27_SUFFIX_W".to_owned(), compiled_w_max.to_string());
         }
     }
-    let mut normalized_settings = BTreeMap::from([
-        (
-            "thinking".to_owned(),
-            json!(profile.generation.thinking.default),
-        ),
-        ("mtp_enabled".to_owned(), json!(strategy.mtp.enabled)),
-        ("mtp_required".to_owned(), json!(strategy.mtp.required)),
-        (
-            "suffix_drafting".to_owned(),
-            json!(strategy.suffix_drafting),
-        ),
-        ("requested_kv_mode".to_owned(), json!(kv_mode.as_str())),
-        ("fast_head".to_owned(), json!(fast_head)),
-    ]);
-    for (name, value) in [
-        (
-            "temperature",
-            profile.generation.defaults.temperature.map(Value::from),
-        ),
-        ("top_p", profile.generation.defaults.top_p.map(Value::from)),
-        ("top_k", profile.generation.defaults.top_k.map(Value::from)),
-        ("min_p", profile.generation.defaults.min_p.map(Value::from)),
-    ] {
-        if let Some(value) = value {
-            normalized_settings.insert(name.to_owned(), value);
-        }
-    }
-    if unlimited_thinking {
-        normalized_settings.insert("thinking_budget".to_owned(), json!("unlimited"));
-    }
-    if let Some(reasoning_effort) = &profile.generation.defaults.reasoning_effort {
+    let mut normalized_settings = BTreeMap::new();
+    for (id, setting) in &settings.effective {
         normalized_settings.insert(
-            "default_reasoning_effort".to_owned(),
-            json!(reasoning_effort),
+            id.to_string(),
+            serde_json::to_value(&setting.value).map_err(|error| {
+                EngineError::InvalidConfiguration(format!(
+                    "could not record setting `{id}`: {error}"
+                ))
+            })?,
         );
     }
-    if profile.load.context.preferred.is_some() || profile.load.context.minimum.is_some() {
-        normalized_settings.insert("requested_context".to_owned(), json!("auto"));
-    }
-    if let Some(minimum) = profile.load.context.minimum {
-        normalized_settings.insert("minimum_context_tokens".to_owned(), json!(minimum));
-    }
-    if strategy.mtp.enabled {
-        normalized_settings.insert(
-            "maximum_mtp_depth".to_owned(),
-            json!(strategy.mtp.maximum_depth),
-        );
-        normalized_settings.insert(
-            "mtp_minimum_probability".to_owned(),
-            json!(strategy.mtp.minimum_probability),
-        );
-    }
-    if let Some(compiled_w_max) = compiled_w_max
-        && strategy.suffix_width_from_runtime_w_max
-    {
-        normalized_settings.insert("compiled_w_max".to_owned(), json!(compiled_w_max));
-    }
-    Ok(Q27ProfileLaunchConfiguration {
+    Ok(Q27ConfiguredLaunch {
         arguments,
         environment,
         normalized_settings,
@@ -1881,7 +1711,7 @@ impl Q27Adapter {
             configuration_error,
             client,
             capability_cache: tokio::sync::RwLock::new(BTreeMap::new()),
-            profile_executions: tokio::sync::RwLock::new(BTreeMap::new()),
+            configured_executions: tokio::sync::RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -2027,7 +1857,7 @@ impl Q27Adapter {
         let endpoint = spec.endpoint.as_deref().ok_or_else(|| {
             EngineError::InvalidConfiguration("q27 launch has no private endpoint".to_owned())
         })?;
-        self.profile_executions.write().await.remove(endpoint);
+        self.configured_executions.write().await.remove(endpoint);
         if spec.model.primary.norted_package.is_some() {
             match progress {
                 Some(progress) => {
@@ -2037,19 +1867,9 @@ impl Q27Adapter {
                 None => revalidate_norted_package_before_launch(&spec.model).await?,
             }
         }
-        let Some(profile) = spec
-            .serve_profile
-            .as_ref()
-            .filter(|profile| q27_profile_has_execution_recipe(profile))
-        else {
+        if !q27_has_configured_execution(&spec.settings) {
             return Ok(());
-        };
-        let strategy = profile.engine.q27.as_ref().ok_or_else(|| {
-            EngineError::InvalidConfiguration(format!(
-                "Serve Profile `{}` has no q27 strategy",
-                profile.display_name
-            ))
-        })?;
+        }
         let capabilities = q27_runtime_capabilities(
             &spec.runtime.manifest.identity,
             &spec.runtime.manifest.acquisition_method,
@@ -2059,52 +1879,54 @@ impl Q27Adapter {
                 .as_ref()
                 .map(Q27SourceBuildEvidence::Provenance),
         );
-        validate_q27_profile_prelaunch(profile, capabilities).map_err(|reason| {
+        validate_q27_settings_prelaunch(&spec.settings, capabilities).map_err(|reason| {
             EngineError::InvalidConfiguration(format!(
-                "selected q27 runtime cannot satisfy Serve Profile `{}`: {reason}",
-                profile.display_name
+                "selected q27 runtime cannot satisfy the effective settings: {reason}"
             ))
         })?;
-        let selected_kv_mode = Q27KvMode::QUALITY_ORDER
-            .into_iter()
-            .find(|mode| spec.environment.get("Q27_KV").map(String::as_str) == Some(mode.as_str()))
-            .ok_or_else(|| {
-                EngineError::InvalidConfiguration(
-                    "q27 Serve Profile launch did not select a recognized Serve Profile KV mode"
-                        .to_owned(),
-                )
-            })?;
-        if !capabilities.supported_kv_modes.contains(&selected_kv_mode)
-            || !strategy
-                .kv_quality_order
-                .iter()
-                .any(|mode| mode == selected_kv_mode.as_str())
-        {
+        let selected_kv_mode = [
+            Q27KvMode::Fp8,
+            Q27KvMode::Turbo5k,
+            Q27KvMode::Turbo3,
+            Q27KvMode::Fp16,
+        ]
+        .into_iter()
+        .find(|mode| {
+            spec.environment.get("Q27_KV").map(String::as_str) == Some(mode.as_str())
+                || (*mode == Q27KvMode::Fp16
+                    && spec
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "--kv-fp16"))
+        });
+        if selected_kv_mode.is_some_and(|mode| !capabilities.supported_kv_modes.contains(&mode)) {
             return Err(EngineError::InvalidConfiguration(format!(
-                "q27 Serve Profile KV mode `{}` is not proven and profile-declared for this executable",
-                selected_kv_mode.as_str()
+                "q27 KV mode `{}` is not proven for this executable",
+                selected_kv_mode.expect("checked").as_str()
             )));
         }
-        let sharp_template = if profile.prompt.mode == norted_core::PromptMode::ExternalTemplate {
-            let template = read_serve_profile_template(profile).await?;
-            validate_serve_profile_template(profile, &template)?;
-            Some(template)
-        } else {
-            None
-        };
+        let sharp_template =
+            if setting_choice(&spec.settings, "q27.prompt_mode") == Some("external_template") {
+                let template = read_configured_template(&spec.settings).await?;
+                validate_configured_template(&spec.settings, &template)?;
+                Some(template)
+            } else {
+                None
+            };
         let compiled_w_max = capabilities.compiled_w_max;
-        if strategy.suffix_width_from_runtime_w_max && compiled_w_max.is_none() {
+        if setting_choice(&spec.settings, "q27.suffix_width_mode") == Some("runtime_w_max")
+            && compiled_w_max.is_none()
+        {
             return Err(EngineError::InvalidConfiguration(
-                "q27 Serve Profile launch has no proven numeric compiled W_MAX".to_owned(),
+                "q27 launch has no proven numeric compiled W_MAX".to_owned(),
             ));
         }
-        self.profile_executions.write().await.insert(
+        self.configured_executions.write().await.insert(
             endpoint.to_owned(),
-            Q27ProfileExecution {
-                profile: profile.clone(),
+            Q27ConfiguredExecution {
+                settings: spec.settings.clone(),
                 sharp_template,
                 compiled_w_max,
-                expected_fast_head: q27_selected_fast_head(&spec.load_settings, strategy)?,
                 selected_kv_mode,
             },
         );
@@ -2113,7 +1935,7 @@ impl Q27Adapter {
 
     fn backend_request(&self, request: &InferenceRequest, stream: bool) -> Value {
         let mut body = json!({
-            "model": request.model_id.0,
+            "model": request.model_profile_id.as_str(),
             "messages": request.messages.iter().map(message_json).collect::<Vec<_>>(),
             "temperature": request.generation_settings.temperature.unwrap_or(0.0),
             "top_p": request.generation_settings.top_p.unwrap_or(1.0),
@@ -2128,41 +1950,25 @@ impl Q27Adapter {
         body
     }
 
-    fn profile_backend_request(
-        execution: &Q27ProfileExecution,
+    fn configured_backend_request(
+        execution: &Q27ConfiguredExecution,
         request: &InferenceRequest,
         stream: bool,
     ) -> Result<(&'static str, Value), EngineError> {
-        let profile = &execution.profile;
-        for (name, present) in [
-            (
-                "temperature",
-                request.generation_settings.temperature.is_some(),
-            ),
-            ("top_p", request.generation_settings.top_p.is_some()),
-            (
-                "reasoning_effort",
-                request.generation_settings.reasoning_effort.is_some(),
-            ),
-        ] {
-            if present && !profile.generation.allows_override(name) {
-                return Err(EngineError::InvalidGenerationSettings(format!(
-                    "selected Serve Profile does not allow request-time `{name}` overrides"
-                )));
-            }
-        }
-        let mut body = json!({"model": request.model_id.0, "stream": stream});
+        let mut body = json!({"model": request.model_profile_id.as_str(), "stream": stream});
         let route = if let Some(template) = execution.sharp_template.as_deref() {
             body["prompt"] = json!(render_sharp_template(
                 template,
                 &request.messages,
-                profile.prompt.render_generation_prompt,
-                profile.prompt.thinking_enabled,
+                setting_toggle(&execution.settings, "q27.render_generation_prompt").unwrap_or(true),
+                setting_toggle(&execution.settings, "q27.template_thinking")
+                    .or_else(|| setting_toggle(&execution.settings, "q27.thinking"))
+                    .unwrap_or(false),
                 request
                     .generation_settings
                     .reasoning_effort
                     .map(norted_engine::ReasoningEffort::as_str)
-                    .or(profile.generation.defaults.reasoning_effort.as_deref()),
+                    .or_else(|| setting_choice(&execution.settings, "reasoning_effort")),
             )?);
             "/v1/completions"
         } else {
@@ -2181,7 +1987,7 @@ impl Q27Adapter {
                 request
                     .generation_settings
                     .temperature
-                    .or(profile.generation.defaults.temperature)
+                    .or_else(|| setting_float(&execution.settings, "temperature"))
                     .map(Value::from),
             ),
             (
@@ -2189,11 +1995,17 @@ impl Q27Adapter {
                 request
                     .generation_settings
                     .top_p
-                    .or(profile.generation.defaults.top_p)
+                    .or_else(|| setting_float(&execution.settings, "top_p"))
                     .map(Value::from),
             ),
-            ("top_k", profile.generation.defaults.top_k.map(Value::from)),
-            ("min_p", profile.generation.defaults.min_p.map(Value::from)),
+            (
+                "top_k",
+                setting_unsigned(&execution.settings, "top_k").map(Value::from),
+            ),
+            (
+                "min_p",
+                setting_float(&execution.settings, "min_p").map(Value::from),
+            ),
         ] {
             if let Some(value) = value {
                 body[name] = value;
@@ -2338,7 +2150,7 @@ impl EngineAdapter for Q27Adapter {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        serve_profile: Option<&norted_core::ServeProfile>,
+        settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
         let facts = match inspect_q27_model(&model.path) {
             Ok(facts) => facts,
@@ -2353,17 +2165,14 @@ impl EngineAdapter for Q27Adapter {
             runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
         );
         let artifact_and_device = qualify_tier_compatibility(facts.tier, evaluation.compatibility);
-        if let Some(profile) = serve_profile {
-            if let Err(reason) = q27_profile_applicability(profile, model, &facts) {
-                return RuntimeCompatibility::Incompatible(reason);
-            }
-            if !q27_profile_has_execution_recipe(profile) {
+        if let Some(settings) = settings {
+            if !q27_has_configured_execution(settings) {
                 return artifact_and_device;
             }
             combine_q27_compatibility(
                 artifact_and_device,
-                evaluate_q27_profile_runtime(
-                    profile,
+                evaluate_q27_configured_runtime(
+                    settings,
                     q27_runtime_capabilities(
                         &runtime.manifest.identity,
                         &runtime.manifest.acquisition_method,
@@ -2405,7 +2214,7 @@ impl EngineAdapter for Q27Adapter {
         runtime: &AvailableRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        serve_profile: Option<&norted_core::ServeProfile>,
+        settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
         if let CompatibilityDecision::Unsupported { reason } = self.compatibility(model) {
             return RuntimeCompatibility::Incompatible(reason);
@@ -2423,11 +2232,8 @@ impl EngineAdapter for Q27Adapter {
             false,
         );
         let artifact_and_device = qualify_tier_compatibility(facts.tier, evaluation.compatibility);
-        if let Some(profile) = serve_profile {
-            if let Err(reason) = q27_profile_applicability(profile, model, &facts) {
-                return RuntimeCompatibility::Incompatible(reason);
-            }
-            if !q27_profile_has_execution_recipe(profile) {
+        if let Some(settings) = settings {
+            if !q27_has_configured_execution(settings) {
                 return artifact_and_device;
             }
             let acquisition = match runtime.acquisition {
@@ -2438,8 +2244,8 @@ impl EngineAdapter for Q27Adapter {
             };
             combine_q27_compatibility(
                 artifact_and_device,
-                evaluate_q27_profile_runtime(
-                    profile,
+                evaluate_q27_configured_runtime(
+                    settings,
                     q27_runtime_capabilities(
                         &runtime.identity,
                         &acquisition,
@@ -2521,17 +2327,16 @@ impl EngineAdapter for Q27Adapter {
         }]
     }
 
-    fn load_setting_definitions(&self) -> Vec<LoadSettingDefinition> {
-        q27_load_setting_definitions()
+    fn setting_definitions(&self) -> Vec<SettingDefinition> {
+        q27_setting_definitions()
     }
 
-    async fn load_settings_schema(
+    async fn settings_schema(
         &self,
         runtime: &InstalledRuntime,
-        _model: &ModelArtifact,
+        model: &ModelArtifact,
         _host: &HostCapabilities,
-        _serve_profile: Option<&norted_core::ServeProfile>,
-    ) -> Result<LoadSettingsSchema, EngineError> {
+    ) -> Result<SettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
         let usage = self
             .capability_cache
@@ -2542,7 +2347,7 @@ impl EngineAdapter for Q27Adapter {
             .ok_or_else(|| {
                 EngineError::Operation("q27 usage observation was not cached".to_owned())
             })?;
-        Ok(q27_load_settings_schema_from_usage(
+        let mut schema = q27_settings_schema_from_usage(
             Some(runtime.manifest.runtime_id.clone()),
             &runtime.manifest.identity,
             &runtime.manifest.acquisition_method,
@@ -2552,7 +2357,21 @@ impl EngineAdapter for Q27Adapter {
                 .as_ref()
                 .map(Q27SourceBuildEvidence::Provenance),
             &usage,
-        ))
+        );
+        let facts = inspect_q27_model(&model.path).map_err(EngineError::InvalidConfiguration)?;
+        if !facts.capabilities.contains("mtp_layer_1") {
+            for definition in &mut schema.definitions {
+                if definition.id.as_str().starts_with("q27.mtp")
+                    || definition.id.as_str().starts_with("q27.suffix")
+                {
+                    definition.supported = false;
+                    definition.unsupported_reason = Some(
+                        "bounded q27 inspection did not prove an MTP prediction layer".to_owned(),
+                    );
+                }
+            }
+        }
+        Ok(schema)
     }
 
     async fn probe(&self) -> Result<EngineProbe, EngineError> {
@@ -2632,7 +2451,7 @@ impl EngineAdapter for Q27Adapter {
 
     async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError> {
         let endpoint = http_endpoint(request.backend_address);
-        self.profile_executions.write().await.remove(&endpoint);
+        self.configured_executions.write().await.remove(&endpoint);
         if !request.backend_address.ip().is_loopback() {
             return Err(EngineError::InvalidConfiguration(
                 "q27 backend address must be loopback".to_owned(),
@@ -2643,38 +2462,29 @@ impl EngineAdapter for Q27Adapter {
                 "q27 can only launch Q27 model artifacts".to_owned(),
             ));
         }
-        let execution_profile = request
-            .serve_profile
-            .as_ref()
-            .filter(|profile| q27_profile_has_execution_recipe(profile));
-        let profile_capabilities = execution_profile.map(|_| {
-            q27_runtime_capabilities(
-                &request.runtime.manifest.identity,
-                &request.runtime.manifest.acquisition_method,
-                request
-                    .runtime
-                    .manifest
-                    .source_build
-                    .as_ref()
-                    .map(Q27SourceBuildEvidence::Provenance),
-            )
-        });
-        if let (Some(profile), Some(capabilities)) = (execution_profile, profile_capabilities) {
-            if let Err(reason) = validate_q27_profile_prelaunch(profile, capabilities) {
-                return Err(EngineError::InvalidConfiguration(format!(
-                    "selected q27 runtime cannot satisfy the Serve Profile: {reason}"
-                )));
-            }
+        let capabilities = q27_runtime_capabilities(
+            &request.runtime.manifest.identity,
+            &request.runtime.manifest.acquisition_method,
+            request
+                .runtime
+                .manifest
+                .source_build
+                .as_ref()
+                .map(Q27SourceBuildEvidence::Provenance),
+        );
+        if q27_has_configured_execution(&request.settings) {
+            validate_q27_settings_prelaunch(&request.settings, capabilities).map_err(|reason| {
+                EngineError::InvalidConfiguration(format!(
+                    "selected q27 runtime cannot satisfy the effective settings: {reason}"
+                ))
+            })?;
         }
         request
-            .load_settings_schema
-            .validate(&request.load_settings)
+            .settings_schema
+            .validate(&request.settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
-        let mut structured = translate_q27_load_settings(
-            &request.load_settings,
-            &self.native_arguments,
-            &self.environment,
-        )?;
+        let structured =
+            translate_q27_settings(&request.settings, &self.native_arguments, &self.environment)?;
         if !matches!(
             request.runtime.manifest.acquisition_method,
             RuntimeAcquisitionMethod::ExternalBinary
@@ -2697,9 +2507,13 @@ impl EngineAdapter for Q27Adapter {
         }
         let model_facts =
             inspect_q27_model(&model_path).map_err(EngineError::InvalidConfiguration)?;
-        if let Some(profile) = request.serve_profile.as_ref() {
-            q27_profile_applicability(profile, &request.model.primary, &model_facts)
-                .map_err(EngineError::InvalidConfiguration)?;
+        if setting_toggle(&request.settings, "q27.mtp") == Some(true)
+            && !model_facts.capabilities.contains("mtp_layer_1")
+        {
+            return Err(EngineError::InvalidConfiguration(
+                "q27 MTP was enabled but bounded artifact inspection did not prove an MTP layer"
+                    .to_owned(),
+            ));
         }
         let tokenizers = request
             .model
@@ -2717,32 +2531,17 @@ impl EngineAdapter for Q27Adapter {
         };
         let tokenizer_path = revalidate_prepared_tokenizer(tokenizer).await?;
         let observation = self.probe_runtime(&request.runtime).await?;
-        let profile_launch = if let Some(profile) = execution_profile {
-            let capabilities = profile_capabilities.expect("profile capabilities");
-            let strategy = profile
-                .engine
-                .q27
-                .as_ref()
-                .expect("applicability checked strategy");
-            if profile.load.context.preferred.is_some() || profile.load.context.minimum.is_some() {
-                remove_q27_value_argument(&mut structured.arguments, "--ctx")?;
-                structured
-                    .arguments
-                    .extend([OsString::from("--ctx"), OsString::from("auto")]);
+        let configured_launch = if q27_has_configured_execution(&request.settings) {
+            let modes = q27_configured_kv_attempt_modes(capabilities, &request.settings);
+            if settings_require_selected_kv(&request.settings) && modes.is_empty() {
+                return Err(EngineError::InvalidConfiguration(
+                    "selected q27 runtime proves none of the configured KV modes".to_owned(),
+                ));
             }
-            let selected_kv_mode = q27_profile_kv_attempt_modes(capabilities, strategy)
-                .into_iter()
-                .next()
-                .ok_or_else(|| {
-                    EngineError::InvalidConfiguration(
-                        "selected q27 runtime proves no Serve Profile-declared KV mode".to_owned(),
-                    )
-                })?;
-            Some(q27_profile_launch_configuration(
-                profile,
+            Some(q27_configured_launch(
+                &request.settings,
                 capabilities.compiled_w_max,
-                q27_selected_fast_head(&request.load_settings, strategy)?,
-                selected_kv_mode,
+                modes.first().copied(),
             )?)
         } else {
             None
@@ -2781,10 +2580,8 @@ impl EngineAdapter for Q27Adapter {
             OsString::from("--port"),
             OsString::from(request.backend_address.port().to_string()),
         ];
-        if let Some(profile_launch) = profile_launch.as_ref() {
-            arguments.extend(profile_launch.arguments.iter().cloned());
-        } else {
-            arguments.push(OsString::from("--no-think"));
+        if let Some(configured_launch) = configured_launch.as_ref() {
+            arguments.extend(configured_launch.arguments.iter().cloned());
         }
         arguments.extend(structured.arguments);
         arguments.extend(self.native_arguments.iter().map(OsString::from));
@@ -2795,20 +2592,14 @@ impl EngineAdapter for Q27Adapter {
             )
         })?;
         let mut environment = q27_launch_environment(&self.environment, &accelerator)?;
-        if let Some(profile_launch) = profile_launch.as_ref() {
-            environment.extend(profile_launch.environment.clone());
+        if let Some(configured_launch) = configured_launch.as_ref() {
+            environment.extend(configured_launch.environment.clone());
         }
         let mut environment_remove = managed_environment_removals();
         environment_remove.extend(structured.environment_remove);
-        let normalized_settings = if let Some(profile_launch) = profile_launch {
-            profile_launch.normalized_settings
-        } else {
-            BTreeMap::from([
-                ("temperature".to_owned(), json!(0.0)),
-                ("top_p".to_owned(), json!(1.0)),
-                ("thinking".to_owned(), json!(false)),
-            ])
-        };
+        let normalized_settings = configured_launch
+            .map(|launch| launch.normalized_settings)
+            .unwrap_or_default();
         Ok(LaunchSpec {
             executable: binary_path,
             arguments,
@@ -2819,13 +2610,12 @@ impl EngineAdapter for Q27Adapter {
             temporary_files: Vec::new(),
             endpoint: Some(endpoint),
             normalized_settings,
-            load_settings: request.load_settings,
+            settings: request.settings,
             native_arguments: self.native_arguments.clone(),
             installation,
             runtime: request.runtime,
             model: request.model,
             accelerator: Some(accelerator),
-            serve_profile: request.serve_profile,
         })
     }
 
@@ -2833,41 +2623,40 @@ impl EngineAdapter for Q27Adapter {
         &self,
         request: LaunchRequest,
     ) -> Result<Vec<LaunchSpec>, EngineError> {
-        let profile = request.serve_profile.clone();
-        let execution_profile = profile
-            .as_ref()
-            .filter(|profile| q27_profile_has_execution_recipe(profile));
-        let capabilities = execution_profile.map(|_| {
-            q27_runtime_capabilities(
-                &request.runtime.manifest.identity,
-                &request.runtime.manifest.acquisition_method,
-                request
-                    .runtime
-                    .manifest
-                    .source_build
-                    .as_ref()
-                    .map(Q27SourceBuildEvidence::Provenance),
-            )
-        });
+        let settings = request.settings.clone();
+        let capabilities = q27_runtime_capabilities(
+            &request.runtime.manifest.identity,
+            &request.runtime.manifest.acquisition_method,
+            request
+                .runtime
+                .manifest
+                .source_build
+                .as_ref()
+                .map(Q27SourceBuildEvidence::Provenance),
+        );
         let first = self.build_launch_spec(request).await?;
-        let Some(profile) = execution_profile else {
+        if !settings_require_selected_kv(&settings) {
             return Ok(vec![first]);
-        };
-        let capabilities = capabilities.expect("profile capabilities");
-        let strategy = profile.engine.q27.as_ref().expect("profile strategy");
-        let modes = q27_profile_kv_attempt_modes(capabilities, strategy);
+        }
+        let modes = q27_configured_kv_attempt_modes(capabilities, &settings);
         if modes.is_empty() {
             return Err(EngineError::InvalidConfiguration(
-                "selected q27 runtime proves no Serve Profile-declared KV mode".to_owned(),
+                "selected q27 runtime proves none of the configured KV modes".to_owned(),
             ));
         }
         Ok(modes
             .into_iter()
             .map(|mode| {
                 let mut attempt = first.clone();
-                attempt
-                    .environment
-                    .insert("Q27_KV".to_owned(), mode.as_str().to_owned());
+                attempt.environment.remove("Q27_KV");
+                attempt.arguments.retain(|argument| argument != "--kv-fp16");
+                if mode == Q27KvMode::Fp16 {
+                    attempt.arguments.push(OsString::from("--kv-fp16"));
+                } else {
+                    attempt
+                        .environment
+                        .insert("Q27_KV".to_owned(), mode.as_str().to_owned());
+                }
                 attempt
                     .normalized_settings
                     .insert("requested_kv_mode".to_owned(), json!(mode.as_str()));
@@ -2900,7 +2689,7 @@ impl EngineAdapter for Q27Adapter {
 
     async fn clear_launch_state(&self, endpoint: Option<&str>) {
         if let Some(endpoint) = endpoint {
-            self.profile_executions.write().await.remove(endpoint);
+            self.configured_executions.write().await.remove(endpoint);
         }
     }
 
@@ -2938,25 +2727,21 @@ impl EngineAdapter for Q27Adapter {
         let endpoint = process.endpoint.as_deref().ok_or_else(|| {
             EngineError::Operation("q27 process has no backend endpoint".to_owned())
         })?;
-        let executions = self.profile_executions.read().await;
+        let executions = self.configured_executions.read().await;
         let Some(execution) = executions.get(endpoint) else {
             return Ok(StartupObservation::Ready(BTreeMap::new()));
         };
         let observed = parse_q27_startup_observation(stderr_tail)?;
-        if observed.kv_mode != execution.selected_kv_mode.as_str() {
+        if let Some(selected_kv_mode) = execution.selected_kv_mode
+            && observed.kv_mode != selected_kv_mode.as_str()
+        {
             return Err(EngineError::Operation(format!(
-                "q27 startup selected KV mode `{}` instead of requested Serve Profile mode `{}`",
+                "q27 startup selected KV mode `{}` instead of requested mode `{}`",
                 observed.kv_mode,
-                execution.selected_kv_mode.as_str()
+                selected_kv_mode.as_str()
             )));
         }
-        let strategy = execution
-            .profile
-            .engine
-            .q27
-            .as_ref()
-            .expect("execution has q27 strategy");
-        if strategy.suffix_width_from_runtime_w_max
+        if setting_choice(&execution.settings, "q27.suffix_width_mode") == Some("runtime_w_max")
             && execution.compiled_w_max.is_some_and(|compiled_w_max| {
                 observed.compiled_w_max != compiled_w_max || observed.suffix_width != compiled_w_max
             })
@@ -2968,29 +2753,36 @@ impl EngineAdapter for Q27Adapter {
                 execution.compiled_w_max.expect("checked")
             )));
         }
-        if observed.thinking != execution.profile.generation.thinking.default
-            || observed.fast_head != execution.expected_fast_head
-            || (strategy.mtp.enabled
-                && (observed.maximum_mtp_depth != strategy.mtp.maximum_depth
-                    || !approximately_equal(
-                        observed.mtp_minimum_probability(),
-                        strategy.mtp.minimum_probability,
-                    )))
-            || observed.suffix_drafting != strategy.suffix_drafting
+        let thinking_mismatch = setting_toggle(&execution.settings, "q27.thinking")
+            .is_some_and(|expected| observed.thinking != expected);
+        let fast_head_mismatch = setting_toggle(&execution.settings, "q27.fast_head")
+            .is_some_and(|expected| observed.fast_head != expected);
+        let depth_mismatch = setting_unsigned(&execution.settings, "q27.mtp_max_depth")
+            .is_some_and(|expected| observed.maximum_mtp_depth != expected.to_string());
+        let probability_mismatch = setting_float(&execution.settings, "q27.mtp_min_probability")
+            .is_some_and(|expected| {
+                !approximately_equal(observed.mtp_minimum_probability(), expected)
+            });
+        let suffix_mismatch = setting_toggle(&execution.settings, "q27.suffix_drafting")
+            .is_some_and(|expected| observed.suffix_drafting != expected);
+        if thinking_mismatch
+            || fast_head_mismatch
+            || depth_mismatch
+            || probability_mismatch
+            || suffix_mismatch
         {
             return Err(EngineError::Operation(
-                "q27 startup profile disagrees with the selected Serve Profile thinking/MTP/fast-head strategy"
+                "q27 startup observation disagrees with the effective thinking/MTP/fast-head settings"
                     .to_owned(),
             ));
         }
-        if let Some(minimum_context) = execution.profile.load.context.minimum
-            && observed.served_context < minimum_context
+        if let Some(requested_context) = setting_unsigned(&execution.settings, "context_length")
+            && observed.served_context < requested_context
         {
-            return Ok(StartupObservation::RetryContextCapacity {
-                kv_mode: observed.kv_mode,
-                observed_context: observed.served_context,
-                minimum_context,
-            });
+            return Err(EngineError::Operation(format!(
+                "q27 served context {} is smaller than configured context {requested_context}",
+                observed.served_context
+            )));
         }
         let mut proof = BTreeMap::from([
             (
@@ -3023,24 +2815,23 @@ impl EngineAdapter for Q27Adapter {
         // q27 exposes no effective-config endpoint. These values are owned by
         // this adapter, sent explicitly on every request, and force env vars
         // are removed from the child environment.
-        let profile = if let Some(endpoint) = process.endpoint.as_deref() {
-            self.profile_executions.read().await.get(endpoint).cloned()
+        let configured = if let Some(endpoint) = process.endpoint.as_deref() {
+            self.configured_executions
+                .read()
+                .await
+                .get(endpoint)
+                .cloned()
         } else {
             None
         };
-        Ok(profile.map_or(
+        Ok(configured.map_or(
             EffectiveGenerationSettings {
                 temperature: 0.0,
                 top_p: 1.0,
             },
             |execution| EffectiveGenerationSettings {
-                temperature: execution
-                    .profile
-                    .generation
-                    .defaults
-                    .temperature
-                    .unwrap_or(0.0),
-                top_p: execution.profile.generation.defaults.top_p.unwrap_or(1.0),
+                temperature: setting_float(&execution.settings, "temperature").unwrap_or(0.0),
+                top_p: setting_float(&execution.settings, "top_p").unwrap_or(1.0),
             },
         ))
     }
@@ -3050,9 +2841,14 @@ impl EngineAdapter for Q27Adapter {
         endpoint: &str,
         request: InferenceRequest,
     ) -> Result<InferenceOutput, EngineError> {
-        let profile = self.profile_executions.read().await.get(endpoint).cloned();
-        let (route, body) = if let Some(execution) = profile.as_ref() {
-            Self::profile_backend_request(execution, &request, false)?
+        let configured = self
+            .configured_executions
+            .read()
+            .await
+            .get(endpoint)
+            .cloned();
+        let (route, body) = if let Some(execution) = configured.as_ref() {
+            Self::configured_backend_request(execution, &request, false)?
         } else {
             (
                 "/v1/chat/completions",
@@ -3087,11 +2883,11 @@ impl EngineAdapter for Q27Adapter {
             .ok_or_else(|| {
                 EngineError::Operation("q27 response contained no assistant text".to_owned())
             })?;
-        let text = if profile.as_ref().is_some_and(|execution| {
-            execution.profile.prompt.response_filter
-                == norted_core::ResponseFilter::DirkSharpReasoning
+        let text = if configured.as_ref().is_some_and(|execution| {
+            setting_choice(&execution.settings, "q27.response_filter")
+                == Some("strip_initial_reasoning")
         }) {
-            filter_q27_serve_profile_output(&text)
+            filter_q27_initial_reasoning(&text)
         } else {
             text
         };
@@ -3107,9 +2903,14 @@ impl EngineAdapter for Q27Adapter {
         endpoint: &str,
         request: InferenceRequest,
     ) -> Result<InferenceStream, EngineError> {
-        let profile = self.profile_executions.read().await.get(endpoint).cloned();
-        let (route, body) = if let Some(execution) = profile.as_ref() {
-            Self::profile_backend_request(execution, &request, true)?
+        let configured = self
+            .configured_executions
+            .read()
+            .await
+            .get(endpoint)
+            .cloned();
+        let (route, body) = if let Some(execution) = configured.as_ref() {
+            Self::configured_backend_request(execution, &request, true)?
         } else {
             ("/v1/chat/completions", self.backend_request(&request, true))
         };
@@ -3131,75 +2932,55 @@ impl EngineAdapter for Q27Adapter {
         }
         Ok(q27_sse_stream(
             response.bytes_stream().boxed(),
-            profile.as_ref().is_some_and(|execution| {
-                execution.profile.prompt.response_filter
-                    == norted_core::ResponseFilter::DirkSharpReasoning
+            configured.as_ref().is_some_and(|execution| {
+                setting_choice(&execution.settings, "q27.response_filter")
+                    == Some("strip_initial_reasoning")
             }),
         ))
     }
 }
 
-fn remove_q27_value_argument(
-    arguments: &mut Vec<OsString>,
-    option: &str,
-) -> Result<(), EngineError> {
-    let positions = arguments
-        .iter()
-        .enumerate()
-        .filter_map(|(index, argument)| (argument == option).then_some(index))
-        .collect::<Vec<_>>();
-    let [index] = positions.as_slice() else {
-        return Err(EngineError::InvalidConfiguration(format!(
-            "q27 Serve Profile expected exactly one structured `{option}` argument"
-        )));
-    };
-    if *index + 1 >= arguments.len() {
-        return Err(EngineError::InvalidConfiguration(format!(
-            "q27 structured `{option}` argument has no value"
-        )));
-    }
-    arguments.drain(*index..=*index + 1);
-    Ok(())
-}
-
-async fn read_serve_profile_template(
-    profile: &norted_core::ServeProfile,
+async fn read_configured_template(
+    settings: &norted_core::ResolvedSettings,
 ) -> Result<String, EngineError> {
-    let Some(template) = profile.prompt.template.as_ref() else {
+    let Some(SettingValue::Path(path)) = settings.value("q27.template_path") else {
         return Err(EngineError::InvalidConfiguration(
-            "q27 Serve Profile requires an external template but does not bind one".to_owned(),
+            "q27 external template mode requires `q27.template_path`".to_owned(),
         ));
     };
-    let file = tokio::fs::File::open(&template.path)
-        .await
-        .map_err(|error| {
-            EngineError::InvalidConfiguration(format!(
-                "could not open Serve Profile template {}: {error}",
-                template.path.display()
-            ))
-        })?;
+    let Some(SettingValue::String(expected_sha256)) = settings.value("q27.template_sha256") else {
+        return Err(EngineError::InvalidConfiguration(
+            "q27 external template mode requires a recorded `q27.template_sha256`".to_owned(),
+        ));
+    };
+    let file = tokio::fs::File::open(path).await.map_err(|error| {
+        EngineError::InvalidConfiguration(format!(
+            "could not open configured template {}: {error}",
+            path.display()
+        ))
+    })?;
     let mut bytes = Vec::new();
     file.take(SHARP_TEMPLATE_LIMIT + 1)
         .read_to_end(&mut bytes)
         .await
         .map_err(|error| {
             EngineError::InvalidConfiguration(format!(
-                "could not read Serve Profile template {}: {error}",
-                template.path.display()
+                "could not read configured template {}: {error}",
+                path.display()
             ))
         })?;
     if bytes.len() as u64 > SHARP_TEMPLATE_LIMIT {
         return Err(EngineError::InvalidConfiguration(
-            "Serve Profile template exceeded the local size limit".to_owned(),
+            "configured template exceeded the local size limit".to_owned(),
         ));
     }
-    if format!("{:x}", Sha256::digest(&bytes)) != template.sha256 {
+    if format!("{:x}", Sha256::digest(&bytes)) != *expected_sha256 {
         return Err(EngineError::InvalidConfiguration(
-            "Serve Profile template SHA-256 no longer matches the selected profile".to_owned(),
+            "configured template SHA-256 no longer matches the Model Profile".to_owned(),
         ));
     }
     String::from_utf8(bytes).map_err(|_| {
-        EngineError::InvalidConfiguration("Serve Profile template is not UTF-8".to_owned())
+        EngineError::InvalidConfiguration("configured template is not UTF-8".to_owned())
     })
 }
 
@@ -3227,12 +3008,12 @@ fn render_sharp_template(
         .add_template("sharp", template_source)
         .map_err(|error| {
             EngineError::InvalidConfiguration(format!(
-                "Serve Profile Sharp template is not supported by the exact Jinja renderer: {error}"
+                "configured Sharp template is not supported by the exact Jinja renderer: {error}"
             ))
         })?;
     let template = environment.get_template("sharp").map_err(|error| {
         EngineError::InvalidConfiguration(format!(
-            "Serve Profile Sharp template could not be loaded: {error}"
+            "configured Sharp template could not be loaded: {error}"
         ))
     })?;
     let messages = messages.iter().map(sharp_message_json).collect::<Vec<_>>();
@@ -3245,14 +3026,12 @@ fn render_sharp_template(
             tools => Vec::<Value>::new(),
         })
         .map_err(|error| {
-            EngineError::InvalidConfiguration(format!(
-                "Serve Profile Sharp rendering failed: {error}"
-            ))
+            EngineError::InvalidConfiguration(format!("configured Sharp rendering failed: {error}"))
         })
 }
 
-fn validate_serve_profile_template(
-    profile: &norted_core::ServeProfile,
+fn validate_configured_template(
+    settings: &norted_core::ResolvedSettings,
     template_source: &str,
 ) -> Result<(), EngineError> {
     let rendered = render_sharp_template(
@@ -3261,14 +3040,15 @@ fn validate_serve_profile_template(
             role: InferenceRole::User,
             text: "Sharp startup validation".to_owned(),
         }],
-        profile.prompt.render_generation_prompt,
-        profile.prompt.thinking_enabled,
-        profile.generation.defaults.reasoning_effort.as_deref(),
+        setting_toggle(settings, "q27.render_generation_prompt").unwrap_or(true),
+        setting_toggle(settings, "q27.template_thinking")
+            .or_else(|| setting_toggle(settings, "q27.thinking"))
+            .unwrap_or(false),
+        setting_choice(settings, "reasoning_effort"),
     )?;
     if rendered.is_empty() {
         return Err(EngineError::InvalidConfiguration(
-            "Serve Profile template produced an empty raw prompt during bounded validation"
-                .to_owned(),
+            "configured template produced an empty raw prompt during bounded validation".to_owned(),
         ));
     }
     Ok(())
@@ -3740,12 +3520,12 @@ const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
 #[derive(Debug, Default)]
-struct Q27ServeProfileOutputFilter {
+struct Q27InitialReasoningFilter {
     reasoning_closed: bool,
     pending: String,
 }
 
-impl Q27ServeProfileOutputFilter {
+impl Q27InitialReasoningFilter {
     fn push(&mut self, input: &str) -> String {
         self.pending.push_str(input);
         if !self.reasoning_closed {
@@ -3801,8 +3581,8 @@ impl Q27ServeProfileOutputFilter {
     }
 }
 
-fn filter_q27_serve_profile_output(text: &str) -> String {
-    let mut filter = Q27ServeProfileOutputFilter::default();
+fn filter_q27_initial_reasoning(text: &str) -> String {
+    let mut filter = Q27InitialReasoningFilter::default();
     let mut public = filter.push(text);
     public.push_str(&filter.finish());
     public
@@ -3827,7 +3607,7 @@ struct SseState {
     queued: VecDeque<Result<InferenceEvent, EngineError>>,
     usage: Option<InferenceUsage>,
     finish_reason: Option<InferenceFinishReason>,
-    serve_profile_output_filter: Option<Q27ServeProfileOutputFilter>,
+    initial_reasoning_filter: Option<Q27InitialReasoningFilter>,
     finished: bool,
 }
 
@@ -3841,8 +3621,7 @@ fn q27_sse_stream(
         queued: VecDeque::new(),
         usage: None,
         finish_reason: None,
-        serve_profile_output_filter: filter_profile_output
-            .then(Q27ServeProfileOutputFilter::default),
+        initial_reasoning_filter: filter_profile_output.then(Q27InitialReasoningFilter::default),
         finished: false,
     };
     Box::pin(stream::unfold(state, |mut state| async move {
@@ -3898,7 +3677,7 @@ fn parse_sse_frames(state: &mut SseState) {
             continue;
         }
         if data == "[DONE]" {
-            if let Some(filter) = state.serve_profile_output_filter.as_mut() {
+            if let Some(filter) = state.initial_reasoning_filter.as_mut() {
                 let delta = filter.finish();
                 if !delta.is_empty() {
                     state
@@ -3986,7 +3765,7 @@ fn parse_sse_frames(state: &mut SseState) {
             .filter(|delta| !delta.is_empty())
         {
             let delta = state
-                .serve_profile_output_filter
+                .initial_reasoning_filter
                 .as_mut()
                 .map_or_else(|| delta.to_owned(), |filter| filter.push(delta));
             if !delta.is_empty() {
@@ -4044,34 +3823,49 @@ fn invalid_probe(reason: String) -> EngineProbe {
     }
 }
 
-fn q27_load_settings_schema_from_usage(
+fn q27_settings_schema_from_usage(
     runtime_id: Option<RuntimeId>,
     identity: &RuntimeIdentity,
     acquisition: &RuntimeAcquisitionMethod,
     source_evidence: Option<Q27SourceBuildEvidence<'_>>,
     usage: &str,
-) -> LoadSettingsSchema {
+) -> SettingsSchema {
     let managed = !matches!(acquisition, RuntimeAcquisitionMethod::ExternalBinary);
     let version = identity.version.as_str();
     let usage = usage.to_ascii_lowercase();
-    let trusted_source_capabilities = matches!(acquisition, RuntimeAcquisitionMethod::SourceBuild)
-        .then(|| q27_runtime_capabilities(identity, acquisition, source_evidence));
-    let mut definitions = q27_load_setting_definitions();
+    let capabilities = q27_runtime_capabilities(identity, acquisition, source_evidence);
+    let mut definitions = q27_setting_definitions();
     apply_q27_runtime_bounds(&mut definitions, managed, version);
     for definition in &mut definitions {
         let option = q27_setting_option(definition.id.as_str());
         let unavailable_by_version = q27_setting_unavailable_by_version(managed, version, option);
         let observed = match definition.id.as_str() {
             "q27.fast_head" => {
-                trusted_source_capabilities
-                    .is_some_and(|capabilities| capabilities.fast_head_control)
+                capabilities.fast_head_control
                     || (usage_has_token(&usage, "--fast-head")
                         && usage_has_token(&usage, "--no-fast-head"))
             }
+            "q27.thinking" => capabilities.thinking,
+            "q27.thinking_budget" => capabilities.unlimited_think_budget,
+            "temperature" | "top_p" => capabilities.temperature_top_p,
+            "top_k" | "min_p" => capabilities.top_k_min_p,
+            "reasoning_effort" => capabilities.exact_sharp_renderer,
+            "q27.kv_mode" => !capabilities.supported_kv_modes.is_empty(),
+            "q27.mtp" | "q27.mtp_max_depth" | "q27.mtp_min_probability" | "q27.suffix_drafting" => {
+                capabilities.mtp_environment
+            }
+            "q27.suffix_width_mode" => capabilities.compiled_w_max.is_some(),
+            "q27.prompt_mode"
+            | "q27.prompt_delivery"
+            | "q27.template_path"
+            | "q27.template_sha256"
+            | "q27.render_generation_prompt"
+            | "q27.template_thinking"
+            | "q27.response_filter" => {
+                capabilities.raw_completions && capabilities.exact_sharp_renderer
+            }
             "parallel_requests" => {
-                trusted_source_capabilities
-                    .is_some_and(|capabilities| capabilities.trustworthy_identity)
-                    || usage_has_token(&usage, option)
+                capabilities.trustworthy_identity || usage_has_token(&usage, option)
             }
             _ => usage_has_token(&usage, option),
         };
@@ -4082,47 +3876,172 @@ fn q27_load_settings_schema_from_usage(
             } else if definition.id.as_str() == "q27.fast_head" {
                 "the exact q27-server usage contract does not advertise both `--fast-head` and `--no-fast-head`"
                     .to_owned()
+            } else if option.is_empty() {
+                "the exact q27 runtime does not prove this semantic control".to_owned()
             } else {
                 format!("the exact q27-server usage contract does not advertise `{option}`")
             });
         }
     }
-    LoadSettingsSchema {
+    SettingsSchema {
         engine_id: ENGINE_ID.to_owned(),
         runtime_id,
         definitions,
     }
 }
 
-fn q27_load_setting_definitions() -> Vec<LoadSettingDefinition> {
-    let mut definitions = common_load_setting_definitions();
+fn q27_setting_definitions() -> Vec<SettingDefinition> {
+    let mut definitions = common_setting_definitions();
     definitions.extend([
         q27_definition(
-            "q27.kv_fp16",
-            "FP16 KV cache",
-            "Opt in to q27's FP16 KV cache",
-            LoadSettingKind::OneWayFlag,
-            Some("runtime/profile-selected KV format"),
+            "q27.kv_mode",
+            "KV mode",
+            "Use the runtime default, Server-owned automatic quality fallback, or an exact q27 KV mode",
+            SettingKind::Choice {
+                choices: ["runtime_default", "auto", "fp8", "turbo5k", "turbo3", "fp16"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            Some("runtime default"),
         ),
         q27_definition(
             "q27.fast_head",
             "Fast head",
             "Explicitly enable or disable q27 fast-head behavior",
-            LoadSettingKind::Toggle,
-            Some("runtime profile-selected"),
+            SettingKind::Toggle,
+            Some("runtime default"),
+        ),
+        q27_definition(
+            "q27.thinking",
+            "Thinking",
+            "Explicitly enable or disable q27 thinking",
+            SettingKind::Toggle,
+            Some("runtime default"),
+        ),
+        q27_definition(
+            "q27.thinking_budget",
+            "Thinking budget",
+            "Maximum q27 thinking budget; zero means unlimited where supported",
+            SettingKind::UnsignedInteger { minimum: Some(0), maximum: None },
+            Some("runtime default"),
+        ),
+        q27_definition(
+            "q27.mtp",
+            "MTP",
+            "Enable or disable q27 multi-token prediction where the exact runtime permits control",
+            SettingKind::Toggle,
+            Some("runtime default"),
+        ),
+        q27_definition(
+            "q27.mtp_max_depth",
+            "MTP maximum depth",
+            "Maximum q27 MTP proposal depth",
+            SettingKind::UnsignedInteger { minimum: Some(1), maximum: None },
+            Some("runtime default"),
+        ),
+        q27_definition(
+            "q27.mtp_min_probability",
+            "MTP minimum probability",
+            "Minimum probability accepted by q27 MTP",
+            SettingKind::Float { minimum: Some(0.0), maximum: Some(1.0) },
+            Some("runtime default"),
+        ),
+        q27_definition(
+            "q27.suffix_drafting",
+            "Suffix drafting",
+            "Enable q27 suffix drafting",
+            SettingKind::Toggle,
+            Some("runtime default"),
+        ),
+        q27_definition(
+            "q27.suffix_width_mode",
+            "Suffix width",
+            "Use the runtime default or the exact runtime's compiled W_MAX",
+            SettingKind::Choice {
+                choices: ["runtime_default", "runtime_w_max"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            Some("runtime default"),
+        ),
+        q27_definition(
+            "q27.prompt_mode",
+            "Template mode",
+            "Use the runtime prompt path or render an explicitly selected local template",
+            SettingKind::Choice {
+                choices: ["runtime_default", "external_template"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            Some("runtime default"),
+        ),
+        q27_definition(
+            "q27.prompt_delivery",
+            "Prompt delivery",
+            "Deliver runtime chat messages or a Server-rendered raw completion prompt",
+            SettingKind::Choice {
+                choices: ["runtime_chat", "raw_completions"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            Some("runtime chat"),
+        ),
+        q27_definition(
+            "q27.template_path",
+            "Template path",
+            "Any compatible local Sharp/Jinja template file",
+            SettingKind::Path,
+            None,
+        ),
+        q27_definition(
+            "q27.template_sha256",
+            "Template SHA-256",
+            "Recorded content identity for the selected local template",
+            SettingKind::String,
+            None,
+        ),
+        q27_definition(
+            "q27.render_generation_prompt",
+            "Render generation prompt",
+            "Ask the external template to append its generation prompt",
+            SettingKind::Toggle,
+            Some("on"),
+        ),
+        q27_definition(
+            "q27.template_thinking",
+            "Template thinking",
+            "Pass positive thinking state to the external template",
+            SettingKind::Toggle,
+            Some("off"),
+        ),
+        q27_definition(
+            "q27.response_filter",
+            "Response filter",
+            "Optionally strip the initial reasoning block and transition from a raw completion",
+            SettingKind::Choice {
+                choices: ["none", "strip_initial_reasoning"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            Some("none"),
         ),
         q27_definition(
             "q27.prefix_cache_path",
             "Prefix cache path",
             "Directory for q27's persistent prefix cache",
-            LoadSettingKind::Path,
+            SettingKind::Path,
             Some("disabled"),
         ),
         q27_definition(
             "q27.prefix_cache_max_gb",
             "Prefix cache disk budget",
             "Persistent prefix-cache LRU disk budget",
-            LoadSettingKind::Float {
+            SettingKind::Float {
                 minimum: Some(0.0),
                 maximum: None,
             },
@@ -4132,7 +4051,7 @@ fn q27_load_setting_definitions() -> Vec<LoadSettingDefinition> {
             "q27.prefix_cache_min_tokens",
             "Prefix cache minimum",
             "Shortest prefix eligible for persistence",
-            LoadSettingKind::UnsignedInteger {
+            SettingKind::UnsignedInteger {
                 minimum: Some(1),
                 maximum: None,
             },
@@ -4142,7 +4061,7 @@ fn q27_load_setting_definitions() -> Vec<LoadSettingDefinition> {
             "q27.prefix_cache_max_tokens",
             "Prefix cache maximum",
             "Largest prefix staged for persistence",
-            LoadSettingKind::UnsignedInteger {
+            SettingKind::UnsignedInteger {
                 minimum: Some(1),
                 maximum: None,
             },
@@ -4152,7 +4071,7 @@ fn q27_load_setting_definitions() -> Vec<LoadSettingDefinition> {
             "q27.prefix_cache_step_tokens",
             "Prefix cache step",
             "Token growth required before re-persisting a conversation",
-            LoadSettingKind::UnsignedInteger {
+            SettingKind::UnsignedInteger {
                 minimum: Some(1),
                 maximum: None,
             },
@@ -4162,7 +4081,7 @@ fn q27_load_setting_definitions() -> Vec<LoadSettingDefinition> {
             "q27.prefix_cache_ram_gb",
             "Prefix cache RAM budget",
             "Pinned host-RAM prefix-cache tier budget",
-            LoadSettingKind::Float {
+            SettingKind::Float {
                 minimum: Some(0.0),
                 maximum: None,
             },
@@ -4176,22 +4095,38 @@ fn q27_definition(
     id: &str,
     label: &str,
     description: &str,
-    kind: LoadSettingKind,
+    kind: SettingKind,
     upstream_default: Option<&str>,
-) -> LoadSettingDefinition {
-    LoadSettingDefinition {
-        id: LoadSettingId::new(id).expect("static q27 setting ID"),
+) -> SettingDefinition {
+    SettingDefinition {
+        id: SettingId::new(id).expect("static q27 setting ID"),
         label: label.to_owned(),
         description: description.to_owned(),
         kind,
-        scope: LoadSettingScope::Engine {
+        scope: SettingScope::Engine {
             engine_id: ENGINE_ID.to_owned(),
         },
+        category: q27_setting_category(id),
         supported: true,
         unsupported_reason: None,
         unit: None,
         upstream_default: upstream_default.map(str::to_owned),
-        recommendation: None,
+    }
+}
+
+fn q27_setting_category(id: &str) -> SettingCategory {
+    if id.contains("thinking") {
+        SettingCategory::Reasoning
+    } else if id.contains("prompt") || id.contains("template") || id.contains("response_filter") {
+        SettingCategory::Prompt
+    } else if id.contains("mtp") || id.contains("suffix") {
+        SettingCategory::Speculation
+    } else if id.contains("kv_") {
+        SettingCategory::KvMemory
+    } else if id.contains("cache") {
+        SettingCategory::Cache
+    } else {
+        SettingCategory::Advanced
     }
 }
 
@@ -4199,7 +4134,6 @@ fn q27_setting_option(id: &str) -> &'static str {
     match id {
         "context_length" => "--ctx",
         "parallel_requests" => "--slots",
-        "q27.kv_fp16" => "--kv-fp16",
         "q27.fast_head" => "--fast-head",
         "q27.prefix_cache_path" => "--prefix-cache",
         "q27.prefix_cache_max_gb" => "--prefix-cache-max-gb",
@@ -4217,11 +4151,7 @@ fn q27_setting_unavailable_by_version(managed: bool, version: &str, option: &str
             || (option.starts_with("--prefix-cache") && !version_at_least(version, 0, 6, 0)))
 }
 
-fn apply_q27_runtime_bounds(
-    definitions: &mut [LoadSettingDefinition],
-    managed: bool,
-    version: &str,
-) {
+fn apply_q27_runtime_bounds(definitions: &mut [SettingDefinition], managed: bool, version: &str) {
     let maximum = managed.then(|| {
         if version_at_least(version, 0, 3, 1) {
             8
@@ -4233,7 +4163,7 @@ fn apply_q27_runtime_bounds(
         .iter_mut()
         .find(|definition| definition.id.as_str() == "parallel_requests")
     {
-        definition.kind = LoadSettingKind::UnsignedInteger {
+        definition.kind = SettingKind::UnsignedInteger {
             minimum: Some(1),
             maximum,
         };
@@ -4246,10 +4176,10 @@ struct Q27StructuredArguments {
     environment_remove: Vec<OsString>,
 }
 
-fn translate_q27_load_settings(
-    settings: &norted_core::ResolvedLoadSettings,
+fn translate_q27_settings(
+    settings: &norted_core::ResolvedSettings,
     native_arguments: &[String],
-    configured_environment: &BTreeMap<String, String>,
+    _configured_environment: &BTreeMap<String, String>,
 ) -> Result<Q27StructuredArguments, EngineError> {
     let has_prefix_path = settings.value("q27.prefix_cache_path").is_some();
     if !has_prefix_path
@@ -4264,67 +4194,78 @@ fn translate_q27_load_settings(
     }
 
     let mut arguments = Vec::new();
-    let mut environment_remove = Vec::new();
+    let environment_remove = Vec::new();
     for (id, resolved) in &settings.effective {
+        if matches!(
+            id.as_str(),
+            "temperature"
+                | "top_p"
+                | "top_k"
+                | "min_p"
+                | "reasoning_effort"
+                | "q27.thinking"
+                | "q27.thinking_budget"
+                | "q27.kv_mode"
+                | "q27.mtp"
+                | "q27.mtp_max_depth"
+                | "q27.mtp_min_probability"
+                | "q27.suffix_drafting"
+                | "q27.suffix_width_mode"
+                | "q27.prompt_mode"
+                | "q27.prompt_delivery"
+                | "q27.template_path"
+                | "q27.template_sha256"
+                | "q27.render_generation_prompt"
+                | "q27.template_thinking"
+                | "q27.response_filter"
+        ) {
+            continue;
+        }
         let aliases = match id.as_str() {
             "q27.fast_head" => vec!["--fast-head", "--no-fast-head"],
             value => vec![q27_setting_option(value)],
         };
         if let Some(argument) = find_q27_native_option(native_arguments, &aliases) {
             return Err(EngineError::InvalidConfiguration(format!(
-                "structured load setting `{id}` conflicts with native q27 argument `{argument}`"
+                "structured setting `{id}` conflicts with native q27 argument `{argument}`"
             )));
         }
-        if id.as_str() == "q27.kv_fp16" {
-            if let Some(name) = configured_environment
-                .keys()
-                .find(|name| name.eq_ignore_ascii_case("Q27_KV"))
-            {
-                return Err(EngineError::InvalidConfiguration(format!(
-                    "structured load setting `{id}` conflicts with configured q27 environment variable `{name}`"
-                )));
-            }
-            environment_remove.push(OsString::from("Q27_KV"));
-        }
         match (id.as_str(), &resolved.value) {
-            ("context_length", LoadSettingValue::UnsignedInteger(value)) => {
+            ("context_length", SettingValue::UnsignedInteger(value)) => {
                 push_q27_value_argument(&mut arguments, "--ctx", value);
             }
-            ("parallel_requests", LoadSettingValue::UnsignedInteger(value)) => {
+            ("parallel_requests", SettingValue::UnsignedInteger(value)) => {
                 push_q27_value_argument(&mut arguments, "--slots", value);
             }
-            ("q27.kv_fp16", LoadSettingValue::FlagEnabled) => {
-                arguments.push(OsString::from("--kv-fp16"));
-            }
-            ("q27.fast_head", LoadSettingValue::Toggle(value)) => {
+            ("q27.fast_head", SettingValue::Toggle(value)) => {
                 arguments.push(OsString::from(if *value {
                     "--fast-head"
                 } else {
                     "--no-fast-head"
                 }));
             }
-            ("q27.prefix_cache_path", LoadSettingValue::Path(value)) => {
+            ("q27.prefix_cache_path", SettingValue::Path(value)) => {
                 arguments.push(OsString::from("--prefix-cache"));
                 arguments.push(value.as_os_str().to_owned());
             }
-            ("q27.prefix_cache_max_gb", LoadSettingValue::Float(value)) => {
+            ("q27.prefix_cache_max_gb", SettingValue::Float(value)) => {
                 push_q27_value_argument(&mut arguments, "--prefix-cache-max-gb", value);
             }
-            ("q27.prefix_cache_min_tokens", LoadSettingValue::UnsignedInteger(value)) => {
+            ("q27.prefix_cache_min_tokens", SettingValue::UnsignedInteger(value)) => {
                 push_q27_value_argument(&mut arguments, "--prefix-cache-min", value);
             }
-            ("q27.prefix_cache_max_tokens", LoadSettingValue::UnsignedInteger(value)) => {
+            ("q27.prefix_cache_max_tokens", SettingValue::UnsignedInteger(value)) => {
                 push_q27_value_argument(&mut arguments, "--prefix-cache-max-tokens", value);
             }
-            ("q27.prefix_cache_step_tokens", LoadSettingValue::UnsignedInteger(value)) => {
+            ("q27.prefix_cache_step_tokens", SettingValue::UnsignedInteger(value)) => {
                 push_q27_value_argument(&mut arguments, "--prefix-cache-step", value);
             }
-            ("q27.prefix_cache_ram_gb", LoadSettingValue::Float(value)) => {
+            ("q27.prefix_cache_ram_gb", SettingValue::Float(value)) => {
                 push_q27_value_argument(&mut arguments, "--prefix-cache-ram-gb", value);
             }
             _ => {
                 return Err(EngineError::InvalidConfiguration(format!(
-                    "load setting `{id}` has an invalid value for q27"
+                    "setting `{id}` has an invalid value for q27"
                 )));
             }
         }
@@ -4550,242 +4491,33 @@ fn unix_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::Path;
-
     use norted_core::{
-        AcceleratorDevice, ArtifactFormat, AuxiliaryArtifact, LoadSettingSource,
-        LoadSettingsProvenance, ModelArtifact, ModelId, Q27MtpStrategy, Q27ServeStrategy,
-        ResolvedLoadSetting, ResolvedLoadSettings, ServeProfile, ToggleOverridePolicy,
-        apply_serve_profile_load_policy,
+        ModelProfileId, ResolvedSetting, ResolvedSettings, SettingId, SettingSource,
     };
-    use serde_json::json;
 
     use super::*;
 
-    fn resolved_load_settings(values: &[(&str, LoadSettingValue)]) -> ResolvedLoadSettings {
-        let effective = values
-            .iter()
-            .map(|(id, value)| {
-                (
-                    LoadSettingId::new(*id).expect("setting ID"),
-                    ResolvedLoadSetting {
-                        value: value.clone(),
-                        source: LoadSettingSource::Invocation,
-                    },
-                )
-            })
-            .collect();
-        ResolvedLoadSettings {
+    fn resolved(values: &[(&str, SettingValue)]) -> ResolvedSettings {
+        ResolvedSettings {
             engine_id: ENGINE_ID.to_owned(),
-            selected_profile: None,
-            effective,
+            model_profile_id: None,
+            effective: values
+                .iter()
+                .map(|(id, value)| {
+                    (
+                        SettingId::new(*id).expect("setting ID"),
+                        ResolvedSetting {
+                            value: value.clone(),
+                            source: SettingSource::Invocation,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
-    fn argument_strings(arguments: Vec<OsString>) -> Vec<String> {
-        arguments
-            .into_iter()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect()
-    }
-
-    fn q27_runtime_identity(variant: &str) -> RuntimeIdentity {
-        RuntimeIdentity {
-            engine_id: ENGINE_ID.to_owned(),
-            package_family: PACKAGE_FAMILY.to_owned(),
-            version: "0.6.2".to_owned(),
-            platform: "linux".to_owned(),
-            architecture: "x86_64".to_owned(),
-            accelerator: "cuda".to_owned(),
-            variant: variant.to_owned(),
-            upstream_revision: None,
-            package: RuntimePackageIdentity {
-                provider_id: PROVIDER_ID.to_owned(),
-                repository: Some(GITHUB_REPOSITORY.to_owned()),
-                release_tag: Some("v0.6.2".to_owned()),
-                asset_id: Some("1".to_owned()),
-                asset_name: Some("q27-v0.6.2-linux-x86_64.tar.gz".to_owned()),
-                additional_assets: Vec::new(),
-            },
-        }
-    }
-
-    fn current_source_runtimes() -> Vec<AvailableRuntime> {
-        let release = release(10, "v0.10.0", "2026-08-26T01:43:22Z", false, vec![]);
-        let commit: GitHubCommit = serde_json::from_value(json!({
-            "sha": PACKAGE_SOURCE_COMMIT,
-            "html_url": format!(
-                "https://github.com/{GITHUB_REPOSITORY}/commit/{PACKAGE_SOURCE_COMMIT}"
-            ),
-            "commit": {
-                "committer": {"date": "2026-08-25T20:13:34Z"},
-                "tree": {"sha": PACKAGE_SOURCE_TREE}
-            }
-        }))
-        .expect("current q27 commit fixture");
-        materialize_qualified_releases(vec![QualifiedRelease {
-            release: &release,
-            version: "0.10.0".to_owned(),
-            binary: None,
-            source: Some(Q27SourceCapability {
-                commit,
-                makefile_sha256: PACKAGE_MAKEFILE_SHA256.to_owned(),
-                package_contract: true,
-                minimum_cuda_version: "12.8".to_owned(),
-                supported_variant_ids: vec!["w8", "w12", "w16"],
-                supported_cuda_compute_capabilities: vec![
-                    ComputeCapability::new(8, 6),
-                    ComputeCapability::new(8, 9),
-                    ComputeCapability::new(12, 0),
-                ],
-                accelerator_target: "sm_86+sm_89+sm_120".to_owned(),
-            }),
-            published_at_unix: release
-                .published_at
-                .as_deref()
-                .and_then(parse_github_timestamp),
-            ordinal: 0,
-        }])
-        .expect("current source runtimes")
-    }
-
-    fn current_source_provenance(plan: &RuntimeSourceBuildPlan) -> RuntimeSourceBuildProvenance {
-        RuntimeSourceBuildProvenance {
-            source: plan.source.clone(),
-            recipe_version: plan.recipe.recipe_version.clone(),
-            build_system: plan.recipe.build_system,
-            build_definition_sha256: plan.recipe.build_definition_sha256.clone(),
-            cmake_configuration_arguments: Vec::new(),
-            build_target: plan.recipe.build_target.clone(),
-            toolchain: norted_core::RuntimeSourceBuildToolchain {
-                cmake_version: "not required".to_owned(),
-                ninja_version: "not required".to_owned(),
-                make_version: "GNU Make 4.4".to_owned(),
-                cpp_compiler: "g++".to_owned(),
-                nvcc_version: "Cuda compilation tools, release 12.8".to_owned(),
-                pkg_config_version: "not required".to_owned(),
-                system_dependencies: BTreeMap::new(),
-            },
-            build_platform: "linux".to_owned(),
-            build_architecture: "x86_64".to_owned(),
-            accelerator_target: plan.recipe.accelerator_target.clone(),
-            built_at_unix: 1_788_000_000,
-            entrypoint: Path::new("source").join(&plan.recipe.entrypoint),
-            entrypoint_sha256: "a".repeat(64),
-        }
-    }
-
-    fn q27_serve_profile_fixture() -> ServeProfile {
-        let mut profile = ServeProfile::local("dirk-quality-q27-v1");
-        profile.display_name = "Dirk Quality".to_owned();
-        profile.applicability.artifact_formats = vec![ArtifactFormat::Q27];
-        profile.applicability.architecture = Some("qwen35".to_owned());
-        profile.applicability.family = Some("qwen3.8-27b".to_owned());
-        profile.applicability.required_model_capabilities =
-            vec!["mtp_layer_1".to_owned(), "text_only".to_owned()];
-        profile.generation.defaults.temperature = Some(1.0);
-        profile.generation.defaults.top_p = Some(0.95);
-        profile.generation.defaults.top_k = Some(20);
-        profile.generation.defaults.min_p = Some(0.05);
-        profile.generation.defaults.reasoning_effort = Some("medium".to_owned());
-        profile.generation.thinking.default = true;
-        profile.generation.thinking.required = true;
-        profile.requirements = vec![norted_core::ServeCapability::UnlimitedThinkingBudget];
-        profile.generation.allowed_user_overrides = vec![
-            "temperature".to_owned(),
-            "top_p".to_owned(),
-            "q27.fast_head".to_owned(),
-        ];
-        profile.load.context.preferred = Some(262_144);
-        profile.load.context.minimum = Some(200_000);
-        profile.engine.q27 = Some(Q27ServeStrategy {
-            mtp: Q27MtpStrategy {
-                enabled: true,
-                required: true,
-                depth_policy: "adaptive".to_owned(),
-                maximum_depth: "auto7".to_owned(),
-                minimum_probability: 0.5,
-            },
-            suffix_drafting: true,
-            suffix_width_from_runtime_w_max: true,
-            fast_head: ToggleOverridePolicy {
-                default: false,
-                user_override_allowed: true,
-            },
-            kv_quality_order: vec!["fp8".to_owned(), "turbo5k".to_owned(), "turbo3".to_owned()],
-        });
-        profile
-    }
-
-    #[test]
-    fn official_q27_variants_have_source_proven_compiled_widths() {
-        let mut identity = RuntimeIdentity {
-            engine_id: ENGINE_ID.to_owned(),
-            package_family: PACKAGE_FAMILY.to_owned(),
-            version: "0.6.2".to_owned(),
-            platform: "linux".to_owned(),
-            architecture: "x86_64".to_owned(),
-            accelerator: "cuda".to_owned(),
-            variant: "w8".to_owned(),
-            upstream_revision: None,
-            package: RuntimePackageIdentity {
-                provider_id: PROVIDER_ID.to_owned(),
-                repository: Some(GITHUB_REPOSITORY.to_owned()),
-                release_tag: Some("v0.6.2".to_owned()),
-                asset_id: Some("1".to_owned()),
-                asset_name: Some("q27-v0.6.2-linux-x86_64.tar.gz".to_owned()),
-                additional_assets: Vec::new(),
-            },
-        };
-        assert_eq!(
-            q27_compiled_w_max(
-                &identity,
-                &RuntimeAcquisitionMethod::OfficialReleaseAsset,
-                None
-            ),
-            Some(8)
-        );
-        identity.variant = "w12".to_owned();
-        assert_eq!(
-            q27_compiled_w_max(
-                &identity,
-                &RuntimeAcquisitionMethod::OfficialReleaseAsset,
-                None
-            ),
-            Some(12)
-        );
-        identity.variant = "w16".to_owned();
-        assert_eq!(
-            q27_compiled_w_max(
-                &identity,
-                &RuntimeAcquisitionMethod::OfficialReleaseAsset,
-                None
-            ),
-            Some(16)
-        );
-        assert_eq!(
-            q27_compiled_w_max(&identity, &RuntimeAcquisitionMethod::ExternalBinary, None),
-            None
-        );
-    }
-
-    #[test]
-    fn exact_old_runtime_has_precise_package_capability_failures() {
-        let identity = q27_runtime_identity("w12");
-        let compatibility = evaluate_q27_runtime_contract(q27_runtime_capabilities(
-            &identity,
-            &RuntimeAcquisitionMethod::OfficialReleaseAsset,
-            None,
-        ));
-        assert!(matches!(
-            compatibility,
-            RuntimeCompatibility::Incompatible(ref reason)
-                if reason.contains("top-k/min-p")
-                    && !reason.contains("all Norted packages")
-        ));
-
-        let synthetic = evaluate_q27_runtime_contract(Q27RuntimeCapabilities {
+    fn exact_capabilities() -> Q27RuntimeCapabilities {
+        Q27RuntimeCapabilities {
             trustworthy_identity: true,
             raw_completions: true,
             exact_sharp_renderer: true,
@@ -4798,509 +4530,185 @@ mod tests {
             fast_head_control: true,
             bounded_startup_observation: true,
             compiled_w_max: Some(12),
-            supported_kv_modes: ALL_Q27_KV_MODES,
-        });
-        assert!(matches!(synthetic, RuntimeCompatibility::NeedsAttention(_)));
-        assert!(
-            validate_q27_runtime_contract(Q27RuntimeCapabilities {
-                trustworthy_identity: true,
-                raw_completions: true,
-                exact_sharp_renderer: true,
-                thinking: true,
-                unlimited_think_budget: true,
-                temperature_top_p: true,
-                top_k_min_p: true,
-                mtp_environment: true,
-                mtp_disable_control: false,
-                fast_head_control: true,
-                bounded_startup_observation: true,
-                compiled_w_max: Some(12),
-                supported_kv_modes: ALL_Q27_KV_MODES,
-            })
-            .is_ok()
-        );
+            supported_kv_modes: Q27_V062_KV_MODES,
+        }
+    }
 
-        let untrusted = q27_runtime_capabilities(
-            &RuntimeIdentity {
-                version: "future-by-name-only".to_owned(),
-                ..identity
-            },
-            &RuntimeAcquisitionMethod::ExternalBinary,
-            None,
-        );
-        let untrusted_compatibility = evaluate_q27_runtime_contract(untrusted);
-        assert!(matches!(
-            untrusted_compatibility,
-            RuntimeCompatibility::Incompatible(ref reason)
-                if reason.contains("no trustworthy package-capability observation")
-        ));
-        assert!(!untrusted_compatibility.is_usable());
-        assert!(validate_q27_runtime_contract(untrusted).is_err());
+    fn argument_strings(arguments: Vec<OsString>) -> Vec<String> {
+        arguments
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
-    fn immutable_current_source_contract_admits_package_capabilities_and_exact_widths() {
-        let runtimes = current_source_runtimes();
-        for (variant, expected_w_max, expected_target) in [
-            ("w8", 8, "build/q27-server-w8"),
-            ("w12", 12, "build/q27-server"),
-            ("w16", 16, "build/q27-server-w16"),
+    fn ordinary_q27_settings_cover_formerly_hidden_execution_controls() {
+        let ids = q27_setting_definitions()
+            .into_iter()
+            .map(|definition| definition.id.to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        for expected in [
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "q27.thinking",
+            "q27.thinking_budget",
+            "q27.fast_head",
+            "q27.kv_mode",
+            "q27.mtp",
+            "q27.mtp_max_depth",
+            "q27.mtp_min_probability",
+            "q27.suffix_drafting",
+            "q27.suffix_width_mode",
+            "q27.prompt_mode",
+            "q27.prompt_delivery",
+            "q27.template_path",
+            "q27.template_sha256",
+            "q27.render_generation_prompt",
+            "q27.template_thinking",
+            "q27.response_filter",
         ] {
-            let runtime = runtimes
-                .iter()
-                .find(|runtime| runtime.identity.variant == variant)
-                .expect("source variant");
-            let plan = runtime.source_build().expect("source plan");
-            assert_eq!(plan.source.commit_sha, PACKAGE_SOURCE_COMMIT);
-            assert_eq!(plan.source.tree_sha, PACKAGE_SOURCE_TREE);
-            assert_eq!(plan.recipe.recipe_version, SOURCE_RECIPE_VERSION);
-            assert_eq!(
-                plan.recipe.build_definition_sha256.as_deref(),
-                Some(PACKAGE_MAKEFILE_SHA256)
-            );
-            assert_eq!(plan.recipe.build_target, expected_target);
-            let capabilities = q27_runtime_capabilities(
-                &runtime.identity,
-                &RuntimeAcquisitionMethod::SourceBuild,
-                Some(Q27SourceBuildEvidence::Plan(plan)),
-            );
-            assert!(validate_q27_runtime_contract(capabilities).is_ok());
-            assert_eq!(capabilities.compiled_w_max, Some(expected_w_max));
-            assert_eq!(capabilities.supported_kv_modes, Q27KvMode::QUALITY_ORDER);
-            let provenance = current_source_provenance(plan);
-            let installed_capabilities = q27_runtime_capabilities(
-                &runtime.identity,
-                &RuntimeAcquisitionMethod::SourceBuild,
-                Some(Q27SourceBuildEvidence::Provenance(&provenance)),
-            );
-            assert!(validate_q27_runtime_contract(installed_capabilities).is_ok());
-            assert_eq!(installed_capabilities.compiled_w_max, Some(expected_w_max));
+            assert!(ids.contains(expected), "missing q27 setting {expected}");
         }
     }
 
     #[test]
-    fn source_capability_fingerprint_requires_every_exact_revision_digest() {
-        let commit: GitHubCommit = serde_json::from_value(json!({
-            "sha": PACKAGE_SOURCE_COMMIT,
-            "html_url": format!(
-                "https://github.com/{GITHUB_REPOSITORY}/commit/{PACKAGE_SOURCE_COMMIT}"
-            ),
-            "commit": {
-                "committer": {"date": "2026-08-25T20:13:34Z"},
-                "tree": {"sha": PACKAGE_SOURCE_TREE}
-            }
-        }))
-        .expect("current commit");
-        assert!(q27_source_package_contract_from_digests(
-            &commit,
-            PACKAGE_MAKEFILE_SHA256,
-            PACKAGE_README_SHA256,
-            PACKAGE_SERVER_SHA256,
-            PACKAGE_ENGINE_SHA256,
-        ));
-        assert!(!q27_source_package_contract_from_digests(
-            &commit,
-            PACKAGE_MAKEFILE_SHA256,
-            PACKAGE_README_SHA256,
-            PACKAGE_SERVER_SHA256,
-            &"0".repeat(64),
-        ));
-    }
-
-    #[test]
-    fn source_package_capabilities_fail_closed_on_recipe_or_target_mismatch() {
-        let mut runtime = current_source_runtimes()
-            .into_iter()
-            .find(|runtime| runtime.identity.variant == "w12")
-            .expect("W12 source runtime");
-        let RuntimeAcquisitionPlan::SourceBuild(plan) = &mut runtime.acquisition else {
-            panic!("source plan")
-        };
-        plan.recipe.build_target = "build/q27-server-w8".to_owned();
-        plan.recipe.entrypoint = "build/q27-server-w8".into();
-        let capabilities = q27_runtime_capabilities(
-            &runtime.identity,
-            &RuntimeAcquisitionMethod::SourceBuild,
-            Some(Q27SourceBuildEvidence::Plan(plan)),
-        );
-        assert!(!capabilities.trustworthy_identity || capabilities.compiled_w_max.is_none());
-        assert!(validate_q27_runtime_contract(capabilities).is_err());
-
-        plan.recipe.build_target = "build/q27-server".to_owned();
-        plan.recipe.entrypoint = "build/q27-server".into();
-        plan.recipe.recipe_version = "q27-upstream-make-v1".to_owned();
-        let capabilities = q27_runtime_capabilities(
-            &runtime.identity,
-            &RuntimeAcquisitionMethod::SourceBuild,
-            Some(Q27SourceBuildEvidence::Plan(plan)),
-        );
-        assert!(!capabilities.trustworthy_identity);
-    }
-
-    const INCOMPLETE_FAST_HEAD_USAGE: &str = "Usage: q27-server model.q27 model.tok --host HOST --port PORT --ctx C \
-         --kv-fp16 --no-fast-head";
-
-    fn trusted_source_schema(usage: &str) -> LoadSettingsSchema {
-        let runtime = current_source_runtimes()
-            .into_iter()
-            .find(|runtime| runtime.identity.variant == "w12")
-            .expect("W12 source runtime");
-        let plan = runtime.source_build().expect("source plan");
-        let provenance = current_source_provenance(plan);
-        q27_load_settings_schema_from_usage(
-            Some(runtime.runtime_id.clone()),
-            &runtime.identity,
-            &RuntimeAcquisitionMethod::SourceBuild,
-            Some(Q27SourceBuildEvidence::Provenance(&provenance)),
-            usage,
-        )
-    }
-
-    #[test]
-    fn trusted_source_contract_supplements_incomplete_usage() {
-        let schema = trusted_source_schema(INCOMPLETE_FAST_HEAD_USAGE);
-        let fast_head = schema
-            .definitions
-            .iter()
-            .find(|definition| definition.id.as_str() == "q27.fast_head")
-            .expect("fast-head definition");
-        assert!(fast_head.supported);
+    fn mtp_configuration_directly_drives_capability_validation() {
+        let settings = resolved(&[("q27.mtp", SettingValue::Toggle(true))]);
+        let mut capabilities = exact_capabilities();
+        capabilities.mtp_environment = false;
         assert!(
-            schema
-                .definitions
-                .iter()
-                .find(|definition| definition.id.as_str() == "parallel_requests")
-                .expect("parallel-requests definition")
-                .supported
-        );
-    }
-
-    #[test]
-    fn trusted_source_fast_head_true_translates_to_enable_flag() {
-        let schema = trusted_source_schema(INCOMPLETE_FAST_HEAD_USAGE);
-        let settings = resolved_load_settings(&[("q27.fast_head", LoadSettingValue::Toggle(true))]);
-        schema.validate(&settings).expect("trusted source schema");
-        let translated =
-            translate_q27_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
-        assert_eq!(argument_strings(translated.arguments), ["--fast-head"]);
-    }
-
-    #[test]
-    fn trusted_source_fast_head_false_translates_to_disable_flag() {
-        let schema = trusted_source_schema(INCOMPLETE_FAST_HEAD_USAGE);
-        let settings =
-            resolved_load_settings(&[("q27.fast_head", LoadSettingValue::Toggle(false))]);
-        schema.validate(&settings).expect("trusted source schema");
-        let translated =
-            translate_q27_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
-        assert_eq!(argument_strings(translated.arguments), ["--no-fast-head"]);
-    }
-
-    #[test]
-    fn external_runtime_with_incomplete_usage_remains_fail_closed() {
-        let mut identity = current_source_runtimes()
-            .into_iter()
-            .find(|runtime| runtime.identity.variant == "w12")
-            .expect("W12 source runtime")
-            .identity;
-        identity.package_family = ENGINE_ID.to_owned();
-        identity.accelerator = "external".to_owned();
-        identity.variant = "q27-server-v0.10.0".to_owned();
-        identity.upstream_revision = None;
-        identity.package = RuntimePackageIdentity {
-            provider_id: "external-binary".to_owned(),
-            repository: Some(GITHUB_REPOSITORY.to_owned()),
-            release_tag: None,
-            asset_id: Some("/opt/q27-server-v0.10.0".to_owned()),
-            asset_name: Some("q27-server-v0.10.0".to_owned()),
-            additional_assets: Vec::new(),
-        };
-        let schema = q27_load_settings_schema_from_usage(
-            None,
-            &identity,
-            &RuntimeAcquisitionMethod::ExternalBinary,
-            None,
-            INCOMPLETE_FAST_HEAD_USAGE,
-        );
-        let fast_head = schema
-            .definitions
-            .iter()
-            .find(|definition| definition.id.as_str() == "q27.fast_head")
-            .expect("fast-head definition");
-        assert!(!fast_head.supported);
-        assert!(
-            !schema
-                .definitions
-                .iter()
-                .find(|definition| definition.id.as_str() == "parallel_requests")
-                .expect("parallel-requests definition")
-                .supported
-        );
-
-        let complete_usage = format!("{INCOMPLETE_FAST_HEAD_USAGE} --fast-head");
-        let schema = q27_load_settings_schema_from_usage(
-            None,
-            &identity,
-            &RuntimeAcquisitionMethod::ExternalBinary,
-            None,
-            &complete_usage,
-        );
-        assert!(
-            schema
-                .definitions
-                .iter()
-                .find(|definition| definition.id.as_str() == "q27.fast_head")
-                .expect("fast-head definition")
-                .supported
-        );
-    }
-
-    #[test]
-    fn mismatched_source_provenance_with_v0100_claim_remains_fail_closed() {
-        let runtime = current_source_runtimes()
-            .into_iter()
-            .find(|runtime| runtime.identity.variant == "w12")
-            .expect("W12 source runtime");
-        let mut provenance =
-            current_source_provenance(runtime.source_build().expect("source plan"));
-        provenance.source.tree_sha = "0".repeat(40);
-        let schema = q27_load_settings_schema_from_usage(
-            Some(runtime.runtime_id.clone()),
-            &runtime.identity,
-            &RuntimeAcquisitionMethod::SourceBuild,
-            Some(Q27SourceBuildEvidence::Provenance(&provenance)),
-            INCOMPLETE_FAST_HEAD_USAGE,
-        );
-        let fast_head = schema
-            .definitions
-            .iter()
-            .find(|definition| definition.id.as_str() == "q27.fast_head")
-            .expect("fast-head definition");
-        assert!(!fast_head.supported);
-    }
-
-    #[test]
-    fn profile_derived_fast_head_default_passes_trusted_source_schema() {
-        let model_id = ModelId("model".to_owned());
-        let mut settings = ResolvedLoadSettings {
-            engine_id: ENGINE_ID.to_owned(),
-            ..ResolvedLoadSettings::default()
-        };
-        settings.effective.insert(
-            LoadSettingId::new("context_length").unwrap(),
-            ResolvedLoadSetting {
-                value: LoadSettingValue::UnsignedInteger(4096),
-                source: LoadSettingSource::ModelDefault {
-                    model_id: model_id.clone(),
-                },
-            },
-        );
-        settings.effective.insert(
-            LoadSettingId::new("q27.fast_head").unwrap(),
-            ResolvedLoadSetting {
-                value: LoadSettingValue::Toggle(true),
-                source: LoadSettingSource::ModelDefault { model_id },
-            },
-        );
-        let profile = q27_serve_profile_fixture();
-        apply_serve_profile_load_policy(Some(&profile), &mut settings)
-            .expect("Serve Profile load policy");
-        assert_eq!(
-            settings.value("context_length"),
-            Some(&LoadSettingValue::UnsignedInteger(262_144)),
-            "profile defaults must follow model defaults in precedence"
-        );
-        assert_eq!(
-            settings.value("q27.fast_head"),
-            Some(&LoadSettingValue::Toggle(false))
-        );
-        assert!(matches!(
-            settings
-                .effective
-                .get(&LoadSettingId::new("q27.fast_head").expect("setting ID"))
-                .map(|setting| &setting.source),
-            Some(LoadSettingSource::ServeProfile { .. })
-        ));
-        let schema = trusted_source_schema(INCOMPLETE_FAST_HEAD_USAGE);
-        schema.validate(&settings).expect("trusted source schema");
-        let translated =
-            translate_q27_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
-        assert!(
-            argument_strings(translated.arguments)
-                .iter()
-                .any(|argument| argument == "--no-fast-head")
-        );
-
-        let mut invocation = resolved_load_settings(&[
-            ("context_length", LoadSettingValue::UnsignedInteger(210_000)),
-            ("q27.fast_head", LoadSettingValue::Toggle(true)),
-        ]);
-        apply_serve_profile_load_policy(Some(&profile), &mut invocation)
-            .expect("allowed invocation overrides");
-        assert_eq!(
-            invocation.value("context_length"),
-            Some(&LoadSettingValue::UnsignedInteger(210_000))
-        );
-        assert_eq!(
-            invocation.value("q27.fast_head"),
-            Some(&LoadSettingValue::Toggle(true))
-        );
-
-        let mut below_minimum = resolved_load_settings(&[(
-            "context_length",
-            LoadSettingValue::UnsignedInteger(199_999),
-        )]);
-        assert!(
-            apply_serve_profile_load_policy(Some(&profile), &mut below_minimum)
+            validate_q27_settings_prelaunch(&settings, capabilities)
                 .unwrap_err()
-                .contains("at least 200000")
+                .contains("MTP")
         );
-
-        let mut locked_profile = profile;
-        locked_profile
-            .engine
-            .q27
-            .as_mut()
-            .unwrap()
-            .fast_head
-            .user_override_allowed = false;
-        let mut conflicting =
-            resolved_load_settings(&[("q27.fast_head", LoadSettingValue::Toggle(true))]);
         assert!(
-            apply_serve_profile_load_policy(Some(&locked_profile), &mut conflicting)
-                .unwrap_err()
-                .contains("locks q27.fast_head=false")
+            validate_q27_settings_prelaunch(&resolved(&[]), capabilities).is_ok(),
+            "an omitted setting must not invent a capability requirement"
         );
     }
 
     #[test]
-    fn serve_profile_launch_preserves_canonical_and_optional_q27_semantics() {
-        let profile = q27_serve_profile_fixture();
-        let mut contradictory_thinking = profile.clone();
-        contradictory_thinking.generation.thinking.default = false;
-        assert!(
-            contradictory_thinking
-                .validate()
-                .unwrap_err()
-                .contains("require thinking")
-        );
-        let mut contradictory_mtp = profile.clone();
-        contradictory_mtp
-            .engine
-            .q27
-            .as_mut()
-            .expect("q27 strategy")
-            .mtp
-            .enabled = false;
-        assert!(
-            contradictory_mtp
-                .validate()
-                .unwrap_err()
-                .contains("required while disabled")
-        );
-        let translated =
-            q27_profile_launch_configuration(&profile, Some(12), false, Q27KvMode::Fp8)
-                .expect("Serve Profile launch configuration");
-        let arguments = argument_strings(translated.arguments);
-        assert!(arguments.iter().any(|argument| argument == "--think"));
-        assert!(!arguments.iter().any(|argument| argument == "--no-think"));
-        assert!(arguments.windows(2).any(|pair| pair == ["--temp", "1"]));
-        assert!(arguments.windows(2).any(|pair| pair == ["--top-p", "0.95"]));
-        assert!(arguments.windows(2).any(|pair| pair == ["--top-k", "20"]));
-        assert!(arguments.windows(2).any(|pair| pair == ["--min-p", "0.05"]));
-        assert!(
-            arguments
-                .windows(2)
-                .any(|pair| pair == ["--think-budget", "0"])
-        );
-        assert_eq!(translated.environment["Q27_MAXD"], "auto7");
-        assert_eq!(translated.environment["Q27_PMIN"], "0.5");
-        assert_eq!(translated.environment["Q27_SUFFIX"], "1");
-        assert_eq!(translated.environment["Q27_SUFFIX_W"], "12");
-        assert_eq!(translated.environment["Q27_KV"], "fp8");
-        assert_eq!(translated.normalized_settings["top_k"], json!(20));
-        assert_eq!(translated.normalized_settings["min_p"], json!(0.05));
-
-        let mut generic = profile.clone();
-        generic.generation.defaults = norted_core::GenerationDefaults::default();
-        generic.generation.thinking.default = false;
-        generic.generation.thinking.required = false;
-        generic.requirements.retain(|requirement| {
-            *requirement != norted_core::ServeCapability::UnlimitedThinkingBudget
-        });
-        let strategy = generic.engine.q27.as_mut().expect("q27 strategy");
-        strategy.suffix_drafting = false;
-        strategy.suffix_width_from_runtime_w_max = false;
-        let generic_launch =
-            q27_profile_launch_configuration(&generic, Some(12), false, Q27KvMode::Fp8)
-                .expect("generic q27 launch configuration");
-        let generic_arguments = argument_strings(generic_launch.arguments);
-        assert_eq!(generic_arguments, ["--no-think"]);
-        assert!(
-            !generic_launch
-                .normalized_settings
-                .contains_key("thinking_budget")
-        );
-        for sampler in ["temperature", "top_p", "top_k", "min_p"] {
-            assert!(!generic_launch.normalized_settings.contains_key(sampler));
-        }
-        assert_eq!(generic_launch.environment["Q27_SUFFIX"], "0");
-        assert!(!generic_launch.environment.contains_key("Q27_SUFFIX_W"));
-
-        generic.engine.q27.as_mut().expect("strategy").mtp.enabled = false;
-        let disabled_launch =
-            q27_profile_launch_configuration(&generic, Some(12), false, Q27KvMode::Fp8)
-                .expect("disabled MTP remains representable before capability admission");
-        assert!(!disabled_launch.environment.contains_key("Q27_MAXD"));
-        assert!(!disabled_launch.environment.contains_key("Q27_PMIN"));
-        assert!(!disabled_launch.environment.contains_key("Q27_SUFFIX"));
-        assert!(!disabled_launch.environment.contains_key("Q27_SUFFIX_W"));
-        assert!(
-            validate_q27_profile_prelaunch(
-                &generic,
-                q27_runtime_capabilities(
-                    &q27_runtime_identity("w12"),
-                    &RuntimeAcquisitionMethod::OfficialReleaseAsset,
-                    None,
-                ),
-            )
-            .unwrap_err()
-            .contains("no proven MTP-disable control")
-        );
-    }
-
-    #[test]
-    fn exact_runtime_kv_modes_follow_profile_quality_order_without_inventing_turbo5k() {
-        let profile = q27_serve_profile_fixture();
-        let strategy = profile.engine.q27.as_ref().expect("q27 strategy");
-        let exact = q27_runtime_capabilities(
-            &q27_runtime_identity("w12"),
-            &RuntimeAcquisitionMethod::OfficialReleaseAsset,
-            None,
-        );
+    fn automatic_kv_selection_is_server_owned_and_proven() {
+        let automatic = resolved(&[("q27.kv_mode", SettingValue::Choice("auto".to_owned()))]);
         assert_eq!(
-            q27_profile_kv_attempt_modes(exact, strategy),
+            q27_configured_kv_attempt_modes(exact_capabilities(), &automatic),
             [Q27KvMode::Fp8, Q27KvMode::Turbo3]
         );
-
-        let future = Q27RuntimeCapabilities {
-            top_k_min_p: true,
-            supported_kv_modes: ALL_Q27_KV_MODES,
-            ..exact
-        };
+        let fp16 = resolved(&[("q27.kv_mode", SettingValue::Choice("fp16".to_owned()))]);
         assert_eq!(
-            q27_profile_kv_attempt_modes(future, strategy),
-            Q27KvMode::QUALITY_ORDER
+            q27_configured_kv_attempt_modes(exact_capabilities(), &fp16),
+            [Q27KvMode::Fp16]
         );
-        assert!(matches!(
-            evaluate_q27_runtime_contract(future),
-            RuntimeCompatibility::NeedsAttention(_)
-        ));
-        assert!(validate_q27_runtime_contract(future).is_ok());
     }
 
     #[test]
-    fn bounded_startup_parser_proves_context_kv_and_numeric_wmax() {
+    fn configured_q27_values_translate_without_provenance_checks() {
+        let settings = resolved(&[
+            ("temperature", SettingValue::Float(0.8)),
+            ("top_p", SettingValue::Float(0.9)),
+            ("top_k", SettingValue::UnsignedInteger(32)),
+            ("min_p", SettingValue::Float(0.05)),
+            ("q27.thinking", SettingValue::Toggle(true)),
+            ("q27.thinking_budget", SettingValue::UnsignedInteger(0)),
+            ("q27.mtp", SettingValue::Toggle(true)),
+            ("q27.mtp_max_depth", SettingValue::UnsignedInteger(7)),
+            ("q27.mtp_min_probability", SettingValue::Float(0.5)),
+            ("q27.suffix_drafting", SettingValue::Toggle(true)),
+            (
+                "q27.suffix_width_mode",
+                SettingValue::Choice("runtime_w_max".to_owned()),
+            ),
+        ]);
+        let launch = q27_configured_launch(&settings, Some(12), Some(Q27KvMode::Fp8))
+            .expect("configured launch");
+        let arguments = argument_strings(launch.arguments);
+        assert!(arguments.iter().any(|argument| argument == "--think"));
+        assert!(arguments.windows(2).any(|pair| pair == ["--top-k", "32"]));
+        assert_eq!(launch.environment["Q27_KV"], "fp8");
+        assert_eq!(launch.environment["Q27_MAXD"], "7");
+        assert_eq!(launch.environment["Q27_SUFFIX_W"], "12");
+
+        let inherited_mtp = q27_configured_launch(
+            &resolved(&[("q27.mtp_max_depth", SettingValue::UnsignedInteger(3))]),
+            Some(12),
+            None,
+        )
+        .expect("MTP subcontrol with runtime MTP default");
+        assert_eq!(inherited_mtp.environment["Q27_MAXD"], "3");
+    }
+
+    #[tokio::test]
+    async fn any_local_template_is_verified_by_content_hash() {
+        let directory = tempfile::tempdir().expect("template directory");
+        let path = directory.path().join("custom.jinja");
+        let bytes = b"{{ messages[0].content }}";
+        std::fs::write(&path, bytes).expect("template");
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let settings = resolved(&[
+            ("q27.template_path", SettingValue::Path(path.clone())),
+            ("q27.template_sha256", SettingValue::String(digest)),
+        ]);
+        assert_eq!(
+            read_configured_template(&settings).await.expect("template"),
+            String::from_utf8(bytes.to_vec()).unwrap()
+        );
+
+        std::fs::write(&path, b"changed").expect("changed template");
+        assert!(read_configured_template(&settings).await.is_err());
+    }
+
+    #[test]
+    fn an_unconfigured_artifact_never_auto_selects_a_template() {
+        let settings = resolved(&[]);
+        assert!(!q27_has_configured_execution(&settings));
+        assert!(settings.value("q27.template_path").is_none());
+    }
+
+    #[test]
+    fn response_filter_has_generic_semantics() {
+        assert_eq!(
+            filter_q27_initial_reasoning("private reasoning</think>public answer"),
+            "public answer"
+        );
+        assert_eq!(filter_q27_initial_reasoning("reasoning only"), "");
+    }
+
+    #[test]
+    fn request_generation_values_override_configured_defaults() {
+        let execution = Q27ConfiguredExecution {
+            settings: resolved(&[
+                ("temperature", SettingValue::Float(0.8)),
+                ("top_p", SettingValue::Float(0.9)),
+            ]),
+            sharp_template: None,
+            compiled_w_max: Some(12),
+            selected_kv_mode: None,
+        };
+        let (_, body) = Q27Adapter::configured_backend_request(
+            &execution,
+            &InferenceRequest {
+                model_profile_id: ModelProfileId::new("profile-alias").expect("profile ID"),
+                messages: Vec::new(),
+                generation_settings: GenerationSettingsPatch {
+                    temperature: Some(0.4),
+                    top_p: Some(0.7),
+                    reasoning_effort: None,
+                },
+                max_output_tokens: None,
+                stream: false,
+            },
+            false,
+        )
+        .expect("request body");
+        assert_eq!(body["temperature"], 0.4);
+        assert_eq!(body["top_p"], 0.7);
+        assert_eq!(body["model"], "profile-alias");
+    }
+
+    #[test]
+    fn bounded_startup_parser_proves_context_kv_and_numeric_width() {
         let observation = parse_q27_startup_observation(&[
             "profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=0 think=1".to_owned(),
             "--ctx auto: 262144 (free 30.0GB post-weights, fp8 KV, W_MAX=12)".to_owned(),
@@ -5310,1825 +4718,14 @@ mod tests {
         assert_eq!(observation.served_context, 262_144);
         assert_eq!(observation.kv_mode, "fp8");
         assert_eq!(observation.compiled_w_max, 12);
-        assert_eq!(observation.suffix_width, 12);
         assert!(observation.thinking);
     }
 
     #[test]
-    fn startup_progress_tracks_exact_startup_lines_without_inventing_fractions() {
-        assert_eq!(parse_q27_startup_progress(&[]), None);
-
-        let weights = parse_q27_startup_progress(&["q27 0.10.0 starting".to_owned()])
-            .expect("early startup output yields an indeterminate phase");
-        assert_eq!(weights.phase, BackendLoadPhase::LoadingModel);
-        assert_eq!(weights.fraction, None);
-        assert_eq!(weights.message.as_deref(), Some("Loading model weights"));
-
-        let profile = parse_q27_startup_progress(&[
-            "profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=0 think=1".to_owned(),
-        ])
-        .expect("profile line yields context resolution");
-        assert_eq!(profile.phase, BackendLoadPhase::AllocatingContext);
-        assert_eq!(profile.fraction, None);
-        assert_eq!(
-            profile.message.as_deref(),
-            Some("Resolving context (fp8 KV)")
-        );
-
-        let slots = parse_q27_startup_progress(&[
-            "profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=0 think=1".to_owned(),
-            "--ctx auto: 262144 (free 30.0GB post-weights, fp8 KV, W_MAX=12)".to_owned(),
-        ])
-        .expect("auto-context line yields slot preparation");
-        assert_eq!(slots.phase, BackendLoadPhase::AllocatingContext);
-        assert_eq!(
-            slots.message.as_deref(),
-            Some("Preparing slots (context 262144)")
-        );
-
-        let verifying = parse_q27_startup_progress(&[
-            "profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=0 think=1".to_owned(),
-            "--ctx auto: 262144 (free 30.0GB post-weights, fp8 KV, W_MAX=12)".to_owned(),
-            "slot 0 ready: ctx=262144".to_owned(),
-        ])
-        .expect("slot-ready line yields verification");
-        assert_eq!(verifying.phase, BackendLoadPhase::VerifyingStartup);
-        assert_eq!(verifying.fraction, None);
-        assert_eq!(
-            verifying.message.as_deref(),
-            Some("Verifying q27 startup profile (context 262144)")
-        );
-
-        let oversized = vec!["x".repeat(5_000)];
-        assert_eq!(parse_q27_startup_progress(&oversized), None);
-    }
-
-    #[tokio::test]
-    async fn serve_profile_startup_retries_only_a_fully_valid_low_context_observation() {
-        let adapter = Q27Adapter::from_config(None, Path::new("."));
-        let endpoint = "http://127.0.0.1:43127";
-        adapter.profile_executions.write().await.insert(
-            endpoint.to_owned(),
-            Q27ProfileExecution {
-                profile: q27_serve_profile_fixture(),
-                sharp_template: Some("sharp".to_owned()),
-                compiled_w_max: Some(12),
-                expected_fast_head: false,
-                selected_kv_mode: Q27KvMode::Fp8,
-            },
-        );
-        let process = ProcessDescriptor {
-            supervisor_id: "test".to_owned(),
-            process_id: 1,
-            engine: EngineRevision {
-                engine_id: ENGINE_ID.to_owned(),
-                version: Some("0.6.2".to_owned()),
-                revision: None,
-            },
-            runtime_id: RuntimeId("runtime".to_owned()),
-            runtime_version: "0.6.2".to_owned(),
-            runtime_variant: "w12".to_owned(),
-            runtime_executable_sha256: "00".repeat(32),
-            model_id: ModelId("model".to_owned()),
-            endpoint: Some(endpoint.to_owned()),
-            launched_at_unix: 0,
-        };
-        let low_context = [
-            "profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=0 think=1".to_owned(),
-            "--ctx auto: 180000 (free 30.0GB post-weights, fp8 KV, W_MAX=12)".to_owned(),
-            "slot 0 ready: ctx=180000".to_owned(),
-        ];
-        assert!(matches!(
-            adapter
-                .startup_observation(&process, &low_context)
-                .await
-                .expect("classified observation"),
-            StartupObservation::RetryContextCapacity {
-                ref kv_mode,
-                observed_context: 180_000,
-                minimum_context: 200_000,
-            } if kv_mode == "fp8"
-        ));
-
-        let wrong_wmax = [
-            low_context[0].clone(),
-            "--ctx auto: 180000 (free 30.0GB post-weights, fp8 KV, W_MAX=8)".to_owned(),
-            low_context[2].clone(),
-        ];
-        assert!(matches!(
-            adapter.startup_observation(&process, &wrong_wmax).await,
-            Err(EngineError::Operation(reason)) if reason.contains("W_MAX")
-        ));
-    }
-
-    #[tokio::test]
-    async fn clearing_reused_endpoint_forces_a_later_raw_launch_to_raw_state() {
-        let adapter = Q27Adapter::from_config(None, Path::new("."));
-        let endpoint = "http://127.0.0.1:43128";
-        adapter.profile_executions.write().await.insert(
-            endpoint.to_owned(),
-            Q27ProfileExecution {
-                profile: q27_serve_profile_fixture(),
-                sharp_template: Some("stale".to_owned()),
-                compiled_w_max: Some(12),
-                expected_fast_head: false,
-                selected_kv_mode: Q27KvMode::Fp8,
-            },
-        );
-        adapter.clear_launch_state(Some(endpoint)).await;
-        assert!(
-            adapter
-                .profile_executions
-                .read()
-                .await
-                .get(endpoint)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn sharp_renderer_preserves_developer_and_message_order() {
-        let template = concat!(
-            "{%- for message in messages -%}",
-            "{{ message.role }}={{ message.content }};",
-            "{%- endfor -%}",
-            "{% if add_generation_prompt %}assistant={{ reasoning_effort }}{% endif %}"
-        );
-        let rendered = render_sharp_template(
-            template,
-            &[
-                InferenceMessage {
-                    role: InferenceRole::System,
-                    text: "s".to_owned(),
-                },
-                InferenceMessage {
-                    role: InferenceRole::Developer,
-                    text: "d".to_owned(),
-                },
-                InferenceMessage {
-                    role: InferenceRole::User,
-                    text: "u".to_owned(),
-                },
-                InferenceMessage {
-                    role: InferenceRole::Assistant,
-                    text: "a".to_owned(),
-                },
-            ],
-            true,
-            true,
-            Some("medium"),
-        )
-        .expect("Sharp rendering");
-        assert_eq!(
-            rendered,
-            "system=s;developer=d;user=u;assistant=a;assistant=medium"
-        );
-
-        let mut profile = q27_serve_profile_fixture();
-        profile.prompt.mode = norted_core::PromptMode::ExternalTemplate;
-        profile.prompt.delivery = norted_core::PromptDelivery::RawCompletions;
-        profile.prompt.render_generation_prompt = true;
-        profile.prompt.thinking_enabled = true;
-        profile.prompt.response_filter = norted_core::ResponseFilter::DirkSharpReasoning;
-        profile
-            .generation
-            .allowed_user_overrides
-            .push("reasoning_effort".to_owned());
-        let execution = Q27ProfileExecution {
-            profile,
-            sharp_template: Some(template.to_owned()),
-            compiled_w_max: Some(12),
-            expected_fast_head: false,
-            selected_kv_mode: Q27KvMode::Fp8,
-        };
-        let (route, body) = Q27Adapter::profile_backend_request(
-            &execution,
-            &InferenceRequest {
-                model_id: ModelId("package-model".to_owned()),
-                messages: vec![InferenceMessage {
-                    role: InferenceRole::Developer,
-                    text: "bound Sharp".to_owned(),
-                }],
-                generation_settings: GenerationSettingsPatch::default(),
-                max_output_tokens: Some(32),
-                stream: false,
-            },
-            false,
-        )
-        .expect("raw Serve Profile request");
-        assert_eq!(route, "/v1/completions");
-        assert!(body.get("messages").is_none());
-        assert_eq!(body["prompt"], "developer=bound Sharp;assistant=medium");
-        assert_eq!(body["top_k"], 20);
-        assert_eq!(body["min_p"], 0.05);
-
-        let (_, allowed) = Q27Adapter::profile_backend_request(
-            &execution,
-            &InferenceRequest {
-                model_id: ModelId("compatible-model".to_owned()),
-                messages: Vec::new(),
-                generation_settings: GenerationSettingsPatch {
-                    temperature: Some(0.7),
-                    top_p: None,
-                    reasoning_effort: Some(norted_engine::ReasoningEffort::High),
-                },
-                max_output_tokens: None,
-                stream: false,
-            },
-            false,
-        )
-        .expect("profile-permitted generation override");
-        assert_eq!(allowed["temperature"], 0.7);
-        assert_eq!(allowed["prompt"], "assistant=high");
-
-        let mut inherited = execution.clone();
-        inherited.profile.generation.defaults = norted_core::GenerationDefaults::default();
-        let (_, inherited_body) = Q27Adapter::profile_backend_request(
-            &inherited,
-            &InferenceRequest {
-                model_id: ModelId("compatible-model".to_owned()),
-                messages: Vec::new(),
-                generation_settings: GenerationSettingsPatch::default(),
-                max_output_tokens: None,
-                stream: false,
-            },
-            false,
-        )
-        .expect("profile with inherited sampler defaults");
-        for sampler in ["temperature", "top_p", "top_k", "min_p"] {
-            assert!(
-                inherited_body.get(sampler).is_none(),
-                "omitted profile sampler `{sampler}` must inherit the q27 raw-endpoint default"
-            );
-        }
-
-        let mut locked = execution;
-        locked
-            .profile
-            .generation
-            .allowed_user_overrides
-            .retain(|name| name != "top_p");
-        assert!(matches!(
-            Q27Adapter::profile_backend_request(
-                &locked,
-                &InferenceRequest {
-                    model_id: ModelId("compatible-model".to_owned()),
-                    messages: Vec::new(),
-                    generation_settings: GenerationSettingsPatch {
-                        temperature: None,
-                        top_p: Some(0.8),
-                        reasoning_effort: None,
-                    },
-                    max_output_tokens: None,
-                    stream: false,
-                },
-                false,
-            ),
-            Err(EngineError::InvalidGenerationSettings(reason))
-                if reason.contains("does not allow")
-        ));
-    }
-
-    #[test]
     fn omitted_settings_emit_no_q27_arguments() {
-        let translated =
-            translate_q27_load_settings(&resolved_load_settings(&[]), &[], &BTreeMap::new())
-                .expect("empty translation");
+        let translated = translate_q27_settings(&resolved(&[]), &[], &BTreeMap::new())
+            .expect("empty translation");
         assert!(translated.arguments.is_empty());
         assert!(translated.environment_remove.is_empty());
-    }
-
-    #[test]
-    fn q27_common_settings_translate_to_ctx_and_slots() {
-        let translated = translate_q27_load_settings(
-            &resolved_load_settings(&[
-                ("context_length", LoadSettingValue::UnsignedInteger(65_536)),
-                ("parallel_requests", LoadSettingValue::UnsignedInteger(2)),
-                ("q27.kv_fp16", LoadSettingValue::FlagEnabled),
-            ]),
-            &[],
-            &BTreeMap::new(),
-        )
-        .expect("q27 translation");
-        assert_eq!(
-            argument_strings(translated.arguments),
-            ["--ctx", "65536", "--slots", "2", "--kv-fp16"]
-        );
-        assert_eq!(translated.environment_remove, [OsString::from("Q27_KV")]);
-    }
-
-    fn q27_schema_with_bounds(managed: bool, version: &str) -> LoadSettingsSchema {
-        let mut definitions = q27_load_setting_definitions();
-        apply_q27_runtime_bounds(&mut definitions, managed, version);
-        LoadSettingsSchema {
-            engine_id: ENGINE_ID.to_owned(),
-            runtime_id: None,
-            definitions,
-        }
-    }
-
-    #[test]
-    fn managed_parallel_request_bound_changes_at_v031() {
-        for (version, expected) in [("0.2.0", 4), ("0.3.0", 4), ("0.3.1", 8), ("0.6.2", 8)] {
-            let schema = q27_schema_with_bounds(true, version);
-            let definition = schema
-                .definitions
-                .iter()
-                .find(|definition| definition.id.as_str() == "parallel_requests")
-                .expect("parallel definition");
-            assert_eq!(
-                definition.kind,
-                LoadSettingKind::UnsignedInteger {
-                    minimum: Some(1),
-                    maximum: Some(expected),
-                }
-            );
-        }
-    }
-
-    #[test]
-    fn managed_v030_rejects_eight_slots_before_translation() {
-        let schema = q27_schema_with_bounds(true, "0.3.0");
-        let settings =
-            resolved_load_settings(&[("parallel_requests", LoadSettingValue::UnsignedInteger(8))]);
-        assert!(schema.validate(&settings).is_err());
-    }
-
-    #[test]
-    fn managed_v031_accepts_eight_slots() {
-        let schema = q27_schema_with_bounds(true, "0.3.1");
-        let settings =
-            resolved_load_settings(&[("parallel_requests", LoadSettingValue::UnsignedInteger(8))]);
-        schema.validate(&settings).expect("v0.3.1 eight slots");
-    }
-
-    #[test]
-    fn external_parallel_requests_has_no_invented_maximum() {
-        let schema = q27_schema_with_bounds(false, "external");
-        let settings =
-            resolved_load_settings(&[("parallel_requests", LoadSettingValue::UnsignedInteger(64))]);
-        schema
-            .validate(&settings)
-            .expect("external usage does not prove a maximum");
-        let translated =
-            translate_q27_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
-        assert_eq!(argument_strings(translated.arguments), ["--slots", "64"]);
-    }
-
-    #[test]
-    fn explicit_positive_context_below_32_remains_valid() {
-        let schema = q27_schema_with_bounds(true, "0.6.2");
-        let settings =
-            resolved_load_settings(&[("context_length", LoadSettingValue::UnsignedInteger(8))]);
-        schema
-            .validate(&settings)
-            .expect("explicit positive q27 context");
-        let translated =
-            translate_q27_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
-        assert_eq!(argument_strings(translated.arguments), ["--ctx", "8"]);
-    }
-
-    #[test]
-    fn prefix_cache_launch_argument_matches_the_effective_path() {
-        let path = std::env::temp_dir().join("norted-data/cache/q27");
-        let settings = resolved_load_settings(&[(
-            "q27.prefix_cache_path",
-            LoadSettingValue::Path(path.clone()),
-        )]);
-        let translated =
-            translate_q27_load_settings(&settings, &[], &BTreeMap::new()).expect("translation");
-        assert_eq!(
-            translated.arguments,
-            [
-                OsString::from("--prefix-cache"),
-                path.clone().into_os_string()
-            ]
-        );
-        let provenance = LoadSettingsProvenance {
-            effective: settings.effective.clone(),
-        };
-        assert_eq!(
-            provenance
-                .effective
-                .get(&LoadSettingId::new("q27.prefix_cache_path").expect("setting ID"))
-                .map(|setting| &setting.value),
-            Some(&LoadSettingValue::Path(path))
-        );
-    }
-
-    #[test]
-    fn q27_structured_native_and_environment_conflicts_are_rejected() {
-        let context =
-            resolved_load_settings(&[("context_length", LoadSettingValue::UnsignedInteger(8192))]);
-        assert!(
-            translate_q27_load_settings(&context, &["--ctx=4096".to_owned()], &BTreeMap::new())
-                .expect_err("native collision")
-                .to_string()
-                .contains("conflicts")
-        );
-        let kv = resolved_load_settings(&[("q27.kv_fp16", LoadSettingValue::FlagEnabled)]);
-        assert!(
-            translate_q27_load_settings(
-                &kv,
-                &[],
-                &BTreeMap::from([("Q27_KV".to_owned(), "turbo5k".to_owned())])
-            )
-            .expect_err("environment collision")
-            .to_string()
-            .contains("Q27_KV")
-        );
-        let fast_head =
-            resolved_load_settings(&[("q27.fast_head", LoadSettingValue::Toggle(false))]);
-        for native in ["--fast-head", "--no-fast-head"] {
-            assert!(
-                translate_q27_load_settings(&fast_head, &[native.to_owned()], &BTreeMap::new())
-                    .expect_err("fast-head native collision")
-                    .to_string()
-                    .contains("conflicts")
-            );
-        }
-    }
-
-    #[test]
-    fn q27_prefix_tuning_without_a_cache_path_is_rejected() {
-        let settings = resolved_load_settings(&[(
-            "q27.prefix_cache_min_tokens",
-            LoadSettingValue::UnsignedInteger(4096),
-        )]);
-        assert!(
-            translate_q27_load_settings(&settings, &[], &BTreeMap::new())
-                .expect_err("ignored prefix tuning")
-                .to_string()
-                .contains("require `q27.prefix_cache_path`")
-        );
-    }
-
-    #[test]
-    fn structured_prefix_cache_settings_keep_the_q27_version_gates() {
-        assert!(q27_setting_unavailable_by_version(
-            true,
-            "0.5.9",
-            "--prefix-cache"
-        ));
-        assert!(q27_setting_unavailable_by_version(
-            true,
-            "0.6.0",
-            "--prefix-cache-ram-gb"
-        ));
-        assert!(!q27_setting_unavailable_by_version(
-            true,
-            "0.6.1",
-            "--prefix-cache-ram-gb"
-        ));
-        assert!(!q27_setting_unavailable_by_version(
-            false,
-            "external",
-            "--prefix-cache-ram-gb"
-        ));
-    }
-
-    #[test]
-    fn exact_q27_reference_is_recovered_from_ids_and_queries() {
-        assert_eq!(q27_tag_from_reference("v0.6.2"), Some("v0.6.2".to_owned()));
-        assert_eq!(q27_tag_from_reference("0.6.2"), Some("v0.6.2".to_owned()));
-        assert_eq!(
-            q27_tag_from_reference("q27-0-6-2-linux-x86-64-cuda-w12-deadbeef"),
-            Some("v0.6.2".to_owned())
-        );
-        assert_eq!(q27_tag_from_reference("q27 cuda"), None);
-    }
-
-    #[test]
-    fn usage_probe_requires_managed_contract_and_configured_options() {
-        let current = "Usage: q27-server model.q27 model.tok --host HOST --port PORT \
-                       defaults: fast-head + no-think + phase stats --ctx N --kv-fp16";
-        assert_eq!(
-            q27_usage_contract_error(
-                current,
-                &[
-                    "--ctx".to_owned(),
-                    "8192".to_owned(),
-                    "--kv-fp16".to_owned()
-                ]
-            ),
-            None
-        );
-        assert!(
-            q27_usage_contract_error(
-                "Usage: q27-server model.q27 model.tok --host HOST --port PORT",
-                &[]
-            )
-            .is_some_and(|error| error.contains("no-think"))
-        );
-        assert!(
-            q27_usage_contract_error(current, &["--prefix-cache".to_owned(), "cache".to_owned()])
-                .is_some_and(|error| error.contains("--prefix-cache"))
-        );
-    }
-
-    fn release(
-        id: u64,
-        tag: &str,
-        published_at: &str,
-        prerelease: bool,
-        assets: Vec<GitHubReleaseAsset>,
-    ) -> GitHubRelease {
-        GitHubRelease {
-            id,
-            tag_name: tag.to_owned(),
-            name: Some(tag.to_owned()),
-            html_url: format!("https://github.com/signalnine/q27/releases/tag/{tag}"),
-            target_commitish: "master".to_owned(),
-            draft: false,
-            prerelease,
-            published_at: Some(published_at.to_owned()),
-            assets,
-        }
-    }
-
-    fn asset(id: u64, tag: &str, digest: Option<&str>) -> GitHubReleaseAsset {
-        GitHubReleaseAsset {
-            id,
-            name: format!("q27-{tag}-linux-x86_64.tar.gz"),
-            size: 14_689_716,
-            browser_download_url: format!(
-                "https://github.com/signalnine/q27/releases/download/{tag}/q27-{tag}-linux-x86_64.tar.gz"
-            ),
-            digest: digest.map(str::to_owned),
-            state: "uploaded".to_owned(),
-        }
-    }
-
-    #[test]
-    fn catalog_admits_source_only_release_and_prefers_its_semantic_version() {
-        let releases = vec![
-            release(10, "v0.10.0", "2026-08-26T01:43:22Z", false, vec![]),
-            release(
-                6,
-                "v0.6.2",
-                "2026-07-25T05:30:39Z",
-                false,
-                vec![asset(
-                    600,
-                    "v0.6.2",
-                    Some("sha256:d0b7bd5abc4c2e84ee8bf5ff3936161a2285dc1d8e3d408f121770838d2c6d11"),
-                )],
-            ),
-        ];
-        let commit: GitHubCommit = serde_json::from_value(serde_json::json!({
-            "sha": "a".repeat(40),
-            "html_url": format!("https://github.com/signalnine/q27/commit/{}", "a".repeat(40)),
-            "commit": {
-                "committer": {"date": "2026-08-25T20:13:34Z"},
-                "tree": {"sha": "b".repeat(40)}
-            }
-        }))
-        .expect("commit fixture");
-        let makefile = concat!(
-            "CXX ?= g++\n",
-            "CXXFLAGS ?= -O2 -std=c++17\n",
-            "NVCC ?= /usr/local/cuda/bin/nvcc\n",
-            "NVCCFLAGS ?= -std=c++17 -gencode arch=compute_86,code=sm_86 \\\n",
-            " -gencode arch=compute_89,code=sm_89 \\\n",
-            " -gencode arch=compute_120,code=sm_120\n",
-            "build/q27-server:\n\t$(NVCC) server.cu -o $@\n",
-            "build/q27-server-w8:\n\t$(NVCC) server.cu -o $@\n",
-            "build/q27-server-w16:\n\t$(NVCC) server.cu -o $@\n",
-        );
-        let source = q27_source_capability_from_files(
-            commit,
-            makefile,
-            "Requirements: CUDA toolkit 12.8+ at `/usr/local/cuda`, gcc.",
-        )
-        .expect("source capability");
-        let partial_makefile = makefile.replace("build/q27-server-w16:", "unsupported-w16:");
-        let partial = q27_source_capability_from_files(
-            source.commit.clone(),
-            &partial_makefile,
-            "Requirements: CUDA toolkit 12.8+ at `/usr/local/cuda`, gcc.",
-        )
-        .expect("partial source capability");
-        assert_eq!(partial.supported_variant_ids, ["w8", "w12"]);
-        let mut changed_source = source.clone();
-        changed_source.commit.sha = "c".repeat(40);
-        changed_source.commit.html_url = format!(
-            "https://github.com/signalnine/q27/commit/{}",
-            changed_source.commit.sha
-        );
-        changed_source.commit.commit.tree.sha = "d".repeat(40);
-        let qualified = vec![
-            QualifiedRelease {
-                release: &releases[0],
-                version: "0.10.0".to_owned(),
-                binary: None,
-                source: Some(source),
-                published_at_unix: releases[0]
-                    .published_at
-                    .as_deref()
-                    .and_then(parse_github_timestamp),
-                ordinal: 0,
-            },
-            QualifiedRelease {
-                release: &releases[1],
-                version: "0.6.2".to_owned(),
-                binary: Some((
-                    &releases[1].assets[0],
-                    RuntimeDigest::parse_github(
-                        releases[1].assets[0].digest.as_deref().expect("digest"),
-                    )
-                    .expect("valid digest"),
-                )),
-                source: None,
-                published_at_unix: releases[1]
-                    .published_at
-                    .as_deref()
-                    .and_then(parse_github_timestamp),
-                ordinal: 1,
-            },
-        ];
-        let runtimes = materialize_qualified_releases(qualified).expect("valid catalog");
-        assert_eq!(runtimes.len(), 6);
-        assert_eq!(compare_versions("0.10.0", "0.9.0"), Ordering::Greater);
-        assert_eq!(compare_versions("0.10.0", "0.6.2"), Ordering::Greater);
-        let source_runtimes = runtimes
-            .iter()
-            .filter(|runtime| runtime.identity.version == "0.10.0")
-            .collect::<Vec<_>>();
-        assert_eq!(source_runtimes.len(), 3);
-        assert!(source_runtimes.iter().all(|runtime| {
-            runtime.channels.contains(&RuntimeReleaseChannel::Stable)
-                && runtime.channels.contains(&RuntimeReleaseChannel::Latest)
-                && runtime.source_build().is_some()
-                && runtime.identity.upstream_revision.as_deref()
-                    == Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        }));
-        let targets = source_runtimes
-            .iter()
-            .map(|runtime| {
-                let plan = runtime.source_build().expect("source plan");
-                (
-                    runtime.identity.variant.as_str(),
-                    plan.recipe.build_target.as_str(),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            targets,
-            [
-                ("w8", "build/q27-server-w8"),
-                ("w12", "build/q27-server"),
-                ("w16", "build/q27-server-w16"),
-            ]
-        );
-        let binary_runtimes = runtimes
-            .iter()
-            .filter(|runtime| runtime.identity.version == "0.6.2")
-            .collect::<Vec<_>>();
-        assert!(binary_runtimes.iter().all(|runtime| {
-            let Some((download, _)) = runtime.release_assets() else {
-                return false;
-            };
-            runtime.channels.is_empty()
-                && download.archive_format == RuntimeArchiveFormat::TarGz
-                && download.digest.is_some()
-        }));
-        let changed_runtimes = materialize_qualified_releases(vec![QualifiedRelease {
-            release: &releases[0],
-            version: "0.10.0".to_owned(),
-            binary: None,
-            source: Some(changed_source),
-            published_at_unix: releases[0]
-                .published_at
-                .as_deref()
-                .and_then(parse_github_timestamp),
-            ordinal: 0,
-        }])
-        .expect("changed source catalog");
-        let original_w12 = source_runtimes
-            .iter()
-            .find(|runtime| runtime.identity.variant == "w12")
-            .expect("original W12");
-        let changed_w12 = changed_runtimes
-            .iter()
-            .find(|runtime| runtime.identity.variant == "w12")
-            .expect("changed W12");
-        assert_ne!(original_w12.runtime_id, changed_w12.runtime_id);
-        assert_eq!(
-            runtimes
-                .iter()
-                .filter(|runtime| runtime.identity.version == "0.10.0")
-                .map(|runtime| runtime.identity.variant.as_str())
-                .collect::<Vec<_>>(),
-            ["w8", "w12", "w16"]
-        );
-        let w8 = source_runtimes
-            .iter()
-            .find(|runtime| runtime.identity.variant == "w8")
-            .expect("W8");
-        let w12 = source_runtimes
-            .iter()
-            .find(|runtime| runtime.identity.variant == "w12")
-            .expect("W12");
-        let w16 = source_runtimes
-            .iter()
-            .find(|runtime| runtime.identity.variant == "w16")
-            .expect("W16");
-        assert_eq!(w8.requirements.minimum_vram_class_gib, Some(24));
-        assert_eq!(w12.requirements.minimum_vram_class_gib, Some(32));
-        assert_eq!(w16.requirements.minimum_vram_class_gib, None);
-        assert_eq!(w16.requirements.minimum_vram_exclusive_class_gib, Some(24));
-        assert_eq!(w8.requirements.minimum_nvidia_driver, None);
-        assert_eq!(
-            w8.requirements.supported_cuda_compute_capabilities,
-            vec![
-                ComputeCapability::new(8, 6),
-                ComputeCapability::new(8, 9),
-                ComputeCapability::new(12, 0)
-            ]
-        );
-        assert!(w16.requirements.advisories.iter().any(|note| {
-            note.contains("specialist") && note.contains("no separate W16 VRAM floor")
-        }));
-        assert!(binary_runtimes.iter().all(|runtime| {
-            runtime.requirements.minimum_nvidia_driver.as_deref() == Some("580")
-        }));
-    }
-
-    #[test]
-    fn catalog_rejects_missing_digests_and_non_linux_archive_shapes() {
-        let mut wrong = asset(2, "v0.6.2", Some(&format!("sha256:{}", "a".repeat(64))));
-        wrong.name = "q27-v0.6.2-windows-x86_64.zip".to_owned();
-        let releases = vec![release(
-            6,
-            "v0.6.2",
-            "2026-07-25T05:30:39Z",
-            false,
-            vec![asset(1, "v0.6.2", None), wrong],
-        )];
-        assert!(catalog_runtimes(&releases).expect("catalog").is_empty());
-    }
-
-    #[test]
-    fn v01_archives_are_excluded_without_terminal_stream_finish_reasons() {
-        let releases = vec![release(
-            1,
-            "v0.1.2",
-            "2026-07-12T23:27:39Z",
-            false,
-            vec![asset(
-                1,
-                "v0.1.2",
-                Some(&format!("sha256:{}", "a".repeat(64))),
-            )],
-        )];
-        let runtimes = catalog_runtimes(&releases).expect("catalog");
-        assert!(runtimes.is_empty());
-    }
-
-    #[test]
-    fn absent_configuration_participates_and_explicit_false_disables() {
-        let absent = Q27Adapter::from_config(None, Path::new("."));
-        assert!(absent.is_enabled());
-        let disabled = Q27Adapter::from_config(Some(&EngineConfig::default()), Path::new("."));
-        assert!(!disabled.is_enabled());
-        assert!(
-            !disabled
-                .compatibility(&model_artifact(PathBuf::from("model.q27")))
-                .is_supported()
-        );
-    }
-
-    #[test]
-    fn managed_arguments_and_environment_are_reserved() {
-        for argument in ["--host", "--PORT=9", "--no_think", "--temp=1"] {
-            assert!(
-                conflicts_with_managed_argument(argument),
-                "accepted {argument}"
-            );
-        }
-        for environment in [
-            "Q27_API_KEY",
-            "q27_force_temp",
-            "Q27_BARE",
-            "CUDA_VISIBLE_DEVICES",
-        ] {
-            assert!(
-                conflicts_with_managed_environment(environment),
-                "accepted {environment}"
-            );
-        }
-        assert_eq!(
-            invalid_native_argument(&["another-model.q27".to_owned()]),
-            Some("another-model.q27")
-        );
-        assert_eq!(
-            invalid_native_argument(&["--threads".to_owned(), "8".to_owned()]),
-            Some("--threads")
-        );
-        assert_eq!(invalid_native_argument(&["--".to_owned()]), Some("--"));
-        assert_eq!(
-            invalid_native_argument(&[
-                "--ctx".to_owned(),
-                "8192".to_owned(),
-                "--kv-fp16".to_owned(),
-                "--slots".to_owned(),
-                "2".to_owned(),
-            ]),
-            None
-        );
-        assert_eq!(
-            invalid_native_argument(&["--kv-fp16".to_owned(), "other.q27".to_owned()]),
-            Some("other.q27")
-        );
-        assert_eq!(
-            invalid_native_argument(&["--ctx".to_owned()]),
-            Some("--ctx")
-        );
-        assert_eq!(
-            invalid_native_argument(&["--ctx=8192".to_owned()]),
-            Some("--ctx=8192")
-        );
-    }
-
-    #[test]
-    fn native_cache_options_follow_the_selected_runtime_version() {
-        let disk = vec!["--prefix-cache".to_owned(), "cache".to_owned()];
-        let ram = vec!["--prefix-cache-ram-gb".to_owned(), "4".to_owned()];
-        assert_eq!(
-            unsupported_native_argument_for_version(&disk, "0.5.0"),
-            Some("--prefix-cache")
-        );
-        assert_eq!(
-            unsupported_native_argument_for_version(&disk, "0.6.0"),
-            None
-        );
-        assert_eq!(
-            unsupported_native_argument_for_version(&ram, "0.6.0"),
-            Some("--prefix-cache-ram-gb")
-        );
-        assert_eq!(unsupported_native_argument_for_version(&ram, "0.6.1"), None);
-    }
-
-    #[test]
-    fn adapter_requires_the_tokenizer_discovered_by_the_model_registry() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let model_path = directory.path().join("example-family-q4s.q27");
-        fs::write(&model_path, b"model").expect("model");
-        let expected = directory.path().join("example-family.tok");
-        fs::write(&expected, b"Q27T\x01\0\0\0").expect("tokenizer");
-        let mut model = model_artifact(model_path);
-        assert!(tokenizer_candidate(&model).is_err());
-        model.auxiliary_artifacts.push(AuxiliaryArtifact {
-            role: AuxiliaryArtifactRole::Tokenizer,
-            path: expected.clone(),
-            size_bytes: 8,
-            hash: None,
-        });
-        assert_eq!(tokenizer_candidate(&model).expect("candidate"), expected);
-    }
-
-    fn accelerator(uuid: &str, vram_gib: Option<u64>) -> AcceleratorDevice {
-        accelerator_with_compute(uuid, vram_gib, Some(ComputeCapability::new(12, 0)))
-    }
-
-    fn accelerator_with_compute(
-        uuid: &str,
-        vram_gib: Option<u64>,
-        compute_capability: Option<ComputeCapability>,
-    ) -> AcceleratorDevice {
-        AcceleratorDevice {
-            accelerator: "cuda".to_owned(),
-            stable_id: Some(uuid.to_owned()),
-            name: Some("fixture".to_owned()),
-            vram_bytes: vram_gib.map(|gib| gib * 1024 * 1024 * 1024),
-            driver_version: Some("600".to_owned()),
-            compute_capability,
-        }
-    }
-
-    fn host_with_vram(gib: u64) -> HostCapabilities {
-        HostCapabilities {
-            platform: "linux".to_owned(),
-            architecture: "x86_64".to_owned(),
-            accelerators: vec![accelerator(
-                "GPU-11111111-1111-1111-1111-111111111111",
-                Some(gib),
-            )],
-            cuda_visible_devices: None,
-            observations: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn model_tiers_reject_clearly_insufficient_vram_classes() {
-        let host_24 = host_with_vram(24);
-        let device = &host_24.accelerators[0];
-        assert!(matches!(
-            q27_tier_compatibility(Q27Tier::Qwen36Q6, device),
-            RuntimeCompatibility::Incompatible(_)
-        ));
-        assert!(matches!(
-            q27_tier_compatibility(Q27Tier::Qwen36Q8, device),
-            RuntimeCompatibility::Incompatible(_)
-        ));
-        assert!(matches!(
-            q27_tier_compatibility(Q27Tier::Qwen38Q6, device),
-            RuntimeCompatibility::Recommended
-        ));
-    }
-
-    #[test]
-    fn w8_and_w12_are_semantically_preferred_while_w16_is_specialist() {
-        let host_24 = host_with_vram(24);
-        let device_24 = &host_24.accelerators[0];
-        assert!(
-            q27_runtime_preference("w8", Some(device_24))
-                < q27_runtime_preference("w12", Some(device_24))
-        );
-        assert!(
-            q27_runtime_preference("w8", Some(device_24))
-                < q27_runtime_preference("w16", Some(device_24))
-        );
-
-        let host_32 = host_with_vram(32);
-        let device_32 = &host_32.accelerators[0];
-        assert!(
-            q27_runtime_preference("w12", Some(device_32))
-                < q27_runtime_preference("w8", Some(device_32))
-        );
-        assert!(
-            q27_runtime_preference("w12", Some(device_32))
-                < q27_runtime_preference("w16", Some(device_32))
-        );
-
-        let unknown = accelerator("GPU-22222222-2222-2222-2222-222222222222", None);
-        assert!(
-            q27_runtime_preference("w8", Some(&unknown))
-                < q27_runtime_preference("w12", Some(&unknown))
-        );
-    }
-
-    #[test]
-    fn exact_gpu_selection_and_uuid_binding_are_one_decision() {
-        let host = HostCapabilities {
-            platform: "linux".to_owned(),
-            architecture: "x86_64".to_owned(),
-            accelerators: vec![
-                accelerator("GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", Some(24)),
-                accelerator("GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", Some(32)),
-            ],
-            cuda_visible_devices: None,
-            observations: Vec::new(),
-        };
-        let w12 = Q27_VARIANTS
-            .iter()
-            .find(|variant| variant.id == "w12")
-            .expect("W12");
-        let evaluation = q27_device_evaluation(
-            "linux",
-            "x86_64",
-            &requirements_for("0.6.2", w12),
-            Some(Q27Tier::Qwen36Q4s),
-            &host,
-            false,
-        );
-        let selected = evaluation.accelerator.expect("selected GPU");
-        assert_eq!(
-            selected.stable_id.as_deref(),
-            Some("GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
-        );
-        let environment =
-            q27_launch_environment(&BTreeMap::new(), &selected).expect("launch binding");
-        assert_eq!(
-            environment.get("CUDA_VISIBLE_DEVICES").map(String::as_str),
-            selected.stable_id.as_deref()
-        );
-        assert!(
-            q27_launch_environment(&BTreeMap::new(), &accelerator("GPU-bbbbbbbb", Some(32)),)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn managed_cuda_targets_are_version_specific_and_checked_before_vram() {
-        let w8 = Q27_VARIANTS
-            .iter()
-            .find(|variant| variant.id == "w8")
-            .expect("W8");
-        let v030 = requirements_for("0.3.0", w8);
-        let v031 = requirements_for("0.3.1", w8);
-        let ada = accelerator_with_compute(
-            "GPU-adaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-            Some(24),
-            Some(ComputeCapability::new(8, 9)),
-        );
-        assert!(matches!(
-            compatibility_for_nvidia_device(&v030, &ada),
-            RuntimeCompatibility::Incompatible(_)
-        ));
-        assert!(matches!(
-            compatibility_for_nvidia_device(&v031, &ada),
-            RuntimeCompatibility::Recommended
-        ));
-
-        let unknown =
-            accelerator_with_compute("GPU-unknownn-aaaa-aaaa-aaaa-aaaaaaaaaaaa", Some(24), None);
-        assert!(matches!(
-            compatibility_for_nvidia_device(&v031, &unknown),
-            RuntimeCompatibility::NeedsAttention(_)
-        ));
-    }
-
-    #[test]
-    fn supported_lower_vram_gpu_beats_unsupported_higher_vram_gpu_and_keeps_uuid() {
-        let unsupported = accelerator_with_compute(
-            "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-            Some(40),
-            Some(ComputeCapability::new(8, 0)),
-        );
-        let supported = accelerator_with_compute(
-            "GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
-            Some(32),
-            Some(ComputeCapability::new(12, 0)),
-        );
-        let host = HostCapabilities {
-            platform: "linux".to_owned(),
-            architecture: "x86_64".to_owned(),
-            accelerators: vec![unsupported, supported],
-            cuda_visible_devices: None,
-            observations: Vec::new(),
-        };
-        let w12 = Q27_VARIANTS
-            .iter()
-            .find(|variant| variant.id == "w12")
-            .expect("W12");
-        let evaluation = q27_device_evaluation(
-            "linux",
-            "x86_64",
-            &requirements_for("0.3.1", w12),
-            Some(Q27Tier::Qwen36Q4s),
-            &host,
-            false,
-        );
-        assert!(matches!(
-            evaluation.compatibility,
-            RuntimeCompatibility::Recommended
-        ));
-        let selected = evaluation.accelerator.expect("supported GPU");
-        assert_eq!(
-            selected.stable_id.as_deref(),
-            Some("GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
-        );
-        let environment =
-            q27_launch_environment(&BTreeMap::new(), &selected).expect("launch binding");
-        assert_eq!(
-            environment.get("CUDA_VISIBLE_DEVICES").map(String::as_str),
-            selected.stable_id.as_deref()
-        );
-    }
-
-    #[test]
-    fn external_q27_uncertainty_is_usable_but_managed_w8_wins_fallback_ranking() {
-        let host = host_with_vram(24);
-        let device = &host.accelerators[0];
-        let managed = q27_device_evaluation(
-            "linux",
-            "x86_64",
-            &requirements_for("0.3.1", &Q27_VARIANTS[0]),
-            Some(Q27Tier::Qwen36Q4s),
-            &host,
-            false,
-        );
-        let external = q27_device_evaluation(
-            "linux",
-            "x86_64",
-            &RuntimeRequirements::default(),
-            Some(Q27Tier::Qwen36Q4s),
-            &host,
-            true,
-        );
-        let external_with_oversized_model = q27_device_evaluation(
-            "linux",
-            "x86_64",
-            &RuntimeRequirements::default(),
-            Some(Q27Tier::Qwen36Q6),
-            &host,
-            true,
-        );
-        assert!(matches!(
-            managed.compatibility,
-            RuntimeCompatibility::Recommended
-        ));
-        assert!(matches!(
-            &external.compatibility,
-            RuntimeCompatibility::NeedsAttention(reason)
-                if reason.contains("external q27 build variant")
-        ));
-        assert!(external.compatibility.is_usable());
-        assert!(matches!(
-            external_with_oversized_model.compatibility,
-            RuntimeCompatibility::Incompatible(_)
-        ));
-        assert!(managed.compatibility.preference_rank() < external.compatibility.preference_rank());
-        assert_eq!(external.accelerator.as_ref(), Some(device));
-    }
-
-    #[test]
-    fn parent_cuda_visibility_is_reconciled_only_by_uuid() {
-        let mut host = HostCapabilities {
-            platform: "linux".to_owned(),
-            architecture: "x86_64".to_owned(),
-            accelerators: vec![
-                accelerator("GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", Some(24)),
-                accelerator("GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", Some(48)),
-            ],
-            cuda_visible_devices: Some("GPU-aaaaaaaa".to_owned()),
-            observations: Vec::new(),
-        };
-        let selected = q27_visible_devices(&host).expect("unique UUID prefix");
-        assert_eq!(selected.len(), 1);
-        assert_eq!(
-            selected[0].stable_id.as_deref(),
-            Some("GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
-        );
-
-        host.cuda_visible_devices = Some("1".to_owned());
-        assert!(matches!(
-            q27_visible_devices(&host),
-            Err(RuntimeCompatibility::Incompatible(reason))
-                if reason.contains("numeric index")
-        ));
-        host.cuda_visible_devices = Some("GPU-aaaaaaaa,GPU-bbbbbbbb".to_owned());
-        assert!(matches!(
-            q27_visible_devices(&host),
-            Err(RuntimeCompatibility::Incompatible(_))
-        ));
-    }
-
-    #[test]
-    fn w16_rejects_24_gib_and_stays_uncertain_on_larger_devices() {
-        let w16 = Q27_VARIANTS
-            .iter()
-            .find(|variant| variant.id == "w16")
-            .expect("W16");
-        let requirements = requirements_for("0.6.2", w16);
-        let host_24 = host_with_vram(24);
-        assert!(matches!(
-            q27_device_evaluation(
-                "linux",
-                "x86_64",
-                &requirements,
-                Some(Q27Tier::Qwen36Q4s),
-                &host_24,
-                false,
-            )
-            .compatibility,
-            RuntimeCompatibility::Incompatible(_)
-        ));
-        let host_48 = host_with_vram(48);
-        assert!(matches!(
-            q27_device_evaluation(
-                "linux",
-                "x86_64",
-                &requirements,
-                Some(Q27Tier::Qwen36Q4s),
-                &host_48,
-                false,
-            )
-            .compatibility,
-            RuntimeCompatibility::NeedsAttention(_)
-        ));
-    }
-
-    #[test]
-    fn available_runtime_model_admission_uses_metadata_and_selected_device() {
-        let releases = vec![release(
-            6,
-            "v0.6.2",
-            "2026-07-25T05:30:39Z",
-            false,
-            vec![asset(
-                600,
-                "v0.6.2",
-                Some("sha256:d0b7bd5abc4c2e84ee8bf5ff3936161a2285dc1d8e3d408f121770838d2c6d11"),
-            )],
-        )];
-        let runtimes = catalog_runtimes(&releases).expect("catalog");
-        let w8 = runtimes
-            .iter()
-            .find(|runtime| runtime.identity.variant == "w8")
-            .expect("W8");
-        let w12 = runtimes
-            .iter()
-            .find(|runtime| runtime.identity.variant == "w12")
-            .expect("W12");
-        let adapter = Q27Adapter::from_config(None, Path::new("."));
-        let host_24 = host_with_vram(24);
-
-        let (_q8_dir, q8) = q27_model_fixture("q8-v1", None, Some(".*"));
-        assert!(matches!(
-            adapter.available_runtime_model_compatibility(w8, &q8, &host_24, None),
-            RuntimeCompatibility::Incompatible(_)
-        ));
-
-        let (_q6_dir, q6) =
-            q27_model_fixture("q6-v1", None, Some("(ssm_out|attn_output|ffn_down)\\."));
-        assert!(matches!(
-            adapter.available_runtime_model_compatibility(w8, &q6, &host_24, None),
-            RuntimeCompatibility::Incompatible(_)
-        ));
-
-        let (_q4_dir, q4) = q27_model_fixture("q4s-v1", Some(true), None);
-        assert!(
-            adapter
-                .available_runtime_model_compatibility(w8, &q4, &host_24, None)
-                .is_usable()
-        );
-        assert!(matches!(
-            adapter.available_runtime_model_compatibility(w12, &q4, &host_24, None),
-            RuntimeCompatibility::Incompatible(_)
-        ));
-    }
-
-    #[test]
-    fn compatible_third_party_q27_can_use_the_same_profile_on_sm120() {
-        let runtime = current_source_runtimes()
-            .into_iter()
-            .find(|runtime| runtime.identity.variant == "w12")
-            .expect("current W12 source runtime");
-        let (_directory, model) = q27_model_fixture("q4s-v2", Some(true), Some("(attn_output)\\."));
-        assert!(model.norted_package.is_none());
-        let adapter = Q27Adapter::from_config(None, Path::new("."));
-        let host = host_with_vram(32);
-        let raw_compatibility =
-            adapter.available_runtime_model_compatibility(&runtime, &model, &host, None);
-        assert!(raw_compatibility.is_usable());
-        let profile = q27_serve_profile_fixture();
-        let compatibility =
-            adapter.available_runtime_model_compatibility(&runtime, &model, &host, Some(&profile));
-        assert!(
-            matches!(
-                compatibility,
-                RuntimeCompatibility::NeedsAttention(ref reason)
-                    if reason.contains("bounded startup observation")
-            ),
-            "{compatibility:?}"
-        );
-        assert!(compatibility.is_usable());
-        let mut wrong_family = profile.clone();
-        wrong_family.applicability.family = Some("arbitrary-family".to_owned());
-        assert!(matches!(
-            adapter.available_runtime_model_compatibility(
-                &runtime,
-                &model,
-                &host,
-                Some(&wrong_family),
-            ),
-            RuntimeCompatibility::Incompatible(reason) if reason.contains("arbitrary-family")
-        ));
-        let mut unknown_capability = profile.clone();
-        unknown_capability
-            .applicability
-            .required_model_capabilities
-            .push("unproven_capability".to_owned());
-        assert!(matches!(
-            adapter.available_runtime_model_compatibility(
-                &runtime,
-                &model,
-                &host,
-                Some(&unknown_capability),
-            ),
-            RuntimeCompatibility::Incompatible(reason) if reason.contains("unproven_capability")
-        ));
-        let (_qwen36_directory, qwen36) = q27_model_fixture("q4s-v1", Some(true), None);
-        assert!(matches!(
-            adapter.available_runtime_model_compatibility(
-                &runtime,
-                &qwen36,
-                &host,
-                Some(&profile),
-            ),
-            RuntimeCompatibility::Incompatible(reason) if reason.contains("qwen3.8-27b")
-        ));
-        assert_eq!(
-            adapter.available_runtime_model_preference(&runtime, &model, &host),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn changed_tokenizer_is_rejected_before_launch() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("model.tok");
-        fs::write(&path, b"Q27T\x01\0\0\0original").expect("tokenizer");
-        let canonical = path.canonicalize().expect("canonical tokenizer");
-        let prepared = PreparedAuxiliaryArtifact {
-            role: AuxiliaryArtifactRole::Tokenizer,
-            path: canonical.clone(),
-            size_bytes: fs::metadata(&canonical).expect("metadata").len(),
-            content_sha256: hash_file(&canonical).await.expect("hash"),
-        };
-        assert_eq!(
-            revalidate_prepared_tokenizer(&prepared)
-                .await
-                .expect("unchanged tokenizer"),
-            canonical
-        );
-        fs::write(&prepared.path, b"Q27T\x01\0\0\0changed!").expect("changed tokenizer");
-        assert!(
-            revalidate_prepared_tokenizer(&prepared)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("changed")
-        );
-    }
-
-    #[test]
-    fn package_full_hash_is_deferred_to_the_final_launch_attempt_boundary() {
-        let source = include_str!("lib.rs");
-        let build_spec = source
-            .split_once("async fn build_launch_spec(&self, request: LaunchRequest)")
-            .expect("q27 build_launch_spec")
-            .1
-            .split_once("async fn build_launch_attempts(")
-            .expect("q27 build_launch_attempts")
-            .0;
-        assert!(
-            !build_spec.contains("revalidate_norted_package_before_launch"),
-            "launch-spec construction must not perform the redundant full package hash"
-        );
-
-        let prepare_attempt = source
-            .split_once("async fn prepare_launch_attempt_inner(")
-            .expect("q27 prepare_launch_attempt_inner")
-            .1
-            .split_once("fn backend_request")
-            .expect("q27 backend request")
-            .0;
-        assert_eq!(
-            prepare_attempt
-                .matches("revalidate_norted_package_before_launch_with_progress")
-                .count(),
-            1,
-            "the progress path must retain one complete final revalidation"
-        );
-        assert_eq!(
-            prepare_attempt
-                .matches("revalidate_norted_package_before_launch(&spec.model).await?")
-                .count(),
-            1,
-            "the compatibility path must retain one complete final revalidation"
-        );
-        assert!(source.contains("Revalidating package before launch"));
-        assert!(source.contains("BackendLoadPhase::PreparingLaunch"));
-    }
-
-    #[test]
-    fn tokenizer_header_is_format_generic_but_fail_closed() {
-        assert!(validate_tokenizer_header(b"Q27T\x01\0\0\0").is_ok());
-        assert!(validate_tokenizer_header(b"GGUF\x01\0\0\0").is_err());
-        assert!(validate_tokenizer_header(b"Q27T\x02\0\0\0").is_err());
-    }
-
-    #[test]
-    fn github_timestamp_conversion_has_a_known_epoch() {
-        assert_eq!(parse_github_timestamp("1970-01-01T00:00:00Z"), Some(0));
-        assert!(parse_github_timestamp("2026-02-29T00:00:00Z").is_none());
-    }
-
-    #[test]
-    fn chat_translation_owns_sampler_values_and_normalizes_developer_role() {
-        let adapter = Q27Adapter::from_config(None, Path::new("."));
-        let body = adapter.backend_request(
-            &InferenceRequest {
-                model_id: ModelId("model".to_owned()),
-                messages: vec![InferenceMessage {
-                    role: InferenceRole::Developer,
-                    text: "instruction".to_owned(),
-                }],
-                generation_settings: GenerationSettingsPatch::default(),
-                max_output_tokens: Some(123),
-                stream: false,
-            },
-            false,
-        );
-        assert_eq!(body["temperature"], 0.0);
-        assert_eq!(body["top_p"], 1.0);
-        assert_eq!(body["max_tokens"], 123);
-        assert_eq!(body["messages"][0]["role"], "system");
-    }
-
-    #[test]
-    fn chat_translation_applies_overrides_and_retains_each_omitted_default() {
-        let adapter = Q27Adapter::from_config(None, Path::new("."));
-        let request = |generation_settings| InferenceRequest {
-            model_id: ModelId("model".to_owned()),
-            messages: Vec::new(),
-            generation_settings,
-            max_output_tokens: None,
-            stream: false,
-        };
-
-        let temperature = adapter.backend_request(
-            &request(GenerationSettingsPatch {
-                temperature: Some(0.6),
-                top_p: None,
-                reasoning_effort: None,
-            }),
-            false,
-        );
-        assert_eq!(temperature["temperature"], 0.6);
-        assert_eq!(temperature["top_p"], 1.0);
-
-        let sampled = adapter.backend_request(
-            &request(GenerationSettingsPatch {
-                temperature: Some(0.6),
-                top_p: Some(0.75),
-                reasoning_effort: None,
-            }),
-            false,
-        );
-        assert_eq!(sampled["temperature"], 0.6);
-        assert_eq!(sampled["top_p"], 0.75);
-    }
-
-    #[test]
-    fn sampler_validation_requires_sampling_before_restricting_top_p() {
-        let adapter = Q27Adapter::from_config(None, Path::new("."));
-        let defaults = EffectiveGenerationSettings {
-            temperature: 0.0,
-            top_p: 1.0,
-        };
-        for valid in [
-            GenerationSettingsPatch::default(),
-            GenerationSettingsPatch {
-                temperature: Some(0.0),
-                top_p: None,
-                reasoning_effort: None,
-            },
-            GenerationSettingsPatch {
-                temperature: Some(0.6),
-                top_p: None,
-                reasoning_effort: None,
-            },
-            GenerationSettingsPatch {
-                temperature: None,
-                top_p: Some(1.0),
-                reasoning_effort: None,
-            },
-            GenerationSettingsPatch {
-                temperature: Some(0.0),
-                top_p: Some(1.0),
-                reasoning_effort: None,
-            },
-            GenerationSettingsPatch {
-                temperature: Some(0.6),
-                top_p: Some(0.75),
-                reasoning_effort: None,
-            },
-        ] {
-            adapter
-                .validate_generation_settings(&valid, &defaults)
-                .expect("q27 can honor sampler patch");
-        }
-
-        for ignored_top_p in [
-            GenerationSettingsPatch {
-                temperature: None,
-                top_p: Some(0.75),
-                reasoning_effort: None,
-            },
-            GenerationSettingsPatch {
-                temperature: Some(0.0),
-                top_p: Some(0.75),
-                reasoning_effort: None,
-            },
-        ] {
-            assert!(matches!(
-                adapter.validate_generation_settings(&ignored_top_p, &defaults),
-                Err(EngineError::InvalidGenerationSettings(_))
-            ));
-        }
-
-        for invalid in [
-            GenerationSettingsPatch {
-                temperature: Some(-0.1),
-                top_p: None,
-                reasoning_effort: None,
-            },
-            GenerationSettingsPatch {
-                temperature: Some(2.1),
-                top_p: None,
-                reasoning_effort: None,
-            },
-            GenerationSettingsPatch {
-                temperature: None,
-                top_p: Some(0.0),
-                reasoning_effort: None,
-            },
-            GenerationSettingsPatch {
-                temperature: None,
-                top_p: Some(1.1),
-                reasoning_effort: None,
-            },
-            GenerationSettingsPatch {
-                temperature: Some(f64::INFINITY),
-                top_p: None,
-                reasoning_effort: None,
-            },
-        ] {
-            assert!(matches!(
-                adapter.validate_generation_settings(&invalid, &defaults),
-                Err(EngineError::InvalidGenerationSettings(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn accepted_sampler_patch_matches_q27_execution_and_public_effective_values() {
-        let adapter = Q27Adapter::from_config(None, Path::new("."));
-        let defaults = EffectiveGenerationSettings {
-            temperature: 0.0,
-            top_p: 1.0,
-        };
-        let request = |generation_settings| InferenceRequest {
-            model_id: ModelId("model".to_owned()),
-            messages: Vec::new(),
-            generation_settings,
-            max_output_tokens: None,
-            stream: false,
-        };
-
-        for patch in [
-            GenerationSettingsPatch::default(),
-            GenerationSettingsPatch {
-                temperature: None,
-                top_p: Some(1.0),
-                reasoning_effort: None,
-            },
-            GenerationSettingsPatch {
-                temperature: Some(0.6),
-                top_p: Some(0.75),
-                reasoning_effort: None,
-            },
-        ] {
-            adapter
-                .validate_generation_settings(&patch, &defaults)
-                .expect("q27 can honor sampler patch");
-            let effective = defaults.merged(&patch);
-            let body = adapter.backend_request(&request(patch), false);
-            assert_eq!(body["temperature"], effective.temperature);
-            assert_eq!(body["top_p"], effective.top_p);
-        }
-    }
-
-    #[tokio::test]
-    async fn chat_sse_translation_emits_text_usage_and_length_completion() {
-        let bytes = Bytes::from_static(
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n\
-              data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
-              data: {\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":2,\"total_tokens\":6}}\n\n\
-              data: [DONE]\n\n",
-        );
-        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(bytes)]).boxed();
-        let mut translated = q27_sse_stream(source, false);
-        let first = translated.next().await.expect("text event").expect("text");
-        assert!(matches!(
-            first,
-            InferenceEvent::TextDelta { ref delta } if delta == "hello"
-        ));
-        let completed = translated
-            .next()
-            .await
-            .expect("completion event")
-            .expect("completion");
-        match completed {
-            InferenceEvent::Completed {
-                usage: Some(usage),
-                finish_reason,
-            } => {
-                assert_eq!(usage.input_tokens, 4);
-                assert_eq!(usage.output_tokens, 2);
-                assert_eq!(usage.total_tokens, 6);
-                assert_eq!(finish_reason, InferenceFinishReason::MaxOutputTokens);
-            }
-            _ => panic!("unexpected completion event"),
-        }
-        assert!(translated.next().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn chat_sse_rejects_done_without_a_terminal_finish_reason() {
-        let bytes = Bytes::from_static(
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n\
-              data: [DONE]\n\n",
-        );
-        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(bytes)]).boxed();
-        let mut translated = q27_sse_stream(source, false);
-        assert!(matches!(
-            translated.next().await.expect("text event"),
-            Ok(InferenceEvent::TextDelta { ref delta }) if delta == "hello"
-        ));
-        assert!(matches!(
-            translated.next().await.expect("terminal error"),
-            Err(EngineError::BackendUnavailable(message)) if message.contains("finish reason")
-        ));
-        assert!(translated.next().await.is_none());
-    }
-
-    #[test]
-    fn package_non_stream_output_suppresses_reasoning_and_control_transition() {
-        assert_eq!(
-            filter_q27_serve_profile_output(
-                "private chain of thought\nmore private\n</think>\nPublic answer"
-            ),
-            "\nPublic answer"
-        );
-        assert_eq!(filter_q27_serve_profile_output("reasoning only"), "");
-        assert_eq!(
-            filter_q27_serve_profile_output("private</think>answer<think>"),
-            "answer"
-        );
-    }
-
-    #[tokio::test]
-    async fn package_stream_filter_handles_every_reasoning_close_boundary() {
-        for boundary in 0..=THINK_CLOSE.len() {
-            let first = format!("private{}", &THINK_CLOSE[..boundary]);
-            let second = format!("{}answer", &THINK_CLOSE[boundary..]);
-            let payload = format!(
-                "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
-                json!({"choices": [{"text": first, "finish_reason": null}]}),
-                json!({"choices": [{"text": second, "finish_reason": null}]}),
-                json!({"choices": [{"text": "", "finish_reason": "stop"}], "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7}}),
-            );
-            let source =
-                stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(payload))]).boxed();
-            let events = q27_sse_stream(source, true)
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()
-                .expect("filtered events");
-            assert!(matches!(
-                events.as_slice(),
-                [InferenceEvent::TextDelta { delta }, InferenceEvent::Completed { usage: Some(usage), finish_reason: InferenceFinishReason::Stop }]
-                    if delta == "answer"
-                        && usage.input_tokens == 4
-                        && usage.output_tokens == 3
-                        && usage.total_tokens == 7
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn package_reasoning_only_length_stream_emits_no_public_text() {
-        let payload = concat!(
-            "data: {\"choices\":[{\"text\":\"private reasoning\",\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"text\":\"\",\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":16,\"total_tokens\":24}}\n\n",
-            "data: [DONE]\n\n"
-        );
-        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
-            payload.as_bytes(),
-        ))])
-        .boxed();
-        let events = q27_sse_stream(source, true)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .expect("filtered events");
-        assert!(matches!(
-            events.as_slice(),
-            [InferenceEvent::Completed { usage: Some(usage), finish_reason: InferenceFinishReason::MaxOutputTokens }]
-                if usage.input_tokens == 8
-                    && usage.output_tokens == 16
-                    && usage.total_tokens == 24
-        ));
-    }
-
-    #[tokio::test]
-    async fn package_stream_emits_normal_answer_deltas_only_after_close() {
-        let payload = concat!(
-            "data: {\"choices\":[{\"text\":\"private</thi\",\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"text\":\"nk>first \" ,\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"text\":\"second\",\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"text\":\"\",\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n"
-        );
-        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
-            payload.as_bytes(),
-        ))])
-        .boxed();
-        let events = q27_sse_stream(source, true)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .expect("filtered events");
-        assert!(matches!(
-            events.as_slice(),
-            [InferenceEvent::TextDelta { delta: first }, InferenceEvent::TextDelta { delta: second }, InferenceEvent::Completed { finish_reason: InferenceFinishReason::Stop, .. }]
-                if first == "first " && second == "second"
-        ));
-    }
-
-    #[tokio::test]
-    async fn raw_q27_stream_keeps_reasoning_like_text_unchanged() {
-        let payload = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>raw</think>answer\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-            "data: [DONE]\n\n"
-        );
-        let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from_static(
-            payload.as_bytes(),
-        ))])
-        .boxed();
-        let events = q27_sse_stream(source, false)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()
-            .expect("raw events");
-        assert!(matches!(
-            events.first(),
-            Some(InferenceEvent::TextDelta { delta }) if delta == "<think>raw</think>answer"
-        ));
-    }
-
-    fn model_artifact(path: PathBuf) -> ModelArtifact {
-        ModelArtifact {
-            id: ModelId("model".to_owned()),
-            display_name: "model".to_owned(),
-            path,
-            format: ArtifactFormat::Q27,
-            size_bytes: 1,
-            created: 0,
-            hash: None,
-            architecture: None,
-            context_length: None,
-            provenance: None,
-            native_identity: None,
-            auxiliary_artifacts: Vec::<AuxiliaryArtifact>::new(),
-            norted_package: None,
-        }
-    }
-
-    fn q27_model_fixture(
-        quant_policy: &str,
-        q4_head: Option<bool>,
-        q8_extra: Option<&str>,
-    ) -> (tempfile::TempDir, ModelArtifact) {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let model_path = directory.path().join("model.q27");
-        let tokenizer_path = directory.path().join("model.tok");
-        let mut metadata = json!({
-            "general.architecture": "qwen35",
-            "qwen35.block_count": 65,
-            "qwen35.nextn_predict_layers": 1,
-            "qwen35.embedding_length": 5120,
-            "qwen35.feed_forward_length": 17408,
-            "qwen35.attention.head_count": 24,
-            "qwen35.attention.head_count_kv": 4,
-            "qwen35.attention.key_length": 256,
-            "qwen35.attention.value_length": 256,
-            "qwen35.rope.dimension_count": 64,
-            "qwen35.ssm.state_size": 128,
-            "qwen35.ssm.group_count": 16,
-            "qwen35.ssm.inner_size": 6144,
-            "qwen35.ssm.time_step_rank": 48,
-            "qwen35.ssm.conv_kernel": 4,
-            "qwen35.attention.layer_norm_rms_epsilon": 0.000001,
-            "qwen35.rope.freq_base": 10000000.0,
-            "group_q4": 64,
-            "group_q8": 128,
-            "nibble_order": "even=low",
-            "quant_policy": quant_policy,
-        });
-        let object = metadata.as_object_mut().expect("metadata object");
-        if let Some(q4_head) = q4_head {
-            object.insert("q4_head".to_owned(), json!(q4_head));
-        }
-        if let Some(q8_extra) = q8_extra {
-            object.insert("q8_extra".to_owned(), json!(q8_extra));
-        }
-        let encoded = serde_json::to_vec(&metadata).expect("metadata JSON");
-        let mut bytes = Vec::with_capacity(16 + encoded.len());
-        bytes.extend_from_slice(b"Q27F");
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        bytes.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&encoded);
-        fs::write(&model_path, bytes).expect("model fixture");
-        fs::write(&tokenizer_path, b"Q27T\x01\0\0\0").expect("tokenizer fixture");
-        let mut model = model_artifact(model_path);
-        model.auxiliary_artifacts.push(AuxiliaryArtifact {
-            role: AuxiliaryArtifactRole::Tokenizer,
-            path: tokenizer_path,
-            size_bytes: 8,
-            hash: None,
-        });
-        (directory, model)
     }
 }

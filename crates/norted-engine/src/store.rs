@@ -1173,8 +1173,10 @@ mod tests {
             runtimes_dir: temporary.path().join("data/runtimes"),
             runtime_cache_dir: temporary.path().join("cache/runtime-packs"),
             runtime_selections_file: temporary.path().join("data/runtime-selections.json"),
-            serve_profiles_file: temporary.path().join("data/serve-profiles.json"),
-            serve_profiles_lock_file: temporary.path().join("data/.serve-profiles.lock"),
+            settings_file: temporary.path().join("data/settings.json"),
+            settings_lock_file: temporary.path().join("data/.settings.lock"),
+            model_profiles_file: temporary.path().join("data/model-profiles.json"),
+            model_profiles_lock_file: temporary.path().join("data/.model-profiles.lock"),
         };
         let store = RuntimeStore::new(&paths);
         let mut staging = store.create_staging().await.expect("staging directory");
@@ -1246,8 +1248,10 @@ mod tests {
             runtimes_dir: temporary.path().join("data/runtimes"),
             runtime_cache_dir: temporary.path().join("cache/runtime-packs"),
             runtime_selections_file: temporary.path().join("data/runtime-selections.json"),
-            serve_profiles_file: temporary.path().join("data/serve-profiles.json"),
-            serve_profiles_lock_file: temporary.path().join("data/.serve-profiles.lock"),
+            settings_file: temporary.path().join("data/settings.json"),
+            settings_lock_file: temporary.path().join("data/.settings.lock"),
+            model_profiles_file: temporary.path().join("data/model-profiles.json"),
+            model_profiles_lock_file: temporary.path().join("data/.model-profiles.lock"),
         };
         let store = RuntimeStore::new(&paths);
         let runtime_id = norted_core::RuntimeId::new("leased-runtime").expect("runtime ID");
@@ -1274,8 +1278,10 @@ mod tests {
             runtimes_dir: temporary.path().join("data/runtimes"),
             runtime_cache_dir: temporary.path().join("cache/runtime-packs"),
             runtime_selections_file: temporary.path().join("data/runtime-selections.json"),
-            serve_profiles_file: temporary.path().join("data/serve-profiles.json"),
-            serve_profiles_lock_file: temporary.path().join("data/.serve-profiles.lock"),
+            settings_file: temporary.path().join("data/settings.json"),
+            settings_lock_file: temporary.path().join("data/.settings.lock"),
+            model_profiles_file: temporary.path().join("data/model-profiles.json"),
+            model_profiles_lock_file: temporary.path().join("data/.model-profiles.lock"),
         };
         let store = RuntimeStore::new(&paths);
         let staging = store.create_staging().await.expect("staging directory");
@@ -1298,8 +1304,10 @@ mod tests {
             runtimes_dir: temporary.path().join("data/runtimes"),
             runtime_cache_dir: temporary.path().join("cache/runtime-packs"),
             runtime_selections_file: temporary.path().join("data/runtime-selections.json"),
-            serve_profiles_file: temporary.path().join("data/serve-profiles.json"),
-            serve_profiles_lock_file: temporary.path().join("data/.serve-profiles.lock"),
+            settings_file: temporary.path().join("data/settings.json"),
+            settings_lock_file: temporary.path().join("data/.settings.lock"),
+            model_profiles_file: temporary.path().join("data/model-profiles.json"),
+            model_profiles_lock_file: temporary.path().join("data/.model-profiles.lock"),
         };
         let first_store = RuntimeStore::new(&paths);
         let second_store = RuntimeStore::new(&paths);
@@ -1341,8 +1349,10 @@ mod tests {
             runtimes_dir: temporary.path().join("data/runtimes"),
             runtime_cache_dir: temporary.path().join("cache/runtime-packs"),
             runtime_selections_file: temporary.path().join("data/runtime-selections.json"),
-            serve_profiles_file: temporary.path().join("data/serve-profiles.json"),
-            serve_profiles_lock_file: temporary.path().join("data/.serve-profiles.lock"),
+            settings_file: temporary.path().join("data/settings.json"),
+            settings_lock_file: temporary.path().join("data/.settings.lock"),
+            model_profiles_file: temporary.path().join("data/model-profiles.json"),
+            model_profiles_lock_file: temporary.path().join("data/.model-profiles.lock"),
         };
         let store = RuntimeStore::new(&paths);
         let identity = RuntimeIdentity {

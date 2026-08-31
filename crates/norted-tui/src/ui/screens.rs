@@ -27,6 +27,7 @@ pub fn render_screen(
     match app.screen {
         Screen::Overview => render_overview(frame, area, app, theme, glyphs, ui_layout),
         Screen::Models => render_models(frame, area, app, theme, glyphs, ui_layout),
+        Screen::ModelProfiles => render_model_profiles(frame, area, app, theme, ui_layout),
         Screen::Runtimes => render_runtimes(frame, area, app, theme, glyphs, ui_layout),
         Screen::Server => render_server(frame, area, app, theme, glyphs, ui_layout),
         Screen::Logs => render_logs(frame, area, app, theme, ui_layout),
@@ -348,30 +349,15 @@ fn render_models(
                 ])
             },
             Line::from(Span::styled(
-                {
-                    let recommended = model
-                        .norted_package
-                        .as_ref()
-                        .and_then(|package| package.recommended_serve_profile.as_ref())
-                        .map(|profile| profile.display_name.as_str())
-                        .unwrap_or("none");
-                    let selected = app
-                        .effective_serve_profile_for_model(model)
-                        .map(|profile| profile.display_name)
-                        .unwrap_or_else(|| "None / Raw runtime defaults".to_owned());
-                    format!(
-                        "Artifact: {} · Source: {} · Recommended Serve Profile: {} · Selected: {} · {}",
-                        model.format,
-                        if model.norted_package.is_some() {
-                            "Norted Builder"
-                        } else {
-                            "raw/local"
-                        },
-                        recommended,
-                        selected,
-                        app.serve_profile_status_for_model(model),
-                    )
-                },
+                format!(
+                    "Artifact: {} · provenance: {} · Enter/c creates Model Profile",
+                    model.format,
+                    if model.norted_package.is_some() {
+                        "Norted package"
+                    } else {
+                        "raw/local"
+                    },
+                ),
                 theme.hint,
             )),
         ])
@@ -706,6 +692,12 @@ fn render_server(
                 "Unavailable".to_owned()
             }
         });
+    let active_profile = app
+        .control
+        .as_ref()
+        .and_then(|control| control.backend.model_profile_id.as_ref())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
     let active_model = app
         .control
         .as_ref()
@@ -747,6 +739,7 @@ fn render_server(
         Paragraph::new(vec![
             key_value("STATE", app.snapshot.server.label(), theme),
             key_value("ENDPOINT", endpoint, theme),
+            key_value("MODEL PROFILE", &active_profile, theme),
             key_value("PUBLIC BIND", &auth.bind, theme),
             key_value("EXPOSURE", exposure, theme),
             key_value("AUTH CONFIGURED", &auth.configured_mode.to_string(), theme),
@@ -834,24 +827,23 @@ fn render_settings(
     frame.render_widget(
         section_title(
             "Settings",
-            "Load defaults, Serve Profiles, and exact-runtime validation",
+            "Global and engine defaults; Model Profiles are edited on their own screen",
             theme,
         ),
         layout[0],
     );
-    let settings_scopes = app.settings_scopes();
+    let scopes = app.settings_scopes();
     for (index, rect) in &ui_layout.settings_scope_rows {
-        let Some(scope) = settings_scopes.get(*index) else {
+        let Some(scope) = scopes.get(*index) else {
             continue;
         };
         let label = match scope {
             crate::app::SettingsScope::Global => "Global".to_owned(),
-            crate::app::SettingsScope::Engine(engine) => engine.clone(),
-            crate::app::SettingsScope::Profile(profile) => profile.to_string(),
-            crate::app::SettingsScope::BuilderProfile(profile) => {
-                format!("{profile} · Builder · read-only")
-            }
-            crate::app::SettingsScope::Model(_) => "Selected model".to_owned(),
+            crate::app::SettingsScope::Engine(engine) => match engine.as_str() {
+                "ninfer" => "NInfer".to_owned(),
+                _ => engine.clone(),
+            },
+            crate::app::SettingsScope::ModelProfile(profile) => profile.to_string(),
         };
         let style = if app.settings_scope_index == *index {
             theme.selected
@@ -862,235 +854,138 @@ fn render_settings(
         };
         frame.render_widget(Paragraph::new(format!(" {label} ")).style(style), *rect);
     }
+    let info = if let Some(input) = &app.settings_input {
+        format!("Value: {}_  · Enter saves · Esc cancels", input.text)
+    } else {
+        "Defaults inherit Global → selected engine. Enter edits; Delete clears and inherits."
+            .to_owned()
+    };
+    frame.render_widget(
+        Paragraph::new(info).style(theme.hint),
+        Rect::new(
+            ui_layout.settings_scopes.x,
+            ui_layout.settings_scopes.y.saturating_add(1),
+            ui_layout.settings_scopes.width,
+            4,
+        ),
+    );
+    render_setting_rows(frame, app, theme, ui_layout);
+}
 
+fn render_model_profiles(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &App,
+    theme: &Theme,
+    ui_layout: &UiLayout,
+) {
+    let layout = content_layout(area);
+    frame.render_widget(
+        section_title(
+            "Model Profiles",
+            "User-created model + engine + settings serving targets",
+            theme,
+        ),
+        layout[0],
+    );
+    for (index, rect) in &ui_layout.settings_scope_rows {
+        let Some(profile) = app.model_profile_values().get(*index).copied() else {
+            continue;
+        };
+        let missing = !app
+            .snapshot
+            .models
+            .iter()
+            .any(|model| model.id == profile.model_id);
+        let active = app
+            .control
+            .as_ref()
+            .and_then(|status| status.backend.model_profile_id.as_ref())
+            == Some(&profile.id);
+        let label = format!(
+            " {}{}{} ",
+            profile.display_name,
+            if active { " · active" } else { "" },
+            if missing { " · missing" } else { "" },
+        );
+        let style = if app.selected_model_profile == Some(*index) {
+            theme.selected
+        } else if missing {
+            theme.warning
+        } else {
+            theme.muted
+        };
+        frame.render_widget(Paragraph::new(label).style(style), *rect);
+    }
     let info_area = Rect::new(
         ui_layout.settings_scopes.x,
         ui_layout.settings_scopes.y.saturating_add(1),
         ui_layout.settings_scopes.width,
         5,
     );
-    let mut info = Vec::new();
-    if let Some(input) = &app.settings_input {
+    let info = if let Some(input) = &app.settings_input {
         let prompt = match input.kind {
-            crate::app::SettingsInputKind::ProfileName => "New Serve Profile",
-            crate::app::SettingsInputKind::ForkProfile => "Fork as local profile",
-            crate::app::SettingsInputKind::SettingValue => "Value",
+            crate::app::SettingsInputKind::ProfileName => "New Model Profile ID",
+            crate::app::SettingsInputKind::DuplicateProfile => "Duplicate Model Profile ID",
+            crate::app::SettingsInputKind::SettingValue => "Override value",
         };
-        info.push(Line::from(vec![
-            Span::styled(format!("{prompt}: "), theme.hint),
-            Span::styled(&input.text, theme.text),
-            Span::styled("_", theme.accent),
-        ]));
-        info.push(Line::from(Span::styled(
-            "Enter saves · Esc cancels",
-            theme.muted,
-        )));
-    } else if let Some(model) = &app.settings_model {
-        let selected_model = app
-            .snapshot
-            .models
-            .iter()
-            .find(|candidate| &candidate.id == model);
-        let serve_profile =
-            selected_model.and_then(|model| app.effective_serve_profile_for_model(model));
-        info.push(Line::from(vec![
-            Span::styled(format!("Model {model}"), theme.text),
-            Span::styled(
-                format!(
-                    "  Serve Profile: {}{}",
-                    serve_profile
-                        .as_ref()
-                        .map(|profile| profile.display_name.as_str())
-                        .unwrap_or("None / Raw runtime defaults"),
-                    serve_profile.as_ref().map_or_else(String::new, |profile| {
-                        format!(
-                            " · {}{}",
-                            profile.source,
-                            if profile.read_only {
-                                " · read-only"
-                            } else {
-                                " · mutable"
-                            }
-                        )
-                    })
-                ),
-                theme.accent,
-            ),
-            Span::styled(
-                format!(
-                    "  runtime: {}",
-                    app.settings_runtime_id
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .as_deref()
-                        .unwrap_or("not validated")
-                ),
-                theme.muted,
-            ),
-        ]));
-        if let Some(profile) = &serve_profile {
-            info.push(Line::from(vec![
+        vec![
+            Line::from(vec![
+                Span::styled(format!("{prompt}: "), theme.hint),
+                Span::styled(format!("{}_", input.text), theme.text),
+            ]),
+            Line::from(Span::styled("Enter saves · Esc cancels", theme.muted)),
+        ]
+    } else if let Some(profile) = app.selected_model_profile_value() {
+        let model = app.selected_profile_model();
+        vec![
+            Line::from(vec![
+                Span::styled(format!("{}  ", profile.id), theme.text),
+                Span::styled(format!("engine {}  ", profile.engine_id), theme.accent),
                 Span::styled(
-                    format!(
-                        "Prompt {:?}/{:?} · template {} · gen-prompt {} · filter {:?} · thinking {}{} · reasoning {} · temp {} top-p {} top-k {} min-p {}",
-                        profile.prompt.mode,
-                        profile.prompt.delivery,
-                        profile
-                            .prompt
-                            .template
-                            .as_ref()
-                            .map(|template| template.identity.as_str())
-                            .unwrap_or("runtime default"),
-                        profile.prompt.render_generation_prompt,
-                        profile.prompt.response_filter,
-                        profile.generation.thinking.default,
-                        if profile.generation.thinking.required { " required" } else { "" },
-                        profile
-                            .generation
-                            .defaults
-                            .reasoning_effort
-                            .as_deref()
-                            .unwrap_or("default"),
-                        profile
-                            .generation
-                            .defaults
-                            .temperature
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "default".to_owned()),
-                        profile
-                            .generation
-                            .defaults
-                            .top_p
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "default".to_owned()),
-                        profile
-                            .generation
-                            .defaults
-                            .top_k
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "default".to_owned()),
-                        profile
-                            .generation
-                            .defaults
-                            .min_p
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "default".to_owned()),
-                    ),
-                    theme.muted,
+                    model.map(|model| model.display_name.clone())
+                        .unwrap_or_else(|| format!("MISSING {}", profile.model_id)),
+                    if model.is_some() { theme.hint } else { theme.warning },
                 ),
-            ]));
-            let context = format!(
-                "context preferred {} / minimum {}",
-                profile
-                    .load
-                    .context
-                    .preferred
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "runtime default".to_owned()),
-                profile
-                    .load
-                    .context
-                    .minimum
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_owned())
-            );
-            let strategy = if let Some(q27) = &profile.engine.q27 {
-                format!(
-                    "q27 KV {} · fast-head {} (override {}) · MTP enabled {} / required {} / max {} / pmin {} · suffix {} / W_MAX {}",
-                    q27.kv_quality_order.join(" → "),
-                    q27.fast_head.default,
-                    q27.fast_head.user_override_allowed,
-                    q27.mtp.enabled,
-                    q27.mtp.required,
-                    q27.mtp.maximum_depth,
-                    q27.mtp.minimum_probability,
-                    q27.suffix_drafting,
-                    q27.suffix_width_from_runtime_w_max,
-                )
-            } else if let Some(ninfer) = &profile.engine.ninfer {
-                format!(
-                    "NInfer KV {}/{} · CUDA graph {} · prefix reuse {} · strategy {} · profiles {}",
-                    ninfer.kv_cache,
-                    ninfer.kv_dtype,
-                    ninfer.cuda_graph_required,
-                    ninfer.prefix_reuse_required,
-                    ninfer.default_speculative_profile,
-                    ninfer
-                        .speculative_profiles
-                        .iter()
-                        .map(|(name, profile)| if profile.speculative_decoding {
-                            format!(
-                                "{name}={}/{}{}",
-                                profile.backend.as_deref().unwrap_or("?"),
-                                profile
-                                    .draft_tokens
-                                    .map(|value| value.to_string())
-                                    .unwrap_or_else(|| "?".to_owned()),
-                                if profile.optimized_proposal_head == Some(true) {
-                                    "/lm-head"
-                                } else {
-                                    ""
-                                }
-                            )
-                        } else {
-                            format!("{name}=off")
-                        })
-                        .collect::<Vec<_>>()
-                        .join(","),
-                )
-            } else {
-                "load-only profile".to_owned()
-            };
-            info.push(Line::from(Span::styled(
-                format!("{context} · {strategy}"),
+            ]),
+            Line::from(Span::styled(
+                model.map(|model| model.path.display().to_string()).unwrap_or_default(),
                 theme.muted,
-            )));
-            info.push(Line::from(Span::styled(
+            )),
+            Line::from(Span::styled(
                 format!(
-                    "Requirements: {}",
-                    profile
-                        .effective_requirements()
-                        .into_iter()
-                        .map(|requirement| format!("{requirement:?}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "hash {} · runtime {}",
+                    profile.content_hash(),
+                    app.settings_runtime_id.as_ref().map(ToString::to_string).unwrap_or_else(|| "not validated".to_owned()),
                 ),
-                theme.hint,
-            )));
-        }
-        if let Some(error) = &app.settings_validation_error {
-            info.push(Line::from(Span::styled(error, theme.warning)));
-        } else {
-            info.push(Line::from(Span::styled(
-                "p cycles profiles/None · f forks Builder profiles · r revalidates the exact runtime",
-                theme.hint,
-            )));
-        }
+                theme.muted,
+            )),
+            Line::from(Span::styled(
+                app.settings_validation_error.as_deref().unwrap_or(
+                    "Left/Right profile · Enter override · Delete inherit · l load · D duplicate · d delete · m model · e engine",
+                ),
+                if app.settings_validation_error.is_some() { theme.warning } else { theme.hint },
+            )),
+        ]
     } else {
-        info.push(Line::from(Span::styled(
-            "Left/Right scope · Enter edit/cycle · Delete inherit · n new profile · d delete",
-            theme.hint,
-        )));
-    }
-    let running = app.control.as_ref().is_some_and(|control| {
-        control.backend.lifecycle == norted_engine::BackendLifecycle::Running
-    });
-    if running {
-        info.push(Line::from(Span::styled(
-            "A model is running; edits apply only on its next load.",
-            theme.warning,
-        )));
-    }
+        vec![Line::from(Span::styled(
+            "No Model Profiles. Select an artifact on Models and press Enter/c to create one.",
+            theme.muted,
+        ))]
+    };
     frame.render_widget(Paragraph::new(info).wrap(Wrap { trim: true }), info_area);
+    render_setting_rows(frame, app, theme, ui_layout);
+}
 
-    if app.serve_profiles_loading {
+fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layout: &UiLayout) {
+    if app.settings_loading {
         frame.render_widget(
-            Paragraph::new("Loading Serve Profile state…").style(theme.muted),
+            Paragraph::new("Loading settings state…").style(theme.muted),
             ui_layout.settings_list,
         );
         return;
     }
-    if let Some(error) = &app.serve_profiles_error {
+    if let Some(error) = &app.settings_error {
         frame.render_widget(
             Paragraph::new(error.as_str())
                 .style(theme.error)
@@ -1126,45 +1021,35 @@ fn render_settings(
             "unsupported"
         };
         let label = match &definition.kind {
-            norted_core::LoadSettingKind::Choice { choices } if choices.is_empty() => {
-                format!("{} [text]", definition.label)
-            }
-            norted_core::LoadSettingKind::Choice { choices } => {
+            norted_core::SettingKind::Choice { choices } => {
                 format!("{} [{}]", definition.label, choices.join("|"))
             }
-            norted_core::LoadSettingKind::UnsignedIntegerOrChoice { choices, .. } => {
+            norted_core::SettingKind::UnsignedIntegerOrChoice { choices, .. } => {
                 format!("{} [number|{}]", definition.label, choices.join("|"))
             }
             _ => definition.label.clone(),
         };
-        let lines = if ui_layout.compact {
-            vec![
-                Line::from(Span::styled(definition.id.to_string(), theme.text)),
-                Line::from(vec![
-                    Span::styled(value, theme.accent),
-                    Span::styled(format!(" · {source} · {support}"), theme.muted),
-                ]),
-            ]
-        } else {
-            vec![
-                Line::from(vec![
-                    Span::styled(format!("{:<36}  ", definition.id), theme.text),
-                    Span::styled(format!("{value:<16}  "), theme.accent),
-                    Span::styled(source, theme.muted),
-                ]),
-                Line::from(vec![
-                    Span::styled(format!("  {label}"), theme.muted),
-                    Span::styled(
-                        format!("  {support}"),
-                        if definition.supported {
-                            theme.hint
-                        } else {
-                            theme.warning
-                        },
-                    ),
-                ]),
-            ]
-        };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("{} · {:<28}  ", definition.category, definition.id),
+                    theme.text,
+                ),
+                Span::styled(format!("{value:<16}  "), theme.accent),
+                Span::styled(source, theme.muted),
+            ]),
+            Line::from(vec![
+                Span::styled(format!("  {label}"), theme.muted),
+                Span::styled(
+                    format!("  {support}"),
+                    if definition.supported {
+                        theme.hint
+                    } else {
+                        theme.warning
+                    },
+                ),
+            ]),
+        ];
         frame.render_widget(Paragraph::new(lines).style(style), *rect);
     }
 }
@@ -1186,7 +1071,7 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         key_value("Enter", "open navigation or load selected model", theme),
         key_value("u", "unload the active model from Models", theme),
         key_value("v", "choose a model-specific runtime override", theme),
-        key_value("p", "open model load settings/profile management", theme),
+        key_value("p", "open model settings/profile management", theme),
         key_value(
             "x / Delete",
             "clear an override from the model runtime picker",

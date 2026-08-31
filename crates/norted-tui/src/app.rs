@@ -4,13 +4,11 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use norted_core::{
-    AppEvent, AppSnapshot, ArtifactFormat, ExternalTemplateReference, LoadSettingDefinition,
-    LoadSettingId, LoadSettingKind, LoadSettingScope, LoadSettingSource, LoadSettingValue,
-    LoadSettingsError, LoadSettingsSchema, LogLevel, ModelArtifact, ModelId, PromptDelivery,
-    PromptMode, PublicAuthStatus, RegistryState, ResolvedLoadSettings, ResponseFilter,
+    AppEvent, AppSnapshot, ArtifactFormat, LogLevel, ModelArtifact, ModelId, ModelProfile,
+    ModelProfileId, ModelProfilesState, PublicAuthStatus, RegistryState, ResolvedSettings,
     RuntimeCompatibility, RuntimeId, RuntimeOperationPhase, RuntimeOperationProgress,
-    RuntimeUpdateState, ServeProfile, ServeProfileName, ServeProfileSource, ServeProfilesState,
-    ServePromptProfile,
+    RuntimeUpdateState, SettingDefinition, SettingId, SettingScope, SettingValue, SettingsSchema,
+    SettingsState,
 };
 use norted_engine::{
     BackendLifecycle, BackendLoadProgress, ControlStatus, RuntimeListSnapshot,
@@ -25,6 +23,7 @@ use crate::ui::layout::{HoverTarget, UiLayout};
 pub enum Screen {
     Overview,
     Models,
+    ModelProfiles,
     Runtimes,
     Server,
     Logs,
@@ -33,9 +32,10 @@ pub enum Screen {
 }
 
 impl Screen {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Overview,
         Self::Models,
+        Self::ModelProfiles,
         Self::Runtimes,
         Self::Server,
         Self::Logs,
@@ -47,6 +47,7 @@ impl Screen {
         match self {
             Self::Overview => "Overview",
             Self::Models => "Models",
+            Self::ModelProfiles => "Model Profiles",
             Self::Runtimes => "Runtimes",
             Self::Server => "Server",
             Self::Logs => "Logs",
@@ -85,7 +86,7 @@ pub enum Update {
 
 #[derive(Debug, Clone)]
 pub enum ControlAction {
-    Load(norted_core::ModelId),
+    Load(ModelProfileId),
     Unload,
 }
 
@@ -102,7 +103,7 @@ pub enum RuntimeAction {
         query: String,
         force_refresh: bool,
         model: Option<Box<ModelArtifact>>,
-        serve_profile: Option<Box<norted_core::ServeProfile>>,
+        settings: Option<Box<ResolvedSettings>>,
     },
     Install(RuntimeId),
     CheckUpdates,
@@ -112,7 +113,7 @@ pub enum RuntimeAction {
     },
     ModelCandidates {
         model: Box<ModelArtifact>,
-        serve_profile: Option<Box<norted_core::ServeProfile>>,
+        settings: Option<Box<ResolvedSettings>>,
     },
     SelectFormat {
         format: ArtifactFormat,
@@ -166,9 +167,7 @@ pub enum RuntimeTaskResult {
 pub enum SettingsScope {
     Global,
     Engine(String),
-    Profile(ServeProfileName),
-    BuilderProfile(String),
-    Model(ModelId),
+    ModelProfile(ModelProfileId),
 }
 
 #[derive(Debug, Clone)]
@@ -176,48 +175,50 @@ pub enum SettingsAction {
     Refresh,
     Set {
         scope: SettingsScope,
-        id: LoadSettingId,
-        value: LoadSettingValue,
+        id: SettingId,
+        value: SettingValue,
     },
     Unset {
         scope: SettingsScope,
-        id: LoadSettingId,
+        id: SettingId,
     },
-    CreateProfile(ServeProfileName),
-    ForkBuilderProfile {
-        source: Box<norted_core::ServeProfile>,
-        name: ServeProfileName,
-    },
-    DeleteProfile(ServeProfileName),
-    AssignProfile {
-        model_id: ModelId,
-        profile: Option<ServeProfileName>,
-    },
-    AssignBuilderProfile {
-        model_id: ModelId,
-        profile_id: String,
-    },
-    InheritRecommendedProfile {
-        model_id: ModelId,
-    },
-    InspectModel {
+    CreateProfile {
+        id: ModelProfileId,
+        display_name: String,
         model: Box<ModelArtifact>,
-        serve_profile: Option<Box<norted_core::ServeProfile>>,
+    },
+    DuplicateProfile {
+        source: ModelProfileId,
+        destination: ModelProfileId,
+    },
+    DeleteProfile(ModelProfileId),
+    SetProfileModel {
+        profile_id: ModelProfileId,
+        model: Box<ModelArtifact>,
+    },
+    CycleProfileEngine {
+        profile_id: ModelProfileId,
+        model: Box<ModelArtifact>,
+    },
+    InspectProfile {
+        profile: Box<ModelProfile>,
+        model: Box<ModelArtifact>,
     },
 }
 
 #[derive(Debug)]
 pub struct ModelSettingsInspection {
-    pub profiles: ServeProfilesState,
+    pub state: SettingsState,
+    pub profiles: ModelProfilesState,
     pub runtime_id: RuntimeId,
-    pub schema: LoadSettingsSchema,
-    pub resolved: ResolvedLoadSettings,
+    pub schema: SettingsSchema,
+    pub resolved: ResolvedSettings,
 }
 
 #[derive(Debug)]
 pub enum SettingsTaskResult {
-    Loaded(Result<ServeProfilesState, String>),
-    Stored(Result<ServeProfilesState, String>),
+    Loaded(Result<(SettingsState, ModelProfilesState), String>),
+    Stored(Result<(SettingsState, ModelProfilesState), String>),
     Inspected {
         model_id: ModelId,
         result: Result<ModelSettingsInspection, String>,
@@ -227,7 +228,7 @@ pub enum SettingsTaskResult {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SettingsInputKind {
     ProfileName,
-    ForkProfile,
+    DuplicateProfile,
     SettingValue,
 }
 
@@ -236,7 +237,7 @@ pub struct SettingsInput {
     pub kind: SettingsInputKind,
     pub text: String,
     pub cursor: usize,
-    setting_id: Option<LoadSettingId>,
+    setting_id: Option<SettingId>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +269,7 @@ pub struct App {
     pub hover: Option<HoverTarget>,
     pub selected_model: Option<usize>,
     pub model_scroll: usize,
+    pub selected_model_profile: Option<usize>,
     pub log_scroll: usize,
     pub runtime_list: Option<RuntimeListSnapshot>,
     pub runtime_list_error: Option<String>,
@@ -293,17 +295,17 @@ pub struct App {
     pub runtime_picker_candidates: Vec<RuntimeModelCandidate>,
     pub runtime_picker_loading: bool,
     pub runtime_picker_error: Option<String>,
-    pub serve_profiles: Option<ServeProfilesState>,
-    pub serve_profiles_error: Option<String>,
-    pub serve_profiles_loading: bool,
-    pub load_setting_definitions: Vec<LoadSettingDefinition>,
-    serve_profile_definitions: Vec<LoadSettingDefinition>,
+    pub settings_state: Option<SettingsState>,
+    pub model_profiles: Option<ModelProfilesState>,
+    pub settings_error: Option<String>,
+    pub settings_loading: bool,
+    pub setting_definitions: Vec<SettingDefinition>,
     pub settings_scope_index: usize,
     pub settings_setting_index: usize,
     pub settings_scroll: usize,
     pub settings_model: Option<ModelId>,
-    pub settings_schema: Option<LoadSettingsSchema>,
-    pub settings_resolved: Option<ResolvedLoadSettings>,
+    pub settings_schema: Option<SettingsSchema>,
+    pub settings_resolved: Option<ResolvedSettings>,
     pub settings_runtime_id: Option<RuntimeId>,
     pub settings_validation_error: Option<String>,
     pub settings_input: Option<SettingsInput>,
@@ -325,7 +327,7 @@ impl App {
         public_auth_status: PublicAuthStatus,
         no_color: bool,
         unicode: bool,
-        load_setting_definitions: Vec<LoadSettingDefinition>,
+        setting_definitions: Vec<SettingDefinition>,
     ) -> Self {
         let mut logs = vec![LogEntry {
             level: LogLevel::Info,
@@ -364,6 +366,7 @@ impl App {
             hover: None,
             selected_model: None,
             model_scroll: 0,
+            selected_model_profile: None,
             log_scroll: 0,
             runtime_list: None,
             runtime_list_error: None,
@@ -389,11 +392,11 @@ impl App {
             runtime_picker_candidates: Vec::new(),
             runtime_picker_loading: false,
             runtime_picker_error: None,
-            serve_profiles: None,
-            serve_profiles_error: None,
-            serve_profiles_loading: true,
-            load_setting_definitions,
-            serve_profile_definitions: serve_profile_editor_definitions(),
+            settings_state: None,
+            model_profiles: None,
+            settings_error: None,
+            settings_loading: true,
+            setting_definitions,
             settings_scope_index: 0,
             settings_setting_index: 0,
             settings_scroll: 0,
@@ -696,43 +699,48 @@ impl App {
 
     pub fn handle_settings_task_result(&mut self, result: SettingsTaskResult) {
         self.settings_busy = false;
-        self.serve_profiles_loading = false;
+        self.settings_loading = false;
         match result {
             SettingsTaskResult::Loaded(result) => match result {
-                Ok(state) => {
-                    self.serve_profiles = Some(state);
-                    self.serve_profiles_error = None;
+                Ok((state, profiles)) => {
+                    self.settings_state = Some(state);
+                    self.model_profiles = Some(profiles);
+                    self.settings_error = None;
                     self.reconcile_settings_selection();
                 }
                 Err(error) => {
-                    self.serve_profiles_error = Some(error.clone());
+                    self.settings_error = Some(error.clone());
                     self.notice = Some(error);
                 }
             },
             SettingsTaskResult::Stored(result) => match result {
-                Ok(state) => {
-                    self.serve_profiles = Some(state);
-                    self.serve_profiles_error = None;
-                    self.notice =
-                        Some("Load settings saved; changes apply on the next load".to_owned());
+                Ok((state, profiles)) => {
+                    self.settings_state = Some(state);
+                    self.model_profiles = Some(profiles);
+                    self.settings_error = None;
+                    self.notice = Some("Settings saved; changes apply on the next load".to_owned());
                     self.reconcile_settings_selection();
-                    if self.settings_model.is_some() {
-                        let _ = self.refresh_model_settings();
+                    if self.screen == Screen::ModelProfiles {
+                        let _ = self.refresh_selected_model_profile();
                     }
                 }
                 Err(error) => {
-                    self.serve_profiles_error = Some(error.clone());
+                    self.settings_error = Some(error.clone());
                     self.notice = Some(error);
                 }
             },
             SettingsTaskResult::Inspected { model_id, result } => {
-                if self.settings_model.as_ref() != Some(&model_id) {
+                if self
+                    .selected_model_profile_value()
+                    .is_none_or(|profile| profile.model_id != model_id)
+                {
                     return;
                 }
                 match result {
                     Ok(inspection) => {
-                        self.serve_profiles = Some(inspection.profiles);
-                        self.serve_profiles_error = None;
+                        self.settings_state = Some(inspection.state);
+                        self.model_profiles = Some(inspection.profiles);
+                        self.settings_error = None;
                         self.settings_runtime_id = Some(inspection.runtime_id);
                         self.settings_schema = Some(inspection.schema);
                         self.settings_resolved = Some(inspection.resolved);
@@ -754,50 +762,14 @@ impl App {
     pub fn settings_scopes(&self) -> Vec<SettingsScope> {
         let mut scopes = vec![SettingsScope::Global];
         let engines = self
-            .load_setting_definitions
+            .setting_definitions
             .iter()
             .filter_map(|definition| match &definition.scope {
-                LoadSettingScope::Common => None,
-                LoadSettingScope::Engine { engine_id } => Some(engine_id.clone()),
+                SettingScope::Common => None,
+                SettingScope::Engine { engine_id } => Some(engine_id.clone()),
             })
             .collect::<BTreeSet<_>>();
         scopes.extend(engines.into_iter().map(SettingsScope::Engine));
-        if let Some(state) = &self.serve_profiles {
-            scopes.extend(state.profiles.keys().cloned().map(SettingsScope::Profile));
-        }
-        let local_ids = self
-            .serve_profiles
-            .as_ref()
-            .map(|state| {
-                state
-                    .profiles
-                    .keys()
-                    .map(ToString::to_string)
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
-        let builder_ids = self
-            .snapshot
-            .models
-            .iter()
-            .filter_map(|model| {
-                model
-                    .norted_package
-                    .as_ref()?
-                    .recommended_serve_profile
-                    .as_ref()
-                    .map(|profile| profile.id.clone())
-            })
-            .collect::<BTreeSet<_>>();
-        scopes.extend(
-            builder_ids
-                .into_iter()
-                .filter(|id| !local_ids.contains(id))
-                .map(SettingsScope::BuilderProfile),
-        );
-        if let Some(model) = &self.settings_model {
-            scopes.push(SettingsScope::Model(model.clone()));
-        }
         scopes
     }
 
@@ -807,48 +779,66 @@ impl App {
             .cloned()
     }
 
-    pub fn settings_definitions(&self) -> Vec<&LoadSettingDefinition> {
+    pub fn settings_definitions(&self) -> Vec<&SettingDefinition> {
         let scope = self.selected_settings_scope();
-        if matches!(
-            scope,
-            Some(SettingsScope::Profile(_) | SettingsScope::BuilderProfile(_))
-        ) {
-            return self
-                .serve_profile_definitions
-                .iter()
-                .chain(self.load_setting_definitions.iter())
-                .collect();
-        }
-        let source = if matches!(scope, Some(SettingsScope::Model(_))) {
+        let source = if self.screen == Screen::ModelProfiles {
             self.settings_schema
                 .as_ref()
                 .map(|schema| schema.definitions.as_slice())
-                .unwrap_or(&self.load_setting_definitions)
+                .unwrap_or(&self.setting_definitions)
         } else {
-            &self.load_setting_definitions
+            &self.setting_definitions
         };
         source
             .iter()
             .filter(|definition| match &scope {
-                Some(SettingsScope::Global) => definition.scope == LoadSettingScope::Common,
+                _ if self.screen == Screen::ModelProfiles => self
+                    .selected_model_profile_value()
+                    .is_some_and(|profile| match &definition.scope {
+                        SettingScope::Common => true,
+                        SettingScope::Engine { engine_id } => {
+                            engine_id == profile.engine_id.as_str()
+                        }
+                    }),
+                Some(SettingsScope::Global) => definition.scope == SettingScope::Common,
                 Some(SettingsScope::Engine(selected)) => match &definition.scope {
-                    LoadSettingScope::Common => true,
-                    LoadSettingScope::Engine { engine_id } => engine_id == selected,
+                    SettingScope::Common => true,
+                    SettingScope::Engine { engine_id } => engine_id == selected,
                 },
-                Some(
-                    SettingsScope::Profile(_)
-                    | SettingsScope::BuilderProfile(_)
-                    | SettingsScope::Model(_),
-                ) => true,
+                Some(SettingsScope::ModelProfile(_)) => true,
                 None => false,
             })
             .collect()
     }
 
-    pub fn settings_value_display(&self, id: &LoadSettingId) -> (String, String, bool) {
-        let Some(state) = &self.serve_profiles else {
+    pub fn settings_value_display(&self, id: &SettingId) -> (String, String, bool) {
+        let Some(state) = &self.settings_state else {
             return ("loading".to_owned(), "state".to_owned(), false);
         };
+        if self.screen == Screen::ModelProfiles {
+            let Some(profile) = self.selected_model_profile_value() else {
+                return (
+                    "<missing profile>".to_owned(),
+                    "unavailable".to_owned(),
+                    false,
+                );
+            };
+            if let Some(value) = profile.overrides.0.get(id) {
+                return (
+                    value.to_string(),
+                    format!("model-profile:{}", profile.id),
+                    true,
+                );
+            }
+            if let Some(setting) = self
+                .settings_resolved
+                .as_ref()
+                .and_then(|resolved| resolved.effective.get(id))
+            {
+                return (setting.value.to_string(), setting.source.to_string(), false);
+            }
+            return ("<runtime default>".to_owned(), "runtime".to_owned(), false);
+        }
         let Some(scope) = self.selected_settings_scope() else {
             return (
                 "<upstream default>".to_owned(),
@@ -856,58 +846,18 @@ impl App {
                 false,
             );
         };
-        if is_serve_profile_editor_field(id) {
-            let profile = match &scope {
-                SettingsScope::Profile(name) => state.profiles.get(name).cloned(),
-                SettingsScope::BuilderProfile(profile_id) => {
-                    self.builder_serve_profile(profile_id).cloned()
-                }
-                SettingsScope::Global | SettingsScope::Engine(_) | SettingsScope::Model(_) => None,
-            };
-            return profile.map_or_else(
-                || ("<not set>".to_owned(), "Serve Profile".to_owned(), false),
-                |profile| {
-                    (
-                        serve_profile_editor_value(&profile, id)
-                            .map(|value| value.to_string())
-                            .unwrap_or_else(|| "<runtime default>".to_owned()),
-                        profile.source.to_string(),
-                        !profile.read_only,
-                    )
-                },
-            );
-        }
         let current = match &scope {
             SettingsScope::Global => state.global_defaults.0.get(id),
             SettingsScope::Engine(engine) => state
                 .engine_defaults
                 .get(engine)
                 .and_then(|patch| patch.0.get(id)),
-            SettingsScope::Profile(profile) => state
-                .profiles
-                .get(profile)
-                .and_then(|profile| profile.load.settings.0.get(id)),
-            SettingsScope::BuilderProfile(profile_id) => self
-                .builder_serve_profile(profile_id)
-                .and_then(|profile| profile.load.settings.0.get(id)),
-            SettingsScope::Model(model) => state
-                .model_defaults
-                .get(model)
-                .and_then(|patch| patch.0.get(id)),
-        };
-        if let SettingsScope::Model(_) = scope
-            && let Some(setting) = self
-                .settings_resolved
+            SettingsScope::ModelProfile(profile_id) => self
+                .model_profiles
                 .as_ref()
-                .and_then(|resolved| resolved.effective.get(id))
-        {
-            let set_here = matches!(setting.source, LoadSettingSource::ModelDefault { .. });
-            return (
-                setting.value.to_string(),
-                setting.source.to_string(),
-                set_here,
-            );
-        }
+                .and_then(|profiles| profiles.profiles.get(profile_id))
+                .and_then(|profile| profile.overrides.0.get(id)),
+        };
         if let Some(value) = current {
             return (value.to_string(), "set here".to_owned(), true);
         }
@@ -935,69 +885,25 @@ impl App {
         )
     }
 
-    pub fn effective_serve_profile_for_model(
-        &self,
-        model: &ModelArtifact,
-    ) -> Option<norted_core::ServeProfile> {
-        let state = self.serve_profiles.as_ref()?;
-        if state.raw_profile_models.contains(&model.id) {
-            return None;
-        }
-        if let Some(name) = state.model_assignments.get(&model.id) {
-            return state.profiles.get(name).cloned();
-        }
-        if let Some(profile_id) = state.builder_profile_assignments.get(&model.id) {
-            return self
-                .snapshot
-                .models
-                .iter()
-                .filter_map(|candidate| {
-                    candidate
-                        .norted_package
-                        .as_ref()?
-                        .recommended_serve_profile
-                        .as_ref()
-                })
-                .find(|profile| &profile.id == profile_id)
-                .cloned();
-        }
-        model
-            .norted_package
+    pub fn model_profile_values(&self) -> Vec<&ModelProfile> {
+        self.model_profiles
             .as_ref()
-            .and_then(|package| package.recommended_serve_profile.clone())
+            .map(|state| state.profiles.values().collect())
+            .unwrap_or_default()
     }
 
-    fn builder_serve_profile(&self, profile_id: &str) -> Option<&norted_core::ServeProfile> {
-        self.snapshot.models.iter().find_map(|model| {
-            let profile = model
-                .norted_package
-                .as_ref()?
-                .recommended_serve_profile
-                .as_ref()?;
-            (profile.id == profile_id).then_some(profile)
-        })
+    pub fn selected_model_profile_value(&self) -> Option<&ModelProfile> {
+        self.model_profile_values()
+            .get(self.selected_model_profile?)
+            .copied()
     }
 
-    pub fn serve_profile_status_for_model(&self, model: &ModelArtifact) -> &'static str {
-        let Some(state) = &self.serve_profiles else {
-            return "loading";
-        };
-        if state.raw_profile_models.contains(&model.id) {
-            "None / Raw runtime defaults"
-        } else if state.model_assignments.contains_key(&model.id) {
-            "User / customized"
-        } else if state.builder_profile_assignments.contains_key(&model.id) {
-            "Builder profile from registry"
-        } else if model
-            .norted_package
-            .as_ref()
-            .and_then(|package| package.recommended_serve_profile.as_ref())
-            .is_some()
-        {
-            "Recommended / canonical"
-        } else {
-            "None / Raw runtime defaults"
-        }
+    pub fn selected_profile_model(&self) -> Option<&ModelArtifact> {
+        let profile = self.selected_model_profile_value()?;
+        self.snapshot
+            .models
+            .iter()
+            .find(|model| model.id == profile.model_id)
     }
 
     pub fn runtime_mutation_busy(&self) -> bool {
@@ -1647,12 +1553,12 @@ impl App {
                 KeyCode::End if !self.snapshot.models.is_empty() => {
                     self.select_model(self.snapshot.models.len() - 1, layout)
                 }
-                KeyCode::Enter => self.request_load(),
+                KeyCode::Enter | KeyCode::Char('c') => self.create_profile_for_selected_model(),
                 KeyCode::Char('u') => self.request_unload(),
                 KeyCode::Char('v') => self.open_model_runtime_picker(),
-                KeyCode::Char('p') => self.open_model_load_settings(),
                 _ => Update::None,
             },
+            Screen::ModelProfiles => self.handle_model_profiles_key(key, layout),
             Screen::Logs => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => self.scroll_logs(1, layout),
                 KeyCode::Down | KeyCode::Char('j') => self.scroll_logs(-1, layout),
@@ -1720,19 +1626,32 @@ impl App {
             KeyCode::PageDown => self.scroll_settings(layout.settings_capacity() as isize, layout),
             KeyCode::Enter => self.edit_selected_setting(),
             KeyCode::Backspace | KeyCode::Delete => self.clear_selected_setting(),
-            KeyCode::Char('n') => {
-                self.settings_input = Some(SettingsInput {
-                    kind: SettingsInputKind::ProfileName,
-                    text: String::new(),
-                    cursor: 0,
-                    setting_id: None,
-                });
-                Update::Render
+            _ => Update::None,
+        }
+    }
+
+    fn handle_model_profiles_key(&mut self, key: KeyEvent, layout: &UiLayout) -> Update {
+        if self.settings_busy {
+            return Update::None;
+        }
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') => self.move_model_profile_selection(-1),
+            KeyCode::Right | KeyCode::Char('l') if key.code != KeyCode::Char('l') => {
+                self.move_model_profile_selection(1)
             }
+            KeyCode::Up | KeyCode::Char('k') => self.move_settings_selection(-1, layout),
+            KeyCode::Down | KeyCode::Char('j') => self.move_settings_selection(1, layout),
+            KeyCode::PageUp => self.scroll_settings(-(layout.settings_capacity() as isize), layout),
+            KeyCode::PageDown => self.scroll_settings(layout.settings_capacity() as isize, layout),
+            KeyCode::Enter => self.edit_selected_setting(),
+            KeyCode::Backspace | KeyCode::Delete => self.clear_selected_setting(),
+            KeyCode::Char('l') => self.request_load(),
+            KeyCode::Char('u') => self.request_unload(),
             KeyCode::Char('d') => self.delete_selected_profile(),
-            KeyCode::Char('f') => self.fork_selected_builder_profile(),
-            KeyCode::Char('p') => self.cycle_model_profile(),
-            KeyCode::Char('r') => self.refresh_model_settings(),
+            KeyCode::Char('D') => self.begin_duplicate_profile(),
+            KeyCode::Char('m') => self.cycle_profile_model(),
+            KeyCode::Char('e') => self.cycle_profile_engine(),
+            KeyCode::Char('r') => self.refresh_selected_model_profile(),
             _ => Update::None,
         }
     }
@@ -1805,30 +1724,48 @@ impl App {
             return Update::None;
         };
         match input.kind {
-            SettingsInputKind::ProfileName => match ServeProfileName::new(input.text) {
-                Ok(name) => self.queue_settings_action(SettingsAction::CreateProfile(name)),
+            SettingsInputKind::ProfileName => match ModelProfileId::new(input.text.clone()) {
+                Ok(id) => {
+                    let Some(model) = self
+                        .settings_model
+                        .as_ref()
+                        .and_then(|model_id| {
+                            self.snapshot
+                                .models
+                                .iter()
+                                .find(|model| &model.id == model_id)
+                        })
+                        .cloned()
+                    else {
+                        self.notice = Some(
+                            "Select an artifact on Models before creating a Model Profile"
+                                .to_owned(),
+                        );
+                        return Update::Render;
+                    };
+                    self.queue_settings_action(SettingsAction::CreateProfile {
+                        id,
+                        display_name: input.text,
+                        model: Box::new(model),
+                    })
+                }
                 Err(error) => {
                     self.notice = Some(error.to_string());
                     Update::Render
                 }
             },
-            SettingsInputKind::ForkProfile => match ServeProfileName::new(input.text) {
-                Ok(name) => {
-                    let Some(SettingsScope::BuilderProfile(profile_id)) =
-                        self.selected_settings_scope()
+            SettingsInputKind::DuplicateProfile => match ModelProfileId::new(input.text) {
+                Ok(destination) => {
+                    let Some(source) = self
+                        .selected_model_profile_value()
+                        .map(|profile| profile.id.clone())
                     else {
-                        self.notice =
-                            Some("The Builder Serve Profile is no longer selected".to_owned());
+                        self.notice = Some("Select a Model Profile to duplicate".to_owned());
                         return Update::Render;
                     };
-                    let Some(source) = self.builder_serve_profile(&profile_id).cloned() else {
-                        self.notice =
-                            Some("The Builder Serve Profile source is unavailable".to_owned());
-                        return Update::Render;
-                    };
-                    self.queue_settings_action(SettingsAction::ForkBuilderProfile {
-                        source: Box::new(source),
-                        name,
+                    self.queue_settings_action(SettingsAction::DuplicateProfile {
+                        source,
+                        destination,
                     })
                 }
                 Err(error) => {
@@ -1861,16 +1798,6 @@ impl App {
     }
 
     fn edit_selected_setting(&mut self) -> Update {
-        if matches!(
-            self.selected_settings_scope(),
-            Some(SettingsScope::BuilderProfile(_))
-        ) {
-            self.notice = Some(
-                "Builder Serve Profiles are read-only; press f to fork a mutable local copy"
-                    .to_owned(),
-            );
-            return Update::Render;
-        }
         let definition = self
             .settings_definitions()
             .get(self.settings_setting_index)
@@ -1888,16 +1815,16 @@ impl App {
         }
         let current = self.current_layer_value(&definition.id);
         match &definition.kind {
-            norted_core::LoadSettingKind::Toggle => {
-                let value = !matches!(current, Some(LoadSettingValue::Toggle(true)));
-                self.set_selected_setting(definition.id, LoadSettingValue::Toggle(value))
+            norted_core::SettingKind::Toggle => {
+                let value = !matches!(current, Some(SettingValue::Toggle(true)));
+                self.set_selected_setting(definition.id, SettingValue::Toggle(value))
             }
-            norted_core::LoadSettingKind::OneWayFlag => {
-                self.set_selected_setting(definition.id, LoadSettingValue::FlagEnabled)
+            norted_core::SettingKind::OneWayFlag => {
+                self.set_selected_setting(definition.id, SettingValue::FlagEnabled)
             }
-            norted_core::LoadSettingKind::Choice { choices } if !choices.is_empty() => {
+            norted_core::SettingKind::Choice { choices } if !choices.is_empty() => {
                 let current = match current {
-                    Some(LoadSettingValue::Choice(value)) => choices
+                    Some(SettingValue::Choice(value)) => choices
                         .iter()
                         .position(|choice| choice == &value)
                         .map(|index| (index + 1) % choices.len()),
@@ -1905,7 +1832,7 @@ impl App {
                 }
                 .unwrap_or(0);
                 let value = choices[current].clone();
-                self.set_selected_setting(definition.id, LoadSettingValue::Choice(value))
+                self.set_selected_setting(definition.id, SettingValue::Choice(value))
             }
             _ => {
                 let text = current.map(|value| value.to_string()).unwrap_or_default();
@@ -1921,9 +1848,17 @@ impl App {
         }
     }
 
-    fn set_selected_setting(&mut self, id: LoadSettingId, value: LoadSettingValue) -> Update {
-        let Some(scope) = self.selected_settings_scope() else {
-            return Update::None;
+    fn set_selected_setting(&mut self, id: SettingId, value: SettingValue) -> Update {
+        let scope = if self.screen == Screen::ModelProfiles {
+            let Some(profile) = self.selected_model_profile_value() else {
+                return Update::None;
+            };
+            SettingsScope::ModelProfile(profile.id.clone())
+        } else {
+            let Some(scope) = self.selected_settings_scope() else {
+                return Update::None;
+            };
+            scope
         };
         self.queue_settings_action(SettingsAction::Set { scope, id, value })
     }
@@ -1933,7 +1868,13 @@ impl App {
             .settings_definitions()
             .get(self.settings_setting_index)
             .map(|definition| definition.id.clone());
-        let (Some(scope), Some(id)) = (self.selected_settings_scope(), id) else {
+        let scope = if self.screen == Screen::ModelProfiles {
+            self.selected_model_profile_value()
+                .map(|profile| SettingsScope::ModelProfile(profile.id.clone()))
+        } else {
+            self.selected_settings_scope()
+        };
+        let (Some(scope), Some(id)) = (scope, id) else {
             return Update::None;
         };
         if self.current_layer_value(&id).is_none() {
@@ -1944,43 +1885,35 @@ impl App {
         self.queue_settings_action(SettingsAction::Unset { scope, id })
     }
 
-    fn current_layer_value(&self, id: &LoadSettingId) -> Option<LoadSettingValue> {
-        let state = self.serve_profiles.as_ref()?;
-        if is_serve_profile_editor_field(id) {
-            return match self.selected_settings_scope()? {
-                SettingsScope::Profile(name) => state
-                    .profiles
-                    .get(&name)
-                    .cloned()
-                    .and_then(|profile| serve_profile_editor_value(&profile, id)),
-                SettingsScope::BuilderProfile(profile_id) => self
-                    .builder_serve_profile(&profile_id)
-                    .and_then(|profile| serve_profile_editor_value(profile, id)),
-                SettingsScope::Global | SettingsScope::Engine(_) | SettingsScope::Model(_) => None,
-            };
+    fn current_layer_value(&self, id: &SettingId) -> Option<SettingValue> {
+        if self.screen == Screen::ModelProfiles {
+            return self
+                .selected_model_profile_value()?
+                .overrides
+                .0
+                .get(id)
+                .cloned();
         }
+        let state = self.settings_state.as_ref()?;
         match self.selected_settings_scope()? {
             SettingsScope::Global => state.global_defaults.0.get(id).cloned(),
             SettingsScope::Engine(engine) => state.engine_defaults.get(&engine)?.0.get(id).cloned(),
-            SettingsScope::Profile(profile) => state
+            SettingsScope::ModelProfile(profile_id) => self
+                .model_profiles
+                .as_ref()?
                 .profiles
-                .get(&profile)?
-                .load
-                .settings
+                .get(&profile_id)?
+                .overrides
                 .0
                 .get(id)
                 .cloned(),
-            SettingsScope::BuilderProfile(profile_id) => self
-                .builder_serve_profile(&profile_id)
-                .and_then(|profile| profile.load.settings.0.get(id).cloned()),
-            SettingsScope::Model(model) => state.model_defaults.get(&model)?.0.get(id).cloned(),
         }
     }
 
     fn queue_settings_action(&mut self, action: SettingsAction) -> Update {
         self.pending_settings_action = Some(action);
         self.settings_busy = true;
-        self.notice = Some("Saving load settings…".to_owned());
+        self.notice = Some("Saving settings…".to_owned());
         Update::Render
     }
 
@@ -1993,12 +1926,6 @@ impl App {
             .rem_euclid(scopes.len() as isize) as usize;
         self.settings_setting_index = 0;
         self.settings_scroll = 0;
-        if matches!(
-            self.selected_settings_scope(),
-            Some(SettingsScope::Model(_))
-        ) {
-            return self.refresh_model_settings();
-        }
         Update::Render
     }
 
@@ -2034,30 +1961,23 @@ impl App {
     }
 
     fn delete_selected_profile(&mut self) -> Update {
-        if matches!(
-            self.selected_settings_scope(),
-            Some(SettingsScope::BuilderProfile(_))
-        ) {
-            self.notice = Some(
-                "Builder Serve Profiles are read-only and cannot be deleted; press f to fork"
-                    .to_owned(),
-            );
-            return Update::Render;
-        }
-        let Some(SettingsScope::Profile(profile)) = self.selected_settings_scope() else {
-            self.notice = Some("Select a named profile before deleting it".to_owned());
+        let Some(profile) = self
+            .selected_model_profile_value()
+            .map(|profile| profile.id.clone())
+        else {
+            self.notice = Some("Select a Model Profile before deleting it".to_owned());
             return Update::Render;
         };
         self.queue_settings_action(SettingsAction::DeleteProfile(profile))
     }
 
-    fn fork_selected_builder_profile(&mut self) -> Update {
-        let Some(SettingsScope::BuilderProfile(_)) = self.selected_settings_scope() else {
-            self.notice = Some("Select a read-only Builder Serve Profile to fork".to_owned());
+    fn begin_duplicate_profile(&mut self) -> Update {
+        if self.selected_model_profile_value().is_none() {
+            self.notice = Some("Select a Model Profile to duplicate".to_owned());
             return Update::Render;
-        };
+        }
         self.settings_input = Some(SettingsInput {
-            kind: SettingsInputKind::ForkProfile,
+            kind: SettingsInputKind::DuplicateProfile,
             text: String::new(),
             cursor: 0,
             setting_id: None,
@@ -2065,135 +1985,115 @@ impl App {
         Update::Render
     }
 
-    fn cycle_model_profile(&mut self) -> Update {
-        let Some(model_id) = self.settings_model.clone() else {
-            self.notice = Some("Open load settings from a selected model first".to_owned());
-            return Update::Render;
-        };
-        let Some(state) = &self.serve_profiles else {
+    fn cycle_profile_model(&mut self) -> Update {
+        let Some(profile_id) = self
+            .selected_model_profile_value()
+            .map(|profile| profile.id.clone())
+        else {
             return Update::None;
         };
-        let local = state.profiles.keys().cloned().collect::<Vec<_>>();
-        let builder = self
+        if self.snapshot.models.is_empty() {
+            self.notice = Some("No discovered model artifacts are available".to_owned());
+            return Update::Render;
+        }
+        let current = self
+            .selected_model_profile_value()
+            .map(|profile| &profile.model_id);
+        let next = current
+            .and_then(|id| {
+                self.snapshot
+                    .models
+                    .iter()
+                    .position(|model| &model.id == id)
+            })
+            .map(|index| (index + 1) % self.snapshot.models.len())
+            .unwrap_or(0);
+        self.queue_settings_action(SettingsAction::SetProfileModel {
+            profile_id,
+            model: Box::new(self.snapshot.models[next].clone()),
+        })
+    }
+
+    fn cycle_profile_engine(&mut self) -> Update {
+        let Some(profile) = self.selected_model_profile_value().cloned() else {
+            return Update::None;
+        };
+        let Some(model) = self
             .snapshot
             .models
             .iter()
-            .filter_map(|model| {
-                model
-                    .norted_package
-                    .as_ref()?
-                    .recommended_serve_profile
-                    .as_ref()
-                    .map(|profile| profile.id.clone())
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        if !state.raw_profile_models.contains(&model_id)
-            && !state.model_assignments.contains_key(&model_id)
-            && !state.builder_profile_assignments.contains_key(&model_id)
-        {
-            return self.queue_settings_action(SettingsAction::AssignProfile {
-                model_id,
-                profile: None,
-            });
-        }
-        if state.raw_profile_models.contains(&model_id) {
-            if let Some(profile) = local.first() {
-                return self.queue_settings_action(SettingsAction::AssignProfile {
-                    model_id,
-                    profile: Some(profile.clone()),
-                });
-            }
-            if let Some(profile_id) = builder.first() {
-                return self.queue_settings_action(SettingsAction::AssignBuilderProfile {
-                    model_id,
-                    profile_id: profile_id.clone(),
-                });
-            }
-            return self
-                .queue_settings_action(SettingsAction::InheritRecommendedProfile { model_id });
-        }
-        if let Some(current) = state.model_assignments.get(&model_id) {
-            if let Some(next) = local
-                .iter()
-                .position(|profile| profile == current)
-                .and_then(|index| local.get(index + 1))
-            {
-                return self.queue_settings_action(SettingsAction::AssignProfile {
-                    model_id,
-                    profile: Some(next.clone()),
-                });
-            }
-            if let Some(profile_id) = builder.first() {
-                return self.queue_settings_action(SettingsAction::AssignBuilderProfile {
-                    model_id,
-                    profile_id: profile_id.clone(),
-                });
-            }
-        }
-        if let Some(current) = state.builder_profile_assignments.get(&model_id)
-            && let Some(next) = builder
-                .iter()
-                .position(|profile| profile == current)
-                .and_then(|index| builder.get(index + 1))
-        {
-            return self.queue_settings_action(SettingsAction::AssignBuilderProfile {
-                model_id,
-                profile_id: next.clone(),
-            });
-        }
-        self.queue_settings_action(SettingsAction::InheritRecommendedProfile { model_id })
-    }
-
-    fn refresh_model_settings(&mut self) -> Update {
-        let model = self.settings_model.as_ref().and_then(|model_id| {
-            self.snapshot
-                .models
-                .iter()
-                .find(|model| &model.id == model_id)
-                .cloned()
-        });
-        let Some(model) = model else {
+            .find(|model| model.id == profile.model_id)
+            .cloned()
+        else {
+            self.notice = Some(format!("Bound model `{}` is missing", profile.model_id));
             return Update::Render;
         };
-        let serve_profile = self.effective_serve_profile_for_model(&model).map(Box::new);
-        self.pending_settings_action = Some(SettingsAction::InspectModel {
+        self.queue_settings_action(SettingsAction::CycleProfileEngine {
+            profile_id: profile.id,
             model: Box::new(model),
-            serve_profile,
+        })
+    }
+
+    fn refresh_selected_model_profile(&mut self) -> Update {
+        let Some(profile) = self.selected_model_profile_value().cloned() else {
+            return Update::Render;
+        };
+        let Some(model) = self
+            .snapshot
+            .models
+            .iter()
+            .find(|model| model.id == profile.model_id)
+            .cloned()
+        else {
+            self.settings_schema = None;
+            self.settings_resolved = None;
+            self.settings_runtime_id = None;
+            self.settings_validation_error =
+                Some(format!("Bound model `{}` is missing", profile.model_id));
+            return Update::Render;
+        };
+        self.pending_settings_action = Some(SettingsAction::InspectProfile {
+            profile: Box::new(profile),
+            model: Box::new(model),
         });
         self.settings_busy = true;
         self.settings_validation_error = None;
         Update::Render
     }
 
-    fn open_model_load_settings(&mut self) -> Update {
+    fn create_profile_for_selected_model(&mut self) -> Update {
         let Some(model) = self
             .selected_model
             .and_then(|index| self.snapshot.models.get(index))
             .cloned()
         else {
-            self.notice = Some("Select a model before opening load settings".to_owned());
+            self.notice = Some("Select a model before creating a Model Profile".to_owned());
             return Update::Render;
         };
         self.settings_model = Some(model.id.clone());
-        self.screen = Screen::Settings;
-        self.nav_focus = Screen::Settings;
-        let scopes = self.settings_scopes();
-        self.settings_scope_index = scopes
-            .iter()
-            .position(|scope| scope == &SettingsScope::Model(model.id.clone()))
-            .unwrap_or(0);
+        self.screen = Screen::ModelProfiles;
+        self.nav_focus = Screen::ModelProfiles;
         self.settings_setting_index = 0;
         self.settings_scroll = 0;
-        let serve_profile = self.effective_serve_profile_for_model(&model).map(Box::new);
-        self.pending_settings_action = Some(SettingsAction::InspectModel {
-            model: Box::new(model),
-            serve_profile,
+        self.settings_input = Some(SettingsInput {
+            kind: SettingsInputKind::ProfileName,
+            text: String::new(),
+            cursor: 0,
+            setting_id: None,
         });
-        self.settings_busy = true;
-        self.notice = Some("Inspecting exact-runtime load settings…".to_owned());
         Update::Render
+    }
+
+    fn move_model_profile_selection(&mut self, direction: isize) -> Update {
+        let len = self.model_profile_values().len();
+        if len == 0 {
+            return Update::None;
+        }
+        let current = self.selected_model_profile.unwrap_or(0) as isize;
+        self.selected_model_profile = Some((current + direction).rem_euclid(len as isize) as usize);
+        self.settings_setting_index = 0;
+        self.settings_scroll = 0;
+        self.refresh_selected_model_profile()
     }
 
     fn reconcile_settings_selection(&mut self) {
@@ -2245,15 +2145,17 @@ impl App {
             }
             Some(HoverTarget::SettingsScope(index)) => {
                 self.focus = FocusArea::Content;
-                self.settings_scope_index =
-                    index.min(self.settings_scopes().len().saturating_sub(1));
+                if self.screen == Screen::ModelProfiles {
+                    self.selected_model_profile =
+                        Some(index.min(self.model_profile_values().len().saturating_sub(1)));
+                } else {
+                    self.settings_scope_index =
+                        index.min(self.settings_scopes().len().saturating_sub(1));
+                }
                 self.settings_setting_index = 0;
                 self.settings_scroll = 0;
-                if matches!(
-                    self.selected_settings_scope(),
-                    Some(SettingsScope::Model(_))
-                ) {
-                    self.refresh_model_settings()
+                if self.screen == Screen::ModelProfiles {
+                    self.refresh_selected_model_profile()
                 } else {
                     Update::Render
                 }
@@ -2313,6 +2215,7 @@ impl App {
         self.focus = FocusArea::Content;
         match self.screen {
             Screen::Models => self.scroll_models(direction * 3, layout),
+            Screen::ModelProfiles => self.scroll_settings(direction * 3, layout),
             Screen::Logs => self.scroll_logs(direction * -3, layout),
             Screen::Runtimes => self.scroll_runtimes(direction * 3, layout),
             Screen::Settings => self.scroll_settings(direction * 3, layout),
@@ -2403,10 +2306,9 @@ impl App {
         self.runtime_picker_loading = true;
         self.runtime_picker_candidates.clear();
         self.runtime_picker_error = None;
-        let serve_profile = self.effective_serve_profile_for_model(&model).map(Box::new);
         self.pending_runtime_action = Some(RuntimeAction::ModelCandidates {
             model: Box::new(model),
-            serve_profile,
+            settings: None,
         });
         self.notice = Some("Checking installed runtime compatibility…".to_owned());
         Update::Render
@@ -2819,16 +2721,11 @@ impl App {
         }
         self.runtime_search_loading = true;
         self.runtime_search_error = None;
-        let serve_profile = self
-            .runtime_search_model
-            .as_deref()
-            .and_then(|model| self.effective_serve_profile_for_model(model))
-            .map(Box::new);
         self.pending_runtime_action = Some(RuntimeAction::Search {
             query: self.runtime_search_query.clone(),
             force_refresh,
             model: self.runtime_search_model.clone(),
-            serve_profile,
+            settings: None,
         });
         Update::Render
     }
@@ -3139,14 +3036,22 @@ impl App {
             self.notice = Some("A control operation is already in progress".to_owned());
             return Update::Render;
         }
-        let Some(index) = self.selected_model else {
-            self.notice = Some("Select a model before loading it".to_owned());
+        let Some(profile) = self.selected_model_profile_value().cloned() else {
+            self.notice = Some("Select a Model Profile before loading it".to_owned());
             return Update::Render;
         };
-        let Some(model) = self.snapshot.models.get(index) else {
-            self.notice = Some("The selected model is no longer available".to_owned());
+        if !self
+            .snapshot
+            .models
+            .iter()
+            .any(|model| model.id == profile.model_id)
+        {
+            self.notice = Some(format!(
+                "Model Profile `{}` cannot load because bound model `{}` is missing",
+                profile.id, profile.model_id
+            ));
             return Update::Render;
-        };
+        }
         let Some(control) = &self.control else {
             self.notice = Some(if self.control_observation_pending() {
                 "Server control observation is still in progress".to_owned()
@@ -3156,14 +3061,14 @@ impl App {
             return Update::Render;
         };
         if control.backend.lifecycle == BackendLifecycle::Running
-            && control.backend.model_id.as_ref() == Some(&model.id)
+            && control.backend.model_profile_id.as_ref() == Some(&profile.id)
         {
-            self.notice = Some("The selected model is already active".to_owned());
+            self.notice = Some("The selected Model Profile is already active".to_owned());
             return Update::Render;
         }
-        self.pending_control_action = Some(ControlAction::Load(model.id.clone()));
+        self.pending_control_action = Some(ControlAction::Load(profile.id.clone()));
         self.control_busy = true;
-        self.notice = Some(format!("Loading {}…", model.display_name));
+        self.notice = Some(format!("Loading {}…", profile.display_name));
         Update::Render
     }
 
@@ -3191,385 +3096,39 @@ impl App {
     }
 }
 
-const PROFILE_TEMPERATURE: &str = "profile.generation.temperature";
-const PROFILE_TOP_P: &str = "profile.generation.top_p";
-const PROFILE_TOP_K: &str = "profile.generation.top_k";
-const PROFILE_MIN_P: &str = "profile.generation.min_p";
-const PROFILE_REASONING_EFFORT: &str = "profile.generation.reasoning_effort";
-const PROFILE_THINKING_DEFAULT: &str = "profile.generation.thinking_default";
-const PROFILE_THINKING_REQUIRED: &str = "profile.generation.thinking_required";
-const PROFILE_ALLOWED_OVERRIDES: &str = "profile.generation.allowed_request_overrides";
-const PROFILE_PROMPT_MODE: &str = "profile.prompt.mode";
-const PROFILE_EXTERNAL_TEMPLATE: &str = "profile.prompt.external_template";
-const PROFILE_RENDER_GENERATION_PROMPT: &str = "profile.prompt.render_generation_prompt";
-const PROFILE_TEMPLATE_THINKING: &str = "profile.prompt.thinking_enabled";
-const PROFILE_RESPONSE_FILTER: &str = "profile.prompt.response_filter";
-
-fn serve_profile_editor_definitions() -> Vec<LoadSettingDefinition> {
-    let definition = |id: &str,
-                      label: &str,
-                      description: &str,
-                      kind: LoadSettingKind,
-                      upstream_default: &str| LoadSettingDefinition {
-        id: LoadSettingId::new(id).expect("static Serve Profile editor setting ID is valid"),
-        label: label.to_owned(),
-        description: description.to_owned(),
-        kind,
-        scope: LoadSettingScope::Common,
-        supported: true,
-        unsupported_reason: None,
-        unit: None,
-        upstream_default: Some(upstream_default.to_owned()),
-        recommendation: None,
-    };
-    vec![
-        definition(
-            PROFILE_TEMPERATURE,
-            "Profile temperature",
-            "Optional Serve Profile generation default",
-            LoadSettingKind::Float {
-                minimum: Some(0.0),
-                maximum: None,
-            },
-            "runtime default",
-        ),
-        definition(
-            PROFILE_TOP_P,
-            "Profile top-p",
-            "Optional Serve Profile nucleus-sampling default",
-            LoadSettingKind::Float {
-                minimum: Some(0.0),
-                maximum: Some(1.0),
-            },
-            "runtime default",
-        ),
-        definition(
-            PROFILE_TOP_K,
-            "Profile top-k",
-            "Optional Serve Profile top-k default",
-            LoadSettingKind::UnsignedInteger {
-                minimum: None,
-                maximum: None,
-            },
-            "runtime default",
-        ),
-        definition(
-            PROFILE_MIN_P,
-            "Profile min-p",
-            "Optional Serve Profile minimum-probability default",
-            LoadSettingKind::Float {
-                minimum: Some(0.0),
-                maximum: Some(1.0),
-            },
-            "runtime default",
-        ),
-        definition(
-            PROFILE_REASONING_EFFORT,
-            "Profile reasoning effort",
-            "Optional reasoning-effort default passed by the Serve Profile",
-            LoadSettingKind::String,
-            "runtime default",
-        ),
-        definition(
-            PROFILE_THINKING_DEFAULT,
-            "Profile thinking default",
-            "Select the effective thinking state",
-            LoadSettingKind::Toggle,
-            "false",
-        ),
-        definition(
-            PROFILE_THINKING_REQUIRED,
-            "Profile thinking required",
-            "Prevent permitted invocation settings from disabling thinking",
-            LoadSettingKind::Toggle,
-            "false",
-        ),
-        definition(
-            PROFILE_ALLOWED_OVERRIDES,
-            "Allowed request overrides",
-            "Comma-separated request fields that may override profile generation defaults",
-            LoadSettingKind::String,
-            "none",
-        ),
-        definition(
-            PROFILE_PROMPT_MODE,
-            "Profile prompt mode",
-            "Use the runtime prompt path or the configured external template",
-            LoadSettingKind::Choice {
-                choices: vec!["runtime_default".to_owned(), "external_template".to_owned()],
-            },
-            "runtime_default",
-        ),
-        definition(
-            PROFILE_EXTERNAL_TEMPLATE,
-            "External template",
-            "Enter identity | path | sha256; setting this selects external-template/raw-completions mode",
-            LoadSettingKind::String,
-            "none",
-        ),
-        definition(
-            PROFILE_RENDER_GENERATION_PROMPT,
-            "Render generation prompt",
-            "Append the template's generation-prompt framing",
-            LoadSettingKind::Toggle,
-            "false",
-        ),
-        definition(
-            PROFILE_TEMPLATE_THINKING,
-            "Template thinking state",
-            "Render the external template with thinking enabled",
-            LoadSettingKind::Toggle,
-            "false",
-        ),
-        definition(
-            PROFILE_RESPONSE_FILTER,
-            "Profile response filter",
-            "Select a typed response filter supported by the target adapter",
-            LoadSettingKind::Choice {
-                choices: vec!["none".to_owned(), "dirk_sharp_reasoning".to_owned()],
-            },
-            "none",
-        ),
-    ]
-}
-
-pub(crate) fn is_serve_profile_editor_field(id: &LoadSettingId) -> bool {
-    matches!(
-        id.as_str(),
-        PROFILE_TEMPERATURE
-            | PROFILE_TOP_P
-            | PROFILE_TOP_K
-            | PROFILE_MIN_P
-            | PROFILE_REASONING_EFFORT
-            | PROFILE_THINKING_DEFAULT
-            | PROFILE_THINKING_REQUIRED
-            | PROFILE_ALLOWED_OVERRIDES
-            | PROFILE_PROMPT_MODE
-            | PROFILE_EXTERNAL_TEMPLATE
-            | PROFILE_RENDER_GENERATION_PROMPT
-            | PROFILE_TEMPLATE_THINKING
-            | PROFILE_RESPONSE_FILTER
-    )
-}
-
-fn serve_profile_editor_value(
-    profile: &ServeProfile,
-    id: &LoadSettingId,
-) -> Option<LoadSettingValue> {
-    match id.as_str() {
-        PROFILE_TEMPERATURE => profile
-            .generation
-            .defaults
-            .temperature
-            .map(LoadSettingValue::Float),
-        PROFILE_TOP_P => profile
-            .generation
-            .defaults
-            .top_p
-            .map(LoadSettingValue::Float),
-        PROFILE_TOP_K => profile
-            .generation
-            .defaults
-            .top_k
-            .map(LoadSettingValue::UnsignedInteger),
-        PROFILE_MIN_P => profile
-            .generation
-            .defaults
-            .min_p
-            .map(LoadSettingValue::Float),
-        PROFILE_REASONING_EFFORT => profile
-            .generation
-            .defaults
-            .reasoning_effort
-            .clone()
-            .map(LoadSettingValue::String),
-        PROFILE_THINKING_DEFAULT => Some(LoadSettingValue::Toggle(
-            profile.generation.thinking.default,
-        )),
-        PROFILE_THINKING_REQUIRED => Some(LoadSettingValue::Toggle(
-            profile.generation.thinking.required,
-        )),
-        PROFILE_ALLOWED_OVERRIDES => Some(LoadSettingValue::String(
-            profile.generation.allowed_user_overrides.join(", "),
-        )),
-        PROFILE_PROMPT_MODE => Some(LoadSettingValue::Choice(
-            match profile.prompt.mode {
-                PromptMode::RuntimeDefault => "runtime_default",
-                PromptMode::ExternalTemplate => "external_template",
-            }
-            .to_owned(),
-        )),
-        PROFILE_EXTERNAL_TEMPLATE => profile.prompt.template.as_ref().map(|template| {
-            LoadSettingValue::String(format!(
-                "{} | {} | {}",
-                template.identity,
-                template.path.display(),
-                template.sha256
-            ))
-        }),
-        PROFILE_RENDER_GENERATION_PROMPT => Some(LoadSettingValue::Toggle(
-            profile.prompt.render_generation_prompt,
-        )),
-        PROFILE_TEMPLATE_THINKING => {
-            Some(LoadSettingValue::Toggle(profile.prompt.thinking_enabled))
-        }
-        PROFILE_RESPONSE_FILTER => Some(LoadSettingValue::Choice(
-            match profile.prompt.response_filter {
-                ResponseFilter::None => "none",
-                ResponseFilter::DirkSharpReasoning => "dirk_sharp_reasoning",
-            }
-            .to_owned(),
-        )),
-        _ => None,
-    }
-}
-
-pub(crate) fn apply_serve_profile_editor_value(
-    profile: &mut ServeProfile,
-    id: &LoadSettingId,
-    value: Option<LoadSettingValue>,
-) -> Result<(), LoadSettingsError> {
-    if profile.read_only || profile.source != ServeProfileSource::UserLocal {
-        return Err(LoadSettingsError::InvalidServeProfile(format!(
-            "Builder Serve Profile `{}` is read-only; fork it before editing",
-            profile.id
-        )));
-    }
-    let invalid = |message: &str| {
-        LoadSettingsError::InvalidServeProfile(format!("Serve Profile field `{id}` {message}"))
-    };
-    match (id.as_str(), value) {
-        (PROFILE_TEMPERATURE, Some(LoadSettingValue::Float(value))) => {
-            profile.generation.defaults.temperature = Some(value);
-        }
-        (PROFILE_TOP_P, Some(LoadSettingValue::Float(value))) => {
-            profile.generation.defaults.top_p = Some(value);
-        }
-        (PROFILE_TOP_K, Some(LoadSettingValue::UnsignedInteger(value))) => {
-            profile.generation.defaults.top_k = Some(value);
-        }
-        (PROFILE_MIN_P, Some(LoadSettingValue::Float(value))) => {
-            profile.generation.defaults.min_p = Some(value);
-        }
-        (PROFILE_REASONING_EFFORT, Some(LoadSettingValue::String(value))) => {
-            profile.generation.defaults.reasoning_effort = Some(value);
-        }
-        (PROFILE_THINKING_DEFAULT, Some(LoadSettingValue::Toggle(value))) => {
-            profile.generation.thinking.default = value;
-        }
-        (PROFILE_THINKING_REQUIRED, Some(LoadSettingValue::Toggle(value))) => {
-            profile.generation.thinking.required = value;
-        }
-        (PROFILE_ALLOWED_OVERRIDES, Some(LoadSettingValue::String(value))) => {
-            profile.generation.allowed_user_overrides = value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-        }
-        (PROFILE_PROMPT_MODE, Some(LoadSettingValue::Choice(mode))) => match mode.as_str() {
-            "runtime_default" => profile.prompt = ServePromptProfile::default(),
-            "external_template" if profile.prompt.template.is_some() => {
-                profile.prompt.mode = PromptMode::ExternalTemplate;
-                profile.prompt.delivery = PromptDelivery::RawCompletions;
-            }
-            "external_template" => {
-                return Err(invalid(
-                    "needs an external template; edit the `External template` row first",
-                ));
-            }
-            _ => return Err(invalid("has an unknown prompt mode")),
-        },
-        (PROFILE_EXTERNAL_TEMPLATE, Some(LoadSettingValue::String(value))) => {
-            let mut fields = value.splitn(3, '|').map(str::trim);
-            let identity = fields.next().unwrap_or_default();
-            let path = fields.next().unwrap_or_default();
-            let sha256 = fields.next().unwrap_or_default();
-            if identity.is_empty() || path.is_empty() || sha256.is_empty() {
-                return Err(invalid("requires `identity | path | sha256`"));
-            }
-            let path = std::fs::canonicalize(path).map_err(|error| {
-                invalid(&format!(
-                    "could not resolve template path `{path}`: {error}"
-                ))
-            })?;
-            profile.prompt.mode = PromptMode::ExternalTemplate;
-            profile.prompt.delivery = PromptDelivery::RawCompletions;
-            profile.prompt.template = Some(ExternalTemplateReference {
-                identity: identity.to_owned(),
-                path,
-                sha256: sha256.to_owned(),
-            });
-        }
-        (PROFILE_RENDER_GENERATION_PROMPT, Some(LoadSettingValue::Toggle(value))) => {
-            profile.prompt.render_generation_prompt = value;
-        }
-        (PROFILE_TEMPLATE_THINKING, Some(LoadSettingValue::Toggle(value))) => {
-            profile.prompt.thinking_enabled = value;
-        }
-        (PROFILE_RESPONSE_FILTER, Some(LoadSettingValue::Choice(filter))) => {
-            profile.prompt.response_filter = match filter.as_str() {
-                "none" => ResponseFilter::None,
-                "dirk_sharp_reasoning" => ResponseFilter::DirkSharpReasoning,
-                _ => return Err(invalid("has an unknown response filter")),
-            };
-        }
-        (PROFILE_TEMPERATURE, None) => profile.generation.defaults.temperature = None,
-        (PROFILE_TOP_P, None) => profile.generation.defaults.top_p = None,
-        (PROFILE_TOP_K, None) => profile.generation.defaults.top_k = None,
-        (PROFILE_MIN_P, None) => profile.generation.defaults.min_p = None,
-        (PROFILE_REASONING_EFFORT, None) => profile.generation.defaults.reasoning_effort = None,
-        (PROFILE_THINKING_DEFAULT, None) => profile.generation.thinking.default = false,
-        (PROFILE_THINKING_REQUIRED, None) => profile.generation.thinking.required = false,
-        (PROFILE_ALLOWED_OVERRIDES, None) => {
-            profile.generation.allowed_user_overrides.clear();
-        }
-        (PROFILE_PROMPT_MODE | PROFILE_EXTERNAL_TEMPLATE, None) => {
-            profile.prompt = ServePromptProfile::default();
-        }
-        (PROFILE_RENDER_GENERATION_PROMPT, None) => {
-            profile.prompt.render_generation_prompt = false;
-        }
-        (PROFILE_TEMPLATE_THINKING, None) => profile.prompt.thinking_enabled = false,
-        (PROFILE_RESPONSE_FILTER, None) => profile.prompt.response_filter = ResponseFilter::None,
-        _ => return Err(invalid("received a value of the wrong type")),
-    }
-    profile
-        .validate()
-        .map_err(LoadSettingsError::InvalidServeProfile)
-}
-
-fn byte_index(value: &str, char_index: usize) -> usize {
+fn byte_index(value: &str, character_index: usize) -> usize {
     value
         .char_indices()
-        .nth(char_index)
-        .map(|(index, _)| index)
-        .unwrap_or(value.len())
+        .nth(character_index)
+        .map_or(value.len(), |(index, _)| index)
 }
 
 #[cfg(test)]
 mod tests {
     use norted_core::{
-        AppSnapshot, EffectivePublicAuthMode, PublicAuthMode, PublicAuthStatus, RegistryState,
-        ServeProfile, ServeProfileSource, ServerState,
-    };
-    use norted_engine::{
-        BackendLifecycle, BackendLoadPhase, BackendLoadProgress, BackendStatus, ControlStatus,
-        RuntimeNotice, RuntimeNoticeLevel,
+        AppSnapshot, EffectivePublicAuthMode, EngineId, ModelId, ModelProfile, ModelProfileId,
+        ModelProfilesState, PublicAuthMode, PublicAuthStatus, RegistryState, ServerState,
+        SettingCategory, SettingDefinition, SettingId, SettingKind, SettingScope, SettingsSchema,
     };
 
-    use super::{
-        App, PROFILE_ALLOWED_OVERRIDES, PROFILE_EXTERNAL_TEMPLATE, PROFILE_MIN_P,
-        PROFILE_PROMPT_MODE, PROFILE_REASONING_EFFORT, PROFILE_RENDER_GENERATION_PROMPT,
-        PROFILE_RESPONSE_FILTER, PROFILE_TEMPERATURE, PROFILE_TEMPLATE_THINKING,
-        PROFILE_THINKING_DEFAULT, PROFILE_THINKING_REQUIRED, PROFILE_TOP_K, PROFILE_TOP_P,
-        apply_serve_profile_editor_value, serve_profile_editor_definitions,
-    };
+    use super::{App, Screen, SettingsScope};
 
-    fn test_app() -> App {
+    fn definition(id: &str, scope: SettingScope) -> SettingDefinition {
+        SettingDefinition {
+            id: SettingId::new(id).expect("setting ID"),
+            label: id.to_owned(),
+            description: id.to_owned(),
+            kind: SettingKind::Toggle,
+            scope,
+            category: SettingCategory::General,
+            supported: true,
+            unsupported_reason: None,
+            unit: None,
+            upstream_default: None,
+        }
+    }
+
+    fn test_app(definitions: Vec<SettingDefinition>) -> App {
         App::new(
             AppSnapshot {
                 server: ServerState::Stopped,
@@ -3588,343 +3147,85 @@ mod tests {
             },
             true,
             true,
-            Vec::new(),
+            definitions,
         )
     }
 
-    fn status(generation: u64, lifecycle: BackendLifecycle) -> ControlStatus {
-        ControlStatus {
-            public_endpoint: Some("http://127.0.0.1:8080".to_owned()),
-            available_engine_count: 1,
-            installed_engine_count: 1,
-            running_engine_count: usize::from(lifecycle == BackendLifecycle::Running),
-            engines: Vec::new(),
-            backend: BackendStatus {
-                generation,
-                lifecycle,
-                model_id: None,
-                engine_id: None,
-                runtime_id: None,
-                runtime_version: None,
-                runtime_variant: None,
-                runtime_executable_sha256: None,
-                process_id: None,
-                private_endpoint: None,
-                load_progress: None,
-                failure: None,
-                provenance: None,
-            },
-            recent_events: Vec::new(),
-        }
+    #[test]
+    fn settings_has_only_global_and_engine_default_scopes() {
+        let app = test_app(vec![
+            definition("temperature", SettingScope::Common),
+            definition(
+                "q27.mtp",
+                SettingScope::Engine {
+                    engine_id: "q27".to_owned(),
+                },
+            ),
+            definition(
+                "ninfer.speculation",
+                SettingScope::Engine {
+                    engine_id: "ninfer".to_owned(),
+                },
+            ),
+        ]);
+        assert_eq!(
+            app.settings_scopes(),
+            vec![
+                SettingsScope::Global,
+                SettingsScope::Engine("ninfer".to_owned()),
+                SettingsScope::Engine("q27".to_owned()),
+            ]
+        );
     }
 
     #[test]
-    fn mutable_profile_editor_covers_common_fields_and_rejects_builder_mutation() {
-        let definitions = serve_profile_editor_definitions();
-        let ids = definitions
-            .iter()
-            .map(|definition| definition.id.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        for expected in [
-            PROFILE_TEMPERATURE,
-            PROFILE_TOP_P,
-            PROFILE_TOP_K,
-            PROFILE_MIN_P,
-            PROFILE_REASONING_EFFORT,
-            PROFILE_THINKING_DEFAULT,
-            PROFILE_THINKING_REQUIRED,
-            PROFILE_ALLOWED_OVERRIDES,
-            PROFILE_PROMPT_MODE,
-            PROFILE_EXTERNAL_TEMPLATE,
-            PROFILE_RENDER_GENERATION_PROMPT,
-            PROFILE_TEMPLATE_THINKING,
-            PROFILE_RESPONSE_FILTER,
-        ] {
-            assert!(ids.contains(expected), "missing editor row {expected}");
-        }
-
-        let mut profile = ServeProfile::local("editable");
-        let set = |profile: &mut ServeProfile, id: &str, value: norted_core::LoadSettingValue| {
-            apply_serve_profile_editor_value(
-                profile,
-                &norted_core::LoadSettingId::new(id).unwrap(),
-                Some(value),
-            )
-            .unwrap();
-        };
-        set(
-            &mut profile,
-            PROFILE_TEMPERATURE,
-            norted_core::LoadSettingValue::Float(0.7),
-        );
-        set(
-            &mut profile,
-            PROFILE_TOP_P,
-            norted_core::LoadSettingValue::Float(0.9),
-        );
-        set(
-            &mut profile,
-            PROFILE_TOP_K,
-            norted_core::LoadSettingValue::UnsignedInteger(32),
-        );
-        set(
-            &mut profile,
-            PROFILE_MIN_P,
-            norted_core::LoadSettingValue::Float(0.05),
-        );
-        set(
-            &mut profile,
-            PROFILE_REASONING_EFFORT,
-            norted_core::LoadSettingValue::String("high".to_owned()),
-        );
-        set(
-            &mut profile,
-            PROFILE_THINKING_DEFAULT,
-            norted_core::LoadSettingValue::Toggle(true),
-        );
-        set(
-            &mut profile,
-            PROFILE_THINKING_REQUIRED,
-            norted_core::LoadSettingValue::Toggle(true),
-        );
-        set(
-            &mut profile,
-            PROFILE_ALLOWED_OVERRIDES,
-            norted_core::LoadSettingValue::String("top_p, temperature, top_p".to_owned()),
-        );
-        let template = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
-        set(
-            &mut profile,
-            PROFILE_EXTERNAL_TEMPLATE,
-            norted_core::LoadSettingValue::String(format!(
-                "sharp-test | {} | {}",
-                template.display(),
-                "a".repeat(64)
-            )),
-        );
-        set(
-            &mut profile,
-            PROFILE_RENDER_GENERATION_PROMPT,
-            norted_core::LoadSettingValue::Toggle(true),
-        );
-        set(
-            &mut profile,
-            PROFILE_TEMPLATE_THINKING,
-            norted_core::LoadSettingValue::Toggle(true),
-        );
-        set(
-            &mut profile,
-            PROFILE_RESPONSE_FILTER,
-            norted_core::LoadSettingValue::Choice("dirk_sharp_reasoning".to_owned()),
-        );
-
-        assert_eq!(profile.generation.defaults.temperature, Some(0.7));
-        assert_eq!(profile.generation.defaults.top_p, Some(0.9));
-        assert_eq!(profile.generation.defaults.top_k, Some(32));
-        assert_eq!(profile.generation.defaults.min_p, Some(0.05));
-        assert_eq!(
-            profile.generation.defaults.reasoning_effort.as_deref(),
-            Some("high")
-        );
-        assert!(profile.generation.thinking.default);
-        assert!(profile.generation.thinking.required);
-        assert_eq!(
-            profile.generation.allowed_user_overrides,
-            vec!["temperature".to_owned(), "top_p".to_owned()]
-        );
-        assert_eq!(
-            profile.prompt.mode,
-            norted_core::PromptMode::ExternalTemplate
-        );
-        assert_eq!(
-            profile.prompt.delivery,
-            norted_core::PromptDelivery::RawCompletions
-        );
-        assert_eq!(
-            profile
-                .prompt
-                .template
-                .as_ref()
-                .map(|template| template.identity.as_str()),
-            Some("sharp-test")
-        );
-        assert!(profile.prompt.render_generation_prompt);
-        assert!(profile.prompt.thinking_enabled);
-        assert_eq!(
-            profile.prompt.response_filter,
-            norted_core::ResponseFilter::DirkSharpReasoning
-        );
-
-        set(
-            &mut profile,
-            PROFILE_PROMPT_MODE,
-            norted_core::LoadSettingValue::Choice("runtime_default".to_owned()),
-        );
-        assert_eq!(profile.prompt, norted_core::ServePromptProfile::default());
-
-        let mut builder = profile;
-        builder.source = ServeProfileSource::BuilderRecommended;
-        builder.read_only = true;
-        let error = apply_serve_profile_editor_value(
-            &mut builder,
-            &norted_core::LoadSettingId::new(PROFILE_TEMPERATURE).unwrap(),
-            Some(norted_core::LoadSettingValue::Float(0.1)),
+    fn model_profile_editor_shows_common_and_bound_engine_only() {
+        let definitions = vec![
+            definition("temperature", SettingScope::Common),
+            definition(
+                "q27.mtp",
+                SettingScope::Engine {
+                    engine_id: "q27".to_owned(),
+                },
+            ),
+            definition(
+                "ninfer.speculation",
+                SettingScope::Engine {
+                    engine_id: "ninfer".to_owned(),
+                },
+            ),
+            definition(
+                "llama.cpp.flash_attention",
+                SettingScope::Engine {
+                    engine_id: "llama.cpp".to_owned(),
+                },
+            ),
+        ];
+        let mut app = test_app(definitions.clone());
+        let id = ModelProfileId::new("quality").expect("profile ID");
+        let profile = ModelProfile::new(
+            id.clone(),
+            "Quality",
+            ModelId("artifact".to_owned()),
+            EngineId::new("q27").expect("engine ID"),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("read-only"));
-        assert_eq!(builder.generation.defaults.temperature, Some(0.7));
-    }
-
-    fn lifecycle(app: &App) -> BackendLifecycle {
-        app.control.as_ref().unwrap().backend.lifecycle
-    }
-
-    #[test]
-    fn loading_to_running_reports_success() {
-        let mut app = test_app();
-        app.handle_control_result(Ok(status(7, BackendLifecycle::Loading)));
-        assert_eq!(app.notice.as_deref(), Some("Model load started"));
-
-        app.replace_control(Some(status(7, BackendLifecycle::Running)), None);
-
-        assert_eq!(lifecycle(&app), BackendLifecycle::Running);
-        assert_eq!(app.notice.as_deref(), Some("Model loaded"));
-    }
-
-    #[test]
-    fn loading_to_failed_surfaces_exact_backend_failure() {
-        let mut app = test_app();
-        app.handle_control_result(Ok(status(8, BackendLifecycle::Loading)));
-        let mut failed = status(8, BackendLifecycle::Failed);
-        failed.backend.failure = Some("q27 rejected tensor metadata at offset 42".to_owned());
-
-        app.replace_control(Some(failed), None);
-
-        assert_eq!(lifecycle(&app), BackendLifecycle::Failed);
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("q27 rejected tensor metadata at offset 42")
-        );
-    }
-
-    #[test]
-    fn stale_loading_admission_cannot_regress_failed_status_or_notice() {
-        let mut app = test_app();
-        let mut failed = status(9, BackendLifecycle::Failed);
-        failed.backend.failure = Some("runtime exited before readiness probe".to_owned());
-        app.replace_control(Some(failed), None);
-
-        app.handle_control_result(Ok(status(9, BackendLifecycle::Loading)));
-
-        assert_eq!(lifecycle(&app), BackendLifecycle::Failed);
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("runtime exited before readiness probe")
-        );
-    }
-
-    #[test]
-    fn stale_loading_admission_cannot_regress_running_status() {
-        let mut app = test_app();
-        app.replace_control(Some(status(10, BackendLifecycle::Running)), None);
-
-        app.handle_control_result(Ok(status(10, BackendLifecycle::Loading)));
-
-        assert_eq!(lifecycle(&app), BackendLifecycle::Running);
-    }
-
-    #[test]
-    fn lower_generation_status_cannot_replace_newer_status() {
-        let mut app = test_app();
-        app.replace_control(Some(status(12, BackendLifecycle::Running)), None);
-
-        app.replace_control(Some(status(11, BackendLifecycle::Stopped)), None);
-
-        assert_eq!(
-            app.control.as_ref().unwrap().backend.generation,
-            12,
-            "the newer generation must remain displayed"
-        );
-        assert_eq!(lifecycle(&app), BackendLifecycle::Running);
-    }
-
-    #[test]
-    fn same_generation_loading_status_refreshes_progress_fields() {
-        let mut app = test_app();
-        let mut initial = status(13, BackendLifecycle::Loading);
-        initial.backend.load_progress = Some(BackendLoadProgress::with_message(
-            BackendLoadPhase::PreparingModel,
-            "Preparing model input",
-        ));
-        app.replace_control(Some(initial), None);
-
-        let mut refreshed = status(13, BackendLifecycle::Loading);
-        refreshed.backend.engine_id = Some("q27".to_owned());
-        refreshed.backend.load_progress = Some(BackendLoadProgress::with_message(
-            BackendLoadPhase::PreparingLaunch,
-            "Revalidating package before launch",
-        ));
-        app.replace_control(Some(refreshed), None);
-
-        let backend = &app.control.as_ref().unwrap().backend;
-        assert_eq!(backend.engine_id.as_deref(), Some("q27"));
-        assert_eq!(
-            backend
-                .load_progress
-                .as_ref()
-                .and_then(|progress| progress.message.as_deref()),
-            Some("Revalidating package before launch")
-        );
-    }
-
-    #[test]
-    fn running_to_failed_is_accepted_and_surfaces_failure() {
-        let mut app = test_app();
-        app.replace_control(Some(status(14, BackendLifecycle::Running)), None);
-        let mut failed = status(14, BackendLifecycle::Failed);
-        failed.backend.failure = Some("backend process exited with status 137".to_owned());
-
-        app.replace_control(Some(failed), None);
-
-        assert_eq!(lifecycle(&app), BackendLifecycle::Failed);
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("backend process exited with status 137")
-        );
-    }
-
-    #[test]
-    fn repeated_failed_observation_restores_failure_without_a_new_runtime_event() {
-        let mut app = test_app();
-        app.replace_control(Some(status(15, BackendLifecycle::Loading)), None);
-        let failure = "runtime health check failed: connection refused";
-        let mut failed = status(15, BackendLifecycle::Failed);
-        failed.backend.failure = Some(failure.to_owned());
-        failed.recent_events.push(RuntimeNotice {
-            timestamp_unix: 123,
-            level: RuntimeNoticeLevel::Error,
-            message: failure.to_owned(),
+        .expect("profile");
+        let mut state = ModelProfilesState::default();
+        state.profiles.insert(id, profile);
+        app.model_profiles = Some(state);
+        app.selected_model_profile = Some(0);
+        app.screen = Screen::ModelProfiles;
+        app.settings_schema = Some(SettingsSchema {
+            engine_id: "q27".to_owned(),
+            runtime_id: None,
+            definitions,
         });
-        app.replace_control(Some(failed.clone()), None);
-        assert_eq!(app.notice.as_deref(), Some(failure));
 
-        app.notice = Some("Model load started".to_owned());
-        app.replace_control(Some(failed), None);
-
-        assert_eq!(app.notice.as_deref(), Some(failure));
-    }
-
-    #[test]
-    fn loading_admission_for_newer_generation_is_accepted() {
-        let mut app = test_app();
-        let mut failed = status(20, BackendLifecycle::Failed);
-        failed.backend.failure = Some("previous load failed".to_owned());
-        app.replace_control(Some(failed), None);
-
-        app.handle_control_result(Ok(status(21, BackendLifecycle::Loading)));
-
-        assert_eq!(app.control.as_ref().unwrap().backend.generation, 21);
-        assert_eq!(lifecycle(&app), BackendLifecycle::Loading);
-        assert_eq!(app.notice.as_deref(), Some("Model load started"));
+        let ids = app
+            .settings_definitions()
+            .into_iter()
+            .map(|definition| definition.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["temperature", "q27.mtp"]);
     }
 }

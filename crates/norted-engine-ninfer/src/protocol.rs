@@ -15,7 +15,7 @@ const PRIVATE_BODY_LIMIT: usize = 32 * 1024 * 1024;
 
 pub(crate) fn backend_request(request: &InferenceRequest, streaming: bool) -> Value {
     let mut body = json!({
-        "model": request.model_id.0,
+        "model": request.model_profile_id.as_str(),
         "messages": request.messages.iter().map(message_json).collect::<Vec<_>>(),
         "stream": streaming,
     });
@@ -395,13 +395,13 @@ mod tests {
     use std::task::{Context, Poll};
 
     use futures_util::StreamExt;
-    use norted_core::ModelId;
+    use norted_core::ModelProfileId;
 
     use super::*;
 
     fn request() -> InferenceRequest {
         InferenceRequest {
-            model_id: ModelId("model".to_owned()),
+            model_profile_id: ModelProfileId::new("model").expect("profile ID"),
             messages: vec![
                 InferenceMessage {
                     role: InferenceRole::Developer,

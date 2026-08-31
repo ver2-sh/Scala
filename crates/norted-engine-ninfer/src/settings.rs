@@ -1,22 +1,21 @@
 use std::ffi::OsString;
 
 use norted_core::{
-    ArtifactNativeIdentity, LoadSettingDefinition, LoadSettingId, LoadSettingKind,
-    LoadSettingScope, LoadSettingValue, ModelArtifact, ResolvedLoadSettings, ServeProfile,
-    UnsignedIntegerOrChoiceValue,
+    ArtifactNativeIdentity, ModelArtifact, ResolvedSettings, SettingCategory, SettingDefinition,
+    SettingId, SettingKind, SettingScope, SettingValue, UnsignedIntegerOrChoiceValue,
 };
-use norted_engine::{EngineError, common_load_setting_definitions};
+use norted_engine::{EngineError, common_setting_definitions};
 
 const MAX_NINFER_CLI_INTEGER: u64 = i32::MAX as u64;
 
-pub(crate) fn definitions() -> Vec<LoadSettingDefinition> {
-    let mut definitions = common_load_setting_definitions();
+pub(crate) fn definitions() -> Vec<SettingDefinition> {
+    let mut definitions = common_setting_definitions();
     definitions.extend([
         definition(
             "ninfer.kv_dtype",
             "KV dtype",
             "NInfer KV cache storage type",
-            LoadSettingKind::Choice {
+            SettingKind::Choice {
                 choices: choices(&["bf16", "int8", "fp8"]),
             },
             Some("exact runtime default"),
@@ -25,7 +24,7 @@ pub(crate) fn definitions() -> Vec<LoadSettingDefinition> {
             "ninfer.kv_capacity",
             "KV capacity",
             "Shared KV token capacity or NInfer automatic sizing",
-            LoadSettingKind::UnsignedIntegerOrChoice {
+            SettingKind::UnsignedIntegerOrChoice {
                 minimum: Some(1),
                 maximum: Some(MAX_NINFER_CLI_INTEGER),
                 choices: choices(&["auto"]),
@@ -36,61 +35,59 @@ pub(crate) fn definitions() -> Vec<LoadSettingDefinition> {
             "ninfer.prefill_chunk",
             "Prefill chunk",
             "Prefill chunk size; must be a positive multiple of 128",
-            LoadSettingKind::UnsignedInteger {
+            SettingKind::UnsignedInteger {
                 minimum: Some(128),
                 maximum: Some(MAX_NINFER_CLI_INTEGER),
             },
             Some("exact runtime default"),
         ),
         definition(
+            "ninfer.speculation",
+            "Speculation",
+            "Enable or disable speculative decoding",
+            SettingKind::Toggle,
+            Some("runtime default/off when omitted"),
+        ),
+        definition(
             "ninfer.speculative_backend",
             "Speculative backend",
             "Explicit NInfer speculative backend; unset keeps speculation off/default",
-            LoadSettingKind::Choice {
+            SettingKind::Choice {
                 choices: choices(&["mtp", "dflash"]),
             },
             Some("off when omitted"),
         ),
         definition(
-            "ninfer.speculative_profile",
-            "Serve Profile strategy",
-            "Select a speculative strategy declared by the active NInfer Serve Profile",
-            LoadSettingKind::Choice {
-                choices: Vec::new(),
-            },
-            None,
-        ),
-        definition(
             "ninfer.draft_tokens",
             "Draft tokens",
             "Speculative draft-token window",
-            LoadSettingKind::UnsignedInteger {
+            SettingKind::UnsignedInteger {
                 minimum: Some(1),
                 maximum: Some(15),
             },
             Some("requires an explicit speculative backend"),
         ),
-        flag(
+        toggle(
             "ninfer.lm_head_draft",
             "LM-head draft",
             "Use NInfer's optimized proposal head with an explicit speculative backend",
         ),
-        flag(
-            "ninfer.no_cuda_graph",
-            "Disable CUDA Graph",
-            "Disable NInfer CUDA Graph execution",
+        toggle(
+            "ninfer.cuda_graph",
+            "CUDA Graph",
+            "Enable or disable NInfer CUDA Graph execution",
         ),
-        flag(
-            "ninfer.no_prefix_reuse",
-            "Disable prefix reuse",
-            "Disable NInfer prefix and continuation caching",
+        toggle(
+            "ninfer.prefix_reuse",
+            "Prefix reuse",
+            "Enable or disable NInfer prefix and continuation caching",
         ),
-        flag(
-            "ninfer.no_thinking",
-            "Disable thinking",
-            "Disable the model's default thinking mode",
+        toggle(
+            "ninfer.thinking",
+            "Thinking",
+            "Enable or disable NInfer thinking",
         ),
-        flag(
+        toggle(
             "ninfer.preserve_thinking",
             "Preserve thinking",
             "Retain closed-turn assistant reasoning in NInfer's private prompt history",
@@ -148,41 +145,12 @@ pub(crate) fn definitions() -> Vec<LoadSettingDefinition> {
     definitions
 }
 
-pub(crate) fn apply_speculative_profile_schema(
-    definitions: &mut [LoadSettingDefinition],
-    serve_profile: Option<&ServeProfile>,
-) {
-    let Some(definition) = definitions
-        .iter_mut()
-        .find(|definition| definition.id.as_str() == "ninfer.speculative_profile")
-    else {
-        return;
-    };
-    let Some(strategy) = serve_profile.and_then(|profile| profile.engine.ninfer.as_ref()) else {
-        definition.supported = false;
-        definition.unsupported_reason = Some(
-            "speculative strategy selection requires a selected NInfer Serve Profile".to_owned(),
-        );
-        definition.recommendation = None;
-        return;
-    };
-    definition.kind = LoadSettingKind::Choice {
-        choices: strategy.speculative_profiles.keys().cloned().collect(),
-    };
-    definition.supported = true;
-    definition.unsupported_reason = None;
-    definition.recommendation = Some(format!(
-        "selected Serve Profile default: {}",
-        strategy.default_speculative_profile
-    ));
-}
-
-pub(crate) fn apply_runtime_bounds(definitions: &mut [LoadSettingDefinition]) {
+pub(crate) fn apply_runtime_bounds(definitions: &mut [SettingDefinition]) {
     if let Some(context) = definitions
         .iter_mut()
         .find(|definition| definition.id.as_str() == "context_length")
     {
-        context.kind = LoadSettingKind::UnsignedInteger {
+        context.kind = SettingKind::UnsignedInteger {
             minimum: Some(1),
             maximum: Some(MAX_NINFER_CLI_INTEGER),
         };
@@ -191,7 +159,7 @@ pub(crate) fn apply_runtime_bounds(definitions: &mut [LoadSettingDefinition]) {
         .iter_mut()
         .find(|definition| definition.id.as_str() == "parallel_requests")
     {
-        parallel.kind = LoadSettingKind::UnsignedInteger {
+        parallel.kind = SettingKind::UnsignedInteger {
             minimum: Some(1),
             maximum: Some(8),
         };
@@ -208,33 +176,47 @@ fn definition(
     id: &str,
     label: &str,
     description: &str,
-    kind: LoadSettingKind,
+    kind: SettingKind,
     upstream_default: Option<&str>,
-) -> LoadSettingDefinition {
-    LoadSettingDefinition {
-        id: LoadSettingId::new(id).expect("static NInfer setting ID"),
+) -> SettingDefinition {
+    SettingDefinition {
+        id: SettingId::new(id).expect("static NInfer setting ID"),
         label: label.to_owned(),
         description: description.to_owned(),
         kind,
-        scope: LoadSettingScope::Engine {
+        scope: SettingScope::Engine {
             engine_id: crate::ENGINE_ID.to_owned(),
         },
+        category: category(id),
         supported: true,
         unsupported_reason: None,
         unit: None,
         upstream_default: upstream_default.map(str::to_owned),
-        recommendation: None,
     }
 }
 
-fn flag(id: &str, label: &str, description: &str) -> LoadSettingDefinition {
+fn toggle(id: &str, label: &str, description: &str) -> SettingDefinition {
     definition(
         id,
         label,
         description,
-        LoadSettingKind::OneWayFlag,
-        Some("disabled/unchanged when omitted"),
+        SettingKind::Toggle,
+        Some("runtime default when omitted"),
     )
+}
+
+fn category(id: &str) -> SettingCategory {
+    if matches!(id, "ninfer.thinking" | "ninfer.preserve_thinking") {
+        SettingCategory::Reasoning
+    } else if id.contains("specul") || id.contains("draft") {
+        SettingCategory::Speculation
+    } else if id.contains("kv_") || id == "ninfer.cuda_graph" {
+        SettingCategory::KvMemory
+    } else if id.contains("prefix") || id.contains("continuation") || id.contains("cache") {
+        SettingCategory::Cache
+    } else {
+        SettingCategory::Advanced
+    }
 }
 
 fn unsigned(
@@ -243,12 +225,12 @@ fn unsigned(
     description: &str,
     minimum: u64,
     maximum: Option<u64>,
-) -> LoadSettingDefinition {
+) -> SettingDefinition {
     definition(
         id,
         label,
         description,
-        LoadSettingKind::UnsignedInteger {
+        SettingKind::UnsignedInteger {
             minimum: Some(minimum),
             maximum,
         },
@@ -260,16 +242,21 @@ pub(crate) fn option_for_setting(id: &str) -> &'static str {
     match id {
         "context_length" => "--max-context",
         "parallel_requests" => "--max-concurrency",
+        "temperature" => "--temperature",
+        "top_p" => "--top-p",
+        "top_k" => "--top-k",
+        "min_p" => "--min-p",
+        "reasoning_effort" => "",
         "ninfer.kv_dtype" => "--kv-dtype",
         "ninfer.kv_capacity" => "--kv-capacity",
         "ninfer.prefill_chunk" => "--prefill-chunk",
+        "ninfer.speculation" => "",
         "ninfer.speculative_backend" => "--spec",
-        "ninfer.speculative_profile" => "",
         "ninfer.draft_tokens" => "--draft-tokens",
         "ninfer.lm_head_draft" => "--lm-head-draft",
-        "ninfer.no_cuda_graph" => "--no-cuda-graph",
-        "ninfer.no_prefix_reuse" => "--no-prefix-reuse",
-        "ninfer.no_thinking" => "--no-thinking",
+        "ninfer.cuda_graph" => "--no-cuda-graph",
+        "ninfer.prefix_reuse" => "--no-prefix-reuse",
+        "ninfer.thinking" => "--no-thinking",
         "ninfer.preserve_thinking" => "--preserve-thinking",
         "ninfer.device_state_slots" => "--device-state-slots",
         "ninfer.host_state_slots" => "--host-state-slots",
@@ -283,18 +270,18 @@ pub(crate) fn option_for_setting(id: &str) -> &'static str {
 }
 
 pub(crate) fn translate(
-    settings: &ResolvedLoadSettings,
+    settings: &ResolvedSettings,
     model: &ModelArtifact,
     native_arguments: &[String],
 ) -> Result<Vec<OsString>, EngineError> {
     for id in settings.effective.keys() {
-        if id.as_str() == "ninfer.speculative_profile" {
+        if matches!(id.as_str(), "ninfer.speculation" | "reasoning_effort") {
             continue;
         }
         let option = option_for_setting(id.as_str());
         if let Some(argument) = find_native_option(native_arguments, option) {
             return Err(EngineError::InvalidConfiguration(format!(
-                "structured load setting `{id}` conflicts with native NInfer argument `{argument}`"
+                "structured setting `{id}` conflicts with native NInfer argument `{argument}`"
             )));
         }
     }
@@ -313,24 +300,35 @@ pub(crate) fn translate(
         ));
     }
 
+    let speculation = toggle_value(settings, "ninfer.speculation")?;
     let speculative = choice_value(settings, "ninfer.speculative_backend")?;
     let draft_tokens = unsigned_value(settings, "ninfer.draft_tokens")?;
-    let lm_head_draft = flag_value(settings, "ninfer.lm_head_draft")?;
-    match speculative {
-        None if draft_tokens.is_some() || lm_head_draft => {
+    if draft_tokens.is_some() && speculative.is_none() {
+        return Err(EngineError::InvalidConfiguration(
+            "ninfer.draft_tokens requires an explicit speculative backend".to_owned(),
+        ));
+    }
+    let speculation_enabled = speculation.unwrap_or(speculative.is_some());
+    if !speculation_enabled && toggle_value(settings, "ninfer.lm_head_draft")? == Some(true) {
+        return Err(EngineError::InvalidConfiguration(
+            "ninfer.lm_head_draft=on requires speculation and an explicit backend".to_owned(),
+        ));
+    }
+    match (speculation_enabled, speculative) {
+        (false, _) => {}
+        (true, None) => {
             return Err(EngineError::InvalidConfiguration(
-                "ninfer.draft_tokens and ninfer.lm_head_draft require ninfer.speculative_backend"
-                    .to_owned(),
+                "ninfer.speculation=on requires ninfer.speculative_backend".to_owned(),
             ));
         }
-        Some("mtp") => {
+        (true, Some("mtp")) => {
             if draft_tokens.is_none_or(|value| !(1..=5).contains(&value)) {
                 return Err(EngineError::InvalidConfiguration(
                     "NInfer MTP requires ninfer.draft_tokens in 1..=5".to_owned(),
                 ));
             }
         }
-        Some("dflash") => {
+        (true, Some("dflash")) => {
             if draft_tokens.is_none_or(|value| !(1..=15).contains(&value)) {
                 return Err(EngineError::InvalidConfiguration(
                     "NInfer DFlash requires ninfer.draft_tokens in 1..=15".to_owned(),
@@ -349,12 +347,11 @@ pub(crate) fn translate(
                 ));
             }
         }
-        Some(value) => {
+        (true, Some(value)) => {
             return Err(EngineError::InvalidConfiguration(format!(
                 "unsupported NInfer speculative backend `{value}`"
             )));
         }
-        None => {}
     }
     if let Some(prefill) = unsigned_value(settings, "ninfer.prefill_chunk")?
         && prefill % 128 != 0
@@ -372,7 +369,7 @@ pub(crate) fn translate(
             "explicit ninfer.kv_capacity must be at least context_length".to_owned(),
         ));
     }
-    if flag_value(settings, "ninfer.no_prefix_reuse")?
+    if toggle_value(settings, "ninfer.prefix_reuse")? == Some(false)
         && settings.effective.keys().any(|id| {
             matches!(
                 id.as_str(),
@@ -387,32 +384,59 @@ pub(crate) fn translate(
         })
     {
         return Err(EngineError::InvalidConfiguration(
-            "ninfer.no_prefix_reuse cannot be combined with NInfer cache-capacity settings"
+            "ninfer.prefix_reuse=off cannot be combined with NInfer cache-capacity settings"
                 .to_owned(),
         ));
     }
 
     let mut arguments = Vec::new();
     for (id, resolved) in &settings.effective {
-        if id.as_str() == "ninfer.speculative_profile" {
+        if matches!(id.as_str(), "ninfer.speculation" | "reasoning_effort") {
+            continue;
+        }
+        if !speculation_enabled
+            && matches!(
+                id.as_str(),
+                "ninfer.speculative_backend" | "ninfer.draft_tokens" | "ninfer.lm_head_draft"
+            )
+        {
             continue;
         }
         let option = option_for_setting(id.as_str());
         match &resolved.value {
-            LoadSettingValue::FlagEnabled => arguments.push(OsString::from(option)),
-            LoadSettingValue::UnsignedInteger(value) => {
+            SettingValue::FlagEnabled => arguments.push(OsString::from(option)),
+            SettingValue::Toggle(value) => match id.as_str() {
+                "ninfer.cuda_graph" | "ninfer.prefix_reuse" | "ninfer.thinking" if !value => {
+                    arguments.push(OsString::from(option));
+                }
+                "ninfer.lm_head_draft" | "ninfer.preserve_thinking" if *value => {
+                    arguments.push(OsString::from(option));
+                }
+                "ninfer.cuda_graph"
+                | "ninfer.prefix_reuse"
+                | "ninfer.thinking"
+                | "ninfer.lm_head_draft"
+                | "ninfer.preserve_thinking" => {}
+                _ => {
+                    return Err(EngineError::InvalidConfiguration(format!(
+                        "setting `{id}` has an invalid toggle mapping for NInfer"
+                    )));
+                }
+            },
+            SettingValue::UnsignedInteger(value) => {
                 push_value(&mut arguments, option, value);
             }
-            LoadSettingValue::Choice(value) => push_value(&mut arguments, option, value),
-            LoadSettingValue::UnsignedIntegerOrChoice(
+            SettingValue::Float(value) => push_value(&mut arguments, option, value),
+            SettingValue::Choice(value) => push_value(&mut arguments, option, value),
+            SettingValue::UnsignedIntegerOrChoice(
                 UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
             ) => push_value(&mut arguments, option, value),
-            LoadSettingValue::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(
-                value,
-            )) => push_value(&mut arguments, option, value),
+            SettingValue::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(value)) => {
+                push_value(&mut arguments, option, value)
+            }
             _ => {
                 return Err(EngineError::InvalidConfiguration(format!(
-                    "load setting `{id}` has an invalid value for NInfer"
+                    "setting `{id}` has an invalid value for NInfer"
                 )));
             }
         }
@@ -435,53 +459,51 @@ fn find_native_option<'a>(arguments: &'a [String], option: &str) -> Option<&'a s
     })
 }
 
-fn unsigned_value(settings: &ResolvedLoadSettings, id: &str) -> Result<Option<u64>, EngineError> {
+fn unsigned_value(settings: &ResolvedSettings, id: &str) -> Result<Option<u64>, EngineError> {
     match settings.value(id) {
-        Some(LoadSettingValue::UnsignedInteger(value)) => Ok(Some(*value)),
+        Some(SettingValue::UnsignedInteger(value)) => Ok(Some(*value)),
         None => Ok(None),
         Some(_) => Err(EngineError::InvalidConfiguration(format!(
-            "load setting `{id}` must be an unsigned integer"
+            "setting `{id}` must be an unsigned integer"
         ))),
     }
 }
 
 fn unsigned_integer_or_choice_value(
-    settings: &ResolvedLoadSettings,
+    settings: &ResolvedSettings,
     id: &str,
 ) -> Result<Option<u64>, EngineError> {
     match settings.value(id) {
-        Some(LoadSettingValue::UnsignedIntegerOrChoice(
+        Some(SettingValue::UnsignedIntegerOrChoice(
             UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
         )) => Ok(Some(*value)),
-        Some(LoadSettingValue::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(
-            _,
-        )))
+        Some(SettingValue::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(_)))
         | None => Ok(None),
         Some(_) => Err(EngineError::InvalidConfiguration(format!(
-            "load setting `{id}` must be an unsigned integer or choice"
+            "setting `{id}` must be an unsigned integer or choice"
         ))),
     }
 }
 
 fn choice_value<'a>(
-    settings: &'a ResolvedLoadSettings,
+    settings: &'a ResolvedSettings,
     id: &str,
 ) -> Result<Option<&'a str>, EngineError> {
     match settings.value(id) {
-        Some(LoadSettingValue::Choice(value)) => Ok(Some(value)),
+        Some(SettingValue::Choice(value)) => Ok(Some(value)),
         None => Ok(None),
         Some(_) => Err(EngineError::InvalidConfiguration(format!(
-            "load setting `{id}` must be a choice"
+            "setting `{id}` must be a choice"
         ))),
     }
 }
 
-fn flag_value(settings: &ResolvedLoadSettings, id: &str) -> Result<bool, EngineError> {
+fn toggle_value(settings: &ResolvedSettings, id: &str) -> Result<Option<bool>, EngineError> {
     match settings.value(id) {
-        Some(LoadSettingValue::FlagEnabled) => Ok(true),
-        None => Ok(false),
+        Some(SettingValue::Toggle(value)) => Ok(Some(*value)),
+        None => Ok(None),
         Some(_) => Err(EngineError::InvalidConfiguration(format!(
-            "load setting `{id}` must be a one-way flag"
+            "setting `{id}` must be a toggle"
         ))),
     }
 }
@@ -492,8 +514,8 @@ mod tests {
     use std::path::PathBuf;
 
     use norted_core::{
-        ArtifactNativeIdentity, LoadSettingId, LoadSettingSource, ModelId, NinferArtifactIdentity,
-        ResolvedLoadSetting,
+        ArtifactNativeIdentity, ModelId, NinferArtifactIdentity, ResolvedSetting, SettingId,
+        SettingSource,
     };
 
     use super::*;
@@ -520,18 +542,18 @@ mod tests {
         }
     }
 
-    fn settings(values: &[(&str, LoadSettingValue)]) -> ResolvedLoadSettings {
-        ResolvedLoadSettings {
+    fn settings(values: &[(&str, SettingValue)]) -> ResolvedSettings {
+        ResolvedSettings {
             engine_id: crate::ENGINE_ID.to_owned(),
-            selected_profile: None,
+            model_profile_id: None,
             effective: values
                 .iter()
                 .map(|(id, value)| {
                     (
-                        LoadSettingId::new(*id).expect("ID"),
-                        ResolvedLoadSetting {
+                        SettingId::new(*id).expect("ID"),
+                        ResolvedSetting {
                             value: value.clone(),
-                            source: LoadSettingSource::Invocation,
+                            source: SettingSource::Invocation,
                         },
                     )
                 })
@@ -539,7 +561,7 @@ mod tests {
         }
     }
 
-    fn translated(values: &[(&str, LoadSettingValue)], model_id: &str) -> Vec<String> {
+    fn translated(values: &[(&str, SettingValue)], model_id: &str) -> Vec<String> {
         translate(&settings(values), &model(model_id), &[])
             .expect("setting translation")
             .into_iter()
@@ -560,23 +582,17 @@ mod tests {
     fn common_and_typed_ninfer_settings_translate_exactly() {
         let arguments = translated(
             &[
-                ("context_length", LoadSettingValue::UnsignedInteger(32_768)),
-                ("parallel_requests", LoadSettingValue::UnsignedInteger(4)),
-                (
-                    "ninfer.kv_dtype",
-                    LoadSettingValue::Choice("fp8".to_owned()),
-                ),
+                ("context_length", SettingValue::UnsignedInteger(32_768)),
+                ("parallel_requests", SettingValue::UnsignedInteger(4)),
+                ("ninfer.kv_dtype", SettingValue::Choice("fp8".to_owned())),
                 (
                     "ninfer.kv_capacity",
-                    LoadSettingValue::UnsignedIntegerOrChoice(
-                        UnsignedIntegerOrChoiceValue::Choice("auto".to_owned()),
-                    ),
+                    SettingValue::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(
+                        "auto".to_owned(),
+                    )),
                 ),
-                (
-                    "ninfer.prefill_chunk",
-                    LoadSettingValue::UnsignedInteger(256),
-                ),
-                ("ninfer.no_cuda_graph", LoadSettingValue::FlagEnabled),
+                ("ninfer.prefill_chunk", SettingValue::UnsignedInteger(256)),
+                ("ninfer.cuda_graph", SettingValue::Toggle(false)),
             ],
             "qwen3.6-27b",
         );
@@ -600,7 +616,7 @@ mod tests {
     #[test]
     fn advertised_common_definitions_remain_engine_neutral() {
         let definitions = definitions();
-        for common in common_load_setting_definitions() {
+        for common in common_setting_definitions() {
             assert_eq!(
                 definitions
                     .iter()
@@ -620,7 +636,7 @@ mod tests {
             .expect("parallel definition");
         assert!(matches!(
             parallel.kind,
-            LoadSettingKind::UnsignedInteger {
+            SettingKind::UnsignedInteger {
                 minimum: Some(1),
                 maximum: Some(8)
             }
@@ -631,7 +647,7 @@ mod tests {
             .expect("KV capacity definition");
         assert!(matches!(
             &capacity.kind,
-            LoadSettingKind::UnsignedIntegerOrChoice { choices, .. }
+            SettingKind::UnsignedIntegerOrChoice { choices, .. }
                 if choices == &["auto".to_owned()]
         ));
     }
@@ -640,40 +656,40 @@ mod tests {
     fn speculative_cross_validation_is_exact() {
         let missing_draft = settings(&[(
             "ninfer.speculative_backend",
-            LoadSettingValue::Choice("mtp".to_owned()),
+            SettingValue::Choice("mtp".to_owned()),
         )]);
         assert!(translate(&missing_draft, &model("qwen3.6-27b"), &[]).is_err());
 
         let mtp = settings(&[
             (
                 "ninfer.speculative_backend",
-                LoadSettingValue::Choice("mtp".to_owned()),
+                SettingValue::Choice("mtp".to_owned()),
             ),
-            ("ninfer.draft_tokens", LoadSettingValue::UnsignedInteger(6)),
+            ("ninfer.draft_tokens", SettingValue::UnsignedInteger(6)),
         ]);
         assert!(translate(&mtp, &model("qwen3.6-27b"), &[]).is_err());
 
         let dflash = settings(&[
             (
                 "ninfer.speculative_backend",
-                LoadSettingValue::Choice("dflash".to_owned()),
+                SettingValue::Choice("dflash".to_owned()),
             ),
-            ("ninfer.draft_tokens", LoadSettingValue::UnsignedInteger(7)),
+            ("ninfer.draft_tokens", SettingValue::UnsignedInteger(7)),
         ]);
         assert!(translate(&dflash, &model("qwen3.6-27b"), &[]).is_err());
         assert!(translate(&dflash, &model("qwen3.6-35b-a3b"), &[]).is_ok());
 
-        let missing_backend = settings(&[("ninfer.lm_head_draft", LoadSettingValue::FlagEnabled)]);
+        let missing_backend = settings(&[("ninfer.lm_head_draft", SettingValue::Toggle(true))]);
         assert!(translate(&missing_backend, &model("qwen3.6-27b"), &[]).is_err());
 
         let valid_mtp = translated(
             &[
                 (
                     "ninfer.speculative_backend",
-                    LoadSettingValue::Choice("mtp".to_owned()),
+                    SettingValue::Choice("mtp".to_owned()),
                 ),
-                ("ninfer.draft_tokens", LoadSettingValue::UnsignedInteger(5)),
-                ("ninfer.lm_head_draft", LoadSettingValue::FlagEnabled),
+                ("ninfer.draft_tokens", SettingValue::UnsignedInteger(5)),
+                ("ninfer.lm_head_draft", SettingValue::Toggle(true)),
             ],
             "qwen3.6-27b",
         );
@@ -689,10 +705,10 @@ mod tests {
     #[test]
     fn explicit_kv_capacity_must_cover_explicit_context() {
         let undersized = settings(&[
-            ("context_length", LoadSettingValue::UnsignedInteger(8192)),
+            ("context_length", SettingValue::UnsignedInteger(8192)),
             (
                 "ninfer.kv_capacity",
-                LoadSettingValue::UnsignedIntegerOrChoice(
+                SettingValue::UnsignedIntegerOrChoice(
                     UnsignedIntegerOrChoiceValue::UnsignedInteger(4096),
                 ),
             ),
@@ -700,10 +716,10 @@ mod tests {
         assert!(translate(&undersized, &model("qwen3.6-27b"), &[]).is_err());
 
         let automatic = settings(&[
-            ("context_length", LoadSettingValue::UnsignedInteger(8192)),
+            ("context_length", SettingValue::UnsignedInteger(8192)),
             (
                 "ninfer.kv_capacity",
-                LoadSettingValue::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(
+                SettingValue::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(
                     "auto".to_owned(),
                 )),
             ),
@@ -715,7 +731,7 @@ mod tests {
     fn structured_settings_conflict_with_both_native_option_forms() {
         let structured = settings(&[(
             "ninfer.speculative_backend",
-            LoadSettingValue::Choice("mtp".to_owned()),
+            SettingValue::Choice("mtp".to_owned()),
         )]);
         for native in [
             vec!["--spec".to_owned(), "mtp".to_owned()],

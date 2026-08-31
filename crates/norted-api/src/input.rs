@@ -1,4 +1,4 @@
-use norted_core::ModelId;
+use norted_core::ModelProfileId;
 use norted_engine::{
     GenerationSettingsPatch, InferenceMessage, InferenceRequest, InferenceRole, ReasoningEffort,
 };
@@ -16,14 +16,21 @@ pub(crate) struct NormalizedRequest {
 }
 
 impl NormalizedRequest {
-    pub(crate) fn inference_request(&self) -> InferenceRequest {
-        InferenceRequest {
-            model_id: ModelId(self.model.clone()),
+    pub(crate) fn inference_request(&self) -> Result<InferenceRequest, OpenAiError> {
+        let model_profile_id = ModelProfileId::new(self.model.clone()).map_err(|_| {
+            OpenAiError::invalid(
+                "`model` must be a valid Model Profile ID.",
+                Some("model"),
+                "invalid_value",
+            )
+        })?;
+        Ok(InferenceRequest {
+            model_profile_id,
             messages: self.messages.clone(),
             max_output_tokens: self.max_output_tokens,
             generation_settings: self.generation_settings,
             stream: self.stream,
-        }
+        })
     }
 }
 

@@ -13,8 +13,8 @@ use color_eyre::Result;
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
 use norted_core::{
-    ApiKeyStore, AppPaths, ApplicationCore, LoadSettingDefinition, LoadSettingsError,
-    LoadSettingsPatch, PublicAuthStatus, ServeProfilesStore, ServerConfig,
+    ApiKeyStore, AppPaths, ApplicationCore, EngineId, ModelProfilesStore, PublicAuthStatus,
+    ServerConfig, SettingDefinition, SettingId, SettingsError, SettingsPatch, SettingsStore,
 };
 use norted_engine::{
     BackendLifecycle, ControlClient, ControlClientError, ControlStatus, RuntimePackManager,
@@ -22,8 +22,7 @@ use norted_engine::{
 
 use app::{
     App, ControlAction, ModelSettingsInspection, RuntimeAction, RuntimeTaskResult, SettingsAction,
-    SettingsScope, SettingsTaskResult, Update, apply_serve_profile_editor_value,
-    is_serve_profile_editor_field,
+    SettingsScope, SettingsTaskResult, Update,
 };
 use terminal::TerminalSession;
 use ui::layout::UiLayout;
@@ -90,7 +89,7 @@ impl ControlPollState {
 pub async fn run(
     core: Arc<ApplicationCore>,
     runtime_packs: Arc<RuntimePackManager>,
-    load_setting_definitions: Vec<LoadSettingDefinition>,
+    setting_definitions: Vec<SettingDefinition>,
 ) -> Result<()> {
     let mut terminal = TerminalSession::enter()?;
     let mut core_events = core.subscribe();
@@ -101,7 +100,7 @@ pub async fn run(
         initial_auth_status,
         core.config.tui.no_color,
         core.config.tui.unicode,
-        load_setting_definitions,
+        setting_definitions,
     );
     let mut layout = UiLayout::default();
     terminal.draw(|frame| layout = ui::render(frame, &app))?;
@@ -335,218 +334,307 @@ fn spawn_settings_action(
     });
 }
 
+async fn read_tui_settings(
+    settings: &SettingsStore,
+    profiles: &ModelProfilesStore,
+) -> std::result::Result<(norted_core::SettingsState, norted_core::ModelProfilesState), String> {
+    let (settings, profiles) = tokio::join!(settings.read(), profiles.read());
+    Ok((
+        settings.map_err(|error| error.to_string())?,
+        profiles.map_err(|error| error.to_string())?,
+    ))
+}
+
 async fn execute_settings_action(
     runtime_packs: Arc<RuntimePackManager>,
     paths: &AppPaths,
     action: SettingsAction,
 ) -> SettingsTaskResult {
-    let store = ServeProfilesStore::new(paths);
+    let settings_store = SettingsStore::new(paths);
+    let profiles_store = ModelProfilesStore::new(paths);
     match action {
         SettingsAction::Refresh => {
-            SettingsTaskResult::Loaded(store.read().await.map_err(|error| error.to_string()))
+            SettingsTaskResult::Loaded(read_tui_settings(&settings_store, &profiles_store).await)
         }
         SettingsAction::Set { scope, id, value } => {
-            let result = store
-                .update(move |state| {
-                    match scope {
-                        SettingsScope::Global => {
-                            if id.namespace().is_some() {
-                                return Err(LoadSettingsError::InvalidGlobalSetting(id));
+            let mut patch = SettingsPatch::default();
+            patch.insert(id, value);
+            if patch.0.keys().any(|id| id.as_str() == "q27.template_path")
+                && let Err(error) = norted_engine::record_local_file_setting_identity(
+                    &mut patch,
+                    "q27.template_path",
+                    "q27.template_sha256",
+                    &paths.data_dir,
+                    4 * 1024 * 1024,
+                )
+                .await
+            {
+                return SettingsTaskResult::Stored(Err(error.to_string()));
+            }
+            let result = match scope {
+                SettingsScope::Global | SettingsScope::Engine(_) => settings_store
+                    .update(move |state| {
+                        match scope {
+                            SettingsScope::Global => {
+                                if let Some(id) = patch.0.keys().find(|id| id.namespace().is_some())
+                                {
+                                    return Err(SettingsError::InvalidGlobalSetting(id.clone()));
+                                }
+                                state.global_defaults.0.extend(patch.0);
                             }
-                            state.global_defaults.insert(id, value);
+                            SettingsScope::Engine(engine_id) => {
+                                if let Some(id) =
+                                    patch.0.keys().find(|id| !id.applies_to_engine(&engine_id))
+                                {
+                                    return Err(SettingsError::WrongEngineScope {
+                                        setting_id: id.clone(),
+                                        engine_id,
+                                    });
+                                }
+                                state
+                                    .engine_defaults
+                                    .entry(engine_id)
+                                    .or_default()
+                                    .0
+                                    .extend(patch.0);
+                            }
+                            SettingsScope::ModelProfile(_) => unreachable!(),
                         }
-                        SettingsScope::Engine(engine_id) => {
-                            if !id.applies_to_engine(&engine_id) {
-                                return Err(LoadSettingsError::WrongEngineScope {
-                                    setting_id: id,
-                                    engine_id,
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|error| error.to_string()),
+                SettingsScope::ModelProfile(profile_id) => profiles_store
+                    .update(move |state| {
+                        let profile = state.profiles.get_mut(&profile_id).ok_or_else(|| {
+                            SettingsError::ModelProfileNotFound(profile_id.clone())
+                        })?;
+                        for id in patch.0.keys() {
+                            if !id.applies_to_engine(profile.engine_id.as_str()) {
+                                return Err(SettingsError::WrongEngineScope {
+                                    setting_id: id.clone(),
+                                    engine_id: profile.engine_id.to_string(),
                                 });
                             }
-                            state
-                                .engine_defaults
-                                .entry(engine_id)
-                                .or_default()
-                                .insert(id, value);
                         }
-                        SettingsScope::Profile(profile) => {
-                            let local = state
-                                .profiles
-                                .get_mut(&profile)
-                                .ok_or_else(|| LoadSettingsError::ProfileNotFound(profile.clone()))?;
-                            if is_serve_profile_editor_field(&id) {
-                                apply_serve_profile_editor_value(local, &id, Some(value))?;
-                            } else {
-                                local.load.settings.insert(id, value);
-                            }
-                        }
-                        SettingsScope::BuilderProfile(profile_id) => {
-                            return Err(LoadSettingsError::InvalidServeProfile(format!(
-                                "Builder Serve Profile `{profile_id}` is read-only; fork it before editing"
-                            )));
-                        }
-                        SettingsScope::Model(model) => {
-                            state
-                                .model_defaults
-                                .entry(model)
-                                .or_default()
-                                .insert(id, value);
-                        }
-                    }
-                    Ok(state.clone())
-                })
-                .await
-                .map_err(|error| error.to_string());
-            SettingsTaskResult::Stored(result)
+                        profile.overrides.0.extend(patch.0);
+                        profile.validate()?;
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|error| error.to_string()),
+            };
+            SettingsTaskResult::Stored(match result {
+                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
+                Err(error) => Err(error),
+            })
         }
         SettingsAction::Unset { scope, id } => {
-            let result = store
-                .update(move |state| {
-                    let cleanup_scope = scope.clone();
-                    let patch = match scope {
-                        SettingsScope::Global => &mut state.global_defaults,
-                        SettingsScope::Engine(engine) => {
-                            state.engine_defaults.entry(engine).or_default()
-                        }
-                        SettingsScope::Profile(profile) => {
-                            let local = state
-                                .profiles
-                                .get_mut(&profile)
-                                .ok_or_else(|| LoadSettingsError::ProfileNotFound(profile.clone()))?;
-                            if is_serve_profile_editor_field(&id) {
-                                apply_serve_profile_editor_value(local, &id, None)?;
-                                return Ok(state.clone());
+            let mut ids = vec![id];
+            if ids[0].as_str() == "q27.template_path" {
+                ids.push(SettingId::new("q27.template_sha256").expect("static setting ID"));
+            }
+            let result = match scope {
+                SettingsScope::Global | SettingsScope::Engine(_) => settings_store
+                    .update(move |state| {
+                        match scope {
+                            SettingsScope::Global => {
+                                for id in &ids {
+                                    state.global_defaults.remove(id);
+                                }
                             }
-                            &mut local.load.settings
-                        }
-                        SettingsScope::BuilderProfile(profile_id) => {
-                            return Err(LoadSettingsError::InvalidServeProfile(format!(
-                                "Builder Serve Profile `{profile_id}` is read-only; fork it before editing"
-                            )));
-                        }
-                        SettingsScope::Model(model) => {
-                            state.model_defaults.entry(model).or_default()
-                        }
-                    };
-                    patch.remove(&id);
-                    if patch.is_empty() {
-                        match cleanup_scope {
-                            SettingsScope::Engine(engine) => {
-                                state.engine_defaults.remove(&engine);
+                            SettingsScope::Engine(engine_id) => {
+                                if let Some(patch) = state.engine_defaults.get_mut(&engine_id) {
+                                    for id in &ids {
+                                        patch.remove(id);
+                                    }
+                                    if patch.is_empty() {
+                                        state.engine_defaults.remove(&engine_id);
+                                    }
+                                }
                             }
-                            SettingsScope::Model(model) => {
-                                state.model_defaults.remove(&model);
-                            }
-                            SettingsScope::Global
-                            | SettingsScope::Profile(_)
-                            | SettingsScope::BuilderProfile(_) => {}
+                            SettingsScope::ModelProfile(_) => unreachable!(),
                         }
-                    }
-                    Ok(state.clone())
-                })
-                .await
-                .map_err(|error| error.to_string());
-            SettingsTaskResult::Stored(result)
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|error| error.to_string()),
+                SettingsScope::ModelProfile(profile_id) => profiles_store
+                    .update(move |state| {
+                        let profile = state.profiles.get_mut(&profile_id).ok_or_else(|| {
+                            SettingsError::ModelProfileNotFound(profile_id.clone())
+                        })?;
+                        for id in &ids {
+                            profile.overrides.remove(id);
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|error| error.to_string()),
+            };
+            SettingsTaskResult::Stored(match result {
+                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
+                Err(error) => Err(error),
+            })
         }
-        SettingsAction::CreateProfile(profile) => {
-            let result = store
-                .update(move |state| {
-                    state.create_profile(profile)?;
-                    Ok(state.clone())
-                })
-                .await
-                .map_err(|error| error.to_string());
-            SettingsTaskResult::Stored(result)
-        }
-        SettingsAction::ForkBuilderProfile { source, name } => {
-            let result = store
-                .update(move |state| {
-                    if state.profiles.contains_key(&name) {
-                        return Err(LoadSettingsError::ProfileAlreadyExists(name));
-                    }
-                    let fork = source.fork_local(name.as_str(), name.as_str());
-                    state.profiles.insert(name, fork);
-                    Ok(state.clone())
-                })
-                .await
-                .map_err(|error| error.to_string());
-            SettingsTaskResult::Stored(result)
-        }
-        SettingsAction::DeleteProfile(profile) => {
-            let result = store
-                .update(move |state| {
-                    state.delete_profile(&profile)?;
-                    Ok(state.clone())
-                })
-                .await
-                .map_err(|error| error.to_string());
-            SettingsTaskResult::Stored(result)
-        }
-        SettingsAction::AssignProfile { model_id, profile } => {
-            let result = store
-                .update(move |state| {
-                    state.assign_profile(model_id, profile)?;
-                    Ok(state.clone())
-                })
-                .await
-                .map_err(|error| error.to_string());
-            SettingsTaskResult::Stored(result)
-        }
-        SettingsAction::AssignBuilderProfile {
-            model_id,
-            profile_id,
-        } => {
-            let result = store
-                .update(move |state| {
-                    state.assign_builder_profile(model_id, profile_id);
-                    Ok(state.clone())
-                })
-                .await
-                .map_err(|error| error.to_string());
-            SettingsTaskResult::Stored(result)
-        }
-        SettingsAction::InheritRecommendedProfile { model_id } => {
-            let result = store
-                .update(move |state| {
-                    state.inherit_recommended_profile(&model_id);
-                    Ok(state.clone())
-                })
-                .await
-                .map_err(|error| error.to_string());
-            SettingsTaskResult::Stored(result)
-        }
-        SettingsAction::InspectModel {
+        SettingsAction::CreateProfile {
+            id,
+            display_name,
             model,
-            serve_profile,
         } => {
+            let engines = runtime_packs.compatible_engine_ids(&model);
+            let result = match engines.as_slice() {
+                [] => Err(format!(
+                    "No registered engine is compatible with model `{}`",
+                    model.id
+                )),
+                [engine] => match EngineId::new(engine.clone()) {
+                    Ok(engine_id) => profiles_store
+                        .update(move |state| state.create(id, display_name, model.id, engine_id))
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                },
+                _ => Err(format!(
+                    "Model `{}` has multiple compatible engines ({}); create the profile with an explicit engine in the CLI",
+                    model.id,
+                    engines.join(", ")
+                )),
+            };
+            SettingsTaskResult::Stored(match result {
+                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
+                Err(error) => Err(error),
+            })
+        }
+        SettingsAction::DuplicateProfile {
+            source,
+            destination,
+        } => {
+            let display_name = destination.to_string();
+            let result = profiles_store
+                .update(move |state| state.duplicate(&source, destination, display_name))
+                .await
+                .map_err(|error| error.to_string());
+            SettingsTaskResult::Stored(match result {
+                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
+                Err(error) => Err(error),
+            })
+        }
+        SettingsAction::DeleteProfile(profile_id) => {
+            let active = match ControlClient::discover(paths).await {
+                Ok(client) => client
+                    .status()
+                    .await
+                    .ok()
+                    .and_then(|status| status.backend.model_profile_id),
+                Err(_) => None,
+            };
+            let result = if active.as_ref() == Some(&profile_id) {
+                Err(format!(
+                    "Active Model Profile `{profile_id}` cannot be deleted; unload it first"
+                ))
+            } else {
+                profiles_store
+                    .update(move |state| state.delete(&profile_id).map(|_| ()))
+                    .await
+                    .map_err(|error| error.to_string())
+            };
+            SettingsTaskResult::Stored(match result {
+                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
+                Err(error) => Err(error),
+            })
+        }
+        SettingsAction::SetProfileModel { profile_id, model } => {
+            let compatible = runtime_packs.compatible_engine_ids(&model);
+            let result = profiles_store
+                .update(move |state| {
+                    let profile = state
+                        .profiles
+                        .get_mut(&profile_id)
+                        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+                    if !compatible
+                        .iter()
+                        .any(|engine| engine == profile.engine_id.as_str())
+                    {
+                        return Err(SettingsError::InvalidModelProfile(format!(
+                            "engine `{}` is incompatible with model `{}`",
+                            profile.engine_id, model.id
+                        )));
+                    }
+                    profile.model_id = model.id;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| error.to_string());
+            SettingsTaskResult::Stored(match result {
+                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
+                Err(error) => Err(error),
+            })
+        }
+        SettingsAction::CycleProfileEngine { profile_id, model } => {
+            let compatible = runtime_packs.compatible_engine_ids(&model);
+            let result = profiles_store
+                .update(move |state| {
+                    let profile = state
+                        .profiles
+                        .get_mut(&profile_id)
+                        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+                    let next = compatible
+                        .iter()
+                        .position(|engine| engine == profile.engine_id.as_str())
+                        .map(|index| (index + 1) % compatible.len())
+                        .unwrap_or(0);
+                    let engine = compatible.get(next).ok_or_else(|| {
+                        SettingsError::InvalidModelProfile(format!(
+                            "no registered engine is compatible with model `{}`",
+                            model.id
+                        ))
+                    })?;
+                    profile.engine_id = EngineId::new(engine.clone())?;
+                    profile
+                        .overrides
+                        .0
+                        .retain(|id, _| id.applies_to_engine(profile.engine_id.as_str()));
+                    Ok(())
+                })
+                .await
+                .map_err(|error| error.to_string());
+            SettingsTaskResult::Stored(match result {
+                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
+                Err(error) => Err(error),
+            })
+        }
+        SettingsAction::InspectProfile { profile, model } => {
             let model_id = model.id.clone();
             let result = async {
-                let profiles = store.read().await.map_err(|error| error.to_string())?;
-                runtime_packs.refresh_host_capabilities().await;
-                let (selection, schema) = runtime_packs
-                    .load_settings_schema_for_model_with_profile(
-                        &model,
-                        None,
-                        serve_profile.as_deref(),
-                    )
-                    .await
-                    .map_err(|error| format!(
-                        "No installed runtime is compatible with the selected Serve Profile. Open Runtimes search to install one or select None/raw defaults: {error}"
-                    ))?;
-                let engine_id = &selection.runtime.manifest.identity.engine_id;
-                let mut resolved = profiles
+                let (state, profiles) = read_tui_settings(&settings_store, &profiles_store).await?;
+                let resolved = state
                     .resolve(
-                        &model.id,
-                        engine_id,
-                        None,
-                        &LoadSettingsPatch::default(),
+                        &profile.id,
+                        profile.engine_id.as_str(),
+                        &profile.overrides,
+                        &SettingsPatch::default(),
                         &paths.data_dir,
                     )
                     .map_err(|error| error.to_string())?;
-                norted_core::apply_serve_profile_load_policy(
-                    serve_profile.as_deref(),
-                    &mut resolved,
-                )?;
+                runtime_packs.refresh_host_capabilities().await;
+                let (selection, schema) = runtime_packs
+                    .settings_schema_for_model_with_settings(&model, None, Some(&resolved))
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "No installed runtime is compatible with Model Profile `{}`: {error}",
+                            profile.id
+                        )
+                    })?;
+                if selection.runtime.manifest.identity.engine_id != profile.engine_id.as_str() {
+                    return Err(format!(
+                        "runtime resolver selected engine `{}` instead of profile engine `{}`",
+                        selection.runtime.manifest.identity.engine_id, profile.engine_id
+                    ));
+                }
                 Ok(ModelSettingsInspection {
+                    state,
                     profiles,
                     runtime_id: selection.runtime.manifest.runtime_id,
                     schema,
@@ -590,17 +678,17 @@ async fn execute_runtime_action(
             query,
             force_refresh,
             model,
-            serve_profile,
+            settings,
         } => {
             runtime_packs.refresh_host_capabilities().await;
             let result = match model {
                 Some(model) => {
                     runtime_packs
-                        .search_for_model_with_profile(
+                        .search_for_model_with_settings(
                             &query,
                             &model,
                             force_refresh,
-                            serve_profile.as_deref(),
+                            settings.as_deref(),
                         )
                         .await
                 }
@@ -673,15 +761,12 @@ async fn execute_runtime_action(
             };
             RuntimeTaskResult::Removed { runtime_id, result }
         }
-        RuntimeAction::ModelCandidates {
-            model,
-            serve_profile,
-        } => {
+        RuntimeAction::ModelCandidates { model, settings } => {
             let model_id = model.id.clone();
             RuntimeTaskResult::ModelCandidates {
                 model_id,
                 result: runtime_packs
-                    .compatible_installed_for_model_with_profile(&model, serve_profile.as_deref())
+                    .compatible_installed_for_model_with_settings(&model, settings.as_deref())
                     .await
                     .map_err(|error| error.to_string()),
             }
@@ -752,7 +837,7 @@ async fn execute_control(
         .await
         .map_err(|error| error.to_string())?;
     match action {
-        ControlAction::Load(model_id) => client.start_load(model_id).await,
+        ControlAction::Load(profile_id) => client.start_load(profile_id).await,
         ControlAction::Unload => client.unload().await,
     }
     .map_err(|error| error.to_string())

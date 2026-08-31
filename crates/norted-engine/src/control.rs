@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use norted_core::{
-    AppPaths, LoadSettingsPatch, ModelId, RuntimeId, ServeProfileName, observe_runtime_descriptor,
-};
+use norted_core::{AppPaths, ModelProfileId, RuntimeId, SettingsPatch, observe_runtime_descriptor};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -18,13 +16,11 @@ const UNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlLoadRequest {
-    pub model_id: ModelId,
+    pub model_profile_id: ModelProfileId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<RuntimeId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile: Option<ServeProfileName>,
-    #[serde(default, skip_serializing_if = "LoadSettingsPatch::is_empty")]
-    pub settings: LoadSettingsPatch,
+    #[serde(default, skip_serializing_if = "SettingsPatch::is_empty")]
+    pub invocation_settings: SettingsPatch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,64 +113,67 @@ impl ControlClient {
         .map(|(_, status)| status)
     }
 
-    pub async fn load(&self, model_id: ModelId) -> Result<ControlStatus, ControlClientError> {
-        self.load_with_runtime(model_id, None).await
+    pub async fn load(
+        &self,
+        profile_id: ModelProfileId,
+    ) -> Result<ControlStatus, ControlClientError> {
+        self.load_with_runtime(profile_id, None).await
     }
 
     pub async fn load_with_runtime(
         &self,
-        model_id: ModelId,
+        profile_id: ModelProfileId,
         runtime_id: Option<RuntimeId>,
     ) -> Result<ControlStatus, ControlClientError> {
-        self.load_with_settings(model_id, runtime_id, None, LoadSettingsPatch::default())
+        self.load_with_settings(profile_id, runtime_id, SettingsPatch::default())
             .await
     }
 
     pub async fn load_with_settings(
         &self,
-        model_id: ModelId,
+        profile_id: ModelProfileId,
         runtime_id: Option<RuntimeId>,
-        profile: Option<ServeProfileName>,
-        settings: LoadSettingsPatch,
+        settings: SettingsPatch,
     ) -> Result<ControlStatus, ControlClientError> {
         let admitted = self
-            .start_load_with_settings(model_id.clone(), runtime_id, profile, settings)
+            .start_load_with_settings(profile_id.clone(), runtime_id, settings)
             .await?;
-        self.wait_for_admitted_load(model_id, admitted.backend.generation)
+        self.wait_for_admitted_load(profile_id, admitted.backend.generation)
             .await
     }
 
-    pub async fn start_load(&self, model_id: ModelId) -> Result<ControlStatus, ControlClientError> {
-        self.start_load_with_runtime(model_id, None).await
+    pub async fn start_load(
+        &self,
+        profile_id: ModelProfileId,
+    ) -> Result<ControlStatus, ControlClientError> {
+        self.start_load_with_runtime(profile_id, None).await
     }
 
     pub async fn start_load_with_runtime(
         &self,
-        model_id: ModelId,
+        profile_id: ModelProfileId,
         runtime_id: Option<RuntimeId>,
     ) -> Result<ControlStatus, ControlClientError> {
-        self.start_load_with_settings(model_id, runtime_id, None, LoadSettingsPatch::default())
+        self.start_load_with_settings(profile_id, runtime_id, SettingsPatch::default())
             .await
     }
 
     pub async fn start_load_with_settings(
         &self,
-        model_id: ModelId,
+        profile_id: ModelProfileId,
         runtime_id: Option<RuntimeId>,
-        profile: Option<ServeProfileName>,
-        settings: LoadSettingsPatch,
+        settings: SettingsPatch,
     ) -> Result<ControlStatus, ControlClientError> {
-        let expected_model = model_id.clone();
+        let expected_profile = profile_id.clone();
         let (response_status, status) = self
             .send::<ControlStatus>(
                 self.client
                     .post(format!("{}{}", self.endpoint, CONTROL_LOAD_PATH))
                     .timeout(LOAD_ADMISSION_TIMEOUT)
                     .json(&ControlLoadRequest {
-                        model_id,
+                        model_profile_id: profile_id,
                         runtime_id,
-                        profile,
-                        settings,
+                        invocation_settings: settings,
                     }),
                 "load admission",
                 LOAD_ADMISSION_TIMEOUT,
@@ -186,10 +185,11 @@ impl ControlClient {
             )));
         }
         if status.backend.lifecycle != BackendLifecycle::Loading
-            || status.backend.model_id.as_ref() != Some(&expected_model)
+            || status.backend.model_profile_id.as_ref() != Some(&expected_profile)
         {
             return Err(ControlClientError::InvalidResponse(
-                "accepted load response did not identify the requested model as Loading".to_owned(),
+                "accepted load response did not identify the requested Model Profile as Loading"
+                    .to_owned(),
             ));
         }
         Ok(status)
@@ -250,28 +250,28 @@ impl ControlClient {
 
     async fn wait_for_admitted_load(
         &self,
-        model_id: ModelId,
+        profile_id: ModelProfileId,
         generation: u64,
     ) -> Result<ControlStatus, ControlClientError> {
         loop {
             let status = self.status().await?;
             if status.backend.generation != generation {
                 return Err(ControlClientError::LoadCancelled(format!(
-                    "load generation {generation} for model `{model_id}` was superseded by generation {}",
+                    "load generation {generation} for Model Profile `{profile_id}` was superseded by generation {}",
                     status.backend.generation
                 )));
             }
             if status
                 .backend
-                .model_id
+                .model_profile_id
                 .as_ref()
-                .is_some_and(|observed| observed != &model_id)
+                .is_some_and(|observed| observed != &profile_id)
             {
                 return Err(ControlClientError::LoadCancelled(format!(
-                    "load generation {generation} changed from model `{model_id}` to `{}`",
+                    "load generation {generation} changed from Model Profile `{profile_id}` to `{}`",
                     status
                         .backend
-                        .model_id
+                        .model_profile_id
                         .as_ref()
                         .expect("checked as present")
                 )));
@@ -285,19 +285,19 @@ impl ControlClient {
                     return Err(ControlClientError::LoadFailed(
                         status.backend.failure.unwrap_or_else(|| {
                             format!(
-                                "load generation {generation} for model `{model_id}` failed without a reason"
+                                "load generation {generation} for Model Profile `{profile_id}` failed without a reason"
                             )
                         }),
                     ));
                 }
                 BackendLifecycle::Stopping => {
                     return Err(ControlClientError::LoadCancelled(format!(
-                        "load generation {generation} for model `{model_id}` was cancelled and is stopping"
+                        "load generation {generation} for Model Profile `{profile_id}` was cancelled and is stopping"
                     )));
                 }
                 BackendLifecycle::Stopped => {
                     return Err(ControlClientError::LoadCancelled(format!(
-                        "load generation {generation} for model `{model_id}` stopped before reaching Running"
+                        "load generation {generation} for Model Profile `{profile_id}` stopped before reaching Running"
                     )));
                 }
             }
@@ -345,6 +345,7 @@ fn loopback_endpoint(address: std::net::SocketAddr) -> String {
 mod tests {
     use super::*;
     use crate::{BackendStatus, ControlStatus};
+    use norted_core::ModelId;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -362,6 +363,7 @@ mod tests {
             backend: BackendStatus {
                 generation,
                 lifecycle,
+                model_profile_id: Some(ModelProfileId::new("fixture").expect("profile ID")),
                 model_id: Some(ModelId("fixture".to_owned())),
                 engine_id: None,
                 runtime_id: None,
@@ -422,7 +424,7 @@ mod tests {
         .await;
         let admitted = tokio::time::timeout(
             Duration::from_secs(1),
-            client.start_load(ModelId("fixture".to_owned())),
+            client.start_load(ModelProfileId::new("fixture").expect("profile ID")),
         )
         .await
         .expect("short-lived admission")
@@ -445,7 +447,7 @@ mod tests {
         ])
         .await;
         let final_status = client
-            .load(ModelId("fixture".to_owned()))
+            .load(ModelProfileId::new("fixture").expect("profile ID"))
             .await
             .expect("blocking load");
 
@@ -468,7 +470,7 @@ mod tests {
         ])
         .await;
         let error = client
-            .load(ModelId("fixture".to_owned()))
+            .load(ModelProfileId::new("fixture").expect("profile ID"))
             .await
             .expect_err("failed load");
 
@@ -490,7 +492,7 @@ mod tests {
         ])
         .await;
         let error = client
-            .load(ModelId("fixture".to_owned()))
+            .load(ModelProfileId::new("fixture").expect("profile ID"))
             .await
             .expect_err("superseded load");
 

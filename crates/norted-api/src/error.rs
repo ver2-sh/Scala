@@ -115,9 +115,9 @@ pub(crate) fn runtime_error(error: RuntimeError) -> OpenAiError {
             parameter: Some("model".to_owned()),
             code: "model_not_found",
         },
-        RuntimeError::ModelNotLoaded(_) => OpenAiError {
+        RuntimeError::ModelProfileNotLoaded(_) => OpenAiError {
             status: StatusCode::CONFLICT,
-            message: "The requested model exists but is not currently loaded.".to_owned(),
+            message: "The requested Model Profile is not currently loaded.".to_owned(),
             kind: "invalid_request_error",
             parameter: Some("model".to_owned()),
             code: "model_not_loaded",

@@ -16,7 +16,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, middleware};
-use norted_core::{ApplicationCore, RuntimePublisher, ServerState};
+use norted_core::{ApplicationCore, ModelProfilesStore, RuntimePublisher, ServerState};
 use norted_engine::{
     CONTROL_LOAD_PATH, CONTROL_STATUS_PATH, CONTROL_UNLOAD_PATH, ControlErrorResponse,
     ControlLoadRequest, ControlStatus, RuntimeManager,
@@ -289,21 +289,36 @@ struct ApiModel {
     created: i64,
 }
 
-async fn models(State(state): State<PublicApiState>) -> Json<ModelList> {
+async fn models(
+    State(state): State<PublicApiState>,
+) -> Result<Json<ModelList>, (StatusCode, String)> {
     let snapshot = state.core.snapshot().await;
-    Json(ModelList {
+    let profiles = ModelProfilesStore::new(&state.core.paths)
+        .read()
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not read Model Profiles: {error}"),
+            )
+        })?;
+    Ok(Json(ModelList {
         object: "list",
-        data: snapshot
-            .models
-            .into_iter()
-            .map(|model| ApiModel {
-                id: model.id.0,
+        data: profiles
+            .profiles
+            .into_values()
+            .map(|profile| ApiModel {
+                id: profile.id.to_string(),
                 object: "model",
-                owned_by: "norted-local",
-                created: model.created,
+                owned_by: "norted-user",
+                created: snapshot
+                    .models
+                    .iter()
+                    .find(|model| model.id == profile.model_id)
+                    .map_or(0, |model| model.created),
             })
             .collect(),
-    })
+    }))
 }
 
 #[derive(Clone)]
@@ -341,16 +356,17 @@ async fn control_load(
     state
         .runtime
         .start_load_with_settings(
-            request.model_id,
+            request.model_profile_id,
             request.runtime_id,
-            request.profile,
-            request.settings,
+            request.invocation_settings,
         )
         .await
         .map(|status| (StatusCode::ACCEPTED, Json(status)))
         .map_err(|error| ControlApiError {
             status: match error {
-                norted_engine::RuntimeError::ModelNotFound(_) => StatusCode::NOT_FOUND,
+                norted_engine::RuntimeError::ModelProfileNotFound(_)
+                | norted_engine::RuntimeError::BoundModelMissing { .. }
+                | norted_engine::RuntimeError::ModelNotFound(_) => StatusCode::NOT_FOUND,
                 norted_engine::RuntimeError::AlreadyActive { .. }
                 | norted_engine::RuntimeError::Busy(_) => StatusCode::CONFLICT,
                 norted_engine::RuntimeError::Incompatible { .. } => {
@@ -466,8 +482,10 @@ mod tests {
             runtimes_dir: root.join("data/runtimes"),
             runtime_cache_dir: root.join("cache/runtime-packs"),
             runtime_selections_file: root.join("data/runtime-selections.json"),
-            serve_profiles_file: root.join("data/serve-profiles.json"),
-            serve_profiles_lock_file: root.join("data/.serve-profiles.lock"),
+            settings_file: root.join("data/settings.json"),
+            settings_lock_file: root.join("data/.settings.lock"),
+            model_profiles_file: root.join("data/model-profiles.json"),
+            model_profiles_lock_file: root.join("data/.model-profiles.lock"),
         };
         paths.ensure_required().expect("fixture paths");
         std::fs::write(
@@ -490,6 +508,21 @@ mod tests {
             .next()
             .expect("discovered model")
             .id;
+        norted_core::ModelProfilesStore::new(&paths)
+            .update({
+                let model_id = model_id.clone();
+                move |state| {
+                    state.create(
+                        norted_core::ModelProfileId::new("fixture").expect("profile ID"),
+                        "Fixture",
+                        model_id,
+                        norted_core::EngineId::new("llama.cpp").expect("engine ID"),
+                    )?;
+                    Ok(())
+                }
+            })
+            .await
+            .expect("model profile fixture");
         let registry = EngineRegistry::default();
         let packs = RuntimePackManager::new(
             &paths,
@@ -537,7 +570,8 @@ mod tests {
         }))
         .expect("Responses request")
         .normalized
-        .inference_request();
+        .inference_request()
+        .expect("Model Profile ID");
         let chat = super::chat::parse_request(json!({
             "model": "model",
             "messages": [{"role": "user", "content": "hello"}],
@@ -547,9 +581,10 @@ mod tests {
         }))
         .expect("Chat request")
         .normalized
-        .inference_request();
+        .inference_request()
+        .expect("Model Profile ID");
 
-        assert_eq!(responses.model_id, chat.model_id);
+        assert_eq!(responses.model_profile_id, chat.model_profile_id);
         assert_eq!(responses.messages.len(), chat.messages.len());
         assert_eq!(responses.messages[0].role, chat.messages[0].role);
         assert_eq!(responses.messages[0].text, chat.messages[0].text);
@@ -568,10 +603,9 @@ mod tests {
             token: Arc::from("fixture-token"),
         });
         let request = ControlLoadRequest {
-            model_id: model_id.clone(),
+            model_profile_id: norted_core::ModelProfileId::new("fixture").expect("profile ID"),
             runtime_id: None,
-            profile: None,
-            settings: norted_core::LoadSettingsPatch::default(),
+            invocation_settings: norted_core::SettingsPatch::default(),
         };
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(1),

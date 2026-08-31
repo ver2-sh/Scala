@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use norted_core::{
     AcceleratorDevice, AcquisitionMethod, ArtifactFormat, ArtifactNativeIdentity, AvailableRuntime,
     EngineConfig, EngineInstallation, EngineRevision, HostCapabilities, InstalledRuntime,
-    LoadSettingValue, ModelArtifact, ModelId, NinferArtifactIdentity, ResolvedLoadSettings,
+    ModelArtifact, ModelProfileId, NinferArtifactIdentity, ResolvedSettings,
     RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId, RuntimeProbeObservation,
-    RuntimeRequirements, inspect_ninfer_container,
+    RuntimeRequirements, SettingValue, inspect_ninfer_container,
 };
 use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CompatibilityDecision,
@@ -112,22 +112,21 @@ const ALLOWED_VALUE_NATIVE_ARGUMENTS: &[&str] = &[
 struct PendingStartup {
     request_log_path: PathBuf,
     native_identity: NinferArtifactIdentity,
-    public_model_id: ModelId,
+    public_model_id: ModelProfileId,
     accelerator: AcceleratorDevice,
-    profile_requirements: Option<NinferStartupRequirements>,
+    settings_requirements: Option<NinferStartupRequirements>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct NinferStartupRequirements {
     minimum_context_tokens: Option<u64>,
-    kv_cache: String,
-    kv_dtype: String,
-    cuda_graph: bool,
-    prefix_reuse: bool,
-    speculative_backend: String,
-    speculative_draft_window: u64,
-    proposal_head: String,
-    expected_thinking: bool,
+    kv_dtype: Option<String>,
+    cuda_graph: Option<bool>,
+    prefix_reuse: Option<bool>,
+    speculative_backend: Option<String>,
+    speculative_draft_window: Option<u64>,
+    proposal_head: Option<String>,
+    expected_thinking: Option<bool>,
     temperature: Option<f64>,
     top_p: Option<f64>,
     top_k: Option<u64>,
@@ -137,85 +136,53 @@ struct NinferStartupRequirements {
 #[derive(Debug, Clone, Copy, Default)]
 struct NinferRuntimeCapabilities {
     trustworthy_identity: bool,
-    external_sharp: bool,
     thinking_control: bool,
     process_sampler_overrides: bool,
     bounded_server_start: bool,
 }
 
-fn evaluate_ninfer_profile_runtime(
-    profile: &norted_core::ServeProfile,
-    capabilities: NinferRuntimeCapabilities,
-) -> RuntimeCompatibility {
-    match validate_ninfer_profile_prelaunch(profile, capabilities) {
-        Ok(()) => RuntimeCompatibility::NeedsAttention(
-            "the exact runtime satisfies the Serve Profile's pre-launch capabilities; context, KV capacity, sampler, and speculation still require server_start proof"
-                .to_owned(),
-        ),
-        Err(reasons) => RuntimeCompatibility::Incompatible(format!(
-            "{reasons}; required startup facts cannot be observed because pre-launch admission failed"
-        )),
-    }
-}
-
-fn validate_ninfer_profile_prelaunch(
-    profile: &norted_core::ServeProfile,
+fn validate_ninfer_settings_prelaunch(
+    settings: &ResolvedSettings,
     capabilities: NinferRuntimeCapabilities,
 ) -> Result<(), String> {
+    if settings.is_empty() {
+        return Ok(());
+    }
     if !capabilities.trustworthy_identity {
         return Err(
-            "the exact NInfer executable has no trustworthy Serve Profile capability observation; external binaries are not credited from filenames or upstream assumptions"
+            "the exact NInfer executable has no trustworthy capability observation; external binaries are not credited from filenames or version assumptions"
                 .to_owned(),
         );
     }
-    let mut reasons = Vec::new();
-    for requirement in profile.effective_requirements() {
-        use norted_core::ServeCapability;
-        let reason = match requirement {
-            ServeCapability::ExternalTemplateApplication
-            | ServeCapability::RawCompletionPromptInput
-                if !capabilities.external_sharp =>
-            {
-                Some("required external Sharp/raw-prompt application is unsupported/unproven")
-            }
-            ServeCapability::Thinking if !capabilities.thinking_control => {
-                Some("Serve Profile thinking control is unsupported/unproven")
-            }
-            ServeCapability::TemperatureTopP | ServeCapability::TopKMinP
-                if !capabilities.process_sampler_overrides =>
-            {
-                Some("Serve Profile sampler controls are unproven")
-            }
-            ServeCapability::ServedContextProof
-            | ServeCapability::NinferCudaGraph
-            | ServeCapability::NinferPrefixReuse
-            | ServeCapability::NinferStartupObservation
-                if !capabilities.bounded_server_start =>
-            {
-                Some("server_start context/KV/graph/prefix/speculation observation is unproven")
-            }
-            ServeCapability::Mtp if !capabilities.bounded_server_start => {
-                Some("NInfer MTP/speculation startup proof is unproven")
-            }
-            ServeCapability::SuffixDrafting
-            | ServeCapability::ObservedWMax
-            | ServeCapability::FastHeadControl
-            | ServeCapability::KvModeProof => {
-                Some("the Serve Profile requires a q27-only capability")
-            }
-            _ => None,
-        };
-        if let Some(reason) = reason
-            && !reasons.contains(&reason)
-        {
-            reasons.push(reason);
-        }
+    let configured = |ids: &[&str]| ids.iter().any(|id| settings.value(id).is_some());
+    if configured(&[
+        "ninfer.thinking",
+        "ninfer.preserve_thinking",
+        "reasoning_effort",
+    ]) && !capabilities.thinking_control
+    {
+        return Err("NInfer thinking control is unsupported or unproven".to_owned());
     }
-    if reasons.is_empty() {
-        Ok(())
-    } else {
-        Err(reasons.join("; "))
+    if configured(&["temperature", "top_p", "top_k", "min_p"])
+        && !capabilities.process_sampler_overrides
+    {
+        return Err("NInfer process sampler controls are unsupported or unproven".to_owned());
     }
+    if configured(&[
+        "context_length",
+        "ninfer.kv_dtype",
+        "ninfer.kv_capacity",
+        "ninfer.cuda_graph",
+        "ninfer.prefix_reuse",
+        "ninfer.speculation",
+        "ninfer.speculative_backend",
+        "ninfer.draft_tokens",
+        "ninfer.lm_head_draft",
+    ]) && !capabilities.bounded_server_start
+    {
+        return Err("NInfer server_start capability observation is unproven".to_owned());
+    }
+    Ok(())
 }
 
 fn ninfer_runtime_capabilities_for_installed(
@@ -229,9 +196,6 @@ fn ninfer_runtime_capabilities_for_installed(
         && runtime.manifest.identity.variant == format!("{}-sm120a", catalog::RECIPE_VERSION);
     NinferRuntimeCapabilities {
         trustworthy_identity: managed_source,
-        // The current managed source recipe embeds its frontend template and
-        // advertises no external template or raw pre-rendered prompt input.
-        external_sharp: false,
         thinking_control: managed_source,
         process_sampler_overrides: managed_source,
         bounded_server_start: managed_source,
@@ -250,215 +214,69 @@ fn ninfer_runtime_capabilities_for_available(
         && runtime.identity.variant == format!("{}-sm120a", catalog::RECIPE_VERSION);
     NinferRuntimeCapabilities {
         trustworthy_identity: managed_source,
-        external_sharp: false,
         thinking_control: managed_source,
         process_sampler_overrides: managed_source,
         bounded_server_start: managed_source,
     }
 }
 
-fn ninfer_profile_sampler_arguments(profile: &norted_core::ServeProfile) -> Vec<OsString> {
-    let mut arguments = Vec::new();
-    for (option, value) in [
-        (
-            "--temperature",
-            profile
-                .generation
-                .defaults
-                .temperature
-                .map(|value| value.to_string()),
-        ),
-        (
-            "--top-p",
-            profile
-                .generation
-                .defaults
-                .top_p
-                .map(|value| value.to_string()),
-        ),
-        (
-            "--top-k",
-            profile
-                .generation
-                .defaults
-                .top_k
-                .map(|value| value.to_string()),
-        ),
-        (
-            "--min-p",
-            profile
-                .generation
-                .defaults
-                .min_p
-                .map(|value| value.to_string()),
-        ),
-    ] {
-        if let Some(value) = value {
-            arguments.extend([OsString::from(option), OsString::from(value)]);
-        }
-    }
-    arguments
-}
-
 fn ninfer_startup_requirements(
-    profile: &norted_core::ServeProfile,
-    settings: &ResolvedLoadSettings,
+    settings: &ResolvedSettings,
 ) -> Result<NinferStartupRequirements, EngineError> {
-    let strategy = profile.engine.ninfer.as_ref().ok_or_else(|| {
-        EngineError::InvalidConfiguration(format!(
-            "Serve Profile `{}` has no NInfer strategy",
-            profile.display_name
-        ))
-    })?;
-    let profile_name = match settings.value("ninfer.speculative_profile") {
-        Some(LoadSettingValue::Choice(profile)) => profile.as_str(),
-        Some(_) => {
-            return Err(EngineError::InvalidConfiguration(
-                "ninfer.speculative_profile must be a choice".to_owned(),
-            ));
-        }
-        None => strategy.default_speculative_profile.as_str(),
+    let choice = |id: &str| match settings.value(id) {
+        Some(SettingValue::Choice(value)) => Ok(Some(value.clone())),
+        None => Ok(None),
+        Some(_) => Err(EngineError::InvalidConfiguration(format!(
+            "setting `{id}` must be a choice"
+        ))),
     };
-    let speculative = strategy.speculative_profiles.get(profile_name).ok_or_else(|| {
-        EngineError::InvalidConfiguration(format!(
-            "NInfer Serve Profile strategy `{profile_name}` is not declared by the selected profile"
-        ))
-    })?;
-    let expected_thinking = settings.value("ninfer.no_thinking").is_none();
-    if profile.generation.thinking.required && !expected_thinking {
-        return Err(EngineError::InvalidConfiguration(format!(
-            "Serve Profile `{}` requires thinking; `ninfer.no_thinking` conflicts",
-            profile.display_name
-        )));
-    }
-    if expected_thinking != profile.generation.thinking.default
-        && !profile.generation.allows_override("ninfer.no_thinking")
-    {
-        return Err(EngineError::InvalidConfiguration(format!(
-            "Serve Profile `{}` does not allow a conflicting NInfer thinking override",
-            profile.display_name
-        )));
-    }
+    let unsigned = |id: &str| match settings.value(id) {
+        Some(SettingValue::UnsignedInteger(value)) => Ok(Some(*value)),
+        None => Ok(None),
+        Some(_) => Err(EngineError::InvalidConfiguration(format!(
+            "setting `{id}` must be an unsigned integer"
+        ))),
+    };
+    let toggle = |id: &str| match settings.value(id) {
+        Some(SettingValue::Toggle(value)) => Ok(Some(*value)),
+        None => Ok(None),
+        Some(_) => Err(EngineError::InvalidConfiguration(format!(
+            "setting `{id}` must be a toggle"
+        ))),
+    };
+    let float = |id: &str| match settings.value(id) {
+        Some(SettingValue::Float(value)) => Ok(Some(*value)),
+        None => Ok(None),
+        Some(_) => Err(EngineError::InvalidConfiguration(format!(
+            "setting `{id}` must be a number"
+        ))),
+    };
+    let speculation = toggle("ninfer.speculation")?;
+    let backend = choice("ninfer.speculative_backend")?;
+    let speculation_enabled = speculation.unwrap_or(backend.is_some());
     Ok(NinferStartupRequirements {
-        minimum_context_tokens: profile.load.context.minimum,
-        kv_cache: strategy.kv_cache.clone(),
-        kv_dtype: strategy.kv_dtype.clone(),
-        cuda_graph: strategy.cuda_graph_required,
-        prefix_reuse: strategy.prefix_reuse_required,
-        speculative_backend: speculative
-            .backend
-            .clone()
-            .unwrap_or_else(|| "none".to_owned()),
-        speculative_draft_window: speculative.draft_tokens.unwrap_or(0),
-        proposal_head: if speculative.optimized_proposal_head.unwrap_or(false) {
-            "optimized".to_owned()
+        minimum_context_tokens: unsigned("context_length")?,
+        kv_dtype: choice("ninfer.kv_dtype")?,
+        cuda_graph: toggle("ninfer.cuda_graph")?,
+        prefix_reuse: toggle("ninfer.prefix_reuse")?,
+        speculative_backend: if speculation_enabled {
+            backend
         } else {
-            "full".to_owned()
+            Some("none".to_owned())
         },
-        expected_thinking,
-        temperature: profile.generation.defaults.temperature,
-        top_p: profile.generation.defaults.top_p,
-        top_k: profile.generation.defaults.top_k,
-        min_p: profile.generation.defaults.min_p,
+        speculative_draft_window: if speculation_enabled {
+            unsigned("ninfer.draft_tokens")?
+        } else {
+            Some(0)
+        },
+        proposal_head: toggle("ninfer.lm_head_draft")?
+            .map(|enabled| if enabled { "optimized" } else { "full" }.to_owned()),
+        expected_thinking: toggle("ninfer.thinking")?,
+        temperature: float("temperature")?,
+        top_p: float("top_p")?,
+        top_k: unsigned("top_k")?,
+        min_p: float("min_p")?,
     })
-}
-
-fn ninfer_profile_has_execution_recipe(profile: &norted_core::ServeProfile) -> bool {
-    profile.requires_runtime_recipe()
-}
-
-#[derive(Debug)]
-struct NinferModelFacts<'a> {
-    architecture: Option<&'a str>,
-    family: Option<&'a str>,
-    capabilities: BTreeSet<&'a str>,
-}
-
-fn ninfer_profile_applicability(
-    profile: &norted_core::ServeProfile,
-    model: &ModelArtifact,
-) -> Result<(), String> {
-    profile.basic_applicability(model)?;
-    let identity = match model.native_identity.as_ref() {
-        Some(ArtifactNativeIdentity::Ninfer(identity)) => identity,
-        None => {
-            return Err(format!(
-                "Serve Profile `{}` requires bounded NInfer container facts, but no native identity was inspected",
-                profile.display_name
-            ));
-        }
-    };
-    let facts = match identity.model_id.as_str() {
-        "qwen3.8-27b" => NinferModelFacts {
-            architecture: Some("qwen35"),
-            family: Some("qwen3.8-27b"),
-            capabilities: BTreeSet::from(["mtp_layer_1", "text_only"]),
-        },
-        "qwen3.6-27b" => NinferModelFacts {
-            architecture: Some("qwen35"),
-            family: Some("qwen3.6-27b"),
-            capabilities: BTreeSet::from(["mtp_layer_1", "text_only"]),
-        },
-        "qwen3.6-35b-a3b" => NinferModelFacts {
-            architecture: Some("qwen35"),
-            family: Some("qwen3.6-35b-a3b"),
-            capabilities: BTreeSet::from(["text_only"]),
-        },
-        _ => NinferModelFacts {
-            architecture: None,
-            family: None,
-            capabilities: BTreeSet::new(),
-        },
-    };
-    if let Some(required) = profile.applicability.architecture.as_deref() {
-        match facts.architecture {
-            Some(observed) if observed == required => {}
-            Some(observed) => {
-                return Err(format!(
-                    "Serve Profile `{}` requires architecture `{required}`, but NInfer native identity `{}` proves `{observed}`",
-                    profile.display_name, identity.model_id
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "Serve Profile `{}` requires architecture `{required}`, which NInfer native identity `{}` cannot prove",
-                    profile.display_name, identity.model_id
-                ));
-            }
-        }
-    }
-    if let Some(required) = profile.applicability.family.as_deref() {
-        match facts.family {
-            Some(observed) if observed == required => {}
-            Some(observed) => {
-                return Err(format!(
-                    "Serve Profile `{}` requires family `{required}`, but NInfer proved `{observed}`",
-                    profile.display_name
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "Serve Profile `{}` requires family `{required}`, which NInfer native identity `{}` cannot prove",
-                    profile.display_name, identity.model_id
-                ));
-            }
-        }
-    }
-    for required in &profile.applicability.required_model_capabilities {
-        if !facts.capabilities.contains(required.as_str()) {
-            return Err(format!(
-                "Serve Profile `{}` requires model capability `{required}`, which NInfer native identity `{}` does not prove",
-                profile.display_name, identity.model_id
-            ));
-        }
-    }
-    if profile.requires_runtime_recipe() && profile.engine.ninfer.is_none() {
-        return Err(format!(
-            "Serve Profile `{}` defines execution behavior but has no NInfer strategy",
-            profile.display_name
-        ));
-    }
-    Ok(())
 }
 
 pub struct NinferAdapter {
@@ -812,7 +630,7 @@ impl EngineAdapter for NinferAdapter {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        serve_profile: Option<&norted_core::ServeProfile>,
+        settings: Option<&ResolvedSettings>,
     ) -> RuntimeCompatibility {
         if let CompatibilityDecision::Unsupported { reason } = self.compatibility(model) {
             return RuntimeCompatibility::Incompatible(reason);
@@ -836,22 +654,23 @@ impl EngineAdapter for NinferAdapter {
         )
         .compatibility;
         let base = combine_compatibility(native, device);
-        if let Some(profile) = serve_profile {
-            if let Err(reason) = ninfer_profile_applicability(profile, model) {
-                return RuntimeCompatibility::Incompatible(reason);
-            }
-            if !ninfer_profile_has_execution_recipe(profile) {
-                return base;
-            }
-            combine_compatibility(
-                base,
-                evaluate_ninfer_profile_runtime(
-                    profile,
-                    ninfer_runtime_capabilities_for_installed(runtime),
-                ),
+        match settings.map(|settings| {
+            validate_ninfer_settings_prelaunch(
+                settings,
+                ninfer_runtime_capabilities_for_installed(runtime),
             )
-        } else {
-            base
+        }) {
+            Some(Err(reason)) => RuntimeCompatibility::Incompatible(reason),
+            Some(Ok(())) if !settings.is_some_and(ResolvedSettings::is_empty) => {
+                combine_compatibility(
+                    base,
+                    RuntimeCompatibility::NeedsAttention(
+                        "configured NInfer settings require final schema-18 startup proof"
+                            .to_owned(),
+                    ),
+                )
+            }
+            _ => base,
         }
     }
 
@@ -860,7 +679,7 @@ impl EngineAdapter for NinferAdapter {
         runtime: &AvailableRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        serve_profile: Option<&norted_core::ServeProfile>,
+        settings: Option<&ResolvedSettings>,
     ) -> RuntimeCompatibility {
         if let CompatibilityDecision::Unsupported { reason } = self.compatibility(model) {
             return RuntimeCompatibility::Incompatible(reason);
@@ -886,22 +705,23 @@ impl EngineAdapter for NinferAdapter {
         )
         .compatibility;
         let base = combine_compatibility(native, device);
-        if let Some(profile) = serve_profile {
-            if let Err(reason) = ninfer_profile_applicability(profile, model) {
-                return RuntimeCompatibility::Incompatible(reason);
-            }
-            if !ninfer_profile_has_execution_recipe(profile) {
-                return base;
-            }
-            combine_compatibility(
-                base,
-                evaluate_ninfer_profile_runtime(
-                    profile,
-                    ninfer_runtime_capabilities_for_available(runtime),
-                ),
+        match settings.map(|settings| {
+            validate_ninfer_settings_prelaunch(
+                settings,
+                ninfer_runtime_capabilities_for_available(runtime),
             )
-        } else {
-            base
+        }) {
+            Some(Err(reason)) => RuntimeCompatibility::Incompatible(reason),
+            Some(Ok(())) if !settings.is_some_and(ResolvedSettings::is_empty) => {
+                combine_compatibility(
+                    base,
+                    RuntimeCompatibility::NeedsAttention(
+                        "configured NInfer settings require final schema-18 startup proof"
+                            .to_owned(),
+                    ),
+                )
+            }
+            _ => base,
         }
     }
 
@@ -1021,17 +841,16 @@ impl EngineAdapter for NinferAdapter {
         }]
     }
 
-    fn load_setting_definitions(&self) -> Vec<norted_core::LoadSettingDefinition> {
+    fn setting_definitions(&self) -> Vec<norted_core::SettingDefinition> {
         settings::definitions()
     }
 
-    async fn load_settings_schema(
+    async fn settings_schema(
         &self,
         runtime: &InstalledRuntime,
         _model: &ModelArtifact,
         _host: &HostCapabilities,
-        serve_profile: Option<&norted_core::ServeProfile>,
-    ) -> Result<norted_core::LoadSettingsSchema, EngineError> {
+    ) -> Result<norted_core::SettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
         let help = self
             .capability_cache
@@ -1044,12 +863,20 @@ impl EngineAdapter for NinferAdapter {
             })?;
         let mut definitions = settings::definitions();
         settings::apply_runtime_bounds(&mut definitions);
-        settings::apply_speculative_profile_schema(&mut definitions, serve_profile);
         for definition in &mut definitions {
-            if definition.id.as_str() == "ninfer.speculative_profile" {
+            if definition.id.as_str() == "reasoning_effort" {
+                definition.supported = false;
+                definition.unsupported_reason = Some(
+                    "the exact managed NInfer request contract does not expose reasoning effort"
+                        .to_owned(),
+                );
                 continue;
             }
-            let option = settings::option_for_setting(definition.id.as_str());
+            let option = if definition.id.as_str() == "ninfer.speculation" {
+                "--spec"
+            } else {
+                settings::option_for_setting(definition.id.as_str())
+            };
             if option.is_empty() || !usage_has_token(&help, option) {
                 definition.supported = false;
                 definition.unsupported_reason = Some(format!(
@@ -1057,7 +884,7 @@ impl EngineAdapter for NinferAdapter {
                 ));
             }
         }
-        Ok(norted_core::LoadSettingsSchema {
+        Ok(norted_core::SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
             definitions,
@@ -1134,37 +961,23 @@ impl EngineAdapter for NinferAdapter {
                 "NInfer backend address must be loopback".to_owned(),
             ));
         }
-        if let Some(profile) = request.serve_profile.as_ref() {
-            ninfer_profile_applicability(profile, &request.model.primary)
-                .map_err(EngineError::InvalidConfiguration)?;
-        }
-        let execution_profile = request
-            .serve_profile
-            .as_ref()
-            .filter(|profile| ninfer_profile_has_execution_recipe(profile));
-        if let Some(profile) = execution_profile {
-            let capabilities = ninfer_runtime_capabilities_for_installed(&request.runtime);
-            if let Err(reason) = validate_ninfer_profile_prelaunch(profile, capabilities) {
-                return Err(EngineError::InvalidConfiguration(format!(
-                    "selected NInfer runtime cannot satisfy the Serve Profile: {reason}"
-                )));
-            }
-        }
+        validate_ninfer_settings_prelaunch(
+            &request.settings,
+            ninfer_runtime_capabilities_for_installed(&request.runtime),
+        )
+        .map_err(EngineError::InvalidConfiguration)?;
         request
-            .load_settings_schema
-            .validate(&request.load_settings)
+            .settings_schema
+            .validate(&request.settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
-        let mut structured = settings::translate(
-            &request.load_settings,
+        let structured = settings::translate(
+            &request.settings,
             &request.model.primary,
             &self.native_arguments,
         )?;
-        let profile_requirements = execution_profile
-            .map(|profile| ninfer_startup_requirements(profile, &request.load_settings))
+        let settings_requirements = (!request.settings.is_empty())
+            .then(|| ninfer_startup_requirements(&request.settings))
             .transpose()?;
-        if let Some(profile) = execution_profile {
-            structured.extend(ninfer_profile_sampler_arguments(profile));
-        }
         let model_path =
             canonical_regular_file(&request.model.primary.path, "NInfer model").await?;
         if model_path != request.model.primary.path {
@@ -1209,7 +1022,11 @@ impl EngineAdapter for NinferAdapter {
             .map_err(EngineError::InvalidConfiguration)?;
         let request_log_path = create_private_request_log()?;
         let endpoint = http_endpoint(request.backend_address);
-        let public_model_id = request.model.primary.id.clone();
+        let public_model_id = request.settings.model_profile_id.clone().ok_or_else(|| {
+            EngineError::InvalidConfiguration(
+                "resolved settings do not identify the loaded Model Profile".to_owned(),
+            )
+        })?;
         let mut arguments = managed_launch_arguments(
             &model_path,
             request.backend_address,
@@ -1253,7 +1070,7 @@ impl EngineAdapter for NinferAdapter {
                 native_identity: expected_identity.clone(),
                 public_model_id: public_model_id.clone(),
                 accelerator: accelerator.clone(),
-                profile_requirements: profile_requirements.clone(),
+                settings_requirements: settings_requirements.clone(),
             },
         ) {
             let _ = tokio::fs::remove_file(previous.request_log_path).await;
@@ -1275,52 +1092,48 @@ impl EngineAdapter for NinferAdapter {
             ),
             ("request_log_schema".to_owned(), json!(18)),
         ]);
-        if let Some(requirements) = profile_requirements.as_ref() {
+        if let Some(requirements) = settings_requirements.as_ref() {
             normalized_settings.extend([
                 (
-                    "serve_profile_thinking".to_owned(),
+                    "configured_thinking".to_owned(),
                     json!(requirements.expected_thinking),
                 ),
                 (
-                    "serve_profile_kv_cache".to_owned(),
-                    json!(requirements.kv_cache),
-                ),
-                (
-                    "serve_profile_kv_dtype".to_owned(),
+                    "configured_kv_dtype".to_owned(),
                     json!(requirements.kv_dtype),
                 ),
                 (
-                    "serve_profile_speculative_backend".to_owned(),
+                    "configured_speculative_backend".to_owned(),
                     json!(requirements.speculative_backend),
                 ),
                 (
-                    "serve_profile_speculative_draft_window".to_owned(),
+                    "configured_speculative_draft_window".to_owned(),
                     json!(requirements.speculative_draft_window),
                 ),
                 (
-                    "serve_profile_proposal_head".to_owned(),
+                    "configured_proposal_head".to_owned(),
                     json!(requirements.proposal_head),
                 ),
             ]);
             for (name, value) in [
                 (
-                    "serve_profile_temperature",
+                    "configured_temperature",
                     requirements.temperature.map(serde_json::Value::from),
                 ),
                 (
-                    "serve_profile_top_p",
+                    "configured_top_p",
                     requirements.top_p.map(serde_json::Value::from),
                 ),
                 (
-                    "serve_profile_top_k",
+                    "configured_top_k",
                     requirements.top_k.map(serde_json::Value::from),
                 ),
                 (
-                    "serve_profile_min_p",
+                    "configured_min_p",
                     requirements.min_p.map(serde_json::Value::from),
                 ),
                 (
-                    "serve_profile_minimum_context_tokens",
+                    "configured_minimum_context_tokens",
                     requirements
                         .minimum_context_tokens
                         .map(serde_json::Value::from),
@@ -1342,13 +1155,12 @@ impl EngineAdapter for NinferAdapter {
             temporary_files: vec![request_log_path],
             endpoint: Some(endpoint),
             normalized_settings,
-            load_settings: request.load_settings,
+            settings: request.settings,
             native_arguments: self.native_arguments.clone(),
             installation,
             runtime: request.runtime,
             model: request.model,
             accelerator: Some(accelerator),
-            serve_profile: request.serve_profile,
         })
     }
 
@@ -1807,7 +1619,7 @@ async fn read_and_validate_startup_log(
             "NInfer startup record has an unsupported artifact type or schema".to_owned(),
         ));
     }
-    if startup.server.public_model_id != pending.public_model_id.0 {
+    if startup.server.public_model_id != pending.public_model_id.as_str() {
         return Err(EngineError::Operation(
             "NInfer startup public model ID differs from the Norted model ID".to_owned(),
         ));
@@ -1885,10 +1697,13 @@ async fn read_and_validate_startup_log(
             "NInfer startup sampler defaults are outside the supported API ranges".to_owned(),
         ));
     }
-    if let Some(requirements) = pending.profile_requirements.as_ref() {
-        if startup.server.default_thinking != requirements.expected_thinking {
+    if let Some(requirements) = pending.settings_requirements.as_ref() {
+        if requirements
+            .expected_thinking
+            .is_some_and(|expected| startup.server.default_thinking != expected)
+        {
             return Err(EngineError::Operation(format!(
-                "NInfer startup default_thinking={} disagrees with the Serve Profile expectation {}",
+                "NInfer startup default_thinking={} disagrees with the configured value {:?}",
                 startup.server.default_thinking, requirements.expected_thinking
             )));
         }
@@ -1896,7 +1711,7 @@ async fn read_and_validate_startup_log(
             && startup.engine.max_context < minimum_context
         {
             return Err(EngineError::Operation(format!(
-                "NInfer Serve Profile startup served only {} context tokens; at least {} are required",
+                "NInfer startup served only {} context tokens; the configured value requires at least {}",
                 startup.engine.max_context, minimum_context
             )));
         }
@@ -1909,28 +1724,42 @@ async fn read_and_validate_startup_log(
                 .is_some_and(|minimum| startup.engine.kv_capacity < minimum)
         {
             return Err(EngineError::Operation(format!(
-                "NInfer Serve Profile startup KV capacity {} ({}) does not prove the {:?}-token minimum contract",
+                "NInfer startup KV capacity {} ({}) does not prove the {:?}-token configured contract",
                 startup.engine.kv_capacity,
                 startup.engine.kv_capacity_mode,
                 requirements.minimum_context_tokens
             )));
         }
-        if startup.engine.kv_cache != requirements.kv_cache
-            || startup.engine.cuda_graph != requirements.cuda_graph
-            || startup.engine.prefix_reuse != requirements.prefix_reuse
+        if requirements
+            .kv_dtype
+            .as_ref()
+            .is_some_and(|expected| startup.engine.kv_cache != *expected)
+            || requirements
+                .cuda_graph
+                .is_some_and(|expected| startup.engine.cuda_graph != expected)
+            || requirements
+                .prefix_reuse
+                .is_some_and(|expected| startup.engine.prefix_reuse != expected)
         {
             return Err(EngineError::Operation(
-                "NInfer Serve Profile startup did not prove the required KV/CUDA-graph/prefix-reuse strategy"
+                "NInfer startup did not prove the configured KV/CUDA-graph/prefix-reuse behavior"
                     .to_owned(),
             ));
         }
-        if startup.engine.speculative_backend != requirements.speculative_backend
-            || startup.engine.speculative_draft_window != requirements.speculative_draft_window
-            || startup.engine.proposal_head != requirements.proposal_head
+        if requirements
+            .speculative_backend
+            .as_ref()
+            .is_some_and(|expected| startup.engine.speculative_backend != *expected)
+            || requirements
+                .speculative_draft_window
+                .is_some_and(|expected| startup.engine.speculative_draft_window != expected)
+            || requirements
+                .proposal_head
+                .as_ref()
+                .is_some_and(|expected| startup.engine.proposal_head != *expected)
         {
             return Err(EngineError::Operation(
-                "NInfer Serve Profile startup did not prove the selected speculative strategy"
-                    .to_owned(),
+                "NInfer startup did not prove the configured speculative behavior".to_owned(),
             ));
         }
         if requirements
@@ -1947,8 +1776,7 @@ async fn read_and_validate_startup_log(
                 .is_some_and(|expected| !approximately_equal(effective_min_p, expected))
         {
             return Err(EngineError::Operation(
-                "NInfer Serve Profile startup did not resolve the explicitly selected sampler defaults"
-                    .to_owned(),
+                "NInfer startup did not resolve the configured sampler defaults".to_owned(),
             ));
         }
     }
@@ -1980,7 +1808,7 @@ fn create_private_request_log() -> Result<PathBuf, EngineError> {
 fn managed_launch_arguments(
     model_path: &Path,
     backend_address: SocketAddr,
-    public_model_id: &ModelId,
+    public_model_id: &ModelProfileId,
     request_log_path: &Path,
 ) -> Vec<OsString> {
     vec![
@@ -1990,7 +1818,7 @@ fn managed_launch_arguments(
         OsString::from("--port"),
         OsString::from(backend_address.port().to_string()),
         OsString::from("--model-id"),
-        OsString::from(public_model_id.0.clone()),
+        OsString::from(public_model_id.as_str()),
         OsString::from("--device"),
         OsString::from("0"),
         OsString::from("--request-log-jsonl"),
@@ -2251,13 +2079,28 @@ fn unix_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use norted_core::{
-        LoadSettingId, LoadSettingKind, LoadSettingSource, ResolvedLoadSetting,
-        ResolvedLoadSettings, ServeProfile, apply_serve_profile_load_policy,
-    };
-    use norted_engine::EngineRegistry;
+    use norted_core::{ResolvedSetting, SettingId, SettingSource};
 
     use super::*;
+
+    fn resolved(values: &[(&str, SettingValue)]) -> ResolvedSettings {
+        ResolvedSettings {
+            engine_id: ENGINE_ID.to_owned(),
+            model_profile_id: None,
+            effective: values
+                .iter()
+                .map(|(id, value)| {
+                    (
+                        SettingId::new(*id).expect("setting ID"),
+                        ResolvedSetting {
+                            value: value.clone(),
+                            source: SettingSource::Invocation,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
 
     #[test]
     fn startup_progress_is_conservative_and_never_invents_fractions() {
@@ -2266,29 +2109,19 @@ mod tests {
             parse_ninfer_startup_progress(&["unrelated log line".to_owned()]),
             None
         );
-
         let loading = parse_ninfer_startup_progress(&["loading model weights".to_owned()])
-            .expect("loading line yields a phase");
+            .expect("loading phase");
         assert_eq!(loading.phase, BackendLoadPhase::LoadingModel);
         assert_eq!(loading.fraction, None);
-
         let context = parse_ninfer_startup_progress(&["allocating kv cache".to_owned()])
-            .expect("kv line yields a phase");
+            .expect("context phase");
         assert_eq!(context.phase, BackendLoadPhase::AllocatingContext);
-
-        let listening = parse_ninfer_startup_progress(&[
-            "loading model weights".to_owned(),
-            "allocating kv cache".to_owned(),
-            "ninfer-serve ready on 127.0.0.1:8080".to_owned(),
-        ])
-        .expect("ready line yields the latest phase");
-        assert_eq!(listening.phase, BackendLoadPhase::VerifyingStartup);
     }
 
     #[test]
     fn native_arguments_are_strict_and_semantic_flags_are_reserved() {
         assert!(
-            invalid_native_argument(&["--max-pending-requests".to_owned(), "12".to_owned(),])
+            invalid_native_argument(&["--max-pending-requests".to_owned(), "12".to_owned()])
                 .is_none()
         );
         assert!(invalid_native_argument(&["--unknown".to_owned()]).is_some());
@@ -2297,727 +2130,68 @@ mod tests {
     }
 
     #[test]
-    fn exact_help_contract_gates_runtime_and_native_capabilities() {
-        let help = "Usage: ninfer-serve <model.ninfer> --host HOST --port PORT --model-id ID --device N --request-log-jsonl FILE Responses/Chat --max-pending-requests N";
-        assert!(help_contract_error(help, &[]).is_none());
-        assert!(
-            help_contract_error(help, &["--max-pending-requests".to_owned(), "8".to_owned()])
-                .is_none()
-        );
-        assert!(help_contract_error(help, &["--not-advertised".to_owned()]).is_some());
-        assert!(
-            help_contract_error("Usage: ninfer-serve <model.ninfer> --host HOST", &[]).is_some()
-        );
-    }
+    fn direct_speculation_settings_replace_named_subprofiles() {
+        let off = ninfer_startup_requirements(&resolved(&[(
+            "ninfer.speculation",
+            SettingValue::Toggle(false),
+        )]))
+        .expect("off settings");
+        assert_eq!(off.speculative_backend.as_deref(), Some("none"));
+        assert_eq!(off.speculative_draft_window, Some(0));
 
-    #[test]
-    fn speculative_strategy_selector_is_open_before_and_closed_after_profile_resolution() {
-        let mut registry = EngineRegistry::default();
-        registry
-            .register(std::sync::Arc::new(NinferAdapter::from_config(
-                None,
-                Path::new("."),
-            )))
-            .expect("register NInfer adapter");
-        let selector_id = LoadSettingId::new("ninfer.speculative_profile").unwrap();
-        for strategy_name in ["mtp3", "quality-mtp"] {
-            let patch = registry
-                .parse_load_settings(&[format!("ninfer.speculative_profile={strategy_name}")])
-                .expect("generic CLI parser accepts unresolved strategy name");
-            assert_eq!(
-                patch.0.get(&selector_id),
-                Some(&LoadSettingValue::Choice(strategy_name.to_owned()))
-            );
-        }
-
-        let mut profile = ninfer_serve_profile_fixture();
-        let strategy = profile.engine.ninfer.as_mut().expect("NInfer strategy");
-        strategy.default_speculative_profile = "quality-mtp".to_owned();
-        strategy.speculative_profiles = BTreeMap::from([(
-            "quality-mtp".to_owned(),
-            norted_core::NinferSpeculativeProfile {
-                speculative_decoding: true,
-                backend: Some("mtp".to_owned()),
-                draft_tokens: Some(3),
-                optimized_proposal_head: Some(true),
-            },
-        )]);
-        profile.validate().expect("custom strategy profile");
-
-        let mut definitions = settings::definitions();
-        settings::apply_speculative_profile_schema(&mut definitions, Some(&profile));
-        let schema = norted_core::LoadSettingsSchema {
-            engine_id: ENGINE_ID.to_owned(),
-            runtime_id: None,
-            definitions,
-        };
-        let selector = schema.definition(&selector_id).expect("strategy selector");
-        assert!(selector.supported);
-        assert_eq!(
-            selector.kind,
-            LoadSettingKind::Choice {
-                choices: vec!["quality-mtp".to_owned()]
-            }
-        );
-        assert_eq!(
-            selector.recommendation.as_deref(),
-            Some("selected Serve Profile default: quality-mtp")
-        );
-
-        let selected = |value: &str| ResolvedLoadSettings {
-            engine_id: ENGINE_ID.to_owned(),
-            selected_profile: None,
-            effective: BTreeMap::from([(
-                selector_id.clone(),
-                ResolvedLoadSetting {
-                    value: LoadSettingValue::Choice(value.to_owned()),
-                    source: LoadSettingSource::Invocation,
-                },
-            )]),
-        };
-        assert!(schema.validate(&selected("quality-mtp")).is_ok());
-        assert!(schema.validate(&selected("mtp3")).is_err());
-
-        let mut without_profile = settings::definitions();
-        settings::apply_speculative_profile_schema(&mut without_profile, None);
-        let selector = without_profile
-            .iter()
-            .find(|definition| definition.id == selector_id)
-            .expect("unsupported strategy selector");
-        assert!(!selector.supported);
-        assert_eq!(
-            selector.unsupported_reason.as_deref(),
-            Some("speculative strategy selection requires a selected NInfer Serve Profile")
-        );
-    }
-
-    #[test]
-    fn serve_profile_compatibility_is_capability_driven_and_current_sharp_is_precise() {
-        let profile = ninfer_serve_profile_fixture();
-        let current = evaluate_ninfer_profile_runtime(
-            &profile,
-            NinferRuntimeCapabilities {
-                trustworthy_identity: true,
-                external_sharp: false,
-                thinking_control: true,
-                process_sampler_overrides: true,
-                bounded_server_start: true,
-            },
-        );
-        assert!(matches!(
-            current,
-            RuntimeCompatibility::Incompatible(ref reason)
-                if reason.contains("required external Sharp/raw-prompt application is unsupported/unproven")
-                    && reason.contains("cannot be observed")
-        ));
-        let future = evaluate_ninfer_profile_runtime(
-            &profile,
-            NinferRuntimeCapabilities {
-                trustworthy_identity: true,
-                external_sharp: true,
-                thinking_control: true,
-                process_sampler_overrides: true,
-                bounded_server_start: true,
-            },
-        );
-        assert!(matches!(future, RuntimeCompatibility::NeedsAttention(_)));
-        assert!(
-            validate_ninfer_profile_prelaunch(
-                &profile,
-                NinferRuntimeCapabilities {
-                    trustworthy_identity: true,
-                    external_sharp: true,
-                    thinking_control: true,
-                    process_sampler_overrides: true,
-                    bounded_server_start: true,
-                }
-            )
-            .is_ok()
-        );
-
-        let untrusted = NinferRuntimeCapabilities {
-            trustworthy_identity: false,
-            external_sharp: false,
-            thinking_control: false,
-            process_sampler_overrides: false,
-            bounded_server_start: false,
-        };
-        let untrusted_compatibility = evaluate_ninfer_profile_runtime(&profile, untrusted);
-        assert!(matches!(
-            untrusted_compatibility,
-            RuntimeCompatibility::Incompatible(ref reason)
-                if reason.contains("no trustworthy Serve Profile capability observation")
-        ));
-        assert!(!untrusted_compatibility.is_usable());
-        assert!(validate_ninfer_profile_prelaunch(&profile, untrusted).is_err());
-    }
-
-    #[tokio::test]
-    async fn serve_profile_sampler_thinking_and_startup_requirements_preserve_optionality() {
-        let profile = ninfer_serve_profile_fixture();
-        assert_eq!(
-            ninfer_profile_sampler_arguments(&profile)
-                .into_iter()
-                .map(|argument| argument.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            [
-                "--temperature",
-                "1",
-                "--top-p",
-                "0.95",
-                "--top-k",
-                "20",
-                "--min-p",
-                "0.05",
-            ]
-        );
-        let mut settings = ResolvedLoadSettings {
-            engine_id: ENGINE_ID.to_owned(),
-            selected_profile: None,
-            effective: BTreeMap::new(),
-        };
-        apply_serve_profile_load_policy(Some(&profile), &mut settings)
-            .expect("Serve Profile load policy");
-        let requirements =
-            ninfer_startup_requirements(&profile, &settings).expect("startup requirements");
-
-        assert_eq!(requirements.kv_cache, "int8-group64");
-        assert_eq!(requirements.kv_dtype, "int8");
-
-        let mut inherited = profile;
-        inherited.generation.defaults = norted_core::GenerationDefaults::default();
-        assert!(ninfer_profile_sampler_arguments(&inherited).is_empty());
-        let inherited_requirements = ninfer_startup_requirements(&inherited, &settings)
-            .expect("inherited sampler requirements");
-        assert_eq!(inherited_requirements.temperature, None);
-        assert_eq!(inherited_requirements.top_p, None);
-        assert_eq!(inherited_requirements.top_k, None);
-        assert_eq!(inherited_requirements.min_p, None);
-
-        inherited.generation.thinking.default = false;
-        inherited.generation.thinking.required = false;
-        let mut no_thinking_settings = ResolvedLoadSettings {
-            engine_id: ENGINE_ID.to_owned(),
-            selected_profile: None,
-            effective: BTreeMap::new(),
-        };
-        apply_serve_profile_load_policy(Some(&inherited), &mut no_thinking_settings)
-            .expect("thinking=false load policy");
-        let launch_arguments = settings::translate(
-            &no_thinking_settings,
-            &ModelArtifact {
-                id: ModelId("model".to_owned()),
-                display_name: "model".to_owned(),
-                path: PathBuf::from("model.ninfer"),
-                format: ArtifactFormat::Ninfer,
-                size_bytes: 1,
-                created: 0,
-                hash: None,
-                architecture: None,
-                context_length: None,
-                provenance: None,
-                native_identity: Some(ArtifactNativeIdentity::Ninfer(NinferArtifactIdentity {
-                    container_version: 2,
-                    model_id: "qwen3.8-27b".to_owned(),
-                    weights_id: "groupwise-int".to_owned(),
-                })),
-                auxiliary_artifacts: Vec::new(),
-                norted_package: None,
-            },
-            &[],
-        )
-        .expect("NInfer launch translation")
-        .into_iter()
-        .map(|argument| argument.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-        assert!(
-            launch_arguments
-                .iter()
-                .any(|argument| argument == "--no-thinking")
-        );
-        let no_thinking_requirements =
-            ninfer_startup_requirements(&inherited, &no_thinking_settings)
-                .expect("thinking=false startup requirements");
-        assert!(!no_thinking_requirements.expected_thinking);
-
-        let startup_log = tempfile::NamedTempFile::new().expect("startup log fixture");
-        let mut no_thinking_record = startup_record_fixture(false, false);
-        no_thinking_record["artifact"]["target"] = json!("qwen3.8-27b");
-        no_thinking_record["engine"]["context_cost"]["model_id"] = json!("qwen3.8-27b");
-        std::fs::write(
-            startup_log.path(),
-            format!(
-                "{}\n",
-                serde_json::to_string(&no_thinking_record).expect("JSON")
-            ),
-        )
-        .expect("write startup record");
-        let mut pending = startup_pending_fixture(startup_log.path());
-        pending.native_identity.model_id = "qwen3.8-27b".to_owned();
-        pending.profile_requirements = Some(no_thinking_requirements);
-        assert!(
-            read_and_validate_startup_log(&pending)
-                .await
-                .expect("thinking=false startup proof")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn current_upstream_target_registry_is_enumerated_exactly() {
-        let fixture = tempfile::tempdir().expect("source registry fixture");
-        write_registry_target(
-            fixture.path(),
-            "qwen3_6_27b",
-            concat!(
-                "static constexpr std::string_view model_id = \"qwen3.6-27b\";\n",
-                "static constexpr std::string_view target_key = \"qwen3_6_27b\";\n",
-                "static constexpr std::string_view qwen3_8_model_id = \"qwen3.8-27b\";\n",
-            ),
-            concat!(
-                "if (identity.model_id == model_id && identity.weights_id == \"groupwise-int\") {\n",
-                "if (identity.model_id == qwen3_8_model_id && identity.weights_id == \"groupwise-int\") {\n",
-                "if (identity.model_id == model_id && identity.weights_id == \"nvfp4\") {\n",
-                "if (identity.model_id == qwen3_8_model_id && identity.weights_id == \"nvfp4\") {\n",
-            ),
-        );
-        write_registry_target(
-            fixture.path(),
-            "qwen3_6_35b_a3b",
-            "static constexpr std::string_view model_id = \"qwen3.6-35b-a3b\";\n",
-            "if (identity.model_id == model_id && identity.weights_id == \"groupwise-int\") {\n",
-        );
-        let identities = inspect_source_native_identities(fixture.path());
-        let observed = identities
-            .into_iter()
-            .map(|identity| match identity {
-                ArtifactNativeIdentity::Ninfer(identity) => {
-                    format!("{}/{}", identity.model_id, identity.weights_id)
-                }
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            observed,
-            BTreeSet::from([
-                "qwen3.6-27b/groupwise-int".to_owned(),
-                "qwen3.6-27b/nvfp4".to_owned(),
-                "qwen3.6-35b-a3b/groupwise-int".to_owned(),
-                "qwen3.8-27b/groupwise-int".to_owned(),
-                "qwen3.8-27b/nvfp4".to_owned(),
-            ])
-        );
-    }
-
-    #[test]
-    fn changed_target_registry_degrades_to_truthful_uncertainty() {
-        let fixture = tempfile::tempdir().expect("source registry fixture");
-        write_registry_target(
-            fixture.path(),
-            "changed",
-            "static constexpr std::string_view model_id = \"changed\";\n",
-            "if (identity.model_id == renamed_expression()) {\n",
-        );
-        assert!(inspect_source_native_identities(fixture.path()).is_empty());
-    }
-
-    #[test]
-    fn exact_supported_gpu_beats_a_larger_unsupported_gpu_and_is_isolated_as_device_zero() {
-        let supported_uuid = "GPU-11111111-2222-3333-4444-555555555555";
-        let host = HostCapabilities {
-            platform: std::env::consts::OS.to_owned(),
-            architecture: std::env::consts::ARCH.to_owned(),
-            accelerators: vec![
-                AcceleratorDevice {
-                    accelerator: "cuda".to_owned(),
-                    stable_id: Some("GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned()),
-                    name: Some("NVIDIA RTX PRO 6000 Blackwell".to_owned()),
-                    vram_bytes: Some(96 * 1024 * 1024 * 1024),
-                    driver_version: Some("600".to_owned()),
-                    compute_capability: Some(norted_core::ComputeCapability::new(12, 0)),
-                },
-                AcceleratorDevice {
-                    accelerator: "cuda".to_owned(),
-                    stable_id: Some(supported_uuid.to_owned()),
-                    name: Some("NVIDIA GeForce RTX 5090".to_owned()),
-                    vram_bytes: Some(32 * 1024 * 1024 * 1024),
-                    driver_version: Some("600".to_owned()),
-                    compute_capability: Some(norted_core::ComputeCapability::new(12, 0)),
-                },
-            ],
-            cuda_visible_devices: None,
-            observations: Vec::new(),
-        };
-        let requirements = RuntimeRequirements {
-            requires_nvidia_gpu: true,
-            supported_cuda_compute_capabilities: vec![norted_core::ComputeCapability::new(12, 0)],
-            required_nvidia_device_names: vec!["NVIDIA GeForce RTX 5090".to_owned()],
-            ..RuntimeRequirements::default()
-        };
-        let evaluation = ninfer_device_evaluation(
-            &host.platform,
-            &host.architecture,
-            &requirements,
-            &host,
-            false,
-        );
-        assert_eq!(evaluation.compatibility, RuntimeCompatibility::Recommended);
-        let accelerator = evaluation.accelerator.expect("selected accelerator");
-        assert_eq!(accelerator.stable_id.as_deref(), Some(supported_uuid));
-        let environment = isolated_cuda_environment(&BTreeMap::new(), &accelerator, "NInfer")
-            .expect("isolated environment");
-        assert_eq!(
-            environment.get("CUDA_VISIBLE_DEVICES").map(String::as_str),
-            Some(supported_uuid)
-        );
-        let arguments = managed_launch_arguments(
-            Path::new("model.ninfer"),
-            "127.0.0.1:1234".parse().expect("address"),
-            &ModelId("model".to_owned()),
-            Path::new("startup.jsonl"),
-        );
-        let device = arguments
-            .iter()
-            .position(|argument| argument == "--device")
-            .expect("device option");
-        assert_eq!(arguments[device + 1], "0");
-    }
-
-    #[test]
-    fn unknown_exact_gpu_name_remains_needs_attention() {
-        let host = HostCapabilities {
-            platform: std::env::consts::OS.to_owned(),
-            architecture: std::env::consts::ARCH.to_owned(),
-            accelerators: vec![AcceleratorDevice {
-                accelerator: "cuda".to_owned(),
-                stable_id: Some("GPU-11111111-2222-3333-4444-555555555555".to_owned()),
-                name: None,
-                vram_bytes: Some(32 * 1024 * 1024 * 1024),
-                driver_version: Some("600".to_owned()),
-                compute_capability: Some(norted_core::ComputeCapability::new(12, 0)),
-            }],
-            cuda_visible_devices: None,
-            observations: Vec::new(),
-        };
-        let requirements = RuntimeRequirements {
-            requires_nvidia_gpu: true,
-            supported_cuda_compute_capabilities: vec![norted_core::ComputeCapability::new(12, 0)],
-            required_nvidia_device_names: vec!["NVIDIA GeForce RTX 5090".to_owned()],
-            ..RuntimeRequirements::default()
-        };
-        assert!(matches!(
-            ninfer_device_evaluation(
-                &host.platform,
-                &host.architecture,
-                &requirements,
-                &host,
-                false,
-            )
-            .compatibility,
-            RuntimeCompatibility::NeedsAttention(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn startup_observation_supplies_exact_effective_sampler_defaults() {
-        let temporary = tempfile::NamedTempFile::new().expect("startup log fixture");
-        let record = startup_record_fixture(false, false);
-        std::fs::write(
-            temporary.path(),
-            format!("{}\n", serde_json::to_string(&record).expect("JSON")),
-        )
-        .expect("write startup log");
-        let pending = startup_pending_fixture(temporary.path());
-        let defaults = read_and_validate_startup_log(&pending)
-            .await
-            .expect("startup defaults")
-            .expect("server_start record");
-        assert_eq!(
-            defaults,
-            EffectiveGenerationSettings {
-                temperature: 0.42,
-                top_p: 0.73,
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn startup_observation_waits_for_the_exact_server_start_record() {
-        let temporary = tempfile::NamedTempFile::new().expect("startup log fixture");
-        std::fs::write(temporary.path(), b"").expect("empty startup log");
-        assert!(
-            read_and_validate_startup_log(&startup_pending_fixture(temporary.path()))
-                .await
-                .expect("pending startup observation")
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn package_startup_observation_proves_context_capacity_and_policy() {
-        let temporary = tempfile::NamedTempFile::new().expect("startup log fixture");
-        let mut record = startup_record_fixture(false, false);
-        record["server"]["default_thinking"] = json!(true);
-        record["sampling_defaults"]["server_overrides"] = json!({
-            "temperature": 1.0,
-            "top_p": 0.95,
-            "top_k": 20,
-            "min_p": 0.05
-        });
-        std::fs::write(
-            temporary.path(),
-            format!("{}\n", serde_json::to_string(&record).expect("JSON")),
-        )
-        .expect("write startup log");
-        let mut pending = startup_pending_fixture(temporary.path());
-        pending.profile_requirements = Some(NinferStartupRequirements {
-            minimum_context_tokens: Some(200_000),
-            kv_cache: "int8-group64".to_owned(),
-            kv_dtype: "int8".to_owned(),
-            cuda_graph: true,
-            prefix_reuse: true,
-            speculative_backend: "none".to_owned(),
-            speculative_draft_window: 0,
-            proposal_head: "full".to_owned(),
-            expected_thinking: true,
-            temperature: Some(1.0),
-            top_p: Some(0.95),
-            top_k: Some(20),
-            min_p: Some(0.05),
-        });
-        assert!(
-            read_and_validate_startup_log(&pending)
-                .await
-                .expect("validated package startup")
-                .is_some()
-        );
-
-        record["engine"]["kv_capacity"] = json!(199_999);
-        std::fs::write(
-            temporary.path(),
-            format!("{}\n", serde_json::to_string(&record).expect("JSON")),
-        )
-        .expect("write insufficient startup log");
-        assert!(read_and_validate_startup_log(&pending).await.is_err());
-    }
-
-    #[test]
-    fn request_sampler_ranges_are_validated_without_clamping() {
-        let adapter = NinferAdapter::from_config(None, Path::new("."));
-        assert!(
-            adapter
-                .validate_generation_settings(
-                    &GenerationSettingsPatch {
-                        temperature: Some(2.0),
-                        top_p: Some(1.0),
-                        reasoning_effort: None,
-                    },
-                    &EffectiveGenerationSettings {
-                        temperature: 0.5,
-                        top_p: 0.9,
-                    },
-                )
-                .is_ok()
-        );
-        assert!(
-            adapter
-                .validate_generation_settings(
-                    &GenerationSettingsPatch {
-                        temperature: Some(2.01),
-                        top_p: None,
-                        reasoning_effort: None,
-                    },
-                    &EffectiveGenerationSettings {
-                        temperature: 0.5,
-                        top_p: 0.9,
-                    },
-                )
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn relative_external_binary_paths_resolve_without_invented_source_identity() {
-        let config: EngineConfig = serde_json::from_value(json!({
-            "enabled": true,
-            "settings": {"binary_path": "tools/ninfer-serve"}
-        }))
-        .expect("external NInfer config fixture");
-        let adapter = NinferAdapter::from_config(Some(&config), Path::new("/config"));
-        assert_eq!(
-            adapter.binary_path.as_deref(),
-            Some(Path::new("/config/tools/ninfer-serve"))
-        );
-        assert!(adapter.configuration_error.is_none());
-    }
-
-    #[tokio::test]
-    async fn startup_observation_rejects_greedy_or_wrong_artifact_identity() {
-        let greedy = tempfile::NamedTempFile::new().expect("startup log fixture");
-        std::fs::write(
-            greedy.path(),
-            format!(
-                "{}\n",
-                serde_json::to_string(&startup_record_fixture(true, false)).expect("JSON")
-            ),
-        )
-        .expect("write startup log");
-        assert!(
-            read_and_validate_startup_log(&startup_pending_fixture(greedy.path()))
-                .await
-                .is_err()
-        );
-
-        let wrong = tempfile::NamedTempFile::new().expect("startup log fixture");
-        std::fs::write(
-            wrong.path(),
-            format!(
-                "{}\n",
-                serde_json::to_string(&startup_record_fixture(false, true)).expect("JSON")
-            ),
-        )
-        .expect("write startup log");
-        assert!(
-            read_and_validate_startup_log(&startup_pending_fixture(wrong.path()))
-                .await
-                .is_err()
-        );
-    }
-
-    fn startup_pending_fixture(path: &Path) -> PendingStartup {
-        PendingStartup {
-            request_log_path: path.to_path_buf(),
-            native_identity: NinferArtifactIdentity {
-                container_version: 2,
-                model_id: "qwen3.6-27b".to_owned(),
-                weights_id: "groupwise-int".to_owned(),
-            },
-            public_model_id: ModelId("stable-model-id".to_owned()),
-            accelerator: AcceleratorDevice {
-                accelerator: "cuda".to_owned(),
-                stable_id: Some("GPU-11111111-2222-3333-4444-555555555555".to_owned()),
-                name: Some("NVIDIA GeForce RTX 5090".to_owned()),
-                vram_bytes: Some(32 * 1024 * 1024 * 1024),
-                driver_version: Some("600".to_owned()),
-                compute_capability: Some(norted_core::ComputeCapability::new(12, 0)),
-            },
-            profile_requirements: None,
-        }
-    }
-
-    fn startup_record_fixture(greedy: bool, wrong_identity: bool) -> serde_json::Value {
-        let model_id = if wrong_identity {
-            "different-model"
-        } else {
-            "qwen3.6-27b"
-        };
-        json!({
-            "artifact_type": "ninfer_serve_request_log",
-            "schema_version": 18,
-            "event": "server_start",
-            "server": {
-                "public_model_id": "stable-model-id",
-                "default_thinking": false
-            },
-            "artifact": {
-                "target": model_id,
-                "weights_id": "groupwise-int"
-            },
-            "engine": {
-                "max_context": 262144,
-                "kv_capacity_mode": "auto",
-                "kv_capacity": 262144,
-                "kv_cache": "int8-group64",
-                "cuda_graph": true,
-                "prefix_reuse": true,
-                "speculative_backend": "none",
-                "speculative_draft_window": 0,
-                "proposal_head": "full",
-                "context_cost": {
-                    "model_id": model_id,
-                    "weights_id": "groupwise-int"
-                }
-            },
-            "sampling_defaults": {
-                "thinking": {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0.05},
-                "non_thinking": {"temperature": 0.25, "top_p": 0.73, "top_k": 20, "min_p": 0.05},
-                "server_overrides": {
-                    "temperature": 0.42,
-                    "top_p": null,
-                    "top_k": null,
-                    "min_p": null
-                },
-                "greedy": greedy
-            },
-            "environment": {
-                "gpu_name": "NVIDIA GeForce RTX 5090",
-                "gpu_uuid": "GPU-11111111-2222-3333-4444-555555555555",
-                "compute_capability_major": 12,
-                "compute_capability_minor": 0
-            }
-        })
-    }
-
-    fn ninfer_serve_profile_fixture() -> ServeProfile {
-        let speculative_profiles = BTreeMap::from([
+        let on = ninfer_startup_requirements(&resolved(&[
+            ("ninfer.speculation", SettingValue::Toggle(true)),
             (
-                "mtp0".to_owned(),
-                norted_core::NinferSpeculativeProfile {
-                    speculative_decoding: false,
-                    backend: None,
-                    draft_tokens: None,
-                    optimized_proposal_head: None,
-                },
+                "ninfer.speculative_backend",
+                SettingValue::Choice("mtp".to_owned()),
             ),
-            (
-                "mtp3".to_owned(),
-                norted_core::NinferSpeculativeProfile {
-                    speculative_decoding: true,
-                    backend: Some("mtp".to_owned()),
-                    draft_tokens: Some(3),
-                    optimized_proposal_head: Some(true),
-                },
-            ),
+            ("ninfer.draft_tokens", SettingValue::UnsignedInteger(3)),
+            ("ninfer.lm_head_draft", SettingValue::Toggle(true)),
+        ]))
+        .expect("direct MTP settings");
+        assert_eq!(on.speculative_backend.as_deref(), Some("mtp"));
+        assert_eq!(on.speculative_draft_window, Some(3));
+        assert_eq!(on.proposal_head.as_deref(), Some("optimized"));
+    }
+
+    #[test]
+    fn configured_features_require_exact_runtime_evidence() {
+        let settings = resolved(&[
+            ("ninfer.thinking", SettingValue::Toggle(true)),
+            ("temperature", SettingValue::Float(0.8)),
+            ("ninfer.speculation", SettingValue::Toggle(true)),
         ]);
-        let mut profile = ServeProfile::local("dirk-quality-ninfer-v1");
-        profile.display_name = "Dirk Quality (NInfer)".to_owned();
-        profile.applicability.artifact_formats = vec![ArtifactFormat::Ninfer];
-        profile.applicability.architecture = Some("qwen35".to_owned());
-        profile.applicability.family = Some("qwen3.8-27b".to_owned());
-        profile.applicability.required_model_capabilities =
-            vec!["mtp_layer_1".to_owned(), "text_only".to_owned()];
-        profile.prompt.mode = norted_core::PromptMode::ExternalTemplate;
-        profile.prompt.delivery = norted_core::PromptDelivery::RawCompletions;
-        profile.prompt.template = Some(norted_core::ExternalTemplateReference {
-            identity: "dirk-sharp".to_owned(),
-            path: PathBuf::from("sharp.jinja"),
-            sha256: "11".repeat(32),
-        });
-        profile.generation.defaults.temperature = Some(1.0);
-        profile.generation.defaults.top_p = Some(0.95);
-        profile.generation.defaults.top_k = Some(20);
-        profile.generation.defaults.min_p = Some(0.05);
-        profile.generation.thinking.default = true;
-        profile.generation.thinking.required = true;
-        profile.load.context.minimum = Some(200_000);
-        profile.engine.ninfer = Some(norted_core::NinferServeStrategy {
-            kv_cache: "int8-group64".to_owned(),
-            kv_dtype: "int8".to_owned(),
-            cuda_graph_required: true,
-            prefix_reuse_required: true,
-            text_only_default: true,
-            default_speculative_profile: "mtp0".to_owned(),
-            speculative_profiles,
-        });
-        profile
+        let no_evidence = NinferRuntimeCapabilities::default();
+        assert!(validate_ninfer_settings_prelaunch(&settings, no_evidence).is_err());
+        let exact = NinferRuntimeCapabilities {
+            trustworthy_identity: true,
+            thinking_control: true,
+            process_sampler_overrides: true,
+            bounded_server_start: true,
+        };
+        assert!(validate_ninfer_settings_prelaunch(&settings, exact).is_ok());
     }
 
-    fn write_registry_target(root: &Path, target: &str, header: &str, package: &str) {
-        let target = root.join("src").join("targets").join(target);
-        let export = target.join("export").join("ninfer").join("targets");
-        let implementation = target.join("impl");
-        std::fs::create_dir_all(&export).expect("create export fixture");
-        std::fs::create_dir_all(&implementation).expect("create implementation fixture");
-        std::fs::write(export.join("package.h"), header).expect("write header fixture");
-        std::fs::write(implementation.join("package.cpp"), package).expect("write package fixture");
+    #[test]
+    fn definitions_expose_actual_controls_without_an_internal_profile_selector() {
+        let ids = settings::definitions()
+            .into_iter()
+            .map(|definition| definition.id.to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        for expected in [
+            "ninfer.speculation",
+            "ninfer.speculative_backend",
+            "ninfer.draft_tokens",
+            "ninfer.lm_head_draft",
+            "ninfer.thinking",
+            "ninfer.kv_dtype",
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+        ] {
+            assert!(ids.contains(expected), "missing setting {expected}");
+        }
+        assert!(!ids.iter().any(|id| id.contains("profile")));
     }
 }

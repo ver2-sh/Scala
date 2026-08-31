@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifact, AuxiliaryArtifactRole, ServeProfile,
-    ServeProfileSource, inspect_ninfer_container,
+    ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifact, AuxiliaryArtifactRole,
+    inspect_ninfer_container,
 };
 
 pub(crate) const MAX_PACKAGE_JSON_BYTES: u64 = 16 * 1024 * 1024;
@@ -54,10 +54,6 @@ pub struct NortedPackageBinding {
     pub master_id: Option<String>,
     pub quant_recipe_key: Option<String>,
     pub canonical_source_lineage_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serve_profile: Option<NortedPackageFile>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recommended_serve_profile: Option<ServeProfile>,
     pub sharp: Option<NortedPackageFile>,
     pub sharp_revision: Option<String>,
     pub sharp_version: Option<String>,
@@ -98,7 +94,6 @@ struct Q27Manifest {
     source_lineage: SourceLineage,
     sharp: Q27Sharp,
     tokenizer: FileRecord,
-    serve_profile: ServeProfileRecord,
     outputs: BTreeMap<String, Q27Output>,
 }
 
@@ -116,16 +111,6 @@ struct Q27Sharp {
 }
 
 #[derive(Debug, Deserialize)]
-struct ServeProfileRecord {
-    filename: String,
-    size: u64,
-    sha256: String,
-    profile_id: String,
-    schema: String,
-    schema_version: u32,
-}
-
-#[derive(Debug, Deserialize)]
 struct Q27Output {
     filename: String,
     size: u64,
@@ -140,7 +125,6 @@ struct NinferManifest {
     canonical_source_lineage_key: String,
     outputs: BTreeMap<String, NinferOutput>,
     sharp: NinferSharp,
-    serve_profile: ServeProfileRecord,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,62 +211,6 @@ struct BuildOutput {
     projector_key: Option<String>,
 }
 
-fn explicit_serve_profile(
-    root: &Path,
-    record: &ServeProfileRecord,
-) -> Result<(NortedPackageFile, ServeProfile), String> {
-    if record.schema != crate::SERVE_PROFILE_SCHEMA
-        || record.schema_version != crate::SERVE_PROFILE_SCHEMA_VERSION
-    {
-        return Err(format!(
-            "manifest binds unsupported Serve Profile schema {} v{}; rebuild this artifact with the current Norted Builder",
-            record.schema, record.schema_version
-        ));
-    }
-    let file = resolve_file(
-        root,
-        &record.filename,
-        Some(record.size),
-        &record.sha256,
-        true,
-    )?;
-    let (mut profile, observed_sha): (ServeProfile, _) = read_json(&file.path)?;
-    if observed_sha != file.sha256
-        || profile.id != record.profile_id
-        || profile.schema != record.schema
-        || profile.schema_version != record.schema_version
-    {
-        return Err("manifest Serve Profile binding disagrees with its sidecar".to_owned());
-    }
-    profile.validate()?;
-    if profile.source != ServeProfileSource::BuilderRecommended || !profile.read_only {
-        return Err("Builder Serve Profile must be builder_recommended and read-only".to_owned());
-    }
-    profile.source_profile_sha256 = Some(file.sha256.clone());
-    profile.resolve_builder_template(root)?;
-    Ok((file, profile))
-}
-
-fn require_recommended_profile_sharp_binding(
-    profile: &ServeProfile,
-    sharp: &NortedPackageFile,
-) -> Result<(), String> {
-    let template = profile
-        .prompt
-        .template
-        .as_ref()
-        .filter(|_| profile.prompt.mode == crate::PromptMode::ExternalTemplate);
-    if template
-        .is_none_or(|template| template.path != sharp.path || template.sha256 != sharp.sha256)
-    {
-        return Err(
-            "package Builder-recommended Serve Profile disagrees with manifest-bound Sharp; rebuild this artifact with the current Norted Builder"
-                .to_owned(),
-        );
-    }
-    Ok(())
-}
-
 pub(crate) fn discover_package_directory(
     root: &Path,
     format: ArtifactFormat,
@@ -315,14 +243,14 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
         .get("schema")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "Q27-MANIFEST schema must be an integer".to_owned())?;
-    if version != 5 {
+    if version != 6 {
         return Err(format!(
             "unsupported Norted q27 package schema {version}; rebuild this artifact with the current Norted Builder"
         ));
     }
     validate_lineage_value(&value["source_lineage"], "q27 package source lineage")?;
     let manifest: Q27Manifest = serde_json::from_value(value.clone())
-        .map_err(|error| format!("invalid Q27-MANIFEST v5: {error}"))?;
+        .map_err(|error| format!("invalid Q27-MANIFEST v6: {error}"))?;
     validate_sha(&manifest.source_lineage.key, "q27 source lineage key")?;
     let manifest_file = package_file_from_observed(&manifest_path, &manifest_sha)?;
     let tokenizer = resolve_file(
@@ -345,13 +273,7 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
         &manifest.sharp.template_sha256,
         true,
     )?;
-    let (profile_file, profile) = explicit_serve_profile(&root, &manifest.serve_profile)?;
-    require_recommended_profile_sharp_binding(&profile, &sharp)?;
-    require_distinct_files(&[
-        ("tokenizer", &tokenizer.path),
-        ("Sharp", &sharp.path),
-        ("Serve Profile", &profile_file.path),
-    ])?;
+    require_distinct_files(&[("tokenizer", &tokenizer.path), ("Sharp", &sharp.path)])?;
     let mut members = HashMap::new();
     let mut bound = HashSet::new();
     for (target, output) in &manifest.outputs {
@@ -378,7 +300,7 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
             &output.sha256,
             false,
         )?;
-        if [&tokenizer.path, &sharp.path, &profile_file.path].contains(&&primary.path)
+        if [&tokenizer.path, &sharp.path].contains(&&primary.path)
             || !bound.insert(primary.path.clone())
         {
             return Err(format!("q27 output `{target}` is ambiguously bound"));
@@ -386,7 +308,7 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
         let binding = NortedPackageBinding {
             kind: NortedPackageKind::Q27,
             manifest_schema: "norted.q27-manifest".to_owned(),
-            manifest_version: 5,
+            manifest_version: 6,
             package_root: root.clone(),
             manifest_path: manifest_path.clone(),
             manifest_sha256: manifest_sha.clone(),
@@ -397,8 +319,6 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
             master_id: None,
             quant_recipe_key: None,
             canonical_source_lineage_key: Some(manifest.source_lineage.key.clone()),
-            serve_profile: Some(profile_file.clone()),
-            recommended_serve_profile: Some(profile.clone()),
             sharp: Some(sharp.clone()),
             sharp_revision: Some(manifest.sharp.resolved_commit.clone()),
             sharp_version: Some(manifest.sharp.version.clone()),
@@ -408,7 +328,6 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
         let auxiliary = vec![
             as_auxiliary(&tokenizer, AuxiliaryArtifactRole::Tokenizer),
             as_auxiliary(&sharp, AuxiliaryArtifactRole::Sharp),
-            as_auxiliary(&profile_file, AuxiliaryArtifactRole::ServeProfile),
             as_auxiliary(&manifest_file, AuxiliaryArtifactRole::Manifest),
         ];
         members.insert(
@@ -440,13 +359,13 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
     if value.get("schema").and_then(serde_json::Value::as_str) != Some("norted.ninfer-manifest") {
         return Err("unsupported Norted NInfer manifest identity; rebuild this artifact with the current Norted Builder".to_owned());
     }
-    if version != 5 {
+    if version != 6 {
         return Err(format!(
             "unsupported Norted NInfer package schema v{version}; rebuild this artifact with the current Norted Builder"
         ));
     }
     let manifest: NinferManifest = serde_json::from_value(value)
-        .map_err(|error| format!("invalid NINFER-MANIFEST v5: {error}"))?;
+        .map_err(|error| format!("invalid NINFER-MANIFEST v6: {error}"))?;
     validate_sha(
         &manifest.canonical_source_lineage_key,
         "NInfer canonical source lineage key",
@@ -459,12 +378,7 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
         &manifest.sharp.sha256,
         true,
     )?;
-    let (profile_file, profile) = explicit_serve_profile(&root, &manifest.serve_profile)?;
-    require_recommended_profile_sharp_binding(&profile, &sharp)?;
-    require_distinct_files(&[
-        ("Sharp", &sharp.path),
-        ("Serve Profile", &profile_file.path),
-    ])?;
+    require_distinct_files(&[("Sharp", &sharp.path)])?;
     let mut members = HashMap::new();
     let mut bound = HashSet::new();
     for (key, output) in &manifest.outputs {
@@ -485,9 +399,7 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
             &output.artifact.sha256,
             false,
         )?;
-        if [&sharp.path, &profile_file.path].contains(&&primary.path)
-            || !bound.insert(primary.path.clone())
-        {
+        if primary.path == sharp.path || !bound.insert(primary.path.clone()) {
             return Err(format!("NInfer output `{key}` is ambiguously bound"));
         }
         let native = inspect_ninfer_container(&primary.path).map_err(|reason| {
@@ -506,7 +418,7 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
         let binding = NortedPackageBinding {
             kind: NortedPackageKind::Ninfer,
             manifest_schema: manifest.schema.clone(),
-            manifest_version: 5,
+            manifest_version: 6,
             package_root: root.clone(),
             manifest_path: manifest_path.clone(),
             manifest_sha256: manifest_sha.clone(),
@@ -517,8 +429,6 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
             master_id: None,
             quant_recipe_key: None,
             canonical_source_lineage_key: Some(manifest.canonical_source_lineage_key.clone()),
-            serve_profile: Some(profile_file.clone()),
-            recommended_serve_profile: Some(profile.clone()),
             sharp: Some(sharp.clone()),
             sharp_revision: Some(manifest.sharp.revision.clone()),
             sharp_version: Some(manifest.sharp.version.clone()),
@@ -527,7 +437,6 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
         };
         let auxiliary = vec![
             as_auxiliary(&sharp, AuxiliaryArtifactRole::Sharp),
-            as_auxiliary(&profile_file, AuxiliaryArtifactRole::ServeProfile),
             as_auxiliary(&manifest_file, AuxiliaryArtifactRole::Manifest),
         ];
         members.insert(
@@ -668,8 +577,6 @@ fn discover_gguf(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, 
                     .or_else(|| lineage.provider_recipe_key.clone())
             }),
             canonical_source_lineage_key: lineage_key,
-            serve_profile: None,
-            recommended_serve_profile: None,
             sharp: None,
             sharp_revision: None,
             sharp_version: None,

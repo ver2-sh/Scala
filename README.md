@@ -5,86 +5,117 @@ Norted Server is a terminal-first local inference control plane. It discovers lo
 The central distinction is:
 
 ```text
-engine        = adapter, compatibility rules, launch semantics, health, protocol translation
-runtime       = one concrete executable package: version + platform + architecture + backend
-serve profile = reusable prompt, generation, load, strategy, and capability recipe
-load settings = process-start configuration for loading/serving a model
-generation settings = request-time sampling/output behavior
+model artifact = one discovered physical GGUF, q27, or NInfer file
+engine         = adapter, compatibility rules, launch semantics, health, protocol translation
+runtime        = one concrete executable package and version
+settings       = Global and per-engine defaults
+Model Profile  = a user-owned serving target binding one artifact, one engine, and overrides
 ```
 
-A GGUF model is not permanently tied to llama.cpp, a Q27 model is not permanently tied to q27, and a NInfer container is not the NInfer executable itself. Selection happens among all installed runtimes whose registered engine can actually use the artifact. Today Norted ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp), [q27](https://github.com/signalnine/q27), and [NInfer](https://github.com/Neroued/ninfer).
+A GGUF model is not permanently tied to llama.cpp, a q27 model is not permanently tied to q27,
+and an NInfer container is not the NInfer executable itself. Model Profile creation uses registered
+engine compatibility, and exact runtime resolution remains separate from the profile. Today Norted
+ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp),
+[q27](https://github.com/signalnine/q27), and [NInfer](https://github.com/Neroued/ninfer).
+
+## Models, Settings, Model Profiles, and Runtimes
+
+- Models is artifact inventory: format, path, size, technical capability, and provenance.
+- Settings contains defaults at exactly Global, llama.cpp, NInfer, and q27 scopes.
+- Model Profiles are user-created mutable serving targets and the normal load unit.
+- Runtimes are installed executable implementations selected for the profile's bound engine.
+
+Two Model Profiles may bind the same artifact and carry different overrides. The active status and
+runtime provenance retain both the Model Profile ID and the underlying artifact Model ID. The
+OpenAI-compatible model alias is the loaded Model Profile ID, including `GET /v1/models` entries and
+the `model` value accepted by inference requests.
+
+Effective settings use one typed system with this complete precedence:
+
+```text
+Global defaults
+  → selected-engine defaults
+  → Model Profile overrides
+  → ephemeral invocation overrides
+```
+
+Request generation fields may override configured generation defaults when the exact adapter and
+runtime support them. There is no model-default layer and no post-resolution hidden policy. An
+omitted value emits no corresponding control when omission is the upstream/runtime default.
+
+Persistent state is deliberately split:
+
+```text
+<data>/settings.json         schema 1: Global and engine defaults
+<data>/model-profiles.json   schema 1: user-owned Model Profiles
+```
+
+Each has its own inter-process lock and atomic replacement. Older combined state is not consumed or
+deleted; recreate current settings and profiles explicitly.
 
 ## Norted Builder packages
 
-Model paths are served in place. When a configured search directory contains a Norted Builder `BUILD-MANIFEST.json`, `q27/Q27-MANIFEST.json`, or `ninfer/NINFER-MANIFEST.json`, discovery binds the declared primary artifacts to their exact tokenizer, projector, Sharp template, recommended `SERVE-PROFILE.json`, hashes, and canonical lineage. It does not copy, move, hardlink, or symlink those files into the Server data directory. `mmproj-F16.gguf` is retained as a projector auxiliary and is not listed as a language model.
+Model paths are served in place. Current q27 and NInfer Builder packages require manifest schema 6;
+schema 5 fails closed with rebuild guidance. GGUF package format is unchanged. Discovery binds
+genuine artifact members and provenance—primary hashes, tokenizer, projector, Sharp companion,
+lineage, and build facts—and performs the existing complete pre-prepare and final pre-spawn
+integrity verification.
 
-Claimed package directories fail closed: an unsupported schema, malformed or oversized JSON, unsafe relative path, symlink escape, missing file, size mismatch, sidecar hash mismatch, duplicate binding, lineage mismatch, or NInfer native-identity mismatch rejects the claimed artifacts instead of reverting to raw serving. Standalone GGUF, q27 plus tokenizer, and NInfer v2 files in directories without the corresponding Norted manifest keep the existing raw-artifact behavior.
+Builder packages contain no serving preset. Sharp is an artifact companion and is never selected
+automatically. A user may explicitly point a q27 Model Profile's external-template setting at the
+package Sharp file or any other compatible local template; both use identical path, size, and
+SHA-256 safety. Norted-built artifacts receive no special serving configuration or capability
+credit. A package artifact and an equivalent raw artifact expose the same controls when their
+observed technical capabilities match.
 
-Discovery parses at most 16 MiB per manifest/profile JSON, validates recorded primary sizes, hashes bounded sidecars, and retains the expected primary digest. The complete package primary is SHA-256 verified during explicit preparation and SHA-256 verified again immediately before every actual process launch. Sidecars are revalidated according to the package boundary. Runtime provenance retains artifact lineage separately from the effective Serve Profile.
+## Typed serving settings
 
-Artifact validity, artifact provenance, and the serving recipe are separate. Norted Builder makes the artifact. Norted Server executes a selected Serve Profile. A valid Norted artifact may use its recommended read-only Builder profile, a compatible user profile, or **None / Raw runtime defaults**. Disabling the recommendation preserves the transformed weights, lineage, associations, and integrity checks, but changes the serving recipe and is recorded as such. A raw compatible third-party artifact may also use a discovered Builder profile without acquiring Norted Builder lineage.
+Common and engine-specific settings share `SettingId`, `SettingValue`, `SettingDefinition`,
+`SettingsPatch`, `ResolvedSettings`, and setting-source attribution. Presentation categories are
+General, Load, Generation, Reasoning, Prompt, KV / Memory, Speculation, Cache, and Advanced. An
+engine or Model Profile editor shows common controls plus only that engine's namespace.
 
-For the current Dirk q27 Serve Profile, Server renders the exact profile-bound Sharp template locally and submits that pre-rendered raw prompt to q27's `/v1/completions` route, avoiding a second chat-template pass. Its response filter suppresses the initial reasoning block and closing control transition while preserving public answer text, finish reason, and usage. Bounded startup output proves the selected KV mode, served context, numeric compiled `W_MAX`, and thinking/MTP/fast-head recipe. KV selection follows the profile's ordered `fp8`, `turbo5k`, then `turbo3` strategy, restricted to modes proven for the exact executable; only a proven sub-minimum context result advances to the next supported mode. Official q27 v0.6.2 proves `fp8` and `turbo3` (not `turbo5k`) and numeric W8/W12/W16 `W_MAX`, but cannot satisfy Dirk Quality because its exact sampler contract lacks required top-k/min-p. It remains eligible for compatible raw q27 use. Unknown runtimes receive no capability credit from filename or version assumptions.
+q27 exposes ordinary settings for context/slots, generation samplers, thinking and budget,
+fast-head, KV mode, MTP depth/probability, suffix drafting and compiled-width behavior, external
+template path/hash and delivery, generation-prompt rendering, template thinking, the generic
+`strip_initial_reasoning` response filter, and prefix cache controls. Automatic q27 KV selection is
+the same server-owned quality sequence for every compatible q27 artifact, filtered by exact runtime
+proof. Selecting MTP, fast-head, a sampler, or an external template creates its capability
+requirement directly from that selected value.
 
-For an NInfer Serve Profile, the exact schema-18 `server_start` record can prove model/weights identity, public alias, GPU identity and compute capability, maximum context, physical KV capacity and type, CUDA graph state, prefix reuse, MTP/speculation strategy, and sampler defaults. The current exact managed runtime remains incompatible with Dirk Quality because applying its required external Sharp template is unsupported/unproven. Startup observation does not compensate for that missing pre-launch mechanism. Selecting None leaves a compatible NInfer artifact on its ordinary raw path.
+NInfer exposes direct settings for context/KV, CUDA Graph, prefix reuse, thinking, speculation,
+backend, draft tokens, optimized proposal head, samplers, and advanced cache controls. There is no
+nested named speculation abstraction. The exact source/runtime, native container v2 identity,
+schema-18 startup observation, DFlash restrictions, and current lack of external Sharp application
+remain authoritative.
 
-Model files continue to be served in place from configured `models.paths`; Norted creates no second model store. Package qualification never copies Builder artifacts or modifies Builder output.
+Structured path values have stable semantics. Absolute paths are used directly. Relative paths
+resolve lexically beneath Norted's `<data>` directory and cannot escape it with `..`. Resolution
+happens before inspection, validation, adapter translation, and provenance.
+Saving `q27.template_path` through the CLI or TUI automatically records the bounded file's
+`q27.template_sha256`; every load rereads the file and rejects a content mismatch.
 
-## Serve Profiles and load settings
-
-Serve Profiles are versioned typed recipes with identity/source, applicability, explicit prompt/template delivery, generation defaults and override permissions, typed load values, minimum requirements, engine-specific strategies, and exact-runtime capability requirements. Profiles constrain runtime qualification but never persist a runtime ID. Builder profiles are immutable distribution artifacts; they can be inspected, assigned to another compatible artifact, or forked into a mutable local profile.
-
-Load settings remain typed, stable Norted IDs. Common settings such as `context_length` and `parallel_requests` are engine-neutral; adapter-owned settings use namespaces such as `llama.cpp.kv_cache_k` and `q27.kv_fp16`. Raw upstream flag spellings remain adapter details. Generation defaults such as temperature, `top_p`, and reasoning effort belong to the Serve Profile and request values may override them only when that field is allowed. Chat `reasoning_effort` and Responses `reasoning.effort` reach external Sharp rendering only for a qualifying selected q27 profile; raw paths and other engines reject the value rather than ignoring it. A conflict with a profile requirement is rejected explicitly.
-
-Mutable state uses schema 3 at `<data>/serve-profiles.json`, outside `config.toml` and immutable runtime manifests. It stores Serve Profiles directly; obsolete `load-profiles.json` is not consumed. Recreate local profiles and defaults manually. Writes use an inter-process lock and atomic replacement. One model may select a local or Builder profile, explicitly select None, or inherit its Builder recommendation. Load resolution is:
-
-```text
-global defaults
-  → selected-engine defaults
-  → model defaults
-  → selected Serve Profile load defaults
-  → invocation --set overrides
-```
-
-Profile minimums and locked values are constraints after that precedence chain, not another overwrite layer. Generation resolution is runtime defaults, then profile defaults, then an allowed request override. Runtime selection evaluates the model, exact runtime evidence, and selected Serve Profile together, so selecting None may admit runtimes that cannot implement a richer profile.
-
-Global defaults accept only common IDs. Engine defaults accept common IDs and that engine's namespace. Model defaults and profiles retain settings for multiple engines; only common settings and the selected engine's namespace apply to one launch. `--profile` replaces the persisted model assignment for that load, and repeated `--set` values are ephemeral.
-
-Omission is significant: if no layer sets a value, Norted emits no corresponding argument and the exact upstream runtime uses its own current default. Clearing a value removes it from that layer and falls through. Known upstream defaults are descriptions, not Norted launch values.
-
-Before launch, the adapter validates the resolved values against the exact executable. llama.cpp observations come from that runtime's `--help` and are cached by runtime ID plus entrypoint SHA-256. q27 uses its exact usage signature plus managed-version gates. A structured setting conflicts explicitly with an equivalent native argument (`--flag value` or `--flag=value`) or environment variable rather than relying on ordering. Native arguments remain available when no structured setting owns the same option.
-
-Initial llama.cpp settings are `context_length`, `parallel_requests`, `llama.cpp.threads`, `llama.cpp.batch_size`, `llama.cpp.micro_batch_size`, `llama.cpp.gpu_offload` (`none`, `auto`, `all`, or an exact layer count), `llama.cpp.flash_attention`, separate `llama.cpp.kv_cache_k`/`llama.cpp.kv_cache_v`, and the single semantic `llama.cpp.load_mode`. Its choices are the Norted-understood modes actually advertised by the selected runtime's `--load-mode` help; older runtimes without that contract mark the setting unsupported. An explicit value emits one `--load-mode` option, while omission emits nothing. When configured, it owns the modern option, deprecated mmap/mlock/direct-I/O aliases, and all equivalent llama environment controls, so another input cannot change the effective mode.
-
-Initial q27 settings are `context_length`, `parallel_requests`, one-way `q27.kv_fp16`, two-sided `q27.fast_head`, and the current persistent prefix-cache path/disk/token-step/RAM controls. Explicit context length accepts any positive integer; automatic VRAM-sizing floors are not applied to an explicit value. For managed runtimes, `parallel_requests` is bounded by the selected version's proven conductor limit: 4 through v0.3.0 and 8 from v0.3.1 while that known contract remains applicable. An external q27 usage signature does not prove a ceiling, so Norted enforces only the positive minimum and passes the requested value unchanged. Unsupported exact-runtime contracts remain visible but fail validation rather than being ignored.
-
-Initial NInfer settings include common `context_length` and `parallel_requests` (1–8), plus `ninfer.kv_dtype`, typed integer-or-`auto` `ninfer.kv_capacity`, `ninfer.prefill_chunk`, startup cache capacities, thinking/cache/CUDA-graph flags, and explicit speculative controls. Speculation remains off/upstream-owned when omitted. Selecting MTP requires 1–5 draft tokens; selecting DFlash requires 1–15 and is accepted only for the exact `qwen3.6-35b-a3b/groupwise-int` text target. `ninfer.lm_head_draft` requires an explicit speculative backend. Every mapped option must be advertised by the selected executable's exact `--help` observation.
-
-Structured path values have stable engine-neutral semantics. Absolute paths are used directly. Relative paths resolve lexically beneath Norted's `<data>` directory, do not require the target to exist, and cannot escape that base with `..`; use an absolute path for another location. Resolution happens before effective inspection and adapter translation, so `settings show`, the TUI, the launch argument, and load-settings provenance all contain the same effective path regardless of the server process's working directory.
-
-All commands honor global `--json`. The scriptable management surface is:
+All commands honor global `--json`. The scriptable management surface includes:
 
 ```console
-norted-server profiles list
-norted-server profiles show|create|delete <NAME>
-norted-server profiles duplicate <SOURCE> <NAME>
-norted-server profiles set <NAME> <ID=VALUE>...
-norted-server profiles unset <NAME> <ID>...
-norted-server profiles set-generation <NAME> <FIELD=VALUE>...
-norted-server profiles set-prompt-runtime-default <NAME>
-norted-server profiles set-prompt-external <NAME> --template <PATH> --template-id <ID> --template-sha256 <SHA256>
-norted-server profiles assign --model <MODEL_ID> <NAME>
-norted-server profiles clear-assignment --model <MODEL_ID>     # explicit None/raw defaults
-norted-server profiles use-recommended --model <MODEL_ID>
-norted-server profiles compatibility <NAME> --model <MODEL_ID> [--runtime <RUNTIME_ID>]
-norted-server settings set --global <ID=VALUE>...
-norted-server settings unset --global <ID>...
-norted-server settings set --engine llama.cpp <ID=VALUE>...
-norted-server settings unset --engine llama.cpp <ID>...
-norted-server settings set --model <MODEL_ID> <ID=VALUE>...
-norted-server settings unset --model <MODEL_ID> <ID>...
-norted-server settings schema --model <MODEL_ID> [--runtime <RUNTIME_ID>]
-norted-server settings show --model <MODEL_ID> [--runtime <RUNTIME_ID>] [--profile <NAME>]
+norted-server model-profiles list
+norted-server model-profiles show <PROFILE>
+norted-server model-profiles create <PROFILE> --model <MODEL_ID> --engine <ENGINE_ID>
+norted-server model-profiles duplicate <SOURCE> <PROFILE>
+norted-server model-profiles delete <PROFILE>
+norted-server model-profiles set-model <PROFILE> <MODEL_ID>
+norted-server model-profiles set-engine <PROFILE> <ENGINE_ID>
+norted-server model-profiles set <PROFILE> <SETTING=VALUE>...
+norted-server model-profiles unset <PROFILE> <SETTING>...
+norted-server model-profiles load <PROFILE> [--runtime <RUNTIME_ID>] [--set <SETTING=VALUE>...]
+norted-server model-profiles compatibility <PROFILE> [--runtime <RUNTIME_ID>]
+norted-server load <PROFILE> [--runtime <RUNTIME_ID>] [--set <SETTING=VALUE>...]
+norted-server settings show --global
+norted-server settings set --global <SETTING=VALUE>...
+norted-server settings unset --global <SETTING>...
+norted-server settings show --engine q27
+norted-server settings set --engine q27 <SETTING=VALUE>...
+norted-server settings unset --engine q27 <SETTING>...
 ```
 
 ## Runtime packs
@@ -217,12 +248,12 @@ norted-server
 ├── status
 ├── auth status
 ├── auth keys list|create|revoke
-├── load <MODEL_ID> [--runtime <RUNTIME_ID>] [--profile <NAME>] [--set <ID=VALUE>]...
+├── load <MODEL_PROFILE_ID> [--runtime <RUNTIME_ID>] [--set <ID=VALUE>]...
 ├── unload
 ├── models list|info <MODEL_ID>
 ├── runtimes ...
-├── profiles list|show|create|duplicate|delete|set|unset|set-generation|set-prompt-*|assign|clear-assignment|use-recommended|compatibility
-├── settings show|schema|set|unset
+├── model-profiles list|show|create|duplicate|delete|set-model|set-engine|set|unset|load|compatibility
+├── settings show|set|unset
 ├── engines list       # low-level adapter diagnostics
 ├── config show
 └── doctor
@@ -280,13 +311,12 @@ cargo run -p norted-server -- serve
 Scriptable management commands remain clients of a running instance. With headless `serve` running, another terminal can use:
 
 ```console
-cargo run -p norted-server -- load <MODEL_ID>
-cargo run -p norted-server -- profiles create coding-large-context
-cargo run -p norted-server -- profiles set coding-large-context context_length=131072 llama.cpp.kv_cache_k=q8_0
-cargo run -p norted-server -- profiles assign --model <MODEL_ID> coding-large-context
-cargo run -p norted-server -- profiles clear-assignment --model <MODEL_ID> # None/raw defaults
-cargo run -p norted-server -- settings show --model <MODEL_ID>
-cargo run -p norted-server -- load <MODEL_ID> --set parallel_requests=2
+cargo run -p norted-server -- model-profiles create coding-large-context --model <MODEL_ID> --engine llama.cpp
+cargo run -p norted-server -- model-profiles set coding-large-context context_length=131072 llama.cpp.kv_cache_k=q8_0
+cargo run -p norted-server -- model-profiles compatibility coding-large-context
+cargo run -p norted-server -- load coding-large-context
+cargo run -p norted-server -- load coding-large-context --set parallel_requests=2
+cargo run -p norted-server -- settings show --engine llama.cpp
 cargo run -p norted-server -- status
 cargo run -p norted-server -- unload
 ```
@@ -306,9 +336,9 @@ cargo run -p norted-server -- tui
 
 At startup the TUI safely chooses one of two modes: it attaches to a healthy instance discovered through the existing runtime descriptor, public identity probe, and authenticated private control `status`, or it starts and owns the same serving composition used by headless `serve`. In owned mode the configured OpenAI-compatible endpoint is live while the TUI runs. Exiting shuts down the owned listeners and active backend and removes the owned descriptor; exiting an attached TUI leaves the external server running.
 
-Its top-level pages are Overview, Models, Runtimes, Server, Logs, Settings, and Help. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Installed source-runtime details include short commit/tree, recipe, Make or CMake, and CUDA provenance.
+Its top-level pages are Overview, Models, Model Profiles, Runtimes, Server, Logs, Settings, and Help. Models is artifact inventory and creates profiles rather than loading raw artifacts. Model Profiles lists, creates, duplicates, deletes, rebinds, edits, validates, and loads user serving targets; it displays missing/incompatible state, active identity, and inherited versus overridden values. Settings shows only Global and engine defaults. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Installed source-runtime details include short commit/tree, recipe, Make or CMake, and CUDA provenance.
 
-Owned startup establishes the serving and authenticated control stack without waiting for complete local model discovery. The TUI promptly draws its pending first frame, then starts model discovery asynchronously; the existing NotScanned, Scanning, Ready/Ready with warnings, and Failed registry states report real progress. While discovery is pending, the public model list contains only artifacts actually registered so far (normally none), and Load cannot admit a model until it exists in the discovered registry. Headless `serve` continues to complete discovery before announcing that it is listening. Neither interactive path performs catalog network I/O merely to start. Settings is a schema-driven editor for global/engine defaults and Serve Profiles. Model details expose artifact format/source, recommended and selected profiles, canonical/custom/None status, prompt delivery/template, generation defaults, load values, engine strategy, requirements, and exact-runtime compatibility. Enter edits or cycles, Delete clears the current layer, and `f` forks a read-only Builder profile into a mutable local copy. From Models, `p` opens the same model-specific profile/default/runtime inspection. Runtime help/usage probing runs in the background. Keyboard, mouse/wheel navigation, narrow layout, `NO_COLOR`, and configured ASCII mode remain supported. Edits never hot-mutate a running backend and apply on its next load.
+Owned startup establishes the serving and authenticated control stack without waiting for complete local model discovery. The TUI promptly draws its pending first frame, then starts model discovery asynchronously; the existing NotScanned, Scanning, Ready/Ready with warnings, and Failed registry states report real progress. A Model Profile cannot load until its exact bound artifact is discovered. Headless `serve` continues to complete discovery before announcing that it is listening. Neither interactive path performs catalog network I/O merely to start. The editor shows only common settings plus the bound engine namespace, and clearing an override restores inheritance. Runtime help/usage probing runs in the background. Keyboard, mouse/wheel navigation, narrow layout, `NO_COLOR`, and configured ASCII mode remain supported. Edits never hot-mutate a running backend and apply on its next load.
 
 When a model is loading, the TUI shows a polished model-loading progress bar on the Models, Server, and Overview screens. Progress is engine-neutral and flows through the same private control status used by both owned and attached TUI modes. Percentages are shown only when the exact runtime exposes trustworthy measurable progress; otherwise the TUI shows an animated indeterminate bar with meaningful phase text (for example, selecting runtime, revalidating a package, spawning the backend, or verifying startup). Engine-specific log parsing stays inside each adapter; the generic manager owns the progress state. While loading, the TUI polls control status at approximately 200 ms and runs a lightweight render tick for animation; its local admission intent remains fast until the accepted generation is authoritatively observed, then Loading itself keeps the fast cadence. Once loading finishes it returns to the existing slower, event-driven cadence.
 
@@ -432,7 +462,7 @@ Example:
 curl http://127.0.0.1:8742/v1/responses \
   -H "Authorization: Bearer $NORTED_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"<MODEL_ID>","input":"Reply with exactly: Norted works."}'
+  -d '{"model":"<MODEL_PROFILE_ID>","input":"Reply with exactly: Norted works."}'
 ```
 
 Chat uses the same key:
