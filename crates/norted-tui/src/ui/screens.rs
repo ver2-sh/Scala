@@ -1126,6 +1126,9 @@ fn render_settings(
             "unsupported"
         };
         let label = match &definition.kind {
+            norted_core::LoadSettingKind::Choice { choices } if choices.is_empty() => {
+                format!("{} [text]", definition.label)
+            }
             norted_core::LoadSettingKind::Choice { choices } => {
                 format!("{} [{}]", definition.label, choices.join("|"))
             }
