@@ -16,6 +16,7 @@ use norted_engine::{
 };
 use norted_engine_llama_cpp::{
     ENGINE_ID as LLAMA_CPP_ENGINE_ID, LlamaCppAdapter, LlamaCppRuntimeCatalogProvider,
+    LlamaCppSourceRuntimeCatalogProvider,
 };
 use norted_engine_ninfer::{
     ENGINE_ID as NINFER_ENGINE_ID, NinferAdapter, NinferRuntimeCatalogProvider,
@@ -109,6 +110,7 @@ pub fn runtime_pack_manager(
 ) -> Result<Arc<RuntimePackManager>> {
     let providers: Vec<Arc<dyn RuntimeCatalogProvider>> = vec![
         Arc::new(LlamaCppRuntimeCatalogProvider::new()),
+        Arc::new(LlamaCppSourceRuntimeCatalogProvider::new()),
         Arc::new(Q27RuntimeCatalogProvider::new()),
         Arc::new(NinferRuntimeCatalogProvider::new()),
     ];

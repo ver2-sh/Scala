@@ -985,8 +985,9 @@ pub async fn detect_host_capabilities() -> HostCapabilities {
                     )
                 });
             } else {
+                host.nvidia_gpu_absence_confirmed = true;
                 host.observations
-                    .push("nvidia-smi returned an unexpected result".to_owned());
+                    .push("nvidia-smi confirmed that no NVIDIA GPU is available".to_owned());
             }
         }
         Ok(Ok(_)) => host
@@ -1104,9 +1105,15 @@ pub fn compatibility_for(
             .filter(|device| device.accelerator.eq_ignore_ascii_case("cuda"))
             .collect::<Vec<_>>();
         if nvidia.is_empty() {
-            return RuntimeCompatibility::NeedsAttention(
-                "requires an NVIDIA GPU; nvidia-smi did not confirm one".to_owned(),
-            );
+            return if host.nvidia_gpu_absence_confirmed {
+                RuntimeCompatibility::Incompatible(
+                    "requires an NVIDIA GPU; nvidia-smi confirmed none is available".to_owned(),
+                )
+            } else {
+                RuntimeCompatibility::NeedsAttention(
+                    "requires an NVIDIA GPU; nvidia-smi did not confirm one".to_owned(),
+                )
+            };
         }
         return nvidia
             .into_iter()
@@ -1553,6 +1560,7 @@ mod tests {
                 driver_version: None,
                 compute_capability: None,
             }],
+            nvidia_gpu_absence_confirmed: false,
             cuda_visible_devices: None,
             observations: Vec::new(),
         };
@@ -1589,6 +1597,7 @@ mod tests {
                 driver_version: None,
                 compute_capability: None,
             }],
+            nvidia_gpu_absence_confirmed: false,
             cuda_visible_devices: None,
             observations: Vec::new(),
         };
@@ -1752,7 +1761,7 @@ mod tests {
                 },
                 prerequisites: RuntimeSourceBuildPrerequisites {
                     minimum_cmake_version: "3.28".to_owned(),
-                    minimum_cuda_version: "13.1".to_owned(),
+                    minimum_cuda_version: Some("13.1".to_owned()),
                     requires_ninja: true,
                     requires_cpp20_compiler: true,
                     requires_make: false,

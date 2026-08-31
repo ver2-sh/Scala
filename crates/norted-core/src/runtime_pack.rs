@@ -316,7 +316,10 @@ pub enum RuntimeSourceBuildSystem {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeSourceBuildPrerequisites {
     pub minimum_cmake_version: String,
-    pub minimum_cuda_version: String,
+    /// Minimum CUDA Toolkit version published by the source contract. `None`
+    /// still requires a working nvcc, but does not invent an upstream floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_cuda_version: Option<String>,
     pub requires_ninja: bool,
     pub requires_cpp20_compiler: bool,
     #[serde(default)]
@@ -710,6 +713,10 @@ pub struct HostCapabilities {
     pub platform: String,
     pub architecture: String,
     pub accelerators: Vec<AcceleratorDevice>,
+    /// A successful NVIDIA probe positively established that no device is
+    /// available. False means absence is unproven, not that a GPU exists.
+    #[serde(default)]
+    pub nvidia_gpu_absence_confirmed: bool,
     /// Parent CUDA visibility captured with the hardware observation. Engines
     /// that bind CUDA devices must reconcile this deliberately.
     pub cuda_visible_devices: Option<String>,
@@ -722,6 +729,7 @@ impl HostCapabilities {
             platform: std::env::consts::OS.to_owned(),
             architecture: std::env::consts::ARCH.to_owned(),
             accelerators: Vec::new(),
+            nvidia_gpu_absence_confirmed: false,
             cuda_visible_devices: std::env::var("CUDA_VISIBLE_DEVICES").ok(),
             observations: Vec::new(),
         }
@@ -938,7 +946,10 @@ fn validate_source_build_plan(
     if (recipe.build_system == RuntimeSourceBuildSystem::Cmake
         && prerequisites.minimum_cmake_version.trim().is_empty())
         || (recipe.build_system == RuntimeSourceBuildSystem::Make && !prerequisites.requires_make)
-        || prerequisites.minimum_cuda_version.trim().is_empty()
+        || prerequisites
+            .minimum_cuda_version
+            .as_deref()
+            .is_some_and(|version| version.trim().is_empty())
         || prerequisites
             .minimum_cpp_standard
             .is_some_and(|standard| standard < 11)

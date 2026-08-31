@@ -1,8 +1,12 @@
 //! llama.cpp-specific launch, probe, health, and inference translation.
 
 mod catalog;
+mod source_catalog;
 
 pub use catalog::{LLAMA_CPP_RUNTIME_PROVIDER_ID, LlamaCppRuntimeCatalogProvider};
+pub use source_catalog::{
+    LLAMA_CPP_SOURCE_RUNTIME_PROVIDER_ID, LlamaCppSourceRuntimeCatalogProvider,
+};
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
@@ -542,6 +546,24 @@ impl EngineAdapter for LlamaCppAdapter {
         })
     }
 
+    fn runtime_model_preference(
+        &self,
+        runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        host: &HostCapabilities,
+    ) -> u16 {
+        llama_runtime_preference(&runtime.manifest.identity.accelerator, host)
+    }
+
+    fn available_runtime_model_preference(
+        &self,
+        runtime: &AvailableRuntime,
+        _model: &ModelArtifact,
+        host: &HostCapabilities,
+    ) -> u16 {
+        llama_runtime_preference(&runtime.identity.accelerator, host)
+    }
+
     fn native_options(&self) -> Vec<NativeOption> {
         vec![NativeOption {
             name: "arguments".to_owned(),
@@ -966,6 +988,19 @@ impl EngineAdapter for LlamaCppAdapter {
             return Err(backend_http_error(status, &body));
         }
         Ok(llama_sse_stream(response.bytes_stream().boxed()))
+    }
+}
+
+fn llama_runtime_preference(accelerator: &str, host: &HostCapabilities) -> u16 {
+    let has_nvidia = host
+        .accelerators
+        .iter()
+        .any(|device| device.accelerator.eq_ignore_ascii_case("cuda"));
+    match (has_nvidia, accelerator) {
+        (true, "cuda") | (false, "cpu") => 0,
+        (_, "vulkan") => 10,
+        (true, "cpu") | (false, "cuda") => 20,
+        _ => 100,
     }
 }
 
