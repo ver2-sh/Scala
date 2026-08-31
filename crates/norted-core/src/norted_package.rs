@@ -574,6 +574,7 @@ fn q27_serve_profile_from_legacy(
         engine: ServeEngineProfiles {
             q27: Some(Q27ServeStrategy {
                 mtp: Q27MtpStrategy {
+                    enabled: policy.mtp.enabled,
                     required: policy.mtp.required,
                     depth_policy: policy.mtp.runtime_depth_policy.clone(),
                     maximum_depth: policy.mtp.adaptive.maximum_depth.clone(),

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -52,11 +53,29 @@ impl Q27Tier {
             Self::Qwen36Q8 => 48,
         }
     }
+
+    pub(crate) fn family(self) -> &'static str {
+        match self {
+            Self::Qwen36Default
+            | Self::Qwen36Q4s
+            | Self::Qwen36Q5f
+            | Self::Qwen36Q6
+            | Self::Qwen36Q6f
+            | Self::Qwen36Q6k
+            | Self::Qwen36Q8 => "qwen3.6-27b",
+            Self::Qwen38Default | Self::Qwen38Q4s | Self::Qwen38Q6 | Self::Qwen38Q6k => {
+                "qwen3.8-27b"
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Q27ModelFacts {
     pub(crate) tier: Option<Q27Tier>,
+    pub(crate) architecture: &'static str,
+    pub(crate) family: Option<&'static str>,
+    pub(crate) capabilities: BTreeSet<&'static str>,
 }
 
 pub(crate) fn inspect_q27_model(path: &Path) -> Result<Q27ModelFacts, String> {
@@ -103,8 +122,12 @@ pub(crate) fn inspect_q27_model(path: &Path) -> Result<Q27ModelFacts, String> {
         .as_object()
         .ok_or_else(|| "Q27 metadata JSON must be an object".to_owned())?;
     validate_current_architecture(metadata)?;
+    let tier = published_tier(metadata);
     Ok(Q27ModelFacts {
-        tier: published_tier(metadata),
+        tier,
+        architecture: "qwen35",
+        family: tier.map(Q27Tier::family),
+        capabilities: BTreeSet::from(["mtp_layer_1", "text_only"]),
     })
 }
 

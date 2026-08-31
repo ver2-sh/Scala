@@ -22,7 +22,8 @@ use norted_engine::{
 
 use app::{
     App, ControlAction, ModelSettingsInspection, RuntimeAction, RuntimeTaskResult, SettingsAction,
-    SettingsScope, SettingsTaskResult, Update,
+    SettingsScope, SettingsTaskResult, Update, apply_serve_profile_editor_value,
+    is_serve_profile_editor_field,
 };
 use terminal::TerminalSession;
 use ui::layout::UiLayout;
@@ -368,12 +369,18 @@ async fn execute_settings_action(
                                 .insert(id, value);
                         }
                         SettingsScope::Profile(profile) => {
-                            state
+                            let local = state
                                 .profiles
                                 .get_mut(&profile)
-                                .ok_or_else(|| LoadSettingsError::ProfileNotFound(profile.clone()))?
-                                .settings
-                                .insert(id, value);
+                                .ok_or_else(|| LoadSettingsError::ProfileNotFound(profile.clone()))?;
+                            if is_serve_profile_editor_field(&id) {
+                                let serve = local.serve_profile.get_or_insert_with(|| {
+                                    norted_core::ServeProfile::local(profile.as_str())
+                                });
+                                apply_serve_profile_editor_value(serve, &id, Some(value))?;
+                            } else {
+                                local.settings.insert(id, value);
+                            }
                         }
                         SettingsScope::BuilderProfile(profile_id) => {
                             return Err(LoadSettingsError::InvalidServeProfile(format!(
@@ -404,11 +411,18 @@ async fn execute_settings_action(
                             state.engine_defaults.entry(engine).or_default()
                         }
                         SettingsScope::Profile(profile) => {
-                            &mut state
+                            let local = state
                                 .profiles
                                 .get_mut(&profile)
-                                .ok_or_else(|| LoadSettingsError::ProfileNotFound(profile.clone()))?
-                                .settings
+                                .ok_or_else(|| LoadSettingsError::ProfileNotFound(profile.clone()))?;
+                            if is_serve_profile_editor_field(&id) {
+                                let serve = local.serve_profile.get_or_insert_with(|| {
+                                    norted_core::ServeProfile::local(profile.as_str())
+                                });
+                                apply_serve_profile_editor_value(serve, &id, None)?;
+                                return Ok(state.clone());
+                            }
+                            &mut local.settings
                         }
                         SettingsScope::BuilderProfile(profile_id) => {
                             return Err(LoadSettingsError::InvalidServeProfile(format!(

@@ -4,11 +4,13 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use norted_core::{
-    AppEvent, AppSnapshot, ArtifactFormat, LoadProfileName, LoadProfilesState,
-    LoadSettingDefinition, LoadSettingId, LoadSettingScope, LoadSettingSource, LoadSettingValue,
-    LoadSettingsSchema, LogLevel, ModelArtifact, ModelId, PublicAuthStatus, RegistryState,
-    ResolvedLoadSettings, RuntimeCompatibility, RuntimeId, RuntimeOperationPhase,
-    RuntimeOperationProgress, RuntimeUpdateState,
+    AppEvent, AppSnapshot, ArtifactFormat, ExternalTemplateReference, LoadProfileName,
+    LoadProfilesState, LoadSettingDefinition, LoadSettingId, LoadSettingKind, LoadSettingScope,
+    LoadSettingSource, LoadSettingValue, LoadSettingsError, LoadSettingsSchema, LogLevel,
+    ModelArtifact, ModelId, PromptDelivery, PromptMode, PublicAuthStatus, RegistryState,
+    ResolvedLoadSettings, ResponseFilter, RuntimeCompatibility, RuntimeId, RuntimeOperationPhase,
+    RuntimeOperationProgress, RuntimeUpdateState, ServeProfile, ServeProfileSource,
+    ServePromptProfile,
 };
 use norted_engine::{
     BackendLifecycle, BackendLoadProgress, ControlStatus, RuntimeListSnapshot,
@@ -295,6 +297,7 @@ pub struct App {
     pub load_profiles_error: Option<String>,
     pub load_profiles_loading: bool,
     pub load_setting_definitions: Vec<LoadSettingDefinition>,
+    serve_profile_definitions: Vec<LoadSettingDefinition>,
     pub settings_scope_index: usize,
     pub settings_setting_index: usize,
     pub settings_scroll: usize,
@@ -390,6 +393,7 @@ impl App {
             load_profiles_error: None,
             load_profiles_loading: true,
             load_setting_definitions,
+            serve_profile_definitions: serve_profile_editor_definitions(),
             settings_scope_index: 0,
             settings_setting_index: 0,
             settings_scroll: 0,
@@ -805,6 +809,16 @@ impl App {
 
     pub fn settings_definitions(&self) -> Vec<&LoadSettingDefinition> {
         let scope = self.selected_settings_scope();
+        if matches!(
+            scope,
+            Some(SettingsScope::Profile(_) | SettingsScope::BuilderProfile(_))
+        ) {
+            return self
+                .serve_profile_definitions
+                .iter()
+                .chain(self.load_setting_definitions.iter())
+                .collect();
+        }
         let source = if matches!(scope, Some(SettingsScope::Model(_))) {
             self.settings_schema
                 .as_ref()
@@ -842,6 +856,30 @@ impl App {
                 false,
             );
         };
+        if is_serve_profile_editor_field(id) {
+            let profile = match &scope {
+                SettingsScope::Profile(name) => state
+                    .profiles
+                    .get(name)
+                    .map(|profile| profile.effective_serve_profile(name)),
+                SettingsScope::BuilderProfile(profile_id) => {
+                    self.builder_serve_profile(profile_id).cloned()
+                }
+                SettingsScope::Global | SettingsScope::Engine(_) | SettingsScope::Model(_) => None,
+            };
+            return profile.map_or_else(
+                || ("<not set>".to_owned(), "Serve Profile".to_owned(), false),
+                |profile| {
+                    (
+                        serve_profile_editor_value(&profile, id)
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "<runtime default>".to_owned()),
+                        profile.source.to_string(),
+                        !profile.read_only,
+                    )
+                },
+            );
+        }
         let current = match &scope {
             SettingsScope::Global => state.global_defaults.0.get(id),
             SettingsScope::Engine(engine) => state
@@ -1854,7 +1892,7 @@ impl App {
                 }));
             return Update::Render;
         }
-        let current = self.current_layer_value(&definition.id).cloned();
+        let current = self.current_layer_value(&definition.id);
         match &definition.kind {
             norted_core::LoadSettingKind::Toggle => {
                 let value = !matches!(current, Some(LoadSettingValue::Toggle(true)));
@@ -1915,16 +1953,31 @@ impl App {
         self.queue_settings_action(SettingsAction::Unset { scope, id })
     }
 
-    fn current_layer_value(&self, id: &LoadSettingId) -> Option<&LoadSettingValue> {
+    fn current_layer_value(&self, id: &LoadSettingId) -> Option<LoadSettingValue> {
         let state = self.load_profiles.as_ref()?;
+        if is_serve_profile_editor_field(id) {
+            return match self.selected_settings_scope()? {
+                SettingsScope::Profile(name) => state
+                    .profiles
+                    .get(&name)
+                    .map(|profile| profile.effective_serve_profile(&name))
+                    .and_then(|profile| serve_profile_editor_value(&profile, id)),
+                SettingsScope::BuilderProfile(profile_id) => self
+                    .builder_serve_profile(&profile_id)
+                    .and_then(|profile| serve_profile_editor_value(profile, id)),
+                SettingsScope::Global | SettingsScope::Engine(_) | SettingsScope::Model(_) => None,
+            };
+        }
         match self.selected_settings_scope()? {
-            SettingsScope::Global => state.global_defaults.0.get(id),
-            SettingsScope::Engine(engine) => state.engine_defaults.get(&engine)?.0.get(id),
-            SettingsScope::Profile(profile) => state.profiles.get(&profile)?.settings.0.get(id),
+            SettingsScope::Global => state.global_defaults.0.get(id).cloned(),
+            SettingsScope::Engine(engine) => state.engine_defaults.get(&engine)?.0.get(id).cloned(),
+            SettingsScope::Profile(profile) => {
+                state.profiles.get(&profile)?.settings.0.get(id).cloned()
+            }
             SettingsScope::BuilderProfile(profile_id) => self
                 .builder_serve_profile(&profile_id)
-                .and_then(|profile| profile.load.settings.0.get(id)),
-            SettingsScope::Model(model) => state.model_defaults.get(&model)?.0.get(id),
+                .and_then(|profile| profile.load.settings.0.get(id).cloned()),
+            SettingsScope::Model(model) => state.model_defaults.get(&model)?.0.get(id).cloned(),
         }
     }
 
@@ -3142,6 +3195,357 @@ impl App {
     }
 }
 
+const PROFILE_TEMPERATURE: &str = "profile.generation.temperature";
+const PROFILE_TOP_P: &str = "profile.generation.top_p";
+const PROFILE_TOP_K: &str = "profile.generation.top_k";
+const PROFILE_MIN_P: &str = "profile.generation.min_p";
+const PROFILE_REASONING_EFFORT: &str = "profile.generation.reasoning_effort";
+const PROFILE_THINKING_DEFAULT: &str = "profile.generation.thinking_default";
+const PROFILE_THINKING_REQUIRED: &str = "profile.generation.thinking_required";
+const PROFILE_ALLOWED_OVERRIDES: &str = "profile.generation.allowed_request_overrides";
+const PROFILE_PROMPT_MODE: &str = "profile.prompt.mode";
+const PROFILE_EXTERNAL_TEMPLATE: &str = "profile.prompt.external_template";
+const PROFILE_RENDER_GENERATION_PROMPT: &str = "profile.prompt.render_generation_prompt";
+const PROFILE_TEMPLATE_THINKING: &str = "profile.prompt.thinking_enabled";
+const PROFILE_RESPONSE_FILTER: &str = "profile.prompt.response_filter";
+
+fn serve_profile_editor_definitions() -> Vec<LoadSettingDefinition> {
+    let definition = |id: &str,
+                      label: &str,
+                      description: &str,
+                      kind: LoadSettingKind,
+                      upstream_default: &str| LoadSettingDefinition {
+        id: LoadSettingId::new(id).expect("static Serve Profile editor setting ID is valid"),
+        label: label.to_owned(),
+        description: description.to_owned(),
+        kind,
+        scope: LoadSettingScope::Common,
+        supported: true,
+        unsupported_reason: None,
+        unit: None,
+        upstream_default: Some(upstream_default.to_owned()),
+        recommendation: None,
+    };
+    vec![
+        definition(
+            PROFILE_TEMPERATURE,
+            "Profile temperature",
+            "Optional Serve Profile generation default",
+            LoadSettingKind::Float {
+                minimum: Some(0.0),
+                maximum: None,
+            },
+            "runtime default",
+        ),
+        definition(
+            PROFILE_TOP_P,
+            "Profile top-p",
+            "Optional Serve Profile nucleus-sampling default",
+            LoadSettingKind::Float {
+                minimum: Some(0.0),
+                maximum: Some(1.0),
+            },
+            "runtime default",
+        ),
+        definition(
+            PROFILE_TOP_K,
+            "Profile top-k",
+            "Optional Serve Profile top-k default",
+            LoadSettingKind::UnsignedInteger {
+                minimum: None,
+                maximum: None,
+            },
+            "runtime default",
+        ),
+        definition(
+            PROFILE_MIN_P,
+            "Profile min-p",
+            "Optional Serve Profile minimum-probability default",
+            LoadSettingKind::Float {
+                minimum: Some(0.0),
+                maximum: Some(1.0),
+            },
+            "runtime default",
+        ),
+        definition(
+            PROFILE_REASONING_EFFORT,
+            "Profile reasoning effort",
+            "Optional reasoning-effort default passed by the Serve Profile",
+            LoadSettingKind::String,
+            "runtime default",
+        ),
+        definition(
+            PROFILE_THINKING_DEFAULT,
+            "Profile thinking default",
+            "Select the effective thinking state",
+            LoadSettingKind::Toggle,
+            "false",
+        ),
+        definition(
+            PROFILE_THINKING_REQUIRED,
+            "Profile thinking required",
+            "Prevent permitted invocation settings from disabling thinking",
+            LoadSettingKind::Toggle,
+            "false",
+        ),
+        definition(
+            PROFILE_ALLOWED_OVERRIDES,
+            "Allowed request overrides",
+            "Comma-separated request fields that may override profile generation defaults",
+            LoadSettingKind::String,
+            "none",
+        ),
+        definition(
+            PROFILE_PROMPT_MODE,
+            "Profile prompt mode",
+            "Use the runtime prompt path or the configured external template",
+            LoadSettingKind::Choice {
+                choices: vec!["runtime_default".to_owned(), "external_template".to_owned()],
+            },
+            "runtime_default",
+        ),
+        definition(
+            PROFILE_EXTERNAL_TEMPLATE,
+            "External template",
+            "Enter identity | path | sha256; setting this selects external-template/raw-completions mode",
+            LoadSettingKind::String,
+            "none",
+        ),
+        definition(
+            PROFILE_RENDER_GENERATION_PROMPT,
+            "Render generation prompt",
+            "Append the template's generation-prompt framing",
+            LoadSettingKind::Toggle,
+            "false",
+        ),
+        definition(
+            PROFILE_TEMPLATE_THINKING,
+            "Template thinking state",
+            "Render the external template with thinking enabled",
+            LoadSettingKind::Toggle,
+            "false",
+        ),
+        definition(
+            PROFILE_RESPONSE_FILTER,
+            "Profile response filter",
+            "Select a typed response filter supported by the target adapter",
+            LoadSettingKind::Choice {
+                choices: vec!["none".to_owned(), "dirk_sharp_reasoning".to_owned()],
+            },
+            "none",
+        ),
+    ]
+}
+
+pub(crate) fn is_serve_profile_editor_field(id: &LoadSettingId) -> bool {
+    matches!(
+        id.as_str(),
+        PROFILE_TEMPERATURE
+            | PROFILE_TOP_P
+            | PROFILE_TOP_K
+            | PROFILE_MIN_P
+            | PROFILE_REASONING_EFFORT
+            | PROFILE_THINKING_DEFAULT
+            | PROFILE_THINKING_REQUIRED
+            | PROFILE_ALLOWED_OVERRIDES
+            | PROFILE_PROMPT_MODE
+            | PROFILE_EXTERNAL_TEMPLATE
+            | PROFILE_RENDER_GENERATION_PROMPT
+            | PROFILE_TEMPLATE_THINKING
+            | PROFILE_RESPONSE_FILTER
+    )
+}
+
+fn serve_profile_editor_value(
+    profile: &ServeProfile,
+    id: &LoadSettingId,
+) -> Option<LoadSettingValue> {
+    match id.as_str() {
+        PROFILE_TEMPERATURE => profile
+            .generation
+            .defaults
+            .temperature
+            .map(LoadSettingValue::Float),
+        PROFILE_TOP_P => profile
+            .generation
+            .defaults
+            .top_p
+            .map(LoadSettingValue::Float),
+        PROFILE_TOP_K => profile
+            .generation
+            .defaults
+            .top_k
+            .map(LoadSettingValue::UnsignedInteger),
+        PROFILE_MIN_P => profile
+            .generation
+            .defaults
+            .min_p
+            .map(LoadSettingValue::Float),
+        PROFILE_REASONING_EFFORT => profile
+            .generation
+            .defaults
+            .reasoning_effort
+            .clone()
+            .map(LoadSettingValue::String),
+        PROFILE_THINKING_DEFAULT => Some(LoadSettingValue::Toggle(
+            profile.generation.thinking.default,
+        )),
+        PROFILE_THINKING_REQUIRED => Some(LoadSettingValue::Toggle(
+            profile.generation.thinking.required,
+        )),
+        PROFILE_ALLOWED_OVERRIDES => Some(LoadSettingValue::String(
+            profile.generation.allowed_user_overrides.join(", "),
+        )),
+        PROFILE_PROMPT_MODE => Some(LoadSettingValue::Choice(
+            match profile.prompt.mode {
+                PromptMode::RuntimeDefault => "runtime_default",
+                PromptMode::ExternalTemplate => "external_template",
+            }
+            .to_owned(),
+        )),
+        PROFILE_EXTERNAL_TEMPLATE => profile.prompt.template.as_ref().map(|template| {
+            LoadSettingValue::String(format!(
+                "{} | {} | {}",
+                template.identity,
+                template.path.display(),
+                template.sha256
+            ))
+        }),
+        PROFILE_RENDER_GENERATION_PROMPT => Some(LoadSettingValue::Toggle(
+            profile.prompt.render_generation_prompt,
+        )),
+        PROFILE_TEMPLATE_THINKING => {
+            Some(LoadSettingValue::Toggle(profile.prompt.thinking_enabled))
+        }
+        PROFILE_RESPONSE_FILTER => Some(LoadSettingValue::Choice(
+            match profile.prompt.response_filter {
+                ResponseFilter::None => "none",
+                ResponseFilter::DirkSharpReasoning => "dirk_sharp_reasoning",
+            }
+            .to_owned(),
+        )),
+        _ => None,
+    }
+}
+
+pub(crate) fn apply_serve_profile_editor_value(
+    profile: &mut ServeProfile,
+    id: &LoadSettingId,
+    value: Option<LoadSettingValue>,
+) -> Result<(), LoadSettingsError> {
+    if profile.read_only || profile.source != ServeProfileSource::UserLocal {
+        return Err(LoadSettingsError::InvalidServeProfile(format!(
+            "Builder Serve Profile `{}` is read-only; fork it before editing",
+            profile.id
+        )));
+    }
+    let invalid = |message: &str| {
+        LoadSettingsError::InvalidServeProfile(format!("Serve Profile field `{id}` {message}"))
+    };
+    match (id.as_str(), value) {
+        (PROFILE_TEMPERATURE, Some(LoadSettingValue::Float(value))) => {
+            profile.generation.defaults.temperature = Some(value);
+        }
+        (PROFILE_TOP_P, Some(LoadSettingValue::Float(value))) => {
+            profile.generation.defaults.top_p = Some(value);
+        }
+        (PROFILE_TOP_K, Some(LoadSettingValue::UnsignedInteger(value))) => {
+            profile.generation.defaults.top_k = Some(value);
+        }
+        (PROFILE_MIN_P, Some(LoadSettingValue::Float(value))) => {
+            profile.generation.defaults.min_p = Some(value);
+        }
+        (PROFILE_REASONING_EFFORT, Some(LoadSettingValue::String(value))) => {
+            profile.generation.defaults.reasoning_effort = Some(value);
+        }
+        (PROFILE_THINKING_DEFAULT, Some(LoadSettingValue::Toggle(value))) => {
+            profile.generation.thinking.default = value;
+        }
+        (PROFILE_THINKING_REQUIRED, Some(LoadSettingValue::Toggle(value))) => {
+            profile.generation.thinking.required = value;
+        }
+        (PROFILE_ALLOWED_OVERRIDES, Some(LoadSettingValue::String(value))) => {
+            profile.generation.allowed_user_overrides = value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
+        (PROFILE_PROMPT_MODE, Some(LoadSettingValue::Choice(mode))) => match mode.as_str() {
+            "runtime_default" => profile.prompt = ServePromptProfile::default(),
+            "external_template" if profile.prompt.template.is_some() => {
+                profile.prompt.mode = PromptMode::ExternalTemplate;
+                profile.prompt.delivery = PromptDelivery::RawCompletions;
+            }
+            "external_template" => {
+                return Err(invalid(
+                    "needs an external template; edit the `External template` row first",
+                ));
+            }
+            _ => return Err(invalid("has an unknown prompt mode")),
+        },
+        (PROFILE_EXTERNAL_TEMPLATE, Some(LoadSettingValue::String(value))) => {
+            let mut fields = value.splitn(3, '|').map(str::trim);
+            let identity = fields.next().unwrap_or_default();
+            let path = fields.next().unwrap_or_default();
+            let sha256 = fields.next().unwrap_or_default();
+            if identity.is_empty() || path.is_empty() || sha256.is_empty() {
+                return Err(invalid("requires `identity | path | sha256`"));
+            }
+            let path = std::fs::canonicalize(path).map_err(|error| {
+                invalid(&format!(
+                    "could not resolve template path `{path}`: {error}"
+                ))
+            })?;
+            profile.prompt.mode = PromptMode::ExternalTemplate;
+            profile.prompt.delivery = PromptDelivery::RawCompletions;
+            profile.prompt.template = Some(ExternalTemplateReference {
+                identity: identity.to_owned(),
+                path,
+                sha256: sha256.to_owned(),
+            });
+        }
+        (PROFILE_RENDER_GENERATION_PROMPT, Some(LoadSettingValue::Toggle(value))) => {
+            profile.prompt.render_generation_prompt = value;
+        }
+        (PROFILE_TEMPLATE_THINKING, Some(LoadSettingValue::Toggle(value))) => {
+            profile.prompt.thinking_enabled = value;
+        }
+        (PROFILE_RESPONSE_FILTER, Some(LoadSettingValue::Choice(filter))) => {
+            profile.prompt.response_filter = match filter.as_str() {
+                "none" => ResponseFilter::None,
+                "dirk_sharp_reasoning" => ResponseFilter::DirkSharpReasoning,
+                _ => return Err(invalid("has an unknown response filter")),
+            };
+        }
+        (PROFILE_TEMPERATURE, None) => profile.generation.defaults.temperature = None,
+        (PROFILE_TOP_P, None) => profile.generation.defaults.top_p = None,
+        (PROFILE_TOP_K, None) => profile.generation.defaults.top_k = None,
+        (PROFILE_MIN_P, None) => profile.generation.defaults.min_p = None,
+        (PROFILE_REASONING_EFFORT, None) => profile.generation.defaults.reasoning_effort = None,
+        (PROFILE_THINKING_DEFAULT, None) => profile.generation.thinking.default = false,
+        (PROFILE_THINKING_REQUIRED, None) => profile.generation.thinking.required = false,
+        (PROFILE_ALLOWED_OVERRIDES, None) => {
+            profile.generation.allowed_user_overrides.clear();
+        }
+        (PROFILE_PROMPT_MODE | PROFILE_EXTERNAL_TEMPLATE, None) => {
+            profile.prompt = ServePromptProfile::default();
+        }
+        (PROFILE_RENDER_GENERATION_PROMPT, None) => {
+            profile.prompt.render_generation_prompt = false;
+        }
+        (PROFILE_TEMPLATE_THINKING, None) => profile.prompt.thinking_enabled = false,
+        (PROFILE_RESPONSE_FILTER, None) => profile.prompt.response_filter = ResponseFilter::None,
+        _ => return Err(invalid("received a value of the wrong type")),
+    }
+    profile
+        .validate()
+        .map_err(LoadSettingsError::InvalidServeProfile)
+}
+
 fn byte_index(value: &str, char_index: usize) -> usize {
     value
         .char_indices()
@@ -3154,14 +3558,20 @@ fn byte_index(value: &str, char_index: usize) -> usize {
 mod tests {
     use norted_core::{
         AppSnapshot, EffectivePublicAuthMode, PublicAuthMode, PublicAuthStatus, RegistryState,
-        ServerState,
+        ServeProfile, ServeProfileSource, ServerState,
     };
     use norted_engine::{
         BackendLifecycle, BackendLoadPhase, BackendLoadProgress, BackendStatus, ControlStatus,
         RuntimeNotice, RuntimeNoticeLevel,
     };
 
-    use super::App;
+    use super::{
+        App, PROFILE_ALLOWED_OVERRIDES, PROFILE_EXTERNAL_TEMPLATE, PROFILE_MIN_P,
+        PROFILE_PROMPT_MODE, PROFILE_REASONING_EFFORT, PROFILE_RENDER_GENERATION_PROMPT,
+        PROFILE_RESPONSE_FILTER, PROFILE_TEMPERATURE, PROFILE_TEMPLATE_THINKING,
+        PROFILE_THINKING_DEFAULT, PROFILE_THINKING_REQUIRED, PROFILE_TOP_K, PROFILE_TOP_P,
+        apply_serve_profile_editor_value, serve_profile_editor_definitions,
+    };
 
     fn test_app() -> App {
         App::new(
@@ -3210,6 +3620,163 @@ mod tests {
             },
             recent_events: Vec::new(),
         }
+    }
+
+    #[test]
+    fn mutable_profile_editor_covers_common_fields_and_rejects_builder_mutation() {
+        let definitions = serve_profile_editor_definitions();
+        let ids = definitions
+            .iter()
+            .map(|definition| definition.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for expected in [
+            PROFILE_TEMPERATURE,
+            PROFILE_TOP_P,
+            PROFILE_TOP_K,
+            PROFILE_MIN_P,
+            PROFILE_REASONING_EFFORT,
+            PROFILE_THINKING_DEFAULT,
+            PROFILE_THINKING_REQUIRED,
+            PROFILE_ALLOWED_OVERRIDES,
+            PROFILE_PROMPT_MODE,
+            PROFILE_EXTERNAL_TEMPLATE,
+            PROFILE_RENDER_GENERATION_PROMPT,
+            PROFILE_TEMPLATE_THINKING,
+            PROFILE_RESPONSE_FILTER,
+        ] {
+            assert!(ids.contains(expected), "missing editor row {expected}");
+        }
+
+        let mut profile = ServeProfile::local("editable");
+        let set = |profile: &mut ServeProfile, id: &str, value: norted_core::LoadSettingValue| {
+            apply_serve_profile_editor_value(
+                profile,
+                &norted_core::LoadSettingId::new(id).unwrap(),
+                Some(value),
+            )
+            .unwrap();
+        };
+        set(
+            &mut profile,
+            PROFILE_TEMPERATURE,
+            norted_core::LoadSettingValue::Float(0.7),
+        );
+        set(
+            &mut profile,
+            PROFILE_TOP_P,
+            norted_core::LoadSettingValue::Float(0.9),
+        );
+        set(
+            &mut profile,
+            PROFILE_TOP_K,
+            norted_core::LoadSettingValue::UnsignedInteger(32),
+        );
+        set(
+            &mut profile,
+            PROFILE_MIN_P,
+            norted_core::LoadSettingValue::Float(0.05),
+        );
+        set(
+            &mut profile,
+            PROFILE_REASONING_EFFORT,
+            norted_core::LoadSettingValue::String("high".to_owned()),
+        );
+        set(
+            &mut profile,
+            PROFILE_THINKING_DEFAULT,
+            norted_core::LoadSettingValue::Toggle(true),
+        );
+        set(
+            &mut profile,
+            PROFILE_THINKING_REQUIRED,
+            norted_core::LoadSettingValue::Toggle(true),
+        );
+        set(
+            &mut profile,
+            PROFILE_ALLOWED_OVERRIDES,
+            norted_core::LoadSettingValue::String("top_p, temperature, top_p".to_owned()),
+        );
+        let template = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        set(
+            &mut profile,
+            PROFILE_EXTERNAL_TEMPLATE,
+            norted_core::LoadSettingValue::String(format!(
+                "sharp-test | {} | {}",
+                template.display(),
+                "a".repeat(64)
+            )),
+        );
+        set(
+            &mut profile,
+            PROFILE_RENDER_GENERATION_PROMPT,
+            norted_core::LoadSettingValue::Toggle(true),
+        );
+        set(
+            &mut profile,
+            PROFILE_TEMPLATE_THINKING,
+            norted_core::LoadSettingValue::Toggle(true),
+        );
+        set(
+            &mut profile,
+            PROFILE_RESPONSE_FILTER,
+            norted_core::LoadSettingValue::Choice("dirk_sharp_reasoning".to_owned()),
+        );
+
+        assert_eq!(profile.generation.defaults.temperature, Some(0.7));
+        assert_eq!(profile.generation.defaults.top_p, Some(0.9));
+        assert_eq!(profile.generation.defaults.top_k, Some(32));
+        assert_eq!(profile.generation.defaults.min_p, Some(0.05));
+        assert_eq!(
+            profile.generation.defaults.reasoning_effort.as_deref(),
+            Some("high")
+        );
+        assert!(profile.generation.thinking.default);
+        assert!(profile.generation.thinking.required);
+        assert_eq!(
+            profile.generation.allowed_user_overrides,
+            vec!["temperature".to_owned(), "top_p".to_owned()]
+        );
+        assert_eq!(
+            profile.prompt.mode,
+            norted_core::PromptMode::ExternalTemplate
+        );
+        assert_eq!(
+            profile.prompt.delivery,
+            norted_core::PromptDelivery::RawCompletions
+        );
+        assert_eq!(
+            profile
+                .prompt
+                .template
+                .as_ref()
+                .map(|template| template.identity.as_str()),
+            Some("sharp-test")
+        );
+        assert!(profile.prompt.render_generation_prompt);
+        assert!(profile.prompt.thinking_enabled);
+        assert_eq!(
+            profile.prompt.response_filter,
+            norted_core::ResponseFilter::DirkSharpReasoning
+        );
+
+        set(
+            &mut profile,
+            PROFILE_PROMPT_MODE,
+            norted_core::LoadSettingValue::Choice("runtime_default".to_owned()),
+        );
+        assert_eq!(profile.prompt, norted_core::ServePromptProfile::default());
+
+        let mut builder = profile;
+        builder.source = ServeProfileSource::BuilderRecommended;
+        builder.read_only = true;
+        let error = apply_serve_profile_editor_value(
+            &mut builder,
+            &norted_core::LoadSettingId::new(PROFILE_TEMPERATURE).unwrap(),
+            Some(norted_core::LoadSettingValue::Float(0.1)),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("read-only"));
+        assert_eq!(builder.generation.defaults.temperature, Some(0.7));
     }
 
     fn lifecycle(app: &App) -> BackendLifecycle {

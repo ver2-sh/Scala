@@ -92,6 +92,15 @@ fn llama_profile_compatibility(
     if let Err(reason) = profile.basic_applicability(model) {
         return RuntimeCompatibility::Incompatible(reason);
     }
+    if profile.applicability.architecture.is_some()
+        || profile.applicability.family.is_some()
+        || !profile.applicability.required_model_capabilities.is_empty()
+    {
+        return RuntimeCompatibility::Incompatible(format!(
+            "Serve Profile `{}` declares architecture/family/model-capability constraints that the bounded llama.cpp GGUF integration cannot prove",
+            profile.display_name
+        ));
+    }
     if profile.requires_runtime_recipe() {
         RuntimeCompatibility::Incompatible(format!(
             "Serve Profile `{}` requires prompt/generation/strategy capabilities that the llama.cpp adapter does not yet implement; choose None/raw defaults or a load-only Serve Profile",

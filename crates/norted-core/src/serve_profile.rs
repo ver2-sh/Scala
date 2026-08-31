@@ -156,6 +156,7 @@ pub enum ServeCapability {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Q27MtpStrategy {
+    pub enabled: bool,
     pub required: bool,
     pub depth_policy: String,
     pub maximum_depth: String,
@@ -330,6 +331,12 @@ impl ServeProfile {
                 "Serve Profile generation defaults are outside their valid ranges".to_owned(),
             );
         }
+        if self.generation.thinking.required && !self.generation.thinking.default {
+            return Err(
+                "Serve Profile cannot require thinking while selecting thinking_default=false"
+                    .to_owned(),
+            );
+        }
         if self.engine.q27.is_some()
             && !self
                 .applicability
@@ -352,6 +359,18 @@ impl ServeProfile {
                 || !(0.0..=1.0).contains(&q27.mtp.minimum_probability)
             {
                 return Err("q27 strategy has an invalid KV/MTP policy".to_owned());
+            }
+            if q27.mtp.required && !q27.mtp.enabled {
+                return Err("q27 MTP cannot be required while disabled".to_owned());
+            }
+            if q27.suffix_drafting && !q27.mtp.enabled {
+                return Err("q27 suffix drafting requires MTP to be enabled".to_owned());
+            }
+            if q27.suffix_width_from_runtime_w_max && !q27.suffix_drafting {
+                return Err(
+                    "q27 runtime W_MAX suffix width requires suffix drafting to be enabled"
+                        .to_owned(),
+                );
             }
         }
         if let Some(ninfer) = &self.engine.ninfer {
@@ -432,6 +451,8 @@ impl ServeProfile {
         if self.prompt.thinking_enabled
             || self.generation.thinking.default
             || self.generation.thinking.required
+            || self.engine.q27.is_some()
+            || self.engine.ninfer.is_some()
         {
             requirements.insert(ServeCapability::Thinking);
         }
@@ -450,7 +471,7 @@ impl ServeProfile {
             requirements.insert(ServeCapability::StartupBannerObservation);
             requirements.insert(ServeCapability::KvModeProof);
             requirements.insert(ServeCapability::FastHeadControl);
-            if q27.mtp.required {
+            if q27.mtp.enabled || q27.mtp.required {
                 requirements.insert(ServeCapability::Mtp);
             }
             if q27.suffix_drafting {
@@ -470,8 +491,8 @@ impl ServeProfile {
             }
             if ninfer
                 .speculative_profiles
-                .values()
-                .any(|strategy| strategy.speculative_decoding)
+                .get(&ninfer.default_speculative_profile)
+                .is_some_and(|strategy| strategy.speculative_decoding)
             {
                 requirements.insert(ServeCapability::Mtp);
             }
@@ -658,12 +679,8 @@ pub fn apply_serve_profile_load_policy(
             &profile.id,
             &profile.display_name,
         )?;
+        apply_ninfer_thinking_policy(profile, settings, &source)?;
         for (id, required, message) in [
-            (
-                "ninfer.no_thinking",
-                profile.generation.thinking.required,
-                "thinking",
-            ),
             (
                 "ninfer.no_cuda_graph",
                 ninfer.cuda_graph_required,
@@ -690,6 +707,44 @@ pub fn apply_serve_profile_load_policy(
         }
         apply_ninfer_speculative_strategy(profile, ninfer, settings, &source)?;
     }
+    Ok(())
+}
+
+fn apply_ninfer_thinking_policy(
+    profile: &ServeProfile,
+    settings: &mut ResolvedLoadSettings,
+    source: &LoadSettingSource,
+) -> Result<(), String> {
+    let id = LoadSettingId::new("ninfer.no_thinking").map_err(|error| error.to_string())?;
+    if !profile.generation.thinking.default {
+        settings.effective.insert(
+            id,
+            ResolvedLoadSetting {
+                value: LoadSettingValue::FlagEnabled,
+                source: source.clone(),
+            },
+        );
+        return Ok(());
+    }
+    let Some(setting) = settings.effective.get(&id) else {
+        return Ok(());
+    };
+    if matches!(setting.source, LoadSettingSource::Invocation) {
+        if profile.generation.thinking.required {
+            return Err(format!(
+                "Serve Profile `{}` requires thinking; `ninfer.no_thinking` conflicts",
+                profile.display_name
+            ));
+        }
+        if profile.generation.allows_override("ninfer.no_thinking") {
+            return Ok(());
+        }
+        return Err(format!(
+            "Serve Profile `{}` does not allow the `ninfer.no_thinking` invocation override",
+            profile.display_name
+        ));
+    }
+    settings.effective.remove(&id);
     Ok(())
 }
 
