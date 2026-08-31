@@ -4,12 +4,12 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use norted_core::{
-    AppEvent, AppSnapshot, ArtifactFormat, ExternalTemplateReference, LoadProfileName,
-    LoadProfilesState, LoadSettingDefinition, LoadSettingId, LoadSettingKind, LoadSettingScope,
-    LoadSettingSource, LoadSettingValue, LoadSettingsError, LoadSettingsSchema, LogLevel,
-    ModelArtifact, ModelId, PromptDelivery, PromptMode, PublicAuthStatus, RegistryState,
-    ResolvedLoadSettings, ResponseFilter, RuntimeCompatibility, RuntimeId, RuntimeOperationPhase,
-    RuntimeOperationProgress, RuntimeUpdateState, ServeProfile, ServeProfileSource,
+    AppEvent, AppSnapshot, ArtifactFormat, ExternalTemplateReference, LoadSettingDefinition,
+    LoadSettingId, LoadSettingKind, LoadSettingScope, LoadSettingSource, LoadSettingValue,
+    LoadSettingsError, LoadSettingsSchema, LogLevel, ModelArtifact, ModelId, PromptDelivery,
+    PromptMode, PublicAuthStatus, RegistryState, ResolvedLoadSettings, ResponseFilter,
+    RuntimeCompatibility, RuntimeId, RuntimeOperationPhase, RuntimeOperationProgress,
+    RuntimeUpdateState, ServeProfile, ServeProfileName, ServeProfileSource, ServeProfilesState,
     ServePromptProfile,
 };
 use norted_engine::{
@@ -166,7 +166,7 @@ pub enum RuntimeTaskResult {
 pub enum SettingsScope {
     Global,
     Engine(String),
-    Profile(LoadProfileName),
+    Profile(ServeProfileName),
     BuilderProfile(String),
     Model(ModelId),
 }
@@ -183,15 +183,15 @@ pub enum SettingsAction {
         scope: SettingsScope,
         id: LoadSettingId,
     },
-    CreateProfile(LoadProfileName),
+    CreateProfile(ServeProfileName),
     ForkBuilderProfile {
         source: Box<norted_core::ServeProfile>,
-        name: LoadProfileName,
+        name: ServeProfileName,
     },
-    DeleteProfile(LoadProfileName),
+    DeleteProfile(ServeProfileName),
     AssignProfile {
         model_id: ModelId,
-        profile: Option<LoadProfileName>,
+        profile: Option<ServeProfileName>,
     },
     AssignBuilderProfile {
         model_id: ModelId,
@@ -208,7 +208,7 @@ pub enum SettingsAction {
 
 #[derive(Debug)]
 pub struct ModelSettingsInspection {
-    pub profiles: LoadProfilesState,
+    pub profiles: ServeProfilesState,
     pub runtime_id: RuntimeId,
     pub schema: LoadSettingsSchema,
     pub resolved: ResolvedLoadSettings,
@@ -216,8 +216,8 @@ pub struct ModelSettingsInspection {
 
 #[derive(Debug)]
 pub enum SettingsTaskResult {
-    Loaded(Result<LoadProfilesState, String>),
-    Stored(Result<LoadProfilesState, String>),
+    Loaded(Result<ServeProfilesState, String>),
+    Stored(Result<ServeProfilesState, String>),
     Inspected {
         model_id: ModelId,
         result: Result<ModelSettingsInspection, String>,
@@ -293,7 +293,7 @@ pub struct App {
     pub runtime_picker_candidates: Vec<RuntimeModelCandidate>,
     pub runtime_picker_loading: bool,
     pub runtime_picker_error: Option<String>,
-    pub load_profiles: Option<LoadProfilesState>,
+    pub load_profiles: Option<ServeProfilesState>,
     pub load_profiles_error: Option<String>,
     pub load_profiles_loading: bool,
     pub load_setting_definitions: Vec<LoadSettingDefinition>,
@@ -858,10 +858,7 @@ impl App {
         };
         if is_serve_profile_editor_field(id) {
             let profile = match &scope {
-                SettingsScope::Profile(name) => state
-                    .profiles
-                    .get(name)
-                    .map(|profile| profile.effective_serve_profile(name)),
+                SettingsScope::Profile(name) => state.profiles.get(name).cloned(),
                 SettingsScope::BuilderProfile(profile_id) => {
                     self.builder_serve_profile(profile_id).cloned()
                 }
@@ -889,7 +886,7 @@ impl App {
             SettingsScope::Profile(profile) => state
                 .profiles
                 .get(profile)
-                .and_then(|profile| profile.settings.0.get(id)),
+                .and_then(|profile| profile.load.settings.0.get(id)),
             SettingsScope::BuilderProfile(profile_id) => self
                 .builder_serve_profile(profile_id)
                 .and_then(|profile| profile.load.settings.0.get(id)),
@@ -947,10 +944,7 @@ impl App {
             return None;
         }
         if let Some(name) = state.model_assignments.get(&model.id) {
-            return state
-                .profiles
-                .get(name)
-                .map(|profile| profile.effective_serve_profile(name));
+            return state.profiles.get(name).cloned();
         }
         if let Some(profile_id) = state.builder_profile_assignments.get(&model.id) {
             return self
@@ -1811,14 +1805,14 @@ impl App {
             return Update::None;
         };
         match input.kind {
-            SettingsInputKind::ProfileName => match LoadProfileName::new(input.text) {
+            SettingsInputKind::ProfileName => match ServeProfileName::new(input.text) {
                 Ok(name) => self.queue_settings_action(SettingsAction::CreateProfile(name)),
                 Err(error) => {
                     self.notice = Some(error.to_string());
                     Update::Render
                 }
             },
-            SettingsInputKind::ForkProfile => match LoadProfileName::new(input.text) {
+            SettingsInputKind::ForkProfile => match ServeProfileName::new(input.text) {
                 Ok(name) => {
                     let Some(SettingsScope::BuilderProfile(profile_id)) =
                         self.selected_settings_scope()
@@ -1960,7 +1954,7 @@ impl App {
                 SettingsScope::Profile(name) => state
                     .profiles
                     .get(&name)
-                    .map(|profile| profile.effective_serve_profile(&name))
+                    .cloned()
                     .and_then(|profile| serve_profile_editor_value(&profile, id)),
                 SettingsScope::BuilderProfile(profile_id) => self
                     .builder_serve_profile(&profile_id)
@@ -1971,9 +1965,14 @@ impl App {
         match self.selected_settings_scope()? {
             SettingsScope::Global => state.global_defaults.0.get(id).cloned(),
             SettingsScope::Engine(engine) => state.engine_defaults.get(&engine)?.0.get(id).cloned(),
-            SettingsScope::Profile(profile) => {
-                state.profiles.get(&profile)?.settings.0.get(id).cloned()
-            }
+            SettingsScope::Profile(profile) => state
+                .profiles
+                .get(&profile)?
+                .load
+                .settings
+                .0
+                .get(id)
+                .cloned(),
             SettingsScope::BuilderProfile(profile_id) => self
                 .builder_serve_profile(&profile_id)
                 .and_then(|profile| profile.load.settings.0.get(id).cloned()),

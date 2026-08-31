@@ -514,8 +514,8 @@ mod tests {
             runtimes_dir: root.join("data/runtimes"),
             runtime_cache_dir: root.join("cache/runtime-packs"),
             runtime_selections_file: root.join("data/runtime-selections.json"),
-            load_profiles_file: root.join("data/load-profiles.json"),
-            load_profiles_lock_file: root.join("data/.load-profiles.lock"),
+            serve_profiles_file: root.join("data/serve-profiles.json"),
+            serve_profiles_lock_file: root.join("data/.serve-profiles.lock"),
         }
     }
 }

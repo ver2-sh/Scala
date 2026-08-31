@@ -6,10 +6,10 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use norted_core::{
-    ApplicationCore, BuilderRecommendationStatus, EnvironmentVariableProvenance, LoadProfileName,
-    LoadProfilesState, LoadProfilesStore, LoadSettingsPatch, LoadSettingsProvenance, ModelArtifact,
-    ModelId, NativeArgumentProvenance, ProcessIdentity, RuntimeId, RuntimeProvenance,
-    RuntimeSelection, ServeProfile, ServeProfileRuntimeIdentity,
+    ApplicationCore, BuilderRecommendationStatus, EnvironmentVariableProvenance, LoadSettingsPatch,
+    LoadSettingsProvenance, ModelArtifact, ModelId, NativeArgumentProvenance, ProcessIdentity,
+    RuntimeId, RuntimeProvenance, RuntimeSelection, ServeProfile, ServeProfileName,
+    ServeProfileRuntimeIdentity, ServeProfilesState, ServeProfilesStore,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -278,7 +278,7 @@ struct LoadAdmission {
 struct AdmittedLoad {
     model: norted_core::ModelArtifact,
     runtime_id: Option<RuntimeId>,
-    profile: Option<LoadProfileName>,
+    profile: Option<ServeProfileName>,
     settings: LoadSettingsPatch,
     cancellation_epoch: u64,
     generation: u64,
@@ -286,15 +286,15 @@ struct AdmittedLoad {
 
 struct ResolvedServeProfileSelection {
     profile: Option<ServeProfile>,
-    local_load_profile: Option<LoadProfileName>,
+    local_load_profile: Option<ServeProfileName>,
     suppress_persisted_local_profile: bool,
 }
 
 async fn resolve_serve_profile(
     core: &ApplicationCore,
     model: &ModelArtifact,
-    state: &LoadProfilesState,
-    invocation: Option<&LoadProfileName>,
+    state: &ServeProfilesState,
+    invocation: Option<&ServeProfileName>,
 ) -> Result<ResolvedServeProfileSelection, String> {
     let builder_profiles = core
         .snapshot()
@@ -322,12 +322,7 @@ async fn resolve_serve_profile(
             },
         )?;
 
-    let local = |name: &LoadProfileName| {
-        state
-            .profiles
-            .get(name)
-            .map(|profile| profile.effective_serve_profile(name))
-    };
+    let local = |name: &ServeProfileName| state.profiles.get(name).cloned();
     if let Some(name) = invocation {
         if name.as_str() == "none" {
             return Ok(ResolvedServeProfileSelection {
@@ -468,7 +463,7 @@ pub struct RuntimeManager {
     operation: Arc<Mutex<()>>,
     cancellation_epoch: AtomicU64,
     shutting_down: AtomicBool,
-    load_profiles: LoadProfilesStore,
+    load_profiles: ServeProfilesStore,
     #[cfg(test)]
     load_start_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
@@ -481,7 +476,7 @@ impl RuntimeManager {
         supervisor: Arc<dyn ProcessSupervisor>,
         options: RuntimeManagerOptions,
     ) -> Arc<Self> {
-        let load_profiles = LoadProfilesStore::new(&core.paths);
+        let load_profiles = ServeProfilesStore::new(&core.paths);
         let manager = Arc::new(Self {
             core,
             registry,
@@ -621,7 +616,7 @@ impl RuntimeManager {
         self: &Arc<Self>,
         model_id: ModelId,
         runtime_id: Option<RuntimeId>,
-        profile: Option<LoadProfileName>,
+        profile: Option<ServeProfileName>,
         settings: LoadSettingsPatch,
     ) -> Result<ControlStatus, RuntimeError> {
         let admission = self
@@ -655,7 +650,7 @@ impl RuntimeManager {
         self: &Arc<Self>,
         model_id: ModelId,
         runtime_id: Option<RuntimeId>,
-        profile: Option<LoadProfileName>,
+        profile: Option<ServeProfileName>,
         settings: LoadSettingsPatch,
     ) -> Result<ControlStatus, RuntimeError> {
         let admission = self
@@ -668,7 +663,7 @@ impl RuntimeManager {
         self: &Arc<Self>,
         model_id: ModelId,
         runtime_id: Option<RuntimeId>,
-        profile: Option<LoadProfileName>,
+        profile: Option<ServeProfileName>,
         settings: LoadSettingsPatch,
     ) -> Result<LoadAdmission, RuntimeError> {
         if self.shutting_down.load(Ordering::Acquire) {
@@ -1025,16 +1020,10 @@ impl RuntimeManager {
             let installation = launch_spec.installation.clone();
             let selected_runtime = launch_spec.runtime.clone();
             let selected_accelerator = launch_spec.accelerator.clone();
-            let mut model_identity = launch_spec.model.runtime_identity();
+            let model_identity = launch_spec.model.runtime_identity();
             let normalized_settings = launch_spec.normalized_settings.clone();
             let load_settings = launch_spec.load_settings.clone();
             let selected_serve_profile = launch_spec.serve_profile.clone();
-            if let Some(package) = &mut model_identity.norted_package
-                && let Some(norted_core::LoadSettingValue::Choice(profile)) =
-                    load_settings.value("ninfer.package_profile")
-            {
-                package.selected_package_profile = Some(profile.clone());
-            }
             let native_arguments = launch_spec.native_arguments.clone();
             let inherits_parent_environment = launch_spec.inherits_parent_environment;
             let native_environment = environment_provenance(
@@ -1108,10 +1097,6 @@ impl RuntimeManager {
                 selection_source: selection.source,
                 accelerator: selected_accelerator,
                 installation,
-                profile: load_settings
-                    .selected_profile
-                    .as_ref()
-                    .map(ToString::to_string),
                 serve_profile: serve_profile_identity,
                 load_settings: LoadSettingsProvenance {
                     effective: load_settings.effective,
@@ -1282,7 +1267,7 @@ impl RuntimeManager {
             let mode = mode.to_owned();
             context_attempts.push((mode.clone(), context));
             startup_observation.insert(
-                "package_kv_attempts".to_owned(),
+                "serve_profile_kv_attempts".to_owned(),
                 serde_json::Value::Array(
                     context_attempts
                         .iter()
@@ -1332,26 +1317,6 @@ impl RuntimeManager {
             state.cancel_loading = false;
             state.load_progress = None;
             if let Some(provenance) = state.provenance.as_mut() {
-                if let Some(package) = provenance.model.norted_package.as_mut() {
-                    if startup_observation
-                        .get("sharp_application")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("pretokenized-raw-prompt")
-                        && selected_serve_profile
-                            .as_ref()
-                            .and_then(|profile| profile.prompt.template.as_ref())
-                            .zip(package.binding.sharp.as_ref())
-                            .is_some_and(|(selected, packaged)| selected.sha256 == packaged.sha256)
-                    {
-                        package.sharp_applied = Some(true);
-                    }
-                    if let Some(context) = startup_observation
-                        .get("observed_served_context")
-                        .and_then(serde_json::Value::as_u64)
-                    {
-                        package.proven_served_context_tokens = Some(context);
-                    }
-                }
                 provenance.normalized_settings.extend(startup_observation);
                 provenance.normalized_settings.insert(
                     "temperature".to_owned(),
@@ -2147,8 +2112,8 @@ mod tests {
             runtimes_dir: root.join("data/runtimes"),
             runtime_cache_dir: root.join("cache/runtime-packs"),
             runtime_selections_file: root.join("data/runtime-selections.json"),
-            load_profiles_file: root.join("data/load-profiles.json"),
-            load_profiles_lock_file: root.join("data/.load-profiles.lock"),
+            serve_profiles_file: root.join("data/serve-profiles.json"),
+            serve_profiles_lock_file: root.join("data/.serve-profiles.lock"),
         };
         paths.ensure_required().expect("fixture paths");
         std::fs::write(

@@ -21,8 +21,8 @@ pub struct AppPaths {
     pub runtimes_dir: PathBuf,
     pub runtime_cache_dir: PathBuf,
     pub runtime_selections_file: PathBuf,
-    pub load_profiles_file: PathBuf,
-    pub load_profiles_lock_file: PathBuf,
+    pub serve_profiles_file: PathBuf,
+    pub serve_profiles_lock_file: PathBuf,
 }
 
 impl AppPaths {
@@ -40,8 +40,8 @@ impl AppPaths {
             config_file: dirs.config_dir().join("config.toml"),
             runtimes_dir: data_dir.join("runtimes"),
             runtime_selections_file: data_dir.join("runtime-selections.json"),
-            load_profiles_file: data_dir.join("load-profiles.json"),
-            load_profiles_lock_file: data_dir.join(".load-profiles.lock"),
+            serve_profiles_file: data_dir.join("serve-profiles.json"),
+            serve_profiles_lock_file: data_dir.join(".serve-profiles.lock"),
             data_dir,
             state_dir,
             runtime_cache_dir: cache_dir.join("runtime-packs"),

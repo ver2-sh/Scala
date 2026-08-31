@@ -2197,8 +2197,8 @@ mod tests {
             runtimes_dir: workspace.path().join("data/runtimes"),
             runtime_cache_dir: workspace.path().join("cache/runtime-packs"),
             runtime_selections_file: workspace.path().join("data/runtime-selections.json"),
-            load_profiles_file: workspace.path().join("data/load-profiles.json"),
-            load_profiles_lock_file: workspace.path().join("data/.load-profiles.lock"),
+            serve_profiles_file: workspace.path().join("data/serve-profiles.json"),
+            serve_profiles_lock_file: workspace.path().join("data/.serve-profiles.lock"),
         };
         let store = RuntimeStore::new(&paths);
         let staging = store.create_staging().await.expect("staging directory");

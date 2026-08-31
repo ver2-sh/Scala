@@ -92,12 +92,6 @@ pub struct ModelRuntimeIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NortedPackageRuntimeIdentity {
     pub binding: crate::NortedPackageBinding,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sharp_applied: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proven_served_context_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selected_package_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,7 +142,6 @@ pub struct RuntimeProvenance {
     pub selection_source: RuntimeSelectionSource,
     pub accelerator: Option<AcceleratorDevice>,
     pub installation: EngineInstallation,
-    pub profile: Option<String>,
     pub serve_profile: ServeProfileRuntimeIdentity,
     #[serde(default)]
     pub load_settings: LoadSettingsProvenance,

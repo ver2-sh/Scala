@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AppPaths, ModelId};
 
-pub const LOAD_PROFILES_SCHEMA_VERSION: u32 = 2;
+pub const SERVE_PROFILES_STATE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -414,9 +414,9 @@ impl LoadSettingsPatch {
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct LoadProfileName(String);
+pub struct ServeProfileName(String);
 
-impl LoadProfileName {
+impl ServeProfileName {
     pub fn new(value: impl Into<String>) -> Result<Self, LoadSettingsError> {
         let value = value.into();
         validate_profile_name(&value)?;
@@ -428,13 +428,13 @@ impl LoadProfileName {
     }
 }
 
-impl std::fmt::Display for LoadProfileName {
+impl std::fmt::Display for ServeProfileName {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(formatter)
     }
 }
 
-impl std::str::FromStr for LoadProfileName {
+impl std::str::FromStr for ServeProfileName {
     type Err = LoadSettingsError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -442,7 +442,7 @@ impl std::str::FromStr for LoadProfileName {
     }
 }
 
-impl TryFrom<String> for LoadProfileName {
+impl TryFrom<String> for ServeProfileName {
     type Error = LoadSettingsError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
@@ -450,51 +450,31 @@ impl TryFrom<String> for LoadProfileName {
     }
 }
 
-impl From<LoadProfileName> for String {
-    fn from(value: LoadProfileName) -> Self {
+impl From<ServeProfileName> for String {
+    fn from(value: ServeProfileName) -> Self {
         value.0
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LoadProfile {
-    #[serde(default)]
-    pub settings: LoadSettingsPatch,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serve_profile: Option<crate::ServeProfile>,
-}
-
-impl LoadProfile {
-    pub fn effective_serve_profile(&self, name: &LoadProfileName) -> crate::ServeProfile {
-        let mut profile = self
-            .serve_profile
-            .clone()
-            .unwrap_or_else(|| crate::ServeProfile::local(name.as_str()));
-        profile.load.settings = self.settings.clone();
-        profile
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct LoadProfilesState {
+pub struct ServeProfilesState {
     pub version: u32,
     pub global_defaults: LoadSettingsPatch,
     pub engine_defaults: BTreeMap<String, LoadSettingsPatch>,
     pub model_defaults: BTreeMap<ModelId, LoadSettingsPatch>,
-    pub profiles: BTreeMap<LoadProfileName, LoadProfile>,
-    pub model_assignments: BTreeMap<ModelId, LoadProfileName>,
+    pub profiles: BTreeMap<ServeProfileName, crate::ServeProfile>,
+    pub model_assignments: BTreeMap<ModelId, ServeProfileName>,
     #[serde(default)]
     pub builder_profile_assignments: BTreeMap<ModelId, String>,
     #[serde(default)]
     pub raw_profile_models: BTreeSet<ModelId>,
 }
 
-impl Default for LoadProfilesState {
+impl Default for ServeProfilesState {
     fn default() -> Self {
         Self {
-            version: LOAD_PROFILES_SCHEMA_VERSION,
+            version: SERVE_PROFILES_STATE_VERSION,
             global_defaults: LoadSettingsPatch::default(),
             engine_defaults: BTreeMap::new(),
             model_defaults: BTreeMap::new(),
@@ -506,12 +486,12 @@ impl Default for LoadProfilesState {
     }
 }
 
-impl LoadProfilesState {
+impl ServeProfilesState {
     pub fn validate(&self) -> Result<(), LoadSettingsError> {
-        if self.version != LOAD_PROFILES_SCHEMA_VERSION {
+        if self.version != SERVE_PROFILES_STATE_VERSION {
             return Err(LoadSettingsError::UnsupportedStateVersion {
                 found: self.version,
-                supported: LOAD_PROFILES_SCHEMA_VERSION,
+                supported: SERVE_PROFILES_STATE_VERSION,
             });
         }
         for id in self.global_defaults.0.keys() {
@@ -541,24 +521,22 @@ impl LoadProfilesState {
             }
         }
         for (name, profile) in &self.profiles {
-            for id in profile.settings.0.keys() {
+            for id in profile.load.settings.0.keys() {
                 validate_setting_id(id.as_str())?;
             }
-            if let Some(serve_profile) = &profile.serve_profile {
-                serve_profile
-                    .validate()
-                    .map_err(LoadSettingsError::InvalidServeProfile)?;
-                if serve_profile.id != name.as_str() {
-                    return Err(LoadSettingsError::InvalidServeProfile(format!(
-                        "persisted Serve Profile `{}` is stored under mismatched key `{name}`",
-                        serve_profile.id
-                    )));
-                }
-                if serve_profile.read_only {
-                    return Err(LoadSettingsError::InvalidServeProfile(
-                        "persisted user Serve Profiles must be mutable".to_owned(),
-                    ));
-                }
+            profile
+                .validate()
+                .map_err(LoadSettingsError::InvalidServeProfile)?;
+            if profile.id != name.as_str() {
+                return Err(LoadSettingsError::InvalidServeProfile(format!(
+                    "persisted Serve Profile `{}` is stored under mismatched key `{name}`",
+                    profile.id
+                )));
+            }
+            if profile.read_only {
+                return Err(LoadSettingsError::InvalidServeProfile(
+                    "persisted user Serve Profiles must be mutable".to_owned(),
+                ));
             }
         }
         for (model_id, profile) in &self.model_assignments {
@@ -596,7 +574,7 @@ impl LoadProfilesState {
         &self,
         model_id: &ModelId,
         engine_id: &str,
-        invocation_profile: Option<&LoadProfileName>,
+        invocation_profile: Option<&ServeProfileName>,
         invocation: &LoadSettingsPatch,
         structured_path_base: &Path,
     ) -> Result<ResolvedLoadSettings, LoadSettingsError> {
@@ -637,10 +615,10 @@ impl LoadProfilesState {
                 .ok_or_else(|| LoadSettingsError::ProfileNotFound(profile_name.clone()))?;
             apply_layer(
                 &mut effective,
-                &profile.settings,
+                &profile.load.settings,
                 engine_id,
-                LoadSettingSource::NamedProfile {
-                    profile: profile_name.clone(),
+                LoadSettingSource::ServeProfile {
+                    profile_id: profile.id.clone(),
                 },
             );
         }
@@ -658,7 +636,7 @@ impl LoadProfilesState {
         })
     }
 
-    pub fn create_profile(&mut self, name: LoadProfileName) -> Result<(), LoadSettingsError> {
+    pub fn create_profile(&mut self, name: ServeProfileName) -> Result<(), LoadSettingsError> {
         if name.as_str() == "none" {
             return Err(LoadSettingsError::InvalidServeProfile(
                 "`none` is reserved for None / Raw runtime defaults".to_owned(),
@@ -667,17 +645,12 @@ impl LoadProfilesState {
         if self.profiles.contains_key(&name) {
             return Err(LoadSettingsError::ProfileAlreadyExists(name));
         }
-        self.profiles.insert(
-            name.clone(),
-            LoadProfile {
-                settings: LoadSettingsPatch::default(),
-                serve_profile: Some(crate::ServeProfile::local(name.as_str())),
-            },
-        );
+        self.profiles
+            .insert(name.clone(), crate::ServeProfile::local(name.as_str()));
         Ok(())
     }
 
-    pub fn delete_profile(&mut self, name: &LoadProfileName) -> Result<(), LoadSettingsError> {
+    pub fn delete_profile(&mut self, name: &ServeProfileName) -> Result<(), LoadSettingsError> {
         if !self.profiles.contains_key(name) {
             return Err(LoadSettingsError::ProfileNotFound(name.clone()));
         }
@@ -699,7 +672,7 @@ impl LoadProfilesState {
     pub fn assign_profile(
         &mut self,
         model_id: ModelId,
-        profile: Option<LoadProfileName>,
+        profile: Option<ServeProfileName>,
     ) -> Result<(), LoadSettingsError> {
         if let Some(profile) = profile {
             if !self.profiles.contains_key(&profile) {
@@ -813,7 +786,6 @@ pub enum LoadSettingSource {
     GlobalDefault,
     EngineDefault { engine_id: String },
     ModelDefault { model_id: ModelId },
-    NamedProfile { profile: LoadProfileName },
     ServeProfile { profile_id: String },
     Invocation,
 }
@@ -824,7 +796,6 @@ impl std::fmt::Display for LoadSettingSource {
             Self::GlobalDefault => formatter.write_str("global-default"),
             Self::EngineDefault { engine_id } => write!(formatter, "engine-default:{engine_id}"),
             Self::ModelDefault { model_id } => write!(formatter, "model-default:{model_id}"),
-            Self::NamedProfile { profile } => write!(formatter, "profile:{profile}"),
             Self::ServeProfile { profile_id } => write!(formatter, "serve-profile:{profile_id}"),
             Self::Invocation => formatter.write_str("invocation"),
         }
@@ -841,7 +812,7 @@ pub struct ResolvedLoadSetting {
 pub struct ResolvedLoadSettings {
     pub engine_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selected_profile: Option<LoadProfileName>,
+    pub selected_profile: Option<ServeProfileName>,
     #[serde(default)]
     pub effective: BTreeMap<LoadSettingId, ResolvedLoadSetting>,
 }
@@ -893,16 +864,16 @@ impl LoadSettingsSchema {
 }
 
 #[derive(Debug, Clone)]
-pub struct LoadProfilesStore {
+pub struct ServeProfilesStore {
     path: PathBuf,
     lock_path: PathBuf,
 }
 
-impl LoadProfilesStore {
+impl ServeProfilesStore {
     pub fn new(paths: &AppPaths) -> Self {
         Self {
-            path: paths.load_profiles_file.clone(),
-            lock_path: paths.load_profiles_lock_file.clone(),
+            path: paths.serve_profiles_file.clone(),
+            lock_path: paths.serve_profiles_lock_file.clone(),
         }
     }
 
@@ -910,23 +881,23 @@ impl LoadProfilesStore {
         &self.path
     }
 
-    pub async fn read(&self) -> Result<LoadProfilesState, LoadProfilesError> {
+    pub async fn read(&self) -> Result<ServeProfilesState, ServeProfilesError> {
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || read_state(&path))
             .await
-            .map_err(|error| LoadProfilesError::Task(error.to_string()))?
+            .map_err(|error| ServeProfilesError::Task(error.to_string()))?
     }
 
-    pub async fn update<F, T>(&self, update: F) -> Result<T, LoadProfilesError>
+    pub async fn update<F, T>(&self, update: F) -> Result<T, ServeProfilesError>
     where
-        F: FnOnce(&mut LoadProfilesState) -> Result<T, LoadSettingsError> + Send + 'static,
+        F: FnOnce(&mut ServeProfilesState) -> Result<T, LoadSettingsError> + Send + 'static,
         T: Send + 'static,
     {
         let path = self.path.clone();
         let lock_path = self.lock_path.clone();
         tokio::task::spawn_blocking(move || {
             if let Some(parent) = lock_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|source| LoadProfilesError::Io {
+                std::fs::create_dir_all(parent).map_err(|source| ServeProfilesError::Io {
                     path: parent.to_path_buf(),
                     source,
                 })?;
@@ -937,12 +908,12 @@ impl LoadProfilesStore {
                 .read(true)
                 .write(true)
                 .open(&lock_path)
-                .map_err(|source| LoadProfilesError::Io {
+                .map_err(|source| ServeProfilesError::Io {
                     path: lock_path.clone(),
                     source,
                 })?;
             lock.lock_exclusive()
-                .map_err(|source| LoadProfilesError::Io {
+                .map_err(|source| ServeProfilesError::Io {
                     path: lock_path,
                     source,
                 })?;
@@ -953,51 +924,41 @@ impl LoadProfilesStore {
             Ok(result)
         })
         .await
-        .map_err(|error| LoadProfilesError::Task(error.to_string()))?
+        .map_err(|error| ServeProfilesError::Task(error.to_string()))?
     }
 }
 
-fn read_state(path: &Path) -> Result<LoadProfilesState, LoadProfilesError> {
+fn read_state(path: &Path) -> Result<ServeProfilesState, ServeProfilesError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(LoadProfilesState::default());
+            return Ok(ServeProfilesState::default());
         }
         Err(source) => {
-            return Err(LoadProfilesError::Io {
+            return Err(ServeProfilesError::Io {
                 path: path.to_path_buf(),
                 source,
             });
         }
     };
-    let mut state: LoadProfilesState =
-        serde_json::from_slice(&bytes).map_err(|source| LoadProfilesError::Parse {
+    let state: ServeProfilesState =
+        serde_json::from_slice(&bytes).map_err(|source| ServeProfilesError::Parse {
             path: path.to_path_buf(),
             source,
         })?;
-    if state.version == 1 {
-        state.version = LOAD_PROFILES_SCHEMA_VERSION;
-        for (name, profile) in &mut state.profiles {
-            if profile.serve_profile.is_none() {
-                let mut serve_profile = crate::ServeProfile::local(name.as_str());
-                serve_profile.load.settings = profile.settings.clone();
-                profile.serve_profile = Some(serve_profile);
-            }
-        }
-    }
     state.validate()?;
     Ok(state)
 }
 
-fn write_state(path: &Path, state: &LoadProfilesState) -> Result<(), LoadProfilesError> {
+fn write_state(path: &Path, state: &ServeProfilesState) -> Result<(), ServeProfilesError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).map_err(|source| LoadProfilesError::Io {
+    std::fs::create_dir_all(parent).map_err(|source| ServeProfilesError::Io {
         path: parent.to_path_buf(),
         source,
     })?;
-    let bytes = serde_json::to_vec_pretty(state).map_err(LoadProfilesError::Serialize)?;
+    let bytes = serde_json::to_vec_pretty(state).map_err(ServeProfilesError::Serialize)?;
     let mut temporary =
-        tempfile::NamedTempFile::new_in(parent).map_err(|source| LoadProfilesError::Io {
+        tempfile::NamedTempFile::new_in(parent).map_err(|source| ServeProfilesError::Io {
             path: parent.to_path_buf(),
             source,
         })?;
@@ -1005,13 +966,13 @@ fn write_state(path: &Path, state: &LoadProfilesState) -> Result<(), LoadProfile
         .write_all(&bytes)
         .and_then(|_| temporary.write_all(b"\n"))
         .and_then(|_| temporary.as_file().sync_all())
-        .map_err(|source| LoadProfilesError::Io {
+        .map_err(|source| ServeProfilesError::Io {
             path: temporary.path().to_path_buf(),
             source,
         })?;
     temporary
         .persist(path)
-        .map_err(|error| LoadProfilesError::Io {
+        .map_err(|error| ServeProfilesError::Io {
             path: path.to_path_buf(),
             source: error.error,
         })?;
@@ -1099,20 +1060,20 @@ pub enum LoadSettingsError {
         engine_id: String,
     },
     #[error("profile `{0}` does not exist")]
-    ProfileNotFound(LoadProfileName),
+    ProfileNotFound(ServeProfileName),
     #[error("profile `{0}` already exists")]
-    ProfileAlreadyExists(LoadProfileName),
+    ProfileAlreadyExists(ServeProfileName),
     #[error(
         "profile `{profile}` is assigned to model(s): {models:?}; clear those assignments before deleting it"
     )]
     ProfileAssigned {
-        profile: LoadProfileName,
+        profile: ServeProfileName,
         models: Vec<ModelId>,
     },
     #[error("profile `{profile}` is assigned to model `{model_id}` but does not exist")]
     MissingAssignedProfile {
         model_id: ModelId,
-        profile: LoadProfileName,
+        profile: ServeProfileName,
     },
     #[error("invalid Serve Profile: {0}")]
     InvalidServeProfile(String),
@@ -1123,7 +1084,7 @@ pub enum LoadSettingsError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum LoadProfilesError {
+pub enum ServeProfilesError {
     #[error("load profile state I/O failed at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -1163,8 +1124,8 @@ mod tests {
     #[test]
     fn resolver_uses_the_required_precedence_and_filters_other_engines() {
         let model_id = ModelId("model".to_owned());
-        let profile = LoadProfileName::new("coding").expect("profile name");
-        let mut state = LoadProfilesState::default();
+        let profile = ServeProfileName::new("coding").expect("profile name");
+        let mut state = ServeProfilesState::default();
         state
             .global_defaults
             .insert(id("context_length"), LoadSettingValue::UnsignedInteger(1));
@@ -1178,16 +1139,12 @@ mod tests {
             .entry(model_id.clone())
             .or_default()
             .insert(id("context_length"), LoadSettingValue::UnsignedInteger(3));
-        state.profiles.insert(
-            profile.clone(),
-            LoadProfile {
-                settings: LoadSettingsPatch(BTreeMap::from([
-                    (id("context_length"), LoadSettingValue::UnsignedInteger(4)),
-                    (id("q27.kv_fp16"), LoadSettingValue::FlagEnabled),
-                ])),
-                serve_profile: None,
-            },
-        );
+        let mut serve_profile = crate::ServeProfile::local(profile.as_str());
+        serve_profile.load.settings = LoadSettingsPatch(BTreeMap::from([
+            (id("context_length"), LoadSettingValue::UnsignedInteger(4)),
+            (id("q27.kv_fp16"), LoadSettingValue::FlagEnabled),
+        ]));
+        state.profiles.insert(profile.clone(), serve_profile);
         state.model_assignments.insert(model_id.clone(), profile);
         let invocation = LoadSettingsPatch(BTreeMap::from([(
             id("context_length"),
@@ -1213,7 +1170,8 @@ mod tests {
         );
         assert!(!resolved.effective.contains_key(&id("q27.kv_fp16")));
         assert!(
-            state.profiles[&LoadProfileName::new("coding").expect("name")]
+            state.profiles[&ServeProfileName::new("coding").expect("name")]
+                .load
                 .settings
                 .0
                 .contains_key(&id("q27.kv_fp16"))
@@ -1223,7 +1181,7 @@ mod tests {
     #[test]
     fn removing_a_higher_layer_value_falls_through() {
         let model_id = ModelId("model".to_owned());
-        let mut state = LoadProfilesState::default();
+        let mut state = ServeProfilesState::default();
         state.global_defaults.insert(
             id("parallel_requests"),
             LoadSettingValue::UnsignedInteger(2),
@@ -1253,8 +1211,8 @@ mod tests {
     #[test]
     fn assigned_profile_cannot_be_deleted() {
         let model = ModelId("model".to_owned());
-        let profile = LoadProfileName::new("coding").expect("profile name");
-        let mut state = LoadProfilesState::default();
+        let profile = ServeProfileName::new("coding").expect("profile name");
+        let mut state = ServeProfilesState::default();
         state
             .create_profile(profile.clone())
             .expect("create profile");
@@ -1270,7 +1228,7 @@ mod tests {
 
     #[test]
     fn invocation_overrides_do_not_mutate_persisted_state() {
-        let state = LoadProfilesState::default();
+        let state = ServeProfilesState::default();
         let before = state.clone();
         let invocation = LoadSettingsPatch(BTreeMap::from([(
             id("context_length"),
@@ -1293,7 +1251,7 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let data_dir = temporary.path().join("data");
         let model = ModelId("model".to_owned());
-        let mut state = LoadProfilesState::default();
+        let mut state = ServeProfilesState::default();
         state
             .model_defaults
             .entry(model.clone())
@@ -1329,7 +1287,7 @@ mod tests {
             id("q27.prefix_cache_path"),
             LoadSettingValue::Path(PathBuf::from("../outside")),
         )]));
-        let error = LoadProfilesState::default()
+        let error = ServeProfilesState::default()
             .resolve(
                 &ModelId("model".to_owned()),
                 "q27",
@@ -1396,44 +1354,11 @@ mod tests {
             runtimes_dir: root.join("data/runtimes"),
             runtime_cache_dir: root.join("cache/runtime-packs"),
             runtime_selections_file: root.join("data/runtime-selections.json"),
-            load_profiles_file: root.join("data/load-profiles.json"),
-            load_profiles_lock_file: root.join("data/.load-profiles.lock"),
+            serve_profiles_file: root.join("data/serve-profiles.json"),
+            serve_profiles_lock_file: root.join("data/.serve-profiles.lock"),
         };
-        let store = LoadProfilesStore::new(&paths);
-        std::fs::create_dir_all(paths.load_profiles_file.parent().unwrap()).unwrap();
-        std::fs::write(
-            &paths.load_profiles_file,
-            serde_json::to_vec(&serde_json::json!({
-                "version": 1,
-                "global_defaults": {},
-                "engine_defaults": {},
-                "model_defaults": {},
-                "profiles": {
-                    "legacy": {
-                        "settings": {
-                            "context_length": {"kind": "unsigned_integer", "value": 8192}
-                        }
-                    }
-                },
-                "model_assignments": {"legacy-model": "legacy"}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let migrated = store.read().await.expect("migrate schema-one state");
-        assert_eq!(migrated.version, LOAD_PROFILES_SCHEMA_VERSION);
-        let legacy_name = LoadProfileName::new("legacy").unwrap();
-        let legacy = &migrated.profiles[&legacy_name];
-        assert_eq!(legacy.serve_profile.as_ref().unwrap().id, "legacy");
-        assert_eq!(
-            legacy.settings.0[&id("context_length")],
-            LoadSettingValue::UnsignedInteger(8192)
-        );
-        assert_eq!(
-            migrated.model_assignments[&ModelId("legacy-model".to_owned())],
-            legacy_name
-        );
-        let profile = LoadProfileName::new("long-context").expect("profile name");
+        let store = ServeProfilesStore::new(&paths);
+        let profile = ServeProfileName::new("long-context").expect("profile name");
         let written = profile.clone();
         store
             .update(move |state| {
@@ -1442,6 +1367,7 @@ mod tests {
                     .profiles
                     .get_mut(&written)
                     .expect("created profile")
+                    .load
                     .settings
                     .insert(
                         id("context_length"),
@@ -1464,6 +1390,7 @@ mod tests {
         let state = store.read().await.expect("read stored state");
         assert_eq!(
             state.profiles[&profile]
+                .load
                 .settings
                 .0
                 .get(&id("context_length")),
@@ -1473,6 +1400,6 @@ mod tests {
             state.global_defaults.0[&id("parallel_requests")],
             LoadSettingValue::UnsignedInteger(2)
         );
-        assert!(paths.load_profiles_file.is_file());
+        assert!(paths.serve_profiles_file.is_file());
     }
 }

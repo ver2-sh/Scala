@@ -167,39 +167,9 @@ pub fn model_info(capabilities: &ModelServingCapabilities, json_output: bool) ->
                 "Package manifest:     {} v{}",
                 package.manifest_schema, package.manifest_version
             );
-            println!("Package validation:   {:?}", package.validation_status);
-            println!(
-                "Package policy:       {}",
-                package.runtime_policy.as_deref().unwrap_or("n/a")
-            );
-            println!(
-                "Package runtime:      {}",
-                package
-                    .runtime_package_capability
-                    .as_ref()
-                    .map(|state| format!("{state:?}"))
-                    .as_deref()
-                    .unwrap_or("unknown")
-            );
-            println!(
-                "Sharp:                required={} validated={} application={}",
-                yes_no(package.sharp_required),
-                yes_no(package.sharp_validated),
-                package
-                    .sharp_application_capability
-                    .as_ref()
-                    .map(|state| format!("{state:?}"))
-                    .as_deref()
-                    .unwrap_or("unknown")
-            );
+            println!("Sharp validated:      {}", yes_no(package.sharp_validated));
             if let Some(lineage) = &package.canonical_lineage_key_short {
                 println!("Package lineage:      {lineage}");
-            }
-            if !package.ninfer_benchmark_profiles.is_empty() {
-                println!(
-                    "Package profiles:     {}",
-                    comma_list(&package.ninfer_benchmark_profiles)
-                );
             }
         }
         println!(
@@ -741,14 +711,14 @@ fn truncate(value: &str, width: usize) -> String {
 
 pub fn profiles(
     operation: &str,
-    state: &norted_core::LoadProfilesState,
-    selected: Option<&norted_core::LoadProfileName>,
+    state: &norted_core::ServeProfilesState,
+    selected: Option<&norted_core::ServeProfileName>,
     json_output: bool,
 ) -> Result<()> {
     if json_output {
         let profile = selected.and_then(|name| {
             state.profiles.get(name).map(|value| {
-                let serve = value.effective_serve_profile(name);
+                let serve = value.clone();
                 let effective_requirements = serve.effective_requirements();
                 json!({
                     "name": name,
@@ -773,7 +743,7 @@ pub fn profiles(
     }
     if let Some(name) = selected {
         let profile = &state.profiles[name];
-        let serve = profile.effective_serve_profile(name);
+        let serve = profile.clone();
         println!("Serve Profile {} ({})", serve.display_name, serve.id);
         println!("  Source:             {}", serve.source);
         println!(
@@ -918,10 +888,10 @@ pub fn profiles(
                 serve.generation.allowed_user_overrides.join(", ")
             }
         );
-        if profile.settings.is_empty() {
+        if profile.load.settings.is_empty() {
             println!("  No overrides; all values inherit.");
         } else {
-            for (id, value) in profile.settings.iter() {
+            for (id, value) in profile.load.settings.iter() {
                 println!("  {id:<38} {value}");
             }
         }
@@ -966,7 +936,7 @@ pub fn profiles(
                     .values()
                     .filter(|candidate| candidate.as_str() == name.as_str())
                     .count();
-            let serve = profile.effective_serve_profile(name);
+            let serve = profile.clone();
             println!(
                 "{name:<32} {:<18} {:<10} {assigned}",
                 serve.source,
@@ -1132,7 +1102,7 @@ pub fn effective_settings(
 pub fn settings_mutation(
     operation: &str,
     scope: &str,
-    state: &norted_core::LoadProfilesState,
+    state: &norted_core::ServeProfilesState,
     json_output: bool,
 ) -> Result<()> {
     if json_output {
