@@ -12,7 +12,7 @@ use norted_engine::{CatalogError, GitHubCommit, GitHubReleaseClient, RuntimeCata
 use crate::{ENGINE_ID, GITHUB_REPOSITORY, PROVIDER_ID, UPSTREAM_REPOSITORY};
 
 pub const PACKAGE_FAMILY: &str = "ninfer-source";
-pub const RECIPE_VERSION: &str = "ninfer-serve-v1";
+pub const RECIPE_VERSION: &str = "ninfer-serve-v2";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NinferRuntimeCatalogProvider;
@@ -203,7 +203,7 @@ fn source_runtime(
                 requires_make: false,
                 minimum_cpp_standard: Some(20),
                 cpp_compiler: None,
-                cuda_compiler: None,
+                cuda_compiler: Some("/usr/local/cuda/bin/nvcc".into()),
                 requires_pkg_config: true,
                 pkg_config_modules: BTreeMap::from([
                     ("libavformat".to_owned(), "60".to_owned()),
@@ -338,6 +338,10 @@ mod tests {
             ]
         );
         assert_eq!(plan.recipe.build_target, "ninfer-serve");
+        assert_eq!(
+            plan.prerequisites.cuda_compiler.as_deref(),
+            Some(std::path::Path::new("/usr/local/cuda/bin/nvcc"))
+        );
         assert_eq!(
             plan.recipe.entrypoint.to_string_lossy(),
             "build/apps/ninfer-serve"

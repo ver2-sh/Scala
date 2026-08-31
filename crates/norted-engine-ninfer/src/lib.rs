@@ -19,8 +19,9 @@ use norted_engine::{
     EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError, EngineFeature,
     EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceOutput, InferenceRequest,
     InferenceStream, InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter,
-    NativeOption, OptionValueKind, PreparedModelInput, ProcessDescriptor, UpdateState,
-    capture_command, compatibility_for, isolated_cuda_environment, prepare_norted_package_input,
+    NativeOption, OptionValueKind, PreparedModelInput, ProcessDescriptor,
+    RuntimeVariantUpdateIdentity, UpdateState, capture_command, compatibility_for,
+    isolated_cuda_environment, prepare_norted_package_input,
     prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
     revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
 };
@@ -42,6 +43,7 @@ pub const UPSTREAM_REPOSITORY: &str = "https://github.com/Neroued/ninfer";
 pub const GITHUB_REPOSITORY: &str = "Neroued/ninfer";
 pub const PROVIDER_ID: &str = "ninfer-official-source";
 const PACKAGE_CAPABILITY_REVISION: &str = "6b94b8c5721f075624c4f36d18279a848ba8b6c9";
+const MANAGED_NINFER_FUNCTIONAL_VARIANT: &str = "managed-linux-x86_64-cuda-sm120a";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -50,6 +52,30 @@ const STARTUP_LOG_LIMIT: u64 = 512 * 1024;
 const STARTUP_LOG_LINE_LIMIT: usize = 128 * 1024;
 
 const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &["CUDA_VISIBLE_DEVICES"];
+
+fn managed_ninfer_variant_update_identity(
+    identity: &norted_core::RuntimeIdentity,
+) -> Option<RuntimeVariantUpdateIdentity> {
+    if identity.engine_id != ENGINE_ID
+        || identity.package_family != catalog::PACKAGE_FAMILY
+        || identity.platform != "linux"
+        || identity.architecture != "x86_64"
+        || identity.accelerator != "cuda"
+        || identity.package.provider_id != PROVIDER_ID
+        || identity.package.repository.as_deref() != Some(GITHUB_REPOSITORY)
+    {
+        return None;
+    }
+    let generation = match identity.variant.as_str() {
+        "ninfer-serve-v1-sm120a" => 1,
+        "ninfer-serve-v2-sm120a" => 2,
+        _ => return None,
+    };
+    Some(RuntimeVariantUpdateIdentity {
+        functional_variant: MANAGED_NINFER_FUNCTIONAL_VARIANT.to_owned(),
+        source_recipe_generation: Some(generation),
+    })
+}
 
 // Norted owns identity, private transport, device selection, structured load
 // settings, request semantics, and all sampler behavior.
@@ -540,6 +566,14 @@ impl EngineAdapter for NinferAdapter {
             api: vec![ApiCapability::Responses, ApiCapability::ChatCompletions],
             features: vec![EngineFeature::TextGeneration],
         }
+    }
+
+    fn runtime_variant_update_identity(
+        &self,
+        identity: &norted_core::RuntimeIdentity,
+    ) -> RuntimeVariantUpdateIdentity {
+        managed_ninfer_variant_update_identity(identity)
+            .unwrap_or_else(|| RuntimeVariantUpdateIdentity::exact(identity))
     }
 
     fn runtime_management_compatibility(&self) -> CompatibilityDecision {
@@ -2119,6 +2153,39 @@ mod tests {
                     )
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn managed_source_recipe_generations_share_the_ninfer_update_line() {
+        let identity = |variant: &str| norted_core::RuntimeIdentity {
+            engine_id: ENGINE_ID.to_owned(),
+            package_family: catalog::PACKAGE_FAMILY.to_owned(),
+            version: "git-20260831-aaaaaaaa".to_owned(),
+            upstream_revision: Some("a".repeat(40)),
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            accelerator: "cuda".to_owned(),
+            variant: variant.to_owned(),
+            package: norted_core::RuntimePackageIdentity {
+                provider_id: PROVIDER_ID.to_owned(),
+                repository: Some(GITHUB_REPOSITORY.to_owned()),
+                release_tag: None,
+                asset_id: None,
+                asset_name: None,
+                additional_assets: Vec::new(),
+            },
+        };
+        let adapter = NinferAdapter::from_config(None, Path::new("."));
+        for (variant, generation) in [("ninfer-serve-v1-sm120a", 1), ("ninfer-serve-v2-sm120a", 2)]
+        {
+            assert_eq!(
+                adapter.runtime_variant_update_identity(&identity(variant)),
+                RuntimeVariantUpdateIdentity {
+                    functional_variant: MANAGED_NINFER_FUNCTIONAL_VARIANT.to_owned(),
+                    source_recipe_generation: Some(generation),
+                }
+            );
         }
     }
 

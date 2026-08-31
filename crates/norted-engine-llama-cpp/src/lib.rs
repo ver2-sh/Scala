@@ -75,7 +75,9 @@ fn managed_llama_variant_update_identity(
         "managed-portable-v1" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 1),
         "managed-portable-v2" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 2),
         "managed-portable-v3" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 3),
+        "managed-portable-v4" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 4),
         "managed-portable-cuda13-v1" => (MANAGED_CUDA13_FUNCTIONAL_VARIANT, 1),
+        "managed-portable-cuda13-v2" => (MANAGED_CUDA13_FUNCTIONAL_VARIANT, 2),
         _ => return None,
     };
     Some(RuntimeVariantUpdateIdentity {
@@ -2169,11 +2171,24 @@ mod recipe_update_tests {
             ("managed-portable-v1", 1),
             ("managed-portable-v2", 2),
             ("managed-portable-v3", 3),
+            ("managed-portable-v4", 4),
         ] {
             assert_eq!(
                 adapter.runtime_variant_update_identity(&identity(variant, "cuda")),
                 RuntimeVariantUpdateIdentity {
                     functional_variant: MANAGED_CUDA12_FUNCTIONAL_VARIANT.to_owned(),
+                    source_recipe_generation: Some(generation),
+                }
+            );
+        }
+        for (variant, generation) in [
+            ("managed-portable-cuda13-v1", 1),
+            ("managed-portable-cuda13-v2", 2),
+        ] {
+            assert_eq!(
+                adapter.runtime_variant_update_identity(&identity(variant, "cuda")),
+                RuntimeVariantUpdateIdentity {
+                    functional_variant: MANAGED_CUDA13_FUNCTIONAL_VARIANT.to_owned(),
                     source_recipe_generation: Some(generation),
                 }
             );
@@ -2184,22 +2199,22 @@ mod recipe_update_tests {
     fn cuda13_is_an_intentional_parallel_functional_variant() {
         let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
         let cuda12 =
-            adapter.runtime_variant_update_identity(&identity("managed-portable-v3", "cuda"));
+            adapter.runtime_variant_update_identity(&identity("managed-portable-v4", "cuda"));
         let cuda13 = adapter
-            .runtime_variant_update_identity(&identity("managed-portable-cuda13-v1", "cuda"));
+            .runtime_variant_update_identity(&identity("managed-portable-cuda13-v2", "cuda"));
 
         assert_eq!(cuda12.functional_variant, MANAGED_CUDA12_FUNCTIONAL_VARIANT);
-        assert_eq!(cuda12.source_recipe_generation, Some(3));
+        assert_eq!(cuda12.source_recipe_generation, Some(4));
         assert_eq!(cuda13.functional_variant, MANAGED_CUDA13_FUNCTIONAL_VARIANT);
-        assert_eq!(cuda13.source_recipe_generation, Some(1));
+        assert_eq!(cuda13.source_recipe_generation, Some(2));
         assert_ne!(cuda12.functional_variant, cuda13.functional_variant);
     }
 
     #[test]
-    fn known_bad_v1_is_not_servable_but_retains_the_v3_update_line() {
+    fn known_bad_v1_is_not_servable_but_retains_the_current_update_line() {
         let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
         let v1_identity = identity("managed-portable-v1", "cuda");
-        let v3_identity = identity("managed-portable-v3", "cuda");
+        let current_identity = identity("managed-portable-v4", "cuda");
         let CompatibilityDecision::Unsupported { reason } =
             adapter.runtime_compatibility(&installed(v1_identity.clone()))
         else {
@@ -2208,9 +2223,12 @@ mod recipe_update_tests {
         assert!(reason.contains("known relocation defect"));
 
         let v1_update = adapter.runtime_variant_update_identity(&v1_identity);
-        let v3_update = adapter.runtime_variant_update_identity(&v3_identity);
-        assert_eq!(v1_update.functional_variant, v3_update.functional_variant);
-        assert!(v3_update.source_recipe_generation > v1_update.source_recipe_generation);
+        let current_update = adapter.runtime_variant_update_identity(&current_identity);
+        assert_eq!(
+            v1_update.functional_variant,
+            current_update.functional_variant
+        );
+        assert!(current_update.source_recipe_generation > v1_update.source_recipe_generation);
 
         let mut external = v1_identity;
         external.package.provider_id = "external-runtime".to_owned();
@@ -2249,7 +2267,7 @@ mod recipe_update_tests {
     fn unknown_generations_and_other_accelerators_do_not_cross_update() {
         let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
         for runtime in [
-            identity("managed-portable-v4", "cuda"),
+            identity("managed-portable-v5", "cuda"),
             identity("managed-portable-v3", "vulkan"),
         ] {
             assert_eq!(
