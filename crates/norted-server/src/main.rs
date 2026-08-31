@@ -493,6 +493,12 @@ async fn handle_model_profiles(
                 .get(&profile_id)
                 .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
             require_compatible_engine(&registry, &model, existing.engine_id.as_str())?;
+            validate_patch_for_model(
+                &registry,
+                &model,
+                existing.engine_id.as_str(),
+                &existing.overrides,
+            )?;
             let selected = profile_id.clone();
             let state = store
                 .update(move |state| {
@@ -539,6 +545,7 @@ async fn handle_model_profiles(
         }
         ModelProfilesCommand::Set { profile, settings } => {
             let profile_id = ModelProfileId::new(profile)?;
+            core.ensure_model_discovery().await?;
             let registry = composition::engine_registry(&core)?;
             let mut patch = registry.parse_settings(&settings)?;
             norted_engine::record_local_file_setting_identity(
@@ -555,6 +562,10 @@ async fn handle_model_profiles(
                 .get(&profile_id)
                 .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
             validate_patch_for_engine(&patch, existing.engine_id.as_str())?;
+            let model = require_model(&core, &existing.model_id).await?;
+            let mut candidate = existing.overrides.clone();
+            candidate.0.extend(patch.0.clone());
+            validate_patch_for_model(&registry, &model, existing.engine_id.as_str(), &candidate)?;
             let selected = profile_id.clone();
             let state = store
                 .update(move |state| {
@@ -688,8 +699,8 @@ async fn exact_model_profile_context(
     )?;
     let packs = composition::runtime_pack_manager(core, registry.clone())?;
     let runtime = runtime.map(RuntimeId::new).transpose()?;
-    let selection = packs
-        .resolve_for_engine_with_settings(
+    let (selection, schema) = packs
+        .settings_schema_for_model_for_engine_with_settings(
             &model,
             profile.engine_id.as_str(),
             runtime.as_ref(),
@@ -700,9 +711,6 @@ async fn exact_model_profile_context(
     let adapter = registry.get(profile.engine_id.as_str()).ok_or_else(|| {
         color_eyre::eyre::eyre!("bound engine `{}` is not registered", profile.engine_id)
     })?;
-    let schema = adapter
-        .settings_schema(&selection.runtime, &model, &host)
-        .await?;
     schema.validate(&resolved)?;
     let compatibility =
         adapter.runtime_model_compatibility(&selection.runtime, &model, &host, Some(&resolved));
@@ -859,6 +867,44 @@ fn validate_patch_for_engine(patch: &SettingsPatch, engine: &str) -> Result<()> 
             .into());
         }
     }
+    Ok(())
+}
+
+fn validate_patch_for_model(
+    registry: &EngineRegistry,
+    model: &norted_core::ModelArtifact,
+    engine: &str,
+    patch: &SettingsPatch,
+) -> Result<()> {
+    let adapter = registry
+        .get(engine)
+        .ok_or_else(|| color_eyre::eyre::eyre!("unknown engine `{engine}`"))?;
+    let schema = norted_core::SettingsSchema {
+        engine_id: engine.to_owned(),
+        runtime_id: None,
+        definitions: adapter.model_setting_definitions(model)?,
+    };
+    let resolved = norted_core::ResolvedSettings {
+        engine_id: engine.to_owned(),
+        model_profile_id: None,
+        effective: patch
+            .0
+            .iter()
+            .map(|(id, value)| {
+                (
+                    id.clone(),
+                    norted_core::ResolvedSetting {
+                        value: value.clone(),
+                        source: norted_core::SettingSource::ModelProfile {
+                            model_profile_id: ModelProfileId::new("model-validation")
+                                .expect("static Model Profile ID"),
+                        },
+                    },
+                )
+            })
+            .collect(),
+    };
+    schema.validate(&resolved)?;
     Ok(())
 }
 

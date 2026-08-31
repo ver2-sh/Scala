@@ -189,6 +189,49 @@ impl RuntimePackManager {
         Ok((selection, schema))
     }
 
+    pub fn model_settings_schema_for_engine(
+        &self,
+        model: &norted_core::ModelArtifact,
+        engine_id: &str,
+    ) -> Result<norted_core::SettingsSchema, RuntimePackError> {
+        let adapter = self.registry.get(engine_id).ok_or_else(|| {
+            RuntimePackError::Selection(format!("bound engine `{engine_id}` is not registered"))
+        })?;
+        if let CompatibilityDecision::Unsupported { reason } = adapter.compatibility(model) {
+            return Err(RuntimePackError::Selection(reason));
+        }
+        let definitions = adapter
+            .model_setting_definitions(model)
+            .map_err(RuntimePackError::Adapter)?;
+        Ok(norted_core::SettingsSchema {
+            engine_id: engine_id.to_owned(),
+            runtime_id: None,
+            definitions,
+        })
+    }
+
+    pub async fn settings_schema_for_model_for_engine_with_settings(
+        &self,
+        model: &norted_core::ModelArtifact,
+        engine_id: &str,
+        explicit_runtime: Option<&norted_core::RuntimeId>,
+        settings: Option<&norted_core::ResolvedSettings>,
+    ) -> Result<(norted_core::RuntimeSelection, norted_core::SettingsSchema), RuntimePackError>
+    {
+        let selection = self
+            .resolve_for_engine_with_settings(model, engine_id, explicit_runtime, settings)
+            .await?;
+        let adapter = self.registry.get(engine_id).ok_or_else(|| {
+            RuntimePackError::Selection(format!("bound engine `{engine_id}` is not registered"))
+        })?;
+        let host = self.host_capabilities().await;
+        let schema = adapter
+            .settings_schema(&selection.runtime, model, &host)
+            .await
+            .map_err(RuntimePackError::Adapter)?;
+        Ok((selection, schema))
+    }
+
     pub async fn list(&self) -> Result<RuntimeListSnapshot, RuntimePackError> {
         let RuntimeStoreSnapshot {
             mut runtimes,
@@ -1768,21 +1811,205 @@ fn version_parts(value: &str) -> Vec<u64> {
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
+    use async_trait::async_trait;
     use norted_core::{
-        ArtifactFormat, AvailableRuntime, InstalledRuntime, RUNTIME_MANIFEST_SCHEMA_VERSION,
+        AcquisitionMethod, AppPaths, ArtifactFormat, AvailableRuntime, EngineInstallation,
+        EngineRevision, InstalledRuntime, ModelArtifact, ModelId, RUNTIME_MANIFEST_SCHEMA_VERSION,
         RuntimeAcquisitionMethod, RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeDownload,
         RuntimeId, RuntimeIdentity, RuntimeManifest, RuntimePackageIdentity,
         RuntimeProbeObservation, RuntimeReleaseChannel, RuntimeRequirements,
         RuntimeSourceBuildProvenance, RuntimeSourceBuildSystem, RuntimeSourceBuildToolchain,
-        RuntimeSourceSnapshot, RuntimeUpdatePreference, RuntimeUpdateState,
+        RuntimeSourceSnapshot, RuntimeUpdatePreference, RuntimeUpdateState, SettingDefinition,
+        SettingId, SettingKind, SettingScope, SettingsSchema,
     };
 
     use super::{
         compare_installed_recency, same_update_line, semantic_release_update_state,
         source_history_update_state,
     };
-    use crate::{GitHubCompare, GitHubComparisonStatus};
+    use crate::{
+        EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError,
+        EngineIdentity, EngineProbe, EngineRegistry, GitHubCompare, GitHubComparisonStatus,
+        InferenceOutput, InferenceRequest, InferenceStream, InstallationState, LaunchRequest,
+        LaunchSpec, NativeOption, ProcessDescriptor, RuntimeCatalogProvider, UpdateState,
+    };
+
+    struct BoundSchemaAdapter {
+        id: &'static str,
+    }
+
+    #[async_trait]
+    impl EngineAdapter for BoundSchemaAdapter {
+        fn identity(&self) -> EngineIdentity {
+            EngineIdentity {
+                id: self.id.to_owned(),
+                display_name: self.id.to_owned(),
+                upstream_repository: String::new(),
+            }
+        }
+
+        fn capabilities(&self) -> EngineCapabilities {
+            EngineCapabilities {
+                artifact_formats: vec![ArtifactFormat::Gguf],
+                ..EngineCapabilities::default()
+            }
+        }
+
+        fn native_options(&self) -> Vec<NativeOption> {
+            Vec::new()
+        }
+
+        async fn settings_schema(
+            &self,
+            runtime: &InstalledRuntime,
+            _model: &ModelArtifact,
+            _host: &norted_core::HostCapabilities,
+        ) -> Result<SettingsSchema, EngineError> {
+            Ok(SettingsSchema {
+                engine_id: self.id.to_owned(),
+                runtime_id: Some(runtime.manifest.runtime_id.clone()),
+                definitions: vec![SettingDefinition {
+                    id: SettingId::new(format!("{}.marker", self.id)).expect("setting ID"),
+                    label: self.id.to_owned(),
+                    description: self.id.to_owned(),
+                    kind: SettingKind::Toggle,
+                    scope: SettingScope::Engine {
+                        engine_id: self.id.to_owned(),
+                    },
+                    category: norted_core::SettingCategory::Advanced,
+                    supported: true,
+                    unsupported_reason: None,
+                    unit: None,
+                    upstream_default: None,
+                }],
+            })
+        }
+
+        async fn probe(&self) -> Result<EngineProbe, EngineError> {
+            Ok(EngineProbe {
+                installation: InstallationState::Installed {
+                    installation: Box::new(EngineInstallation {
+                        engine: EngineRevision {
+                            engine_id: self.id.to_owned(),
+                            version: Some("1".to_owned()),
+                            revision: None,
+                        },
+                        source_repository: None,
+                        acquisition_method: AcquisitionMethod::ExternalBinary,
+                        binary_path: PathBuf::from(format!("/tmp/{}-server", self.id)),
+                        binary_sha256: Some("a".repeat(64)),
+                        build: None,
+                        platform: std::env::consts::OS.to_owned(),
+                        architecture: std::env::consts::ARCH.to_owned(),
+                        runtime_variant: Some("fixture".to_owned()),
+                        acquired_at_unix: None,
+                        observed_at_unix: 1,
+                    }),
+                },
+                update: UpdateState::Unknown,
+                healthy: true,
+                detail: "fixture".to_owned(),
+            })
+        }
+
+        async fn probe_runtime(
+            &self,
+            _runtime: &InstalledRuntime,
+        ) -> Result<RuntimeProbeObservation, EngineError> {
+            unreachable!()
+        }
+
+        async fn build_launch_spec(
+            &self,
+            _request: LaunchRequest,
+        ) -> Result<LaunchSpec, EngineError> {
+            unreachable!()
+        }
+
+        async fn health(&self, _process: &ProcessDescriptor) -> Result<bool, EngineError> {
+            unreachable!()
+        }
+
+        async fn effective_generation_settings(
+            &self,
+            _process: &ProcessDescriptor,
+        ) -> Result<EffectiveGenerationSettings, EngineError> {
+            unreachable!()
+        }
+
+        async fn infer(
+            &self,
+            _endpoint: &str,
+            _request: InferenceRequest,
+        ) -> Result<InferenceOutput, EngineError> {
+            unreachable!()
+        }
+
+        async fn infer_stream(
+            &self,
+            _endpoint: &str,
+            _request: InferenceRequest,
+        ) -> Result<InferenceStream, EngineError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_engine_schema_resolution_never_selects_another_compatible_engine() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.toml"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            runtimes_dir: root.join("data/runtimes"),
+            runtime_cache_dir: root.join("cache/runtime-packs"),
+            runtime_selections_file: root.join("data/runtime-selections.json"),
+            settings_file: root.join("data/settings.json"),
+            settings_lock_file: root.join("data/.settings.lock"),
+            model_profiles_file: root.join("data/model-profiles.json"),
+            model_profiles_lock_file: root.join("data/.model-profiles.lock"),
+        };
+        paths.ensure_required().expect("application paths");
+        let mut registry = EngineRegistry::default();
+        registry
+            .register(Arc::new(BoundSchemaAdapter { id: "fake_a" }))
+            .expect("fake_a adapter");
+        registry
+            .register(Arc::new(BoundSchemaAdapter { id: "fake_b" }))
+            .expect("fake_b adapter");
+        let providers = Vec::<Arc<dyn RuntimeCatalogProvider>>::new();
+        let manager =
+            super::RuntimePackManager::new(&paths, registry, providers).expect("runtime manager");
+        let model = ModelArtifact {
+            id: ModelId("fixture".to_owned()),
+            display_name: "Fixture".to_owned(),
+            path: PathBuf::from("fixture.gguf"),
+            format: ArtifactFormat::Gguf,
+            size_bytes: 1,
+            created: 1,
+            hash: None,
+            architecture: None,
+            context_length: None,
+            provenance: None,
+            native_identity: None,
+            auxiliary_artifacts: Vec::new(),
+            norted_package: None,
+        };
+
+        let (selection, schema) = manager
+            .settings_schema_for_model_for_engine_with_settings(&model, "fake_b", None, None)
+            .await
+            .expect("bound fake_b schema");
+        assert_eq!(selection.runtime.manifest.identity.engine_id, "fake_b");
+        assert_eq!(schema.engine_id, "fake_b");
+        assert_eq!(schema.definitions[0].id.as_str(), "fake_b.marker");
+    }
 
     #[test]
     fn source_update_states_follow_git_ancestry_only() {

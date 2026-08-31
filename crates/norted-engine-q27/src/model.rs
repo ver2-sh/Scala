@@ -106,17 +106,21 @@ pub(crate) fn inspect_q27_model(path: &Path) -> Result<Q27ModelFacts, String> {
         .ok_or_else(|| "Q27 metadata JSON must be an object".to_owned())?;
     validate_current_architecture(metadata)?;
     let tier = published_tier(metadata);
-    Ok(Q27ModelFacts {
-        tier,
-        capabilities: BTreeSet::from(["mtp_layer_1", "text_only"]),
-    })
+    let mut capabilities = BTreeSet::from(["text_only"]);
+    if metadata
+        .get("qwen35.nextn_predict_layers")
+        .and_then(Value::as_u64)
+        == Some(1)
+    {
+        capabilities.insert("mtp_layer_1");
+    }
+    Ok(Q27ModelFacts { tier, capabilities })
 }
 
 fn validate_current_architecture(metadata: &Map<String, Value>) -> Result<(), String> {
     require_string(metadata, "general.architecture", "qwen35")?;
     for (key, expected) in [
         ("qwen35.block_count", 65),
-        ("qwen35.nextn_predict_layers", 1),
         ("qwen35.embedding_length", 5120),
         ("qwen35.feed_forward_length", 17408),
         ("qwen35.attention.head_count", 24),
@@ -133,6 +137,18 @@ fn validate_current_architecture(metadata: &Map<String, Value>) -> Result<(), St
         ("group_q8", 128),
     ] {
         require_u64(metadata, key, expected)?;
+    }
+    let nextn_predict_layers = metadata
+        .get("qwen35.nextn_predict_layers")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            "Q27 architecture metadata `qwen35.nextn_predict_layers` is missing or not an unsigned integer"
+                .to_owned()
+        })?;
+    if nextn_predict_layers > 1 {
+        return Err(format!(
+            "Q27 architecture metadata `qwen35.nextn_predict_layers` is {nextn_predict_layers}; current q27 runtimes support at most one prediction layer"
+        ));
     }
     require_f64(
         metadata,
@@ -312,6 +328,41 @@ mod tests {
             inspect_q27_model(incompatible.path())
                 .unwrap_err()
                 .contains("embedding_length")
+        );
+    }
+
+    #[test]
+    fn mtp_capability_requires_a_proven_prediction_layer() {
+        let with_mtp = write_model(&architecture_metadata());
+        assert!(
+            inspect_q27_model(with_mtp.path())
+                .expect("MTP fixture")
+                .capabilities
+                .contains("mtp_layer_1")
+        );
+
+        let mut without_mtp = architecture_metadata();
+        without_mtp
+            .as_object_mut()
+            .expect("object")
+            .insert("qwen35.nextn_predict_layers".to_owned(), json!(0));
+        let without_mtp = write_model(&without_mtp);
+        assert!(
+            !inspect_q27_model(without_mtp.path())
+                .expect("non-MTP fixture remains a valid q27 artifact")
+                .capabilities
+                .contains("mtp_layer_1")
+        );
+
+        let mut unsupported = architecture_metadata();
+        unsupported
+            .as_object_mut()
+            .expect("object")
+            .insert("qwen35.nextn_predict_layers".to_owned(), json!(2));
+        assert!(
+            inspect_q27_model(write_model(&unsupported).path())
+                .unwrap_err()
+                .contains("at most one prediction layer")
         );
     }
 }
