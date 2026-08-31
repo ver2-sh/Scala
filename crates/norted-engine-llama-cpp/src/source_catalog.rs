@@ -18,8 +18,8 @@ use crate::catalog::{
 use crate::{ENGINE_ID, UPSTREAM_REPOSITORY};
 
 const PACKAGE_FAMILY: &str = "llama-cpp-managed-source";
-const CUDA12_RECIPE_VERSION: &str = "managed-portable-v3";
-const CUDA13_RECIPE_VERSION: &str = "managed-portable-cuda13-v1";
+const CUDA12_RECIPE_VERSION: &str = "managed-portable-v4";
+const CUDA13_RECIPE_VERSION: &str = "managed-portable-cuda13-v2";
 const CUDA_ARCHITECTURES: &str = "75-real;80-real;86-real;89-real;90-real;120a-real";
 const ACCELERATOR_TARGET: &str = "sm_75+sm_80+sm_86+sm_89+sm_90+sm_120a";
 const SOURCE_CONTRACT_FILE_LIMIT: usize = 512 * 1024;
@@ -564,7 +564,7 @@ fn source_runtime(
                 requires_make: false,
                 minimum_cpp_standard: Some(17),
                 cpp_compiler: None,
-                cuda_compiler: None,
+                cuda_compiler: Some("/usr/local/cuda/bin/nvcc".into()),
                 requires_pkg_config: false,
                 pkg_config_modules: BTreeMap::new(),
             },
@@ -821,6 +821,10 @@ mod tests {
                 Some(recipe.minimum_driver)
             );
             assert_eq!(plan.recipe.accelerator_target, ACCELERATOR_TARGET);
+            assert_eq!(
+                plan.prerequisites.cuda_compiler.as_deref(),
+                Some(std::path::Path::new("/usr/local/cuda/bin/nvcc"))
+            );
             assert_eq!(
                 plan.source.commit_sha,
                 "1111111111111111111111111111111111111111"

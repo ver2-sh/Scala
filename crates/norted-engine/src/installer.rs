@@ -541,6 +541,9 @@ impl RuntimeInstaller {
                         build_text.clone(),
                     ];
                     configure_arguments.extend(plan.recipe.cmake_configuration_arguments.clone());
+                    if let Some(cuda_compiler) = cmake_cuda_compiler_configuration(plan)? {
+                        configure_arguments.push(cuda_compiler);
+                    }
                     let configure_refs = configure_arguments
                         .iter()
                         .map(String::as_str)
@@ -1034,6 +1037,12 @@ async fn check_source_build_prerequisites(
         )));
     }
 
+    // Validate the generic CMake binding before probing the compiler. The same
+    // typed prerequisite path is appended to configure as
+    // CMAKE_CUDA_COMPILER, so admission and build execution cannot select
+    // different nvcc programs through ambient PATH or CUDACXX.
+    cmake_cuda_compiler_configuration(plan)?;
+
     command_text("git", &["--version"], None).await?;
     let cmake_version = if plan.recipe.build_system == RuntimeSourceBuildSystem::Cmake {
         let identity = command_text("cmake", &["--version"], None).await?;
@@ -1117,6 +1126,34 @@ async fn check_source_build_prerequisites(
         pkg_config_version: first_line(&pkg_config_identity),
         system_dependencies,
     })
+}
+
+fn cmake_cuda_compiler_configuration(
+    plan: &RuntimeSourceBuildPlan,
+) -> Result<Option<String>, RuntimeInstallError> {
+    if plan.recipe.build_system != RuntimeSourceBuildSystem::Cmake {
+        return Ok(None);
+    }
+    if plan
+        .recipe
+        .cmake_configuration_arguments
+        .iter()
+        .any(|argument| argument.contains("CMAKE_CUDA_COMPILER"))
+    {
+        return Err(RuntimeInstallError::Prerequisite(
+            "source recipes must declare the CUDA compiler through the typed `cuda_compiler` prerequisite, not a competing CMake argument"
+                .to_owned(),
+        ));
+    }
+    let Some(compiler) = plan.prerequisites.cuda_compiler.as_deref() else {
+        return Ok(None);
+    };
+    let compiler = compiler.to_str().ok_or_else(|| {
+        RuntimeInstallError::Prerequisite(
+            "the configured CUDA compiler path is not valid UTF-8".to_owned(),
+        )
+    })?;
+    Ok(Some(format!("-DCMAKE_CUDA_COMPILER={compiler}")))
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -2359,7 +2396,8 @@ mod tests {
     use crate::store::RuntimeStore;
 
     use super::{
-        RuntimeInstallError, SourceBuildPrerequisiteEvaluationKey, extract_archive, hex_digest,
+        RuntimeInstallError, SourceBuildPrerequisiteEvaluationKey,
+        cmake_cuda_compiler_configuration, extract_archive, hex_digest,
         inspect_build_dependency_contract, require_cuda_compiler_targets, require_minimum_version,
         require_version_below, required_cuda_compiler_targets, run_owned_staging_operation,
         run_source_command, validate_relative_link_target, verify_package_digest,
@@ -2470,6 +2508,32 @@ mod tests {
         assert_ne!(
             SourceBuildPrerequisiteEvaluationKey::from_plan(&plan),
             SourceBuildPrerequisiteEvaluationKey::from_plan(&different_targets)
+        );
+
+        let mut explicit_compiler = plan.clone();
+        explicit_compiler.prerequisites.cuda_compiler = Some("/usr/local/cuda/bin/nvcc".into());
+        assert_ne!(
+            SourceBuildPrerequisiteEvaluationKey::from_plan(&plan),
+            SourceBuildPrerequisiteEvaluationKey::from_plan(&explicit_compiler)
+        );
+        assert_eq!(
+            cmake_cuda_compiler_configuration(&explicit_compiler)
+                .expect("typed CUDA compiler binding"),
+            Some("-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc".to_owned())
+        );
+
+        explicit_compiler
+            .recipe
+            .cmake_configuration_arguments
+            .push("-DCMAKE_CUDA_COMPILER=/other/nvcc".to_owned());
+        assert!(cmake_cuda_compiler_configuration(&explicit_compiler).is_err());
+
+        explicit_compiler.recipe.cmake_configuration_arguments.pop();
+        explicit_compiler.recipe.build_system = RuntimeSourceBuildSystem::Make;
+        assert_eq!(
+            cmake_cuda_compiler_configuration(&explicit_compiler)
+                .expect("Make recipes retain their own compiler contract"),
+            None
         );
     }
 
