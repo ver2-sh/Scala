@@ -15,8 +15,8 @@ use norted_core::{
     AcceleratorDevice, ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifactRole,
     AvailableRuntime, EngineInstallation, EngineRevision, HostCapabilities, InstalledRuntime,
     ModelArtifact, ModelId, ModelRuntimeIdentity, ResolvedSettings, RuntimeCompatibility,
-    RuntimeId, RuntimeProbeObservation, SettingDefinition, SettingId, SettingsError, SettingsPatch,
-    SettingsSchema,
+    RuntimeId, RuntimeIdentity, RuntimeProbeObservation, SettingDefinition, SettingId,
+    SettingsError, SettingsPatch, SettingsSchema,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -991,6 +991,23 @@ pub enum RegistryError {
     DuplicateEngineId(String),
 }
 
+/// Engine-owned logical variant identity used only for update discovery.
+/// RuntimeIdentity and RuntimeId remain immutable package identities.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RuntimeVariantUpdateIdentity {
+    pub functional_variant: String,
+    pub source_recipe_generation: Option<u32>,
+}
+
+impl RuntimeVariantUpdateIdentity {
+    pub fn exact(identity: &RuntimeIdentity) -> Self {
+        Self {
+            functional_variant: identity.variant.clone(),
+            source_recipe_generation: None,
+        }
+    }
+}
+
 #[async_trait]
 pub trait EngineAdapter: Send + Sync {
     fn identity(&self) -> EngineIdentity;
@@ -1006,6 +1023,14 @@ pub trait EngineAdapter: Send + Sync {
     }
     fn runtime_compatibility(&self, _runtime: &InstalledRuntime) -> CompatibilityDecision {
         CompatibilityDecision::Supported
+    }
+    /// Separates an intentional functional variant from an explicitly ordered
+    /// source-recipe generation without changing immutable runtime identity.
+    fn runtime_variant_update_identity(
+        &self,
+        identity: &RuntimeIdentity,
+    ) -> RuntimeVariantUpdateIdentity {
+        RuntimeVariantUpdateIdentity::exact(identity)
     }
     fn compatibility(&self, model: &ModelArtifact) -> CompatibilityDecision {
         if self.capabilities().accepts(model.format) {

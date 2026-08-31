@@ -310,7 +310,16 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
                         .as_deref()
                         .map_or_else(
                             || "CUDA toolkit/nvcc".to_owned(),
-                            |version| format!("CUDA >= {version}"),
+                            |version| {
+                                source_build
+                                    .prerequisites
+                                    .maximum_cuda_version_exclusive
+                                    .as_deref()
+                                    .map_or_else(
+                                        || format!("CUDA >= {version}"),
+                                        |maximum| format!("CUDA >= {version}, < {maximum}"),
+                                    )
+                            },
                         ),
                 ];
                 if source_build.prerequisites.requires_ninja {
@@ -334,7 +343,16 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
                     .as_deref()
                     .map_or_else(
                         || "CUDA toolkit".to_owned(),
-                        |version| format!("CUDA >= {version}"),
+                        |version| {
+                            source_build
+                                .prerequisites
+                                .maximum_cuda_version_exclusive
+                                .as_deref()
+                                .map_or_else(
+                                    || format!("CUDA >= {version}"),
+                                    |maximum| format!("CUDA >= {version}, < {maximum}"),
+                                )
+                        },
                     ),
                 source_build
                     .prerequisites
