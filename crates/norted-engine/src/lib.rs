@@ -608,15 +608,11 @@ impl PreparedModelInput {
                     content_sha256: artifact.content_sha256.clone(),
                 })
                 .collect(),
-            norted_package: self.primary.norted_package.clone().map(|binding| {
-                let sharp_applied = binding.sharp.as_ref().map(|_| false);
-                norted_core::NortedPackageRuntimeIdentity {
-                    selected_package_profile: None,
-                    binding,
-                    sharp_applied,
-                    proven_served_context_tokens: None,
-                }
-            }),
+            norted_package: self
+                .primary
+                .norted_package
+                .clone()
+                .map(|binding| norted_core::NortedPackageRuntimeIdentity { binding }),
         }
     }
 }
@@ -697,49 +693,23 @@ pub struct NortedPackageSummary {
     pub kind: norted_core::NortedPackageKind,
     pub manifest_schema: String,
     pub manifest_version: u32,
-    pub validation_status: norted_core::NortedPackageStatus,
-    pub runtime_policy: Option<String>,
-    pub sharp_required: bool,
     pub sharp_validated: bool,
-    pub sharp_application_capability: Option<RuntimeCompatibility>,
     pub canonical_lineage_key_short: Option<String>,
     pub native_identity: Option<ArtifactNativeIdentity>,
-    pub ninfer_benchmark_profiles: Vec<String>,
-    pub runtime_package_capability: Option<RuntimeCompatibility>,
 }
 
-fn norted_package_summary(
-    model: &ModelArtifact,
-    runtime_capability: Option<RuntimeCompatibility>,
-    sharp_application_capability: Option<RuntimeCompatibility>,
-) -> Option<NortedPackageSummary> {
+fn norted_package_summary(model: &ModelArtifact) -> Option<NortedPackageSummary> {
     let package = model.norted_package.as_ref()?;
-    let mut benchmark_profiles = match &package.policy {
-        norted_core::NortedPackagePolicy::Ninfer(policy) => {
-            policy.benchmark_profiles.keys().cloned().collect()
-        }
-        _ => Vec::new(),
-    };
-    benchmark_profiles.sort();
     Some(NortedPackageSummary {
         kind: package.kind,
         manifest_schema: package.manifest_schema.clone(),
         manifest_version: package.manifest_version,
-        validation_status: package.status.clone(),
-        runtime_policy: package
-            .runtime_policy_profile
-            .clone()
-            .or_else(|| package.runtime_policy_id.clone()),
-        sharp_required: package.sharp.is_some(),
         sharp_validated: package.sharp.is_some(),
-        sharp_application_capability,
         canonical_lineage_key_short: package
             .canonical_source_lineage_key
             .as_ref()
             .map(|key| key.chars().take(12).collect()),
         native_identity: model.native_identity.clone(),
-        ninfer_benchmark_profiles: benchmark_profiles,
-        runtime_package_capability: runtime_capability,
     })
 }
 
@@ -965,16 +935,6 @@ pub trait EngineAdapter: Send + Sync {
         _host: &HostCapabilities,
     ) -> u16 {
         100
-    }
-    /// Reports only the external-template/raw-prompt capability for a package.
-    /// This stays separate from overall runtime/model compatibility so local
-    /// model info does not mislabel an unrelated runtime failure as Sharp.
-    fn runtime_package_sharp_compatibility(
-        &self,
-        _runtime: &InstalledRuntime,
-        _model: &ModelArtifact,
-    ) -> Option<RuntimeCompatibility> {
-        None
     }
     /// Evaluates a catalog runtime against a concrete model without installing
     /// it. Ordinary engines inherit the same coarse model gate as installed
@@ -1611,8 +1571,8 @@ mod tests {
             runtimes_dir: root.join("data/runtimes"),
             runtime_cache_dir: root.join("cache/runtime-packs"),
             runtime_selections_file: root.join("data/runtime-selections.json"),
-            load_profiles_file: root.join("data/load-profiles.json"),
-            load_profiles_lock_file: root.join("data/.load-profiles.lock"),
+            serve_profiles_file: root.join("data/serve-profiles.json"),
+            serve_profiles_lock_file: root.join("data/.serve-profiles.lock"),
         };
         paths.ensure_required().expect("application paths");
 
@@ -1790,21 +1750,9 @@ mod tests {
         std::fs::write(&manifest_path, &manifest_bytes).expect("manifest fixture");
         let registry = ModelRegistry::discover(&[temporary.path().to_path_buf()]);
         let artifact = registry.artifacts().first().expect("package artifact");
-        let summary = super::norted_package_summary(
-            artifact,
-            Some(RuntimeCompatibility::Incompatible(
-                "runtime package capability fixture".to_owned(),
-            )),
-            None,
-        )
-        .expect("local package summary");
+        let summary = super::norted_package_summary(artifact).expect("local package summary");
         assert_eq!(summary.kind, norted_core::NortedPackageKind::Gguf);
         assert_eq!(summary.manifest_version, 2);
-        assert_eq!(
-            summary.validation_status,
-            norted_core::NortedPackageStatus::Valid
-        );
-        assert!(summary.runtime_package_capability.is_some());
         let preparation_progress = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&preparation_progress);
         let reporter: super::LoadProgressReporter = Arc::new(move |progress| {

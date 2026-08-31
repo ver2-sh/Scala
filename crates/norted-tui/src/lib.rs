@@ -13,8 +13,8 @@ use color_eyre::Result;
 use crossterm::event::{Event, EventStream};
 use futures_util::StreamExt;
 use norted_core::{
-    ApiKeyStore, AppPaths, ApplicationCore, LoadProfilesStore, LoadSettingDefinition,
-    LoadSettingsError, LoadSettingsPatch, PublicAuthStatus, ServerConfig,
+    ApiKeyStore, AppPaths, ApplicationCore, LoadSettingDefinition, LoadSettingsError,
+    LoadSettingsPatch, PublicAuthStatus, ServeProfilesStore, ServerConfig,
 };
 use norted_engine::{
     BackendLifecycle, ControlClient, ControlClientError, ControlStatus, RuntimePackManager,
@@ -340,7 +340,7 @@ async fn execute_settings_action(
     paths: &AppPaths,
     action: SettingsAction,
 ) -> SettingsTaskResult {
-    let store = LoadProfilesStore::new(paths);
+    let store = ServeProfilesStore::new(paths);
     match action {
         SettingsAction::Refresh => {
             SettingsTaskResult::Loaded(store.read().await.map_err(|error| error.to_string()))
@@ -374,12 +374,9 @@ async fn execute_settings_action(
                                 .get_mut(&profile)
                                 .ok_or_else(|| LoadSettingsError::ProfileNotFound(profile.clone()))?;
                             if is_serve_profile_editor_field(&id) {
-                                let serve = local.serve_profile.get_or_insert_with(|| {
-                                    norted_core::ServeProfile::local(profile.as_str())
-                                });
-                                apply_serve_profile_editor_value(serve, &id, Some(value))?;
+                                apply_serve_profile_editor_value(local, &id, Some(value))?;
                             } else {
-                                local.settings.insert(id, value);
+                                local.load.settings.insert(id, value);
                             }
                         }
                         SettingsScope::BuilderProfile(profile_id) => {
@@ -416,13 +413,10 @@ async fn execute_settings_action(
                                 .get_mut(&profile)
                                 .ok_or_else(|| LoadSettingsError::ProfileNotFound(profile.clone()))?;
                             if is_serve_profile_editor_field(&id) {
-                                let serve = local.serve_profile.get_or_insert_with(|| {
-                                    norted_core::ServeProfile::local(profile.as_str())
-                                });
-                                apply_serve_profile_editor_value(serve, &id, None)?;
+                                apply_serve_profile_editor_value(local, &id, None)?;
                                 return Ok(state.clone());
                             }
-                            &mut local.settings
+                            &mut local.load.settings
                         }
                         SettingsScope::BuilderProfile(profile_id) => {
                             return Err(LoadSettingsError::InvalidServeProfile(format!(
@@ -470,13 +464,7 @@ async fn execute_settings_action(
                         return Err(LoadSettingsError::ProfileAlreadyExists(name));
                     }
                     let fork = source.fork_local(name.as_str(), name.as_str());
-                    state.profiles.insert(
-                        name,
-                        norted_core::LoadProfile {
-                            settings: fork.load.settings.clone(),
-                            serve_profile: Some(fork),
-                        },
-                    );
+                    state.profiles.insert(name, fork);
                     Ok(state.clone())
                 })
                 .await

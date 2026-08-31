@@ -56,7 +56,7 @@ const SOURCE_RUNTIME_ONLY_RECIPE_VERSION: &str = "q27-upstream-make-v2-runtime-o
 // re-reads the bounded files from this exact commit, installation rechecks the
 // exact commit/tree and Makefile digest, and the resulting facts persist in
 // RuntimeSourceBuildProvenance. A new upstream tree must receive a new audited
-// contract before it can gain Norted-package capabilities.
+// contract before it can gain exact-runtime capabilities.
 const PACKAGE_SOURCE_COMMIT: &str = "4770e053656af9aababdc49c81f280ad21b74986";
 const PACKAGE_SOURCE_TREE: &str = "ff712f78fd17b5fe12149679114b6def003f16a6";
 const PACKAGE_MAKEFILE_SHA256: &str =
@@ -1125,7 +1125,7 @@ fn q27_runtime_capabilities(
         bounded_startup_observation: trustworthy_identity,
         compiled_w_max: q27_compiled_w_max(identity, acquisition, source_evidence),
         // q27 v0.6.2 source contains fp8 and turbo3. It does not contain the
-        // package policy's intermediate turbo5k mode.
+        // Serve Profile's intermediate turbo5k mode.
         supported_kv_modes: if exact_source_contract {
             &Q27KvMode::QUALITY_ORDER
         } else if exact_managed_v062 {
@@ -1137,7 +1137,7 @@ fn q27_runtime_capabilities(
 }
 
 #[cfg(test)]
-fn q27_package_prelaunch_failures(capabilities: Q27RuntimeCapabilities) -> Vec<&'static str> {
+fn q27_runtime_contract_failures(capabilities: Q27RuntimeCapabilities) -> Vec<&'static str> {
     let mut reasons = Vec::new();
     if !capabilities.raw_completions {
         reasons.push("raw /v1/completions prompt handling is unproven");
@@ -1158,7 +1158,7 @@ fn q27_package_prelaunch_failures(capabilities: Q27RuntimeCapabilities) -> Vec<&
         reasons.push("top-k/min-p package defaults are unsupported/unproven");
     }
     if !capabilities.mtp_environment {
-        reasons.push("Q27_MAXD/Q27_PMIN/Q27_SUFFIX package policy is unproven");
+        reasons.push("Q27_MAXD/Q27_PMIN/Q27_SUFFIX Serve Profile is unproven");
     }
     if !capabilities.fast_head_control {
         reasons.push("fast-head package control is unproven");
@@ -1176,10 +1176,10 @@ fn q27_package_prelaunch_failures(capabilities: Q27RuntimeCapabilities) -> Vec<&
 }
 
 #[cfg(test)]
-fn evaluate_q27_package_runtime(capabilities: Q27RuntimeCapabilities) -> RuntimeCompatibility {
-    match validate_q27_package_prelaunch(capabilities) {
+fn evaluate_q27_runtime_contract(capabilities: Q27RuntimeCapabilities) -> RuntimeCompatibility {
+    match validate_q27_runtime_contract(capabilities) {
         Ok(()) => RuntimeCompatibility::NeedsAttention(
-            "pre-launch q27 package capabilities are proven; actual served context, KV mode, and W_MAX still require bounded startup observation"
+            "pre-launch q27 Serve Profile capabilities are proven; actual served context, KV mode, and W_MAX still require bounded startup observation"
                 .to_owned(),
         ),
         Err(reason) => RuntimeCompatibility::Incompatible(format!(
@@ -1297,14 +1297,14 @@ fn validate_q27_profile_prelaunch(
 }
 
 #[cfg(test)]
-fn validate_q27_package_prelaunch(capabilities: Q27RuntimeCapabilities) -> Result<(), String> {
+fn validate_q27_runtime_contract(capabilities: Q27RuntimeCapabilities) -> Result<(), String> {
     if !capabilities.trustworthy_identity {
         return Err(
             "the exact q27 executable has no trustworthy package-capability observation; external binaries are not credited from filenames or upstream version assumptions"
                 .to_owned(),
         );
     }
-    let failures = q27_package_prelaunch_failures(capabilities);
+    let failures = q27_runtime_contract_failures(capabilities);
     if failures.is_empty() {
         Ok(())
     } else {
@@ -2400,35 +2400,6 @@ impl EngineAdapter for Q27Adapter {
         q27_runtime_preference(&runtime.manifest.identity.variant, accelerator.as_ref())
     }
 
-    fn runtime_package_sharp_compatibility(
-        &self,
-        runtime: &InstalledRuntime,
-        model: &ModelArtifact,
-    ) -> Option<RuntimeCompatibility> {
-        model.norted_package.as_ref()?;
-        let capabilities = q27_runtime_capabilities(
-            &runtime.manifest.identity,
-            &runtime.manifest.acquisition_method,
-            runtime
-                .manifest
-                .source_build
-                .as_ref()
-                .map(Q27SourceBuildEvidence::Provenance),
-        );
-        Some(if !capabilities.trustworthy_identity {
-            RuntimeCompatibility::Incompatible(
-                "Sharp/raw-prompt capability is unproven for this exact q27 executable".to_owned(),
-            )
-        } else if capabilities.exact_sharp_renderer && capabilities.raw_completions {
-            RuntimeCompatibility::Compatible
-        } else {
-            RuntimeCompatibility::Incompatible(
-                "manifest-bound Sharp rendering into q27 raw completions is unsupported/unproven"
-                    .to_owned(),
-            )
-        })
-    }
-
     fn available_runtime_model_compatibility(
         &self,
         runtime: &AvailableRuntime,
@@ -3120,7 +3091,7 @@ impl EngineAdapter for Q27Adapter {
             execution.profile.prompt.response_filter
                 == norted_core::ResponseFilter::DirkSharpReasoning
         }) {
-            filter_q27_package_output(&text)
+            filter_q27_serve_profile_output(&text)
         } else {
             text
         };
@@ -3769,12 +3740,12 @@ const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
 #[derive(Debug, Default)]
-struct Q27PackageOutputFilter {
+struct Q27ServeProfileOutputFilter {
     reasoning_closed: bool,
     pending: String,
 }
 
-impl Q27PackageOutputFilter {
+impl Q27ServeProfileOutputFilter {
     fn push(&mut self, input: &str) -> String {
         self.pending.push_str(input);
         if !self.reasoning_closed {
@@ -3830,8 +3801,8 @@ impl Q27PackageOutputFilter {
     }
 }
 
-fn filter_q27_package_output(text: &str) -> String {
-    let mut filter = Q27PackageOutputFilter::default();
+fn filter_q27_serve_profile_output(text: &str) -> String {
+    let mut filter = Q27ServeProfileOutputFilter::default();
     let mut public = filter.push(text);
     public.push_str(&filter.finish());
     public
@@ -3856,13 +3827,13 @@ struct SseState {
     queued: VecDeque<Result<InferenceEvent, EngineError>>,
     usage: Option<InferenceUsage>,
     finish_reason: Option<InferenceFinishReason>,
-    package_output_filter: Option<Q27PackageOutputFilter>,
+    serve_profile_output_filter: Option<Q27ServeProfileOutputFilter>,
     finished: bool,
 }
 
 fn q27_sse_stream(
     source: BoxStream<'static, Result<Bytes, reqwest::Error>>,
-    filter_package_output: bool,
+    filter_profile_output: bool,
 ) -> InferenceStream {
     let state = SseState {
         source,
@@ -3870,7 +3841,8 @@ fn q27_sse_stream(
         queued: VecDeque::new(),
         usage: None,
         finish_reason: None,
-        package_output_filter: filter_package_output.then(Q27PackageOutputFilter::default),
+        serve_profile_output_filter: filter_profile_output
+            .then(Q27ServeProfileOutputFilter::default),
         finished: false,
     };
     Box::pin(stream::unfold(state, |mut state| async move {
@@ -3926,7 +3898,7 @@ fn parse_sse_frames(state: &mut SseState) {
             continue;
         }
         if data == "[DONE]" {
-            if let Some(filter) = state.package_output_filter.as_mut() {
+            if let Some(filter) = state.serve_profile_output_filter.as_mut() {
                 let delta = filter.finish();
                 if !delta.is_empty() {
                     state
@@ -4014,7 +3986,7 @@ fn parse_sse_frames(state: &mut SseState) {
             .filter(|delta| !delta.is_empty())
         {
             let delta = state
-                .package_output_filter
+                .serve_profile_output_filter
                 .as_mut()
                 .map_or_else(|| delta.to_owned(), |filter| filter.push(delta));
             if !delta.is_empty() {
@@ -4801,7 +4773,7 @@ mod tests {
     #[test]
     fn exact_old_runtime_has_precise_package_capability_failures() {
         let identity = q27_runtime_identity("w12");
-        let compatibility = evaluate_q27_package_runtime(q27_runtime_capabilities(
+        let compatibility = evaluate_q27_runtime_contract(q27_runtime_capabilities(
             &identity,
             &RuntimeAcquisitionMethod::OfficialReleaseAsset,
             None,
@@ -4813,7 +4785,7 @@ mod tests {
                     && !reason.contains("all Norted packages")
         ));
 
-        let synthetic = evaluate_q27_package_runtime(Q27RuntimeCapabilities {
+        let synthetic = evaluate_q27_runtime_contract(Q27RuntimeCapabilities {
             trustworthy_identity: true,
             raw_completions: true,
             exact_sharp_renderer: true,
@@ -4830,7 +4802,7 @@ mod tests {
         });
         assert!(matches!(synthetic, RuntimeCompatibility::NeedsAttention(_)));
         assert!(
-            validate_q27_package_prelaunch(Q27RuntimeCapabilities {
+            validate_q27_runtime_contract(Q27RuntimeCapabilities {
                 trustworthy_identity: true,
                 raw_completions: true,
                 exact_sharp_renderer: true,
@@ -4856,14 +4828,14 @@ mod tests {
             &RuntimeAcquisitionMethod::ExternalBinary,
             None,
         );
-        let untrusted_compatibility = evaluate_q27_package_runtime(untrusted);
+        let untrusted_compatibility = evaluate_q27_runtime_contract(untrusted);
         assert!(matches!(
             untrusted_compatibility,
             RuntimeCompatibility::Incompatible(ref reason)
                 if reason.contains("no trustworthy package-capability observation")
         ));
         assert!(!untrusted_compatibility.is_usable());
-        assert!(validate_q27_package_prelaunch(untrusted).is_err());
+        assert!(validate_q27_runtime_contract(untrusted).is_err());
     }
 
     #[test]
@@ -4892,7 +4864,7 @@ mod tests {
                 &RuntimeAcquisitionMethod::SourceBuild,
                 Some(Q27SourceBuildEvidence::Plan(plan)),
             );
-            assert!(validate_q27_package_prelaunch(capabilities).is_ok());
+            assert!(validate_q27_runtime_contract(capabilities).is_ok());
             assert_eq!(capabilities.compiled_w_max, Some(expected_w_max));
             assert_eq!(capabilities.supported_kv_modes, Q27KvMode::QUALITY_ORDER);
             let provenance = current_source_provenance(plan);
@@ -4901,7 +4873,7 @@ mod tests {
                 &RuntimeAcquisitionMethod::SourceBuild,
                 Some(Q27SourceBuildEvidence::Provenance(&provenance)),
             );
-            assert!(validate_q27_package_prelaunch(installed_capabilities).is_ok());
+            assert!(validate_q27_runtime_contract(installed_capabilities).is_ok());
             assert_eq!(installed_capabilities.compiled_w_max, Some(expected_w_max));
         }
     }
@@ -4952,7 +4924,7 @@ mod tests {
             Some(Q27SourceBuildEvidence::Plan(plan)),
         );
         assert!(!capabilities.trustworthy_identity || capabilities.compiled_w_max.is_none());
-        assert!(validate_q27_package_prelaunch(capabilities).is_err());
+        assert!(validate_q27_runtime_contract(capabilities).is_err());
 
         plan.recipe.build_target = "build/q27-server".to_owned();
         plan.recipe.entrypoint = "build/q27-server".into();
@@ -5321,10 +5293,10 @@ mod tests {
             Q27KvMode::QUALITY_ORDER
         );
         assert!(matches!(
-            evaluate_q27_package_runtime(future),
+            evaluate_q27_runtime_contract(future),
             RuntimeCompatibility::NeedsAttention(_)
         ));
-        assert!(validate_q27_package_prelaunch(future).is_ok());
+        assert!(validate_q27_runtime_contract(future).is_ok());
     }
 
     #[test]
@@ -6968,14 +6940,14 @@ mod tests {
     #[test]
     fn package_non_stream_output_suppresses_reasoning_and_control_transition() {
         assert_eq!(
-            filter_q27_package_output(
+            filter_q27_serve_profile_output(
                 "private chain of thought\nmore private\n</think>\nPublic answer"
             ),
             "\nPublic answer"
         );
-        assert_eq!(filter_q27_package_output("reasoning only"), "");
+        assert_eq!(filter_q27_serve_profile_output("reasoning only"), "");
         assert_eq!(
-            filter_q27_package_output("private</think>answer<think>"),
+            filter_q27_serve_profile_output("private</think>answer<think>"),
             "answer"
         );
     }

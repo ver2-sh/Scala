@@ -16,11 +16,11 @@ A GGUF model is not permanently tied to llama.cpp, a Q27 model is not permanentl
 
 ## Norted Builder packages
 
-Model paths are served in place. When a configured search directory contains a Norted Builder `BUILD-MANIFEST.json`, `q27/Q27-MANIFEST.json`, or `ninfer/NINFER-MANIFEST.json`, discovery binds the declared primary artifacts to their exact tokenizer, projector, Sharp template, runtime policy, recommended `SERVE-PROFILE.json`, hashes, and canonical lineage. It does not copy, move, hardlink, or symlink those files into the Server data directory. `mmproj-F16.gguf` is retained as a projector auxiliary and is not listed as a language model.
+Model paths are served in place. When a configured search directory contains a Norted Builder `BUILD-MANIFEST.json`, `q27/Q27-MANIFEST.json`, or `ninfer/NINFER-MANIFEST.json`, discovery binds the declared primary artifacts to their exact tokenizer, projector, Sharp template, recommended `SERVE-PROFILE.json`, hashes, and canonical lineage. It does not copy, move, hardlink, or symlink those files into the Server data directory. `mmproj-F16.gguf` is retained as a projector auxiliary and is not listed as a language model.
 
 Claimed package directories fail closed: an unsupported schema, malformed or oversized JSON, unsafe relative path, symlink escape, missing file, size mismatch, sidecar hash mismatch, duplicate binding, lineage mismatch, or NInfer native-identity mismatch rejects the claimed artifacts instead of reverting to raw serving. Standalone GGUF, q27 plus tokenizer, and NInfer v2 files in directories without the corresponding Norted manifest keep the existing raw-artifact behavior.
 
-Discovery parses at most 16 MiB per manifest/runtime-policy/profile JSON, validates recorded primary sizes, hashes bounded sidecars, and retains the expected primary digest. The complete package primary is SHA-256 verified during explicit preparation and SHA-256 verified again immediately before every actual process launch. Sidecars are revalidated according to the package boundary. Runtime provenance retains artifact lineage separately from the effective Serve Profile.
+Discovery parses at most 16 MiB per manifest/profile JSON, validates recorded primary sizes, hashes bounded sidecars, and retains the expected primary digest. The complete package primary is SHA-256 verified during explicit preparation and SHA-256 verified again immediately before every actual process launch. Sidecars are revalidated according to the package boundary. Runtime provenance retains artifact lineage separately from the effective Serve Profile.
 
 Artifact validity, artifact provenance, and the serving recipe are separate. Norted Builder makes the artifact. Norted Server executes a selected Serve Profile. A valid Norted artifact may use its recommended read-only Builder profile, a compatible user profile, or **None / Raw runtime defaults**. Disabling the recommendation preserves the transformed weights, lineage, associations, and integrity checks, but changes the serving recipe and is recorded as such. A raw compatible third-party artifact may also use a discovered Builder profile without acquiring Norted Builder lineage.
 
@@ -32,11 +32,11 @@ Model files continue to be served in place from configured `models.paths`; Norte
 
 ## Serve Profiles and load settings
 
-Serve Profiles are versioned typed recipes with identity/source, applicability, explicit prompt/template delivery, generation defaults and override permissions, typed load values, minimum requirements, engine-specific strategies, and exact-runtime capability requirements. Profiles constrain runtime qualification but never persist a runtime ID. Builder profiles are immutable distribution artifacts; they can be inspected, assigned to another compatible artifact, or forked into a mutable local profile. Existing named Load Profiles migrate as load-only Serve Profiles.
+Serve Profiles are versioned typed recipes with identity/source, applicability, explicit prompt/template delivery, generation defaults and override permissions, typed load values, minimum requirements, engine-specific strategies, and exact-runtime capability requirements. Profiles constrain runtime qualification but never persist a runtime ID. Builder profiles are immutable distribution artifacts; they can be inspected, assigned to another compatible artifact, or forked into a mutable local profile.
 
 Load settings remain typed, stable Norted IDs. Common settings such as `context_length` and `parallel_requests` are engine-neutral; adapter-owned settings use namespaces such as `llama.cpp.kv_cache_k` and `q27.kv_fp16`. Raw upstream flag spellings remain adapter details. Generation defaults such as temperature, `top_p`, and reasoning effort belong to the Serve Profile and request values may override them only when that field is allowed. Chat `reasoning_effort` and Responses `reasoning.effort` reach external Sharp rendering only for a qualifying selected q27 profile; raw paths and other engines reject the value rather than ignoring it. A conflict with a profile requirement is rejected explicitly.
 
-Mutable state remains schema-versioned at `<data>/load-profiles.json`, outside `config.toml` and immutable runtime manifests. Schema 2 reads and migrates schema-1 named profiles without data loss. Writes use an inter-process lock and atomic replacement. One model may select a local or Builder profile, explicitly select None, or inherit its Builder recommendation. Load resolution is:
+Mutable state uses schema 3 at `<data>/serve-profiles.json`, outside `config.toml` and immutable runtime manifests. It stores Serve Profiles directly; obsolete `load-profiles.json` is not consumed. Recreate local profiles and defaults manually. Writes use an inter-process lock and atomic replacement. One model may select a local or Builder profile, explicitly select None, or inherit its Builder recommendation. Load resolution is:
 
 ```text
 global defaults
@@ -466,7 +466,7 @@ cargo check --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Focused tests cover bounded NInfer admission, typed identity, source manifests and legacy compatibility, exact commit/tree verification, CMake dependency auditing, source history, GPU selection/isolation, settings cross-validation, startup observation, bounded protocol translation, stream cancellation, archive traversal, digest verification, catalog parsing, selection, and existing adapter contracts. Runtime archives, source checkouts/build trees, extracted binaries, model/tokenizer files, caches, generated manifests/selections, logs, control credentials, and build output must not be committed.
+Focused tests cover bounded NInfer admission, typed identity, source manifests and current schema validation, exact commit/tree verification, CMake dependency auditing, source history, GPU selection/isolation, settings cross-validation, startup observation, bounded protocol translation, stream cancellation, archive traversal, digest verification, catalog parsing, selection, and existing adapter contracts. Runtime archives, source checkouts/build trees, extracted binaries, model/tokenizer files, caches, generated manifests/selections, logs, control credentials, and build output must not be committed.
 
 ## Current limitations
 

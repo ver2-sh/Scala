@@ -52,7 +52,7 @@ pub(crate) fn definitions() -> Vec<LoadSettingDefinition> {
             Some("off when omitted"),
         ),
         definition(
-            "ninfer.package_profile",
+            "ninfer.speculative_profile",
             "Serve Profile strategy",
             "Select a speculative strategy declared by the active NInfer Serve Profile",
             LoadSettingKind::Choice {
@@ -235,7 +235,7 @@ pub(crate) fn option_for_setting(id: &str) -> &'static str {
         "ninfer.kv_capacity" => "--kv-capacity",
         "ninfer.prefill_chunk" => "--prefill-chunk",
         "ninfer.speculative_backend" => "--spec",
-        "ninfer.package_profile" => "",
+        "ninfer.speculative_profile" => "",
         "ninfer.draft_tokens" => "--draft-tokens",
         "ninfer.lm_head_draft" => "--lm-head-draft",
         "ninfer.no_cuda_graph" => "--no-cuda-graph",
@@ -259,7 +259,7 @@ pub(crate) fn translate(
     native_arguments: &[String],
 ) -> Result<Vec<OsString>, EngineError> {
     for id in settings.effective.keys() {
-        if id.as_str() == "ninfer.package_profile" {
+        if id.as_str() == "ninfer.speculative_profile" {
             continue;
         }
         let option = option_for_setting(id.as_str());
@@ -365,7 +365,7 @@ pub(crate) fn translate(
 
     let mut arguments = Vec::new();
     for (id, resolved) in &settings.effective {
-        if id.as_str() == "ninfer.package_profile" {
+        if id.as_str() == "ninfer.speculative_profile" {
             continue;
         }
         let option = option_for_setting(id.as_str());

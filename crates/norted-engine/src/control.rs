@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use norted_core::{
-    AppPaths, LoadProfileName, LoadSettingsPatch, ModelId, RuntimeId, observe_runtime_descriptor,
+    AppPaths, LoadSettingsPatch, ModelId, RuntimeId, ServeProfileName, observe_runtime_descriptor,
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -22,7 +22,7 @@ pub struct ControlLoadRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<RuntimeId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub profile: Option<LoadProfileName>,
+    pub profile: Option<ServeProfileName>,
     #[serde(default, skip_serializing_if = "LoadSettingsPatch::is_empty")]
     pub settings: LoadSettingsPatch,
 }
@@ -134,7 +134,7 @@ impl ControlClient {
         &self,
         model_id: ModelId,
         runtime_id: Option<RuntimeId>,
-        profile: Option<LoadProfileName>,
+        profile: Option<ServeProfileName>,
         settings: LoadSettingsPatch,
     ) -> Result<ControlStatus, ControlClientError> {
         let admitted = self
@@ -161,7 +161,7 @@ impl ControlClient {
         &self,
         model_id: ModelId,
         runtime_id: Option<RuntimeId>,
-        profile: Option<LoadProfileName>,
+        profile: Option<ServeProfileName>,
         settings: LoadSettingsPatch,
     ) -> Result<ControlStatus, ControlClientError> {
         let expected_model = model_id.clone();

@@ -10,15 +10,13 @@ use crate::{
 };
 
 pub const SERVE_PROFILE_SCHEMA: &str = "norted.serve-profile";
-pub const SERVE_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const SERVE_PROFILE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServeProfileSource {
     UserLocal,
     BuilderRecommended,
-    BuilderLegacyPolicy,
-    BuiltIn,
 }
 
 impl std::fmt::Display for ServeProfileSource {
@@ -26,8 +24,6 @@ impl std::fmt::Display for ServeProfileSource {
         formatter.write_str(match self {
             Self::UserLocal => "user/local",
             Self::BuilderRecommended => "Builder",
-            Self::BuilderLegacyPolicy => "Builder legacy policy (synthesized)",
-            Self::BuiltIn => "built-in",
         })
     }
 }
@@ -127,7 +123,7 @@ pub struct ContextPolicy {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct ServeLoadProfile {
+pub struct ServeLoadDefaults {
     pub settings: LoadSettingsPatch,
     pub context: ContextPolicy,
 }
@@ -227,7 +223,7 @@ pub struct ServeProfile {
     #[serde(default)]
     pub generation: ServeGenerationProfile,
     #[serde(default)]
-    pub load: ServeLoadProfile,
+    pub load: ServeLoadDefaults,
     #[serde(default)]
     pub requirements: Vec<ServeCapability>,
     #[serde(default)]
@@ -249,7 +245,7 @@ impl ServeProfile {
             applicability: ServeProfileApplicability::default(),
             prompt: ServePromptProfile::default(),
             generation: ServeGenerationProfile::default(),
-            load: ServeLoadProfile::default(),
+            load: ServeLoadDefaults::default(),
             requirements: Vec::new(),
             engine: ServeEngineProfiles::default(),
         }
@@ -513,13 +509,8 @@ impl ServeProfile {
     pub fn content_hash(&self) -> String {
         let mut material = self.clone();
         material.source_profile_sha256 = None;
-        if matches!(
-            material.source,
-            ServeProfileSource::BuilderRecommended | ServeProfileSource::BuilderLegacyPolicy
-        ) {
-            // Builder and synthesized-legacy copies of one portable recipe are the same
-            // profile even after their package-relative template has been resolved locally.
-            material.source = ServeProfileSource::BuilderRecommended;
+        if matches!(material.source, ServeProfileSource::BuilderRecommended) {
+            // Resolve-local paths do not change a Builder profile's content identity.
             if let Some(template) = material.prompt.template.as_mut()
                 && template.path.is_absolute()
                 && let Some(filename) = template.path.file_name()
@@ -755,14 +746,16 @@ fn apply_ninfer_speculative_strategy(
     source: &LoadSettingSource,
 ) -> Result<(), String> {
     let selector_id =
-        LoadSettingId::new("ninfer.package_profile").map_err(|error| error.to_string())?;
+        LoadSettingId::new("ninfer.speculative_profile").map_err(|error| error.to_string())?;
     let selected = match settings.effective.get(&selector_id) {
         Some(setting) if setting_is_selected_layer(setting, &profile.id) => {
             let LoadSettingValue::Choice(value) = &setting.value else {
-                return Err("ninfer.package_profile must be a choice".to_owned());
+                return Err("ninfer.speculative_profile must be a choice".to_owned());
             };
             if value != &strategy.default_speculative_profile
-                && !profile.generation.allows_override("ninfer.package_profile")
+                && !profile
+                    .generation
+                    .allows_override("ninfer.speculative_profile")
             {
                 return Err(format!(
                     "Serve Profile `{}` locks NInfer strategy `{}`; requested `{value}`",

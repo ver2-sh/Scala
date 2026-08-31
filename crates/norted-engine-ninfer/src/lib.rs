@@ -310,11 +310,11 @@ fn ninfer_startup_requirements(
             profile.display_name
         ))
     })?;
-    let profile_name = match settings.value("ninfer.package_profile") {
+    let profile_name = match settings.value("ninfer.speculative_profile") {
         Some(LoadSettingValue::Choice(profile)) => profile.as_str(),
         Some(_) => {
             return Err(EngineError::InvalidConfiguration(
-                "ninfer.package_profile must be a choice".to_owned(),
+                "ninfer.speculative_profile must be a choice".to_owned(),
             ));
         }
         None => strategy.default_speculative_profile.as_str(),
@@ -905,27 +905,6 @@ impl EngineAdapter for NinferAdapter {
         }
     }
 
-    fn runtime_package_sharp_compatibility(
-        &self,
-        runtime: &InstalledRuntime,
-        model: &ModelArtifact,
-    ) -> Option<RuntimeCompatibility> {
-        model.norted_package.as_ref()?;
-        let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
-        Some(if !capabilities.trustworthy_identity {
-            RuntimeCompatibility::Incompatible(
-                "external Sharp application capability is unproven for this exact NInfer executable"
-                    .to_owned(),
-            )
-        } else if capabilities.external_sharp {
-            RuntimeCompatibility::Compatible
-        } else {
-            RuntimeCompatibility::Incompatible(
-                "required external Sharp application is unsupported/unproven".to_owned(),
-            )
-        })
-    }
-
     fn runtime_model_accelerator(
         &self,
         runtime: &InstalledRuntime,
@@ -1066,7 +1045,7 @@ impl EngineAdapter for NinferAdapter {
         let mut definitions = settings::definitions();
         settings::apply_runtime_bounds(&mut definitions);
         for definition in &mut definitions {
-            if definition.id.as_str() == "ninfer.package_profile" {
+            if definition.id.as_str() == "ninfer.speculative_profile" {
                 if serve_profile
                     .and_then(|profile| profile.engine.ninfer.as_ref())
                     .is_none()
