@@ -52,10 +52,12 @@ pub use runtime_pack::{
     RuntimeId, RuntimeIdentity, RuntimeIdentityError, RuntimeManifest, RuntimeManifestError,
     RuntimeOperationPhase, RuntimeOperationProgress, RuntimePackageAssetIdentity,
     RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel, RuntimeRequirements,
-    RuntimeSelection, RuntimeSelectionSource, RuntimeSelections, RuntimeSourceBuildPlan,
-    RuntimeSourceBuildPrerequisites, RuntimeSourceBuildProvenance, RuntimeSourceBuildRecipe,
-    RuntimeSourceBuildSystem, RuntimeSourceBuildToolchain, RuntimeSourceSnapshot,
-    RuntimeUpdatePreference, RuntimeUpdateState, is_full_git_sha, is_safe_relative_path,
+    RuntimeSelection, RuntimeSelectionSource, RuntimeSelections,
+    RuntimeSourceBuildConfigurationError, RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites,
+    RuntimeSourceBuildProvenance, RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem,
+    RuntimeSourceBuildToolchain, RuntimeSourceSnapshot, RuntimeUpdatePreference,
+    RuntimeUpdateState, effective_cmake_configuration_arguments, is_full_git_sha,
+    is_safe_relative_path,
 };
 pub use settings::{
     GpuOffload, ResolvedSetting, ResolvedSettings, SETTINGS_STATE_VERSION, SettingCategory,

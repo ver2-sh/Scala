@@ -297,7 +297,9 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use norted_core::{RuntimeAcquisitionPlan, RuntimeReleaseChannel};
+    use norted_core::{
+        RuntimeAcquisitionPlan, RuntimeReleaseChannel, effective_cmake_configuration_arguments,
+    };
 
     use super::{parse_github_timestamp, source_runtime};
 
@@ -341,6 +343,17 @@ mod tests {
         assert_eq!(
             plan.prerequisites.cuda_compiler.as_deref(),
             Some(std::path::Path::new("/usr/local/cuda/bin/nvcc"))
+        );
+        let effective_arguments = effective_cmake_configuration_arguments(&plan)
+            .expect("valid effective CMake configuration")
+            .expect("CMake source build");
+        assert_eq!(
+            effective_arguments.len(),
+            plan.recipe.cmake_configuration_arguments.len() + 1
+        );
+        assert_eq!(
+            effective_arguments.last().map(String::as_str),
+            Some("-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc")
         );
         assert_eq!(
             plan.recipe.entrypoint.to_string_lossy(),

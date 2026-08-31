@@ -9,7 +9,7 @@ use norted_core::{
     RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId, RuntimeIdentity, RuntimeManifest,
     RuntimeOperationProgress, RuntimePackageIdentity, RuntimeProbeObservation,
     RuntimeReleaseChannel, RuntimeSelection, RuntimeSelectionSource, RuntimeSelections,
-    RuntimeUpdatePreference, RuntimeUpdateState,
+    RuntimeUpdatePreference, RuntimeUpdateState, effective_cmake_configuration_arguments,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -1579,13 +1579,7 @@ fn ensure_catalog_provenance_matches(
                 && manifest.downloaded_archive_sha256.is_none()
                 && manifest.additional_downloaded_archive_sha256.is_empty()
                 && manifest.source_build.as_ref().is_some_and(|provenance| {
-                    provenance.source == plan.source
-                        && provenance.recipe_version == plan.recipe.recipe_version
-                        && provenance.build_system == plan.recipe.build_system
-                        && provenance.cmake_configuration_arguments
-                            == plan.recipe.cmake_configuration_arguments
-                        && provenance.build_target == plan.recipe.build_target
-                        && provenance.accelerator_target == plan.recipe.accelerator_target
+                    source_build_provenance_matches_plan(provenance, plan)
                 })
         }
     };
@@ -1598,6 +1592,32 @@ fn ensure_catalog_provenance_matches(
         detail: "the current provider metadata no longer matches the immutable installed identity, requirements, source, or verified archive digests".to_owned(),
     }
     .into())
+}
+
+fn source_build_provenance_matches_plan(
+    provenance: &norted_core::RuntimeSourceBuildProvenance,
+    plan: &norted_core::RuntimeSourceBuildPlan,
+) -> bool {
+    effective_cmake_configuration_arguments(plan).is_ok_and(|effective_arguments| {
+        let effective_matches = match (
+            provenance.effective_cmake_configuration_arguments.as_ref(),
+            effective_arguments.as_ref(),
+        ) {
+            (Some(recorded), Some(expected)) => recorded == expected,
+            // Legacy schema-2 source manifests retained only the
+            // provider-owned arguments. Accept them without inferring or
+            // rewriting the omitted effective list.
+            (None, _) => true,
+            (Some(_), None) => false,
+        };
+        provenance.source == plan.source
+            && provenance.recipe_version == plan.recipe.recipe_version
+            && provenance.build_system == plan.recipe.build_system
+            && provenance.cmake_configuration_arguments == plan.recipe.cmake_configuration_arguments
+            && effective_matches
+            && provenance.build_target == plan.recipe.build_target
+            && provenance.accelerator_target == plan.recipe.accelerator_target
+    })
 }
 
 fn compatibility_for_installed(
@@ -1935,14 +1955,15 @@ mod tests {
         RuntimeAcquisitionMethod, RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeDownload,
         RuntimeId, RuntimeIdentity, RuntimeManifest, RuntimePackageIdentity,
         RuntimeProbeObservation, RuntimeReleaseChannel, RuntimeRequirements,
-        RuntimeSourceBuildProvenance, RuntimeSourceBuildSystem, RuntimeSourceBuildToolchain,
+        RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites, RuntimeSourceBuildProvenance,
+        RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem, RuntimeSourceBuildToolchain,
         RuntimeSourceSnapshot, RuntimeUpdatePreference, RuntimeUpdateState, SettingDefinition,
         SettingId, SettingKind, SettingScope, SettingsSchema,
     };
 
     use super::{
         compare_installed_recency, same_update_line, semantic_release_update_state,
-        source_history_update_state, source_recipe_ordering,
+        source_build_provenance_matches_plan, source_history_update_state, source_recipe_ordering,
     };
     use crate::{
         EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError,
@@ -2474,6 +2495,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn source_provenance_matches_effective_cmake_configuration_and_legacy_manifests() {
+        let installed = installed_fixture(
+            "git-20260831-aaaaaaaa",
+            Some((1_788_134_400, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+        );
+        let legacy = installed
+            .manifest
+            .source_build
+            .expect("source-build provenance");
+        let plan = RuntimeSourceBuildPlan {
+            source: legacy.source.clone(),
+            recipe: RuntimeSourceBuildRecipe {
+                recipe_version: legacy.recipe_version.clone(),
+                build_system: RuntimeSourceBuildSystem::Cmake,
+                build_definition_sha256: None,
+                cmake_configuration_arguments: Vec::new(),
+                build_target: legacy.build_target.clone(),
+                entrypoint: PathBuf::from("build/fixture"),
+                accelerator_target: legacy.accelerator_target.clone(),
+                rejected_build_environment: Vec::new(),
+            },
+            prerequisites: RuntimeSourceBuildPrerequisites {
+                minimum_cmake_version: "3.18".to_owned(),
+                minimum_cuda_version: Some("13.0".to_owned()),
+                maximum_cuda_version_exclusive: Some("14.0".to_owned()),
+                requires_ninja: true,
+                requires_cpp20_compiler: false,
+                requires_make: false,
+                minimum_cpp_standard: Some(17),
+                cpp_compiler: None,
+                cuda_compiler: Some(PathBuf::from("/usr/local/cuda/bin/nvcc")),
+                requires_pkg_config: false,
+                pkg_config_modules: BTreeMap::new(),
+            },
+        };
+
+        assert!(
+            source_build_provenance_matches_plan(&legacy, &plan),
+            "legacy manifests without an effective list remain readable and match their recipe"
+        );
+
+        let mut current = legacy.clone();
+        current.effective_cmake_configuration_arguments = Some(vec![
+            "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc".to_owned(),
+        ]);
+        assert!(source_build_provenance_matches_plan(&current, &plan));
+
+        current.effective_cmake_configuration_arguments =
+            Some(vec!["-DCMAKE_CUDA_COMPILER=/other/nvcc".to_owned()]);
+        assert!(!source_build_provenance_matches_plan(&current, &plan));
+    }
+
     fn installed_fixture(version: &str, source: Option<(i64, &str)>) -> InstalledRuntime {
         let identity = RuntimeIdentity {
             engine_id: "fixture-engine".to_owned(),
@@ -2510,6 +2584,7 @@ mod tests {
                     build_system: RuntimeSourceBuildSystem::Cmake,
                     build_definition_sha256: None,
                     cmake_configuration_arguments: Vec::new(),
+                    effective_cmake_configuration_arguments: None,
                     build_target: "fixture".to_owned(),
                     toolchain: RuntimeSourceBuildToolchain {
                         cmake_version: "4.0".to_owned(),

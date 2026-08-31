@@ -626,7 +626,10 @@ fn provider_error(message: &str) -> CatalogError {
 
 #[cfg(test)]
 mod tests {
-    use norted_core::{AcceleratorDevice, HostCapabilities, RuntimeCompatibility};
+    use norted_core::{
+        AcceleratorDevice, HostCapabilities, RuntimeCompatibility,
+        effective_cmake_configuration_arguments,
+    };
     use norted_engine::compatibility_for;
 
     use super::*;
@@ -824,6 +827,17 @@ mod tests {
             assert_eq!(
                 plan.prerequisites.cuda_compiler.as_deref(),
                 Some(std::path::Path::new("/usr/local/cuda/bin/nvcc"))
+            );
+            let effective_arguments = effective_cmake_configuration_arguments(plan)
+                .expect("valid effective CMake configuration")
+                .expect("CMake source build");
+            assert_eq!(
+                effective_arguments.len(),
+                plan.recipe.cmake_configuration_arguments.len() + 1
+            );
+            assert_eq!(
+                effective_arguments.last().map(String::as_str),
+                Some("-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc")
             );
             assert_eq!(
                 plan.source.commit_sha,
