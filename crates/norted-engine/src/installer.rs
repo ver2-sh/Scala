@@ -1133,14 +1133,42 @@ async fn verify_explicit_cuda_architectures(
         return Ok(());
     };
     if !required.real.is_empty() {
-        let supported = command_text(nvcc_program, &["--list-gpu-code"], None).await?;
-        require_cuda_compiler_targets("real", &required.real, &supported)?;
+        verify_reported_cuda_compiler_targets(
+            nvcc_program,
+            "real",
+            &required.real,
+            "--list-gpu-code",
+        )
+        .await?;
     }
     if !required.virtual_targets.is_empty() {
-        let supported = command_text(nvcc_program, &["--list-gpu-arch"], None).await?;
-        require_cuda_compiler_targets("virtual", &required.virtual_targets, &supported)?;
+        verify_reported_cuda_compiler_targets(
+            nvcc_program,
+            "virtual",
+            &required.virtual_targets,
+            "--list-gpu-arch",
+        )
+        .await?;
     }
     Ok(())
+}
+
+async fn verify_reported_cuda_compiler_targets(
+    nvcc_program: &str,
+    kind: &str,
+    required: &[String],
+    list_argument: &str,
+) -> Result<(), RuntimeInstallError> {
+    let listed = command_text(nvcc_program, &[list_argument], None).await?;
+    if require_cuda_compiler_targets(kind, required, &listed).is_ok() {
+        return Ok(());
+    }
+
+    // CUDA 13's list actions report base SM/compute values but omit accepted
+    // architecture-specific `a`/`f` values. Its own option help is the
+    // compiler-authoritative enumeration for those targets.
+    let help = command_text(nvcc_program, &["--help"], None).await?;
+    require_cuda_compiler_targets(kind, required, &format!("{listed}\n{help}"))
 }
 
 fn required_cuda_compiler_targets(
@@ -1203,7 +1231,10 @@ fn require_cuda_compiler_targets(
     required: &[String],
     supported: &str,
 ) -> Result<(), RuntimeInstallError> {
-    let supported = supported.split_whitespace().collect::<HashSet<_>>();
+    let supported = supported
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .filter(|target| !target.is_empty())
+        .collect::<HashSet<_>>();
     let missing = required
         .iter()
         .filter(|target| !supported.contains(target.as_str()))
@@ -2329,9 +2360,10 @@ mod tests {
 
     use super::{
         RuntimeInstallError, SourceBuildPrerequisiteEvaluationKey, extract_archive, hex_digest,
-        inspect_build_dependency_contract, require_cuda_compiler_targets, require_version_below,
-        required_cuda_compiler_targets, run_owned_staging_operation, run_source_command,
-        validate_relative_link_target, verify_package_digest, verify_source_checkout,
+        inspect_build_dependency_contract, require_cuda_compiler_targets, require_minimum_version,
+        require_version_below, required_cuda_compiler_targets, run_owned_staging_operation,
+        run_source_command, validate_relative_link_target, verify_package_digest,
+        verify_source_checkout,
     };
 
     #[test]
@@ -2348,6 +2380,12 @@ mod tests {
         assert_eq!(required.virtual_targets, ["compute_90", "compute_120a"]);
         require_cuda_compiler_targets("real", &required.real, "sm_75\nsm_90\nsm_120a\n")
             .expect("all real targets supported");
+        require_cuda_compiler_targets(
+            "real",
+            &required.real,
+            "accepted values: 'sm_75','sm_90','sm_120a'",
+        )
+        .expect("nvcc help punctuation preserves exact target tokens");
         assert!(matches!(
             require_cuda_compiler_targets("real", &required.real, "sm_75\nsm_90\n"),
             Err(RuntimeInstallError::Prerequisite(message))
@@ -2375,6 +2413,15 @@ mod tests {
             .expect("all CUDA 12.x releases are admitted");
         assert!(require_version_below("CUDA Toolkit", "13.0", "13.0").is_err());
         assert!(require_version_below("CUDA Toolkit", "14.0", "13.0").is_err());
+
+        require_minimum_version("CUDA Toolkit", "13.0", "13.0")
+            .expect("CUDA 13.0 is admitted by the CUDA-13 recipe");
+        require_minimum_version("CUDA Toolkit", "13.3.73", "13.0")
+            .expect("later CUDA 13.x is admitted by the CUDA-13 recipe");
+        require_version_below("CUDA Toolkit", "13.3.73", "14.0")
+            .expect("CUDA 13.x remains below the next major");
+        assert!(require_minimum_version("CUDA Toolkit", "12.9", "13.0").is_err());
+        assert!(require_version_below("CUDA Toolkit", "14.0", "14.0").is_err());
     }
 
     #[test]

@@ -276,7 +276,7 @@ impl RuntimePackManager {
                         .variant
                         .cmp(&right.manifest.identity.variant)
                 })
-                .then_with(|| compare_installed_recency(right, left))
+                .then_with(|| compare_installed_recency_with_registry(&self.registry, right, left))
         });
         let selections = self.store.selections().await?;
         let host = self.host.read().await.clone();
@@ -849,7 +849,13 @@ impl RuntimePackManager {
                 .then_with(|| {
                     acquisition_rank(&left.0.runtime).cmp(&acquisition_rank(&right.0.runtime))
                 })
-                .then_with(|| compare_installed_recency(&right.0.runtime, &left.0.runtime))
+                .then_with(|| {
+                    compare_installed_recency_with_registry(
+                        &self.registry,
+                        &right.0.runtime,
+                        &left.0.runtime,
+                    )
+                })
                 .then_with(|| {
                     left.0
                         .runtime
@@ -1272,7 +1278,13 @@ impl RuntimePackManager {
                 .then_with(|| {
                     acquisition_rank(&left.0.runtime).cmp(&acquisition_rank(&right.0.runtime))
                 })
-                .then_with(|| compare_installed_recency(&right.0.runtime, &left.0.runtime))
+                .then_with(|| {
+                    compare_installed_recency_with_registry(
+                        &self.registry,
+                        &right.0.runtime,
+                        &left.0.runtime,
+                    )
+                })
                 .then_with(|| {
                     left.0
                         .runtime
@@ -1821,18 +1833,48 @@ fn update_channel_matches(
     candidate.channels.contains(&channel)
 }
 
-fn compare_installed_recency(left: &InstalledRuntime, right: &InstalledRuntime) -> Ordering {
+fn compare_installed_recency_with_registry(
+    registry: &crate::EngineRegistry,
+    left: &InstalledRuntime,
+    right: &InstalledRuntime,
+) -> Ordering {
+    let adapter = (left.manifest.identity.engine_id == right.manifest.identity.engine_id)
+        .then(|| registry.get(&left.manifest.identity.engine_id))
+        .flatten();
+    compare_installed_recency(left, right, adapter.as_deref())
+}
+
+fn compare_installed_recency(
+    left: &InstalledRuntime,
+    right: &InstalledRuntime,
+    adapter: Option<&dyn crate::EngineAdapter>,
+) -> Ordering {
     let left_manifest = &left.manifest;
     let right_manifest = &right.manifest;
+    let left_variant = adapter.map_or_else(
+        || crate::RuntimeVariantUpdateIdentity::exact(&left_manifest.identity),
+        |adapter| adapter.runtime_variant_update_identity(&left_manifest.identity),
+    );
+    let right_variant = adapter.map_or_else(
+        || crate::RuntimeVariantUpdateIdentity::exact(&right_manifest.identity),
+        |adapter| adapter.runtime_variant_update_identity(&right_manifest.identity),
+    );
     let same_update_line = left_manifest.identity.engine_id == right_manifest.identity.engine_id
         && (left_manifest.identity.package_family == right_manifest.identity.package_family
             || q27_logical_update_family(&left_manifest.identity, &right_manifest.identity))
         && left_manifest.identity.platform == right_manifest.identity.platform
         && left_manifest.identity.architecture == right_manifest.identity.architecture
         && left_manifest.identity.accelerator == right_manifest.identity.accelerator
-        && left_manifest.identity.variant == right_manifest.identity.variant
+        && left_variant.functional_variant == right_variant.functional_variant
         && left_manifest.identity.package.provider_id
             == right_manifest.identity.package.provider_id;
+    let recipe_ordering = match (
+        left_variant.source_recipe_generation,
+        right_variant.source_recipe_generation,
+    ) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => Ordering::Equal,
+    };
     if same_update_line
         && let (Some(left_source), Some(right_source)) = (
             left_manifest.source_build.as_ref(),
@@ -1852,12 +1894,18 @@ fn compare_installed_recency(left: &InstalledRuntime, right: &InstalledRuntime) 
                     .commit_sha
                     .cmp(&right_source.source.commit_sha)
             })
+            .then(recipe_ordering)
             .then_with(|| left_manifest.runtime_id.cmp(&right_manifest.runtime_id));
     }
     compare_versions(
         &left_manifest.identity.version,
         &right_manifest.identity.version,
     )
+    .then(if same_update_line {
+        recipe_ordering
+    } else {
+        Ordering::Equal
+    })
 }
 
 fn compare_versions(left: &str, right: &str) -> Ordering {
@@ -2317,7 +2365,7 @@ mod tests {
         );
 
         let mut fallback_candidates = [older, newer.clone()];
-        fallback_candidates.sort_by(|left, right| compare_installed_recency(right, left));
+        fallback_candidates.sort_by(|left, right| compare_installed_recency(right, left, None));
         assert_eq!(
             fallback_candidates[0].manifest.runtime_id,
             newer.manifest.runtime_id
@@ -2326,7 +2374,102 @@ mod tests {
         let release_v1 = installed_fixture("v1.9.0", None);
         let release_v2 = installed_fixture("v2.0.0", None);
         assert_eq!(
-            compare_installed_recency(&release_v2, &release_v1),
+            compare_installed_recency(&release_v2, &release_v1, None),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn installed_recipe_generations_rank_with_engine_owned_update_identity() {
+        let adapter = BoundSchemaAdapter {
+            id: "fixture-engine",
+        };
+        let mut v2 = installed_fixture(
+            "git-20260831-aaaaaaaa",
+            Some((1_788_134_400, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")),
+        );
+        v2.manifest.identity.variant = "recipe-v2".to_owned();
+        v2.manifest.runtime_id = RuntimeId::from_identity(&v2.manifest.identity);
+        v2.manifest
+            .source_build
+            .as_mut()
+            .expect("source fixture")
+            .recipe_version = "recipe-v2".to_owned();
+
+        let mut v3 = v2.clone();
+        v3.manifest.identity.variant = "recipe-v3".to_owned();
+        v3.manifest.runtime_id = RuntimeId::from_identity(&v3.manifest.identity);
+        v3.manifest
+            .source_build
+            .as_mut()
+            .expect("source fixture")
+            .recipe_version = "recipe-v3".to_owned();
+
+        assert_eq!(
+            compare_installed_recency(&v3, &v2, Some(&adapter)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_installed_recency(&v2, &v3, Some(&adapter)),
+            std::cmp::Ordering::Less,
+            "a lower recipe generation cannot win through RuntimeId ordering"
+        );
+
+        let mut newer_source_v2 = v2.clone();
+        newer_source_v2.manifest.identity.version = "git-20260901-bbbbbbbb".to_owned();
+        newer_source_v2.manifest.identity.upstream_revision = Some("b".repeat(40));
+        newer_source_v2.manifest.runtime_id =
+            RuntimeId::from_identity(&newer_source_v2.manifest.identity);
+        let source = newer_source_v2
+            .manifest
+            .source_build
+            .as_mut()
+            .expect("source fixture");
+        source.source.commit_timestamp_unix += 86_400;
+        source.source.commit_sha = "b".repeat(40);
+        assert_eq!(
+            compare_installed_recency(&newer_source_v2, &v3, Some(&adapter)),
+            std::cmp::Ordering::Greater,
+            "a genuinely newer upstream source still outranks an older source recipe generation"
+        );
+
+        let mut intentional_variant = v3.clone();
+        intentional_variant.manifest.identity.variant = "specialist".to_owned();
+        intentional_variant.manifest.runtime_id =
+            RuntimeId::from_identity(&intentional_variant.manifest.identity);
+        let source = intentional_variant
+            .manifest
+            .source_build
+            .as_mut()
+            .expect("source fixture");
+        source.source.commit_timestamp_unix += 86_400;
+        source.source.commit_sha = "c".repeat(40);
+        assert_eq!(
+            compare_installed_recency(&v3, &intentional_variant, Some(&adapter)),
+            std::cmp::Ordering::Equal,
+            "recipe generations must not cross-rank distinct functional variants"
+        );
+    }
+
+    #[test]
+    fn default_variant_recency_preserves_q27_and_ninfer_style_behavior() {
+        let older = installed_fixture("v1.9.0", None);
+        let newer = installed_fixture("v2.0.0", None);
+        assert_eq!(
+            compare_installed_recency(&newer, &older, None),
+            std::cmp::Ordering::Greater
+        );
+
+        let older_source = installed_fixture(
+            "git-20260830-ffffffff",
+            Some((1_788_048_000, "ffffffffffffffffffffffffffffffffffffffff")),
+        );
+        let newer_source = installed_fixture(
+            "git-20260831-00000000",
+            Some((1_788_134_400, "0000000000000000000000000000000000000000")),
+        );
+        assert_eq!(
+            compare_installed_recency(&newer_source, &older_source, None),
             std::cmp::Ordering::Greater
         );
     }
