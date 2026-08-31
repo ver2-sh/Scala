@@ -235,7 +235,7 @@ fn explicit_serve_profile(
         || record.schema_version != crate::SERVE_PROFILE_SCHEMA_VERSION
     {
         return Err(format!(
-            "manifest binds unsupported Serve Profile schema {} v{}",
+            "manifest binds unsupported Serve Profile schema {} v{}; rebuild this artifact with the current Norted Builder",
             record.schema, record.schema_version
         ));
     }
@@ -261,6 +261,26 @@ fn explicit_serve_profile(
     profile.source_profile_sha256 = Some(file.sha256.clone());
     profile.resolve_builder_template(root)?;
     Ok((file, profile))
+}
+
+fn require_recommended_profile_sharp_binding(
+    profile: &ServeProfile,
+    sharp: &NortedPackageFile,
+) -> Result<(), String> {
+    let template = profile
+        .prompt
+        .template
+        .as_ref()
+        .filter(|_| profile.prompt.mode == crate::PromptMode::ExternalTemplate);
+    if template
+        .is_none_or(|template| template.path != sharp.path || template.sha256 != sharp.sha256)
+    {
+        return Err(
+            "package Builder-recommended Serve Profile disagrees with manifest-bound Sharp; rebuild this artifact with the current Norted Builder"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn discover_package_directory(
@@ -326,6 +346,7 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
         true,
     )?;
     let (profile_file, profile) = explicit_serve_profile(&root, &manifest.serve_profile)?;
+    require_recommended_profile_sharp_binding(&profile, &sharp)?;
     require_distinct_files(&[
         ("tokenizer", &tokenizer.path),
         ("Sharp", &sharp.path),
@@ -439,6 +460,7 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
         true,
     )?;
     let (profile_file, profile) = explicit_serve_profile(&root, &manifest.serve_profile)?;
+    require_recommended_profile_sharp_binding(&profile, &sharp)?;
     require_distinct_files(&[
         ("Sharp", &sharp.path),
         ("Serve Profile", &profile_file.path),

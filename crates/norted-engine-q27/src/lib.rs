@@ -1146,22 +1146,22 @@ fn q27_runtime_contract_failures(capabilities: Q27RuntimeCapabilities) -> Vec<&'
         reasons.push("exact manifest-bound Sharp application is unproven");
     }
     if !capabilities.thinking {
-        reasons.push("thinking-enabled package execution is unproven");
+        reasons.push("thinking-enabled Serve Profile execution is unproven");
     }
     if !capabilities.unlimited_think_budget {
         reasons.push("unlimited thinking budget is unsupported/unproven");
     }
     if !capabilities.temperature_top_p {
-        reasons.push("temperature/top-p package defaults are unsupported/unproven");
+        reasons.push("temperature/top-p Serve Profile defaults are unsupported/unproven");
     }
     if !capabilities.top_k_min_p {
-        reasons.push("top-k/min-p package defaults are unsupported/unproven");
+        reasons.push("top-k/min-p Serve Profile defaults are unsupported/unproven");
     }
     if !capabilities.mtp_environment {
         reasons.push("Q27_MAXD/Q27_PMIN/Q27_SUFFIX Serve Profile is unproven");
     }
     if !capabilities.fast_head_control {
-        reasons.push("fast-head package control is unproven");
+        reasons.push("fast-head Serve Profile control is unproven");
     }
     if !capabilities.bounded_startup_observation {
         reasons.push("served context/KV startup observation is unproven");
@@ -1170,7 +1170,7 @@ fn q27_runtime_contract_failures(capabilities: Q27RuntimeCapabilities) -> Vec<&'
         reasons.push("numeric compiled W_MAX is unproven");
     }
     if capabilities.supported_kv_modes.is_empty() {
-        reasons.push("no package-policy KV mode is proven for this executable");
+        reasons.push("no Serve Profile KV mode is proven for this executable");
     }
     reasons
 }
@@ -2070,7 +2070,7 @@ impl Q27Adapter {
             .find(|mode| spec.environment.get("Q27_KV").map(String::as_str) == Some(mode.as_str()))
             .ok_or_else(|| {
                 EngineError::InvalidConfiguration(
-                    "q27 Serve Profile launch did not select a recognized policy KV mode"
+                    "q27 Serve Profile launch did not select a recognized Serve Profile KV mode"
                         .to_owned(),
                 )
             })?;

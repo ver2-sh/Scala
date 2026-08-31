@@ -271,7 +271,7 @@ impl ServeProfile {
             return Err("a user/local Serve Profile cannot be read-only".to_owned());
         }
         if self.source != ServeProfileSource::UserLocal && !self.read_only {
-            return Err("Builder and built-in Serve Profiles must be read-only".to_owned());
+            return Err("Builder-recommended Serve Profiles must be read-only".to_owned());
         }
         if self.prompt.mode == PromptMode::ExternalTemplate {
             let template = self.prompt.template.as_ref().ok_or_else(|| {

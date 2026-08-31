@@ -1083,14 +1083,14 @@ fn render_settings(
     }
     frame.render_widget(Paragraph::new(info).wrap(Wrap { trim: true }), info_area);
 
-    if app.load_profiles_loading {
+    if app.serve_profiles_loading {
         frame.render_widget(
-            Paragraph::new("Loading load-profile state…").style(theme.muted),
+            Paragraph::new("Loading Serve Profile state…").style(theme.muted),
             ui_layout.settings_list,
         );
         return;
     }
-    if let Some(error) = &app.load_profiles_error {
+    if let Some(error) = &app.serve_profiles_error {
         frame.render_widget(
             Paragraph::new(error.as_str())
                 .style(theme.error)

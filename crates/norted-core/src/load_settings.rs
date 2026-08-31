@@ -1078,30 +1078,30 @@ pub enum LoadSettingsError {
     #[error("invalid Serve Profile: {0}")]
     InvalidServeProfile(String),
     #[error(
-        "load profile state schema version {found} is unsupported; this build supports {supported}"
+        "Serve Profile state schema version {found} is unsupported; this build supports {supported}"
     )]
     UnsupportedStateVersion { found: u32, supported: u32 },
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServeProfilesError {
-    #[error("load profile state I/O failed at {path}: {source}")]
+    #[error("Serve Profile state I/O failed at {path}: {source}")]
     Io {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
-    #[error("load profile state at {path} is invalid JSON: {source}")]
+    #[error("Serve Profile state at {path} is invalid JSON: {source}")]
     Parse {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
     },
-    #[error("could not serialize load profile state: {0}")]
+    #[error("could not serialize Serve Profile state: {0}")]
     Serialize(serde_json::Error),
     #[error(transparent)]
     Invalid(#[from] LoadSettingsError),
-    #[error("load profile state task failed: {0}")]
+    #[error("Serve Profile state task failed: {0}")]
     Task(String),
 }
 

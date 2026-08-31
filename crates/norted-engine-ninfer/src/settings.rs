@@ -2,7 +2,7 @@ use std::ffi::OsString;
 
 use norted_core::{
     ArtifactNativeIdentity, LoadSettingDefinition, LoadSettingId, LoadSettingKind,
-    LoadSettingScope, LoadSettingValue, ModelArtifact, ResolvedLoadSettings,
+    LoadSettingScope, LoadSettingValue, ModelArtifact, ResolvedLoadSettings, ServeProfile,
     UnsignedIntegerOrChoiceValue,
 };
 use norted_engine::{EngineError, common_load_setting_definitions};
@@ -56,9 +56,9 @@ pub(crate) fn definitions() -> Vec<LoadSettingDefinition> {
             "Serve Profile strategy",
             "Select a speculative strategy declared by the active NInfer Serve Profile",
             LoadSettingKind::Choice {
-                choices: choices(&["mtp0", "mtp3"]),
+                choices: Vec::new(),
             },
-            Some("no benchmark profile selected"),
+            None,
         ),
         definition(
             "ninfer.draft_tokens",
@@ -146,6 +146,35 @@ pub(crate) fn definitions() -> Vec<LoadSettingDefinition> {
         ),
     ]);
     definitions
+}
+
+pub(crate) fn apply_speculative_profile_schema(
+    definitions: &mut [LoadSettingDefinition],
+    serve_profile: Option<&ServeProfile>,
+) {
+    let Some(definition) = definitions
+        .iter_mut()
+        .find(|definition| definition.id.as_str() == "ninfer.speculative_profile")
+    else {
+        return;
+    };
+    let Some(strategy) = serve_profile.and_then(|profile| profile.engine.ninfer.as_ref()) else {
+        definition.supported = false;
+        definition.unsupported_reason = Some(
+            "speculative strategy selection requires a selected NInfer Serve Profile".to_owned(),
+        );
+        definition.recommendation = None;
+        return;
+    };
+    definition.kind = LoadSettingKind::Choice {
+        choices: strategy.speculative_profiles.keys().cloned().collect(),
+    };
+    definition.supported = true;
+    definition.unsupported_reason = None;
+    definition.recommendation = Some(format!(
+        "selected Serve Profile default: {}",
+        strategy.default_speculative_profile
+    ));
 }
 
 pub(crate) fn apply_runtime_bounds(definitions: &mut [LoadSettingDefinition]) {

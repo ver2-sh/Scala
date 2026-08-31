@@ -1044,18 +1044,9 @@ impl EngineAdapter for NinferAdapter {
             })?;
         let mut definitions = settings::definitions();
         settings::apply_runtime_bounds(&mut definitions);
+        settings::apply_speculative_profile_schema(&mut definitions, serve_profile);
         for definition in &mut definitions {
             if definition.id.as_str() == "ninfer.speculative_profile" {
-                if serve_profile
-                    .and_then(|profile| profile.engine.ninfer.as_ref())
-                    .is_none()
-                {
-                    definition.supported = false;
-                    definition.unsupported_reason = Some(
-                        "speculative strategy selection requires a selected NInfer Serve Profile"
-                            .to_owned(),
-                    );
-                }
                 continue;
             }
             let option = settings::option_for_setting(definition.id.as_str());
@@ -2260,7 +2251,10 @@ fn unix_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use norted_core::{ResolvedLoadSettings, ServeProfile, apply_serve_profile_load_policy};
+    use norted_core::{
+        LoadSettingId, LoadSettingKind, LoadSettingSource, ResolvedLoadSetting,
+        ResolvedLoadSettings, ServeProfile, apply_serve_profile_load_policy,
+    };
 
     use super::*;
 
@@ -2312,6 +2306,70 @@ mod tests {
         assert!(help_contract_error(help, &["--not-advertised".to_owned()]).is_some());
         assert!(
             help_contract_error("Usage: ninfer-serve <model.ninfer> --host HOST", &[]).is_some()
+        );
+    }
+
+    #[test]
+    fn speculative_strategy_selector_is_derived_from_the_selected_serve_profile() {
+        let mut profile = ninfer_serve_profile_fixture();
+        let strategy = profile.engine.ninfer.as_mut().expect("NInfer strategy");
+        strategy.default_speculative_profile = "quality-mtp".to_owned();
+        strategy.speculative_profiles = BTreeMap::from([(
+            "quality-mtp".to_owned(),
+            norted_core::NinferSpeculativeProfile {
+                speculative_decoding: true,
+                backend: Some("mtp".to_owned()),
+                draft_tokens: Some(3),
+                optimized_proposal_head: Some(true),
+            },
+        )]);
+        profile.validate().expect("custom strategy profile");
+
+        let mut definitions = settings::definitions();
+        settings::apply_speculative_profile_schema(&mut definitions, Some(&profile));
+        let schema = norted_core::LoadSettingsSchema {
+            engine_id: ENGINE_ID.to_owned(),
+            runtime_id: None,
+            definitions,
+        };
+        let selector_id = LoadSettingId::new("ninfer.speculative_profile").unwrap();
+        let selector = schema.definition(&selector_id).expect("strategy selector");
+        assert!(selector.supported);
+        assert_eq!(
+            selector.kind,
+            LoadSettingKind::Choice {
+                choices: vec!["quality-mtp".to_owned()]
+            }
+        );
+        assert_eq!(
+            selector.recommendation.as_deref(),
+            Some("selected Serve Profile default: quality-mtp")
+        );
+
+        let selected = |value: &str| ResolvedLoadSettings {
+            engine_id: ENGINE_ID.to_owned(),
+            selected_profile: None,
+            effective: BTreeMap::from([(
+                selector_id.clone(),
+                ResolvedLoadSetting {
+                    value: LoadSettingValue::Choice(value.to_owned()),
+                    source: LoadSettingSource::Invocation,
+                },
+            )]),
+        };
+        assert!(schema.validate(&selected("quality-mtp")).is_ok());
+        assert!(schema.validate(&selected("undeclared")).is_err());
+
+        let mut without_profile = settings::definitions();
+        settings::apply_speculative_profile_schema(&mut without_profile, None);
+        let selector = without_profile
+            .iter()
+            .find(|definition| definition.id == selector_id)
+            .expect("unsupported strategy selector");
+        assert!(!selector.supported);
+        assert_eq!(
+            selector.unsupported_reason.as_deref(),
+            Some("speculative strategy selection requires a selected NInfer Serve Profile")
         );
     }
 
