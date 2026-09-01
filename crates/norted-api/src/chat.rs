@@ -10,6 +10,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use norted_engine::{
     InferenceEvent, InferenceFinishReason, InferenceMessage, InferenceStream, InferenceUsage,
+    OutputFormat,
 };
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -18,8 +19,8 @@ use crate::auth::RequestCorrelation;
 use crate::error::{OpenAiError, runtime_error};
 use crate::input::{
     NormalizedRequest, generation_settings, object, optional_bool, optional_positive_u32,
-    optional_reasoning_effort, reject_unknown_fields, require_null_or, required_string, role,
-    text_content,
+    optional_reasoning_effort, optional_string, reject_unknown_fields, require_null_or,
+    required_string, role, text_content,
 };
 use crate::{PublicApiState, unix_timestamp};
 
@@ -145,12 +146,14 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
         .enumerate()
         .map(|(index, message)| parse_message(message, index))
         .collect::<Result<Vec<_>, _>>()?;
+    let output_format = parse_response_format(object.get("response_format"))?;
     Ok(ParsedRequest {
         normalized: NormalizedRequest {
             model,
             messages,
             max_output_tokens,
             generation_settings,
+            output_format,
             stream,
         },
         include_usage,
@@ -278,12 +281,6 @@ fn validate_identity_fields(
     )?;
     require_null_or(
         object,
-        "presence_penalty",
-        |value| value.as_f64() == Some(0.0),
-        "zero",
-    )?;
-    require_null_or(
-        object,
         "logit_bias",
         |value| value.as_object().is_some_and(serde_json::Map::is_empty),
         "an empty object",
@@ -302,23 +299,15 @@ fn validate_identity_fields(
         "`\"auto\"` or `\"default\"`",
     )?;
     require_null_or(object, "user", Value::is_string, "a string")?;
-    for field in [
-        "audio",
-        "prediction",
-        "seed",
-        "stop",
-        "verbosity",
-        "web_search_options",
-    ] {
+    for field in ["audio", "prediction", "verbosity", "web_search_options"] {
         require_null_or(object, field, |_| false, "`null`")?;
     }
-    validate_response_format(object.get("response_format"))?;
     validate_stream_options(object.get("stream_options"), stream)
 }
 
-fn validate_response_format(value: Option<&Value>) -> Result<(), OpenAiError> {
+fn parse_response_format(value: Option<&Value>) -> Result<Option<OutputFormat>, OpenAiError> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(());
+        return Ok(None);
     };
     let format = value.as_object().ok_or_else(|| {
         OpenAiError::invalid(
@@ -327,14 +316,75 @@ fn validate_response_format(value: Option<&Value>) -> Result<(), OpenAiError> {
             "invalid_type",
         )
     })?;
-    reject_unknown_fields(format, &["type"], "Chat response_format")?;
-    if format.get("type").and_then(Value::as_str) != Some("text") {
-        return Err(OpenAiError::unsupported(
-            "Only plain text Chat responses are supported.",
+    match format.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            reject_unknown_fields(format, &["type"], "Chat response_format")?;
+            Ok(None)
+        }
+        Some("json_object") => {
+            reject_unknown_fields(format, &["type"], "Chat response_format")?;
+            Ok(Some(OutputFormat::JsonObject))
+        }
+        Some("json_schema") => {
+            reject_unknown_fields(format, &["type", "json_schema"], "Chat response_format")?;
+            let wrapper = format
+                .get("json_schema")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    OpenAiError::invalid(
+                        "`response_format.json_schema` must be an object.",
+                        Some("response_format.json_schema"),
+                        "invalid_type",
+                    )
+                })?;
+            reject_unknown_fields(
+                wrapper,
+                &["name", "description", "schema", "strict"],
+                "Chat JSON Schema",
+            )?;
+            let name = optional_string(wrapper, "name")?;
+            if name.as_ref().is_some_and(|name| name.trim().is_empty()) {
+                return Err(OpenAiError::invalid(
+                    "`response_format.json_schema.name` must not be empty.",
+                    Some("response_format.json_schema.name"),
+                    "invalid_value",
+                ));
+            }
+            let description = optional_string(wrapper, "description")?;
+            let schema = wrapper
+                .get("schema")
+                .filter(|value| value.is_object())
+                .cloned()
+                .ok_or_else(|| {
+                    OpenAiError::invalid(
+                        "`response_format.json_schema.schema` must be a JSON object.",
+                        Some("response_format.json_schema.schema"),
+                        "invalid_type",
+                    )
+                })?;
+            let strict = match wrapper.get("strict") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(value)) => Some(*value),
+                Some(_) => {
+                    return Err(OpenAiError::invalid(
+                        "`response_format.json_schema.strict` must be a boolean.",
+                        Some("response_format.json_schema.strict"),
+                        "invalid_type",
+                    ));
+                }
+            };
+            Ok(Some(OutputFormat::JsonSchema {
+                name,
+                description,
+                schema,
+                strict,
+            }))
+        }
+        _ => Err(OpenAiError::unsupported(
+            "`response_format.type` must be `text`, `json_object`, or `json_schema`.",
             "response_format.type",
-        ));
+        )),
     }
-    Ok(())
 }
 
 fn validate_stream_options(value: Option<&Value>, stream: bool) -> Result<bool, OpenAiError> {

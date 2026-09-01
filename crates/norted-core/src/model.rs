@@ -50,7 +50,30 @@ impl ArtifactFormat {
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "format", content = "identity")]
 pub enum ArtifactNativeIdentity {
+    Gguf(GgufArtifactIdentity),
     Ninfer(NinferArtifactIdentity),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct GgufArtifactIdentity {
+    pub version: u32,
+    pub architecture: String,
+    pub context_length: Option<u64>,
+    pub expert_count: Option<u64>,
+    pub expert_used_count: Option<u64>,
+    pub tokenizer_metadata_sha256: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GgufMetadataError {
+    #[error("could not read GGUF metadata: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("GGUF magic is not recognized")]
+    InvalidMagic,
+    #[error("GGUF version {0} is unsupported")]
+    UnsupportedVersion(u32),
+    #[error("GGUF metadata is malformed: {0}")]
+    Malformed(String),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -232,6 +255,10 @@ impl ModelRegistry {
                             .and_then(|member| member.native_identity.clone())
                         {
                             Some(identity)
+                        } else if format == ArtifactFormat::Gguf {
+                            inspect_gguf_metadata(&canonical_path)
+                                .ok()
+                                .map(ArtifactNativeIdentity::Gguf)
                         } else if format == ArtifactFormat::Ninfer {
                             match inspect_ninfer_container(&canonical_path) {
                                 Ok(metadata) => {
@@ -258,6 +285,12 @@ impl ModelRegistry {
                                     &mut registry.warnings,
                                 )
                             });
+                        let (architecture, context_length) = match &native_identity {
+                            Some(ArtifactNativeIdentity::Gguf(identity)) => {
+                                (Some(identity.architecture.clone()), identity.context_length)
+                            }
+                            _ => (None, None),
+                        };
                         registry.artifacts.push(ModelArtifact {
                             id: model_id(path, format, &identity, None),
                             display_name: path
@@ -270,8 +303,8 @@ impl ModelRegistry {
                             size_bytes: metadata.len(),
                             created: artifact_timestamp(&metadata),
                             hash: None,
-                            architecture: None,
-                            context_length: None,
+                            architecture,
+                            context_length,
                             provenance: None,
                             native_identity,
                             auxiliary_artifacts,
@@ -300,6 +333,233 @@ impl ModelRegistry {
 
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+}
+
+const MAX_GGUF_METADATA_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_GGUF_METADATA_ENTRIES: u64 = 1_000_000;
+const MAX_GGUF_STRING_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_GGUF_ARRAY_ITEMS: u64 = 16_000_000;
+
+/// Reads only the bounded GGUF header/metadata region. Tensor payloads are
+/// never mapped or hashed. The tokenizer digest covers the exact encoded
+/// `tokenizer.ggml.*` metadata values and is used only as a conservative
+/// speculative-model vocabulary compatibility proof.
+pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMetadataError> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = GgufReader {
+        inner: std::io::BufReader::new(file),
+        consumed: 0,
+    };
+    let magic = reader.bytes::<4>(None)?;
+    if &magic != b"GGUF" {
+        return Err(GgufMetadataError::InvalidMagic);
+    }
+    let version = reader.u32(None)?;
+    if !(2..=3).contains(&version) {
+        return Err(GgufMetadataError::UnsupportedVersion(version));
+    }
+    let _tensor_count = reader.u64(None)?;
+    let metadata_count = reader.u64(None)?;
+    if metadata_count > MAX_GGUF_METADATA_ENTRIES {
+        return Err(GgufMetadataError::Malformed(format!(
+            "metadata entry count {metadata_count} exceeds the safety limit"
+        )));
+    }
+
+    let mut architecture = None;
+    let mut architecture_numbers = HashMap::<String, u64>::new();
+    let mut tokenizer = Sha256::new();
+    let mut tokenizer_fields = 0_u64;
+
+    for _ in 0..metadata_count {
+        let key = reader.string(None)?;
+        let value_type = reader.u32(None)?;
+        if key.starts_with("tokenizer.ggml.") {
+            tokenizer.update((key.len() as u64).to_le_bytes());
+            tokenizer.update(key.as_bytes());
+            tokenizer.update(value_type.to_le_bytes());
+            reader.value(value_type, None, Some(&mut tokenizer))?;
+            tokenizer_fields += 1;
+            continue;
+        }
+        let capture = key == "general.architecture"
+            || key.ends_with(".context_length")
+            || key.ends_with(".expert_count")
+            || key.ends_with(".expert_used_count");
+        let value = reader.value(value_type, capture.then_some(&key), None)?;
+        if key == "general.architecture" {
+            architecture = value.and_then(GgufScalar::into_string);
+        } else if let Some(value) = value.and_then(GgufScalar::into_u64) {
+            if key.ends_with(".context_length")
+                || key.ends_with(".expert_count")
+                || key.ends_with(".expert_used_count")
+            {
+                architecture_numbers.insert(key, value);
+            }
+        }
+    }
+    let architecture = architecture.ok_or_else(|| {
+        GgufMetadataError::Malformed("missing string `general.architecture`".to_owned())
+    })?;
+    let context_length = architecture_numbers
+        .get(&format!("{architecture}.context_length"))
+        .copied();
+    let expert_count = architecture_numbers
+        .get(&format!("{architecture}.expert_count"))
+        .copied();
+    let expert_used_count = architecture_numbers
+        .get(&format!("{architecture}.expert_used_count"))
+        .copied();
+    Ok(GgufArtifactIdentity {
+        version,
+        architecture,
+        context_length,
+        expert_count,
+        expert_used_count,
+        tokenizer_metadata_sha256: (tokenizer_fields > 0)
+            .then(|| format!("{:x}", tokenizer.finalize())),
+    })
+}
+
+enum GgufScalar {
+    Unsigned(u64),
+    Signed(i64),
+    String(String),
+}
+
+impl GgufScalar {
+    fn into_u64(self) -> Option<u64> {
+        match self {
+            Self::Unsigned(value) => Some(value),
+            Self::Signed(value) => u64::try_from(value).ok(),
+            Self::String(_) => None,
+        }
+    }
+
+    fn into_string(self) -> Option<String> {
+        match self {
+            Self::String(value) => Some(value),
+            Self::Unsigned(_) | Self::Signed(_) => None,
+        }
+    }
+}
+
+struct GgufReader<R> {
+    inner: R,
+    consumed: u64,
+}
+
+impl<R: Read> GgufReader<R> {
+    fn raw(
+        &mut self,
+        bytes: &mut [u8],
+        mut digest: Option<&mut Sha256>,
+    ) -> Result<(), GgufMetadataError> {
+        self.consumed = self
+            .consumed
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| {
+                GgufMetadataError::Malformed("metadata byte count overflowed".to_owned())
+            })?;
+        if self.consumed > MAX_GGUF_METADATA_BYTES {
+            return Err(GgufMetadataError::Malformed(format!(
+                "metadata exceeds the {MAX_GGUF_METADATA_BYTES}-byte safety limit"
+            )));
+        }
+        self.inner.read_exact(bytes)?;
+        if let Some(digest) = digest.as_mut() {
+            digest.update(bytes);
+        }
+        Ok(())
+    }
+
+    fn bytes<const N: usize>(
+        &mut self,
+        digest: Option<&mut Sha256>,
+    ) -> Result<[u8; N], GgufMetadataError> {
+        let mut bytes = [0_u8; N];
+        self.raw(&mut bytes, digest)?;
+        Ok(bytes)
+    }
+
+    fn u32(&mut self, digest: Option<&mut Sha256>) -> Result<u32, GgufMetadataError> {
+        Ok(u32::from_le_bytes(self.bytes(digest)?))
+    }
+
+    fn u64(&mut self, digest: Option<&mut Sha256>) -> Result<u64, GgufMetadataError> {
+        Ok(u64::from_le_bytes(self.bytes(digest)?))
+    }
+
+    fn string(&mut self, digest: Option<&mut Sha256>) -> Result<String, GgufMetadataError> {
+        let mut digest = digest;
+        let length = self.u64(digest.as_deref_mut())?;
+        if length > MAX_GGUF_STRING_BYTES {
+            return Err(GgufMetadataError::Malformed(format!(
+                "string length {length} exceeds the safety limit"
+            )));
+        }
+        let length = usize::try_from(length)
+            .map_err(|_| GgufMetadataError::Malformed("string length overflowed".to_owned()))?;
+        let mut bytes = vec![0_u8; length];
+        self.raw(&mut bytes, digest)?;
+        String::from_utf8(bytes)
+            .map_err(|_| GgufMetadataError::Malformed("metadata string is not UTF-8".to_owned()))
+    }
+
+    fn value(
+        &mut self,
+        value_type: u32,
+        capture_key: Option<&str>,
+        mut digest: Option<&mut Sha256>,
+    ) -> Result<Option<GgufScalar>, GgufMetadataError> {
+        let scalar = match value_type {
+            0 => GgufScalar::Unsigned(u64::from(self.bytes::<1>(digest.as_deref_mut())?[0])),
+            1 => GgufScalar::Signed(i64::from(i8::from_le_bytes(
+                self.bytes::<1>(digest.as_deref_mut())?,
+            ))),
+            2 => GgufScalar::Unsigned(u64::from(u16::from_le_bytes(
+                self.bytes(digest.as_deref_mut())?,
+            ))),
+            3 => GgufScalar::Signed(i64::from(i16::from_le_bytes(
+                self.bytes(digest.as_deref_mut())?,
+            ))),
+            4 => GgufScalar::Unsigned(u64::from(self.u32(digest.as_deref_mut())?)),
+            5 => GgufScalar::Signed(i64::from(i32::from_le_bytes(
+                self.bytes(digest.as_deref_mut())?,
+            ))),
+            6 => {
+                let _ = self.bytes::<4>(digest.as_deref_mut())?;
+                return Ok(None);
+            }
+            7 => GgufScalar::Unsigned(u64::from(self.bytes::<1>(digest.as_deref_mut())?[0])),
+            8 => GgufScalar::String(self.string(digest.as_deref_mut())?),
+            9 => {
+                let element_type = self.u32(digest.as_deref_mut())?;
+                let count = self.u64(digest.as_deref_mut())?;
+                if count > MAX_GGUF_ARRAY_ITEMS {
+                    return Err(GgufMetadataError::Malformed(format!(
+                        "array item count {count} exceeds the safety limit"
+                    )));
+                }
+                for _ in 0..count {
+                    self.value(element_type, None, digest.as_deref_mut())?;
+                }
+                return Ok(None);
+            }
+            10 => GgufScalar::Unsigned(self.u64(digest.as_deref_mut())?),
+            11 => GgufScalar::Signed(i64::from_le_bytes(self.bytes(digest.as_deref_mut())?)),
+            12 => {
+                let _ = self.bytes::<8>(digest)?;
+                return Ok(None);
+            }
+            other => {
+                return Err(GgufMetadataError::Malformed(format!(
+                    "unknown value type {other}"
+                )));
+            }
+        };
+        Ok(capture_key.map(|_| scalar))
     }
 }
 

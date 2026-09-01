@@ -277,6 +277,8 @@ struct ActiveBackend {
     engine_id: String,
     endpoint: String,
     effective_generation_settings: EffectiveGenerationSettings,
+    settings: norted_core::ResolvedSettings,
+    settings_schema: norted_core::SettingsSchema,
     _runtime_lease: RuntimeLease,
 }
 
@@ -844,8 +846,8 @@ impl RuntimeManager {
                 runtime: selection.runtime.clone(),
                 accelerator: selection.accelerator.clone(),
                 backend_address,
-                settings: resolved_settings,
-                settings_schema,
+                settings: resolved_settings.clone(),
+                settings_schema: settings_schema.clone(),
             })
             .await
         {
@@ -1233,6 +1235,8 @@ impl RuntimeManager {
                 engine_id: engine_id.clone(),
                 endpoint,
                 effective_generation_settings,
+                settings: resolved_settings.clone(),
+                settings_schema,
                 _runtime_lease: runtime_lease,
             });
             push_notice(
@@ -1350,15 +1354,15 @@ impl RuntimeManager {
 
     pub async fn infer(
         &self,
-        request: InferenceRequest,
+        mut request: InferenceRequest,
     ) -> Result<RoutedInferenceOutput, RuntimeError> {
-        let (adapter, endpoint, backend_generation_settings) =
+        let (adapter, endpoint, backend_generation_settings, settings, settings_schema) =
             self.inference_target(&request.model_profile_id).await?;
+        prepare_inference_request(&adapter, &endpoint, &settings, &mut request)
+            .await
+            .map_err(map_inference_error)?;
         adapter
-            .validate_generation_settings(
-                &request.generation_settings,
-                &backend_generation_settings,
-            )
+            .validate_inference_request(&request, &backend_generation_settings, &settings_schema)
             .map_err(map_inference_error)?;
         let effective_generation_settings =
             backend_generation_settings.merged(&request.generation_settings);
@@ -1374,15 +1378,15 @@ impl RuntimeManager {
 
     pub async fn infer_stream(
         &self,
-        request: InferenceRequest,
+        mut request: InferenceRequest,
     ) -> Result<RoutedInferenceStream, RuntimeError> {
-        let (adapter, endpoint, backend_generation_settings) =
+        let (adapter, endpoint, backend_generation_settings, settings, settings_schema) =
             self.inference_target(&request.model_profile_id).await?;
+        prepare_inference_request(&adapter, &endpoint, &settings, &mut request)
+            .await
+            .map_err(map_inference_error)?;
         adapter
-            .validate_generation_settings(
-                &request.generation_settings,
-                &backend_generation_settings,
-            )
+            .validate_inference_request(&request, &backend_generation_settings, &settings_schema)
             .map_err(map_inference_error)?;
         let effective_generation_settings =
             backend_generation_settings.merged(&request.generation_settings);
@@ -1640,7 +1644,16 @@ impl RuntimeManager {
     async fn inference_target(
         &self,
         requested_alias: &ModelProfileId,
-    ) -> Result<(Arc<dyn EngineAdapter>, String, EffectiveGenerationSettings), RuntimeError> {
+    ) -> Result<
+        (
+            Arc<dyn EngineAdapter>,
+            String,
+            EffectiveGenerationSettings,
+            norted_core::ResolvedSettings,
+            norted_core::SettingsSchema,
+        ),
+        RuntimeError,
+    > {
         let state = self.state.read().await;
         match (&state.lifecycle, &state.active) {
             (BackendLifecycle::Running, Some(active))
@@ -1650,6 +1663,8 @@ impl RuntimeManager {
                     Arc::clone(&active.adapter),
                     active.endpoint.clone(),
                     active.effective_generation_settings,
+                    active.settings.clone(),
+                    active.settings_schema.clone(),
                 ))
             }
             (BackendLifecycle::Failed, _) => Err(RuntimeError::BackendCrashed(
@@ -1780,6 +1795,104 @@ async fn cleanup_temporary_launch_files(paths: &[std::path::PathBuf]) {
 async fn cleanup_pending_launch_files(attempts: &VecDeque<crate::LaunchSpec>) {
     for attempt in attempts {
         cleanup_temporary_launch_files(&attempt.temporary_files).await;
+    }
+}
+
+async fn prepare_inference_request(
+    adapter: &Arc<dyn EngineAdapter>,
+    endpoint: &str,
+    settings: &norted_core::ResolvedSettings,
+    request: &mut InferenceRequest,
+) -> Result<(), EngineError> {
+    if request.max_output_tokens.is_none()
+        && let Some(norted_core::SettingValue::UnsignedInteger(value)) =
+            settings.value("max_output_tokens")
+    {
+        request.max_output_tokens = u32::try_from(*value).ok();
+    }
+    if !request.messages.iter().any(|message| {
+        matches!(
+            message.role,
+            crate::InferenceRole::System | crate::InferenceRole::Developer
+        )
+    }) && let Some(norted_core::SettingValue::String(prompt)) = settings.value("system_prompt")
+    {
+        request.messages.insert(
+            0,
+            crate::InferenceMessage {
+                role: crate::InferenceRole::System,
+                text: prompt.clone(),
+            },
+        );
+    }
+    if request.output_format.is_none()
+        && let Some(norted_core::SettingValue::Json(schema)) =
+            settings.value("structured_output_schema")
+    {
+        request.output_format = Some(crate::OutputFormat::JsonSchema {
+            name: None,
+            description: None,
+            schema: schema.clone(),
+            strict: None,
+        });
+    }
+
+    if !matches!(
+        settings.value("context_overflow"),
+        Some(norted_core::SettingValue::Choice(policy)) if policy == "truncate_middle"
+    ) {
+        return Ok(());
+    }
+    let output_allowance = request.max_output_tokens.ok_or_else(|| {
+        EngineError::InvalidGenerationSettings(
+            "truncate_middle requires an explicit request or Model Profile maximum output-token limit"
+                .to_owned(),
+        )
+    })?;
+    let capacity = adapter.context_capacity(endpoint).await?.ok_or_else(|| {
+        EngineError::InvalidGenerationSettings(
+            "the selected engine/runtime cannot prove an exact context capacity for truncate_middle"
+                .to_owned(),
+        )
+    })?;
+    let input_budget = capacity.checked_sub(u64::from(output_allowance)).ok_or_else(|| {
+        EngineError::InvalidGenerationSettings(format!(
+            "maximum output allowance {output_allowance} leaves no input capacity in the exact {capacity}-token context"
+        ))
+    })?;
+
+    loop {
+        let count = adapter
+            .count_input_tokens(endpoint, request)
+            .await?
+            .ok_or_else(|| {
+                EngineError::InvalidGenerationSettings(
+                    "the selected engine/runtime has no exact tokenizer path for truncate_middle"
+                        .to_owned(),
+                )
+            })?;
+        if count <= input_budget {
+            return Ok(());
+        }
+        let newest = request.messages.len().saturating_sub(1);
+        let removable = request
+            .messages
+            .iter()
+            .enumerate()
+            .find_map(|(index, message)| {
+                (index < newest
+                    && !matches!(
+                        message.role,
+                        crate::InferenceRole::System | crate::InferenceRole::Developer
+                    ))
+                .then_some(index)
+            });
+        let Some(index) = removable else {
+            return Err(EngineError::InvalidGenerationSettings(format!(
+                "exact rendered input uses {count} tokens but only {input_budget} are available; required instructions and the newest conversational tail cannot be truncated"
+            )));
+        };
+        request.messages.remove(index);
     }
 }
 

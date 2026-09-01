@@ -19,11 +19,11 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use norted_core::{
-    AcquisitionMethod, ArtifactFormat, AvailableRuntime, EngineConfig, EngineInstallation,
-    EngineRevision, GpuOffload, HostCapabilities, InstalledRuntime, ModelArtifact,
-    RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId, RuntimeIdentity,
+    AcquisitionMethod, ArtifactFormat, ArtifactNativeIdentity, AvailableRuntime, EngineConfig,
+    EngineInstallation, EngineRevision, GpuOffload, HostCapabilities, InstalledRuntime,
+    ModelArtifact, RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId, RuntimeIdentity,
     RuntimeProbeObservation, SettingDefinition, SettingId, SettingKind, SettingScope, SettingValue,
-    SettingsSchema,
+    SettingsSchema, UnsignedIntegerOrChoiceValue,
 };
 use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CompatibilityDecision,
@@ -31,7 +31,7 @@ use norted_engine::{
     EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceEvent, InferenceFinishReason,
     InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
     InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter,
-    NativeOption, OptionValueKind, PreparedModelInput, ProcessDescriptor,
+    NativeOption, OptionValueKind, OutputFormat, PreparedModelInput, ProcessDescriptor,
     RuntimeVariantUpdateIdentity, UpdateState, capture_command, common_setting_definitions,
     prepare_norted_package_input, prepare_norted_package_input_with_progress,
     revalidate_norted_package_before_launch, revalidate_norted_package_before_launch_with_progress,
@@ -461,6 +461,45 @@ impl LlamaCppAdapter {
         if let Some(top_p) = request.generation_settings.top_p {
             body["top_p"] = json!(top_p);
         }
+        if let Some(seed) = request.generation_settings.seed {
+            body["seed"] = json!(seed);
+        }
+        if let Some(repeat_penalty) = request.generation_settings.repeat_penalty {
+            body["repeat_penalty"] = json!(repeat_penalty);
+        }
+        if let Some(presence_penalty) = request.generation_settings.presence_penalty {
+            body["presence_penalty"] = json!(presence_penalty);
+        }
+        if let Some(stop) = &request.generation_settings.stop {
+            body["stop"] = json!(stop);
+        }
+        if let Some(reasoning_effort) = request.generation_settings.reasoning_effort {
+            body["reasoning_effort"] = json!(reasoning_effort.as_str());
+        }
+        if let Some(output_format) = &request.output_format {
+            body["response_format"] = match output_format {
+                OutputFormat::JsonObject => json!({ "type": "json_object" }),
+                OutputFormat::JsonSchema {
+                    name,
+                    description,
+                    schema,
+                    strict,
+                } => {
+                    let mut wrapper = json!({ "schema": schema });
+                    let object = wrapper.as_object_mut().expect("static object");
+                    if let Some(name) = name {
+                        object.insert("name".to_owned(), json!(name));
+                    }
+                    if let Some(description) = description {
+                        object.insert("description".to_owned(), json!(description));
+                    }
+                    if let Some(strict) = strict {
+                        object.insert("strict".to_owned(), json!(strict));
+                    }
+                    json!({ "type": "json_schema", "json_schema": wrapper })
+                }
+            };
+        }
         if stream {
             body["stream_options"] = json!({ "include_usage": true });
         }
@@ -499,12 +538,6 @@ impl EngineAdapter for LlamaCppAdapter {
         settings: &GenerationSettingsPatch,
         _backend_defaults: &EffectiveGenerationSettings,
     ) -> Result<(), EngineError> {
-        if settings.reasoning_effort.is_some() {
-            return Err(EngineError::InvalidGenerationSettings(
-                "the Norted llama.cpp integration has no proven generic reasoning-effort mechanism"
-                    .to_owned(),
-            ));
-        }
         if let Some(temperature) = settings.temperature
             && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
         {
@@ -519,7 +552,144 @@ impl EngineAdapter for LlamaCppAdapter {
                 "llama.cpp top_p must be finite and in the range 0..=1".to_owned(),
             ));
         }
+        if settings.seed.is_some_and(|seed| seed > u64::from(u32::MAX)) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "llama.cpp seed must fit in an unsigned 32-bit integer".to_owned(),
+            ));
+        }
+        if let Some(value) = settings.repeat_penalty
+            && (!value.is_finite() || value < 0.0)
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "llama.cpp repeat penalty must be finite and non-negative".to_owned(),
+            ));
+        }
+        if let Some(value) = settings.presence_penalty
+            && (!value.is_finite() || !(-2.0..=2.0).contains(&value))
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "llama.cpp presence penalty must be finite and in the range -2..=2".to_owned(),
+            ));
+        }
+        if settings.stop.as_ref().is_some_and(|values| {
+            values.is_empty()
+                || values
+                    .iter()
+                    .any(|value| value.is_empty() || value.contains('\0'))
+        }) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "llama.cpp stop strings must be non-empty and contain no NUL bytes".to_owned(),
+            ));
+        }
         Ok(())
+    }
+
+    fn validate_inference_request(
+        &self,
+        request: &InferenceRequest,
+        backend_defaults: &EffectiveGenerationSettings,
+        settings_schema: &SettingsSchema,
+    ) -> Result<(), EngineError> {
+        self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
+        let required = [
+            (request.generation_settings.seed.is_some(), "seed"),
+            (
+                request.generation_settings.repeat_penalty.is_some(),
+                "repeat_penalty",
+            ),
+            (
+                request.generation_settings.presence_penalty.is_some(),
+                "presence_penalty",
+            ),
+            (request.generation_settings.stop.is_some(), "stop_strings"),
+            (
+                request.generation_settings.reasoning_effort.is_some(),
+                "reasoning_effort",
+            ),
+            (request.output_format.is_some(), "structured_output_schema"),
+        ];
+        for (used, id) in required {
+            if used {
+                require_supported_setting(settings_schema, id)?;
+            }
+        }
+        if let Some(effort) = request.generation_settings.reasoning_effort {
+            let id = SettingId::new("reasoning_effort").expect("static setting ID");
+            let definition = settings_schema.definition(&id).expect("common definition");
+            let SettingKind::Choice { choices } = &definition.kind else {
+                return Err(EngineError::InvalidGenerationSettings(
+                    "exact llama.cpp reasoning-effort contract is malformed".to_owned(),
+                ));
+            };
+            if !choices.iter().any(|choice| choice == effort.as_str()) {
+                return Err(EngineError::InvalidGenerationSettings(format!(
+                    "the exact llama-server does not advertise reasoning effort `{effort}`"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn context_capacity(&self, endpoint: &str) -> Result<Option<u64>, EngineError> {
+        let response = self
+            .client
+            .get(format!("{endpoint}/props"))
+            .timeout(PROPS_TIMEOUT)
+            .send()
+            .await
+            .map_err(map_transport_error)?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
+        if !status.is_success() {
+            return Err(backend_http_error(status, &body));
+        }
+        let props: PropsResponse = serde_json::from_slice(&body).map_err(|error| {
+            EngineError::Operation(format!(
+                "invalid llama.cpp /props context contract: {error}"
+            ))
+        })?;
+        Ok(Some(props.default_generation_settings.n_ctx))
+    }
+
+    async fn count_input_tokens(
+        &self,
+        endpoint: &str,
+        request: &InferenceRequest,
+    ) -> Result<Option<u64>, EngineError> {
+        let response = self
+            .client
+            .post(format!("{endpoint}/v1/chat/completions/input_tokens"))
+            .timeout(PROPS_TIMEOUT)
+            .json(&self.backend_request(request, false))
+            .send()
+            .await
+            .map_err(map_transport_error)?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
+        if !status.is_success() {
+            return Err(EngineError::InvalidGenerationSettings(format!(
+                "exact llama-server token counting is unavailable: {}",
+                backend_http_error(status, &body)
+            )));
+        }
+        let value: Value = serde_json::from_slice(&body).map_err(|error| {
+            EngineError::Operation(format!("invalid llama.cpp input-token response: {error}"))
+        })?;
+        let count = value
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                EngineError::Operation(
+                    "llama.cpp input-token response omitted `input_tokens`".to_owned(),
+                )
+            })?;
+        Ok(Some(count))
     }
 
     fn runtime_management_compatibility(&self) -> CompatibilityDecision {
@@ -573,17 +743,17 @@ impl EngineAdapter for LlamaCppAdapter {
         _host: &HostCapabilities,
         settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
-        let model = llama_model_compatibility(self.compatibility(model));
-        if matches!(model, RuntimeCompatibility::Incompatible(_)) {
-            return model;
+        let model_compatibility = llama_model_compatibility(self.compatibility(model));
+        if matches!(model_compatibility, RuntimeCompatibility::Incompatible(_)) {
+            return model_compatibility;
         }
         let help = self
             .capability_cache
             .try_read()
             .ok()
             .and_then(|cache| cache.get(&Self::capability_key(runtime)).cloned());
-        settings.map_or(model, |settings| {
-            llama_configured_runtime_compatibility(settings, help.as_deref())
+        settings.map_or(model_compatibility, |settings| {
+            llama_configured_runtime_compatibility(settings, Some(model), help.as_deref())
         })
     }
 
@@ -594,12 +764,12 @@ impl EngineAdapter for LlamaCppAdapter {
         _host: &HostCapabilities,
         settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
-        let model = llama_model_compatibility(self.compatibility(model));
-        if matches!(model, RuntimeCompatibility::Incompatible(_)) {
-            return model;
+        let model_compatibility = llama_model_compatibility(self.compatibility(model));
+        if matches!(model_compatibility, RuntimeCompatibility::Incompatible(_)) {
+            return model_compatibility;
         }
-        settings.map_or(model, |settings| {
-            llama_configured_runtime_compatibility(settings, None)
+        settings.map_or(model_compatibility, |settings| {
+            llama_configured_runtime_compatibility(settings, Some(model), None)
         })
     }
 
@@ -652,9 +822,9 @@ impl EngineAdapter for LlamaCppAdapter {
 
     fn model_setting_definitions(
         &self,
-        _model: &ModelArtifact,
+        model: &ModelArtifact,
     ) -> Result<Vec<SettingDefinition>, EngineError> {
-        Ok(llama_model_setting_definitions())
+        Ok(llama_model_setting_definitions(Some(model)))
     }
 
     async fn settings_schema(
@@ -821,8 +991,13 @@ impl EngineAdapter for LlamaCppAdapter {
             .settings_schema
             .validate(&request.settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
-        let structured =
-            translate_llama_settings(&request.settings, &self.native_arguments, &self.environment)?;
+        validate_llama_bound_files(&request.settings, &request.model.primary).await?;
+        let structured = translate_llama_settings_for_model(
+            &request.settings,
+            Some(&request.model.primary),
+            &self.native_arguments,
+            &self.environment,
+        )?;
         let observation = self.probe_runtime(&request.runtime).await?;
         let binary_path = request.runtime.entrypoint_path();
         let manifest = &request.runtime.manifest;
@@ -1061,6 +1236,22 @@ fn llama_runtime_preference(accelerator: &str, host: &HostCapabilities) -> u16 {
     }
 }
 
+fn require_supported_setting(schema: &SettingsSchema, id: &str) -> Result<(), EngineError> {
+    let id = SettingId::new(id).expect("static setting ID");
+    match schema.definition(&id) {
+        Some(definition) if definition.supported => Ok(()),
+        Some(definition) => Err(EngineError::InvalidGenerationSettings(
+            definition
+                .unsupported_reason
+                .clone()
+                .unwrap_or_else(|| format!("the exact llama-server does not support `{id}`")),
+        )),
+        None => Err(EngineError::InvalidGenerationSettings(format!(
+            "the exact llama-server schema does not define `{id}`"
+        ))),
+    }
+}
+
 #[derive(Deserialize)]
 struct HealthResponse {
     status: String,
@@ -1073,6 +1264,7 @@ struct PropsResponse {
 
 #[derive(Deserialize)]
 struct DefaultGenerationSettings {
+    n_ctx: u64,
     params: PropsGenerationParams,
 }
 
@@ -1415,17 +1607,115 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
         llama_definition(
             "llama.cpp.load_mode",
             "Model load mode",
-            "One unambiguous llama.cpp model-loading mode",
+            "Current model-loading policy covering mmap and keep-in-memory semantics without deprecated standalone switches",
             SettingKind::Choice {
                 choices: llama_load_modes(),
             },
             Some("runtime-selected; omission preserves the exact runtime default"),
         ),
+        llama_definition(
+            "llama.cpp.rope_frequency_base",
+            "RoPE frequency base",
+            "RoPE base frequency used by NTK-aware scaling",
+            SettingKind::Float { minimum: Some(f64::MIN_POSITIVE), maximum: None },
+            Some("loaded from model"),
+        ),
+        llama_definition(
+            "llama.cpp.rope_frequency_scale",
+            "RoPE frequency scale",
+            "RoPE frequency scaling factor; context expands by 1/value",
+            SettingKind::Float { minimum: Some(f64::MIN_POSITIVE), maximum: None },
+            Some("loaded from model"),
+        ),
+        llama_definition(
+            "llama.cpp.unified_kv_cache",
+            "Unified KV cache",
+            "Use one KV buffer shared across server sequences",
+            SettingKind::Toggle,
+            Some("exact runtime automatic behavior"),
+        ),
+        llama_definition(
+            "llama.cpp.kv_cache_gpu_offload",
+            "KV cache GPU offload",
+            "Place KV cache storage on an accelerator when enabled",
+            SettingKind::Toggle,
+            Some("enabled in current runtimes"),
+        ),
+        llama_definition(
+            "llama.cpp.context_checkpoints",
+            "Context checkpoints",
+            "Maximum context checkpoints per server slot; omission preserves the exact runtime default",
+            SettingKind::UnsignedInteger { minimum: Some(0), maximum: None },
+            Some("exact runtime default"),
+        ),
+        llama_definition(
+            "llama.cpp.cpu_moe_layers",
+            "MoE layers on CPU",
+            "Keep expert weights for the first N model layers on CPU",
+            SettingKind::UnsignedInteger { minimum: Some(0), maximum: None },
+            Some("none"),
+        ),
+        llama_definition(
+            "llama.cpp.cpu_moe_all",
+            "All MoE weights on CPU",
+            "Keep all Mixture-of-Experts weights on CPU",
+            SettingKind::OneWayFlag,
+            Some("disabled"),
+        ),
+        llama_definition(
+            "llama.cpp.active_experts",
+            "Number of active experts",
+            "Override the architecture-specific GGUF expert_used_count metadata only when the selected model proves that key",
+            SettingKind::UnsignedInteger { minimum: Some(1), maximum: None },
+            Some("loaded from model metadata"),
+        ),
+        llama_definition(
+            "llama.cpp.chat_template",
+            "Chat template",
+            "Exact runtime-advertised built-in chat template name; omission keeps model metadata authoritative",
+            SettingKind::Choice { choices: Vec::new() },
+            Some("model metadata"),
+        ),
+        llama_definition(
+            "llama.cpp.chat_template_file",
+            "Chat template file",
+            "Bound local Jinja chat-template file; content identity is recorded with the profile/default",
+            SettingKind::Path,
+            Some("model metadata"),
+        ),
+        llama_definition(
+            "llama.cpp.chat_template_sha256",
+            "Chat template SHA-256",
+            "Recorded content identity for the selected local chat-template file",
+            SettingKind::String,
+            None,
+        ),
+        llama_definition(
+            "llama.cpp.speculative_mode",
+            "Speculative decoding",
+            "Exact runtime-advertised speculative decoding mode; off emits the runtime's none mode",
+            SettingKind::Choice { choices: Vec::new() },
+            Some("off"),
+        ),
+        llama_definition(
+            "llama.cpp.speculative_draft_model",
+            "Speculative draft model",
+            "Bound local GGUF draft artifact used by draft-model speculative modes",
+            SettingKind::Path,
+            Some("unused"),
+        ),
+        llama_definition(
+            "llama.cpp.speculative_draft_sha256",
+            "Draft model SHA-256",
+            "Recorded content identity for the selected speculative draft artifact",
+            SettingKind::String,
+            None,
+        ),
     ]);
     definitions
 }
 
-fn llama_model_setting_definitions() -> Vec<SettingDefinition> {
+fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<SettingDefinition> {
     let mut definitions = llama_setting_definitions();
     if let Some(temperature) = definitions
         .iter_mut()
@@ -1436,15 +1726,30 @@ fn llama_model_setting_definitions() -> Vec<SettingDefinition> {
             maximum: Some(2.0),
         };
     }
-    if let Some(reasoning) = definitions
+    if let Some(experts) = definitions
         .iter_mut()
-        .find(|definition| definition.id.as_str() == "reasoning_effort")
+        .find(|definition| definition.id.as_str() == "llama.cpp.active_experts")
     {
-        reasoning.supported = false;
-        reasoning.unsupported_reason = Some(
-            "the Norted llama.cpp integration has no proven generic reasoning-effort mechanism"
-                .to_owned(),
-        );
+        match model.and_then(|model| match &model.native_identity {
+            Some(ArtifactNativeIdentity::Gguf(identity)) => Some(identity),
+            _ => None,
+        }) {
+            Some(identity)
+                if identity.expert_used_count.is_some() && identity.expert_count.is_some() =>
+            {
+                experts.kind = SettingKind::UnsignedInteger {
+                    minimum: Some(1),
+                    maximum: identity.expert_count,
+                };
+            }
+            _ => {
+                experts.supported = false;
+                experts.unsupported_reason = Some(
+                    "the selected GGUF does not prove an architecture-specific expert_used_count override"
+                        .to_owned(),
+                );
+            }
+        }
     }
     definitions
 }
@@ -1464,8 +1769,17 @@ fn llama_definition(
         scope: SettingScope::Engine {
             engine_id: ENGINE_ID.to_owned(),
         },
-        category: if id.contains("kv_cache") || id.contains("flash_attention") {
+        category: if id.contains("unified_kv")
+            || id.contains("kv_cache")
+            || id.contains("flash_attention")
+        {
             norted_core::SettingCategory::KvMemory
+        } else if id.contains("speculative") {
+            norted_core::SettingCategory::Speculation
+        } else if id.contains("chat_template") {
+            norted_core::SettingCategory::Prompt
+        } else if id.contains("context_checkpoint") {
+            norted_core::SettingCategory::Advanced
         } else if id.contains("cache") {
             norted_core::SettingCategory::Cache
         } else {
@@ -1502,6 +1816,17 @@ fn llama_setting_contract(id: &str) -> &'static [&'static str] {
         "top_p" => &["--top-p"],
         "top_k" => &["--top-k"],
         "min_p" => &["--min-p"],
+        "seed" => &["--seed"],
+        "repeat_penalty" => &["--repeat-penalty"],
+        "presence_penalty" => &["--presence-penalty"],
+        "max_output_tokens" => &["--predict"],
+        "stop_strings" => &["--reverse-prompt"],
+        "reasoning" => &["--reasoning"],
+        "reasoning_effort" => &["--reasoning-effort"],
+        "reasoning_budget" => &["--reasoning-budget"],
+        "reasoning_budget_message" => &["--reasoning-budget-message"],
+        "structured_output_schema" => &["--json-schema"],
+        "context_overflow" => &["--ctx-size"],
         "llama.cpp.threads" => &["--threads"],
         "llama.cpp.batch_size" => &["--batch-size"],
         "llama.cpp.micro_batch_size" => &["--ubatch-size"],
@@ -1510,6 +1835,22 @@ fn llama_setting_contract(id: &str) -> &'static [&'static str] {
         "llama.cpp.kv_cache_k" => &["--cache-type-k"],
         "llama.cpp.kv_cache_v" => &["--cache-type-v"],
         "llama.cpp.load_mode" => &["--load-mode"],
+        "llama.cpp.rope_frequency_base" => &["--rope-freq-base"],
+        "llama.cpp.rope_frequency_scale" => &["--rope-freq-scale"],
+        "llama.cpp.unified_kv_cache" => &["--kv-unified", "--no-kv-unified"],
+        "llama.cpp.kv_cache_gpu_offload" => &["--kv-offload", "--no-kv-offload"],
+        "llama.cpp.context_checkpoints" => &["--ctx-checkpoints"],
+        "llama.cpp.cpu_moe_layers" => &["--n-cpu-moe"],
+        "llama.cpp.cpu_moe_all" => &["--cpu-moe"],
+        "llama.cpp.active_experts" => &["--override-kv"],
+        "llama.cpp.chat_template" => &["--chat-template"],
+        "llama.cpp.chat_template_file" | "llama.cpp.chat_template_sha256" => {
+            &["--jinja", "--chat-template-file"]
+        }
+        "llama.cpp.speculative_mode" => &["--spec-type"],
+        "llama.cpp.speculative_draft_model" | "llama.cpp.speculative_draft_sha256" => {
+            &["--spec-draft-model"]
+        }
         _ => &[],
     }
 }
@@ -1523,6 +1864,18 @@ fn llama_setting_has_execution_path(id: &str) -> bool {
             | "top_p"
             | "top_k"
             | "min_p"
+            | "seed"
+            | "repeat_penalty"
+            | "presence_penalty"
+            | "max_output_tokens"
+            | "stop_strings"
+            | "system_prompt"
+            | "reasoning"
+            | "reasoning_effort"
+            | "reasoning_budget"
+            | "reasoning_budget_message"
+            | "structured_output_schema"
+            | "context_overflow"
             | "llama.cpp.threads"
             | "llama.cpp.batch_size"
             | "llama.cpp.micro_batch_size"
@@ -1531,6 +1884,20 @@ fn llama_setting_has_execution_path(id: &str) -> bool {
             | "llama.cpp.kv_cache_k"
             | "llama.cpp.kv_cache_v"
             | "llama.cpp.load_mode"
+            | "llama.cpp.rope_frequency_base"
+            | "llama.cpp.rope_frequency_scale"
+            | "llama.cpp.unified_kv_cache"
+            | "llama.cpp.kv_cache_gpu_offload"
+            | "llama.cpp.context_checkpoints"
+            | "llama.cpp.cpu_moe_layers"
+            | "llama.cpp.cpu_moe_all"
+            | "llama.cpp.active_experts"
+            | "llama.cpp.chat_template"
+            | "llama.cpp.chat_template_file"
+            | "llama.cpp.chat_template_sha256"
+            | "llama.cpp.speculative_mode"
+            | "llama.cpp.speculative_draft_model"
+            | "llama.cpp.speculative_draft_sha256"
     )
 }
 
@@ -1539,8 +1906,7 @@ fn apply_llama_exact_help_contract(definitions: &mut [SettingDefinition], help: 
         if !llama_setting_has_execution_path(definition.id.as_str()) {
             definition.supported = false;
             definition.unsupported_reason = Some(
-                "the Norted llama.cpp integration has no proven generic reasoning-effort mechanism"
-                    .to_owned(),
+                "the Norted llama.cpp adapter has no executable path for this setting".to_owned(),
             );
             continue;
         }
@@ -1563,6 +1929,60 @@ fn apply_llama_exact_help_contract(definitions: &mut [SettingDefinition], help: 
             .map(|option| help_option_context(help, option))
             .unwrap_or_default();
         match definition.id.as_str() {
+            "system_prompt" => {}
+            "reasoning_effort" => {
+                let choices = ["minimal", "low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .filter(|choice| text_has_value(&contract, choice))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if choices.is_empty() {
+                    definition.supported = false;
+                    definition.unsupported_reason = Some(
+                        "the exact llama-server does not advertise any supported reasoning-effort levels"
+                            .to_owned(),
+                    );
+                } else {
+                    definition.kind = SettingKind::Choice { choices };
+                }
+            }
+            "llama.cpp.chat_template" => {
+                let block = help_option_block(help, "--chat-template");
+                let choices = advertised_values_with_prefixes(&block, &[])
+                    .into_iter()
+                    .filter(|value| !value.starts_with('-') && value != "env")
+                    .collect::<Vec<_>>();
+                if choices.is_empty() {
+                    definition.supported = false;
+                    definition.unsupported_reason = Some(
+                        "the exact llama-server does not advertise finite built-in chat-template choices"
+                            .to_owned(),
+                    );
+                } else {
+                    definition.kind = SettingKind::Choice { choices };
+                }
+            }
+            "llama.cpp.speculative_mode" => {
+                let block = help_option_block(help, "--spec-type");
+                let mut choices =
+                    advertised_values_with_prefixes(&block, &["none", "draft-", "ngram-"]);
+                for choice in &mut choices {
+                    if choice == "none" {
+                        *choice = "off".to_owned();
+                    }
+                }
+                choices.sort();
+                choices.dedup();
+                if choices.is_empty() {
+                    definition.supported = false;
+                    definition.unsupported_reason = Some(
+                        "the exact llama-server does not advertise speculative decoding modes"
+                            .to_owned(),
+                    );
+                } else {
+                    definition.kind = SettingKind::Choice { choices };
+                }
+            }
             "llama.cpp.flash_attention"
                 if !["auto", "on", "off"]
                     .into_iter()
@@ -1619,6 +2039,7 @@ fn apply_llama_exact_help_contract(definitions: &mut [SettingDefinition], help: 
 
 fn llama_configured_runtime_compatibility(
     settings: &norted_core::ResolvedSettings,
+    model: Option<&ModelArtifact>,
     exact_help: Option<&str>,
 ) -> RuntimeCompatibility {
     let configured = settings
@@ -1634,7 +2055,7 @@ fn llama_configured_runtime_compatibility(
         .find(|id| !llama_setting_has_execution_path(id.as_str()))
     {
         return RuntimeCompatibility::Incompatible(format!(
-            "llama.cpp setting `{id}` has no executable adapter path; reasoning_effort has no proven generic llama.cpp mechanism"
+            "llama.cpp setting `{id}` has no executable adapter path"
         ));
     }
     let Some(help) = exact_help else {
@@ -1643,7 +2064,7 @@ fn llama_configured_runtime_compatibility(
                 .to_owned(),
         );
     };
-    let mut definitions = llama_model_setting_definitions();
+    let mut definitions = llama_model_setting_definitions(model);
     apply_llama_exact_help_contract(&mut definitions, help);
     let schema = SettingsSchema {
         engine_id: ENGINE_ID.to_owned(),
@@ -1651,6 +2072,12 @@ fn llama_configured_runtime_compatibility(
         definitions,
     };
     match schema.validate(settings) {
+        Ok(()) if settings.value("llama.cpp.speculative_draft_model").is_some() => {
+            RuntimeCompatibility::NeedsAttention(
+                "draft tokenizer identity is checked by Norted; the exact llama-server launch remains authoritative for draft architecture/tensor compatibility"
+                    .to_owned(),
+            )
+        }
         Ok(()) => RuntimeCompatibility::Compatible,
         Err(error) => RuntimeCompatibility::Incompatible(error.to_string()),
     }
@@ -1753,14 +2180,201 @@ fn text_has_value(text: &str, expected: &str) -> bool {
     .any(|value| value == expected)
 }
 
+fn advertised_values_with_prefixes(text: &str, prefixes: &[&str]) -> Vec<String> {
+    if prefixes.is_empty()
+        && let Some((_, values)) = text.split_once("list of built-in templates:")
+    {
+        let values = values.split("(env:").next().unwrap_or(values);
+        return values
+            .split(',')
+            .map(str::trim)
+            .filter(|value| {
+                !value.is_empty()
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            })
+            .map(str::to_owned)
+            .collect();
+    }
+    text.split(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                ',' | '|' | '[' | ']' | '(' | ')' | '{' | '}' | '<' | '>' | ':' | ';' | '\'' | '"'
+            )
+    })
+    .map(|value| value.trim_matches('.'))
+    .filter(|value| {
+        prefixes
+            .iter()
+            .any(|prefix| *value == *prefix || value.starts_with(prefix))
+    })
+    .filter(|value| {
+        value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+    .map(str::to_owned)
+    .collect()
+}
+
 #[derive(Debug)]
 struct LlamaStructuredArguments {
     arguments: Vec<OsString>,
     environment_remove: Vec<OsString>,
 }
 
-fn translate_llama_settings(
+async fn validate_llama_bound_files(
     settings: &norted_core::ResolvedSettings,
+    model: &ModelArtifact,
+) -> Result<(), EngineError> {
+    if settings.value("llama.cpp.chat_template").is_some()
+        && settings.value("llama.cpp.chat_template_file").is_some()
+    {
+        return Err(EngineError::InvalidConfiguration(
+            "choose either a built-in llama.cpp chat template or a bound template file, not both"
+                .to_owned(),
+        ));
+    }
+    if settings.value("llama.cpp.cpu_moe_all").is_some()
+        && settings.value("llama.cpp.cpu_moe_layers").is_some()
+    {
+        return Err(EngineError::InvalidConfiguration(
+            "choose either all MoE weights on CPU or an exact CPU MoE layer count, not both"
+                .to_owned(),
+        ));
+    }
+    verify_bound_file(
+        settings,
+        "llama.cpp.chat_template_file",
+        "llama.cpp.chat_template_sha256",
+        4 * 1024 * 1024,
+    )
+    .await?;
+    if let Some(SettingValue::Path(path)) = settings.value("llama.cpp.chat_template_file") {
+        let bytes = tokio::fs::read(path).await.map_err(|error| {
+            EngineError::InvalidConfiguration(format!(
+                "could not read bound chat template {}: {error}",
+                path.display()
+            ))
+        })?;
+        if bytes.is_empty() || std::str::from_utf8(&bytes).is_err() {
+            return Err(EngineError::InvalidConfiguration(
+                "bound llama.cpp chat template must be non-empty UTF-8".to_owned(),
+            ));
+        }
+    }
+    verify_bound_file(
+        settings,
+        "llama.cpp.speculative_draft_model",
+        "llama.cpp.speculative_draft_sha256",
+        1024_u64 * 1024 * 1024 * 1024,
+    )
+    .await?;
+
+    let mode = match settings.value("llama.cpp.speculative_mode") {
+        Some(SettingValue::Choice(value)) => Some(value.as_str()),
+        _ => None,
+    };
+    let draft_path = match settings.value("llama.cpp.speculative_draft_model") {
+        Some(SettingValue::Path(path)) => Some(path),
+        _ => None,
+    };
+    if mode == Some("off") && draft_path.is_some() {
+        return Err(EngineError::InvalidConfiguration(
+            "speculative decoding is off but a draft model is configured".to_owned(),
+        ));
+    }
+    if mode.is_none() && draft_path.is_some() {
+        return Err(EngineError::InvalidConfiguration(
+            "a speculative draft model requires an explicit speculative mode".to_owned(),
+        ));
+    }
+    if mode.is_some_and(|mode| mode.starts_with("ngram-")) && draft_path.is_some() {
+        return Err(EngineError::InvalidConfiguration(
+            "n-gram speculative modes do not use a draft-model artifact".to_owned(),
+        ));
+    }
+    if mode.is_some_and(|mode| {
+        matches!(
+            mode,
+            "draft-simple" | "draft-eagle3" | "draft-dflash" | "draft-dspark"
+        )
+    }) && draft_path.is_none()
+    {
+        return Err(EngineError::InvalidConfiguration(format!(
+            "speculative mode `{}` requires a bound draft model",
+            mode.expect("checked")
+        )));
+    }
+    if let Some(path) = draft_path {
+        let draft = norted_core::inspect_gguf_metadata(path).map_err(|error| {
+            EngineError::InvalidConfiguration(format!(
+                "speculative draft model {} is not a valid bounded GGUF: {error}",
+                path.display()
+            ))
+        })?;
+        let target = match &model.native_identity {
+            Some(ArtifactNativeIdentity::Gguf(identity)) => identity,
+            _ => {
+                return Err(EngineError::InvalidConfiguration(
+                    "the target model lacks bounded GGUF tokenizer identity needed to prove draft compatibility"
+                        .to_owned(),
+                ));
+            }
+        };
+        match (
+            target.tokenizer_metadata_sha256.as_deref(),
+            draft.tokenizer_metadata_sha256.as_deref(),
+        ) {
+            (Some(target), Some(draft)) if target == draft => {}
+            _ => {
+                return Err(EngineError::InvalidConfiguration(
+                    "the draft and target GGUF files do not prove identical tokenizer metadata"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn verify_bound_file(
+    settings: &norted_core::ResolvedSettings,
+    path_setting: &str,
+    sha_setting: &str,
+    maximum_bytes: u64,
+) -> Result<(), EngineError> {
+    let Some(SettingValue::Path(path)) = settings.value(path_setting) else {
+        if settings.value(sha_setting).is_some() {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "`{sha_setting}` requires `{path_setting}`"
+            )));
+        }
+        return Ok(());
+    };
+    let Some(SettingValue::String(expected)) = settings.value(sha_setting) else {
+        return Err(EngineError::InvalidConfiguration(format!(
+            "`{path_setting}` requires recorded `{sha_setting}` identity"
+        )));
+    };
+    let id = SettingId::new(path_setting).expect("static setting ID");
+    let observed =
+        norted_core::bounded_setting_file_sha256(&id, path, Path::new("/"), maximum_bytes)
+            .await
+            .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
+    if !observed.eq_ignore_ascii_case(expected) {
+        return Err(EngineError::InvalidConfiguration(format!(
+            "bound file `{path_setting}` no longer matches recorded SHA-256 {expected}"
+        )));
+    }
+    Ok(())
+}
+
+fn translate_llama_settings_for_model(
+    settings: &norted_core::ResolvedSettings,
+    model: Option<&ModelArtifact>,
     native_arguments: &[String],
     configured_environment: &BTreeMap<String, String>,
 ) -> Result<LlamaStructuredArguments, EngineError> {
@@ -1802,6 +2416,50 @@ fn translate_llama_settings(
             ("min_p", SettingValue::Float(value)) => {
                 push_value_argument(&mut arguments, "--min-p", *value);
             }
+            ("seed", SettingValue::UnsignedIntegerOrChoice(value)) => {
+                let value = match value {
+                    UnsignedIntegerOrChoiceValue::UnsignedInteger(value) => value.to_string(),
+                    UnsignedIntegerOrChoiceValue::Choice(value) if value == "random" => {
+                        "-1".to_owned()
+                    }
+                    _ => {
+                        return Err(EngineError::InvalidConfiguration(
+                            "seed must be a 32-bit integer or `random`".to_owned(),
+                        ));
+                    }
+                };
+                push_value_argument(&mut arguments, "--seed", value);
+            }
+            ("repeat_penalty", SettingValue::Float(value)) => {
+                push_value_argument(&mut arguments, "--repeat-penalty", *value);
+            }
+            ("presence_penalty", SettingValue::Float(value)) => {
+                push_value_argument(&mut arguments, "--presence-penalty", *value);
+            }
+            ("max_output_tokens", SettingValue::UnsignedInteger(value)) => {
+                push_value_argument(&mut arguments, "--predict", *value);
+            }
+            ("stop_strings", SettingValue::StringList(values)) => {
+                for value in values {
+                    push_value_argument(&mut arguments, "--reverse-prompt", value);
+                }
+            }
+            ("reasoning", SettingValue::Choice(value)) => {
+                push_value_argument(&mut arguments, "--reasoning", value);
+            }
+            ("reasoning_effort", SettingValue::Choice(value)) => {
+                push_value_argument(&mut arguments, "--reasoning-effort", value);
+            }
+            ("reasoning_budget", SettingValue::Integer(value)) => {
+                push_value_argument(&mut arguments, "--reasoning-budget", *value);
+            }
+            ("reasoning_budget_message", SettingValue::String(value)) => {
+                push_value_argument(&mut arguments, "--reasoning-budget-message", value);
+            }
+            ("structured_output_schema", SettingValue::Json(value)) => {
+                push_value_argument(&mut arguments, "--json-schema", value.to_string());
+            }
+            ("system_prompt" | "context_overflow", _) => {}
             ("llama.cpp.threads", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--threads", *value);
             }
@@ -1833,6 +2491,79 @@ fn translate_llama_settings(
                 arguments.push(OsString::from("--load-mode"));
                 arguments.push(OsString::from(value));
             }
+            ("llama.cpp.rope_frequency_base", SettingValue::Float(value)) => {
+                push_value_argument(&mut arguments, "--rope-freq-base", *value);
+            }
+            ("llama.cpp.rope_frequency_scale", SettingValue::Float(value)) => {
+                push_value_argument(&mut arguments, "--rope-freq-scale", *value);
+            }
+            ("llama.cpp.unified_kv_cache", SettingValue::Toggle(value)) => {
+                arguments.push(OsString::from(if *value {
+                    "--kv-unified"
+                } else {
+                    "--no-kv-unified"
+                }));
+            }
+            ("llama.cpp.kv_cache_gpu_offload", SettingValue::Toggle(value)) => {
+                arguments.push(OsString::from(if *value {
+                    "--kv-offload"
+                } else {
+                    "--no-kv-offload"
+                }));
+            }
+            ("llama.cpp.context_checkpoints", SettingValue::UnsignedInteger(value)) => {
+                push_value_argument(&mut arguments, "--ctx-checkpoints", *value);
+            }
+            ("llama.cpp.cpu_moe_layers", SettingValue::UnsignedInteger(value)) => {
+                push_value_argument(&mut arguments, "--n-cpu-moe", *value);
+            }
+            ("llama.cpp.cpu_moe_all", SettingValue::FlagEnabled) => {
+                arguments.push(OsString::from("--cpu-moe"));
+            }
+            ("llama.cpp.active_experts", SettingValue::UnsignedInteger(value)) => {
+                let architecture = match model.and_then(|model| match &model.native_identity {
+                    Some(ArtifactNativeIdentity::Gguf(identity))
+                        if identity.expert_used_count.is_some() =>
+                    {
+                        Some(&identity.architecture)
+                    }
+                    _ => None,
+                }) {
+                    Some(architecture) => architecture,
+                    _ => {
+                        return Err(EngineError::InvalidConfiguration(
+                            "active-expert override lacks proven GGUF architecture metadata"
+                                .to_owned(),
+                        ));
+                    }
+                };
+                push_value_argument(
+                    &mut arguments,
+                    "--override-kv",
+                    format!("{architecture}.expert_used_count=int:{value}"),
+                );
+            }
+            ("llama.cpp.chat_template", SettingValue::Choice(value)) => {
+                push_value_argument(&mut arguments, "--chat-template", value);
+            }
+            ("llama.cpp.chat_template_file", SettingValue::Path(value)) => {
+                arguments.push(OsString::from("--jinja"));
+                arguments.push(OsString::from("--chat-template-file"));
+                arguments.push(value.as_os_str().to_owned());
+            }
+            ("llama.cpp.chat_template_sha256", SettingValue::String(_)) => {}
+            ("llama.cpp.speculative_mode", SettingValue::Choice(value)) => {
+                push_value_argument(
+                    &mut arguments,
+                    "--spec-type",
+                    if value == "off" { "none" } else { value },
+                );
+            }
+            ("llama.cpp.speculative_draft_model", SettingValue::Path(value)) => {
+                arguments.push(OsString::from("--spec-draft-model"));
+                arguments.push(value.as_os_str().to_owned());
+            }
+            ("llama.cpp.speculative_draft_sha256", SettingValue::String(_)) => {}
             _ => {
                 return Err(EngineError::InvalidConfiguration(format!(
                     "setting `{id}` has an invalid value for llama.cpp"
@@ -1846,6 +2577,15 @@ fn translate_llama_settings(
     })
 }
 
+#[cfg(test)]
+fn translate_llama_settings(
+    settings: &norted_core::ResolvedSettings,
+    native_arguments: &[String],
+    configured_environment: &BTreeMap<String, String>,
+) -> Result<LlamaStructuredArguments, EngineError> {
+    translate_llama_settings_for_model(settings, None, native_arguments, configured_environment)
+}
+
 fn llama_setting_collision_contract(
     id: &str,
 ) -> (&'static [&'static str], &'static [&'static str]) {
@@ -1856,6 +2596,33 @@ fn llama_setting_collision_contract(
         "top_p" => (&["--top-p"], &["LLAMA_ARG_TOP_P"]),
         "top_k" => (&["--top-k"], &["LLAMA_ARG_TOP_K"]),
         "min_p" => (&["--min-p"], &["LLAMA_ARG_MIN_P"]),
+        "seed" => (&["-s", "--seed"], &[]),
+        "repeat_penalty" => (&["--repeat-penalty"], &[]),
+        "presence_penalty" => (&["--presence-penalty"], &[]),
+        "max_output_tokens" => (
+            &["-n", "--predict", "--n-predict"],
+            &["LLAMA_ARG_N_PREDICT"],
+        ),
+        "stop_strings" => (&["-r", "--reverse-prompt"], &[]),
+        "system_prompt" | "context_overflow" => (&[], &[]),
+        "reasoning" => (&["-rea", "--reasoning"], &["LLAMA_ARG_REASONING"]),
+        "reasoning_effort" => (&["--reasoning-effort"], &["LLAMA_ARG_REASONING_EFFORT"]),
+        "reasoning_budget" => (&["--reasoning-budget"], &["LLAMA_ARG_THINK_BUDGET"]),
+        "reasoning_budget_message" => (
+            &["--reasoning-budget-message"],
+            &["LLAMA_ARG_THINK_BUDGET_MESSAGE"],
+        ),
+        "structured_output_schema" => (
+            &[
+                "-j",
+                "--json-schema",
+                "-jf",
+                "--json-schema-file",
+                "--grammar",
+                "--grammar-file",
+            ],
+            &[],
+        ),
         "llama.cpp.threads" => (&["-t", "--threads"], &["LLAMA_ARG_THREADS"]),
         "llama.cpp.batch_size" => (&["-b", "--batch-size"], &["LLAMA_ARG_BATCH"]),
         "llama.cpp.micro_batch_size" => (&["-ub", "--ubatch-size"], &["LLAMA_ARG_UBATCH"]),
@@ -1886,6 +2653,47 @@ fn llama_setting_collision_contract(
                 "LLAMA_ARG_DIO",
                 "LLAMA_ARG_NO_DIO",
             ],
+        ),
+        "llama.cpp.rope_frequency_base" => (&["--rope-freq-base"], &["LLAMA_ARG_ROPE_FREQ_BASE"]),
+        "llama.cpp.rope_frequency_scale" => {
+            (&["--rope-freq-scale"], &["LLAMA_ARG_ROPE_FREQ_SCALE"])
+        }
+        "llama.cpp.unified_kv_cache" => (
+            &["-kvu", "--kv-unified", "-no-kvu", "--no-kv-unified"],
+            &["LLAMA_ARG_KV_UNIFIED"],
+        ),
+        "llama.cpp.kv_cache_gpu_offload" => (
+            &["-kvo", "--kv-offload", "-nkvo", "--no-kv-offload"],
+            &["LLAMA_ARG_KV_OFFLOAD"],
+        ),
+        "llama.cpp.context_checkpoints" => (
+            &["-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"],
+            &["LLAMA_ARG_CTX_CHECKPOINTS"],
+        ),
+        "llama.cpp.cpu_moe_layers" => (&["-ncmoe", "--n-cpu-moe"], &["LLAMA_ARG_N_CPU_MOE"]),
+        "llama.cpp.cpu_moe_all" => (&["-cmoe", "--cpu-moe"], &["LLAMA_ARG_CPU_MOE"]),
+        "llama.cpp.active_experts" => (&["--override-kv"], &[]),
+        "llama.cpp.chat_template" => (
+            &["--chat-template", "--chat-template-file"],
+            &["LLAMA_ARG_CHAT_TEMPLATE", "LLAMA_ARG_CHAT_TEMPLATE_FILE"],
+        ),
+        "llama.cpp.chat_template_file" | "llama.cpp.chat_template_sha256" => (
+            &[
+                "--jinja",
+                "--no-jinja",
+                "--chat-template",
+                "--chat-template-file",
+            ],
+            &[
+                "LLAMA_ARG_JINJA",
+                "LLAMA_ARG_CHAT_TEMPLATE",
+                "LLAMA_ARG_CHAT_TEMPLATE_FILE",
+            ],
+        ),
+        "llama.cpp.speculative_mode" => (&["--spec-type"], &["LLAMA_ARG_SPEC_TYPE"]),
+        "llama.cpp.speculative_draft_model" | "llama.cpp.speculative_draft_sha256" => (
+            &["-md", "--model-draft", "--spec-draft-model"],
+            &["LLAMA_ARG_SPEC_DRAFT_MODEL"],
         ),
         _ => (&[], &[]),
     }
@@ -2345,6 +3153,7 @@ mod generation_settings_tests {
                 text: "hello".to_owned(),
             }],
             generation_settings,
+            output_format: None,
             max_output_tokens: Some(123),
             stream: false,
         }
@@ -2362,7 +3171,7 @@ mod generation_settings_tests {
             &request(GenerationSettingsPatch {
                 temperature: Some(0.25),
                 top_p: Some(0.8),
-                reasoning_effort: None,
+                ..Default::default()
             }),
             false,
         );
@@ -2380,7 +3189,7 @@ mod generation_settings_tests {
                     &GenerationSettingsPatch {
                         temperature: Some(2.0),
                         top_p: Some(0.0),
-                        reasoning_effort: None,
+                        ..Default::default()
                     },
                     &EffectiveGenerationSettings {
                         temperature: 0.8,
@@ -2392,23 +3201,19 @@ mod generation_settings_tests {
         for invalid in [
             GenerationSettingsPatch {
                 temperature: Some(-0.1),
-                top_p: None,
-                reasoning_effort: None,
+                ..Default::default()
             },
             GenerationSettingsPatch {
                 temperature: Some(2.1),
-                top_p: None,
-                reasoning_effort: None,
+                ..Default::default()
             },
             GenerationSettingsPatch {
-                temperature: None,
                 top_p: Some(1.1),
-                reasoning_effort: None,
+                ..Default::default()
             },
             GenerationSettingsPatch {
                 temperature: Some(f64::NAN),
-                top_p: None,
-                reasoning_effort: None,
+                ..Default::default()
             },
         ] {
             assert!(matches!(
@@ -2425,16 +3230,15 @@ mod generation_settings_tests {
         assert!(matches!(
             adapter.validate_generation_settings(
                 &GenerationSettingsPatch {
-                    temperature: None,
-                    top_p: None,
                     reasoning_effort: Some(norted_engine::ReasoningEffort::High),
+                    ..Default::default()
                 },
                 &EffectiveGenerationSettings {
                     temperature: 0.8,
                     top_p: 0.95,
                 },
             ),
-            Err(EngineError::InvalidGenerationSettings(_))
+            Ok(())
         ));
     }
 }
@@ -2578,18 +3382,22 @@ mod settings_tests {
     }
 
     #[test]
-    fn exact_generation_controls_are_help_gated_and_reasoning_is_unsupported() {
+    fn exact_generation_and_reasoning_controls_are_help_gated() {
         let configured = resolved(&[("temperature", SettingValue::Float(0.7))]);
         assert!(matches!(
-            llama_configured_runtime_compatibility(&configured, None),
+            llama_configured_runtime_compatibility(&configured, None, None),
             RuntimeCompatibility::NeedsAttention(_)
         ));
         assert!(matches!(
-            llama_configured_runtime_compatibility(&configured, Some("  --temp N  temperature")),
+            llama_configured_runtime_compatibility(
+                &configured,
+                None,
+                Some("  --temp N  temperature")
+            ),
             RuntimeCompatibility::Compatible
         ));
         assert!(matches!(
-            llama_configured_runtime_compatibility(&configured, Some("  --top-p N  top p")),
+            llama_configured_runtime_compatibility(&configured, None, Some("  --top-p N  top p")),
             RuntimeCompatibility::Incompatible(_)
         ));
 
@@ -2602,10 +3410,10 @@ mod settings_tests {
         let generation_help =
             "  --temp N  temperature\n  --top-p N  top p\n  --top-k N  top k\n  --min-p N  min p";
         assert!(matches!(
-            llama_configured_runtime_compatibility(&all_generation, Some(generation_help)),
+            llama_configured_runtime_compatibility(&all_generation, None, Some(generation_help)),
             RuntimeCompatibility::Compatible
         ));
-        let mut definitions = llama_model_setting_definitions();
+        let mut definitions = llama_model_setting_definitions(None);
         apply_llama_exact_help_contract(&mut definitions, "  --temp N  temperature");
         for id in ["top_p", "top_k", "min_p"] {
             assert!(
@@ -2618,8 +3426,8 @@ mod settings_tests {
             );
         }
 
-        let reasoning = llama_model_setting_definitions()
-            .into_iter()
+        let reasoning = definitions
+            .iter()
             .find(|definition| definition.id.as_str() == "reasoning_effort")
             .expect("reasoning definition");
         assert!(!reasoning.supported);
@@ -2627,13 +3435,13 @@ mod settings_tests {
             reasoning
                 .unsupported_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("no proven generic reasoning-effort"))
+                .is_some_and(|reason| reason.contains("does not advertise"))
         );
     }
 
     #[test]
     fn every_supported_exact_schema_definition_has_an_execution_path() {
-        for definition in llama_model_setting_definitions() {
+        for definition in llama_model_setting_definitions(None) {
             if definition.supported {
                 assert!(
                     llama_setting_has_execution_path(definition.id.as_str()),
@@ -2641,7 +3449,8 @@ mod settings_tests {
                     definition.id
                 );
                 assert!(
-                    !llama_setting_contract(definition.id.as_str()).is_empty(),
+                    definition.id.as_str() == "system_prompt"
+                        || !llama_setting_contract(definition.id.as_str()).is_empty(),
                     "supported llama.cpp setting {} has no exact-runtime contract",
                     definition.id
                 );

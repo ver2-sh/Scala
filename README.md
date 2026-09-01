@@ -75,6 +75,16 @@ Common and engine-specific settings share `SettingId`, `SettingValue`, `SettingD
 General, Load, Generation, Reasoning, Prompt, KV / Memory, Speculation, Cache, and Advanced. An
 engine or Model Profile editor shows common controls plus only that engine's namespace.
 
+llama.cpp exposes load/runtime controls for context and slots; CPU threads and logical/physical
+batches; weight and KV offload; unified KV, checkpointing, Flash Attention, and K/V cache types;
+RoPE frequency base/scale; current `load_mode`; MoE CPU placement; architecture-aware active
+expert override; reasoning mode/effort/budget/message; built-in or bound-file chat templates; and
+exact-runtime-advertised speculative modes with an optional bound GGUF draft. `load_mode` is the
+only first-class model-loading policy: `mmap`, `mlock`, `mmap+mlock`, and `dio` choices cover the
+old “Try mmap” and “Keep Model in Memory” behavior without reviving deprecated standalone flags.
+Generation/profile defaults include seed/random, response limit, stop strings, repeat/presence
+penalties, system prompt, and an optional JSON Schema.
+
 q27 exposes ordinary settings for context/slots, generation samplers, thinking and budget,
 fast-head, KV mode, MTP depth/probability, suffix drafting and compiled-width behavior, external
 template path/hash and delivery, generation-prompt rendering, template thinking, the generic
@@ -92,8 +102,12 @@ remain authoritative.
 Structured path values have stable semantics. Absolute paths are used directly. Relative paths
 resolve lexically beneath Norted's `<data>` directory and cannot escape it with `..`. Resolution
 happens before inspection, validation, adapter translation, and provenance.
-Saving `q27.template_path` through the CLI or TUI automatically records the bounded file's
-`q27.template_sha256`; every load rereads the file and rejects a content mismatch.
+Saving `q27.template_path`, `llama.cpp.chat_template_file`, or
+`llama.cpp.speculative_draft_model` through the CLI or TUI automatically records its SHA-256;
+every load rereads the bound file and rejects a content mismatch. Draft GGUFs must additionally
+prove identical bounded tokenizer metadata with the target; the exact llama-server load remains
+authoritative for draft architecture/tensor compatibility and is reported as needs-attention until
+that definitive load succeeds.
 
 All commands honor global `--json`. The scriptable management surface includes:
 
@@ -411,7 +425,11 @@ All adapters keep native configuration engine-namespaced while rejecting flags o
 
 ## Model artifacts and native identity
 
-Discovery recognizes `.gguf`, `.q27`, and `.ninfer` primary artifacts. Q27 admission reads only its fixed 16-byte `Q27F` v1 header and a metadata JSON blob capped at 1 MiB; it never maps or hashes the tensor payload. The current q27 runtime family requires the metadata-declared `qwen35` 65-block/MTP architecture and the upstream shape constants. Published Qwen3.6 tiers are proven from the exact `quant_policy`/`q4_head`/`q8_extra` tuple: default/q4s/q5f require 24 GiB-class, q6/q6f/q6k require 32 GiB-class, and q8 requires 48 GiB-class. Qwen3.8's distinct v2 tuples map q4s/default/q6 to 24 GiB-class and q6k to 32 GiB-class. A valid architecture with an unknown recipe remains explicit needs-attention rather than being guessed from its filename.
+Discovery recognizes `.gguf`, `.q27`, and `.ninfer` primary artifacts. GGUF discovery reads a
+bounded metadata header, not tensor payloads, and records `general.architecture`, model context,
+expert/expert-used counts, and a tokenizer-metadata digest when present. This is what permits
+architecture-specific expert override and conservative draft-tokenizer proof without filename or
+model-family guesses. Q27 admission reads only its fixed 16-byte `Q27F` v1 header and a metadata JSON blob capped at 1 MiB; it never maps or hashes the tensor payload. The current q27 runtime family requires the metadata-declared `qwen35` 65-block/MTP architecture and the upstream shape constants. Published Qwen3.6 tiers are proven from the exact `quant_policy`/`q4_head`/`q8_extra` tuple: default/q4s/q5f require 24 GiB-class, q6/q6f/q6k require 32 GiB-class, and q8 requires 48 GiB-class. Qwen3.8's distinct v2 tuples map q4s/default/q6 to 24 GiB-class and q6k to 32 GiB-class. A valid architecture with an unknown recipe remains explicit needs-attention rather than being guessed from its filename.
 
 Q27 serving also requires one unambiguous `.tok` companion. An exact same-stem tokenizer is preferred; otherwise discovery may associate a unique boundary-safe prefix match for quantized filenames. The tokenizer must have the current `Q27T` magic/version header. It is recorded as an auxiliary artifact, never listed as an independent model, and does not change the stable primary model ID. During load the adapter canonicalizes and hashes the declared tokenizer into a prepared engine-neutral input. q27-server receives that exact path, and size/SHA-256 are revalidated immediately before launch; the adapter no longer performs a second companion search.
 
@@ -477,11 +495,32 @@ Bearer authentication does not encrypt transport. Loopback needs no network tran
 
 Each backend and the separately authenticated private control listener use OS-assigned loopback ports. Public API keys cannot authorize control operations, and clients are never redirected to or given the private upstream server.
 
-The Responses text subset accepts `model`; string or text-message `input`; `developer`, `system`, `user`, and `assistant` roles; optional `instructions`; `max_output_tokens`; `temperature`; `top_p`; and `stream`. Identity values such as `store=false`, `background=false`, `tools=[]`, `tool_choice="none"`, plain-text format, `truncation="disabled"`, empty metadata, and null optional fields are accepted where they request no extra behavior. Stateful Responses, storage, non-empty tools, reasoning controls, automatic truncation, structured output, and non-text content are rejected explicitly.
+The Responses text subset accepts `model`; string or text-message `input`; `developer`, `system`, `user`, and `assistant` roles; optional `instructions`; `max_output_tokens`; `temperature`; `top_p`; reasoning effort; `text.format` plain text, JSON object, or JSON Schema; and `stream`. JSON Schema name, description, schema, and strictness are retained when translated to a compatible backend. Identity values such as `store=false`, `background=false`, `tools=[]`, `tool_choice="none"`, `truncation="disabled"`, empty metadata, and null optional fields are accepted where they request no extra behavior. Stateful Responses, storage, non-empty tools, automatic OpenAI truncation, and non-text content are rejected explicitly.
 
-Chat Completions accepts the same canonical text messages and generation controls, plus `max_completion_tokens` and its deprecated `max_tokens` alias. Equal aliases are accepted and conflicting aliases fail. Compatibility identity values include `n=1`, `store=false`, `tools=[]`, `tool_choice="none"`, text-only modality, `stream_options.include_usage`, and explicit `include_obfuscation=false`; requests for multiple choices, tools, logprobs, audio, vision, stored completions, structured output, penalties, stop-sequence behavior, or stream obfuscation are rejected. Stream options require `stream=true`. Both public parsers produce the same engine-neutral `InferenceRequest`; neither endpoint proxies upstream JSON.
+Chat Completions accepts the same canonical text messages and generation controls, plus non-null
+32-bit `seed`, string-or-array `stop`, presence penalty in `-2..=2`, reasoning effort,
+`response_format` text/JSON object/JSON Schema, and `max_completion_tokens` with its deprecated
+`max_tokens` alias. Equal token-limit aliases are accepted and conflicting aliases fail.
+Compatibility identity values include `n=1`, `store=false`, `tools=[]`, `tool_choice="none"`,
+text-only modality, `stream_options.include_usage`, and explicit `include_obfuscation=false`;
+requests for multiple choices, tools, logprobs, audio, vision, stored completions, frequency
+penalties, or stream obfuscation are rejected. Stream options require `stream=true`. Both public
+parsers produce the same engine-neutral `InferenceRequest`; neither endpoint proxies upstream JSON.
 
-Request-time `temperature`, `top_p`, and output-token limits are generation settings, not persistent mutations. They never modify profiles, runtime selection, or launch provenance. For llama.cpp, configured `temperature`, `top_p`, `top_k`, and `min_p` become process defaults only when the exact `llama-server --help` contract advertises the corresponding controls; omission preserves upstream behavior, and explicit request `temperature`/`top_p` fields override those defaults. q27 retains Norted's existing omitted defaults of `temperature=0` and `top_p=1`; because q27 is greedy at temperature zero, an explicit `top_p < 1` requires a positive effective temperature. NInfer likewise sends only explicit request sampler fields. Its effective omitted defaults come from the exact schema-18 `server_start` record written by the launched runtime, including thinking mode and server overrides; Norted validates artifact identity, public alias, GPU identity, compute capability, and non-greedy state before readiness. The private restrictive JSONL path is Norted-owned and unlinked after startup observation so later prompts/outputs do not persist as request history. Responses stream options likewise require `stream=true` and accept explicit `include_obfuscation=false`; Norted does not implement OpenAI stream padding/obfuscation. Responses usage remains omitted unless its required shape is known truthfully; Chat emits basic prompt/completion/total counts when the backend reports them.
+Request-time sampler, stop, reasoning, structured-output, and output-limit values are ephemeral and
+never mutate profiles, runtime selection, or launch provenance. Explicit request fields override
+configured defaults only where the active exact engine/runtime schema proves support. For
+llama.cpp, configured samplers and generation defaults become process defaults through advertised
+flags; request values are sent to its private Chat API. Unsupported runtimes receive a clear 400
+rather than an unknown flag or silently ignored request field. q27 and NInfer remain truthful about
+their narrower request contracts.
+
+`context_overflow=truncate_middle` is Norted request management, not llama.cpp context shift. It
+requires a finite request/profile output allowance, reads the exact effective slot context from the
+selected backend, counts the fully rendered chat with that model's tokenizer, preserves every
+system/developer instruction and the newest conversational tail, and removes older middle messages
+until prompt plus generation allowance fits. If either exact capacity/tokenization is unavailable,
+or required content alone cannot fit, the request fails instead of estimating characters.
 
 Every public success, error, and stream carries a fresh opaque `x-request-id`. A valid ASCII `X-Client-Request-Id` of at most 512 characters is retained only as correlation metadata and never replaces the server ID. Public inference JSON is bounded to 32 MiB; oversized bodies receive a clean 413. Errors use one sanitized OpenAI-style envelope and never expose local paths, private endpoints, control tokens, key digests, or Rust debug output.
 

@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use norted_engine::{
     EffectiveGenerationSettings, InferenceEvent, InferenceFinishReason, InferenceMessage,
-    InferenceRole, InferenceStream, InferenceUsage,
+    InferenceRole, InferenceStream, InferenceUsage, OutputFormat,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -68,6 +68,8 @@ pub(super) async fn create(
     let inference = parsed.normalized.inference_request()?;
     let public_model = parsed.normalized.model.clone();
     let max_output_tokens = parsed.normalized.max_output_tokens;
+    let output_format = parsed.normalized.output_format.clone();
+    let reasoning_effort = parsed.normalized.generation_settings.reasoning_effort;
     if parsed.normalized.stream {
         let routed = state
             .runtime
@@ -82,6 +84,8 @@ pub(super) async fn create(
                 model: public_model,
                 instructions: parsed.instructions,
                 max_output_tokens,
+                output_format,
+                reasoning_effort,
                 effective_generation_settings: routed.effective_generation_settings,
             },
             routed.stream,
@@ -104,6 +108,8 @@ pub(super) async fn create(
             model: public_model,
             instructions: parsed.instructions,
             max_output_tokens,
+            output_format,
+            reasoning_effort,
             effective_generation_settings: routed.effective_generation_settings,
         };
         Ok(Json(response_document(
@@ -134,6 +140,7 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
     let max_output_tokens = optional_positive_u32(object, "max_output_tokens")?;
     let mut generation_settings = generation_settings(object)?;
     generation_settings.reasoning_effort = responses_reasoning_effort(object.get("reasoning"))?;
+    let output_format = parse_text_format(object.get("text"))?;
     let input = object.get("input").ok_or_else(|| {
         OpenAiError::invalid(
             "Missing required field: input",
@@ -179,6 +186,7 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
             messages,
             max_output_tokens,
             generation_settings,
+            output_format,
             stream,
         },
         instructions,
@@ -282,7 +290,6 @@ fn validate_identity_fields(
     for field in ["safety_identifier", "user"] {
         require_null_or(object, field, Value::is_string, "a string")?;
     }
-    validate_text_format(object.get("text"))?;
     validate_stream_options(object.get("stream_options"), stream)
 }
 
@@ -303,16 +310,16 @@ fn responses_reasoning_effort(
     optional_reasoning_effort(reasoning.get("effort"), "reasoning.effort")
 }
 
-fn validate_text_format(value: Option<&Value>) -> Result<(), OpenAiError> {
+fn parse_text_format(value: Option<&Value>) -> Result<Option<OutputFormat>, OpenAiError> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(());
+        return Ok(None);
     };
     let text = value.as_object().ok_or_else(|| {
         OpenAiError::invalid("`text` must be an object.", Some("text"), "invalid_type")
     })?;
     reject_unknown_fields(text, &["format"], "Responses text")?;
     let Some(format) = text.get("format").filter(|format| !format.is_null()) else {
-        return Ok(());
+        return Ok(None);
     };
     let format = format.as_object().ok_or_else(|| {
         OpenAiError::invalid(
@@ -321,14 +328,64 @@ fn validate_text_format(value: Option<&Value>) -> Result<(), OpenAiError> {
             "invalid_type",
         )
     })?;
-    reject_unknown_fields(format, &["type"], "Responses text format")?;
-    if format.get("type").and_then(Value::as_str) != Some("text") {
-        return Err(OpenAiError::unsupported(
-            "Only plain text output format is supported.",
+    match format.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            reject_unknown_fields(format, &["type"], "Responses text format")?;
+            Ok(None)
+        }
+        Some("json_object") => {
+            reject_unknown_fields(format, &["type"], "Responses text format")?;
+            Ok(Some(OutputFormat::JsonObject))
+        }
+        Some("json_schema") => {
+            reject_unknown_fields(
+                format,
+                &["type", "name", "description", "schema", "strict"],
+                "Responses JSON Schema format",
+            )?;
+            let name = optional_string(format, "name")?;
+            if name.as_ref().is_some_and(|name| name.trim().is_empty()) {
+                return Err(OpenAiError::invalid(
+                    "`text.format.name` must not be empty.",
+                    Some("text.format.name"),
+                    "invalid_value",
+                ));
+            }
+            let description = optional_string(format, "description")?;
+            let schema = format
+                .get("schema")
+                .filter(|value| value.is_object())
+                .cloned()
+                .ok_or_else(|| {
+                    OpenAiError::invalid(
+                        "`text.format.schema` must be a JSON object.",
+                        Some("text.format.schema"),
+                        "invalid_type",
+                    )
+                })?;
+            let strict = match format.get("strict") {
+                None | Some(Value::Null) => None,
+                Some(Value::Bool(value)) => Some(*value),
+                Some(_) => {
+                    return Err(OpenAiError::invalid(
+                        "`text.format.strict` must be a boolean.",
+                        Some("text.format.strict"),
+                        "invalid_type",
+                    ));
+                }
+            };
+            Ok(Some(OutputFormat::JsonSchema {
+                name,
+                description,
+                schema,
+                strict,
+            }))
+        }
+        _ => Err(OpenAiError::unsupported(
+            "`text.format.type` must be `text`, `json_object`, or `json_schema`.",
             "text.format.type",
-        ));
+        )),
     }
-    Ok(())
 }
 
 fn validate_stream_options(value: Option<&Value>, stream: bool) -> Result<(), OpenAiError> {
@@ -370,6 +427,8 @@ struct ResponseContext {
     model: String,
     instructions: Option<String>,
     max_output_tokens: Option<u32>,
+    output_format: Option<OutputFormat>,
+    reasoning_effort: Option<norted_engine::ReasoningEffort>,
     effective_generation_settings: EffectiveGenerationSettings,
 }
 
@@ -453,9 +512,9 @@ fn response_document(
         "background": false,
         "max_output_tokens": context.max_output_tokens,
         "previous_response_id": Value::Null,
-        "reasoning": Value::Null,
+        "reasoning": context.reasoning_effort.map(|effort| json!({ "effort": effort.as_str() })),
         "store": false,
-        "text": { "format": { "type": "text" } },
+        "text": { "format": responses_output_format(context.output_format.as_ref()) },
         "truncation": "disabled",
     });
     if let Some(usage) = usage.and_then(usage_document) {
@@ -465,6 +524,32 @@ fn response_document(
             .insert("usage".to_owned(), usage);
     }
     document
+}
+
+fn responses_output_format(format: Option<&OutputFormat>) -> Value {
+    match format {
+        None => json!({ "type": "text" }),
+        Some(OutputFormat::JsonObject) => json!({ "type": "json_object" }),
+        Some(OutputFormat::JsonSchema {
+            name,
+            description,
+            schema,
+            strict,
+        }) => {
+            let mut value = json!({ "type": "json_schema", "schema": schema });
+            let object = value.as_object_mut().expect("static object");
+            if let Some(name) = name {
+                object.insert("name".to_owned(), json!(name));
+            }
+            if let Some(description) = description {
+                object.insert("description".to_owned(), json!(description));
+            }
+            if let Some(strict) = strict {
+                object.insert("strict".to_owned(), json!(strict));
+            }
+            value
+        }
+    }
 }
 
 fn message_item(context: &ResponseContext, status: OutputMessageStatus, text: &str) -> Value {
@@ -941,6 +1026,8 @@ mod tests {
             model: "model".to_owned(),
             instructions: None,
             max_output_tokens: None,
+            output_format: None,
+            reasoning_effort: None,
             effective_generation_settings: EffectiveGenerationSettings {
                 temperature: 0.7,
                 top_p: 0.95,

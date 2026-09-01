@@ -91,7 +91,8 @@ schema for common plus their own namespace, gate it first with facts proved by t
 then gate it with the exact runtime contract before validating effective settings. Capability
 requirements are consequences of selected settings. q27 retains exact source fingerprints and
 bounded context/KV/W_MAX startup proof; NInfer retains native-container and schema-18 startup proof;
-llama.cpp uses exact help evidence.
+llama.cpp uses exact help evidence for every structured launch control and keeps Norted-owned
+system-prompt/context management separate from native launch flags.
 
 `RuntimeProvenance.model_profile` records the ID, display name, deterministic content hash, bound
 artifact ID, and engine ID. Artifact lineage and hashes remain separately recorded. Settings
@@ -238,6 +239,14 @@ Git and build children use `kill_on_drop`, stream bounded failure tails, and run
 
 `ModelArtifact` retains the primary artifact and stable ID, engine-neutral `AuxiliaryArtifact` values with roles, and an optional typed `ArtifactNativeIdentity`. Q27 discovery prefers `model.q27` + `model.tok`; for quantized names it may use the unique longest boundary-safe prefix tokenizer. Candidates must be beside the model and contain `Q27T` magic with supported header version 1. `.tok` is never a primary model. Missing, invalid, or ambiguous companions are expressed by q27's model compatibility result and prevent launch.
 
+GGUF inspection reads a bounded version-2/3 metadata header and never maps tensor payloads. Its
+typed identity retains architecture, context length, expert/expert-used counts, and a digest of the
+exact encoded `tokenizer.ggml.*` metadata. The architecture supplies the only legal
+`<architecture>.expert_used_count` override key; absence of the exact metadata makes the active
+expert setting model-unsupported. Draft GGUF admission requires matching tokenizer metadata and a
+recorded whole-file SHA-256, while exact llama-server startup remains the definitive draft
+architecture/tensor check.
+
 Q27 model inspection reads a fixed 16-byte `Q27F` v1 header, rejects metadata lengths above 1 MiB before allocation, reads only that JSON blob, and never maps/hashes tensor payloads. The q27 adapter validates the current `qwen35` 65-block/MTP architecture constants. Exact published tiers come from `quant_policy` plus the presence/value of `q4_head` and `q8_extra`, never the filename. Qwen3.6 default/q4s/q5f map to 24 GiB-class, q6/q6f/q6k to 32 GiB-class, and q8 to 48 GiB-class; Qwen3.8 v2 q4s/default/q6 map to 24 GiB-class and q6k to 32 GiB-class. Unknown recipe tuples remain NeedsAttention.
 
 NInfer version-2 containers begin with `NINFER\0\x02` and a little-endian 64-bit JSON directory length at byte 8. Discovery caps the directory at 16 MiB, proves it lies within the file, validates the closed identity/object descriptor shapes and ordered non-overlapping object ranges, and reads no later weight bytes. Version 1 is not migrated or rewritten. The resulting typed NInfer identity contains `container_version`, `model_id`, and `weights_id`; it is carried through prepared input, compatibility, private model information, and launch provenance without being placed in `architecture` or exposed by public `/v1/models`.
@@ -257,7 +266,20 @@ llama-server --model <canonical-gguf> --alias <stable-id>
              --host 127.0.0.1 --port <dynamic> [allowed native arguments]
 ```
 
-The adapter polls `/health`, then obtains authoritative effective `temperature` and `top_p` from `/props` before Running. Configured `temperature`, `top_p`, `top_k`, and `min_p` are emitted only through exact help-advertised process-default controls; omission preserves upstream behavior, while request-time `temperature` and `top_p` are explicit request fields that override those defaults. It maps internal `/v1/chat/completions` responses/SSE to normalized inference output/events.
+The adapter polls `/health`, then obtains authoritative effective `temperature` and `top_p` from
+`/props` before Running. Exact-help-gated launch controls cover context/parallelism, samplers,
+threads/batches, weight and KV offload, unified KV, context checkpoints, Flash Attention, cache
+types, RoPE base/scale, `load_mode`, CPU MoE placement, architecture-aware active experts,
+reasoning, chat template, JSON Schema defaults, and speculative mode/draft artifact. Every setting
+owns its current aliases and environment variables for collision removal/rejection. Omission emits
+nothing. `load_mode` intentionally replaces deprecated mmap/mlock/direct-I/O controls.
+
+Private Chat requests carry explicit seed, stop, repeat/presence penalty, reasoning effort, token
+limit, and OpenAI-compatible response format only after the active exact schema proves the
+corresponding mechanism. JSON Schema wrappers retain schema/name/description/strict fields and use
+llama.cpp grammar-backed sampling in both normal and streaming paths. `/props` supplies exact slot
+capacity and `/v1/chat/completions/input_tokens` supplies exact fully templated token counts for the
+engine-neutral truncate-middle policy; failure of either endpoint fails the request truthfully.
 
 ### q27
 
@@ -316,7 +338,15 @@ Private backend status carries Model Profile ID, underlying artifact Model ID, e
 
 ## Public protocol
 
-Responses remains canonical and Chat Completions is compatibility-only. Both public parsers normalize `developer`, `system`, `user`, and `assistant` text into the same engine-neutral `InferenceMessage` list and attach a typed `GenerationSettingsPatch`. Chat `reasoning_effort` and Responses `reasoning.effort` share the same typed low/medium/high value. `RuntimeManager` validates request values against the active adapter/runtime and merges supported request generation fields over configured defaults without mutating runtime selection or immutable launch provenance. The public serving alias and `/v1/models` identity are the active/user-created Model Profile ID, while the artifact Model ID remains private provenance.
+Responses remains canonical and Chat Completions is compatibility-only. Both public parsers
+normalize `developer`, `system`, `user`, and `assistant` text into the same engine-neutral
+`InferenceMessage` list and attach typed sampler/seed/stop/reasoning settings plus an optional
+structured output contract. Chat `reasoning_effort` and Responses `reasoning.effort` share the same
+typed effort levels. `RuntimeManager` applies configured system prompt, output limit, and JSON
+Schema defaults only when their request counterparts are omitted, validates request values against
+the active exact schema, and never mutates runtime selection or immutable launch provenance. The
+public serving alias and `/v1/models` identity are the active/user-created Model Profile ID, while
+the artifact Model ID remains private provenance.
 
 `POST /v1/responses` accepts the documented text subset and constructs the current non-streaming document or ordered Responses SSE sequence itself. `POST /v1/chat/completions` constructs current text ChatCompletion objects/chunks from the same normalized inference output. Each adapter owns only its private upstream JSON/SSE: llama.cpp omits absent sampler fields and q27 materializes its established 0/1 defaults while accepting `top_p < 1` only with a positive effective temperature. Output-limit completion maps to incomplete/length state, basic Chat usage is emitted when known, and richer Responses usage is emitted only when every required detail is known. Stream options are valid only on streams; explicit disabled obfuscation is compatible, but Norted does not emit OpenAI stream padding. Unsupported input or top-level behavior is rejected rather than forwarded or silently ignored.
 
@@ -324,7 +354,11 @@ Public middleware assigns an independent `req_...` ID and returns it as `x-reque
 
 `GET /v1/models` remains the audited OpenAI-style list with exactly `id`, `object`, `created`, and `owned_by`. Runtime metadata and NInfer model/weights identities remain private control-plane state rather than leaking into this public compatibility surface; local `models info` may show the typed identity.
 
-The richer `ModelServingCapabilities` view is local/private: it derives format, compatible registered engines, compatible installed runtimes, resolved runtime, active state, and gateway features from real compatibility and selection data. Tools, vision, and structured output are false for this milestone. `norted-server models info <MODEL_ID>` exposes the view without expanding the public Model object.
+The richer `ModelServingCapabilities` view is local/private: it derives format, compatible
+registered engines, compatible installed runtimes, resolved runtime, active state, and gateway
+features from real compatibility and selection data. Structured output becomes true only when the
+selected exact runtime schema advertises the JSON-Schema mechanism; tools and vision remain false.
+`norted-server models info <MODEL_ID>` exposes the view without expanding the public Model object.
 
 ## Public API-key state and transport
 

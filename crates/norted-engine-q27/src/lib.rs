@@ -2046,6 +2046,16 @@ impl EngineAdapter for Q27Adapter {
         settings: &GenerationSettingsPatch,
         backend_defaults: &EffectiveGenerationSettings,
     ) -> Result<(), EngineError> {
+        if settings.seed.is_some()
+            || settings.repeat_penalty.is_some()
+            || settings.presence_penalty.is_some()
+            || settings.stop.is_some()
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 does not prove seed, repetition/presence penalties, or stop-string request controls"
+                    .to_owned(),
+            ));
+        }
         if let Some(temperature) = settings.temperature
             && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
         {
@@ -4779,8 +4789,9 @@ mod tests {
                 generation_settings: GenerationSettingsPatch {
                     temperature: Some(0.4),
                     top_p: Some(0.7),
-                    reasoning_effort: None,
+                    ..Default::default()
                 },
+                output_format: None,
                 max_output_tokens: None,
                 stream: false,
             },
