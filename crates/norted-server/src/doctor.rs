@@ -1576,14 +1576,53 @@ fn directory_write_access(path: &Path) -> Result<(), String> {
 
 #[cfg(not(unix))]
 fn directory_write_access(path: &Path) -> Result<(), String> {
-    let permissions = fs::metadata(path)
-        .map_err(|error| error.to_string())?
-        .permissions();
-    if permissions.readonly() {
-        Err("directory is marked read-only".to_owned())
-    } else {
-        Ok(())
+    directory_write_probe(path)
+}
+
+#[cfg(any(not(unix), test))]
+fn directory_write_probe(path: &Path) -> Result<(), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_PROBE_ID: AtomicU64 = AtomicU64::new(0);
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    for _ in 0..16 {
+        let probe_id = NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed);
+        let probe_path = path.join(format!(
+            ".norted-doctor-write-probe-{}-{timestamp}-{probe_id}",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+        {
+            Ok(probe) => {
+                drop(probe);
+                return fs::remove_file(&probe_path).map_err(|error| {
+                    format!(
+                        "Doctor created temporary write probe {} but could not remove it: {error}",
+                        probe_path.display()
+                    )
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "could not create a temporary write probe in {}: {error}",
+                    path.display()
+                ));
+            }
+        }
     }
+    Err(format!(
+        "could not create a uniquely named temporary write probe in {} after 16 attempts",
+        path.display()
+    ))
 }
 
 fn pass(
@@ -1690,5 +1729,59 @@ mod tests {
         assert_eq!(report.status, DoctorStatus::Warning);
         assert_eq!(report.summary.problems, 1);
         assert!(!report.has_failures());
+    }
+
+    #[test]
+    fn remediation_commands_have_real_newline_boundaries() {
+        let single_command = AUTH_KEY_REMEDIATION;
+        let multiple_commands = format!(
+            "Run:\n  norted-server runtimes list\n  norted-server runtimes clear-selection --model {}",
+            "example"
+        );
+
+        assert_eq!(
+            single_command.lines().collect::<Vec<_>>(),
+            ["Run:", "  norted-server auth keys create --name <LABEL>"]
+        );
+        assert_eq!(
+            multiple_commands.lines().collect::<Vec<_>>(),
+            [
+                "Run:",
+                "  norted-server runtimes list",
+                "  norted-server runtimes clear-selection --model example"
+            ]
+        );
+    }
+
+    #[test]
+    fn remediation_newlines_serialize_as_json_escapes() {
+        let finding = finding(
+            "remediation.newlines",
+            "test",
+            DoctorStatus::Warning,
+            "attention",
+            None,
+            &[AUTH_KEY_REMEDIATION],
+        );
+
+        let json = serde_json::to_string(&finding).expect("serialize finding");
+        assert!(json.contains(
+            r#""remediation":["Run:\n  norted-server auth keys create --name <LABEL>"]"#
+        ));
+        assert!(!json.contains("Run:norted-server"));
+    }
+
+    #[test]
+    fn successful_directory_write_probe_leaves_no_file() {
+        let temporary = TempDir::new().expect("temporary directory");
+
+        directory_write_probe(temporary.path()).expect("directory should be writable");
+
+        assert_eq!(
+            fs::read_dir(temporary.path())
+                .expect("read temporary directory")
+                .count(),
+            0
+        );
     }
 }
