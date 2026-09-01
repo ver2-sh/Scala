@@ -10,10 +10,11 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use norted_core::{
     AppPaths, ArtifactFormat, ModelArtifact, ModelArtifactProvenance, ModelId, ModelLibraryReceipt,
-    ModelLibraryReceiptMember, ModelRegistry, NortedPackageAcquisitionPlan, inspect_gguf_metadata,
-    inspect_ninfer_container, model_library_receipt_path, norted_package_manifest_name,
-    plan_norted_package_acquisition, q27_tokenizer_candidate, recover_norted_package_primary_paths,
-    select_q27_tokenizer_filename,
+    ModelLibraryReceiptMember, ModelRegistry, NortedPackageAcquisitionPlan,
+    NortedPackageAcquisitionRole, inspect_gguf_metadata, inspect_ninfer_container,
+    model_library_receipt_path, norted_package_manifest_name, plan_norted_package_acquisition,
+    q27_tokenizer_candidate, recover_norted_package_primary_paths, select_q27_tokenizer_filename,
+    validate_q27_tokenizer_header,
 };
 use reqwest::{Client, StatusCode, Url, header};
 use serde::{Deserialize, Serialize};
@@ -248,11 +249,10 @@ impl ModelLibrary {
                 "expected a .gguf, .q27, or .ninfer artifact".to_owned(),
             )
         })?;
-        validate_artifact(&source, format)?;
         let source_parent = source.parent().unwrap_or_else(|| Path::new("."));
-        let discovery_root = local_package_root(&source, format)
-            .await?
-            .unwrap_or_else(|| source_parent.to_path_buf());
+        let package_root = local_package_root(&source, format).await?;
+        validate_artifact(&source, format)?;
+        let discovery_root = package_root.unwrap_or_else(|| source_parent.to_path_buf());
         let source_registry = ModelRegistry::discover(&[discovery_root]);
         let discovered_source = source_registry
             .artifacts()
@@ -266,17 +266,12 @@ impl ModelLibrary {
                     source_registry.warnings().join("; ")
                 })
             })?;
-        let mut companion = None;
-        if format == ArtifactFormat::Q27 && discovered_source.norted_package.is_none() {
-            let mut warnings = Vec::new();
-            companion = q27_tokenizer_candidate(&source, &mut warnings);
-            if companion.is_none() {
-                let detail = warnings
-                    .first()
-                    .map_or("required tokenizer companion was not found", String::as_str);
-                return Err(ModelLibraryError::InvalidArtifact(detail.to_owned()));
-            }
-        }
+        let companion =
+            if format == ArtifactFormat::Q27 && discovered_source.norted_package.is_none() {
+                Some(validate_raw_q27_tokenizer(&source)?)
+            } else {
+                None
+            };
         let filename = safe_basename(&source)?;
         let import_identity = discovered_source
             .norted_package
@@ -357,7 +352,15 @@ impl ModelLibrary {
             let selected = PathBuf::from(&filename);
             copy_file(&source, &stage.join(&selected)).await?;
             if let Some(companion) = companion {
-                copy_file(&companion, &stage.join(safe_basename(&companion)?)).await?;
+                let staged_companion = stage.join(safe_basename(&companion)?);
+                copy_file(&companion, &staged_companion).await?;
+                let paired = validate_raw_q27_tokenizer(&stage.join(&selected))?;
+                if paired != staged_companion {
+                    return Err(ModelLibraryError::InvalidArtifact(
+                        "staged q27 tokenizer companion no longer matches the selected tokenizer"
+                            .to_owned(),
+                    ));
+                }
             }
             validate_artifact(&stage.join(&selected), format)?;
             let provenance = ModelArtifactProvenance {
@@ -712,15 +715,7 @@ impl ModelLibrary {
             } else {
                 validate_artifact(&primary_path, resolved.format)?;
                 if resolved.format == ArtifactFormat::Q27 {
-                    let mut warnings = Vec::new();
-                    if q27_tokenizer_candidate(&primary_path, &mut warnings).is_none() {
-                        return Err(ModelLibraryError::InvalidArtifact(
-                            warnings.first().cloned().unwrap_or_else(|| {
-                                "downloaded q27 artifact is missing its tokenizer companion"
-                                    .to_owned()
-                            }),
-                        ));
-                    }
+                    let _ = validate_raw_q27_tokenizer(&primary_path)?;
                 }
                 vec![ModelLibraryReceiptMember {
                     path: primary_name.clone(),
@@ -1052,10 +1047,17 @@ impl HuggingFaceCatalogProvider {
                 })?;
                 match plan_norted_package_acquisition(&bytes, format) {
                     Ok(plan) => {
-                        if plan
-                            .primary_files()
-                            .any(|file| file.path == selected_relative)
+                        if let Some(selected_member) = plan
+                            .files
+                            .iter()
+                            .find(|file| file.path == selected_relative)
                         {
+                            if selected_member.role != NortedPackageAcquisitionRole::Primary {
+                                return Err(ModelLibraryError::InvalidCatalog(format!(
+                                    "Norted package manifest `{manifest_filename}` declares `{primary_filename}` as a non-primary {} member; select a primary model artifact instead",
+                                    package_role_name(selected_member.role)
+                                )));
+                            }
                             let primary_filenames = plan
                                 .primary_files()
                                 .map(|file| slash_path(&directory.join(&file.path)))
@@ -1497,6 +1499,46 @@ fn validate_artifact(path: &Path, format: ArtifactFormat) -> Result<()> {
     }
 }
 
+fn validate_raw_q27_tokenizer(primary: &Path) -> Result<PathBuf> {
+    let mut warnings = Vec::new();
+    let tokenizer = q27_tokenizer_candidate(primary, &mut warnings).ok_or_else(|| {
+        ModelLibraryError::InvalidArtifact(warnings.first().cloned().unwrap_or_else(|| {
+            format!(
+                "q27 artifact {} is missing its required tokenizer companion",
+                primary.display()
+            )
+        }))
+    })?;
+    let metadata = std::fs::metadata(&tokenizer).map_err(|source| ModelLibraryError::Io {
+        path: tokenizer.clone(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(ModelLibraryError::InvalidArtifact(format!(
+            "q27 tokenizer companion {} is not a regular file",
+            tokenizer.display()
+        )));
+    }
+    validate_q27_tokenizer_header(&tokenizer).map_err(|reason| {
+        ModelLibraryError::InvalidArtifact(format!(
+            "q27 tokenizer companion {} is invalid: {reason}",
+            tokenizer.display()
+        ))
+    })?;
+    Ok(tokenizer)
+}
+
+fn package_role_name(role: NortedPackageAcquisitionRole) -> &'static str {
+    match role {
+        NortedPackageAcquisitionRole::Manifest => "manifest",
+        NortedPackageAcquisitionRole::Primary => "primary",
+        NortedPackageAcquisitionRole::Tokenizer => "tokenizer",
+        NortedPackageAcquisitionRole::Projector => "projector",
+        NortedPackageAcquisitionRole::Sharp => "Sharp metadata",
+        NortedPackageAcquisitionRole::Other => "auxiliary",
+    }
+}
+
 async fn local_package_root(source: &Path, format: ArtifactFormat) -> Result<Option<PathBuf>> {
     let manifest_name = norted_package_manifest_name(format);
     let mut directory = source.parent().ok_or_else(|| {
@@ -1522,15 +1564,25 @@ async fn local_package_root(source: &Path, format: ArtifactFormat) -> Result<Opt
                 )
             })?;
             match plan_norted_package_acquisition(&bytes, format) {
-                Ok(plan) if plan.primary_files().any(|file| file.path == selected) => {
-                    return directory.canonicalize().map(Some).map_err(|source| {
-                        ModelLibraryError::Io {
-                            path: directory.to_path_buf(),
-                            source,
+                Ok(plan) => {
+                    if let Some(selected_member) =
+                        plan.files.iter().find(|file| file.path == selected)
+                    {
+                        if selected_member.role != NortedPackageAcquisitionRole::Primary {
+                            return Err(ModelLibraryError::InvalidArtifact(format!(
+                                "Norted package manifest {} declares the selected artifact as a non-primary {} member; select a primary model artifact instead",
+                                manifest.display(),
+                                package_role_name(selected_member.role)
+                            )));
                         }
-                    });
+                        return directory.canonicalize().map(Some).map_err(|source| {
+                            ModelLibraryError::Io {
+                                path: directory.to_path_buf(),
+                                source,
+                            }
+                        });
+                    }
                 }
-                Ok(_) => {}
                 Err(error)
                     if recover_norted_package_primary_paths(&bytes, format)
                         .is_some_and(|claims| claims.contains(selected)) =>
