@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, FocusArea};
+use crate::app::{App, FocusArea, ModelLibraryView, Screen};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{centered_message, hint};
 use crate::ui::layout::{HoverTarget, UiLayout};
@@ -185,6 +185,8 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
             hint("Enter", "run", theme),
             hint("Esc", "cancel", theme),
         ]
+    } else if app.focus == FocusArea::Content && app.screen == Screen::Models {
+        models_footer(app, area.width, theme, glyphs)
     } else if area.width < 60 {
         vec![
             hint("Tab", "focus", theme),
@@ -197,15 +199,6 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
                 hint("Left/Right", "focus", theme),
                 hint("Enter", "open", theme),
                 hint("Tab", "content", theme),
-                hint("/", "commands", theme),
-            ],
-            (FocusArea::Content, crate::app::Screen::Models) => vec![
-                hint(glyphs.up_down, "select", theme),
-                hint("Enter/c", "create profile", theme),
-                hint("u", "unload active", theme),
-                hint("v", "runtime override", theme),
-                hint("wheel", "scroll", theme),
-                hint("Tab", "focus", theme),
                 hint("/", "commands", theme),
             ],
             (FocusArea::Content, crate::app::Screen::ModelProfiles) => vec![
@@ -255,6 +248,88 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn models_footer<'a>(
+    app: &'a App,
+    width: u16,
+    theme: &'a Theme,
+    glyphs: &'a Glyphs,
+) -> Vec<Vec<Span<'a>>> {
+    if app.model_library_view == ModelLibraryView::Discover && app.model_search_editing {
+        let finish_label = if width < 60 { "done" } else { "finish editing" };
+        return vec![
+            hint("Type", "query", theme),
+            hint("Enter", "search", theme),
+            hint("Esc", finish_label, theme),
+        ];
+    }
+
+    let compact = width < 84;
+    if app.model_library_view == ModelLibraryView::Installed {
+        let mut line = if compact {
+            vec![hint(
+                if glyphs.unicode { "→/s" } else { ">/s" },
+                "Discover",
+                theme,
+            )]
+        } else {
+            vec![
+                hint("Left/Right", "view", theme),
+                hint("s", "Discover", theme),
+            ]
+        };
+        if !app.snapshot.models.is_empty() {
+            line.push(hint(glyphs.up_down, "select", theme));
+        }
+        if let Some(model) = app
+            .selected_model
+            .and_then(|index| app.snapshot.models.get(index))
+        {
+            line.push(hint("Enter/c", "profile", theme));
+            if !compact {
+                line.push(hint("v", "runtime", theme));
+            }
+            let is_active = app
+                .control
+                .as_ref()
+                .and_then(|control| control.backend.model_id.as_ref())
+                == Some(&model.id);
+            if width >= 90 && !app.model_library_busy() && model.provenance.is_some() && !is_active
+            {
+                line.push(hint("d", "remove", theme));
+            }
+        }
+        return line;
+    }
+
+    let has_results = !app.model_search_artifacts().is_empty();
+    let has_selection = app.selected_model_search_result.is_some() && has_results;
+    let mut line = if compact {
+        vec![
+            hint(
+                if glyphs.unicode { "←/i" } else { "</i" },
+                "Installed",
+                theme,
+            ),
+            hint("e", "search", theme),
+        ]
+    } else {
+        vec![
+            hint("Left/Right", "view", theme),
+            hint("e", "search/edit", theme),
+            hint("f", "format", theme),
+        ]
+    };
+    if has_results && !compact {
+        line.push(hint(glyphs.up_down, "select", theme));
+    }
+    if has_selection && !app.model_library_busy() {
+        line.push(hint("d", "download", theme));
+    } else if compact {
+        line.push(hint("f", "format", theme));
+    }
+    line
 }
 
 pub fn set_command_cursor(frame: &mut Frame<'_>, area: Rect, app: &App) {
