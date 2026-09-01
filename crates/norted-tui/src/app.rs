@@ -15,6 +15,7 @@ use norted_engine::{
     RuntimeModelCandidate, RuntimeNoticeLevel, RuntimeSearchResult, RuntimeSearchSnapshot,
     RuntimeUpdateCheck,
 };
+use norted_model_library::{CatalogFile, CatalogSearch, ModelOperationProgress};
 use ratatui::layout::Position;
 
 use crate::commands::{self, CommandAction};
@@ -129,6 +130,29 @@ pub enum RuntimeAction {
     ClearModelSelection {
         model_id: ModelId,
     },
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ModelLibraryView {
+    Installed,
+    Discover,
+}
+
+#[derive(Debug, Clone)]
+pub enum ModelLibraryAction {
+    Search {
+        query: String,
+        format: Option<ArtifactFormat>,
+    },
+    Download(String),
+    Remove(ModelId),
+}
+
+#[derive(Debug)]
+pub enum ModelLibraryTaskResult {
+    Searched(Result<CatalogSearch, String>),
+    Downloaded(Box<Result<ModelArtifact, String>>),
+    Removed(Result<ModelId, String>),
 }
 
 #[derive(Debug)]
@@ -285,6 +309,15 @@ pub struct App {
     pub hover: Option<HoverTarget>,
     pub selected_model: Option<usize>,
     pub model_scroll: usize,
+    pub model_library_view: ModelLibraryView,
+    pub model_search_query: String,
+    pub model_search_cursor: usize,
+    pub model_search_editing: bool,
+    pub model_search_format: Option<ArtifactFormat>,
+    pub model_search: Option<CatalogSearch>,
+    pub model_search_loading: bool,
+    pub selected_model_search_result: Option<usize>,
+    pub model_operation: Option<ModelOperationProgress>,
     pub selected_model_profile: Option<usize>,
     pub log_scroll: usize,
     pub runtime_list: Option<RuntimeListSnapshot>,
@@ -334,6 +367,9 @@ pub struct App {
     pending_runtime_action: Option<RuntimeAction>,
     runtime_mutation_busy: bool,
     pending_runtime_remove_confirmation: Option<RuntimeId>,
+    pending_model_library_action: Option<ModelLibraryAction>,
+    pending_model_remove_confirmation: Option<ModelId>,
+    model_library_busy: bool,
     pending_settings_action: Option<SettingsAction>,
     settings_busy: bool,
     seen_runtime_events: BTreeSet<(i64, u8, String)>,
@@ -384,6 +420,15 @@ impl App {
             hover: None,
             selected_model: None,
             model_scroll: 0,
+            model_library_view: ModelLibraryView::Installed,
+            model_search_query: String::new(),
+            model_search_cursor: 0,
+            model_search_editing: false,
+            model_search_format: None,
+            model_search: None,
+            model_search_loading: false,
+            selected_model_search_result: None,
+            model_operation: None,
             selected_model_profile: None,
             log_scroll: 0,
             runtime_list: None,
@@ -433,6 +478,9 @@ impl App {
             pending_runtime_action: None,
             runtime_mutation_busy: false,
             pending_runtime_remove_confirmation: None,
+            pending_model_library_action: None,
+            pending_model_remove_confirmation: None,
+            model_library_busy: false,
             pending_settings_action: None,
             settings_busy: false,
             seen_runtime_events: BTreeSet::new(),
@@ -472,6 +520,7 @@ impl App {
         }
         if key.code != KeyCode::Char('d') {
             self.pending_runtime_remove_confirmation = None;
+            self.pending_model_remove_confirmation = None;
         }
         match key.code {
             KeyCode::Char('/') => {
@@ -715,6 +764,67 @@ impl App {
 
     pub fn take_runtime_action(&mut self) -> Option<RuntimeAction> {
         self.pending_runtime_action.take()
+    }
+
+    pub fn take_model_library_action(&mut self) -> Option<ModelLibraryAction> {
+        self.pending_model_library_action.take()
+    }
+
+    pub fn handle_model_library_result(&mut self, result: ModelLibraryTaskResult) {
+        self.model_library_busy = false;
+        match result {
+            ModelLibraryTaskResult::Searched(result) => {
+                self.model_search_loading = false;
+                match result {
+                    Ok(search) => {
+                        self.model_search = Some(search);
+                        self.selected_model_search_result =
+                            (!self.model_search_artifacts().is_empty()).then_some(0);
+                    }
+                    Err(error) => {
+                        self.notice = Some(error.clone());
+                        self.push_log(LogLevel::Error, error);
+                    }
+                }
+            }
+            ModelLibraryTaskResult::Downloaded(result) => match *result {
+                Ok(model) => {
+                    self.notice =
+                        Some(format!("Downloaded {} as {}", model.display_name, model.id));
+                    self.push_log(
+                        LogLevel::Info,
+                        format!("Model download completed: {}", model.id),
+                    );
+                }
+                Err(error) => {
+                    self.notice = Some(error.clone());
+                    self.push_log(LogLevel::Error, error);
+                }
+            },
+            ModelLibraryTaskResult::Removed(result) => {
+                self.pending_model_remove_confirmation = None;
+                match result {
+                    Ok(model_id) => self.notice = Some(format!("Removed managed model {model_id}")),
+                    Err(error) => {
+                        self.notice = Some(error.clone());
+                        self.push_log(LogLevel::Error, error);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn handle_model_operation_progress(&mut self, progress: ModelOperationProgress) {
+        self.model_operation = Some(progress);
+    }
+
+    pub fn model_search_artifacts(&self) -> Vec<&CatalogFile> {
+        self.model_search
+            .as_ref()
+            .into_iter()
+            .flat_map(|search| &search.repositories)
+            .flat_map(|repository| &repository.artifacts)
+            .collect()
     }
 
     pub fn take_settings_action(&mut self) -> Option<SettingsAction> {
@@ -1606,6 +1716,9 @@ impl App {
 
     fn handle_content_key(&mut self, key: KeyEvent, layout: &UiLayout) -> Update {
         match self.screen {
+            Screen::Models if self.model_library_view == ModelLibraryView::Discover => {
+                self.handle_model_discover_key(key)
+            }
             Screen::Models => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => self.move_model_selection(-1, layout),
                 KeyCode::Down | KeyCode::Char('j') => self.move_model_selection(1, layout),
@@ -1618,6 +1731,11 @@ impl App {
                 KeyCode::Enter | KeyCode::Char('c') => self.create_profile_for_selected_model(),
                 KeyCode::Char('u') => self.request_unload(),
                 KeyCode::Char('v') => self.open_model_runtime_picker(),
+                KeyCode::Char('s') => {
+                    self.model_library_view = ModelLibraryView::Discover;
+                    Update::Render
+                }
+                KeyCode::Char('d') => self.request_model_removal(),
                 _ => Update::None,
             },
             Screen::ModelProfiles => self.handle_model_profiles_key(key, layout),
@@ -1673,6 +1791,160 @@ impl App {
             Screen::Settings => self.handle_settings_key(key, layout),
             _ => Update::None,
         }
+    }
+
+    fn handle_model_discover_key(&mut self, key: KeyEvent) -> Update {
+        if self.model_search_editing {
+            match key.code {
+                KeyCode::Esc => self.model_search_editing = false,
+                KeyCode::Enter => {
+                    self.model_search_editing = false;
+                    return self.request_model_search();
+                }
+                KeyCode::Backspace if self.model_search_cursor > 0 => {
+                    let end = byte_index(&self.model_search_query, self.model_search_cursor);
+                    let start = byte_index(&self.model_search_query, self.model_search_cursor - 1);
+                    self.model_search_query.replace_range(start..end, "");
+                    self.model_search_cursor -= 1;
+                }
+                KeyCode::Delete
+                    if self.model_search_cursor < self.model_search_query.chars().count() =>
+                {
+                    let start = byte_index(&self.model_search_query, self.model_search_cursor);
+                    let end = byte_index(&self.model_search_query, self.model_search_cursor + 1);
+                    self.model_search_query.replace_range(start..end, "");
+                }
+                KeyCode::Left => {
+                    self.model_search_cursor = self.model_search_cursor.saturating_sub(1)
+                }
+                KeyCode::Right => {
+                    self.model_search_cursor =
+                        (self.model_search_cursor + 1).min(self.model_search_query.chars().count());
+                }
+                KeyCode::Home => self.model_search_cursor = 0,
+                KeyCode::End => self.model_search_cursor = self.model_search_query.chars().count(),
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    let index = byte_index(&self.model_search_query, self.model_search_cursor);
+                    self.model_search_query.insert(index, character);
+                    self.model_search_cursor += 1;
+                }
+                _ => return Update::None,
+            }
+            return Update::Render;
+        }
+        match key.code {
+            KeyCode::Char('i') | KeyCode::Esc => {
+                self.model_library_view = ModelLibraryView::Installed;
+                Update::Render
+            }
+            KeyCode::Char('e') | KeyCode::Char('/') => {
+                self.model_search_editing = true;
+                self.model_search_cursor = self.model_search_query.chars().count();
+                Update::Render
+            }
+            KeyCode::Enter | KeyCode::Char('r') => self.request_model_search(),
+            KeyCode::Char('f') => {
+                self.model_search_format = match self.model_search_format {
+                    None => Some(ArtifactFormat::Gguf),
+                    Some(ArtifactFormat::Gguf) => Some(ArtifactFormat::Q27),
+                    Some(ArtifactFormat::Q27) => Some(ArtifactFormat::Ninfer),
+                    Some(ArtifactFormat::Ninfer) => None,
+                };
+                Update::Render
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_model_search_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_model_search_selection(1),
+            KeyCode::Char('d') => self.request_model_download(),
+            _ => Update::None,
+        }
+    }
+
+    fn request_model_search(&mut self) -> Update {
+        if self.model_library_busy {
+            self.notice = Some("A Model Library operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        self.model_library_busy = true;
+        self.model_search_loading = true;
+        self.pending_model_library_action = Some(ModelLibraryAction::Search {
+            query: self.model_search_query.clone(),
+            format: self.model_search_format,
+        });
+        Update::Render
+    }
+
+    fn move_model_search_selection(&mut self, direction: isize) -> Update {
+        let len = self.model_search_artifacts().len();
+        if len == 0 {
+            return Update::None;
+        }
+        let current = self.selected_model_search_result.unwrap_or(0) as isize;
+        self.selected_model_search_result =
+            Some((current + direction).clamp(0, len as isize - 1) as usize);
+        Update::Render
+    }
+
+    fn request_model_download(&mut self) -> Update {
+        if self.model_library_busy {
+            self.notice = Some("A Model Library operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        let model_ref = self.selected_model_search_result.and_then(|index| {
+            self.model_search_artifacts()
+                .get(index)
+                .map(|artifact| artifact.model_ref.clone())
+        });
+        let Some(model_ref) = model_ref else {
+            self.notice = Some("Select a concrete artifact before downloading".to_owned());
+            return Update::Render;
+        };
+        self.model_library_busy = true;
+        self.pending_model_library_action = Some(ModelLibraryAction::Download(model_ref));
+        Update::Render
+    }
+
+    fn request_model_removal(&mut self) -> Update {
+        if self.model_library_busy {
+            self.notice = Some("A Model Library operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        let Some(model) = self
+            .selected_model
+            .and_then(|index| self.snapshot.models.get(index))
+        else {
+            return Update::None;
+        };
+        if model.provenance.is_none() {
+            self.notice = Some(
+                "Configured external models are read-only; import them before managed removal"
+                    .to_owned(),
+            );
+            return Update::Render;
+        }
+        if self
+            .control
+            .as_ref()
+            .and_then(|control| control.backend.model_id.as_ref())
+            == Some(&model.id)
+        {
+            self.notice = Some("Unload the active model before removing it".to_owned());
+            return Update::Render;
+        }
+        if self.pending_model_remove_confirmation.as_ref() != Some(&model.id) {
+            self.pending_model_remove_confirmation = Some(model.id.clone());
+            self.notice = Some(format!(
+                "Press d again to remove managed model {}",
+                model.id
+            ));
+            return Update::Render;
+        }
+        self.model_library_busy = true;
+        self.pending_model_library_action = Some(ModelLibraryAction::Remove(model.id.clone()));
+        Update::Render
     }
 
     fn handle_settings_key(&mut self, key: KeyEvent, layout: &UiLayout) -> Update {
@@ -2233,7 +2505,11 @@ impl App {
                     self.close_command();
                 }
                 self.focus = FocusArea::Content;
-                self.selected_model = Some(index);
+                if self.model_library_view == ModelLibraryView::Discover {
+                    self.selected_model_search_result = Some(index);
+                } else {
+                    self.selected_model = Some(index);
+                }
                 Update::Render
             }
             Some(HoverTarget::Runtime(index)) => {
@@ -2325,6 +2601,9 @@ impl App {
         }
         self.focus = FocusArea::Content;
         match self.screen {
+            Screen::Models if self.model_library_view == ModelLibraryView::Discover => {
+                self.move_model_search_selection(direction * 3)
+            }
             Screen::Models => self.scroll_models(direction * 3, layout),
             Screen::ModelProfiles => self.scroll_settings(direction * 3, layout),
             Screen::Logs => self.scroll_logs(direction * -3, layout),

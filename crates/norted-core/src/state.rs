@@ -239,7 +239,9 @@ impl ApplicationCore {
     }
 
     async fn complete_model_discovery(&self) -> Result<()> {
-        match discover_models(self.config.models.paths.clone()).await {
+        let mut paths = self.config.models.paths.clone();
+        paths.push(self.paths.data_dir.join("models"));
+        match discover_models(paths).await {
             Ok(registry) => {
                 let registry_state = if registry.warnings().is_empty() {
                     RegistryState::Ready

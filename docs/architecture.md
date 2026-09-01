@@ -55,6 +55,7 @@ The interactive process preserves this boundary in both lifecycle modes. The TUI
 ## Crate responsibilities
 
 - `norted-core` owns platform paths, schema-version-1 configuration, public-auth policy, the versioned atomic API-key store, typed serving settings and resolution, user-owned Model Profiles, model/auxiliary-artifact discovery, stable IDs, runtime identity/manifest/preferences data, host-independent provenance, application state, and process descriptors.
+- `norted-model-library` owns the provider-neutral model catalog/acquisition contract, Hugging Face API provider, streamed/resumable downloads, receipts, safe import, atomic activation, and managed-only removal. It performs no model transformation or runtime acquisition.
 - `norted-engine` owns `EngineAdapter`, `EngineRegistry`, the provider/catalog/cache, secure installer, runtime store and resolver, runtime/backend manager, generic process supervisor, control client, and normalized inference types.
 - `norted-engine-llama-cpp` owns official llama.cpp asset classification, the immutable managed Linux CUDA source recipe/provider, binary probes, flags/environment policy, readiness and `/props`, and Chat Completions JSON/SSE translation.
 - `norted-engine-q27` owns official q27 binary/source capability classification, exact Makefile target recipes, tokenizer requirements, usage-signature probes, flags/environment policy, readiness, provable sampler settings, and Chat Completions JSON/SSE translation.
@@ -64,6 +65,51 @@ The interactive process preserves this boundary in both lifecycle modes. The TUI
 - `norted-server` is the composition root and scriptable CLI.
 
 Adapter registration and provider registration are separate. A built-in engine can be enabled even when no runtime is installed; conversely, every installed manifest still requires its corresponding registered adapter before it can launch.
+
+## Model Library and acquisition
+
+`ModelRegistry` remains the single local model inventory. Every scan includes configured external
+paths plus `<data>/models`; there is no parallel registry per engine or format. A library receipt
+next to a managed primary supplies stable logical identity and acquisition provenance without
+changing upstream bytes. Ordinary rescans therefore retain a downloaded artifact's `ModelId` even
+when transient catalog ordering changes.
+
+`ModelCatalogProvider` is independent of `RuntimeCatalogProvider`. The initial Hugging Face provider
+uses the HTTP metadata API to group relevant siblings by repository and exact revision, and returns
+individual `.gguf`, `.q27`, and `.ninfer` variants with size/LFS SHA-256 when published. An exact
+reference has provider, repository, revision, and filename identity. Provider results are only
+format candidates; they do not advertise a compatible engine or runtime before local inspection.
+No repository or model family is hard-coded into this generic provider.
+
+Acquisition streams each response to a cache `.part`, uses a Range request when partial data exists,
+checks authoritative size and SHA-256, then assembles all files in a registry-excluded
+`.norted-staging` directory on the managed root's filesystem. q27 tokenizer selection calls the same core selector used by local discovery,
+including the upstream `MODEL.q27` + sole `TOKENIZER.tok` layout. Norted package manifests are
+recognized only to retain all manifest-declared package files and existing lineage. The complete
+staged directory is rediscovered and validated before one rename to:
+
+```text
+<data>/models/huggingface/<publisher>/<repository>/<revision>/<artifact-key>/
+<data>/models/imports/<stable-import-key>/
+```
+
+GGUF uses bounded metadata inspection, q27 uses adapter-owned bounded architecture/tier inspection
+plus validated tokenizer presence, and NInfer uses its native v2 container inspector. NInfer does
+not gain invented tokenizer/template sidecars. Failed or cancelled staging is excluded from discovery;
+all required files must complete before activation. The receipt records provider, repository,
+revision, remote filename, local size, source URL, acquisition time, and authoritative digest when
+available. It is model-acquisition provenance, not a substitute for Norted Builder lineage.
+
+Import copies by default. If the source is a valid Norted package, all package files are copied and
+the original package manifest remains authoritative. Removal canonicalizes both managed root and
+artifact, requires receipt-backed provenance, and removes only the containing artifact directory
+below `<data>/models`; configured external artifacts are read-only.
+
+The TUI Models screen is one integrated Model Library with Installed and Discover modes, query and
+format controls, concrete artifact details, byte progress, download, managed removal, and the
+existing runtime picker for verified compatibility. The CLI exposes the same search, download,
+import, remove, list, and info model. Runtime search/install/update and model build/transformation
+remain separate systems.
 
 ## Settings and Model Profile resolution
 

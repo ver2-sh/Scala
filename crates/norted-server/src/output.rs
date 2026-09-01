@@ -228,6 +228,83 @@ pub fn model_info(capabilities: &ModelServingCapabilities, json_output: bool) ->
     Ok(())
 }
 
+pub fn models_search(
+    search: &norted_model_library::CatalogSearch,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(search)?);
+    } else if search.repositories.is_empty() {
+        println!("No relevant Hugging Face model artifacts found.");
+    } else {
+        for repository in &search.repositories {
+            println!("{}  @{}", repository.repository, repository.revision);
+            for artifact in &repository.artifacts {
+                println!(
+                    "  {:<7} {:>12}  {}",
+                    artifact.format.as_str().to_ascii_uppercase(),
+                    artifact
+                        .size_bytes
+                        .map(format_bytes)
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                    artifact.filename,
+                );
+                println!("           ref: {}", artifact.model_ref);
+                if !artifact.required_companions.is_empty() {
+                    println!(
+                        "           companion: {}",
+                        artifact.required_companions.join(", ")
+                    );
+                }
+                println!("           compatibility: unverified until downloaded and inspected");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn model_operation(
+    operation: &str,
+    artifact: &norted_core::ModelArtifact,
+    json_output: bool,
+) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "operation": operation,
+                "model": artifact,
+            }))?
+        );
+    } else {
+        println!(
+            "{} {} as {} ({})",
+            if operation == "import" {
+                "Imported"
+            } else {
+                "Downloaded"
+            },
+            artifact.display_name,
+            artifact.id,
+            artifact.path.display(),
+        );
+        println!("Artifact compatibility remains subject to installed runtime inspection.");
+    }
+    Ok(())
+}
+
+pub fn model_removed(model_id: &norted_core::ModelId, json_output: bool) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "operation": "remove", "model_id": model_id }))?
+        );
+    } else {
+        println!("Removed managed model {model_id}.");
+    }
+    Ok(())
+}
+
 fn comma_list(values: &[String]) -> String {
     if values.is_empty() {
         "none".to_owned()

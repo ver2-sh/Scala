@@ -92,6 +92,20 @@ pub enum ModelsCommand {
     List,
     /// Show private serving capabilities for one discovered model
     Info { model_id: String },
+    /// Search Hugging Face for concrete downloadable model artifacts
+    Search {
+        /// Repository, model, publisher, or artifact search text
+        query: Option<String>,
+        /// Restrict results to one artifact format
+        #[arg(long)]
+        format: Option<norted_core::ArtifactFormat>,
+    },
+    /// Download and validate one exact artifact reference returned by search
+    Download { model_ref: String },
+    /// Safely copy an existing local artifact into the managed library
+    Import { path: std::path::PathBuf },
+    /// Remove one managed library artifact
+    Remove { model_id: String },
 }
 
 #[derive(Debug, Args)]

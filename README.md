@@ -57,6 +57,49 @@ Persistent state is deliberately split:
 Each has its own inter-process lock and atomic replacement. Older combined state is not consumed or
 deleted; recreate current settings and profiles explicitly.
 
+### Model Library
+
+Models includes a managed, runtime-agnostic Model Library as well as configured external search
+paths. The Installed view browses all locally discovered GGUF, q27, and NInfer artifacts. Discover
+searches Hugging Face directly, exposes each concrete file/quantization, filters by format, and
+labels remote results as format candidates whose runtime compatibility is unverified. Download,
+import, and removal are explicit operations; only receipt-backed files below the managed root can
+be removed by the library.
+
+Managed models use the platform-native Norted data directory shown by `config show`:
+
+```text
+<data>/models/
+  huggingface/<publisher>/<repository>/<revision>/<artifact-key>/
+    <artifact and required package files>
+    <artifact>.norted-library.json
+  imports/<stable-import-key>/
+    <copied artifact and required package files>
+    <artifact>.norted-library.json
+```
+
+The sidecar receipt records provider, repository, exact revision, remote filename, size, acquisition
+time, source URL, and authoritative SHA-256 when Hugging Face publishes one. Model payloads are not
+modified. Norted Builder manifests and lineage remain separate and are copied/downloaded with the
+package files when present.
+
+Large files stream to resumable partial files in the application cache. They are checked for the
+published size and LFS SHA-256, inspected through the normal bounded format handling, and activated
+by directory rename only after every required file validates. Thus a q27 primary and tokenizer
+become visible together, while failed/partial transfers never enter local discovery.
+
+q27 pairing uses one shared rule for discovery and acquisition: exact stems first, then a unique
+longest boundary-safe prefix, then the sole `.tok` file (including `MODEL.q27` plus
+`TOKENIZER.tok`). The tokenizer header and adapter-owned Q27 architecture metadata must validate.
+NInfer stays a self-contained `.ninfer` v2 artifact with embedded resources and exposes its native
+`container_version`, `model_id`, and `weights_id`. GGUF and NInfer use their existing bounded
+inspectors after acquisition.
+
+Artifact format and verified compatibility are deliberately different facts. GGUF is only a
+llama.cpp candidate, q27 is only a q27 candidate, and NInfer is only an NInfer candidate until the
+registered adapter checks the exact artifact, installed runtime, and observed host. Existing GPU,
+architecture, tier, native-identity, and runtime restrictions are never inferred from a filename.
+
 ## Norted Builder packages
 
 Model paths are served in place. Current q27 and NInfer Builder packages require manifest schema 6;
@@ -263,6 +306,12 @@ Updates install a new exact runtime beside the old one. They never overwrite or 
 The runtime command tree is scriptable and supports global `--json`:
 
 ```console
+cargo run -p norted-server -- models list
+cargo run -p norted-server -- models info <MODEL_ID>
+cargo run -p norted-server -- models search [QUERY] [--format gguf|q27|ninfer]
+cargo run -p norted-server -- models download <MODEL_REF>
+cargo run -p norted-server -- models import <PATH>
+cargo run -p norted-server -- models remove <MODEL_ID>
 cargo run -p norted-server -- runtimes list
 cargo run -p norted-server -- runtimes search [QUERY]
 cargo run -p norted-server -- runtimes search --refresh
@@ -296,7 +345,7 @@ norted-server
 ├── auth keys list|create|revoke
 ├── load <MODEL_PROFILE_ID> [--runtime <RUNTIME_ID>] [--set <ID=VALUE>]...
 ├── unload
-├── models list|info <MODEL_ID>
+├── models list|info|search|download|import|remove
 ├── runtimes ...
 ├── model-profiles list|show|create|duplicate|delete|set-model|set-engine|set|unset|load|compatibility
 ├── settings show|set|unset
@@ -409,7 +458,7 @@ cargo run -p norted-server -- tui
 
 At startup the TUI safely chooses one of two modes: it attaches to a healthy instance discovered through the existing runtime descriptor, public identity probe, and authenticated private control `status`, or it starts and owns the same serving composition used by headless `serve`. In owned mode the configured OpenAI-compatible endpoint is live while the TUI runs. Exiting shuts down the owned listeners and active backend and removes the owned descriptor; exiting an attached TUI leaves the external server running.
 
-Its top-level pages are Overview, Models, Model Profiles, Runtimes, Server, Logs, Settings, and Help. Models is artifact inventory and creates profiles rather than loading raw artifacts. Model Profiles lists, creates, duplicates, deletes, rebinds, edits, validates, and loads user serving targets; it displays missing/incompatible state, active identity, and inherited versus overridden values. Settings shows only Global and engine defaults. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Incompatible candidates are hidden by default and can be revealed with the keyboard- and mouse-accessible `Show incompatible` checkbox; Recommended, Compatible, and Needs Attention results remain visible. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Installed source-runtime details include short commit/tree, recipe, Make or CMake, and CUDA provenance.
+Its top-level pages are Overview, Models, Model Profiles, Runtimes, Server, Logs, Settings, and Help. Models is an integrated Model Library: Installed preserves the local artifact/profile/runtime workflow, while Discover provides Hugging Face query editing, format filtering, concrete artifact details, live download bytes, and explicit managed removal. Remote rows say compatibility is unverified; the existing runtime picker continues to provide proven engine/runtime/host compatibility after acquisition. Model Profiles lists, creates, duplicates, deletes, rebinds, edits, validates, and loads user serving targets; it displays missing/incompatible state, active identity, and inherited versus overridden values. Settings shows only Global and engine defaults. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Incompatible candidates are hidden by default and can be revealed with the keyboard- and mouse-accessible `Show incompatible` checkbox; Recommended, Compatible, and Needs Attention results remain visible. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Installed source-runtime details include short commit/tree, recipe, Make or CMake, and CUDA provenance.
 
 Owned startup establishes the serving and authenticated control stack without waiting for complete local model discovery. The TUI promptly draws its pending first frame, then starts model discovery asynchronously; the existing NotScanned, Scanning, Ready/Ready with warnings, and Failed registry states report real progress. A Model Profile cannot load until its exact bound artifact is discovered. Headless `serve` continues to complete discovery before announcing that it is listening. Neither interactive path performs catalog network I/O merely to start. The editor shows only common settings plus the bound engine namespace, and clearing an override restores inheritance. Runtime help/usage probing runs in the background. Keyboard, mouse/wheel navigation, narrow layout, `NO_COLOR`, and configured ASCII mode remain supported. Edits never hot-mutate a running backend and apply on its next load.
 

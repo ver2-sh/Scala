@@ -1,7 +1,7 @@
 use norted_core::RegistryState;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 
-use crate::app::{App, Overlay, Screen};
+use crate::app::{App, ModelLibraryView, Overlay, Screen};
 
 use super::components::content_layout;
 use super::shell::{COMPACT_WIDTH, MIN_HEIGHT, MIN_WIDTH};
@@ -120,27 +120,44 @@ impl UiLayout {
         }
 
         let (model_list, model_progress) = if app.screen == Screen::Models {
-            reserve_bottom(screen_body, app.selected_model_load_progress().is_some(), 3)
+            reserve_bottom(
+                screen_body,
+                app.selected_model_load_progress().is_some() || app.model_operation.is_some(),
+                3,
+            )
         } else {
             (Rect::default(), Rect::default())
         };
 
         let mut model_rows = Vec::new();
+        let model_count = if app.model_library_view == ModelLibraryView::Discover {
+            app.model_search_artifacts().len()
+        } else {
+            app.snapshot.models.len()
+        };
         if app.screen == Screen::Models
-            && matches!(
-                app.snapshot.registry_state,
-                RegistryState::Ready | RegistryState::ReadyWithWarnings { .. }
-            )
-            && !app.snapshot.models.is_empty()
+            && (app.model_library_view == ModelLibraryView::Discover
+                || matches!(
+                    app.snapshot.registry_state,
+                    RegistryState::Ready | RegistryState::ReadyWithWarnings { .. }
+                ))
+            && model_count > 0
         {
             let capacity = (model_list.height / MODEL_ROW_HEIGHT) as usize;
-            let end = (app.model_scroll + capacity).min(app.snapshot.models.len());
-            for index in app.model_scroll..end {
+            let start = if app.model_library_view == ModelLibraryView::Discover {
+                app.selected_model_search_result
+                    .unwrap_or_default()
+                    .saturating_sub(capacity.saturating_sub(1))
+            } else {
+                app.model_scroll
+            };
+            let end = (start + capacity).min(model_count);
+            for index in start..end {
                 model_rows.push((
                     index,
                     Rect::new(
                         model_list.x,
-                        model_list.y + ((index - app.model_scroll) as u16 * MODEL_ROW_HEIGHT),
+                        model_list.y + ((index - start) as u16 * MODEL_ROW_HEIGHT),
                         model_list.width,
                         MODEL_ROW_HEIGHT,
                     ),
