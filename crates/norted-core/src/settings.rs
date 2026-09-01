@@ -564,6 +564,7 @@ fn apply_layer(
     engine_id: &str,
     source: SettingSource,
 ) {
+    suppress_inherited_semantic_alternatives(effective, patch, engine_id);
     for (id, value) in patch.iter() {
         if id.applies_to_engine(engine_id) {
             effective.insert(
@@ -573,6 +574,58 @@ fn apply_layer(
                     source: source.clone(),
                 },
             );
+        }
+    }
+}
+
+fn suppress_inherited_semantic_alternatives(
+    effective: &mut BTreeMap<SettingId, ResolvedSetting>,
+    patch: &SettingsPatch,
+    engine_id: &str,
+) {
+    if engine_id != "llama.cpp" {
+        return;
+    }
+    let contains = |id: &str| patch.0.keys().any(|candidate| candidate.as_str() == id);
+    let mut suppress = Vec::new();
+
+    if contains("llama.cpp.chat_template") {
+        suppress.extend([
+            "llama.cpp.chat_template_file",
+            "llama.cpp.chat_template_sha256",
+        ]);
+    }
+    if contains("llama.cpp.chat_template_file") {
+        suppress.extend(["llama.cpp.chat_template", "llama.cpp.chat_template_sha256"]);
+    }
+    if contains("llama.cpp.cpu_moe_all") {
+        suppress.push("llama.cpp.cpu_moe_layers");
+    }
+    if contains("llama.cpp.cpu_moe_layers") {
+        suppress.push("llama.cpp.cpu_moe_all");
+    }
+    if matches!(
+        patch
+            .0
+            .iter()
+            .find(|(id, _)| id.as_str() == "llama.cpp.speculative_mode")
+            .map(|(_, value)| value),
+        Some(SettingValue::Choice(mode))
+            if mode == "off" || mode == "draft-mtp" || mode.starts_with("ngram-")
+    ) {
+        suppress.extend([
+            "llama.cpp.speculative_draft_model",
+            "llama.cpp.speculative_draft_sha256",
+        ]);
+    }
+
+    for id in suppress {
+        if let Some(id) = effective
+            .keys()
+            .find(|candidate| candidate.as_str() == id)
+            .cloned()
+        {
+            effective.remove(&id);
         }
     }
 }

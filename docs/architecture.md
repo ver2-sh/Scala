@@ -270,9 +270,14 @@ The adapter polls `/health`, then obtains authoritative effective `temperature` 
 `/props` before Running. Exact-help-gated launch controls cover context/parallelism, samplers,
 threads/batches, weight and KV offload, unified KV, context checkpoints, Flash Attention, cache
 types, RoPE base/scale, `load_mode`, CPU MoE placement, architecture-aware active experts,
-reasoning, chat template, JSON Schema defaults, and speculative mode/draft artifact. Every setting
+reasoning, chat template, and speculative mode/draft artifact. Every setting
 owns its current aliases and environment variables for collision removal/rejection. Omission emits
 nothing. `load_mode` intentionally replaces deprecated mmap/mlock/direct-I/O controls.
+
+The four-layer resolver normalizes llama.cpp semantic alternatives before compatibility, launch,
+inspection, and provenance: a higher-layer built-in/file template choice or all/exact CPU-MoE
+choice suppresses its inherited sibling, while `off`, n-gram, and `draft-mtp` modes suppress an
+inherited external draft identity. Same-layer contradictions remain visible and invalid.
 
 Private Chat requests carry explicit seed, stop, repeat/presence penalty, reasoning effort, token
 limit, and OpenAI-compatible response format only after the active exact schema proves the
@@ -280,6 +285,11 @@ corresponding mechanism. JSON Schema wrappers retain schema/name/description/str
 llama.cpp grammar-backed sampling in both normal and streaming paths. `/props` supplies exact slot
 capacity and `/v1/chat/completions/input_tokens` supplies exact fully templated token counts for the
 engine-neutral truncate-middle policy; failure of either endpoint fails the request truthfully.
+Configured JSON Schemas are per-request defaults on this path rather than launch-time
+`--json-schema` constraints, allowing explicit text, JSON object, or request-schema selection to
+override them. Current upstream `draft-mtp` consumes main-model MTP heads, not an external draft;
+without a bounded architecture-neutral proof of usable heads, compatibility remains
+needs-attention until exact server load.
 
 ### q27
 
@@ -345,7 +355,10 @@ structured output contract. Chat `reasoning_effort` and Responses `reasoning.eff
 typed effort levels. `RuntimeManager` applies configured system prompt, output limit, and JSON
 Schema defaults only when their request counterparts are omitted, validates request values against
 the active exact schema, and never mutates runtime selection or immutable launch provenance. The
-public serving alias and `/v1/models` identity are the active/user-created Model Profile ID, while
+resolved effective output format is returned with both streaming and non-streaming routes so a
+Responses document reports a configured default schema or an explicit text/schema override
+truthfully. The public serving alias and `/v1/models` identity are the active/user-created Model
+Profile ID, while
 the artifact Model ID remains private provenance.
 
 `POST /v1/responses` accepts the documented text subset and constructs the current non-streaming document or ordered Responses SSE sequence itself. `POST /v1/chat/completions` constructs current text ChatCompletion objects/chunks from the same normalized inference output. Each adapter owns only its private upstream JSON/SSE: llama.cpp omits absent sampler fields and q27 materializes its established 0/1 defaults while accepting `top_p < 1` only with a positive effective temperature. Output-limit completion maps to incomplete/length state, basic Chat usage is emitted when known, and richer Responses usage is emitted only when every required detail is known. Stream options are valid only on streams; explicit disabled obfuscation is compatible, but Norted does not emit OpenAI stream padding. Unsupported input or top-level behavior is rejected rather than forwarded or silently ignored.

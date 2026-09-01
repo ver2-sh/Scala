@@ -361,7 +361,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
         common_definition(
             "structured_output_schema",
             "Structured output schema",
-            "Default JSON Schema object used to constrain generated output",
+            "Default per-request JSON Schema object used when the request omits its output format",
             norted_core::SettingKind::JsonObject,
             norted_core::SettingCategory::Generation,
             Some("plain text"),
@@ -1069,6 +1069,7 @@ impl GenerationSettingsPatch {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum OutputFormat {
+    Text,
     JsonObject,
     JsonSchema {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1112,11 +1113,13 @@ pub struct InferenceOutput {
 pub struct RoutedInferenceOutput {
     pub output: InferenceOutput,
     pub effective_generation_settings: EffectiveGenerationSettings,
+    pub effective_output_format: Option<OutputFormat>,
 }
 
 pub struct RoutedInferenceStream {
     pub stream: InferenceStream,
     pub effective_generation_settings: EffectiveGenerationSettings,
+    pub effective_output_format: Option<OutputFormat>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -1425,7 +1428,10 @@ pub trait EngineAdapter: Send + Sync {
         _settings_schema: &SettingsSchema,
     ) -> Result<(), EngineError> {
         self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
-        if request.output_format.is_some() {
+        if matches!(
+            request.output_format.as_ref(),
+            Some(OutputFormat::JsonObject | OutputFormat::JsonSchema { .. })
+        ) {
             return Err(EngineError::InvalidGenerationSettings(format!(
                 "engine `{}` does not support structured output",
                 self.identity().id

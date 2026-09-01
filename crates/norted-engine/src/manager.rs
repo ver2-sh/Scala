@@ -1366,6 +1366,7 @@ impl RuntimeManager {
             .map_err(map_inference_error)?;
         let effective_generation_settings =
             backend_generation_settings.merged(&request.generation_settings);
+        let effective_output_format = request.output_format.clone();
         let output = adapter
             .infer(&endpoint, request)
             .await
@@ -1373,6 +1374,7 @@ impl RuntimeManager {
         Ok(RoutedInferenceOutput {
             output,
             effective_generation_settings,
+            effective_output_format,
         })
     }
 
@@ -1390,6 +1392,7 @@ impl RuntimeManager {
             .map_err(map_inference_error)?;
         let effective_generation_settings =
             backend_generation_settings.merged(&request.generation_settings);
+        let effective_output_format = request.output_format.clone();
         let stream = adapter
             .infer_stream(&endpoint, request)
             .await
@@ -1397,6 +1400,7 @@ impl RuntimeManager {
         Ok(RoutedInferenceStream {
             stream,
             effective_generation_settings,
+            effective_output_format,
         })
     }
 

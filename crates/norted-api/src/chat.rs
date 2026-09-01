@@ -319,7 +319,7 @@ fn parse_response_format(value: Option<&Value>) -> Result<Option<OutputFormat>, 
     match format.get("type").and_then(Value::as_str) {
         Some("text") => {
             reject_unknown_fields(format, &["type"], "Chat response_format")?;
-            Ok(None)
+            Ok(Some(OutputFormat::Text))
         }
         Some("json_object") => {
             reject_unknown_fields(format, &["type"], "Chat response_format")?;
