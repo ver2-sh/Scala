@@ -16,7 +16,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "KV dtype",
             "NInfer KV cache storage type",
             SettingKind::Choice {
-                choices: choices(&["bf16", "int8", "fp8"]),
+                choices: choices(&["bf16", "int8", "fp8", "nvfp4", "k8v4"]),
             },
             Some("exact runtime default"),
         ),
@@ -71,6 +71,16 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "ninfer.lm_head_draft",
             "LM-head draft",
             "Use NInfer's optimized proposal head with an explicit speculative backend",
+        ),
+        toggle(
+            "ninfer.vision",
+            "Vision residency",
+            "Load NInfer's fixed Vision GPU allocations and enable supported image/video inputs",
+        ),
+        toggle(
+            "ninfer.greedy",
+            "Greedy sampling",
+            "Force exact argmax sampling for every request",
         ),
         toggle(
             "ninfer.cuda_graph",
@@ -135,11 +145,67 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(MAX_NINFER_CLI_INTEGER),
         ),
         unsigned(
-            "ninfer.max_cache_markers_per_request",
-            "Cache markers",
-            "Maximum cache markers per request",
+            "ninfer.max_pending_requests",
+            "Pending requests",
+            "Maximum queued requests beyond active concurrency",
+            1,
+            Some(MAX_NINFER_CLI_INTEGER),
+        ),
+        unsigned(
+            "ninfer.pending_timeout_ms",
+            "Pending timeout",
+            "Maximum queue wait before a request is rejected, in milliseconds",
+            1,
+            Some(MAX_NINFER_CLI_INTEGER),
+        ),
+        unsigned(
+            "ninfer.log_stats_interval_ms",
+            "Stats interval",
+            "Periodic throughput logging interval in milliseconds; zero disables it",
             0,
             Some(MAX_NINFER_CLI_INTEGER),
+        ),
+        unsigned(
+            "ninfer.max_request_mib",
+            "Maximum request size",
+            "Private NInfer request-body limit in MiB; Norted's public limit remains authoritative",
+            1,
+            Some(u64::MAX >> 20),
+        ),
+        unsigned(
+            "ninfer.media_cache_mib",
+            "Media cache budget",
+            "Retained preprocessed-media cache budget in MiB; zero disables retained reuse",
+            0,
+            Some(u64::MAX >> 20),
+        ),
+        unsigned(
+            "ninfer.media_live_mib",
+            "Live media budget",
+            "Aggregate live BF16 media-payload budget in MiB",
+            1,
+            Some(u64::MAX >> 20),
+        ),
+        unsigned(
+            "ninfer.media_preprocess_threads",
+            "Media preprocessing threads",
+            "Media preprocessing workers; zero selects NInfer automatic sizing",
+            0,
+            Some(64),
+        ),
+        unsigned(
+            "ninfer.response_store_max_records",
+            "Response-store records",
+            "Maximum process-local Responses records retained by NInfer's private API",
+            1,
+            Some(MAX_NINFER_CLI_INTEGER),
+        ),
+        unsigned(
+            "ninfer.response_store_max_mib",
+            "Response-store budget",
+            "Process-local Responses store size budget in MiB",
+            1,
+            Some(u64::MAX >> 20),
         ),
     ]);
     definitions
@@ -165,6 +231,27 @@ pub(crate) fn apply_runtime_bounds(definitions: &mut [SettingDefinition]) {
         };
         parallel.description =
             "Maximum active same-model request concurrency in ninfer-serve".to_owned();
+    }
+    if let Some(top_k) = definitions
+        .iter_mut()
+        .find(|definition| definition.id.as_str() == "top_k")
+    {
+        top_k.kind = SettingKind::UnsignedInteger {
+            minimum: Some(0),
+            maximum: Some(20),
+        };
+    }
+    if let Some(budget) = definitions
+        .iter_mut()
+        .find(|definition| definition.id.as_str() == "reasoning_budget")
+    {
+        budget.kind = SettingKind::Integer {
+            minimum: Some(1),
+            maximum: Some(i64::from(u32::MAX)),
+        };
+        budget.description =
+            "Positive process-default thinking budget; explicit request effort/toggle controls remain separate"
+                .to_owned();
     }
 }
 
@@ -251,7 +338,7 @@ fn category(id: &str) -> SettingCategory {
         SettingCategory::Reasoning
     } else if id.contains("specul") || id.contains("draft") {
         SettingCategory::Speculation
-    } else if id.contains("kv_") || id == "ninfer.cuda_graph" {
+    } else if id.contains("kv_") || id == "ninfer.cuda_graph" || id.contains("media") {
         SettingCategory::KvMemory
     } else if id.contains("prefix") || id.contains("continuation") || id.contains("cache") {
         SettingCategory::Cache
@@ -287,7 +374,12 @@ pub(crate) fn option_for_setting(id: &str) -> &'static str {
         "top_p" => "--top-p",
         "top_k" => "--top-k",
         "min_p" => "--min-p",
-        "reasoning_effort" => "",
+        "seed" => "--seed",
+        "presence_penalty" => "--presence-penalty",
+        "frequency_penalty" => "--frequency-penalty",
+        "max_output_tokens" => "--default-max-tokens",
+        "reasoning_budget" => "--default-thinking-budget",
+        "reasoning_effort" | "reasoning" | "stop_strings" | "system_prompt" => "",
         "ninfer.kv_dtype" => "--kv-dtype",
         "ninfer.kv_capacity" => "--kv-capacity",
         "ninfer.prefill_chunk" => "--prefill-chunk",
@@ -295,6 +387,8 @@ pub(crate) fn option_for_setting(id: &str) -> &'static str {
         "ninfer.speculative_backend" => "--spec",
         "ninfer.draft_tokens" => "--draft-tokens",
         "ninfer.lm_head_draft" => "--lm-head-draft",
+        "ninfer.vision" => "--vision",
+        "ninfer.greedy" => "--greedy",
         "ninfer.cuda_graph" => "--no-cuda-graph",
         "ninfer.prefix_reuse" => "--no-prefix-reuse",
         "ninfer.thinking" => "--no-thinking",
@@ -305,7 +399,15 @@ pub(crate) fn option_for_setting(id: &str) -> &'static str {
         "ninfer.max_private_continuations" => "--max-private-continuations",
         "ninfer.max_shared_prefixes" => "--max-shared-prefixes",
         "ninfer.max_long_anchors_per_continuation" => "--max-long-anchors-per-continuation",
-        "ninfer.max_cache_markers_per_request" => "--max-cache-markers-per-request",
+        "ninfer.max_pending_requests" => "--max-pending-requests",
+        "ninfer.pending_timeout_ms" => "--pending-timeout-ms",
+        "ninfer.log_stats_interval_ms" => "--log-stats-interval-ms",
+        "ninfer.max_request_mib" => "--max-request-mib",
+        "ninfer.media_cache_mib" => "--media-cache-mib",
+        "ninfer.media_live_mib" => "--media-live-mib",
+        "ninfer.media_preprocess_threads" => "--media-preprocess-threads",
+        "ninfer.response_store_max_records" => "--response-store-max-records",
+        "ninfer.response_store_max_mib" => "--response-store-max-mib",
         _ => "",
     }
 }
@@ -316,7 +418,14 @@ pub(crate) fn translate(
     native_arguments: &[String],
 ) -> Result<Vec<OsString>, EngineError> {
     for id in settings.effective.keys() {
-        if matches!(id.as_str(), "ninfer.speculation" | "reasoning_effort") {
+        if matches!(
+            id.as_str(),
+            "ninfer.speculation"
+                | "reasoning_effort"
+                | "reasoning"
+                | "stop_strings"
+                | "system_prompt"
+        ) {
             continue;
         }
         let option = option_for_setting(id.as_str());
@@ -350,6 +459,41 @@ pub(crate) fn translate(
         ));
     }
     let speculation_enabled = speculation.unwrap_or(speculative.is_some());
+    if toggle_value(settings, "ninfer.greedy")? == Some(true)
+        && ["temperature", "top_p", "top_k", "min_p", "seed"]
+            .into_iter()
+            .any(|id| settings.value(id).is_some())
+    {
+        return Err(EngineError::InvalidConfiguration(
+            "ninfer.greedy cannot be combined with sampler defaults that it would override"
+                .to_owned(),
+        ));
+    }
+    if toggle_value(settings, "ninfer.vision")? == Some(true) && speculative == Some("dflash") {
+        return Err(EngineError::InvalidConfiguration(
+            "NInfer vision cannot be combined with the DFlash speculative backend".to_owned(),
+        ));
+    }
+    if toggle_value(settings, "ninfer.vision")? != Some(true)
+        && [
+            "ninfer.media_cache_mib",
+            "ninfer.media_live_mib",
+            "ninfer.media_preprocess_threads",
+        ]
+        .into_iter()
+        .any(|id| settings.value(id).is_some())
+    {
+        return Err(EngineError::InvalidConfiguration(
+            "NInfer media resource settings require `ninfer.vision=on`".to_owned(),
+        ));
+    }
+    if let Some(SettingValue::Integer(value)) = settings.value("reasoning_budget")
+        && *value <= 0
+    {
+        return Err(EngineError::InvalidConfiguration(
+            "NInfer default reasoning budget must be a positive token count".to_owned(),
+        ));
+    }
     if !speculation_enabled && toggle_value(settings, "ninfer.lm_head_draft")? == Some(true) {
         return Err(EngineError::InvalidConfiguration(
             "ninfer.lm_head_draft=on requires speculation and an explicit backend".to_owned(),
@@ -414,7 +558,6 @@ pub(crate) fn translate(
                     | "ninfer.max_private_continuations"
                     | "ninfer.max_shared_prefixes"
                     | "ninfer.max_long_anchors_per_continuation"
-                    | "ninfer.max_cache_markers_per_request"
             )
         })
     {
@@ -426,7 +569,14 @@ pub(crate) fn translate(
 
     let mut arguments = Vec::new();
     for (id, resolved) in &settings.effective {
-        if matches!(id.as_str(), "ninfer.speculation" | "reasoning_effort") {
+        if matches!(
+            id.as_str(),
+            "ninfer.speculation"
+                | "reasoning_effort"
+                | "reasoning"
+                | "stop_strings"
+                | "system_prompt"
+        ) {
             continue;
         }
         if !speculation_enabled
@@ -447,11 +597,16 @@ pub(crate) fn translate(
                 "ninfer.lm_head_draft" | "ninfer.preserve_thinking" if *value => {
                     arguments.push(OsString::from(option));
                 }
+                "ninfer.vision" | "ninfer.greedy" if *value => {
+                    arguments.push(OsString::from(option));
+                }
                 "ninfer.cuda_graph"
                 | "ninfer.prefix_reuse"
                 | "ninfer.thinking"
                 | "ninfer.lm_head_draft"
-                | "ninfer.preserve_thinking" => {}
+                | "ninfer.preserve_thinking"
+                | "ninfer.vision"
+                | "ninfer.greedy" => {}
                 _ => {
                     return Err(EngineError::InvalidConfiguration(format!(
                         "setting `{id}` has an invalid toggle mapping for NInfer"
@@ -462,10 +617,13 @@ pub(crate) fn translate(
                 push_value(&mut arguments, option, value);
             }
             SettingValue::Float(value) => push_value(&mut arguments, option, value),
+            SettingValue::Integer(value) => push_value(&mut arguments, option, value),
             SettingValue::Choice(value) => push_value(&mut arguments, option, value),
             SettingValue::UnsignedIntegerOrChoice(
                 UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
             ) => push_value(&mut arguments, option, value),
+            SettingValue::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(value))
+                if id.as_str() == "seed" && value == "random" => {}
             SettingValue::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(value)) => {
                 push_value(&mut arguments, option, value)
             }

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 
 use axum::Json;
@@ -9,8 +9,9 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use norted_engine::{
-    EffectiveGenerationSettings, InferenceEvent, InferenceFinishReason, InferenceMessage,
-    InferenceRole, InferenceStream, InferenceUsage, OutputFormat,
+    EffectiveGenerationSettings, InferenceContentPart, InferenceEvent, InferenceFinishReason,
+    InferenceMessage, InferenceOutput, InferenceRole, InferenceStream, InferenceTool,
+    InferenceToolCall, InferenceToolChoice, InferenceUsage, OutputFormat,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -18,9 +19,9 @@ use uuid::Uuid;
 use crate::auth::RequestCorrelation;
 use crate::error::{OpenAiError, runtime_error};
 use crate::input::{
-    NormalizedRequest, generation_settings, object, optional_bool, optional_positive_u32,
-    optional_reasoning_effort, optional_string, reject_unknown_fields, require_null_or,
-    required_string, role, text_content,
+    NormalizedRequest, generation_settings, object, optional_bool, optional_bool_value,
+    optional_nonnegative_u32, optional_positive_u32, optional_reasoning_effort, optional_string,
+    reject_unknown_fields, require_null_or, required_string, role,
 };
 use crate::{PublicApiState, unix_timestamp};
 
@@ -45,6 +46,12 @@ const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
     "stream",
     "stream_options",
     "temperature",
+    "seed",
+    "presence_penalty",
+    "frequency_penalty",
+    "stop",
+    "top_k",
+    "min_p",
     "text",
     "tool_choice",
     "tools",
@@ -69,6 +76,9 @@ pub(super) async fn create(
     let public_model = parsed.normalized.model.clone();
     let max_output_tokens = parsed.normalized.max_output_tokens;
     let reasoning_effort = parsed.normalized.generation_settings.reasoning_effort;
+    let tools = parsed.normalized.tools.clone();
+    let tool_choice = parsed.normalized.tool_choice.clone();
+    let parallel_tool_calls = parsed.normalized.parallel_tool_calls.unwrap_or(true);
     if parsed.normalized.stream {
         let routed = state
             .runtime
@@ -85,6 +95,9 @@ pub(super) async fn create(
                 max_output_tokens,
                 output_format: routed.effective_output_format,
                 reasoning_effort,
+                tools,
+                tool_choice,
+                parallel_tool_calls,
                 effective_generation_settings: routed.effective_generation_settings,
             },
             routed.stream,
@@ -109,13 +122,15 @@ pub(super) async fn create(
             max_output_tokens,
             output_format: routed.effective_output_format,
             reasoning_effort,
+            tools,
+            tool_choice,
+            parallel_tool_calls,
             effective_generation_settings: routed.effective_generation_settings,
         };
         Ok(Json(response_document(
             &context,
             status,
-            Some(&routed.output.text),
-            routed.output.usage.as_ref(),
+            Some(&routed.output),
             None,
         ))
         .into_response())
@@ -138,7 +153,13 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
     let instructions = optional_string(object, "instructions")?;
     let max_output_tokens = optional_positive_u32(object, "max_output_tokens")?;
     let mut generation_settings = generation_settings(object)?;
-    generation_settings.reasoning_effort = responses_reasoning_effort(object.get("reasoning"))?;
+    let reasoning = responses_reasoning(object.get("reasoning"))?;
+    generation_settings.reasoning_effort = reasoning.effort;
+    generation_settings.reasoning_enabled = reasoning.enabled;
+    generation_settings.reasoning_budget = reasoning.budget;
+    let tools = parse_tools(object.get("tools"))?;
+    let tool_choice = parse_tool_choice(object.get("tool_choice"), &tools)?;
+    let parallel_tool_calls = optional_bool_value(object, "parallel_tool_calls")?;
     let output_format = parse_text_format(object.get("text"))?;
     let input = object.get("input").ok_or_else(|| {
         OpenAiError::invalid(
@@ -149,16 +170,15 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
     })?;
     let mut messages = Vec::new();
     if let Some(instructions) = &instructions {
-        messages.push(InferenceMessage {
-            role: InferenceRole::Developer,
-            text: instructions.clone(),
-        });
+        messages.push(InferenceMessage::text(
+            InferenceRole::Developer,
+            instructions.clone(),
+        ));
     }
     match input {
-        Value::String(text) => messages.push(InferenceMessage {
-            role: InferenceRole::User,
-            text: text.clone(),
-        }),
+        Value::String(text) => {
+            messages.push(InferenceMessage::text(InferenceRole::User, text.clone()))
+        }
         Value::Array(items) => {
             if items.is_empty() {
                 return Err(OpenAiError::invalid(
@@ -168,7 +188,17 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
                 ));
             }
             for (index, item) in items.iter().enumerate() {
-                messages.push(parse_message(item, index)?);
+                for message in parse_input_item(item, index)? {
+                    if message.role == InferenceRole::Assistant
+                        && let Some(previous) = messages.last_mut()
+                        && previous.role == InferenceRole::Assistant
+                    {
+                        previous.content.extend(message.content);
+                        previous.tool_calls.extend(message.tool_calls);
+                    } else {
+                        messages.push(message);
+                    }
+                }
             }
         }
         _ => {
@@ -185,6 +215,9 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
             messages,
             max_output_tokens,
             generation_settings,
+            tools,
+            tool_choice,
+            parallel_tool_calls,
             output_format,
             stream,
         },
@@ -192,7 +225,7 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
     })
 }
 
-fn parse_message(value: &Value, index: usize) -> Result<InferenceMessage, OpenAiError> {
+fn parse_input_item(value: &Value, index: usize) -> Result<Vec<InferenceMessage>, OpenAiError> {
     let parameter = format!("input[{index}]");
     let message = value.as_object().ok_or_else(|| {
         OpenAiError::invalid(
@@ -201,16 +234,91 @@ fn parse_message(value: &Value, index: usize) -> Result<InferenceMessage, OpenAi
             "invalid_type",
         )
     })?;
-    reject_unknown_fields(message, &["type", "role", "content"], "input message")?;
-    if let Some(kind) = message.get("type")
-        && !kind.is_null()
-        && kind.as_str() != Some("message")
-    {
+    let item_type = message
+        .get("type")
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_str)
+        .unwrap_or("message");
+    if item_type == "function_call" {
+        reject_unknown_fields(
+            message,
+            &["type", "id", "call_id", "name", "arguments", "status"],
+            "function_call input Item",
+        )?;
+        require_null_or(
+            message,
+            "status",
+            |value| value.as_str() == Some("completed"),
+            "`\"completed\"`",
+        )?;
+        let call_id = required_nonempty(message.get("call_id"), &format!("{parameter}.call_id"))?;
+        let arguments =
+            required_nonempty(message.get("arguments"), &format!("{parameter}.arguments"))?;
+        if !serde_json::from_str::<Value>(&arguments).is_ok_and(|value| value.is_object()) {
+            return Err(OpenAiError::invalid(
+                "Function-call `arguments` must encode a JSON object.",
+                Some(format!("{parameter}.arguments")),
+                "invalid_value",
+            ));
+        }
+        return Ok(vec![InferenceMessage {
+            role: InferenceRole::Assistant,
+            content: Vec::new(),
+            tool_calls: vec![InferenceToolCall {
+                id: call_id,
+                name: required_nonempty(message.get("name"), &format!("{parameter}.name"))?,
+                arguments,
+            }],
+            tool_call_id: None,
+        }]);
+    }
+    if item_type == "function_call_output" {
+        reject_unknown_fields(
+            message,
+            &["type", "id", "call_id", "name", "output", "status"],
+            "function_call_output input Item",
+        )?;
+        require_null_or(
+            message,
+            "status",
+            |value| value.as_str() == Some("completed"),
+            "`\"completed\"`",
+        )?;
+        require_null_or(message, "name", Value::is_string, "a string")?;
+        let output = message.get("output").ok_or_else(|| {
+            OpenAiError::invalid(
+                "Function-call output requires `output`.",
+                Some(format!("{parameter}.output")),
+                "missing_required_parameter",
+            )
+        })?;
+        return Ok(vec![InferenceMessage {
+            role: InferenceRole::Tool,
+            content: parse_responses_content(
+                output,
+                &format!("{parameter}.output"),
+                InferenceRole::Tool,
+            )?,
+            tool_calls: Vec::new(),
+            tool_call_id: Some(required_nonempty(
+                message.get("call_id"),
+                &format!("{parameter}.call_id"),
+            )?),
+        }]);
+    }
+    if item_type != "message" {
         return Err(OpenAiError::unsupported(
-            "Only `message` input items are supported.",
+            "Only `message`, `function_call`, and `function_call_output` input Items are supported.",
             format!("{parameter}.type"),
         ));
     }
+    reject_unknown_fields(
+        message,
+        &["type", "role", "content", "id", "status"],
+        "input message",
+    )?;
+    require_null_or(message, "id", Value::is_string, "a string")?;
+    require_null_or(message, "status", Value::is_string, "a string")?;
     let role = role(message.get("role"), &format!("{parameter}.role"))?;
     let content = message.get("content").ok_or_else(|| {
         OpenAiError::invalid(
@@ -219,8 +327,254 @@ fn parse_message(value: &Value, index: usize) -> Result<InferenceMessage, OpenAi
             "missing_required_parameter",
         )
     })?;
-    let text = text_content(content, &format!("{parameter}.content"), "input_text")?;
-    Ok(InferenceMessage { role, text })
+    Ok(vec![InferenceMessage {
+        role,
+        content: parse_responses_content(content, &format!("{parameter}.content"), role)?,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    }])
+}
+
+fn parse_responses_content(
+    value: &Value,
+    parameter: &str,
+    role: InferenceRole,
+) -> Result<Vec<InferenceContentPart>, OpenAiError> {
+    if let Some(text) = value.as_str() {
+        return Ok(vec![InferenceContentPart::Text {
+            text: text.to_owned(),
+        }]);
+    }
+    let parts = value.as_array().ok_or_else(|| {
+        OpenAiError::invalid(
+            "Content must be a string or an array of typed parts.",
+            Some(parameter),
+            "invalid_type",
+        )
+    })?;
+    if parts.is_empty() {
+        return Err(OpenAiError::invalid(
+            "Content part arrays must not be empty.",
+            Some(parameter),
+            "invalid_value",
+        ));
+    }
+    let mut content = Vec::with_capacity(parts.len());
+    for (index, part) in parts.iter().enumerate() {
+        let part_parameter = format!("{parameter}[{index}]");
+        let part = part.as_object().ok_or_else(|| {
+            OpenAiError::invalid(
+                "Content parts must be objects.",
+                Some(part_parameter.clone()),
+                "invalid_type",
+            )
+        })?;
+        match part.get("type").and_then(Value::as_str) {
+            Some("input_text" | "output_text" | "refusal") => {
+                reject_unknown_fields(part, &["type", "text"], "Responses text content")?;
+                content.push(InferenceContentPart::Text {
+                    text: required_nonempty(part.get("text"), &format!("{part_parameter}.text"))?,
+                });
+            }
+            Some("input_image")
+                if matches!(
+                    role,
+                    InferenceRole::User | InferenceRole::Assistant | InferenceRole::Tool
+                ) =>
+            {
+                reject_unknown_fields(
+                    part,
+                    &["type", "image_url", "detail"],
+                    "Responses image content",
+                )?;
+                require_null_or(
+                    part,
+                    "detail",
+                    |value| value.as_str() == Some("auto"),
+                    "`\"auto\"`",
+                )?;
+                content.push(InferenceContentPart::ImageUrl {
+                    url: media_url(
+                        part.get("image_url"),
+                        &format!("{part_parameter}.image_url"),
+                    )?,
+                });
+            }
+            Some("input_video") if role == InferenceRole::User => {
+                reject_unknown_fields(part, &["type", "video_url"], "Responses video content")?;
+                content.push(InferenceContentPart::VideoUrl {
+                    url: media_url(
+                        part.get("video_url"),
+                        &format!("{part_parameter}.video_url"),
+                    )?,
+                });
+            }
+            Some(kind) => {
+                return Err(OpenAiError::unsupported(
+                    format!("Unsupported Responses content type `{kind}` for this role."),
+                    format!("{part_parameter}.type"),
+                ));
+            }
+            None => {
+                return Err(OpenAiError::invalid(
+                    "Content parts require a string `type`.",
+                    Some(format!("{part_parameter}.type")),
+                    "missing_required_parameter",
+                ));
+            }
+        }
+    }
+    Ok(content)
+}
+
+fn media_url(value: Option<&Value>, parameter: &str) -> Result<String, OpenAiError> {
+    let url = required_nonempty(value, parameter)?;
+    if !(url.starts_with("https://") || url.starts_with("http://") || url.starts_with("data:")) {
+        return Err(OpenAiError::unsupported(
+            "Media input supports only HTTP(S) and data URLs; local file paths are forbidden.",
+            parameter,
+        ));
+    }
+    Ok(url)
+}
+
+fn parse_tools(value: Option<&Value>) -> Result<Vec<InferenceTool>, OpenAiError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let tools = value.as_array().ok_or_else(|| {
+        OpenAiError::invalid("`tools` must be an array.", Some("tools"), "invalid_type")
+    })?;
+    let mut parsed = Vec::with_capacity(tools.len());
+    for (index, tool) in tools.iter().enumerate() {
+        let parameter = format!("tools[{index}]");
+        let tool = tool.as_object().ok_or_else(|| {
+            OpenAiError::invalid(
+                "Tools must be objects.",
+                Some(parameter.clone()),
+                "invalid_type",
+            )
+        })?;
+        reject_unknown_fields(
+            tool,
+            &["type", "name", "description", "parameters", "strict"],
+            "Responses tool",
+        )?;
+        if tool.get("type").and_then(Value::as_str) != Some("function") {
+            return Err(OpenAiError::unsupported(
+                "Only direct function tools are supported.",
+                format!("{parameter}.type"),
+            ));
+        }
+        require_null_or(tool, "strict", |value| value == false, "`false`")?;
+        let name = required_nonempty(tool.get("name"), &format!("{parameter}.name"))?;
+        if parsed
+            .iter()
+            .any(|existing: &InferenceTool| existing.name == name)
+        {
+            return Err(OpenAiError::invalid(
+                "Function tool names must be unique.",
+                Some(format!("{parameter}.name")),
+                "duplicate_parameter",
+            ));
+        }
+        let parameters = tool
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+        if !parameters.is_object() {
+            return Err(OpenAiError::invalid(
+                "Function `parameters` must be a JSON object.",
+                Some(format!("{parameter}.parameters")),
+                "invalid_type",
+            ));
+        }
+        parsed.push(InferenceTool {
+            name,
+            description: tool
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            parameters,
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_tool_choice(
+    value: Option<&Value>,
+    tools: &[InferenceTool],
+) -> Result<Option<InferenceToolChoice>, OpenAiError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let choice = match value {
+        Value::String(value) => match value.as_str() {
+            "auto" => InferenceToolChoice::Auto,
+            "none" => InferenceToolChoice::None,
+            "required" => InferenceToolChoice::Required,
+            _ => {
+                return Err(OpenAiError::unsupported(
+                    "`tool_choice` must be `auto`, `none`, `required`, or a named function.",
+                    "tool_choice",
+                ));
+            }
+        },
+        Value::Object(choice) => {
+            reject_unknown_fields(choice, &["type", "name"], "tool_choice")?;
+            if choice.get("type").and_then(Value::as_str) != Some("function") {
+                return Err(OpenAiError::unsupported(
+                    "Only named function tool choice objects are supported.",
+                    "tool_choice.type",
+                ));
+            }
+            InferenceToolChoice::Function {
+                name: required_nonempty(choice.get("name"), "tool_choice.name")?,
+            }
+        }
+        _ => {
+            return Err(OpenAiError::invalid(
+                "`tool_choice` must be a string or object.",
+                Some("tool_choice"),
+                "invalid_type",
+            ));
+        }
+    };
+    if matches!(
+        choice,
+        InferenceToolChoice::Required | InferenceToolChoice::Function { .. }
+    ) && tools.is_empty()
+    {
+        return Err(OpenAiError::invalid(
+            "This `tool_choice` requires at least one declared function tool.",
+            Some("tool_choice"),
+            "invalid_value",
+        ));
+    }
+    if let InferenceToolChoice::Function { name } = &choice
+        && !tools.iter().any(|tool| tool.name == *name)
+    {
+        return Err(OpenAiError::invalid(
+            "Named `tool_choice` must reference a declared function.",
+            Some("tool_choice.name"),
+            "invalid_value",
+        ));
+    }
+    Ok(Some(choice))
+}
+
+fn required_nonempty(value: Option<&Value>, parameter: &str) -> Result<String, OpenAiError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            OpenAiError::invalid(
+                format!("`{parameter}` must be a non-empty string."),
+                Some(parameter),
+                "invalid_value",
+            )
+        })
 }
 
 fn validate_identity_fields(
@@ -229,18 +583,6 @@ fn validate_identity_fields(
 ) -> Result<(), OpenAiError> {
     require_null_or(object, "store", |value| value == false, "`false`")?;
     require_null_or(object, "background", |value| value == false, "`false`")?;
-    require_null_or(
-        object,
-        "tools",
-        |value| value.as_array().is_some_and(Vec::is_empty),
-        "an empty array",
-    )?;
-    require_null_or(
-        object,
-        "tool_choice",
-        |value| value.as_str() == Some("none"),
-        "`\"none\"`",
-    )?;
     require_null_or(
         object,
         "truncation",
@@ -258,12 +600,6 @@ fn validate_identity_fields(
         "include",
         |value| value.as_array().is_some_and(Vec::is_empty),
         "an empty array",
-    )?;
-    require_null_or(
-        object,
-        "parallel_tool_calls",
-        |value| value == false,
-        "`false`",
     )?;
     require_null_or(
         object,
@@ -292,11 +628,16 @@ fn validate_identity_fields(
     validate_stream_options(object.get("stream_options"), stream)
 }
 
-fn responses_reasoning_effort(
-    value: Option<&Value>,
-) -> Result<Option<norted_engine::ReasoningEffort>, OpenAiError> {
+#[derive(Default)]
+struct ResponsesReasoning {
+    effort: Option<norted_engine::ReasoningEffort>,
+    enabled: Option<bool>,
+    budget: Option<i64>,
+}
+
+fn responses_reasoning(value: Option<&Value>) -> Result<ResponsesReasoning, OpenAiError> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(None);
+        return Ok(ResponsesReasoning::default());
     };
     let reasoning = value.as_object().ok_or_else(|| {
         OpenAiError::invalid(
@@ -305,8 +646,26 @@ fn responses_reasoning_effort(
             "invalid_type",
         )
     })?;
-    reject_unknown_fields(reasoning, &["effort"], "reasoning")?;
-    optional_reasoning_effort(reasoning.get("effort"), "reasoning.effort")
+    reject_unknown_fields(
+        reasoning,
+        &["effort", "enabled", "budget_tokens"],
+        "reasoning",
+    )?;
+    let effort = optional_reasoning_effort(reasoning.get("effort"), "reasoning.effort")?;
+    let enabled = optional_bool_value(reasoning, "enabled")?;
+    let budget = optional_nonnegative_u32(reasoning, "budget_tokens")?.map(i64::from);
+    if effort == Some(norted_engine::ReasoningEffort::None) && enabled == Some(true) {
+        return Err(OpenAiError::invalid(
+            "`reasoning.effort=none` conflicts with `reasoning.enabled=true`.",
+            Some("reasoning"),
+            "conflicting_parameters",
+        ));
+    }
+    Ok(ResponsesReasoning {
+        effort,
+        enabled,
+        budget,
+    })
 }
 
 fn parse_text_format(value: Option<&Value>) -> Result<Option<OutputFormat>, OpenAiError> {
@@ -428,6 +787,9 @@ struct ResponseContext {
     max_output_tokens: Option<u32>,
     output_format: Option<OutputFormat>,
     reasoning_effort: Option<norted_engine::ReasoningEffort>,
+    tools: Vec<InferenceTool>,
+    tool_choice: Option<InferenceToolChoice>,
+    parallel_tool_calls: bool,
     effective_generation_settings: EffectiveGenerationSettings,
 }
 
@@ -468,8 +830,7 @@ impl ResponseStatus {
 fn response_document(
     context: &ResponseContext,
     status: ResponseStatus,
-    text: Option<&str>,
-    usage: Option<&InferenceUsage>,
+    generated: Option<&InferenceOutput>,
     error: Option<Value>,
 ) -> Value {
     let message_status = match status {
@@ -477,11 +838,17 @@ fn response_document(
         ResponseStatus::Incomplete => Some(OutputMessageStatus::Incomplete),
         ResponseStatus::InProgress | ResponseStatus::Failed => None,
     };
-    let output = text
-        .zip(message_status)
-        .map_or_else(Vec::new, |(text, status)| {
-            vec![message_item(context, status, text)]
-        });
+    let mut output = Vec::new();
+    if let Some(generated) = generated {
+        if (!generated.text.is_empty() || generated.tool_calls.is_empty())
+            && let Some(status) = message_status
+        {
+            output.push(message_item(context, status, &generated.text));
+        }
+        for (index, call) in generated.tool_calls.iter().enumerate() {
+            output.push(function_call_item(context, index as u32, call));
+        }
+    }
     let completed_at = if status == ResponseStatus::Completed {
         json!(unix_timestamp())
     } else {
@@ -503,10 +870,10 @@ fn response_document(
         "metadata": {},
         "model": context.model,
         "output": output,
-        "parallel_tool_calls": false,
+        "parallel_tool_calls": context.parallel_tool_calls,
         "temperature": context.effective_generation_settings.temperature,
-        "tool_choice": "none",
-        "tools": [],
+        "tool_choice": responses_tool_choice(context.tool_choice.as_ref()),
+        "tools": context.tools.iter().map(responses_tool).collect::<Vec<_>>(),
         "top_p": context.effective_generation_settings.top_p,
         "background": false,
         "max_output_tokens": context.max_output_tokens,
@@ -516,13 +883,48 @@ fn response_document(
         "text": { "format": responses_output_format(context.output_format.as_ref()) },
         "truncation": "disabled",
     });
-    if let Some(usage) = usage.and_then(usage_document) {
+    if let Some(usage) = generated
+        .and_then(|generated| generated.usage.as_ref())
+        .and_then(usage_document)
+    {
         document
             .as_object_mut()
             .expect("Response document is an object")
             .insert("usage".to_owned(), usage);
     }
     document
+}
+
+fn responses_tool(tool: &InferenceTool) -> Value {
+    json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.parameters,
+        "strict": false,
+    })
+}
+
+fn responses_tool_choice(choice: Option<&InferenceToolChoice>) -> Value {
+    match choice {
+        None | Some(InferenceToolChoice::Auto) => json!("auto"),
+        Some(InferenceToolChoice::None) => json!("none"),
+        Some(InferenceToolChoice::Required) => json!("required"),
+        Some(InferenceToolChoice::Function { name }) => {
+            json!({"type": "function", "name": name})
+        }
+    }
+}
+
+fn function_call_item(context: &ResponseContext, index: u32, call: &InferenceToolCall) -> Value {
+    json!({
+        "id": format!("fc_{}_{}", context.response_id.trim_start_matches("resp_"), index),
+        "type": "function_call",
+        "status": "completed",
+        "call_id": call.id,
+        "name": call.name,
+        "arguments": call.arguments,
+    })
 }
 
 fn responses_output_format(format: Option<&OutputFormat>) -> Value {
@@ -588,8 +990,21 @@ struct PublicStreamState {
     backend: InferenceStream,
     queue: VecDeque<Result<Bytes, Infallible>>,
     text: String,
+    text_output_index: Option<u32>,
+    tool_calls: BTreeMap<u32, StreamToolCall>,
+    next_output_index: u32,
     sequence: u64,
     terminal: bool,
+}
+
+#[derive(Default)]
+struct StreamToolCall {
+    output_index: Option<u32>,
+    item_id: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+    added: bool,
 }
 
 fn streaming_response(context: ResponseContext, backend: InferenceStream) -> Response {
@@ -598,42 +1013,17 @@ fn streaming_response(context: ResponseContext, backend: InferenceStream) -> Res
         backend,
         queue: VecDeque::new(),
         text: String::new(),
+        text_output_index: None,
+        tool_calls: BTreeMap::new(),
+        next_output_index: 0,
         sequence: 0,
         terminal: false,
     };
     let initial_response =
-        response_document(&state.context, ResponseStatus::InProgress, None, None, None);
+        response_document(&state.context, ResponseStatus::InProgress, None, None);
     state.push_event("response.created", json!({ "response": initial_response }));
-    let in_progress =
-        response_document(&state.context, ResponseStatus::InProgress, None, None, None);
+    let in_progress = response_document(&state.context, ResponseStatus::InProgress, None, None);
     state.push_event("response.in_progress", json!({ "response": in_progress }));
-    state.push_event(
-        "response.output_item.added",
-        json!({
-            "output_index": 0,
-            "item": {
-                "id": state.context.message_id,
-                "type": "message",
-                "status": "in_progress",
-                "role": "assistant",
-                "content": [],
-            },
-        }),
-    );
-    state.push_event(
-        "response.content_part.added",
-        json!({
-            "item_id": state.context.message_id,
-            "output_index": 0,
-            "content_index": 0,
-            "part": {
-                "type": "output_text",
-                "text": "",
-                "annotations": [],
-            },
-        }),
-    );
-
     let public_stream = stream::unfold(state, |mut state| async move {
         loop {
             if let Some(event) = state.queue.pop_front() {
@@ -644,18 +1034,25 @@ fn streaming_response(context: ResponseContext, backend: InferenceStream) -> Res
             }
             match state.backend.next().await {
                 Some(Ok(InferenceEvent::TextDelta { delta })) => {
+                    let output_index = state.ensure_text_started();
                     state.text.push_str(&delta);
                     state.push_event(
                         "response.output_text.delta",
                         json!({
                             "item_id": state.context.message_id,
-                            "output_index": 0,
+                            "output_index": output_index,
                             "content_index": 0,
                             "delta": delta,
                             "logprobs": [],
                         }),
                     );
                 }
+                Some(Ok(InferenceEvent::ToolCallDelta {
+                    index,
+                    id,
+                    name,
+                    arguments_delta,
+                })) => state.push_tool_delta(index, id, name, arguments_delta),
                 Some(Ok(InferenceEvent::Completed {
                     usage,
                     finish_reason,
@@ -681,6 +1078,102 @@ fn streaming_response(context: ResponseContext, backend: InferenceStream) -> Res
 }
 
 impl PublicStreamState {
+    fn ensure_text_started(&mut self) -> u32 {
+        if let Some(index) = self.text_output_index {
+            return index;
+        }
+        let output_index = self.next_output_index;
+        self.next_output_index = self.next_output_index.saturating_add(1);
+        self.text_output_index = Some(output_index);
+        self.push_event(
+            "response.output_item.added",
+            json!({
+                "output_index": output_index,
+                "item": {
+                    "id": self.context.message_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+            }),
+        );
+        self.push_event(
+            "response.content_part.added",
+            json!({
+                "item_id": self.context.message_id,
+                "output_index": output_index,
+                "content_index": 0,
+                "part": {
+                    "type": "output_text",
+                    "text": "",
+                    "annotations": [],
+                },
+            }),
+        );
+        output_index
+    }
+
+    fn push_tool_delta(
+        &mut self,
+        index: u32,
+        id: Option<String>,
+        name: Option<String>,
+        arguments_delta: String,
+    ) {
+        let call = self.tool_calls.entry(index).or_default();
+        if let Some(id) = id {
+            call.call_id = id;
+        }
+        if let Some(name) = name {
+            call.name = name;
+        }
+        call.arguments.push_str(&arguments_delta);
+        if call.output_index.is_none() {
+            call.output_index = Some(self.next_output_index);
+            self.next_output_index = self.next_output_index.saturating_add(1);
+            call.item_id = format!(
+                "fc_{}_{}",
+                self.context.response_id.trim_start_matches("resp_"),
+                index
+            );
+        }
+        let output_index = call.output_index.expect("assigned");
+        let item_id = call.item_id.clone();
+        let call_id = call.call_id.clone();
+        let call_name = call.name.clone();
+        let should_add = !call.added && !call_id.is_empty() && !call_name.is_empty();
+        if should_add {
+            call.added = true;
+        }
+        if should_add {
+            self.push_event(
+                "response.output_item.added",
+                json!({
+                    "output_index": output_index,
+                    "item": {
+                        "id": item_id,
+                        "type": "function_call",
+                        "status": "in_progress",
+                        "call_id": call_id,
+                        "name": call_name,
+                        "arguments": "",
+                    },
+                }),
+            );
+        }
+        if !arguments_delta.is_empty() {
+            self.push_event(
+                "response.function_call_arguments.delta",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "delta": arguments_delta,
+                }),
+            );
+        }
+    }
+
     fn push_event(&mut self, event_type: &'static str, payload: Value) {
         let mut payload = payload.as_object().cloned().unwrap_or_default();
         payload.insert("type".to_owned(), Value::String(event_type.to_owned()));
@@ -708,37 +1201,81 @@ impl PublicStreamState {
                 )
             };
         let text = self.text.clone();
-        self.push_event(
-            "response.output_text.done",
-            json!({
-                "item_id": self.context.message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "text": text,
-                "logprobs": [],
-            }),
-        );
-        self.push_event(
-            "response.content_part.done",
-            json!({
-                "item_id": self.context.message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "part": {
-                    "type": "output_text",
+        if let Some(output_index) = self.text_output_index {
+            self.push_event(
+                "response.output_text.done",
+                json!({
+                    "item_id": self.context.message_id,
+                    "output_index": output_index,
+                    "content_index": 0,
                     "text": text,
-                    "annotations": [],
-                },
-            }),
-        );
-        self.push_event(
-            "response.output_item.done",
-            json!({
-                "output_index": 0,
-                "item": message_item(&self.context, message_status, &text),
-            }),
-        );
-        let response = response_document(&self.context, status, Some(&text), usage, None);
+                    "logprobs": [],
+                }),
+            );
+            self.push_event(
+                "response.content_part.done",
+                json!({
+                    "item_id": self.context.message_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": {
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": [],
+                    },
+                }),
+            );
+            self.push_event(
+                "response.output_item.done",
+                json!({
+                    "output_index": output_index,
+                    "item": message_item(&self.context, message_status, &text),
+                }),
+            );
+        }
+        let completed_calls = self
+            .tool_calls
+            .iter()
+            .map(|(index, call)| {
+                (
+                    *index,
+                    call.output_index.unwrap_or(0),
+                    call.item_id.clone(),
+                    InferenceToolCall {
+                        id: call.call_id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        for (index, output_index, item_id, call) in &completed_calls {
+            self.push_event(
+                "response.function_call_arguments.done",
+                json!({
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "arguments": call.arguments,
+                }),
+            );
+            self.push_event(
+                "response.output_item.done",
+                json!({
+                    "output_index": output_index,
+                    "item": function_call_item(&self.context, *index, call),
+                }),
+            );
+        }
+        let generated = InferenceOutput {
+            text,
+            tool_calls: completed_calls
+                .into_iter()
+                .map(|(_, _, _, call)| call)
+                .collect(),
+            usage: usage.cloned(),
+            finish_reason,
+        };
+        let response = response_document(&self.context, status, Some(&generated), None);
         self.push_event(terminal_event, json!({ "response": response }));
         self.terminal = true;
     }
@@ -748,13 +1285,7 @@ impl PublicStreamState {
             "code": "server_error",
             "message": "The model failed to generate a response.",
         });
-        let response = response_document(
-            &self.context,
-            ResponseStatus::Failed,
-            None,
-            None,
-            Some(error),
-        );
+        let response = response_document(&self.context, ResponseStatus::Failed, None, Some(error));
         self.push_event("response.failed", json!({ "response": response }));
         self.terminal = true;
     }
@@ -769,7 +1300,7 @@ mod tests {
     use futures_util::stream;
     use norted_engine::{
         EffectiveGenerationSettings, EngineError, InferenceEvent, InferenceFinishReason,
-        InferenceRole, InferenceStream, InferenceUsage, ReasoningEffort,
+        InferenceOutput, InferenceRole, InferenceStream, InferenceUsage, ReasoningEffort,
     };
     use serde_json::{Value, json};
 
@@ -878,8 +1409,12 @@ mod tests {
         let completed = response_document(
             &context(),
             ResponseStatus::Completed,
-            Some("done"),
-            None,
+            Some(&InferenceOutput {
+                text: "done".to_owned(),
+                tool_calls: Vec::new(),
+                usage: None,
+                finish_reason: InferenceFinishReason::Stop,
+            }),
             None,
         );
         assert_eq!(completed["object"], "response");
@@ -891,12 +1426,16 @@ mod tests {
         let incomplete = response_document(
             &context(),
             ResponseStatus::Incomplete,
-            Some("partial"),
-            Some(&InferenceUsage {
-                input_tokens: 2,
-                output_tokens: 1,
-                total_tokens: 3,
-                ..Default::default()
+            Some(&InferenceOutput {
+                text: "partial".to_owned(),
+                tool_calls: Vec::new(),
+                usage: Some(InferenceUsage {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                    total_tokens: 3,
+                    ..Default::default()
+                }),
+                finish_reason: InferenceFinishReason::MaxOutputTokens,
             }),
             None,
         );
@@ -1027,6 +1566,9 @@ mod tests {
             max_output_tokens: None,
             output_format: None,
             reasoning_effort: None,
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: false,
             effective_generation_settings: EffectiveGenerationSettings {
                 temperature: 0.7,
                 top_p: 0.95,

@@ -29,11 +29,11 @@ use norted_engine::{
     EngineIdentity, EngineProbe, GenerationSettingsPatch, GitHubCommit, GitHubRelease,
     GitHubReleaseAsset, GitHubReleaseClient, InferenceEvent, InferenceFinishReason,
     InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
-    InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter,
-    NativeOption, OptionValueKind, PreparedAuxiliaryArtifact, PreparedModelInput,
-    ProcessDescriptor, RuntimeCatalogProvider, StartupObservation, UpdateState, capture_command,
-    common_setting_definitions, compatibility_for, compatibility_for_nvidia_device,
-    isolated_cuda_environment, prepare_norted_package_input,
+    InferenceToolCall, InferenceToolChoice, InferenceUsage, InstallationState, LaunchRequest,
+    LaunchSpec, LoadProgressReporter, NativeOption, OptionValueKind, PreparedAuxiliaryArtifact,
+    PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider, StartupObservation, UpdateState,
+    capture_command, common_setting_definitions, compatibility_for,
+    compatibility_for_nvidia_device, isolated_cuda_environment, prepare_norted_package_input,
     prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
     revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
 };
@@ -87,6 +87,7 @@ const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &[
     "Q27_API_KEY",
     "Q27_FORCE_TEMP",
     "Q27_FORCE_TOP_P",
+    "Q27_BATCH",
     "Q27_SAMPLED",
     "Q27_BARE",
     "Q27_KV",
@@ -1046,6 +1047,10 @@ struct Q27RuntimeCapabilities {
     unlimited_think_budget: bool,
     temperature_top_p: bool,
     top_k_min_p: bool,
+    request_seed: bool,
+    request_thinking: bool,
+    tool_calling: bool,
+    stable_serving_environment: bool,
     mtp_environment: bool,
     mtp_disable_control: bool,
     fast_head_control: bool,
@@ -1089,6 +1094,10 @@ fn q27_runtime_capabilities(
         unlimited_think_budget: trustworthy_identity,
         temperature_top_p: trustworthy_identity,
         top_k_min_p: exact_source_contract,
+        request_seed: exact_source_contract,
+        request_thinking: exact_source_contract,
+        tool_calling: exact_source_contract,
+        stable_serving_environment: exact_source_contract,
         mtp_environment: trustworthy_identity,
         // The exact q27 engine always performs NextN/MTP speculative decode.
         // Q27_SUFFIX=0 disables only suffix drafting; it is not an MTP-off switch.
@@ -1173,6 +1182,42 @@ fn validate_q27_settings_prelaunch(
     {
         failures.push("top-k/min-p controls are unproven");
     }
+    if settings.value("seed").is_some() && !capabilities.request_seed {
+        failures.push("request-default seed control is unproven");
+    }
+    if (settings.value("seed").is_some()
+        || setting_unsigned(settings, "top_k").is_some_and(|value| value > 0)
+        || setting_float(settings, "min_p").is_some_and(|value| value > 0.0))
+        && setting_float(settings, "temperature").unwrap_or(0.0) <= 0.0
+    {
+        failures
+            .push("q27 seed/top-k/min-p request defaults require a positive temperature default");
+    }
+    if (settings.value("reasoning").is_some() || settings.value("reasoning_budget").is_some())
+        && (!capabilities.request_thinking
+            || setting_toggle(settings, "q27.request_thinking") != Some(true))
+    {
+        failures.push(
+            "q27 reasoning request defaults require the proven `q27.request_thinking` launch control",
+        );
+    }
+    if settings.value("q27.request_thinking").is_some() && !capabilities.request_thinking {
+        failures.push("per-request thinking control is unproven");
+    }
+    if settings.value("q27.constrain_tools").is_some() && !capabilities.tool_calling {
+        failures.push("tool grammar constraint control is unproven");
+    }
+    if (settings.value("q27.continuous_batching").is_some()
+        || settings.value("q27.sampled_graphs").is_some())
+        && !capabilities.stable_serving_environment
+    {
+        failures.push("stable batching/sampled-graph controls are unproven");
+    }
+    if setting_toggle(settings, "q27.sampled_graphs") == Some(false)
+        && setting_float(settings, "temperature").is_some_and(|temperature| temperature > 0.0)
+    {
+        failures.push("q27 sampled graphs cannot be disabled with a sampled temperature default");
+    }
     if [
         "q27.mtp",
         "q27.mtp_max_depth",
@@ -1196,6 +1241,11 @@ fn validate_q27_settings_prelaunch(
     }
     if settings.value("q27.kv_mode").is_some() && capabilities.supported_kv_modes.is_empty() {
         failures.push("no configurable KV mode is proven for this executable");
+    }
+    if settings.value("q27.slot1_context_length").is_some()
+        && setting_unsigned(settings, "parallel_requests").unwrap_or(1) < 2
+    {
+        failures.push("q27 background-slot context requires at least two configured slots");
     }
     if failures.is_empty() {
         Ok(())
@@ -1438,6 +1488,7 @@ struct Q27ConfiguredExecution {
     sharp_template: Option<String>,
     compiled_w_max: Option<u64>,
     selected_kv_mode: Option<Q27KvMode>,
+    capabilities: Q27RuntimeCapabilities,
 }
 
 #[derive(Debug)]
@@ -1484,9 +1535,18 @@ fn q27_has_configured_execution(settings: &norted_core::ResolvedSettings) -> boo
                 | "top_p"
                 | "top_k"
                 | "min_p"
-                | "reasoning_effort"
+                | "seed"
+                | "max_output_tokens"
+                | "system_prompt"
+                | "reasoning"
+                | "reasoning_budget"
                 | "q27.thinking"
                 | "q27.thinking_budget"
+                | "q27.request_thinking"
+                | "q27.constrain_tools"
+                | "q27.continuous_batching"
+                | "q27.sampled_graphs"
+                | "q27.slot1_context_length"
                 | "q27.fast_head"
                 | "q27.kv_mode"
                 | "q27.mtp"
@@ -1528,6 +1588,12 @@ fn q27_configured_launch(
             OsString::from(budget.to_string()),
         ]);
     }
+    if setting_toggle(settings, "q27.request_thinking") == Some(true) {
+        arguments.push(OsString::from("--request-think"));
+    }
+    if setting_toggle(settings, "q27.constrain_tools") == Some(true) {
+        arguments.push(OsString::from("--constrain-tools"));
+    }
     for (option, value) in [
         (
             "--temp",
@@ -1551,6 +1617,12 @@ fn q27_configured_launch(
         }
     }
     let mut environment = BTreeMap::new();
+    if let Some(enabled) = setting_toggle(settings, "q27.continuous_batching") {
+        environment.insert("Q27_BATCH".to_owned(), u8::from(enabled).to_string());
+    }
+    if let Some(enabled) = setting_toggle(settings, "q27.sampled_graphs") {
+        environment.insert("Q27_SAMPLED".to_owned(), u8::from(enabled).to_string());
+    }
     if let Some(kv_mode) = selected_kv_mode {
         if kv_mode == Q27KvMode::Fp16 {
             arguments.push(OsString::from("--kv-fp16"));
@@ -1869,9 +1941,6 @@ impl Q27Adapter {
                 None => revalidate_norted_package_before_launch(&spec.model).await?,
             }
         }
-        if !q27_has_configured_execution(&spec.settings) {
-            return Ok(());
-        }
         let capabilities = q27_runtime_capabilities(
             &spec.runtime.manifest.identity,
             &spec.runtime.manifest.acquisition_method,
@@ -1881,6 +1950,9 @@ impl Q27Adapter {
                 .as_ref()
                 .map(Q27SourceBuildEvidence::Provenance),
         );
+        if !capabilities.trustworthy_identity && !q27_has_configured_execution(&spec.settings) {
+            return Ok(());
+        }
         validate_q27_settings_prelaunch(&spec.settings, capabilities).map_err(|reason| {
             EngineError::InvalidConfiguration(format!(
                 "selected q27 runtime cannot satisfy the effective settings: {reason}"
@@ -1930,12 +2002,34 @@ impl Q27Adapter {
                 sharp_template,
                 compiled_w_max,
                 selected_kv_mode,
+                capabilities,
             },
         );
         Ok(())
     }
 
-    fn backend_request(&self, request: &InferenceRequest, stream: bool) -> Value {
+    fn backend_request(
+        &self,
+        request: &InferenceRequest,
+        stream: bool,
+    ) -> Result<Value, EngineError> {
+        if request.messages.iter().any(InferenceMessage::has_media)
+            || !request.tools.is_empty()
+            || request
+                .messages
+                .iter()
+                .any(|message| !message.tool_calls.is_empty() || message.tool_call_id.is_some())
+            || request.generation_settings.seed.is_some()
+            || request.generation_settings.top_k.is_some()
+            || request.generation_settings.min_p.is_some()
+            || request.generation_settings.reasoning_enabled.is_some()
+            || request.generation_settings.reasoning_budget.is_some()
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "the unverified external q27 contract supports only text, temperature, top_p, and max-token translation"
+                    .to_owned(),
+            ));
+        }
         let mut body = json!({
             "model": request.model_profile_id.as_str(),
             "messages": request.messages.iter().map(message_json).collect::<Vec<_>>(),
@@ -1949,7 +2043,7 @@ impl Q27Adapter {
         if stream {
             body["stream_options"] = json!({ "include_usage": true });
         }
-        body
+        Ok(body)
     }
 
     fn configured_backend_request(
@@ -1957,6 +2051,89 @@ impl Q27Adapter {
         request: &InferenceRequest,
         stream: bool,
     ) -> Result<(&'static str, Value), EngineError> {
+        if request.messages.iter().any(InferenceMessage::has_media) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 does not support media content".to_owned(),
+            ));
+        }
+        if (request.generation_settings.seed.is_some() && !execution.capabilities.request_seed)
+            || ((request.generation_settings.top_k.is_some()
+                || request.generation_settings.min_p.is_some())
+                && !execution.capabilities.top_k_min_p)
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "this exact q27 runtime does not prove the requested seed/top_k/min_p controls"
+                    .to_owned(),
+            ));
+        }
+        if (!request.tools.is_empty()
+            || request
+                .messages
+                .iter()
+                .any(|message| !message.tool_calls.is_empty() || message.tool_call_id.is_some()))
+            && !execution.capabilities.tool_calling
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "this exact q27 runtime does not prove tool calling".to_owned(),
+            ));
+        }
+        if execution.sharp_template.is_some()
+            && (!request.tools.is_empty()
+                || request.messages.iter().any(|message| {
+                    !message.tool_calls.is_empty() || message.tool_call_id.is_some()
+                }))
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 tool calling requires the runtime chat route, not external raw-prompt delivery"
+                    .to_owned(),
+            ));
+        }
+        if (request.generation_settings.reasoning_enabled.is_some()
+            || request.generation_settings.reasoning_budget.is_some())
+            && (!execution.capabilities.request_thinking
+                || setting_toggle(&execution.settings, "q27.request_thinking") != Some(true))
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 per-request thinking requires `q27.request_thinking` to be enabled".to_owned(),
+            ));
+        }
+        if request
+            .generation_settings
+            .reasoning_budget
+            .is_some_and(|budget| budget < 0)
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 per-request thinking budget must be zero or positive".to_owned(),
+            ));
+        }
+        let effective_temperature = request
+            .generation_settings
+            .temperature
+            .or_else(|| setting_float(&execution.settings, "temperature"))
+            .unwrap_or(0.0);
+        let requests_sampling_control = request.generation_settings.seed.is_some()
+            || request
+                .generation_settings
+                .top_k
+                .is_some_and(|value| value > 0)
+            || request
+                .generation_settings
+                .min_p
+                .is_some_and(|value| value > 0.0);
+        if requests_sampling_control && effective_temperature <= 0.0 {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 seed/top_k/min_p apply only to sampled requests with temperature above zero"
+                    .to_owned(),
+            ));
+        }
+        if setting_toggle(&execution.settings, "q27.sampled_graphs") == Some(false)
+            && effective_temperature > 0.0
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 sampled requests are unavailable because `q27.sampled_graphs` is disabled"
+                    .to_owned(),
+            ));
+        }
         let mut body = json!({"model": request.model_profile_id.as_str(), "stream": stream});
         let route = if let Some(template) = execution.sharp_template.as_deref() {
             body["prompt"] = json!(render_sharp_template(
@@ -1986,31 +2163,83 @@ impl Q27Adapter {
         for (name, value) in [
             (
                 "temperature",
-                request
-                    .generation_settings
-                    .temperature
-                    .or_else(|| setting_float(&execution.settings, "temperature"))
-                    .map(Value::from),
+                Some(Value::from(
+                    request
+                        .generation_settings
+                        .temperature
+                        .or_else(|| setting_float(&execution.settings, "temperature"))
+                        .unwrap_or(0.0),
+                )),
             ),
             (
                 "top_p",
-                request
-                    .generation_settings
-                    .top_p
-                    .or_else(|| setting_float(&execution.settings, "top_p"))
-                    .map(Value::from),
+                Some(Value::from(
+                    request
+                        .generation_settings
+                        .top_p
+                        .or_else(|| setting_float(&execution.settings, "top_p"))
+                        .unwrap_or(1.0),
+                )),
             ),
             (
                 "top_k",
-                setting_unsigned(&execution.settings, "top_k").map(Value::from),
+                request
+                    .generation_settings
+                    .top_k
+                    .or_else(|| setting_unsigned(&execution.settings, "top_k"))
+                    .map(Value::from),
             ),
             (
                 "min_p",
-                setting_float(&execution.settings, "min_p").map(Value::from),
+                request
+                    .generation_settings
+                    .min_p
+                    .or_else(|| setting_float(&execution.settings, "min_p"))
+                    .map(Value::from),
             ),
         ] {
             if let Some(value) = value {
                 body[name] = value;
+            }
+        }
+        if let Some(seed) = request.generation_settings.seed {
+            body["seed"] = json!(seed);
+        }
+        if let Some(enabled) = request.generation_settings.reasoning_enabled {
+            body["enable_thinking"] = json!(enabled);
+        }
+        if let Some(budget) = request.generation_settings.reasoning_budget {
+            body["thinking_token_budget"] = json!(budget);
+        }
+        if !request.tools.is_empty() {
+            body["tools"] = Value::Array(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "type": "function",
+                            "function": {
+                                "name": tool.name,
+                                "description": tool.description,
+                                "parameters": tool.parameters,
+                            }
+                        })
+                    })
+                    .collect(),
+            );
+            if let Some(choice) = request.tool_choice.as_ref() {
+                body["tool_choice"] = match choice {
+                    InferenceToolChoice::Auto => json!("auto"),
+                    InferenceToolChoice::None => json!("none"),
+                    InferenceToolChoice::Required => json!("required"),
+                    InferenceToolChoice::Function { name } => {
+                        json!({"type": "function", "function": {"name": name}})
+                    }
+                };
+            }
+            if let Some(parallel) = request.parallel_tool_calls {
+                body["parallel_tool_calls"] = json!(parallel);
             }
         }
         if let Some(maximum) = request.max_output_tokens {
@@ -2036,9 +2265,35 @@ impl EngineAdapter for Q27Adapter {
     fn capabilities(&self) -> EngineCapabilities {
         EngineCapabilities {
             artifact_formats: vec![ArtifactFormat::Q27],
-            api: vec![ApiCapability::ChatCompletions],
-            features: vec![EngineFeature::TextGeneration],
+            api: vec![ApiCapability::Responses, ApiCapability::ChatCompletions],
+            features: vec![EngineFeature::TextGeneration, EngineFeature::ToolCalling],
         }
+    }
+
+    fn serving_features(
+        &self,
+        runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        settings: Option<&norted_core::ResolvedSettings>,
+    ) -> Vec<EngineFeature> {
+        let capabilities = q27_runtime_capabilities(
+            &runtime.manifest.identity,
+            &runtime.manifest.acquisition_method,
+            runtime
+                .manifest
+                .source_build
+                .as_ref()
+                .map(Q27SourceBuildEvidence::Provenance),
+        );
+        let mut features = vec![EngineFeature::TextGeneration];
+        if capabilities.tool_calling
+            && settings.is_none_or(|settings| {
+                setting_choice(settings, "q27.prompt_mode") != Some("external_template")
+            })
+        {
+            features.push(EngineFeature::ToolCalling);
+        }
+        features
     }
 
     fn validate_generation_settings(
@@ -2046,13 +2301,19 @@ impl EngineAdapter for Q27Adapter {
         settings: &GenerationSettingsPatch,
         backend_defaults: &EffectiveGenerationSettings,
     ) -> Result<(), EngineError> {
-        if settings.seed.is_some()
-            || settings.repeat_penalty.is_some()
+        if settings.repeat_penalty.is_some()
             || settings.presence_penalty.is_some()
+            || settings.frequency_penalty.is_some()
             || settings.stop.is_some()
         {
             return Err(EngineError::InvalidGenerationSettings(
-                "q27 does not prove seed, repetition/presence penalties, or stop-string request controls"
+                "q27 does not prove repetition/presence/frequency penalties or stop-string request controls"
+                    .to_owned(),
+            ));
+        }
+        if settings.reasoning_effort.is_some() {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 does not expose reasoning-effort levels; use the exact thinking toggle and budget semantics"
                     .to_owned(),
             ));
         }
@@ -2071,11 +2332,32 @@ impl EngineAdapter for Q27Adapter {
                     .to_owned(),
             ));
         }
+        if settings.top_k.is_some_and(|top_k| top_k >= 1_000_000_000) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 top_k must be below 1000000000; zero disables it".to_owned(),
+            ));
+        }
+        if let Some(min_p) = settings.min_p
+            && (!min_p.is_finite() || !(0.0..=1.0).contains(&min_p))
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 min_p must be finite and in the range 0..=1; zero disables it".to_owned(),
+            ));
+        }
         let effective_temperature = settings.temperature.unwrap_or(backend_defaults.temperature);
         if settings.top_p.is_some_and(|top_p| top_p < 1.0) && effective_temperature <= 0.0 {
             return Err(EngineError::InvalidGenerationSettings(
                 "q27 top_p below 1 requires a positive effective temperature; q27 uses greedy decoding otherwise"
                     .to_owned(),
+            ));
+        }
+        if (settings.seed.is_some()
+            || settings.top_k.is_some_and(|value| value > 0)
+            || settings.min_p.is_some_and(|value| value > 0.0))
+            && effective_temperature <= 0.0
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 seed/top_k/min_p require a positive effective temperature".to_owned(),
             ));
         }
         Ok(())
@@ -2870,7 +3152,7 @@ impl EngineAdapter for Q27Adapter {
         } else {
             (
                 "/v1/chat/completions",
-                self.backend_request(&request, false),
+                self.backend_request(&request, false)?,
             )
         };
         let response = self
@@ -2895,12 +3177,26 @@ impl EngineAdapter for Q27Adapter {
         let choice = response.choices.into_iter().next().ok_or_else(|| {
             EngineError::Operation("q27 response contained no completion choice".to_owned())
         })?;
-        let text = choice
-            .text
-            .or_else(|| choice.message.and_then(|message| message.content))
-            .ok_or_else(|| {
-                EngineError::Operation("q27 response contained no assistant text".to_owned())
-            })?;
+        let (text, tool_calls) = match (choice.text, choice.message) {
+            (Some(text), _) => (text, Vec::new()),
+            (None, Some(message)) => (
+                message.content.unwrap_or_default(),
+                message
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| InferenceToolCall {
+                        id: call.id,
+                        name: call.function.name,
+                        arguments: call.function.arguments,
+                    })
+                    .collect(),
+            ),
+            (None, None) => {
+                return Err(EngineError::Operation(
+                    "q27 response contained neither assistant text nor tool calls".to_owned(),
+                ));
+            }
+        };
         let text = if configured.as_ref().is_some_and(|execution| {
             setting_choice(&execution.settings, "q27.response_filter")
                 == Some("strip_initial_reasoning")
@@ -2911,6 +3207,7 @@ impl EngineAdapter for Q27Adapter {
         };
         Ok(InferenceOutput {
             text,
+            tool_calls,
             usage: response.usage.map(Into::into),
             finish_reason: map_finish_reason(choice.finish_reason.as_deref())?,
         })
@@ -2930,7 +3227,10 @@ impl EngineAdapter for Q27Adapter {
         let (route, body) = if let Some(execution) = configured.as_ref() {
             Self::configured_backend_request(execution, &request, true)?
         } else {
-            ("/v1/chat/completions", self.backend_request(&request, true))
+            (
+                "/v1/chat/completions",
+                self.backend_request(&request, true)?,
+            )
         };
         let response = self
             .client
@@ -3054,10 +3354,10 @@ fn validate_configured_template(
 ) -> Result<(), EngineError> {
     let rendered = render_sharp_template(
         template_source,
-        &[InferenceMessage {
-            role: InferenceRole::User,
-            text: "Sharp startup validation".to_owned(),
-        }],
+        &[InferenceMessage::text(
+            InferenceRole::User,
+            "Sharp startup validation",
+        )],
         setting_toggle(settings, "q27.render_generation_prompt").unwrap_or(true),
         setting_toggle(settings, "q27.template_thinking")
             .or_else(|| setting_toggle(settings, "q27.thinking"))
@@ -3512,6 +3812,20 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatMessage {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ChatToolCall>,
+}
+
+#[derive(Deserialize)]
+struct ChatToolCall {
+    id: String,
+    function: ChatToolFunction,
+}
+
+#[derive(Deserialize)]
+struct ChatToolFunction {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3792,6 +4106,48 @@ fn parse_sse_frames(state: &mut SseState) {
                     .push_back(Ok(InferenceEvent::TextDelta { delta }));
             }
         }
+        if let Some(tool_calls) = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"))
+            .and_then(|delta| delta.get("tool_calls"))
+            .and_then(Value::as_array)
+        {
+            for call in tool_calls {
+                let Some(index) = call.get("index").and_then(Value::as_u64) else {
+                    state.queued.push_back(Err(EngineError::Operation(
+                        "q27 tool-call delta omitted its index".to_owned(),
+                    )));
+                    state.finished = true;
+                    return;
+                };
+                let index = match u32::try_from(index) {
+                    Ok(index) => index,
+                    Err(_) => {
+                        state.queued.push_back(Err(EngineError::Operation(
+                            "q27 tool-call delta index exceeded u32".to_owned(),
+                        )));
+                        state.finished = true;
+                        return;
+                    }
+                };
+                let function = call.get("function");
+                state.queued.push_back(Ok(InferenceEvent::ToolCallDelta {
+                    index,
+                    id: call.get("id").and_then(Value::as_str).map(str::to_owned),
+                    name: function
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    arguments_delta: function
+                        .and_then(|function| function.get("arguments"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                }));
+            }
+        }
     }
 }
 
@@ -3808,14 +4164,37 @@ fn find_sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
 }
 
 fn message_json(message: &InferenceMessage) -> Value {
-    json!({
+    let mut value = json!({
         "role": match message.role {
             InferenceRole::System | InferenceRole::Developer => "system",
             InferenceRole::User => "user",
             InferenceRole::Assistant => "assistant",
+            InferenceRole::Tool => "tool",
         },
-        "content": message.text,
-    })
+        "content": message.text_only().unwrap_or_default(),
+    });
+    if !message.tool_calls.is_empty() {
+        value["tool_calls"] = Value::Array(
+            message
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments},
+                    })
+                })
+                .collect(),
+        );
+        if message.content.is_empty() {
+            value["content"] = Value::Null;
+        }
+    }
+    if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+        value["tool_call_id"] = json!(tool_call_id);
+    }
+    value
 }
 
 fn sharp_message_json(message: &InferenceMessage) -> Value {
@@ -3825,8 +4204,9 @@ fn sharp_message_json(message: &InferenceMessage) -> Value {
             InferenceRole::Developer => "developer",
             InferenceRole::User => "user",
             InferenceRole::Assistant => "assistant",
+            InferenceRole::Tool => "tool",
         },
-        "content": message.text,
+        "content": message.text_only().unwrap_or_default(),
     })
 }
 
@@ -3865,9 +4245,17 @@ fn q27_settings_schema_from_usage(
             }
             "q27.thinking" => capabilities.thinking,
             "q27.thinking_budget" => capabilities.unlimited_think_budget,
+            "q27.request_thinking" => capabilities.request_thinking,
+            "q27.constrain_tools" => capabilities.tool_calling,
+            "q27.continuous_batching" | "q27.sampled_graphs" => {
+                capabilities.stable_serving_environment
+            }
             "temperature" | "top_p" => capabilities.temperature_top_p,
             "top_k" | "min_p" => capabilities.top_k_min_p,
-            "reasoning_effort" => capabilities.exact_sharp_renderer,
+            "seed" => capabilities.request_seed,
+            "max_output_tokens" | "system_prompt" => capabilities.trustworthy_identity,
+            "reasoning" | "reasoning_budget" => capabilities.request_thinking,
+            "reasoning_effort" => false,
             "q27.kv_mode" => !capabilities.supported_kv_modes.is_empty(),
             "q27.mtp" | "q27.mtp_max_depth" | "q27.mtp_min_probability" | "q27.suffix_drafting" => {
                 capabilities.mtp_environment
@@ -3912,6 +4300,16 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
     let mut definitions = common_setting_definitions();
     definitions.extend([
         q27_definition(
+            "q27.slot1_context_length",
+            "Background slot context length",
+            "Context window for slots after slot 0; explicit `context_length` continues to own slot 0",
+            SettingKind::UnsignedInteger {
+                minimum: Some(1),
+                maximum: Some(262_144),
+            },
+            Some("inherits slot 0/runtime auto sizing"),
+        ),
+        q27_definition(
             "q27.kv_mode",
             "KV mode",
             "Use the runtime default, Server-owned automatic quality fallback, or an exact q27 KV mode",
@@ -3943,6 +4341,34 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
             "Maximum q27 thinking budget; zero means unlimited where supported",
             SettingKind::UnsignedInteger { minimum: Some(0), maximum: None },
             Some("runtime default"),
+        ),
+        q27_definition(
+            "q27.request_thinking",
+            "Per-request thinking",
+            "Allow explicit request thinking enable/disable and budget fields to override the server/profile default",
+            SettingKind::Toggle,
+            Some("off"),
+        ),
+        q27_definition(
+            "q27.constrain_tools",
+            "Constrain tool calls",
+            "Grammar-constrain eligible greedy automatic tool-call bodies; sampled and forced calls retain upstream behavior",
+            SettingKind::Toggle,
+            Some("off"),
+        ),
+        q27_definition(
+            "q27.continuous_batching",
+            "Continuous batching",
+            "Explicitly enable or disable q27's stable serving-time continuous batching path",
+            SettingKind::Toggle,
+            Some("runtime profile default"),
+        ),
+        q27_definition(
+            "q27.sampled_graphs",
+            "Sampled decoding graphs",
+            "Capture sampled decoding graphs; disabling saves VRAM but rejects positive-temperature requests",
+            SettingKind::Toggle,
+            Some("on"),
         ),
         q27_definition(
             "q27.mtp",
@@ -4186,7 +4612,7 @@ fn q27_setting_category(id: &str) -> SettingCategory {
         SettingCategory::Prompt
     } else if id.contains("mtp") || id.contains("suffix") {
         SettingCategory::Speculation
-    } else if id.contains("kv_") {
+    } else if id.contains("kv_") || id.contains("context_length") {
         SettingCategory::KvMemory
     } else if id.contains("cache") {
         SettingCategory::Cache
@@ -4199,7 +4625,10 @@ fn q27_setting_option(id: &str) -> &'static str {
     match id {
         "context_length" => "--ctx",
         "parallel_requests" => "--slots",
+        "q27.slot1_context_length" => "--slot1-ctx",
         "q27.fast_head" => "--fast-head",
+        "q27.request_thinking" => "--request-think",
+        "q27.constrain_tools" => "--constrain-tools",
         "q27.prefix_cache_path" => "--prefix-cache",
         "q27.prefix_cache_max_gb" => "--prefix-cache-max-gb",
         "q27.prefix_cache_min_tokens" => "--prefix-cache-min",
@@ -4231,6 +4660,15 @@ fn apply_q27_runtime_bounds(definitions: &mut [SettingDefinition], managed: bool
         definition.kind = SettingKind::UnsignedInteger {
             minimum: Some(1),
             maximum,
+        };
+    }
+    if let Some(definition) = definitions
+        .iter_mut()
+        .find(|definition| definition.id.as_str() == "top_k")
+    {
+        definition.kind = SettingKind::UnsignedInteger {
+            minimum: Some(0),
+            maximum: Some(999_999_999),
         };
     }
 }
@@ -4267,9 +4705,18 @@ fn translate_q27_settings(
                 | "top_p"
                 | "top_k"
                 | "min_p"
+                | "seed"
+                | "max_output_tokens"
+                | "system_prompt"
+                | "reasoning"
+                | "reasoning_budget"
                 | "reasoning_effort"
                 | "q27.thinking"
                 | "q27.thinking_budget"
+                | "q27.request_thinking"
+                | "q27.constrain_tools"
+                | "q27.continuous_batching"
+                | "q27.sampled_graphs"
                 | "q27.kv_mode"
                 | "q27.mtp"
                 | "q27.mtp_max_depth"
@@ -4301,6 +4748,9 @@ fn translate_q27_settings(
             }
             ("parallel_requests", SettingValue::UnsignedInteger(value)) => {
                 push_q27_value_argument(&mut arguments, "--slots", value);
+            }
+            ("q27.slot1_context_length", SettingValue::UnsignedInteger(value)) => {
+                push_q27_value_argument(&mut arguments, "--slot1-ctx", value);
             }
             ("q27.fast_head", SettingValue::Toggle(value)) => {
                 arguments.push(OsString::from(if *value {
@@ -4462,6 +4912,7 @@ fn map_finish_reason(reason: Option<&str>) -> Result<InferenceFinishReason, Engi
     match reason {
         Some("stop") => Ok(InferenceFinishReason::Stop),
         Some("length") => Ok(InferenceFinishReason::MaxOutputTokens),
+        Some("tool_calls") => Ok(InferenceFinishReason::ToolCalls),
         Some(reason) => Err(EngineError::Operation(format!(
             "q27 returned unsupported finish reason `{reason}`"
         ))),
@@ -4590,6 +5041,10 @@ mod tests {
             unlimited_think_budget: true,
             temperature_top_p: true,
             top_k_min_p: true,
+            request_seed: true,
+            request_thinking: true,
+            tool_calling: true,
+            stable_serving_environment: true,
             mtp_environment: true,
             mtp_disable_control: false,
             fast_head_control: true,
@@ -4780,6 +5235,7 @@ mod tests {
             sharp_template: None,
             compiled_w_max: Some(12),
             selected_kv_mode: None,
+            capabilities: exact_capabilities(),
         };
         let (_, body) = Q27Adapter::configured_backend_request(
             &execution,
@@ -4791,6 +5247,9 @@ mod tests {
                     top_p: Some(0.7),
                     ..Default::default()
                 },
+                tools: Vec::new(),
+                tool_choice: None,
+                parallel_tool_calls: None,
                 output_format: None,
                 max_output_tokens: None,
                 stream: false,

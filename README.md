@@ -91,19 +91,32 @@ penalties, system prompt, and an optional JSON Schema.
 The JSON Schema is a request default, not a process-wide constraint: an omitted request format uses
 it, while explicit text, JSON object, or request JSON Schema wins.
 
-q27 exposes ordinary settings for context/slots, generation samplers, thinking and budget,
-fast-head, KV mode, MTP depth/probability, suffix drafting and compiled-width behavior, external
-template path/hash and delivery, generation-prompt rendering, template thinking, the generic
-`strip_initial_reasoning` response filter, and prefix cache controls. Automatic q27 KV selection is
-the same server-owned quality sequence for every compatible q27 artifact, filtered by exact runtime
-proof. Selecting MTP, fast-head, a sampler, or an external template creates its capability
-requirement directly from that selected value.
+q27 exposes ordinary settings for context/slots (including the background-slot context), generation
+samplers, thinking and budget, opt-in per-request thinking, fast-head, KV mode, MTP
+depth/probability, suffix drafting and compiled-width behavior, continuous batching, sampled-graph
+residency, optional greedy tool-call constraints, external template path/hash and delivery,
+generation-prompt rendering, template thinking, the generic `strip_initial_reasoning` response
+filter, and prefix cache controls. Automatic q27 KV selection is the same server-owned quality
+sequence for every compatible q27 artifact, filtered by exact runtime proof. `Q27_BATCH` and
+`Q27_SAMPLED` are typed because v0.10 documents them as serving controls; checksum, trace,
+benchmark, kernel-selection, and development-only variables remain intentionally native/internal.
+On the runtime chat route, audited v0.10 supports ordinary function tools, auto/none/required/named
+choice, parallel-call policy, assistant/tool history, and streaming call deltas. External-template
+raw completion mode deliberately reports no tool capability. `q27.constrain_tools` strengthens
+eligible greedy automatic calls but does not pretend to constrain sampled or forced calls.
 
-NInfer exposes direct settings for context/KV, CUDA Graph, prefix reuse, thinking, speculation,
-backend, draft tokens, optimized proposal head, samplers, and advanced cache controls. There is no
-nested named speculation abstraction. The exact source/runtime, native container v2 identity,
-schema-18 startup observation, DFlash restrictions, and current lack of external Sharp application
-remain authoritative.
+NInfer exposes direct settings for context/KV, exact-help-advertised KV formats, CUDA Graph, prefix
+reuse, thinking, speculation/backend/draft/proposal head, samplers and greedy mode, queue limits,
+request/statistics limits, Vision residency and media budgets/workers, Responses-store bounds, and
+advanced cache controls. There is no nested named speculation abstraction. The exact source
+commit/tree, executable help, native container v2 identity, revision-specific startup schema,
+DFlash/Vision restriction, and observed startup state remain authoritative. The audited current
+source advertises `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`; older executable help narrows the
+choice list instead of inheriting newer formats.
+`--context-cost-presets` remains a narrowly allowlisted native file escape hatch until Norted can
+bind its canonical path and content identity as strongly as other file-backed settings. NInfer
+host/port/key/model alias/device/CORS/request-log controls remain Norted-owned, and diagnostic,
+benchmark, tracing, and kernel-development controls are not promoted into ordinary settings.
 
 Structured path values have stable semantics. Absolute paths are used directly. Relative paths
 resolve lexically beneath Norted's `<data>` directory and cannot escape it with `..`. Resolution
@@ -189,6 +202,15 @@ The q27 provider exposes official Linux x86_64 CUDA releases from v0.2.0 onward.
 For a q27 source build, discovery resolves the release tag to a full Git commit/tree and inspects bounded exact-revision build and runtime-contract files. Search does not clone or compile. The current v0.10.0 contract fingerprints its provider-reviewed `Makefile`, `README.md`, `src/server.cu`, and `src/engine.cuh`; that evidence proves generic q27 raw-completions, thinking/sampling, MTP/suffix/fast-head, KV-mode, startup-banner, and target-specific W_MAX capabilities. Installation revalidates the tag contract and immutable commit/tree, checks Linux x86_64, Git, Make, the source-declared CUDA floor and `/usr/local/cuda/bin/nvcc`, and the declared host C++ compiler/standard before staging. It checks out that exact commit separately from model-artifact state, requires the checked-out Makefile to match the provider-audited dependency/command closure digest, removes build-control environment overrides, and runs only `make <selected-target>`. The recipe version, Makefile digest, source commit/tree, exact target, toolchain, and built executable digest persist in the installed provenance, so launch admission does not consult mutable upstream state. The resulting executable must be regular, executable, hash-stable, and pass the q27 adapter probe before atomic activation.
 
 NInfer publishes source rather than an installable release binary. Its provider resolves the canonical `Neroued/ninfer` default-branch HEAD into one `Latest` source snapshot containing the full commit and Git-tree SHAs. It deliberately exposes no `Stable` channel and no fake release asset. Revalidation targets the selected commit itself, so a normal later HEAD does not substitute new source; bounded historical source descriptors retained from explicit searches keep that exact selection addressable after a refresh. Update checks use Git ancestry: identical is current, a descendant is an available update, and backward or diverged history is a provider warning rather than an implicit downgrade. Installed snapshots and selections remain side by side and unchanged until explicitly updated/selected.
+
+The currently reviewed NInfer request/startup authority is commit
+`21a0e85f8819edc644a3bc036fca6d05cf52ac6e`, tree
+`09eda8f77d17d140f57baac89a0259772e51a5f7`, with request-log schema 19. The historical
+`6b94b8c5721f075624c4f36d18279a848ba8b6c9` / tree
+`9ca953565dd514a3044b5c7c8055a07e6ce9a0f7` contract remains bounded to its schema-18 evidence.
+Executable help can prove an exact launch option without changing request semantics; an unknown
+future source snapshot does not inherit reviewed tools/media/request capabilities and remains
+NeedsAttention until its protocol/startup changes are audited.
 
 The current official NInfer build contract is Linux x86_64, NVIDIA GeForce RTX 5090, numeric compute capability 12.0 with `sm_120a`, CUDA Toolkit 13.1 or newer, CMake 3.28 or newer, Ninja, a C++20 compiler, pkg-config, FFmpeg development modules, and libcurl. Product name and compute capability are independent observed checks; missing facts are needs-attention and contradictory facts are incompatible. Norted never installs host packages automatically.
 
@@ -504,17 +526,23 @@ Bearer authentication does not encrypt transport. Loopback needs no network tran
 
 Each backend and the separately authenticated private control listener use OS-assigned loopback ports. Public API keys cannot authorize control operations, and clients are never redirected to or given the private upstream server.
 
-The Responses text subset accepts `model`; string or text-message `input`; `developer`, `system`, `user`, and `assistant` roles; optional `instructions`; `max_output_tokens`; `temperature`; `top_p`; reasoning effort; `text.format` plain text, JSON object, or JSON Schema; and `stream`. JSON Schema name, description, schema, and strictness are retained when translated to a compatible backend. Identity values such as `store=false`, `background=false`, `tools=[]`, `tool_choice="none"`, `truncation="disabled"`, empty metadata, and null optional fields are accepted where they request no extra behavior. Stateful Responses, storage, non-empty tools, automatic OpenAI truncation, and non-text content are rejected explicitly.
+The Responses surface accepts `model`; string or message/`function_call`/`function_call_output`
+input Items; canonical roles; optional `instructions`; output and sampler controls; reasoning;
+function tools; supported image/video content; `text.format`; and `stream`. JSON Schema
+name/description/schema/strictness are retained only for a compatible structured-output backend.
+Function-call Items preserve call IDs, names, and JSON argument strings. Stateful Responses,
+storage, automatic OpenAI truncation, audio, generated-image output, arbitrary local media paths,
+and other unimplemented modalities remain explicit errors.
 
-Chat Completions accepts the same canonical text messages and generation controls, plus non-null
-32-bit `seed`, string-or-array `stop`, presence penalty in `-2..=2`, reasoning effort,
+Chat Completions accepts the same canonical messages and generation controls, plus non-null
+32-bit `seed`, local `top_k`/`min_p` extensions, string-or-array `stop`, presence/frequency
+penalties in `-2..=2`, reasoning effort and local thinking toggle/budget extensions,
 `response_format` text/JSON object/JSON Schema, and `max_completion_tokens` with its deprecated
 `max_tokens` alias. Equal token-limit aliases are accepted and conflicting aliases fail.
-Compatibility identity values include `n=1`, `store=false`, `tools=[]`, `tool_choice="none"`,
-text-only modality, `stream_options.include_usage`, and explicit `include_obfuscation=false`;
-requests for multiple choices, tools, logprobs, audio, vision, stored completions, frequency
-penalties, or stream obfuscation are rejected. Stream options require `stream=true`. Both public
-parsers produce the same engine-neutral `InferenceRequest`; neither endpoint proxies upstream JSON.
+Ordinary function tools use standard assistant `tool_calls` and tool-result history shapes.
+Requests for multiple choices, logprobs, audio, stored completions, or stream obfuscation are
+rejected. Stream options require `stream=true`. Both public parsers produce the same
+engine-neutral `InferenceRequest`; neither endpoint proxies upstream JSON.
 
 Request-time sampler, stop, reasoning, structured-output, and output-limit values are ephemeral and
 never mutate profiles, runtime selection, or launch provenance. Explicit request fields override
@@ -523,8 +551,12 @@ llama.cpp, configured samplers and generation defaults become process defaults t
 flags; structured-output schemas instead remain per-request defaults sent to its private Chat API.
 Responses reports this effective format after defaulting, including configured schemas used for
 omitted formats and explicit text/schema overrides. Unsupported runtimes receive a clear 400
-rather than an unknown flag or silently ignored request field. q27 and NInfer remain truthful about
-their narrower request contracts.
+rather than an unknown flag or silently ignored request field. q27 request seed/top-k/min-p require
+sampled v0.10 execution; its request thinking fields require `q27.request_thinking`. NInfer's
+configured reasoning budget is a launch default because its private Chat route has no matching
+per-request budget field. System prompt, output limit, sampler, stop, penalty, thinking, and effort
+values otherwise act as request defaults where the exact private contract supports them, and an
+explicit request wins.
 
 `context_overflow=truncate_middle` is Norted request management, not llama.cpp context shift. It
 requires a finite request/profile output allowance, reads the exact effective slot context from the
@@ -555,7 +587,15 @@ curl http://127.0.0.1:8742/v1/chat/completions \
 
 Responses streaming emits the current ordered Norted-generated Responses SSE events and ends in completed, incomplete, or failed state. Chat streaming emits stable `chat.completion.chunk` IDs, assistant/text deltas, a truthful stop/length finish reason, optional known usage, and `[DONE]`. Dropping a client stream drops its owned backend stream rather than leaving detached generation.
 
-For NInfer, both public endpoints still pass through the canonical Norted `InferenceRequest` and private `/v1/chat/completions` translation; they are never raw-proxied to NInfer's richer APIs. Developer/System/User/Assistant order is preserved. Private reasoning text is discarded rather than mixed into the answer, only known usage details are mapped, and bounded SSE requires a supported terminal reason plus `[DONE]`. Norted continues to report tools, vision, structured output, stateful Responses, and Anthropic Messages as unsupported even where upstream NInfer implements them.
+For NInfer, both public endpoints pass through the canonical Norted `InferenceRequest` and private
+`/v1/chat/completions` translation; they are never raw-proxied to NInfer's richer APIs. The reviewed
+source contract carries seed, top-k/min-p, penalties, stops, thinking/effort, ordinary function
+tools, tool history/results, and streaming tool deltas. NInfer supports only `auto`/`none` tool
+choice and cannot guarantee single-call mode, so required/named choices, strict functions, and
+`parallel_tool_calls=false` are rejected. With exact registered-artifact support and
+`ninfer.vision=on`, user images/videos and tool-result images may use bounded HTTP(S) or data URLs;
+audio, file paths, assistant/system media, and arbitrary modalities remain unsupported. Structured
+output stays false because the audited NInfer source rejects constrained non-text response formats.
 
 Public `/v1/models` remains the minimal OpenAI list (`id`, `object`, `created`, `owned_by`). Use the private local `norted-server models info <MODEL_ID>` command, with optional `--json`, to inspect compatible engines/runtimes, current resolution and active state, and model/engine serving capabilities without exposing them publicly.
 
@@ -584,7 +624,7 @@ Focused tests cover bounded NInfer admission, typed identity, source manifests a
 - Managed source builds are provider-specific: llama.cpp supports the newest exact tagged Linux x86_64 portable CUDA source recipe, q27 supports exact tagged Linux x86_64 CUDA releases whose upstream Makefile contract is recognized, and NInfer supports its exact Linux x86_64/RTX 5090/sm_120a contract. Other providers do not gain source support automatically.
 - The llama.cpp Linux CUDA V4 build requires Git, CMake 3.18 or newer, Ninja, a C++17 compiler, CUDA Toolkit `>=12.8,<13.0` at `/usr/local/cuda/bin/nvcc`, and compiler support for every fixed target. Driver `525.60.13` or newer is required; absent driver evidence remains needs-attention. Norted validates these tools but does not install system, CUDA, driver, or toolchain packages.
 - Norted does not download, convert, or migrate `.ninfer` model artifacts. The user places supported version-2 containers in configured model directories.
-- The public surface is the documented Responses and Chat Completions text subsets plus health/model listing; tools, embeddings, vision, audio, stateful Responses, and multimodal inference are not implemented.
+- The public surface is Responses and Chat Completions plus health/model listing. Ordinary function tools are exact-engine gated; NInfer image/video input is exact-artifact/runtime/residency gated. Embeddings, audio, generated images, arbitrary modalities, and stateful Responses are not implemented.
 - There is no built-in TLS/certificate management, permissive CORS, rate-limit infrastructure, service installer, model downloader, or web UI.
 
 See [docs/architecture.md](docs/architecture.md) for component boundaries and the exact runtime acquisition, resolution, and launch flow.

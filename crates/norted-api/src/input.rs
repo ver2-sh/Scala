@@ -1,7 +1,7 @@
 use norted_core::ModelProfileId;
 use norted_engine::{
-    GenerationSettingsPatch, InferenceMessage, InferenceRequest, InferenceRole, OutputFormat,
-    ReasoningEffort,
+    GenerationSettingsPatch, InferenceMessage, InferenceRequest, InferenceRole, InferenceTool,
+    InferenceToolChoice, OutputFormat, ReasoningEffort,
 };
 use serde_json::{Map, Value};
 
@@ -13,6 +13,9 @@ pub(crate) struct NormalizedRequest {
     pub(crate) messages: Vec<InferenceMessage>,
     pub(crate) max_output_tokens: Option<u32>,
     pub(crate) generation_settings: GenerationSettingsPatch,
+    pub(crate) tools: Vec<InferenceTool>,
+    pub(crate) tool_choice: Option<InferenceToolChoice>,
+    pub(crate) parallel_tool_calls: Option<bool>,
     pub(crate) output_format: Option<OutputFormat>,
     pub(crate) stream: bool,
 }
@@ -31,6 +34,9 @@ impl NormalizedRequest {
             messages: self.messages.clone(),
             max_output_tokens: self.max_output_tokens,
             generation_settings: self.generation_settings.clone(),
+            tools: self.tools.clone(),
+            tool_choice: self.tool_choice.clone(),
+            parallel_tool_calls: self.parallel_tool_calls,
             output_format: self.output_format.clone(),
             stream: self.stream,
         })
@@ -123,6 +129,28 @@ pub(crate) fn optional_bool(
     }
 }
 
+pub(crate) fn optional_bool_value(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<bool>, OpenAiError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(OpenAiError::invalid(
+            format!("`{field}` must be a boolean."),
+            Some(field),
+            "invalid_type",
+        )),
+    }
+}
+
+pub(crate) fn optional_nonnegative_u32(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<u32>, OpenAiError> {
+    optional_u32(object, field)
+}
+
 pub(crate) fn optional_positive_u32(
     object: &Map<String, Value>,
     field: &str,
@@ -155,10 +183,15 @@ pub(crate) fn generation_settings(
     Ok(GenerationSettingsPatch {
         temperature: optional_f64(object, "temperature", 0.0, 2.0)?,
         top_p: optional_f64(object, "top_p", 0.0, 1.0)?,
+        top_k: optional_u32(object, "top_k")?.map(u64::from),
+        min_p: optional_f64(object, "min_p", 0.0, 1.0)?,
         seed: optional_u32(object, "seed")?.map(u64::from),
         repeat_penalty: None,
         presence_penalty: optional_f64(object, "presence_penalty", -2.0, 2.0)?,
+        frequency_penalty: optional_f64(object, "frequency_penalty", -2.0, 2.0)?,
         stop: optional_stop(object.get("stop"), "stop")?,
+        reasoning_enabled: None,
+        reasoning_budget: None,
         reasoning_effort: None,
     })
 }
@@ -238,6 +271,7 @@ pub(crate) fn optional_reasoning_effort(
     match value {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => match value.as_str() {
+            "none" => Ok(Some(ReasoningEffort::None)),
             "minimal" => Ok(Some(ReasoningEffort::Minimal)),
             "low" => Ok(Some(ReasoningEffort::Low)),
             "medium" => Ok(Some(ReasoningEffort::Medium)),
@@ -245,7 +279,9 @@ pub(crate) fn optional_reasoning_effort(
             "xhigh" => Ok(Some(ReasoningEffort::Xhigh)),
             "max" => Ok(Some(ReasoningEffort::Max)),
             _ => Err(OpenAiError::invalid(
-                format!("`{field}` must be `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`."),
+                format!(
+                    "`{field}` must be `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`."
+                ),
                 Some(field),
                 "invalid_value",
             )),
@@ -292,58 +328,15 @@ pub(crate) fn role(value: Option<&Value>, parameter: &str) -> Result<InferenceRo
         Some("system") => Ok(InferenceRole::System),
         Some("user") => Ok(InferenceRole::User),
         Some("assistant") => Ok(InferenceRole::Assistant),
+        Some("tool") => Ok(InferenceRole::Tool),
         Some(_) => Err(OpenAiError::unsupported(
-            "Only developer, system, user, and assistant text messages are supported.",
+            "Only developer, system, user, assistant, and tool messages are supported.",
             parameter,
         )),
         None => Err(OpenAiError::invalid(
             "Each message requires a string `role`.",
             Some(parameter),
             "missing_required_parameter",
-        )),
-    }
-}
-
-pub(crate) fn text_content(
-    value: &Value,
-    parameter: &str,
-    part_type: &str,
-) -> Result<String, OpenAiError> {
-    match value {
-        Value::String(text) => Ok(text.clone()),
-        Value::Array(parts) => {
-            let mut text = String::new();
-            for (index, part) in parts.iter().enumerate() {
-                let part_parameter = format!("{parameter}[{index}]");
-                let part = part.as_object().ok_or_else(|| {
-                    OpenAiError::invalid(
-                        "Text content parts must be JSON objects.",
-                        Some(part_parameter.clone()),
-                        "invalid_type",
-                    )
-                })?;
-                reject_unknown_fields(part, &["type", "text"], "text content")?;
-                if part.get("type").and_then(Value::as_str) != Some(part_type) {
-                    return Err(OpenAiError::unsupported(
-                        format!("Only `{part_type}` content parts are supported."),
-                        format!("{part_parameter}.type"),
-                    ));
-                }
-                let part_text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
-                    OpenAiError::invalid(
-                        format!("`{part_type}` content requires a string `text` field."),
-                        Some(format!("{part_parameter}.text")),
-                        "missing_required_parameter",
-                    )
-                })?;
-                text.push_str(part_text);
-            }
-            Ok(text)
-        }
-        _ => Err(OpenAiError::invalid(
-            "Message `content` must be a string or an array of text content parts.",
-            Some(parameter),
-            "invalid_type",
         )),
     }
 }

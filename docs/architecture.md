@@ -90,7 +90,8 @@ engine/format default, then best compatible installed runtime. Adapters expose a
 schema for common plus their own namespace, gate it first with facts proved by the bound model, and
 then gate it with the exact runtime contract before validating effective settings. Capability
 requirements are consequences of selected settings. q27 retains exact source fingerprints and
-bounded context/KV/W_MAX startup proof; NInfer retains native-container and schema-18 startup proof;
+bounded context/KV/W_MAX startup proof; NInfer retains native-container and revision-specific
+schema-18/schema-19 startup proof;
 llama.cpp uses exact help evidence for every structured launch control and keeps Norted-owned
 system-prompt/context management separate from native launch flags.
 
@@ -279,7 +280,7 @@ inspection, and provenance: a higher-layer built-in/file template choice or all/
 choice suppresses its inherited sibling, while `off`, n-gram, and `draft-mtp` modes suppress an
 inherited external draft identity. Same-layer contradictions remain visible and invalid.
 
-Private Chat requests carry explicit seed, stop, repeat/presence penalty, reasoning effort, token
+Private Chat requests carry explicit seed, stop, repeat/presence/frequency penalty, reasoning effort, token
 limit, and OpenAI-compatible response format only after the active exact schema proves the
 corresponding mechanism. JSON Schema wrappers retain schema/name/description/strict fields and use
 llama.cpp grammar-backed sampling in both normal and streaming paths. `/props` supplies exact slot
@@ -303,7 +304,7 @@ q27-server <canonical-model.q27> <canonical-tokenizer.tok>
            [allowed native arguments]
 ```
 
-Norted rejects q27 options/environment that could replace positional inputs, binding/authentication, thinking semantics, sampling truth, or Norted's GPU binding. Compatibility chooses one UUID-identified NVIDIA device and launch sets `CUDA_VISIBLE_DEVICES` to that same full UUID; numeric indices are never correlated across CUDA and `nvidia-smi`. A single inherited UUID constraint is reconciled, while numeric, multiple, unknown, empty, or ambiguous constraints fail closed. Before launch, q27 prepares the already-discovered tokenizer as an engine-neutral auxiliary identity containing role, canonical path, size, and SHA-256. The launch spec uses that exact path and rechecks size/hash immediately before process creation; q27 never rediscovers a companion at launch. It strips conflicting inherited q27 variables and sends explicit `temperature: 0.0` and `top_p: 1.0` on every Chat Completions request; those values are therefore the reported effective settings. Readiness requires `/health` status `ok`. JSON and SSE are translated through the same normalized inference types as llama.cpp.
+Norted rejects q27 options/environment that could replace positional inputs, binding/authentication, thinking semantics, sampling truth, or Norted's GPU binding. Compatibility chooses one UUID-identified NVIDIA device and launch sets `CUDA_VISIBLE_DEVICES` to that same full UUID; numeric indices are never correlated across CUDA and `nvidia-smi`. A single inherited UUID constraint is reconciled, while numeric, multiple, unknown, empty, or ambiguous constraints fail closed. Before launch, q27 prepares the already-discovered tokenizer as an engine-neutral auxiliary identity containing role, canonical path, size, and SHA-256. The launch spec uses that exact path and rechecks size/hash immediately before process creation; q27 never rediscovers a companion at launch. The exact v0.10 source contract forwards sampled request seed/top-k/min-p, while greedy requests reject controls upstream would ignore. Request thinking enable/budget is accepted only with the explicit `--request-think` profile setting. Ordinary function definitions, tool choice, assistant/tool history, non-streaming calls, and streaming deltas use engine-neutral types; raw external-template delivery is text-only. Stable `Q27_BATCH` and `Q27_SAMPLED` behavior is typed, while diagnostic/checksum/trace, benchmark, kernel-development, and unstable post-release controls remain unexposed. Readiness requires `/health` status `ok`; JSON and SSE are translated through the same normalized inference types as the other adapters.
 
 ### NInfer
 
@@ -322,9 +323,26 @@ ninfer-serve <canonical-model.ninfer>
              [strictly allowlisted operational arguments]
 ```
 
-The positional artifact, binding, alias, device, auth/CORS surface, structured load options, cache/vision/Responses-state controls, sampler/greedy controls, and startup log are reserved. `/health` alone is insufficient for readiness. Norted reads a bounded schema-18 `server_start` JSONL record, validates the public alias, artifact target/weights identity, context-cost identity, selected GPU UUID/name/compute capability, and non-greedy state, and derives exact effective temperature/top-p from the runtime's selected thinking preset plus server overrides. The file is then unlinked while the Linux child retains its descriptor; supervisor/cancellation paths remove it on every failed startup or exit.
+The positional artifact, binding, alias, device, auth/CORS surface, typed load/cache/media/store
+controls, sampler/greedy controls, and startup log are reserved. `/health` alone is insufficient for
+readiness. Norted selects the expected bounded `server_start` schema from the reviewed exact source
+contract (19 for commit `21a0e85f...`, 18 for the retained historical authority), validates public
+alias, artifact target/weights and context-cost identity, selected GPU identity, KV/CUDA/prefix/spec
+state, Vision residency, greedy state, and configured sampler defaults, then derives effective
+temperature/top-p. The file is unlinked before requests are served; failure and cancellation paths
+remove it as well.
 
-Public Responses and Chat messages both become one ordered canonical `InferenceRequest`, then private NInfer Chat JSON. Omitted sampler fields stay absent; explicit values are range-checked and forwarded. Non-streaming and bounded SSE parsers expose answer content only, discard separate reasoning text, map only stop/length, preserve only reported usage details, require a terminal finish reason and `[DONE]`, and own the underlying HTTP stream directly so client cancellation drops it. NInfer's vision, tools, Anthropic surface, raw/stateful Responses routes, and request history are intentionally outside this adapter contract.
+Public Responses and Chat messages both become one ordered canonical `InferenceRequest`, then
+private NInfer Chat JSON. The reviewed source contract forwards seed, top-k/min-p,
+presence/frequency penalties, stops, reasoning effort and thinking enable; its Chat route has no
+per-request thinking budget, so the positive configured budget is a launch default. Function tools
+are translated only for auto/none choice with parallel calls permitted; required/named/strict and
+single-call guarantees fail rather than weaken. Assistant tool calls and tool-result history are
+preserved, and tool deltas become Responses and Chat events. Exact registered artifacts expose user
+image/video and tool-result image content only when startup proves `--vision`; HTTP(S)/data URLs are
+accepted, local paths and unsupported roles/modalities are not. Structured output, raw/stateful
+upstream Responses, and Anthropic remain outside this bridge. Unknown future revisions can use
+help-proven launch facts but do not inherit these reviewed protocol capabilities.
 
 ## Process, control, and provenance
 
@@ -349,10 +367,11 @@ Private backend status carries Model Profile ID, underlying artifact Model ID, e
 ## Public protocol
 
 Responses remains canonical and Chat Completions is compatibility-only. Both public parsers
-normalize `developer`, `system`, `user`, and `assistant` text into the same engine-neutral
-`InferenceMessage` list and attach typed sampler/seed/stop/reasoning settings plus an optional
-structured output contract. Chat `reasoning_effort` and Responses `reasoning.effort` share the same
-typed effort levels. `RuntimeManager` applies configured system prompt, output limit, and JSON
+normalize canonical messages, typed text/image/video content, function definitions/choice,
+assistant calls and tool results into the same engine-neutral `InferenceMessage`/tool contract,
+then attach sampler/seed/stop/penalty/reasoning settings plus an optional structured output
+contract. Chat `reasoning_effort` and Responses `reasoning.effort` share typed effort levels.
+`RuntimeManager` applies configured system prompt, output limit, sampler/penalty/stop/reasoning, and JSON
 Schema defaults only when their request counterparts are omitted, validates request values against
 the active exact schema, and never mutates runtime selection or immutable launch provenance. The
 resolved effective output format is returned with both streaming and non-streaming routes so a
@@ -361,16 +380,23 @@ truthfully. The public serving alias and `/v1/models` identity are the active/us
 Profile ID, while
 the artifact Model ID remains private provenance.
 
-`POST /v1/responses` accepts the documented text subset and constructs the current non-streaming document or ordered Responses SSE sequence itself. `POST /v1/chat/completions` constructs current text ChatCompletion objects/chunks from the same normalized inference output. Each adapter owns only its private upstream JSON/SSE: llama.cpp omits absent sampler fields and q27 materializes its established 0/1 defaults while accepting `top_p < 1` only with a positive effective temperature. Output-limit completion maps to incomplete/length state, basic Chat usage is emitted when known, and richer Responses usage is emitted only when every required detail is known. Stream options are valid only on streams; explicit disabled obfuscation is compatible, but Norted does not emit OpenAI stream padding. Unsupported input or top-level behavior is rejected rather than forwarded or silently ignored.
+`POST /v1/responses` constructs response messages/function-call Items and ordered text/tool SSE
+events itself. `POST /v1/chat/completions` constructs compatible assistant `tool_calls`, tool-call
+deltas, and text chunks from the same normalized inference output. Each adapter owns only its
+private upstream JSON/SSE. Output-limit and tool-call terminal reasons map distinctly; unsupported
+tool choice, modality, structured output, or sampler behavior is rejected rather than forwarded or
+silently weakened.
 
-Public middleware assigns an independent `req_...` ID and returns it as `x-request-id` on success, JSON errors, and streams. `X-Client-Request-Id` is accepted only as ASCII correlation metadata up to 512 characters. Authentication runs before bounded JSON extraction; inference bodies are capped at 32 MiB. Errors share the OpenAI-style `error { message, type, param, code }` envelope and map internal conditions deliberately without local paths, private addresses, credentials, or debug text. No permissive CORS layer is installed. NInfer follows this same canonical path; its upstream Responses/Anthropic/tools/vision/state are not proxied into a second public surface.
+Public middleware assigns an independent `req_...` ID and returns it as `x-request-id` on success, JSON errors, and streams. `X-Client-Request-Id` is accepted only as ASCII correlation metadata up to 512 characters. Authentication runs before bounded JSON extraction; inference bodies are capped at 32 MiB. Errors share the OpenAI-style `error { message, type, param, code }` envelope and map internal conditions deliberately without local paths, private addresses, credentials, or debug text. No permissive CORS layer is installed. NInfer follows this same canonical path; its upstream Responses/Anthropic/state surfaces are not proxied into a second public surface.
 
 `GET /v1/models` remains the audited OpenAI-style list with exactly `id`, `object`, `created`, and `owned_by`. Runtime metadata and NInfer model/weights identities remain private control-plane state rather than leaking into this public compatibility surface; local `models info` may show the typed identity.
 
 The richer `ModelServingCapabilities` view is local/private: it derives format, compatible
 registered engines, compatible installed runtimes, resolved runtime, active state, and gateway
 features from real compatibility and selection data. Structured output becomes true only when the
-selected exact runtime schema advertises the JSON-Schema mechanism; tools and vision remain false.
+selected exact runtime schema and end-to-end bridge implement it. q27 tool calling requires the
+audited runtime-chat route; NInfer tools require a reviewed protocol snapshot, and NInfer Vision
+also requires a compatible registered artifact plus startup-configured residency.
 `norted-server models info <MODEL_ID>` exposes the view without expanding the public Model object.
 
 ## Public API-key state and transport
