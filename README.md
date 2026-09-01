@@ -61,36 +61,48 @@ deleted; recreate current settings and profiles explicitly.
 
 Models includes a managed, runtime-agnostic Model Library as well as configured external search
 paths. The Installed view browses all locally discovered GGUF, q27, and NInfer artifacts. Discover
-searches Hugging Face directly, exposes each concrete file/quantization, filters by format, and
-labels remote results as format candidates whose runtime compatibility is unverified. Download,
-import, and removal are explicit operations; only receipt-backed files below the managed root can
-be removed by the library.
+searches Hugging Face directly, exposes each concrete file/quantization with repository and exact
+revision context, filters by format, and labels remote results as format candidates whose runtime
+compatibility is unverified. Download, import, and removal are explicit operations; only
+receipt-backed acquisitions below the managed root can be removed by the library.
 
 Managed models use the platform-native Norted data directory shown by `config show`:
 
 ```text
 <data>/models/
   huggingface/<publisher>/<repository>/<revision>/<artifact-key>/
-    <artifact and required package files>
-    <artifact>.norted-library.json
+    <repository-relative artifact or package tree>
+    .norted-library.json
   imports/<stable-import-key>/
-    <copied artifact and required package files>
-    <artifact>.norted-library.json
+    <copied artifact or exact package tree>
+    .norted-library.json
 ```
 
-The sidecar receipt records provider, repository, exact revision, remote filename, size, acquisition
-time, source URL, and authoritative SHA-256 when Hugging Face publishes one. Model payloads are not
-modified. Norted Builder manifests and lineage remain separate and are copied/downloaded with the
-package files when present.
+The package-level receipt records one acquisition identity plus every exposed primary member. Each
+member retains provider, repository, exact revision, remote filename, size, acquisition time,
+source URL, and the authoritative acquisition SHA-256 when one was verified. A rescan accepts that
+managed provenance only while the current member size still matches; the acquisition digest is not
+misrepresented as a freshly computed current-file hash. Model payloads are not modified.
+
+Norted `BUILD-MANIFEST.json`, `Q27-MANIFEST.json`, and `NINFER-MANIFEST.json` packages are resolved
+relative to the directory containing that exact manifest. Downloads and imports reproduce only the
+manifest-required closure, preserving safe nested relative paths, all primary outputs, the q27
+tokenizer and Sharp companion, the NInfer Sharp companion, and a declared GGUF projector. Builder
+build keys, master IDs, quant-recipe identity, native identity, canonical source lineage, projector
+binding, and manifest identity remain authoritative and unmodified. Multiple package primaries are
+activated and owned as one acquisition while remaining separate models in the registry and Model
+Profiles.
 
 Large files stream to resumable partial files in the application cache. They are checked for the
-published size and LFS SHA-256, inspected through the normal bounded format handling, and activated
-by directory rename only after every required file validates. Thus a q27 primary and tokenizer
-become visible together, while failed/partial transfers never enter local discovery.
+published or manifest size and SHA-256, inspected through the normal bounded format handling, and
+activated by directory rename only after every required file validates. Thus every member of a
+package becomes visible together, while failed/partial transfers never enter local discovery.
 
-q27 pairing uses one shared rule for discovery and acquisition: exact stems first, then a unique
+Raw q27 pairing uses one shared rule for discovery and acquisition: exact stems first, then a unique
 longest boundary-safe prefix, then the sole `.tok` file (including `MODEL.q27` plus
-`TOKENIZER.tok`). The tokenizer header and adapter-owned Q27 architecture metadata must validate.
+`TOKENIZER.tok`). A Norted q27 package instead uses its exact manifest-bound tokenizer, regardless
+of unrelated nearby `.tok` files. The tokenizer header and adapter-owned Q27 architecture metadata
+must validate.
 NInfer stays a self-contained `.ninfer` v2 artifact with embedded resources and exposes its native
 `container_version`, `model_id`, and `weights_id`. GGUF and NInfer use their existing bounded
 inspectors after acquisition.
@@ -107,6 +119,10 @@ schema 5 fails closed with rebuild guidance. GGUF package format is unchanged. D
 genuine artifact members and provenance—primary hashes, tokenizer, projector, Sharp companion,
 lineage, and build facts—and performs the existing complete pre-prepare and final pre-spawn
 integrity verification.
+
+Managed package installation is atomic and package-owned. Removing any member plans removal of the
+single containing acquisition and all of its primary `ModelId`s. Both the CLI and TUI refuse that
+removal while any affected member is active. Configured external packages remain read-only.
 
 Builder packages contain no serving preset. Sharp is an artifact companion and is never selected
 automatically. A user may explicitly point a q27 Model Profile's external-template setting at the
@@ -458,7 +474,7 @@ cargo run -p norted-server -- tui
 
 At startup the TUI safely chooses one of two modes: it attaches to a healthy instance discovered through the existing runtime descriptor, public identity probe, and authenticated private control `status`, or it starts and owns the same serving composition used by headless `serve`. In owned mode the configured OpenAI-compatible endpoint is live while the TUI runs. Exiting shuts down the owned listeners and active backend and removes the owned descriptor; exiting an attached TUI leaves the external server running.
 
-Its top-level pages are Overview, Models, Model Profiles, Runtimes, Server, Logs, Settings, and Help. Models is an integrated Model Library: Installed preserves the local artifact/profile/runtime workflow, while Discover provides Hugging Face query editing, format filtering, concrete artifact details, live download bytes, and explicit managed removal. Remote rows say compatibility is unverified; the existing runtime picker continues to provide proven engine/runtime/host compatibility after acquisition. Model Profiles lists, creates, duplicates, deletes, rebinds, edits, validates, and loads user serving targets; it displays missing/incompatible state, active identity, and inherited versus overridden values. Settings shows only Global and engine defaults. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Incompatible candidates are hidden by default and can be revealed with the keyboard- and mouse-accessible `Show incompatible` checkbox; Recommended, Compatible, and Needs Attention results remain visible. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Installed source-runtime details include short commit/tree, recipe, Make or CMake, and CUDA provenance.
+Its top-level pages are Overview, Models, Model Profiles, Runtimes, Server, Logs, Settings, and Help. Models is an integrated Model Library: Installed preserves the local artifact/profile/runtime workflow, while Discover provides Hugging Face query editing, format filtering, repository-qualified artifact details, compact revision and size, known companion/package-manifest status, live download bytes, and explicit managed removal. Identical filenames from different repositories remain visibly distinct and retain their exact repository-qualified download reference. Remote rows say compatibility is unverified; the existing runtime picker continues to provide proven engine/runtime/host compatibility after acquisition. Model Profiles lists, creates, duplicates, deletes, rebinds, edits, validates, and loads user serving targets; it displays missing/incompatible state, active identity, and inherited versus overridden values. Settings shows only Global and engine defaults. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Incompatible candidates are hidden by default and can be revealed with the keyboard- and mouse-accessible `Show incompatible` checkbox; Recommended, Compatible, and Needs Attention results remain visible. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Installed source-runtime details include short commit/tree, recipe, Make or CMake, and CUDA provenance.
 
 Owned startup establishes the serving and authenticated control stack without waiting for complete local model discovery. The TUI promptly draws its pending first frame, then starts model discovery asynchronously; the existing NotScanned, Scanning, Ready/Ready with warnings, and Failed registry states report real progress. A Model Profile cannot load until its exact bound artifact is discovered. Headless `serve` continues to complete discovery before announcing that it is listening. Neither interactive path performs catalog network I/O merely to start. The editor shows only common settings plus the bound engine namespace, and clearing an override restores inheritance. Runtime help/usage probing runs in the background. Keyboard, mouse/wheel navigation, narrow layout, `NO_COLOR`, and configured ASCII mode remain supported. Edits never hot-mutate a running backend and apply on its next load.
 

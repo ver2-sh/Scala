@@ -69,24 +69,42 @@ Adapter registration and provider registration are separate. A built-in engine c
 ## Model Library and acquisition
 
 `ModelRegistry` remains the single local model inventory. Every scan includes configured external
-paths plus `<data>/models`; there is no parallel registry per engine or format. A library receipt
-next to a managed primary supplies stable logical identity and acquisition provenance without
-changing upstream bytes. Ordinary rescans therefore retain a downloaded artifact's `ModelId` even
-when transient catalog ordering changes.
+paths plus `<data>/models`; there is no parallel registry per engine or format. One receipt at the
+managed acquisition root enumerates every primary member and supplies stable logical identities and
+per-member acquisition provenance without changing upstream bytes. Ordinary rescans retain each
+downloaded artifact's `ModelId` when transient catalog ordering changes, but receipt provenance is
+accepted only when the current primary size still matches. Its verified acquisition digest remains
+provenance; `ModelArtifact.hash` is reserved for a current content hash actually established by the
+load-time package integrity path.
 
 `ModelCatalogProvider` is independent of `RuntimeCatalogProvider`. The initial Hugging Face provider
 uses the HTTP metadata API to group relevant siblings by repository and exact revision, and returns
 individual `.gguf`, `.q27`, and `.ninfer` variants with size/LFS SHA-256 when published. An exact
-reference has provider, repository, revision, and filename identity. Provider results are only
+reference has provider, repository, revision, and filename identity. The TUI selection retains and
+renders that repository identity, so equal filenames cannot alias. Provider results are only
 format candidates; they do not advertise a compatible engine or runtime before local inspection.
 No repository or model family is hard-coded into this generic provider.
 
 Acquisition streams each response to a cache `.part`, uses a Range request when partial data exists,
 checks authoritative size and SHA-256, then assembles all files in a registry-excluded
-`.norted-staging` directory on the managed root's filesystem. q27 tokenizer selection calls the same core selector used by local discovery,
-including the upstream `MODEL.q27` + sole `TOKENIZER.tok` layout. Norted package manifests are
-recognized only to retain all manifest-declared package files and existing lineage. The complete
-staged directory is rediscovered and validated before one rename to:
+`.norted-staging` directory on the managed root's filesystem. Raw q27 tokenizer selection calls the
+same core selector used by local discovery, including the upstream `MODEL.q27` + sole
+`TOKENIZER.tok` layout.
+
+Norted package acquisition planning is a pure `norted-core` interpretation of the same locally
+accepted `BUILD-MANIFEST.json`, `Q27-MANIFEST.json`, and `NINFER-MANIFEST.json` schemas. A provider
+searches only exact ancestor manifest paths for the selected repository filename; filenames inside
+the manifest resolve relative to that manifest directory. It never chooses a repository-global
+manifest by basename. The plan contains the complete required closure, primary membership,
+auxiliary roles, and declared size/hash facts. The HTTP provider maps those safe package-relative
+paths to repository filenames without interpreting lineage or coupling core to Hugging Face.
+
+Staging preserves the repository/package directory tree, rejects absolute, parent, backslash,
+collision, and containment escapes, creates exact parent directories, and verifies all declared
+members before activation. GGUF packages retain the manifest and declared projector; q27 packages
+retain the exact manifest-bound tokenizer, Sharp, all outputs, and lineage; NInfer packages retain
+Sharp, all outputs, native identity, and lineage. The complete staged directory is rediscovered and
+validated before one rename to:
 
 ```text
 <data>/models/huggingface/<publisher>/<repository>/<revision>/<artifact-key>/
@@ -96,14 +114,18 @@ staged directory is rediscovered and validated before one rename to:
 GGUF uses bounded metadata inspection, q27 uses adapter-owned bounded architecture/tier inspection
 plus validated tokenizer presence, and NInfer uses its native v2 container inspector. NInfer does
 not gain invented tokenizer/template sidecars. Failed or cancelled staging is excluded from discovery;
-all required files must complete before activation. The receipt records provider, repository,
-revision, remote filename, local size, source URL, acquisition time, and authoritative digest when
-available. It is model-acquisition provenance, not a substitute for Norted Builder lineage.
+all required files must complete before activation. The package-level receipt records one managed
+acquisition identity and every primary member, with provider, repository, revision, remote filename,
+local size, source URL, acquisition time, and authoritative acquisition digest when available. It is
+model-acquisition provenance, not a substitute for Norted Builder lineage.
 
-Import copies by default. If the source is a valid Norted package, all package files are copied and
-the original package manifest remains authoritative. Removal canonicalizes both managed root and
-artifact, requires receipt-backed provenance, and removes only the containing artifact directory
-below `<data>/models`; configured external artifacts are read-only.
+Import copies by default. If the source is a valid Norted package, only the manifest-planned file
+closure is copied, with nested relative paths intact; unrelated neighboring files are excluded and
+the original package manifest remains authoritative. Every primary output becomes an individual
+registry/Profile target but shares one atomic managed acquisition. Removal derives a contained plan
+from the receipt, revalidates every member, and exposes all affected `ModelId`s. The CLI and TUI
+compare that full set with private control state and refuse deletion if any member is active, then
+remove only the acquisition root below `<data>/models`. Configured external artifacts are read-only.
 
 The TUI Models screen is one integrated Model Library with Installed and Discover modes, query and
 format controls, concrete artifact details, byte progress, download, managed removal, and the

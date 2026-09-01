@@ -446,7 +446,7 @@ fn render_model_discover(
     } else {
         let artifacts = app.model_search_artifacts();
         let items = ui_layout.model_rows.iter().map(|(index, _)| {
-            let artifact = artifacts[*index];
+            let (repository, artifact) = artifacts[*index];
             let style = if app.selected_model_search_result == Some(*index) {
                 theme.selected
             } else {
@@ -456,17 +456,26 @@ fn render_model_discover(
                 .size_bytes
                 .map(format_bytes)
                 .unwrap_or_else(|| "size unknown".to_owned());
-            let companion = if artifact.required_companions.is_empty() {
-                String::new()
+            let companion = if let Some(manifest) = &artifact.package_manifest {
+                format!("package candidate via {manifest}")
+            } else if artifact.required_companions.is_empty() {
+                "standalone/raw candidate".to_owned()
             } else {
-                format!(" · +{}", artifact.required_companions.join(", "))
+                format!("requires {}", artifact.required_companions.join(", "))
             };
+            let revision = truncate_middle(&repository.revision, 12, glyphs.ellipsis);
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(artifact.format.as_str().to_ascii_uppercase(), theme.accent),
                     Span::styled(format!("  {}", artifact.filename), theme.text),
                 ]),
-                Line::from(Span::styled(format!("{size}{companion}"), theme.muted)),
+                Line::from(vec![
+                    Span::styled(&repository.repository, theme.text),
+                    Span::styled(
+                        format!(" · {size} · rev {revision} · {companion}"),
+                        theme.muted,
+                    ),
+                ]),
                 Line::from(Span::styled(
                     "Format candidate · runtime compatibility unverified · d download",
                     theme.hint,

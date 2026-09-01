@@ -1,5 +1,6 @@
 //! Managed model acquisition without model transformation or runtime ownership.
 
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -9,8 +10,10 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use norted_core::{
     AppPaths, ArtifactFormat, ModelArtifact, ModelArtifactProvenance, ModelId, ModelLibraryReceipt,
-    ModelRegistry, inspect_gguf_metadata, inspect_ninfer_container, model_library_receipt_path,
-    q27_tokenizer_candidate, select_q27_tokenizer_filename,
+    ModelLibraryReceiptMember, ModelRegistry, NortedPackageAcquisitionPlan, inspect_gguf_metadata,
+    inspect_ninfer_container, model_library_receipt_path, norted_package_manifest_name,
+    plan_norted_package_acquisition, q27_tokenizer_candidate, recover_norted_package_primary_paths,
+    select_q27_tokenizer_filename,
 };
 use reqwest::{Client, StatusCode, Url, header};
 use serde::{Deserialize, Serialize};
@@ -18,7 +21,8 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 
-const RECEIPT_SCHEMA_VERSION: u32 = 1;
+const RECEIPT_SCHEMA_VERSION: u32 = 2;
+const MAX_PACKAGE_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ModelLibraryError {
@@ -60,6 +64,9 @@ pub struct CatalogFile {
     pub size_bytes: Option<u64>,
     pub sha256: Option<String>,
     pub required_companions: Vec<String>,
+    /// A same-format manifest exists in an ancestor directory. Valid package
+    /// membership is established only when the exact reference is resolved.
+    pub package_manifest: Option<String>,
     /// Remote entries are format candidates until local inspection succeeds.
     pub compatibility: CatalogCompatibility,
 }
@@ -100,6 +107,26 @@ pub struct ResolvedArtifact {
     pub primary: ResolvedFile,
     pub companions: Vec<ResolvedFile>,
     pub format: ArtifactFormat,
+    pub package: Option<ResolvedPackage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedPackage {
+    pub manifest_filename: String,
+    pub primary_filenames: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelRemovalPlan {
+    acquisition_root: PathBuf,
+    pub acquisition_id: String,
+    pub affected_model_ids: Vec<ModelId>,
+}
+
+impl ModelRemovalPlan {
+    pub fn acquisition_root(&self) -> &Path {
+        &self.acquisition_root
+    }
 }
 
 #[async_trait]
@@ -222,10 +249,11 @@ impl ModelLibrary {
             )
         })?;
         validate_artifact(&source, format)?;
-        let source_registry = ModelRegistry::discover(&[source
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf()]);
+        let source_parent = source.parent().unwrap_or_else(|| Path::new("."));
+        let discovery_root = local_package_root(&source, format)
+            .await?
+            .unwrap_or_else(|| source_parent.to_path_buf());
+        let source_registry = ModelRegistry::discover(&[discovery_root]);
         let discovered_source = source_registry
             .artifacts()
             .iter()
@@ -239,7 +267,7 @@ impl ModelLibrary {
                 })
             })?;
         let mut companion = None;
-        if format == ArtifactFormat::Q27 {
+        if format == ArtifactFormat::Q27 && discovered_source.norted_package.is_none() {
             let mut warnings = Vec::new();
             companion = q27_tokenizer_candidate(&source, &mut warnings);
             if companion.is_none() {
@@ -250,66 +278,116 @@ impl ModelLibrary {
             }
         }
         let filename = safe_basename(&source)?;
-        let logical = format!("local-import:{}", sha256_text(&source.to_string_lossy()));
+        let import_identity = discovered_source
+            .norted_package
+            .as_ref()
+            .map_or(source.as_path(), |package| package.manifest_path.as_path());
+        let logical = format!(
+            "local-import:{}",
+            sha256_text(&import_identity.to_string_lossy())
+        );
+        let acquisition_id = logical.clone();
         let destination = self.root.join("imports").join(&logical[13..25]);
         if destination.exists() {
             return Err(ModelLibraryError::AlreadyInstalled(destination));
         }
         let stage = self.create_stage().await?;
-        if let Some(package) = &discovered_source.norted_package {
-            let mut entries =
-                tokio::fs::read_dir(&package.package_root)
+        let (selected_path, receipt_members) = if let Some(package) =
+            &discovered_source.norted_package
+        {
+            let manifest_bytes =
+                tokio::fs::read(&package.manifest_path)
                     .await
                     .map_err(|source| ModelLibraryError::Io {
-                        path: package.package_root.clone(),
+                        path: package.manifest_path.clone(),
                         source,
                     })?;
-            while let Some(entry) =
-                entries
-                    .next_entry()
-                    .await
-                    .map_err(|source| ModelLibraryError::Io {
-                        path: package.package_root.clone(),
-                        source,
-                    })?
-            {
-                if entry
-                    .file_type()
-                    .await
-                    .map_err(|source| ModelLibraryError::Io {
-                        path: entry.path(),
-                        source,
-                    })?
-                    .is_file()
-                {
-                    copy_file(&entry.path(), &stage.join(entry.file_name())).await?;
-                }
+            let plan = plan_norted_package_acquisition(&manifest_bytes, format)
+                .map_err(ModelLibraryError::InvalidArtifact)?;
+            let selected = source
+                .strip_prefix(&package.package_root)
+                .map_err(|_| {
+                    ModelLibraryError::InvalidArtifact(
+                        "package primary is outside its package root".to_owned(),
+                    )
+                })?
+                .to_path_buf();
+            if !plan.primary_files().any(|file| file.path == selected) {
+                return Err(ModelLibraryError::InvalidArtifact(
+                    "selected artifact is not a primary member of its Norted package".to_owned(),
+                ));
             }
+            for file in &plan.files {
+                copy_relative_file(&package.package_root, &stage, &file.path).await?;
+            }
+            verify_package_files(&stage, &plan).await?;
+            let installed = validate_package_stage(&stage, &plan)?;
+            let mut members = Vec::with_capacity(installed.len());
+            for artifact in installed {
+                let relative = artifact
+                    .path
+                    .strip_prefix(&*stage)
+                    .map_err(|_| {
+                        ModelLibraryError::InvalidArtifact(
+                            "staged package member escaped its acquisition root".to_owned(),
+                        )
+                    })?
+                    .to_path_buf();
+                let source_path = package.package_root.join(&relative);
+                let provenance = ModelArtifactProvenance {
+                    acquisition_id: acquisition_id.clone(),
+                    provider: "local_import".to_owned(),
+                    repository: None,
+                    logical_id: Some(format!("{acquisition_id}:{}", slash_path(&relative))),
+                    source: Some(source_path.display().to_string()),
+                    revision: None,
+                    remote_filename: None,
+                    acquired_at_unix: unix_timestamp(),
+                    size_bytes: artifact.size_bytes,
+                    digest: None,
+                };
+                members.push(ModelLibraryReceiptMember {
+                    path: relative,
+                    format: artifact.format,
+                    provenance,
+                });
+            }
+            (selected, members)
         } else {
-            copy_file(&source, &stage.join(&filename)).await?;
+            let selected = PathBuf::from(&filename);
+            copy_file(&source, &stage.join(&selected)).await?;
             if let Some(companion) = companion {
                 copy_file(&companion, &stage.join(safe_basename(&companion)?)).await?;
             }
-        }
-        let size_bytes = file_len(&source).await?;
-        let provenance = ModelArtifactProvenance {
-            provider: "local_import".to_owned(),
-            repository: None,
-            logical_id: Some(logical),
-            source: Some(source.display().to_string()),
-            revision: None,
-            remote_filename: None,
-            acquired_at_unix: unix_timestamp(),
-            size_bytes,
-            digest: None,
+            validate_artifact(&stage.join(&selected), format)?;
+            let provenance = ModelArtifactProvenance {
+                acquisition_id: acquisition_id.clone(),
+                provider: "local_import".to_owned(),
+                repository: None,
+                logical_id: Some(logical),
+                source: Some(source.display().to_string()),
+                revision: None,
+                remote_filename: None,
+                acquired_at_unix: unix_timestamp(),
+                size_bytes: file_len(&source).await?,
+                digest: None,
+            };
+            (
+                selected.clone(),
+                vec![ModelLibraryReceiptMember {
+                    path: selected,
+                    format,
+                    provenance,
+                }],
+            )
         };
-        write_receipt(&stage.join(&filename), provenance).await?;
-        let _ = discover_exact(&stage, &filename)?;
+        write_receipt(&stage, &acquisition_id, receipt_members).await?;
+        let _ = discover_exact(&stage, &selected_path)?;
         activate_stage(&stage, &destination).await?;
-        discover_exact(&destination, &filename)
+        discover_exact(&destination, &selected_path)
     }
 
-    pub async fn remove(&self, model: &ModelArtifact) -> Result<()> {
+    pub fn plan_removal(&self, model: &ModelArtifact) -> Result<ModelRemovalPlan> {
         let root = self
             .root
             .canonicalize()
@@ -324,19 +402,162 @@ impl ModelLibrary {
                 path: model.path.clone(),
                 source,
             })?;
-        if !path.starts_with(&root) || model.provenance.is_none() {
+        let provenance = model
+            .provenance
+            .as_ref()
+            .ok_or_else(|| ModelLibraryError::NotManaged(model.id.clone()))?;
+        if !path.starts_with(&root) {
             return Err(ModelLibraryError::NotManaged(model.id.clone()));
         }
-        let artifact_root = path
+        let mut acquisition_root = path
             .parent()
             .ok_or_else(|| ModelLibraryError::NotManaged(model.id.clone()))?;
-        if artifact_root == root || !artifact_root.starts_with(&root) {
+        let receipt_path = loop {
+            let candidate = model_library_receipt_path(acquisition_root);
+            if candidate.exists() {
+                break candidate;
+            }
+            if acquisition_root == root || !acquisition_root.starts_with(&root) {
+                return Err(ModelLibraryError::NotManaged(model.id.clone()));
+            }
+            acquisition_root = acquisition_root
+                .parent()
+                .ok_or_else(|| ModelLibraryError::NotManaged(model.id.clone()))?;
+        };
+        if acquisition_root == root
+            || !acquisition_root.starts_with(&root)
+            || acquisition_root.starts_with(&self.staging)
+        {
             return Err(ModelLibraryError::NotManaged(model.id.clone()));
         }
-        tokio::fs::remove_dir_all(artifact_root)
+        let bytes = std::fs::read(&receipt_path).map_err(|source| ModelLibraryError::Io {
+            path: receipt_path.clone(),
+            source,
+        })?;
+        let receipt: ModelLibraryReceipt = serde_json::from_slice(&bytes)
+            .map_err(|error| ModelLibraryError::InvalidArtifact(error.to_string()))?;
+        if receipt.schema_version != RECEIPT_SCHEMA_VERSION
+            || receipt.acquisition_id != provenance.acquisition_id
+            || receipt.members.is_empty()
+        {
+            return Err(ModelLibraryError::NotManaged(model.id.clone()));
+        }
+        let mut member_paths = HashSet::new();
+        let mut selected = false;
+        for member in &receipt.members {
+            if !safe_relative(&member.path)
+                || !member_paths.insert(member.path.clone())
+                || member.provenance.acquisition_id != receipt.acquisition_id
+            {
+                return Err(ModelLibraryError::InvalidArtifact(
+                    "managed acquisition receipt contains an unsafe or conflicting member"
+                        .to_owned(),
+                ));
+            }
+            let member_path = acquisition_root.join(&member.path);
+            let canonical = member_path
+                .canonicalize()
+                .map_err(|source| ModelLibraryError::Io {
+                    path: member_path.clone(),
+                    source,
+                })?;
+            let metadata = canonical
+                .metadata()
+                .map_err(|source| ModelLibraryError::Io {
+                    path: canonical.clone(),
+                    source,
+                })?;
+            if !canonical.starts_with(acquisition_root)
+                || !metadata.is_file()
+                || metadata.len() != member.provenance.size_bytes
+                || ArtifactFormat::from_path(&canonical) != Some(member.format)
+            {
+                return Err(ModelLibraryError::InvalidArtifact(format!(
+                    "managed acquisition member {} no longer matches its receipt",
+                    member.path.display()
+                )));
+            }
+            selected |= canonical == path;
+        }
+        if !selected {
+            return Err(ModelLibraryError::NotManaged(model.id.clone()));
+        }
+        let registry = ModelRegistry::discover(&[acquisition_root.to_path_buf()]);
+        let mut affected_model_ids = Vec::with_capacity(receipt.members.len());
+        for member in &receipt.members {
+            let expected =
+                acquisition_root
+                    .join(&member.path)
+                    .canonicalize()
+                    .map_err(|source| ModelLibraryError::Io {
+                        path: acquisition_root.join(&member.path),
+                        source,
+                    })?;
+            let artifact = registry
+                .artifacts()
+                .iter()
+                .find(|artifact| artifact.path == expected)
+                .ok_or_else(|| {
+                    ModelLibraryError::InvalidArtifact(if registry.warnings().is_empty() {
+                        format!(
+                            "managed acquisition member {} is no longer discoverable",
+                            member.path.display()
+                        )
+                    } else {
+                        registry.warnings().join("; ")
+                    })
+                })?;
+            if artifact
+                .provenance
+                .as_ref()
+                .map(|value| value.acquisition_id.as_str())
+                != Some(receipt.acquisition_id.as_str())
+            {
+                return Err(ModelLibraryError::InvalidArtifact(format!(
+                    "managed acquisition member {} has invalid provenance",
+                    member.path.display()
+                )));
+            }
+            affected_model_ids.push(artifact.id.clone());
+        }
+        affected_model_ids.sort();
+        affected_model_ids.dedup();
+        Ok(ModelRemovalPlan {
+            acquisition_root: acquisition_root.to_path_buf(),
+            acquisition_id: receipt.acquisition_id,
+            affected_model_ids,
+        })
+    }
+
+    pub async fn remove(&self, plan: &ModelRemovalPlan) -> Result<()> {
+        let root = self
+            .root
+            .canonicalize()
+            .map_err(|source| ModelLibraryError::Io {
+                path: self.root.clone(),
+                source,
+            })?;
+        let acquisition_root =
+            plan.acquisition_root
+                .canonicalize()
+                .map_err(|source| ModelLibraryError::Io {
+                    path: plan.acquisition_root.clone(),
+                    source,
+                })?;
+        if acquisition_root != plan.acquisition_root
+            || acquisition_root == root
+            || !acquisition_root.starts_with(&root)
+            || acquisition_root.starts_with(&self.staging)
+            || !model_library_receipt_path(&acquisition_root).is_file()
+        {
+            return Err(ModelLibraryError::InvalidArtifact(
+                "managed acquisition removal target is no longer safe".to_owned(),
+            ));
+        }
+        tokio::fs::remove_dir_all(&acquisition_root)
             .await
             .map_err(|source| ModelLibraryError::Io {
-                path: artifact_root.to_path_buf(),
+                path: acquisition_root,
                 source,
             })
     }
@@ -378,9 +599,17 @@ impl ModelLibrary {
                     .iter()
                     .all(|file| file.size_bytes.is_some());
             let mut completed = 0_u64;
+            let mut destinations = HashSet::new();
             for file in std::iter::once(&resolved.primary).chain(resolved.companions.iter()) {
-                let basename = safe_remote_basename(&file.filename)?;
-                let destination = stage.join(&basename);
+                let relative = safe_remote_path(&file.filename)?;
+                if !destinations.insert(relative.clone()) {
+                    return Err(ModelLibraryError::InvalidCatalog(format!(
+                        "remote acquisition contains colliding path `{}`",
+                        relative.display()
+                    )));
+                }
+                let destination = stage.join(&relative);
+                create_parent(&destination).await?;
                 let bytes = self
                     .download_file(
                         model_ref,
@@ -392,7 +621,7 @@ impl ModelLibrary {
                     .await?;
                 completed += bytes;
             }
-            let primary_name = safe_remote_basename(&resolved.primary.filename)?;
+            let primary_name = safe_remote_path(&resolved.primary.filename)?;
             let primary_path = stage.join(&primary_name);
             self.emit(
                 model_ref,
@@ -402,37 +631,109 @@ impl ModelLibrary {
                 total_known.then_some(total),
                 "Inspecting downloaded artifact",
             );
-            validate_artifact(&primary_path, resolved.format)?;
-            if resolved.format == ArtifactFormat::Q27 {
-                let mut warnings = Vec::new();
-                if q27_tokenizer_candidate(&primary_path, &mut warnings).is_none() {
+            let acquisition_id = format!(
+                "{}:{}@{}:{}",
+                resolved.provider,
+                resolved.repository,
+                resolved.revision,
+                resolved
+                    .package
+                    .as_ref()
+                    .map_or(resolved.primary.filename.as_str(), |package| package
+                        .manifest_filename
+                        .as_str())
+            );
+            let receipt_members = if let Some(package) = &resolved.package {
+                let manifest_path = stage.join(safe_remote_path(&package.manifest_filename)?);
+                let manifest_bytes = tokio::fs::read(&manifest_path).await.map_err(|source| {
+                    ModelLibraryError::Io {
+                        path: manifest_path,
+                        source,
+                    }
+                })?;
+                let plan = plan_norted_package_acquisition(&manifest_bytes, resolved.format)
+                    .map_err(ModelLibraryError::InvalidArtifact)?;
+                let package_root = Path::new(&package.manifest_filename)
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""));
+                let staged_package_root = stage.join(package_root);
+                verify_package_files(&staged_package_root, &plan).await?;
+                let installed = validate_package_stage(&staged_package_root, &plan)?;
+                let expected = package
+                    .primary_filenames
+                    .iter()
+                    .map(|path| safe_remote_path(path))
+                    .collect::<Result<HashSet<_>>>()?;
+                let observed = installed
+                    .iter()
+                    .filter_map(|artifact| artifact.path.strip_prefix(&*stage).ok())
+                    .map(Path::to_path_buf)
+                    .collect::<HashSet<_>>();
+                if observed != expected {
                     return Err(ModelLibraryError::InvalidArtifact(
-                        warnings.first().cloned().unwrap_or_else(|| {
-                            "downloaded q27 artifact is missing its tokenizer companion".to_owned()
-                        }),
+                        "downloaded package primary membership differs from its manifest"
+                            .to_owned(),
                     ));
                 }
-            }
-            let logical_id = format!(
-                "{}:{}/{}@{}:{}",
-                resolved.provider,
-                resolved.repository.split('/').next().unwrap_or("unknown"),
-                resolved.repository.split('/').nth(1).unwrap_or("unknown"),
-                resolved.revision,
-                resolved.primary.filename
-            );
-            let provenance = ModelArtifactProvenance {
-                provider: resolved.provider.clone(),
-                repository: Some(resolved.repository.clone()),
-                logical_id: Some(logical_id),
-                source: Some(resolved.primary.url.to_string()),
-                revision: Some(resolved.revision.clone()),
-                remote_filename: Some(resolved.primary.filename.clone()),
-                acquired_at_unix: unix_timestamp(),
-                size_bytes: file_len(&primary_path).await?,
-                digest: resolved.primary.sha256.clone(),
+                let resolved_files = std::iter::once(&resolved.primary)
+                    .chain(resolved.companions.iter())
+                    .map(|file| (file.filename.as_str(), file))
+                    .collect::<std::collections::HashMap<_, _>>();
+                installed
+                    .into_iter()
+                    .map(|artifact| {
+                        let relative = artifact
+                            .path
+                            .strip_prefix(&*stage)
+                            .map_err(|_| {
+                                ModelLibraryError::InvalidArtifact(
+                                    "staged package member escaped its acquisition root".to_owned(),
+                                )
+                            })?
+                            .to_path_buf();
+                        let remote = slash_path(&relative);
+                        let file = resolved_files.get(remote.as_str()).ok_or_else(|| {
+                            ModelLibraryError::InvalidCatalog(format!(
+                                "package primary `{remote}` was not resolved"
+                            ))
+                        })?;
+                        Ok(ModelLibraryReceiptMember {
+                            path: relative,
+                            format: artifact.format,
+                            provenance: remote_provenance(
+                                resolved,
+                                file,
+                                &acquisition_id,
+                                artifact.size_bytes,
+                            ),
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                validate_artifact(&primary_path, resolved.format)?;
+                if resolved.format == ArtifactFormat::Q27 {
+                    let mut warnings = Vec::new();
+                    if q27_tokenizer_candidate(&primary_path, &mut warnings).is_none() {
+                        return Err(ModelLibraryError::InvalidArtifact(
+                            warnings.first().cloned().unwrap_or_else(|| {
+                                "downloaded q27 artifact is missing its tokenizer companion"
+                                    .to_owned()
+                            }),
+                        ));
+                    }
+                }
+                vec![ModelLibraryReceiptMember {
+                    path: primary_name.clone(),
+                    format: resolved.format,
+                    provenance: remote_provenance(
+                        resolved,
+                        &resolved.primary,
+                        &acquisition_id,
+                        file_len(&primary_path).await?,
+                    ),
+                }]
             };
-            write_receipt(&primary_path, provenance).await?;
+            write_receipt(&stage, &acquisition_id, receipt_members).await?;
             let _ = discover_exact(&stage, &primary_name)?;
             let destination = managed_destination(&self.root, resolved)?;
             if destination.exists() {
@@ -696,63 +997,134 @@ impl HuggingFaceCatalogProvider {
             .await?)
     }
 
-    async fn package_companions(
+    async fn manifest_bytes(&self, url: Url) -> Result<Vec<u8>> {
+        let response = self.client.get(url).send().await?.error_for_status()?;
+        if response
+            .content_length()
+            .is_some_and(|size| size > MAX_PACKAGE_MANIFEST_BYTES)
+        {
+            return Err(ModelLibraryError::InvalidCatalog(
+                "Norted package manifest exceeds the bounded manifest size".to_owned(),
+            ));
+        }
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if bytes.len().saturating_add(chunk.len())
+                > usize::try_from(MAX_PACKAGE_MANIFEST_BYTES).expect("manifest bound fits usize")
+            {
+                return Err(ModelLibraryError::InvalidCatalog(
+                    "Norted package manifest exceeds the bounded manifest size".to_owned(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
+    }
+
+    async fn resolve_package(
         &self,
         repository: &HfRepository,
         repository_id: &str,
         revision: &str,
         primary_filename: &str,
         format: ArtifactFormat,
-    ) -> Result<Vec<ResolvedFile>> {
-        let manifest_name = match format {
-            ArtifactFormat::Q27 => "q27-manifest.json",
-            ArtifactFormat::Ninfer => "ninfer-manifest.json",
-            ArtifactFormat::Gguf => return Ok(Vec::new()),
-        };
-        let Some(manifest) = repository.siblings.iter().find(|file| {
-            file.rfilename
-                .rsplit('/')
-                .next()
-                .is_some_and(|name| name.eq_ignore_ascii_case(manifest_name))
-        }) else {
-            return Ok(Vec::new());
-        };
-        let resolved_manifest = manifest.resolved(&self.api_base, repository_id, revision)?;
-        let document: serde_json::Value = self
-            .client
-            .get(resolved_manifest.url.clone())
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-        let mut filenames = Vec::new();
-        collect_manifest_filenames(&document, &mut filenames);
-        if !filenames
-            .iter()
-            .any(|filename| filename == primary_filename)
-        {
-            return Ok(Vec::new());
-        }
-        let mut companions = vec![resolved_manifest];
-        for filename in filenames {
-            if filename == primary_filename
-                || companions.iter().any(|file| file.filename == filename)
-            {
-                continue;
-            }
-            let sibling = repository
+    ) -> Result<Option<(ResolvedPackage, Vec<ResolvedFile>)>> {
+        let manifest_name = norted_package_manifest_name(format);
+        let primary_path = Path::new(primary_filename);
+        let mut directory = primary_path.parent().unwrap_or_else(|| Path::new(""));
+        loop {
+            let manifest_path = directory.join(manifest_name);
+            let manifest_filename = slash_path(&manifest_path);
+            if let Some(manifest) = repository
                 .siblings
                 .iter()
-                .find(|file| file.rfilename == filename)
-                .ok_or_else(|| {
-                    ModelLibraryError::InvalidCatalog(format!(
-                        "Norted package manifest references missing file `{filename}`"
-                    ))
+                .find(|file| file.rfilename == manifest_filename)
+            {
+                let resolved_manifest =
+                    manifest.resolved(&self.api_base, repository_id, revision)?;
+                let bytes = self.manifest_bytes(resolved_manifest.url.clone()).await?;
+                let selected_relative = primary_path.strip_prefix(directory).map_err(|_| {
+                    ModelLibraryError::InvalidCatalog(
+                        "remote package candidate is outside its manifest directory".to_owned(),
+                    )
                 })?;
-            companions.push(sibling.resolved(&self.api_base, repository_id, revision)?);
+                match plan_norted_package_acquisition(&bytes, format) {
+                    Ok(plan) => {
+                        if plan
+                            .primary_files()
+                            .any(|file| file.path == selected_relative)
+                        {
+                            let primary_filenames = plan
+                                .primary_files()
+                                .map(|file| slash_path(&directory.join(&file.path)))
+                                .collect::<Vec<_>>();
+                            let mut files = Vec::with_capacity(plan.files.len());
+                            for planned in &plan.files {
+                                let filename = slash_path(&directory.join(&planned.path));
+                                let sibling = repository
+                                    .siblings
+                                    .iter()
+                                    .find(|file| file.rfilename == filename)
+                                    .ok_or_else(|| {
+                                        ModelLibraryError::InvalidCatalog(format!(
+                                            "Norted package manifest references missing file `{filename}`"
+                                        ))
+                                    })?;
+                                let mut resolved =
+                                    sibling.resolved(&self.api_base, repository_id, revision)?;
+                                if planned
+                                    .size_bytes
+                                    .zip(resolved.size_bytes)
+                                    .is_some_and(|(expected, observed)| expected != observed)
+                                {
+                                    return Err(ModelLibraryError::InvalidCatalog(format!(
+                                        "Norted package file `{filename}` catalog size disagrees with its manifest"
+                                    )));
+                                }
+                                if planned
+                                    .sha256
+                                    .as_ref()
+                                    .zip(resolved.sha256.as_ref())
+                                    .is_some_and(|(expected, observed)| {
+                                        !expected.eq_ignore_ascii_case(observed)
+                                    })
+                                {
+                                    return Err(ModelLibraryError::InvalidCatalog(format!(
+                                        "Norted package file `{filename}` catalog digest disagrees with its manifest"
+                                    )));
+                                }
+                                resolved.size_bytes = planned.size_bytes.or(resolved.size_bytes);
+                                resolved.sha256 = planned.sha256.clone().or(resolved.sha256);
+                                files.push(resolved);
+                            }
+                            return Ok(Some((
+                                ResolvedPackage {
+                                    manifest_filename,
+                                    primary_filenames,
+                                },
+                                files,
+                            )));
+                        }
+                    }
+                    Err(error) => {
+                        if recover_norted_package_primary_paths(&bytes, format)
+                            .is_some_and(|claims| claims.contains(selected_relative))
+                        {
+                            return Err(ModelLibraryError::InvalidCatalog(format!(
+                                "Norted package manifest `{manifest_filename}` claims `{primary_filename}` but is invalid: {error}"
+                            )));
+                        }
+                    }
+                }
+            }
+            if directory.as_os_str().is_empty() {
+                break;
+            }
+            directory = directory.parent().unwrap_or_else(|| Path::new(""));
         }
-        Ok(companions)
+        Ok(None)
     }
 }
 
@@ -814,11 +1186,34 @@ impl ModelCatalogProvider for HuggingFaceCatalogProvider {
                     parsed.repository, parsed.filename
                 ))
             })?;
-        let mut companions = if format == ArtifactFormat::Q27 {
+        let package = self
+            .resolve_package(
+                &repository,
+                &parsed.repository,
+                &revision,
+                &parsed.filename,
+                format,
+            )
+            .await?;
+        let (resolved_primary, package, companions) = if let Some((package, mut files)) = package {
+            let selected = files
+                .iter()
+                .position(|file| file.filename == parsed.filename)
+                .ok_or_else(|| {
+                    ModelLibraryError::InvalidCatalog(
+                        "resolved package does not contain its selected primary".to_owned(),
+                    )
+                })?;
+            let resolved_primary = files.remove(selected);
+            (resolved_primary, Some(package), files)
+        } else if format == ArtifactFormat::Q27 {
             let tokenizer_names = repository
                 .siblings
                 .iter()
-                .filter(|file| file.rfilename.to_ascii_lowercase().ends_with(".tok"))
+                .filter(|file| {
+                    file.rfilename.to_ascii_lowercase().ends_with(".tok")
+                        && same_remote_directory(&file.rfilename, &parsed.filename)
+                })
                 .map(|file| file.rfilename.clone())
                 .collect::<Vec<_>>();
             let selected = select_q27_tokenizer_filename(&parsed.filename, &tokenizer_names)
@@ -829,41 +1224,34 @@ impl ModelCatalogProvider for HuggingFaceCatalogProvider {
                         parsed.filename
                     ))
                 })?;
-            vec![
+            let companions = vec![
                 repository
                     .siblings
                     .iter()
                     .find(|file| file.rfilename == selected)
                     .expect("selected sibling exists")
                     .resolved(&self.api_base, &parsed.repository, &revision)?,
-            ]
-        } else {
-            Vec::new()
-        };
-        for companion in self
-            .package_companions(
-                &repository,
-                &parsed.repository,
-                &revision,
-                &parsed.filename,
-                format,
+            ];
+            (
+                primary.resolved(&self.api_base, &parsed.repository, &revision)?,
+                None,
+                companions,
             )
-            .await?
-        {
-            if !companions
-                .iter()
-                .any(|existing| existing.filename == companion.filename)
-            {
-                companions.push(companion);
-            }
-        }
+        } else {
+            (
+                primary.resolved(&self.api_base, &parsed.repository, &revision)?,
+                None,
+                Vec::new(),
+            )
+        };
         Ok(ResolvedArtifact {
             provider: self.id().to_owned(),
             repository: parsed.repository.clone(),
             revision: revision.clone(),
-            primary: primary.resolved(&self.api_base, &parsed.repository, &revision)?,
+            primary: resolved_primary,
             companions,
             format,
+            package,
         })
     }
 }
@@ -882,12 +1270,6 @@ impl HfRepository {
         format_filter: Option<ArtifactFormat>,
     ) -> Result<Option<CatalogRepository>> {
         let revision = self.sha.unwrap_or_else(|| "main".to_owned());
-        let tokenizers = self
-            .siblings
-            .iter()
-            .filter(|file| file.rfilename.to_ascii_lowercase().ends_with(".tok"))
-            .map(|file| file.rfilename.clone())
-            .collect::<Vec<_>>();
         let mut artifacts = Vec::new();
         for sibling in &self.siblings {
             let Some(format) = ArtifactFormat::from_path(Path::new(&sibling.rfilename)) else {
@@ -896,7 +1278,19 @@ impl HfRepository {
             if format_filter.is_some_and(|filter| filter != format) {
                 continue;
             }
-            let required_companions = if format == ArtifactFormat::Q27 {
+            let package_manifest =
+                nearest_package_manifest(&self.siblings, &sibling.rfilename, format);
+            let required_companions = if format == ArtifactFormat::Q27 && package_manifest.is_none()
+            {
+                let tokenizers = self
+                    .siblings
+                    .iter()
+                    .filter(|file| {
+                        file.rfilename.to_ascii_lowercase().ends_with(".tok")
+                            && same_remote_directory(&file.rfilename, &sibling.rfilename)
+                    })
+                    .map(|file| file.rfilename.clone())
+                    .collect::<Vec<_>>();
                 let Ok(Some(tokenizer)) =
                     select_q27_tokenizer_filename(&sibling.rfilename, &tokenizers)
                 else {
@@ -913,6 +1307,7 @@ impl HfRepository {
                 size_bytes: sibling.size(),
                 sha256: sibling.sha256(),
                 required_companions,
+                package_manifest,
                 compatibility: CatalogCompatibility::Unverified,
             });
         }
@@ -970,6 +1365,31 @@ impl HfSibling {
     }
 }
 
+fn same_remote_directory(left: &str, right: &str) -> bool {
+    Path::new(left).parent() == Path::new(right).parent()
+}
+
+fn nearest_package_manifest(
+    siblings: &[HfSibling],
+    artifact_filename: &str,
+    format: ArtifactFormat,
+) -> Option<String> {
+    let manifest_name = norted_package_manifest_name(format);
+    let mut directory = Path::new(artifact_filename)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    loop {
+        let candidate = slash_path(&directory.join(manifest_name));
+        if siblings.iter().any(|file| file.rfilename == candidate) {
+            return Some(candidate);
+        }
+        if directory.as_os_str().is_empty() {
+            return None;
+        }
+        directory = directory.parent().unwrap_or_else(|| Path::new(""));
+    }
+}
+
 struct HfReference {
     repository: String,
     revision: String,
@@ -1004,33 +1424,18 @@ fn parse_hf_ref(value: &str) -> Result<HfReference> {
     })
 }
 
-fn collect_manifest_filenames(value: &serde_json::Value, output: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, value) in object {
-                if key == "filename"
-                    && let Some(filename) = value.as_str()
-                {
-                    output.push(filename.to_owned());
-                }
-                collect_manifest_filenames(value, output);
-            }
-        }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_manifest_filenames(value, output);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn managed_destination(root: &Path, resolved: &ResolvedArtifact) -> Result<PathBuf> {
     let mut repo = resolved.repository.split('/');
     let publisher = safe_segment(repo.next().unwrap_or_default())?;
     let repository = safe_segment(repo.next().unwrap_or_default())?;
     let revision = safe_segment(&resolved.revision)?;
-    let artifact = &sha256_text(&resolved.primary.filename)[..16];
+    let identity = resolved
+        .package
+        .as_ref()
+        .map_or(resolved.primary.filename.as_str(), |package| {
+            package.manifest_filename.as_str()
+        });
+    let artifact = &sha256_text(identity)[..16];
     Ok(root
         .join("huggingface")
         .join(publisher)
@@ -1051,24 +1456,20 @@ fn safe_segment(value: &str) -> Result<&str> {
 
 fn safe_relative(path: &Path) -> bool {
     !path.as_os_str().is_empty()
+        && !path.to_string_lossy().contains('\\')
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn safe_remote_basename(filename: &str) -> Result<String> {
-    if !safe_relative(Path::new(filename)) {
+fn safe_remote_path(filename: &str) -> Result<PathBuf> {
+    let path = Path::new(filename);
+    if !safe_relative(path) {
         return Err(ModelLibraryError::InvalidCatalog(format!(
             "unsafe remote filename `{filename}`"
         )));
     }
-    Path::new(filename)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            ModelLibraryError::InvalidCatalog(format!("invalid remote filename `{filename}`"))
-        })
+    Ok(path.to_path_buf())
 }
 
 fn safe_basename(path: &Path) -> Result<String> {
@@ -1096,6 +1497,63 @@ fn validate_artifact(path: &Path, format: ArtifactFormat) -> Result<()> {
     }
 }
 
+async fn local_package_root(source: &Path, format: ArtifactFormat) -> Result<Option<PathBuf>> {
+    let manifest_name = norted_package_manifest_name(format);
+    let mut directory = source.parent().ok_or_else(|| {
+        ModelLibraryError::InvalidArtifact("artifact path has no parent directory".to_owned())
+    })?;
+    loop {
+        let manifest = directory.join(manifest_name);
+        if let Ok(metadata) = tokio::fs::metadata(&manifest).await
+            && metadata.is_file()
+            && metadata.len() > 0
+            && metadata.len() <= MAX_PACKAGE_MANIFEST_BYTES
+        {
+            let bytes =
+                tokio::fs::read(&manifest)
+                    .await
+                    .map_err(|source| ModelLibraryError::Io {
+                        path: manifest.clone(),
+                        source,
+                    })?;
+            let selected = source.strip_prefix(directory).map_err(|_| {
+                ModelLibraryError::InvalidArtifact(
+                    "local package candidate escapes its manifest directory".to_owned(),
+                )
+            })?;
+            match plan_norted_package_acquisition(&bytes, format) {
+                Ok(plan) if plan.primary_files().any(|file| file.path == selected) => {
+                    return directory.canonicalize().map(Some).map_err(|source| {
+                        ModelLibraryError::Io {
+                            path: directory.to_path_buf(),
+                            source,
+                        }
+                    });
+                }
+                Ok(_) => {}
+                Err(error)
+                    if recover_norted_package_primary_paths(&bytes, format)
+                        .is_some_and(|claims| claims.contains(selected)) =>
+                {
+                    return Err(ModelLibraryError::InvalidArtifact(format!(
+                        "Norted package manifest {} claims the selected artifact but is invalid: {error}",
+                        manifest.display()
+                    )));
+                }
+                Err(_) => {}
+            }
+        }
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        if parent == directory {
+            break;
+        }
+        directory = parent;
+    }
+    Ok(None)
+}
+
 async fn copy_file(source: &Path, destination: &Path) -> Result<()> {
     tokio::fs::copy(source, destination)
         .await
@@ -1104,6 +1562,150 @@ async fn copy_file(source: &Path, destination: &Path) -> Result<()> {
             path: destination.to_path_buf(),
             source: source_error,
         })
+}
+
+async fn create_parent(path: &Path) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        ModelLibraryError::InvalidArtifact(format!(
+            "artifact path {} has no parent",
+            path.display()
+        ))
+    })?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|source| ModelLibraryError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })
+}
+
+async fn copy_relative_file(source_root: &Path, stage: &Path, relative: &Path) -> Result<()> {
+    if !safe_relative(relative) {
+        return Err(ModelLibraryError::InvalidArtifact(format!(
+            "unsafe package-relative path {}",
+            relative.display()
+        )));
+    }
+    let source = source_root
+        .join(relative)
+        .canonicalize()
+        .map_err(|source| ModelLibraryError::Io {
+            path: source_root.join(relative),
+            source,
+        })?;
+    if !source.starts_with(source_root) || !source.is_file() {
+        return Err(ModelLibraryError::InvalidArtifact(format!(
+            "package file {} escapes its source root or is not regular",
+            relative.display()
+        )));
+    }
+    let destination = stage.join(relative);
+    create_parent(&destination).await?;
+    copy_file(&source, &destination).await
+}
+
+fn validate_package_stage(
+    stage: &Path,
+    plan: &NortedPackageAcquisitionPlan,
+) -> Result<Vec<ModelArtifact>> {
+    let registry = ModelRegistry::discover(&[stage.to_path_buf()]);
+    let expected = plan
+        .primary_files()
+        .map(|file| file.path.clone())
+        .collect::<HashSet<_>>();
+    let members = registry
+        .artifacts()
+        .iter()
+        .filter(|artifact| artifact.norted_package.is_some())
+        .filter_map(|artifact| {
+            let relative = artifact.path.strip_prefix(stage).ok()?;
+            expected.contains(relative).then_some(artifact.clone())
+        })
+        .collect::<Vec<_>>();
+    if members.len() != expected.len() {
+        return Err(ModelLibraryError::InvalidArtifact(
+            if registry.warnings().is_empty() {
+                "staged Norted package did not expose every declared primary member".to_owned()
+            } else {
+                registry.warnings().join("; ")
+            },
+        ));
+    }
+    Ok(members)
+}
+
+async fn verify_package_files(stage: &Path, plan: &NortedPackageAcquisitionPlan) -> Result<()> {
+    for file in &plan.files {
+        let path = stage.join(&file.path);
+        let metadata =
+            tokio::fs::metadata(&path)
+                .await
+                .map_err(|source| ModelLibraryError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+        if !metadata.is_file() {
+            return Err(ModelLibraryError::InvalidArtifact(format!(
+                "package member {} is not a regular file",
+                file.path.display()
+            )));
+        }
+        if file
+            .size_bytes
+            .is_some_and(|expected| expected != metadata.len())
+        {
+            return Err(ModelLibraryError::InvalidArtifact(format!(
+                "package member {} has {} bytes; expected {}",
+                file.path.display(),
+                metadata.len(),
+                file.size_bytes.expect("checked expected size")
+            )));
+        }
+        if let Some(expected) = &file.sha256 {
+            let observed = sha256_file(&path).await?;
+            if observed != *expected {
+                return Err(ModelLibraryError::DigestMismatch {
+                    filename: slash_path(&file.path),
+                    expected: expected.clone(),
+                    observed,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn remote_provenance(
+    resolved: &ResolvedArtifact,
+    file: &ResolvedFile,
+    acquisition_id: &str,
+    size_bytes: u64,
+) -> ModelArtifactProvenance {
+    ModelArtifactProvenance {
+        acquisition_id: acquisition_id.to_owned(),
+        provider: resolved.provider.clone(),
+        repository: Some(resolved.repository.clone()),
+        logical_id: Some(format!(
+            "{}:{}@{}:{}",
+            resolved.provider, resolved.repository, resolved.revision, file.filename
+        )),
+        source: Some(file.url.to_string()),
+        revision: Some(resolved.revision.clone()),
+        remote_filename: Some(file.filename.clone()),
+        acquired_at_unix: unix_timestamp(),
+        size_bytes,
+        digest: file.sha256.clone(),
+    }
+}
+
+fn slash_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 async fn file_len(path: &Path) -> Result<u64> {
@@ -1116,15 +1718,19 @@ async fn file_len(path: &Path) -> Result<u64> {
         })
 }
 
-async fn write_receipt(primary: &Path, provenance: ModelArtifactProvenance) -> Result<()> {
+async fn write_receipt(
+    acquisition_root: &Path,
+    acquisition_id: &str,
+    members: Vec<ModelLibraryReceiptMember>,
+) -> Result<()> {
     let receipt = ModelLibraryReceipt {
         schema_version: RECEIPT_SCHEMA_VERSION,
-        primary_filename: safe_basename(primary)?,
-        provenance,
+        acquisition_id: acquisition_id.to_owned(),
+        members,
     };
     let bytes = serde_json::to_vec_pretty(&receipt)
         .map_err(|error| ModelLibraryError::InvalidArtifact(error.to_string()))?;
-    let path = model_library_receipt_path(primary);
+    let path = model_library_receipt_path(acquisition_root);
     tokio::fs::write(&path, bytes)
         .await
         .map_err(|source| ModelLibraryError::Io { path, source })
@@ -1148,14 +1754,19 @@ async fn activate_stage(stage: &Path, destination: &Path) -> Result<()> {
         })
 }
 
-fn discover_exact(root: &Path, filename: &str) -> Result<ModelArtifact> {
+fn discover_exact(root: &Path, relative: &Path) -> Result<ModelArtifact> {
+    let expected = root
+        .join(relative)
+        .canonicalize()
+        .map_err(|source| ModelLibraryError::Io {
+            path: root.join(relative),
+            source,
+        })?;
     let registry = ModelRegistry::discover(&[root.to_path_buf()]);
     registry
         .artifacts()
         .iter()
-        .find(|artifact| {
-            artifact.path.file_name().and_then(|value| value.to_str()) == Some(filename)
-        })
+        .find(|artifact| artifact.path == expected)
         .cloned()
         .ok_or_else(|| ModelLibraryError::InvalidArtifact(registry.warnings().join("; ")))
 }

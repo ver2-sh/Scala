@@ -15,7 +15,7 @@ use norted_engine::{
     RuntimeModelCandidate, RuntimeNoticeLevel, RuntimeSearchResult, RuntimeSearchSnapshot,
     RuntimeUpdateCheck,
 };
-use norted_model_library::{CatalogFile, CatalogSearch, ModelOperationProgress};
+use norted_model_library::{CatalogFile, CatalogRepository, CatalogSearch, ModelOperationProgress};
 use ratatui::layout::Position;
 
 use crate::commands::{self, CommandAction};
@@ -818,12 +818,17 @@ impl App {
         self.model_operation = Some(progress);
     }
 
-    pub fn model_search_artifacts(&self) -> Vec<&CatalogFile> {
+    pub fn model_search_artifacts(&self) -> Vec<(&CatalogRepository, &CatalogFile)> {
         self.model_search
             .as_ref()
             .into_iter()
             .flat_map(|search| &search.repositories)
-            .flat_map(|repository| &repository.artifacts)
+            .flat_map(|repository| {
+                repository
+                    .artifacts
+                    .iter()
+                    .map(move |artifact| (repository, artifact))
+            })
             .collect()
     }
 
@@ -1896,7 +1901,7 @@ impl App {
         let model_ref = self.selected_model_search_result.and_then(|index| {
             self.model_search_artifacts()
                 .get(index)
-                .map(|artifact| artifact.model_ref.clone())
+                .map(|(_, artifact)| artifact.model_ref.clone())
         });
         let Some(model_ref) = model_ref else {
             self.notice = Some("Select a concrete artifact before downloading".to_owned());
@@ -1937,7 +1942,7 @@ impl App {
         if self.pending_model_remove_confirmation.as_ref() != Some(&model.id) {
             self.pending_model_remove_confirmation = Some(model.id.clone());
             self.notice = Some(format!(
-                "Press d again to remove managed model {}",
+                "Press d again to remove the managed acquisition containing {}",
                 model.id
             ));
             return Update::Render;
