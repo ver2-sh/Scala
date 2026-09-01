@@ -11,6 +11,7 @@ pub const MODEL_ROW_HEIGHT: u16 = 3;
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum HoverTarget {
     Navigation(Screen),
+    ModelLibraryTab(ModelLibraryView),
     Model(usize),
     Runtime(usize),
     RuntimeSearchAction,
@@ -37,6 +38,8 @@ pub struct UiLayout {
     pub overview_metrics: Rect,
     pub overview_body: Rect,
     pub overview_progress: Rect,
+    pub model_installed_tab: Rect,
+    pub model_discover_tab: Rect,
     pub model_list: Rect,
     pub model_progress: Rect,
     pub model_rows: Vec<(usize, Rect)>,
@@ -119,7 +122,17 @@ impl UiLayout {
             overview_body = overview[3];
         }
 
+        let mut model_installed_tab = Rect::default();
+        let mut model_discover_tab = Rect::default();
         let (model_list, model_progress) = if app.screen == Screen::Models {
+            let model_header = content_layout(content)[0];
+            model_installed_tab = Rect::new(model_header.x, model_header.y + 1, 13, 1);
+            model_discover_tab = Rect::new(
+                model_installed_tab.right().saturating_add(2),
+                model_header.y + 1,
+                if compact { 12 } else { 27 },
+                1,
+            );
             reserve_bottom(
                 screen_body,
                 app.selected_model_load_progress().is_some() || app.model_operation.is_some(),
@@ -439,6 +452,8 @@ impl UiLayout {
             overview_metrics,
             overview_body,
             overview_progress,
+            model_installed_tab,
+            model_discover_tab,
             model_list,
             model_progress,
             model_rows,
@@ -523,6 +538,12 @@ impl UiLayout {
             .find(|(_, area)| contains(*area, position))
         {
             return Some(HoverTarget::Navigation(*screen));
+        }
+        if contains(self.model_installed_tab, position) {
+            return Some(HoverTarget::ModelLibraryTab(ModelLibraryView::Installed));
+        }
+        if contains(self.model_discover_tab, position) {
+            return Some(HoverTarget::ModelLibraryTab(ModelLibraryView::Discover));
         }
         if let Some((index, _)) = self
             .model_rows

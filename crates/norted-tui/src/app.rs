@@ -518,6 +518,14 @@ impl App {
         if self.command_active {
             return self.handle_command_key(key);
         }
+        if self.screen == Screen::Models
+            && self.model_library_view == ModelLibraryView::Discover
+            && self.focus == FocusArea::Content
+            && self.model_search_editing
+            && !matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+        {
+            return self.handle_model_discover_key(key);
+        }
         if key.code != KeyCode::Char('d') {
             self.pending_runtime_remove_confirmation = None;
             self.pending_model_remove_confirmation = None;
@@ -535,10 +543,12 @@ impl App {
             }
             KeyCode::Char('q') => Update::Quit,
             KeyCode::Tab => {
+                self.model_search_editing = false;
                 self.cycle_focus(1);
                 Update::Render
             }
             KeyCode::BackTab => {
+                self.model_search_editing = false;
                 self.cycle_focus(-1);
                 Update::Render
             }
@@ -627,6 +637,14 @@ impl App {
             && self.runtime_search_focus == RuntimeSearchFocus::Query
         {
             self.insert_runtime_search_text(&normalized);
+            return Update::Render;
+        }
+        if self.screen == Screen::Models
+            && self.model_library_view == ModelLibraryView::Discover
+            && self.focus == FocusArea::Content
+            && self.model_search_editing
+        {
+            self.insert_model_search_text(&normalized);
             return Update::Render;
         }
         if !self.command_active {
@@ -830,6 +848,10 @@ impl App {
                     .map(move |artifact| (repository, artifact))
             })
             .collect()
+    }
+
+    pub fn model_library_busy(&self) -> bool {
+        self.model_library_busy
     }
 
     pub fn take_settings_action(&mut self) -> Option<SettingsAction> {
@@ -1725,6 +1747,9 @@ impl App {
                 self.handle_model_discover_key(key)
             }
             Screen::Models => match key.code {
+                KeyCode::Right | KeyCode::Char('s') => {
+                    self.switch_model_library_view(ModelLibraryView::Discover)
+                }
                 KeyCode::Up | KeyCode::Char('k') => self.move_model_selection(-1, layout),
                 KeyCode::Down | KeyCode::Char('j') => self.move_model_selection(1, layout),
                 KeyCode::PageUp => self.scroll_models(-(layout.model_capacity() as isize), layout),
@@ -1736,10 +1761,6 @@ impl App {
                 KeyCode::Enter | KeyCode::Char('c') => self.create_profile_for_selected_model(),
                 KeyCode::Char('u') => self.request_unload(),
                 KeyCode::Char('v') => self.open_model_runtime_picker(),
-                KeyCode::Char('s') => {
-                    self.model_library_view = ModelLibraryView::Discover;
-                    Update::Render
-                }
                 KeyCode::Char('d') => self.request_model_removal(),
                 _ => Update::None,
             },
@@ -1842,9 +1863,8 @@ impl App {
             return Update::Render;
         }
         match key.code {
-            KeyCode::Char('i') | KeyCode::Esc => {
-                self.model_library_view = ModelLibraryView::Installed;
-                Update::Render
+            KeyCode::Left | KeyCode::Char('i') | KeyCode::Esc => {
+                self.switch_model_library_view(ModelLibraryView::Installed)
             }
             KeyCode::Char('e') | KeyCode::Char('/') => {
                 self.model_search_editing = true;
@@ -1866,6 +1886,26 @@ impl App {
             KeyCode::Char('d') => self.request_model_download(),
             _ => Update::None,
         }
+    }
+
+    fn switch_model_library_view(&mut self, view: ModelLibraryView) -> Update {
+        self.model_library_view = view;
+        if view == ModelLibraryView::Discover {
+            self.pending_model_remove_confirmation = None;
+        }
+        self.model_search_editing = view == ModelLibraryView::Discover
+            && self.model_search.is_none()
+            && !self.model_search_loading;
+        if self.model_search_editing {
+            self.model_search_cursor = self.model_search_query.chars().count();
+        }
+        Update::Render
+    }
+
+    fn insert_model_search_text(&mut self, text: &str) {
+        let index = byte_index(&self.model_search_query, self.model_search_cursor);
+        self.model_search_query.insert_str(index, text);
+        self.model_search_cursor += text.chars().count();
     }
 
     fn request_model_search(&mut self) -> Update {
@@ -2504,6 +2544,13 @@ impl App {
                 self.screen = screen;
                 self.notice = None;
                 Update::Render
+            }
+            Some(HoverTarget::ModelLibraryTab(view)) => {
+                if self.command_active {
+                    self.close_command();
+                }
+                self.focus = FocusArea::Content;
+                self.switch_model_library_view(view)
             }
             Some(HoverTarget::Model(index)) => {
                 if self.command_active {
