@@ -1933,8 +1933,13 @@ impl App {
         if self.model_search_format == format {
             return Update::Render;
         }
+        if self.model_library_busy {
+            self.notice = Some("A Model Library operation is already in progress".to_owned());
+            return Update::Render;
+        }
         self.model_search_format = format;
-        if self.model_search.is_some() || self.model_library_busy {
+        if self.model_search.is_some() {
+            self.model_search_editing = false;
             self.request_model_search()
         } else {
             Update::Render
