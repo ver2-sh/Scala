@@ -120,12 +120,16 @@ fn render_overview(
                 )),
                 Line::default(),
                 Line::from(Span::styled(
-                    "Add one or more directories under [models].paths in your config.",
-                    theme.muted,
+                    if glyphs.unicode {
+                        "Open Models → Discover to download from Hugging Face."
+                    } else {
+                        "Open Models, then Discover, to download from Hugging Face."
+                    },
+                    theme.accent,
                 )),
                 Line::from(Span::styled(
-                    "Recognized formats: .gguf, .q27, and .ninfer",
-                    theme.hint,
+                    "Alternatively, configure external model paths for existing artifacts.",
+                    theme.muted,
                 )),
                 Line::default(),
                 Line::from(vec![
@@ -230,6 +234,154 @@ fn render_metrics(
     }
 }
 
+fn render_model_header(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: &Theme,
+    glyphs: &Glyphs,
+    ui_layout: &UiLayout,
+    area: Rect,
+) {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("Model Library", theme.accent))),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    let installed_active = app.model_library_view == ModelLibraryView::Installed;
+    let installed_label = if installed_active {
+        "[ Installed ]"
+    } else {
+        "  Installed  "
+    };
+    let mut installed_style = if installed_active {
+        theme.nav_active
+    } else {
+        theme.nav_inactive
+    };
+    if app.hover == Some(HoverTarget::ModelLibraryTab(ModelLibraryView::Installed)) {
+        installed_style = installed_style.patch(theme.hovered);
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(installed_label, installed_style))),
+        ui_layout.model_installed_tab,
+    );
+
+    let discover_active = app.model_library_view == ModelLibraryView::Discover;
+    let discover_label = match (discover_active, ui_layout.compact, glyphs.unicode) {
+        (true, true, _) => "[ Discover ]",
+        (false, true, _) => "  Discover  ",
+        (true, false, true) => "[ Discover · Hugging Face ]",
+        (false, false, true) => "  Discover · Hugging Face  ",
+        (true, false, false) => "[ Discover - Hugging Face ]",
+        (false, false, false) => "  Discover - Hugging Face  ",
+    };
+    let mut discover_style = if discover_active {
+        theme.nav_active
+    } else {
+        theme.nav_inactive
+    };
+    if app.hover == Some(HoverTarget::ModelLibraryTab(ModelLibraryView::Discover)) {
+        discover_style = discover_style.patch(theme.hovered);
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(discover_label, discover_style))),
+        ui_layout.model_discover_tab,
+    );
+
+    let detail_area = Rect::new(area.x, area.y + 2, area.width, 1);
+    if app.model_library_view == ModelLibraryView::Installed {
+        let detail = match &app.snapshot.registry_state {
+            RegistryState::NotScanned => "Local discovery is preparing".to_owned(),
+            RegistryState::Scanning => "Scanning configured external model paths".to_owned(),
+            RegistryState::Failed { .. } => "Local discovery failed; see Logs".to_owned(),
+            RegistryState::Ready if app.snapshot.registry_warnings.is_empty() => {
+                "Local artifacts and managed downloads".to_owned()
+            }
+            RegistryState::Ready | RegistryState::ReadyWithWarnings { .. } => format!(
+                "Local artifacts with {} warning(s); see Logs",
+                app.snapshot.registry_warnings.len()
+            ),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(detail, theme.muted))),
+            detail_area,
+        );
+        return;
+    }
+
+    let filter = app
+        .model_search_format
+        .map(|format| format.as_str().to_ascii_uppercase())
+        .unwrap_or_else(|| "ALL".to_owned());
+    let suffix = format!("   Format: {filter}");
+    let query_width = (detail_area.width as usize).saturating_sub("Search: ".len() + suffix.len());
+    let (query, query_style) = if app.model_search_query.is_empty() {
+        let placeholder = format!("Search Hugging Face models{}", glyphs.ellipsis);
+        let text = if app.model_search_editing {
+            format!("_  {placeholder}")
+        } else {
+            placeholder
+        };
+        (
+            truncate_middle(&text, query_width, glyphs.ellipsis),
+            theme.hint,
+        )
+    } else if app.model_search_editing {
+        (
+            editable_query_text(
+                &app.model_search_query,
+                app.model_search_cursor,
+                query_width,
+                glyphs.ellipsis,
+            ),
+            theme.command,
+        )
+    } else {
+        (
+            truncate_middle(&app.model_search_query, query_width, glyphs.ellipsis),
+            theme.text,
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Search: ", theme.hint),
+            Span::styled(query, query_style),
+            Span::styled("   Format: ", theme.hint),
+            Span::styled(filter, theme.accent),
+        ])),
+        detail_area,
+    );
+}
+
+fn editable_query_text(query: &str, cursor: usize, max_width: usize, ellipsis: &str) -> String {
+    let mut characters = query.chars().collect::<Vec<_>>();
+    let marker = cursor.min(characters.len());
+    characters.insert(marker, '_');
+    if characters.len() <= max_width {
+        return characters.into_iter().collect();
+    }
+
+    let ellipsis_width = ellipsis.chars().count();
+    let window_width = max_width
+        .saturating_sub(ellipsis_width.saturating_mul(2))
+        .max(1);
+    let mut start = marker.saturating_sub(window_width / 2);
+    let mut end = (start + window_width).min(characters.len());
+    if marker >= end {
+        end = (marker + 1).min(characters.len());
+        start = end.saturating_sub(window_width);
+    }
+    let mut visible = String::new();
+    if start > 0 {
+        visible.push_str(ellipsis);
+    }
+    visible.extend(characters[start..end].iter());
+    if end < characters.len() {
+        visible.push_str(ellipsis);
+    }
+    visible
+}
+
 fn render_models(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -239,26 +391,11 @@ fn render_models(
     ui_layout: &UiLayout,
 ) {
     let layout = content_layout(area);
+    render_model_header(frame, app, theme, glyphs, ui_layout, layout[0]);
     if app.model_library_view == ModelLibraryView::Discover {
-        render_model_discover(frame, app, theme, glyphs, ui_layout, &layout);
+        render_model_discover(frame, app, theme, glyphs, ui_layout);
         return;
     }
-    let subtitle = match &app.snapshot.registry_state {
-        RegistryState::NotScanned => "Model discovery has not started".to_owned(),
-        RegistryState::Scanning => "Scanning configured search paths in the background".to_owned(),
-        RegistryState::Failed { .. } => "Model discovery could not complete; see Logs".to_owned(),
-        RegistryState::Ready if app.snapshot.registry_warnings.is_empty() => {
-            "Local artifacts discovered from configured search paths".to_owned()
-        }
-        RegistryState::Ready | RegistryState::ReadyWithWarnings { .. } => format!(
-            "Local artifacts discovered with {} warning(s); see Logs",
-            app.snapshot.registry_warnings.len()
-        ),
-    };
-    frame.render_widget(
-        section_title("Model Library · Installed", &subtitle, theme),
-        layout[0],
-    );
     if matches!(app.snapshot.registry_state, RegistryState::NotScanned) {
         render_empty(
             frame,
@@ -287,8 +424,8 @@ fn render_models(
         render_empty(
             frame,
             layout[1],
-            &format!("{}  Registry is empty", glyphs.empty),
-            "Configure model directories in config.toml. Unknown file types are ignored.",
+            &format!("{}  No models installed", glyphs.empty),
+            "Press Right Arrow or s to browse Hugging Face, or configure external model paths.",
             theme,
         );
         return;
@@ -357,7 +494,7 @@ fn render_models(
             },
             Line::from(Span::styled(
                 format!(
-                    "Artifact: {} · provenance: {} · Enter/c profile · s discover{}",
+                    "Artifact: {} · provenance: {} · Enter/c profile{}",
                     model.format,
                     if model.norted_package.is_some() {
                         "Norted package"
@@ -398,27 +535,7 @@ fn render_model_discover(
     theme: &Theme,
     glyphs: &Glyphs,
     ui_layout: &UiLayout,
-    layout: &[Rect],
 ) {
-    let filter = app
-        .model_search_format
-        .map(|format| format.as_str().to_ascii_uppercase())
-        .unwrap_or_else(|| "ALL".to_owned());
-    let cursor = if app.model_search_editing { "▌" } else { "" };
-    let subtitle = format!(
-        "Hugging Face · query: {}{} · format: {} · e edit · Enter search · f filter · i installed",
-        if app.model_search_query.is_empty() {
-            "<popular>"
-        } else {
-            &app.model_search_query
-        },
-        cursor,
-        filter,
-    );
-    frame.render_widget(
-        section_title("Model Library · Discover", &subtitle, theme),
-        layout[0],
-    );
     if app.model_search_loading {
         render_empty(
             frame,
@@ -431,8 +548,8 @@ fn render_model_discover(
         render_empty(
             frame,
             ui_layout.model_list,
-            "Search the remote model catalog",
-            "Press e to enter a query, choose a format with f, then press Enter. Remote compatibility is unverified until local inspection.",
+            "Search Hugging Face",
+            "Type a model, publisher, or repository name and press Enter. Formats: GGUF, q27, and NInfer.",
             theme,
         );
     } else if app.model_search_artifacts().is_empty() {
@@ -447,11 +564,14 @@ fn render_model_discover(
         let artifacts = app.model_search_artifacts();
         let items = ui_layout.model_rows.iter().map(|(index, _)| {
             let (repository, artifact) = artifacts[*index];
-            let style = if app.selected_model_search_result == Some(*index) {
+            let mut style = if app.selected_model_search_result == Some(*index) {
                 theme.selected
             } else {
                 ratatui::style::Style::default()
             };
+            if app.hover == Some(HoverTarget::Model(*index)) {
+                style = style.patch(theme.hovered);
+            }
             let size = artifact
                 .size_bytes
                 .map(format_bytes)
@@ -1227,18 +1347,26 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         Line::from(Span::styled("MODELS AND MODEL PROFILES", theme.hint)),
         key_value(
             "Models",
-            "artifact inventory; Enter/c creates a Model Profile",
+            "Installed inventory and Hugging Face Discover views",
             theme,
         ),
+        key_value("Left / Right", "change the Model Library view", theme),
+        key_value(
+            "Enter / f",
+            "search while editing / change Discover format",
+            theme,
+        ),
+        key_value("d", "download the selected remote artifact", theme),
         key_value(
             "Model Profiles",
             "normal load and per-profile override screen",
             theme,
         ),
-        key_value("l", "load the selected Model Profile", theme),
-        key_value("u", "unload the active Model Profile", theme),
-        key_value("e", "change the selected profile's bound engine", theme),
-        key_value("Delete", "clear an override so it inherits", theme),
+        key_value(
+            "l/u/e/Delete",
+            "load, unload, rebind engine, or inherit",
+            theme,
+        ),
         Line::default(),
         Line::from(Span::styled("SETTINGS AND RUNTIMES", theme.hint)),
         key_value("Settings", "Global and per-engine defaults", theme),
