@@ -86,8 +86,9 @@ expert override; reasoning mode/effort/budget/message; built-in or bound-file ch
 exact-runtime-advertised speculative modes with an optional bound GGUF draft. `load_mode` is the
 only first-class model-loading policy: `mmap`, `mlock`, `mmap+mlock`, and `dio` choices cover the
 old “Try mmap” and “Keep Model in Memory” behavior without reviving deprecated standalone flags.
-Generation/profile defaults include seed/random, response limit, stop strings, repeat/presence
-penalties, system prompt, and an optional JSON Schema.
+Generation/profile defaults include engine-supported seed behavior, response limit, stop strings,
+repeat/presence penalties, system prompt, and an optional JSON Schema. The common setting retains
+`random` for engines that implement runtime randomness; q27 exact schemas accept numeric seeds only.
 The JSON Schema is a request default, not a process-wide constraint: an omitted request format uses
 it, while explicit text, JSON object, or request JSON Schema wins.
 
@@ -205,9 +206,7 @@ NInfer publishes source rather than an installable release binary. Its provider 
 
 The currently reviewed NInfer request/startup authority is commit
 `21a0e85f8819edc644a3bc036fca6d05cf52ac6e`, tree
-`09eda8f77d17d140f57baac89a0259772e51a5f7`, with request-log schema 19. The historical
-`6b94b8c5721f075624c4f36d18279a848ba8b6c9` / tree
-`9ca953565dd514a3044b5c7c8055a07e6ce9a0f7` contract remains bounded to its schema-18 evidence.
+`09eda8f77d17d140f57baac89a0259772e51a5f7`, with request-log schema 19.
 Executable help can prove an exact launch option without changing request semantics; an unknown
 future source snapshot does not inherit reviewed tools/media/request capabilities and remains
 NeedsAttention until its protocol/startup changes are audited.
@@ -552,7 +551,9 @@ flags; structured-output schemas instead remain per-request defaults sent to its
 Responses reports this effective format after defaulting, including configured schemas used for
 omitted formats and explicit text/schema overrides. Unsupported runtimes receive a clear 400
 rather than an unknown flag or silently ignored request field. q27 request seed/top-k/min-p require
-sampled v0.10 execution; its request thinking fields require `q27.request_thinking`. NInfer's
+sampled v0.10 execution; q27 accepts only numeric seeds and rejects the common `random` sentinel
+instead of treating it as an omitted seed. Its request thinking fields require
+`q27.request_thinking`. NInfer's
 configured reasoning budget is a launch default because its private Chat route has no matching
 per-request budget field. System prompt, output limit, sampler, stop, penalty, thinking, and effort
 values otherwise act as request defaults where the exact private contract supports them, and an

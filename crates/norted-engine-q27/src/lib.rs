@@ -1136,6 +1136,14 @@ fn validate_q27_settings_prelaunch(
     settings: &norted_core::ResolvedSettings,
     capabilities: Q27RuntimeCapabilities,
 ) -> Result<(), String> {
+    if let Some(SettingValue::UnsignedIntegerOrChoice(
+        norted_core::UnsignedIntegerOrChoiceValue::Choice(value),
+    )) = settings.value("seed")
+    {
+        return Err(format!(
+            "q27 does not implement `seed={value}`; configure an explicit numeric seed or leave it unset"
+        ));
+    }
     if !capabilities.trustworthy_identity {
         return Err(
             "the exact q27 executable has no trustworthy capability observation; external binaries are not credited from filenames or upstream version assumptions"
@@ -4234,6 +4242,21 @@ fn q27_settings_schema_from_usage(
     let capabilities = q27_runtime_capabilities(identity, acquisition, source_evidence);
     let mut definitions = q27_setting_definitions();
     apply_q27_runtime_bounds(&mut definitions, managed, version);
+    if capabilities.request_seed
+        && let Some(seed) = definitions
+            .iter_mut()
+            .find(|definition| definition.id.as_str() == "seed")
+    {
+        seed.description =
+            "Configured numeric q27 request seed; q27 does not implement the `random` sentinel"
+                .to_owned();
+        seed.kind = SettingKind::UnsignedIntegerOrChoice {
+            minimum: Some(0),
+            maximum: Some(u64::from(u32::MAX)),
+            choices: Vec::new(),
+        };
+        seed.upstream_default = Some("q27 request seed 0 when omitted".to_owned());
+    }
     for definition in &mut definitions {
         let option = q27_setting_option(definition.id.as_str());
         let unavailable_by_version = q27_setting_unavailable_by_version(managed, version, option);
