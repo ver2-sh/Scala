@@ -46,11 +46,11 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode> {
-    if matches!(&cli.command, Some(Command::Doctor)) {
-        let checks = doctor::run();
-        let has_fatal = checks.iter().any(|check| check.fatal);
-        output::doctor(&checks, cli.json)?;
-        return Ok(if has_fatal {
+    if let Some(Command::Doctor(args)) = &cli.command {
+        let report = doctor::run().await;
+        let has_failures = report.has_failures();
+        output::doctor(&report, cli.json, args.verbose)?;
+        return Ok(if has_failures {
             ExitCode::FAILURE
         } else {
             ExitCode::SUCCESS
@@ -245,7 +245,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Config(args) => match args.command {
             ConfigCommand::Show => output::config(core, cli.json)?,
         },
-        Command::Doctor => unreachable!("doctor is dispatched before application startup"),
+        Command::Doctor(_) => unreachable!("doctor is dispatched before application startup"),
     }
     Ok(ExitCode::SUCCESS)
 }

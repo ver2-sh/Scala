@@ -261,6 +261,33 @@ norted-server
 └── doctor
 ```
 
+### Whole-system diagnostics
+
+`doctor` checks application paths and configuration, public authentication,
+local model/package discovery, settings and Model Profiles, engine adapters,
+managed runtime integrity and selections, private control state, host/GPU
+compatibility, and relevant managed-source toolchain prerequisites.
+
+```console
+norted-server doctor
+norted-server doctor --verbose
+norted-server --json doctor
+```
+
+The diagnostic is always offline and read-only. It does not initialize stores,
+repair state, start the Server, install packages, invoke Norted-Utils, contact
+runtime providers, or check for updates. The default human view prints only
+warnings and failures; `--verbose` also prints successful checks. JSON always
+contains every check in one document.
+
+Warnings are advisory and exit with status 0. Any failed check exits with
+status 1. Doctor never applies repairs; follow its suggested existing commands
+explicitly. Runtime update discovery remains a separate, explicit operation:
+
+```console
+norted-server runtimes check-updates
+```
+
 For normal interactive use, start the TUI directly:
 
 ```console

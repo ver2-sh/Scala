@@ -8,7 +8,7 @@ use color_eyre::eyre::{Context, Result, eyre};
 use fs2::FileExt;
 use norted_api::{ApiServer, PublicAuth, PublicAuthVerifier};
 use norted_core::{
-    ApiKeyStore, AppPaths, ApplicationCore, EffectivePublicAuthMode, PublicAuthStatus,
+    ApiKeyStore, AppConfig, AppPaths, ApplicationCore, EffectivePublicAuthMode, PublicAuthStatus,
 };
 use norted_engine::{
     ControlClient, ControlClientError, EngineRegistry, RuntimeCatalogProvider, RuntimeManager,
@@ -87,18 +87,25 @@ pub async fn runtime_manager(core: Arc<ApplicationCore>) -> Result<Arc<RuntimeMa
 }
 
 pub fn engine_registry(core: &ApplicationCore) -> Result<EngineRegistry> {
-    let config_directory = core.config_path.parent().unwrap_or_else(|| Path::new("."));
+    engine_registry_from_config(&core.config, &core.config_path)
+}
+
+pub fn engine_registry_from_config(
+    config: &AppConfig,
+    config_path: &Path,
+) -> Result<EngineRegistry> {
+    let config_directory = config_path.parent().unwrap_or_else(|| Path::new("."));
     let mut registry = EngineRegistry::default();
     registry.register(Arc::new(LlamaCppAdapter::from_config(
-        core.config.engine.get(LLAMA_CPP_ENGINE_ID),
+        config.engine.get(LLAMA_CPP_ENGINE_ID),
         config_directory,
     )))?;
     registry.register(Arc::new(Q27Adapter::from_config(
-        core.config.engine.get(Q27_ENGINE_ID),
+        config.engine.get(Q27_ENGINE_ID),
         config_directory,
     )))?;
     registry.register(Arc::new(NinferAdapter::from_config(
-        core.config.engine.get(NINFER_ENGINE_ID),
+        config.engine.get(NINFER_ENGINE_ID),
         config_directory,
     )))?;
     Ok(registry)
@@ -108,13 +115,20 @@ pub fn runtime_pack_manager(
     core: &ApplicationCore,
     registry: EngineRegistry,
 ) -> Result<Arc<RuntimePackManager>> {
+    runtime_pack_manager_from_paths(&core.paths, registry)
+}
+
+pub fn runtime_pack_manager_from_paths(
+    paths: &AppPaths,
+    registry: EngineRegistry,
+) -> Result<Arc<RuntimePackManager>> {
     let providers: Vec<Arc<dyn RuntimeCatalogProvider>> = vec![
         Arc::new(LlamaCppRuntimeCatalogProvider::new()),
         Arc::new(LlamaCppSourceRuntimeCatalogProvider::new()),
         Arc::new(Q27RuntimeCatalogProvider::new()),
         Arc::new(NinferRuntimeCatalogProvider::new()),
     ];
-    Ok(RuntimePackManager::new(&core.paths, registry, providers)?)
+    Ok(RuntimePackManager::new(paths, registry, providers)?)
 }
 
 pub async fn discover_existing_control(paths: &AppPaths) -> Result<Option<ControlClient>> {

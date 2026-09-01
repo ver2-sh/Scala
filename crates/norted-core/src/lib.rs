@@ -42,7 +42,7 @@ pub use provenance::{
 };
 pub use runtime::{
     RuntimeDescriptor, RuntimeObservationError, RuntimePublisher, observe_runtime,
-    observe_runtime_descriptor,
+    observe_runtime_descriptor, observe_runtime_descriptor_read_only,
 };
 pub use runtime_pack::{
     AcceleratorDevice, AvailableRuntime, ComputeCapability, HostCapabilities, InstalledRuntime,

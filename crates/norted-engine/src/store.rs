@@ -6,6 +6,7 @@ use norted_core::{
     AppPaths, InstalledRuntime, RUNTIME_SELECTIONS_SCHEMA_VERSION, RuntimeAcquisitionMethod,
     RuntimeId, RuntimeManifest, RuntimeSelections,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::catalog::atomic_write;
@@ -49,7 +50,60 @@ pub enum RuntimeStoreError {
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeStoreSnapshot {
     pub runtimes: Vec<InstalledRuntime>,
-    pub warnings: Vec<String>,
+    pub issues: Vec<RuntimeStoreIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeStoreIssue {
+    pub kind: RuntimeStoreIssueKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStoreIssueKind {
+    Io,
+    InvalidManifest,
+    UnsafePath,
+    ProvenanceConflict,
+}
+
+impl RuntimeStoreIssue {
+    fn from_error(error: RuntimeStoreError) -> Self {
+        let (kind, path) = match &error {
+            RuntimeStoreError::Io { path, .. } => (RuntimeStoreIssueKind::Io, Some(path.clone())),
+            RuntimeStoreError::InvalidManifest { path, .. } => {
+                (RuntimeStoreIssueKind::InvalidManifest, Some(path.clone()))
+            }
+            RuntimeStoreError::UnsafePath(path) => {
+                (RuntimeStoreIssueKind::UnsafePath, Some(path.clone()))
+            }
+            RuntimeStoreError::ProvenanceConflict { .. } => {
+                (RuntimeStoreIssueKind::ProvenanceConflict, None)
+            }
+            RuntimeStoreError::NotInstalled(_)
+            | RuntimeStoreError::RuntimeInUse(_)
+            | RuntimeStoreError::InstallationInProgress(_)
+            | RuntimeStoreError::RuntimeSelected { .. }
+            | RuntimeStoreError::ExternalRuntime(_)
+            | RuntimeStoreError::InvalidSelections(_) => (RuntimeStoreIssueKind::Io, None),
+        };
+        Self {
+            kind,
+            path,
+            message: error.to_string(),
+        }
+    }
+
+    fn walk_error(error: walkdir::Error) -> Self {
+        Self {
+            kind: RuntimeStoreIssueKind::Io,
+            path: error.path().map(Path::to_path_buf),
+            message: error.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +229,27 @@ impl RuntimeStore {
 
     pub async fn scan(&self) -> Result<RuntimeStoreSnapshot, RuntimeStoreError> {
         self.ensure().await?;
+        self.inspect_existing().await
+    }
+
+    /// Inspects only runtime-store state that already exists.
+    ///
+    /// Unlike [`Self::scan`], this never initializes the runtime-store layout.
+    /// An absent root is a valid empty/fresh store.
+    pub async fn inspect_existing(&self) -> Result<RuntimeStoreSnapshot, RuntimeStoreError> {
+        match tokio::fs::symlink_metadata(&self.root).await {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(RuntimeStoreError::UnsafePath(self.root.clone())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RuntimeStoreSnapshot::default());
+            }
+            Err(source) => {
+                return Err(RuntimeStoreError::Io {
+                    path: self.root.clone(),
+                    source,
+                });
+            }
+        }
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || scan_blocking(&root))
             .await
@@ -979,7 +1054,7 @@ fn scan_blocking(root: &Path) -> Result<RuntimeStoreSnapshot, RuntimeStoreError>
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                snapshot.warnings.push(error.to_string());
+                snapshot.issues.push(RuntimeStoreIssue::walk_error(error));
                 continue;
             }
         };
@@ -1041,7 +1116,7 @@ fn scan_blocking(root: &Path) -> Result<RuntimeStoreSnapshot, RuntimeStoreError>
         })();
         match parsed {
             Ok(runtime) => snapshot.runtimes.push(runtime),
-            Err(error) => snapshot.warnings.push(error.to_string()),
+            Err(error) => snapshot.issues.push(RuntimeStoreIssue::from_error(error)),
         }
     }
     snapshot.runtimes.sort_by(|left, right| {
@@ -1158,6 +1233,36 @@ mod tests {
         .await
         .expect("write fixture manifest");
         staging
+    }
+
+    #[tokio::test]
+    async fn inspecting_an_absent_store_does_not_initialize_it() {
+        let temporary = tempfile::tempdir().expect("temporary runtime root");
+        let paths = AppPaths {
+            config_dir: temporary.path().join("config"),
+            config_file: temporary.path().join("config/config.toml"),
+            data_dir: temporary.path().join("data"),
+            state_dir: temporary.path().join("state"),
+            cache_dir: temporary.path().join("cache"),
+            log_dir: temporary.path().join("logs"),
+            runtimes_dir: temporary.path().join("data/runtimes"),
+            runtime_cache_dir: temporary.path().join("cache/runtime-packs"),
+            runtime_selections_file: temporary.path().join("data/runtime-selections.json"),
+            settings_file: temporary.path().join("data/settings.json"),
+            settings_lock_file: temporary.path().join("data/.settings.lock"),
+            model_profiles_file: temporary.path().join("data/model-profiles.json"),
+            model_profiles_lock_file: temporary.path().join("data/.model-profiles.lock"),
+        };
+        let store = RuntimeStore::new(&paths);
+
+        let snapshot = store
+            .inspect_existing()
+            .await
+            .expect("absent store is valid fresh state");
+
+        assert!(snapshot.runtimes.is_empty());
+        assert!(snapshot.issues.is_empty());
+        assert!(!paths.data_dir.exists());
     }
 
     #[tokio::test]
@@ -1412,9 +1517,9 @@ mod tests {
         assert!(snapshot.runtimes.is_empty());
         assert!(
             snapshot
-                .warnings
+                .issues
                 .iter()
-                .any(|warning| warning.contains("SHA-256"))
+                .any(|issue| issue.message.contains("SHA-256"))
         );
 
         let mut repair_staging = stage_runtime(&store, &manifest, b"original").await;

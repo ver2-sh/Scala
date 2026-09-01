@@ -8,7 +8,7 @@ use norted_core::{
 use norted_engine::{ControlClient, ControlStatus, InstallationState, ModelServingCapabilities};
 use serde_json::json;
 
-use crate::doctor::DoctorCheck;
+use crate::doctor::{DoctorReport, DoctorStatus};
 
 pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
     let observation_error = core
@@ -478,26 +478,61 @@ pub fn config(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn doctor(checks: &[DoctorCheck], json_output: bool) -> Result<()> {
+pub fn doctor(report: &DoctorReport, json_output: bool, verbose: bool) -> Result<()> {
     if json_output {
-        println!("{}", serde_json::to_string_pretty(checks)?);
+        println!("{}", serde_json::to_string_pretty(report)?);
     } else {
-        println!("Norted Server doctor");
-        for check in checks {
-            println!(
-                "  {:<4}  {:<20} {}",
-                check.status.label(),
-                check.name,
-                check.detail
-            );
-        }
-        let failures = checks.iter().filter(|check| check.fatal).count();
-        let warnings = checks
+        for check in report
+            .checks
             .iter()
-            .filter(|check| matches!(check.status, crate::doctor::CheckStatus::Warning))
-            .count();
-        println!();
-        println!("{failures} fatal problem(s), {warnings} warning(s)");
+            .filter(|check| verbose || check.status != DoctorStatus::Pass)
+        {
+            println!("{:<4}  {}", check.status.label(), check.message);
+            if let Some(detail) = &check.detail {
+                for line in detail.lines() {
+                    println!("  {line}");
+                }
+            }
+            for remediation in &check.remediation {
+                for line in remediation.lines() {
+                    println!("  {line}");
+                }
+            }
+            println!();
+        }
+        match report.status {
+            DoctorStatus::Pass => println!("PASS  No problems found."),
+            DoctorStatus::Warning => println!(
+                "WARN  Found {} potential problem{}.",
+                report.summary.problems,
+                if report.summary.problems == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+            DoctorStatus::Fail => println!(
+                "FAIL  Found {} problem{} ({} failure{}, {} warning{}).",
+                report.summary.problems,
+                if report.summary.problems == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                report.summary.failures,
+                if report.summary.failures == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                report.summary.warnings,
+                if report.summary.warnings == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+        }
     }
     Ok(())
 }
