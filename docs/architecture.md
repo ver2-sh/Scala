@@ -90,8 +90,8 @@ engine/format default, then best compatible installed runtime. Adapters expose a
 schema for common plus their own namespace, gate it first with facts proved by the bound model, and
 then gate it with the exact runtime contract before validating effective settings. Capability
 requirements are consequences of selected settings. q27 retains exact source fingerprints and
-bounded context/KV/W_MAX startup proof; NInfer retains native-container and revision-specific
-schema-18/schema-19 startup proof;
+bounded context/KV/W_MAX startup proof; NInfer retains native-container and exact-current-revision
+schema-19 startup proof;
 llama.cpp uses exact help evidence for every structured launch control and keeps Norted-owned
 system-prompt/context management separate from native launch flags.
 
@@ -325,8 +325,8 @@ ninfer-serve <canonical-model.ninfer>
 
 The positional artifact, binding, alias, device, auth/CORS surface, typed load/cache/media/store
 controls, sampler/greedy controls, and startup log are reserved. `/health` alone is insufficient for
-readiness. Norted selects the expected bounded `server_start` schema from the reviewed exact source
-contract (19 for commit `21a0e85f...`, 18 for the retained historical authority), validates public
+readiness. Norted selects the bounded schema-19 `server_start` record for reviewed exact source
+commit `21a0e85f...`, validates public
 alias, artifact target/weights and context-cost identity, selected GPU identity, KV/CUDA/prefix/spec
 state, Vision residency, greedy state, and configured sampler defaults, then derives effective
 temperature/top-p. The file is unlinked before requests are served; failure and cancellation paths

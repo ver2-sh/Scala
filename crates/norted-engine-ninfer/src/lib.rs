@@ -42,10 +42,9 @@ pub const ENGINE_ID: &str = "ninfer";
 pub const UPSTREAM_REPOSITORY: &str = "https://github.com/Neroued/ninfer";
 pub const GITHUB_REPOSITORY: &str = "Neroued/ninfer";
 pub const PROVIDER_ID: &str = "ninfer-official-source";
-const LEGACY_PACKAGE_CAPABILITY_REVISION: &str = "6b94b8c5721f075624c4f36d18279a848ba8b6c9";
-const LEGACY_PACKAGE_CAPABILITY_TREE: &str = "9ca953565dd514a3044b5c7c8055a07e6ce9a0f7";
 const CURRENT_PACKAGE_CAPABILITY_REVISION: &str = "21a0e85f8819edc644a3bc036fca6d05cf52ac6e";
 const CURRENT_PACKAGE_CAPABILITY_TREE: &str = "09eda8f77d17d140f57baac89a0259772e51a5f7";
+const CURRENT_REQUEST_LOG_SCHEMA: u32 = 19;
 const MANAGED_NINFER_FUNCTIONAL_VARIANT: &str = "managed-linux-x86_64-cuda-sm120a";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -266,14 +265,7 @@ fn ninfer_runtime_capabilities_for_installed(
                 && build.source.tree_sha == CURRENT_PACKAGE_CAPABILITY_TREE
                 && build.recipe_version == catalog::RECIPE_VERSION
         });
-    let legacy = managed_source
-        && revision == Some(LEGACY_PACKAGE_CAPABILITY_REVISION)
-        && runtime.manifest.source_build.as_ref().is_some_and(|build| {
-            build.source.commit_sha == LEGACY_PACKAGE_CAPABILITY_REVISION
-                && build.source.tree_sha == LEGACY_PACKAGE_CAPABILITY_TREE
-                && build.recipe_version == catalog::RECIPE_VERSION
-        });
-    ninfer_reviewed_capabilities(current, legacy)
+    ninfer_reviewed_capabilities(current)
 }
 
 fn ninfer_runtime_capabilities_for_available(
@@ -293,27 +285,19 @@ fn ninfer_runtime_capabilities_for_available(
             source.commit_sha == CURRENT_PACKAGE_CAPABILITY_REVISION
                 && source.tree_sha == CURRENT_PACKAGE_CAPABILITY_TREE
         });
-    let legacy = managed_source
-        && runtime.identity.upstream_revision.as_deref()
-            == Some(LEGACY_PACKAGE_CAPABILITY_REVISION)
-        && source.is_some_and(|source| {
-            source.commit_sha == LEGACY_PACKAGE_CAPABILITY_REVISION
-                && source.tree_sha == LEGACY_PACKAGE_CAPABILITY_TREE
-        });
-    ninfer_reviewed_capabilities(current, legacy)
+    ninfer_reviewed_capabilities(current)
 }
 
-fn ninfer_reviewed_capabilities(current: bool, legacy: bool) -> NinferRuntimeCapabilities {
-    let reviewed = current || legacy;
+fn ninfer_reviewed_capabilities(current: bool) -> NinferRuntimeCapabilities {
     NinferRuntimeCapabilities {
-        trustworthy_identity: reviewed,
-        thinking_control: reviewed,
-        process_sampler_overrides: reviewed,
-        bounded_server_start: reviewed,
-        protocol_semantics: reviewed,
-        tool_calling: reviewed,
+        trustworthy_identity: current,
+        thinking_control: current,
+        process_sampler_overrides: current,
+        bounded_server_start: current,
+        protocol_semantics: current,
+        tool_calling: current,
         vision: current,
-        request_log_schema: current.then_some(19).or_else(|| legacy.then_some(18)),
+        request_log_schema: current.then_some(CURRENT_REQUEST_LOG_SCHEMA),
     }
 }
 
@@ -2026,10 +2010,11 @@ async fn read_and_validate_startup_log(
     let Some(startup) = startup else {
         return Ok(None);
     };
-    let schema_supported = pending.capabilities.request_log_schema.map_or_else(
-        || matches!(startup.schema_version, 18 | 19),
-        |expected| startup.schema_version == expected,
-    );
+    let schema_supported = startup.schema_version
+        == pending
+            .capabilities
+            .request_log_schema
+            .unwrap_or(CURRENT_REQUEST_LOG_SCHEMA);
     if startup.artifact_type != "ninfer_serve_request_log"
         || !schema_supported
         || startup.event != "server_start"
