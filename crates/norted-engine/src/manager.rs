@@ -1808,6 +1808,73 @@ async fn prepare_inference_request(
     settings: &norted_core::ResolvedSettings,
     request: &mut InferenceRequest,
 ) -> Result<(), EngineError> {
+    if request.generation_settings.top_k.is_none()
+        && let Some(norted_core::SettingValue::UnsignedInteger(value)) = settings.value("top_k")
+    {
+        request.generation_settings.top_k = Some(*value);
+    }
+    if request.generation_settings.min_p.is_none()
+        && let Some(norted_core::SettingValue::Float(value)) = settings.value("min_p")
+    {
+        request.generation_settings.min_p = Some(*value);
+    }
+    if request.generation_settings.seed.is_none()
+        && let Some(norted_core::SettingValue::UnsignedIntegerOrChoice(
+            norted_core::UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
+        )) = settings.value("seed")
+    {
+        request.generation_settings.seed = Some(*value);
+    }
+    if request.generation_settings.repeat_penalty.is_none()
+        && let Some(norted_core::SettingValue::Float(value)) = settings.value("repeat_penalty")
+    {
+        request.generation_settings.repeat_penalty = Some(*value);
+    }
+    if request.generation_settings.presence_penalty.is_none()
+        && let Some(norted_core::SettingValue::Float(value)) = settings.value("presence_penalty")
+    {
+        request.generation_settings.presence_penalty = Some(*value);
+    }
+    if request.generation_settings.frequency_penalty.is_none()
+        && let Some(norted_core::SettingValue::Float(value)) = settings.value("frequency_penalty")
+    {
+        request.generation_settings.frequency_penalty = Some(*value);
+    }
+    if request.generation_settings.stop.is_none()
+        && let Some(norted_core::SettingValue::StringList(value)) = settings.value("stop_strings")
+    {
+        request.generation_settings.stop = Some(value.clone());
+    }
+    if request.generation_settings.reasoning_enabled.is_none()
+        && let Some(norted_core::SettingValue::Choice(value)) = settings.value("reasoning")
+    {
+        request.generation_settings.reasoning_enabled = match value.as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            "auto" => None,
+            _ => None,
+        };
+    }
+    if adapter.uses_setting_as_request_default("reasoning_budget")
+        && request.generation_settings.reasoning_budget.is_none()
+        && let Some(norted_core::SettingValue::Integer(value)) = settings.value("reasoning_budget")
+    {
+        request.generation_settings.reasoning_budget = Some(*value);
+    }
+    if request.generation_settings.reasoning_effort.is_none()
+        && let Some(norted_core::SettingValue::Choice(value)) = settings.value("reasoning_effort")
+    {
+        request.generation_settings.reasoning_effort = match value.as_str() {
+            "none" => Some(crate::ReasoningEffort::None),
+            "minimal" => Some(crate::ReasoningEffort::Minimal),
+            "low" => Some(crate::ReasoningEffort::Low),
+            "medium" => Some(crate::ReasoningEffort::Medium),
+            "high" => Some(crate::ReasoningEffort::High),
+            "xhigh" => Some(crate::ReasoningEffort::Xhigh),
+            "max" => Some(crate::ReasoningEffort::Max),
+            _ => None,
+        };
+    }
     if request.max_output_tokens.is_none()
         && let Some(norted_core::SettingValue::UnsignedInteger(value)) =
             settings.value("max_output_tokens")
@@ -1823,10 +1890,7 @@ async fn prepare_inference_request(
     {
         request.messages.insert(
             0,
-            crate::InferenceMessage {
-                role: crate::InferenceRole::System,
-                text: prompt.clone(),
-            },
+            crate::InferenceMessage::text(crate::InferenceRole::System, prompt.clone()),
         );
     }
     if request.output_format.is_none()

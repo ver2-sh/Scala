@@ -42,7 +42,10 @@ pub const ENGINE_ID: &str = "ninfer";
 pub const UPSTREAM_REPOSITORY: &str = "https://github.com/Neroued/ninfer";
 pub const GITHUB_REPOSITORY: &str = "Neroued/ninfer";
 pub const PROVIDER_ID: &str = "ninfer-official-source";
-const PACKAGE_CAPABILITY_REVISION: &str = "6b94b8c5721f075624c4f36d18279a848ba8b6c9";
+const LEGACY_PACKAGE_CAPABILITY_REVISION: &str = "6b94b8c5721f075624c4f36d18279a848ba8b6c9";
+const LEGACY_PACKAGE_CAPABILITY_TREE: &str = "9ca953565dd514a3044b5c7c8055a07e6ce9a0f7";
+const CURRENT_PACKAGE_CAPABILITY_REVISION: &str = "21a0e85f8819edc644a3bc036fca6d05cf52ac6e";
+const CURRENT_PACKAGE_CAPABILITY_TREE: &str = "09eda8f77d17d140f57baac89a0259772e51a5f7";
 const MANAGED_NINFER_FUNCTIONAL_VARIANT: &str = "managed-linux-x86_64-cuda-sm120a";
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -87,7 +90,11 @@ const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "--max-context",
     "--kv-capacity",
     "--max-concurrency",
+    "--max-pending-requests",
+    "--pending-timeout-ms",
     "--prefill-chunk",
+    "--log-stats-interval-ms",
+    "--max-request-mib",
     "--device",
     "--request-log-jsonl",
     "--kv-dtype",
@@ -104,7 +111,6 @@ const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "--max-private-continuations",
     "--max-shared-prefixes",
     "--max-long-anchors-per-continuation",
-    "--max-cache-markers-per-request",
     "--media-cache-mib",
     "--media-live-mib",
     "--media-preprocess-threads",
@@ -126,13 +132,7 @@ const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
 
 // These operational tuning options do not change model identity, private
 // binding, device isolation, or request-generation semantics.
-const ALLOWED_VALUE_NATIVE_ARGUMENTS: &[&str] = &[
-    "--max-pending-requests",
-    "--pending-timeout-ms",
-    "--log-stats-interval-ms",
-    "--max-request-mib",
-    "--context-cost-presets",
-];
+const ALLOWED_VALUE_NATIVE_ARGUMENTS: &[&str] = &["--context-cost-presets"];
 
 #[derive(Debug, Clone)]
 struct PendingStartup {
@@ -141,6 +141,7 @@ struct PendingStartup {
     public_model_id: ModelProfileId,
     accelerator: AcceleratorDevice,
     settings_requirements: Option<NinferStartupRequirements>,
+    capabilities: NinferRuntimeCapabilities,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +158,20 @@ struct NinferStartupRequirements {
     top_p: Option<f64>,
     top_k: Option<u64>,
     min_p: Option<f64>,
+    presence_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
+    seed: Option<u64>,
+    default_output_tokens: Option<u64>,
+    default_thinking_budget: Option<u64>,
+    max_pending_requests: Option<u64>,
+    pending_timeout_ms: Option<u64>,
+    log_stats_interval_ms: Option<u64>,
+    max_request_bytes: Option<u64>,
+    media_cache_bytes: Option<u64>,
+    media_live_bytes: Option<u64>,
+    media_preprocess_threads: Option<u64>,
+    vision: Option<bool>,
+    greedy: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -165,6 +180,10 @@ struct NinferRuntimeCapabilities {
     thinking_control: bool,
     process_sampler_overrides: bool,
     bounded_server_start: bool,
+    protocol_semantics: bool,
+    tool_calling: bool,
+    vision: bool,
+    request_log_schema: Option<u32>,
 }
 
 fn validate_ninfer_settings_prelaunch(
@@ -185,12 +204,23 @@ fn validate_ninfer_settings_prelaunch(
         "ninfer.thinking",
         "ninfer.preserve_thinking",
         "reasoning_effort",
+        "reasoning",
     ]) && !capabilities.thinking_control
     {
         return Err("NInfer thinking control is unsupported or unproven".to_owned());
     }
-    if configured(&["temperature", "top_p", "top_k", "min_p"])
-        && !capabilities.process_sampler_overrides
+    if configured(&[
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "seed",
+        "presence_penalty",
+        "frequency_penalty",
+        "max_output_tokens",
+        "reasoning_budget",
+        "ninfer.greedy",
+    ]) && !capabilities.process_sampler_overrides
     {
         return Err("NInfer process sampler controls are unsupported or unproven".to_owned());
     }
@@ -204,6 +234,16 @@ fn validate_ninfer_settings_prelaunch(
         "ninfer.speculative_backend",
         "ninfer.draft_tokens",
         "ninfer.lm_head_draft",
+        "ninfer.vision",
+        "ninfer.max_pending_requests",
+        "ninfer.pending_timeout_ms",
+        "ninfer.log_stats_interval_ms",
+        "ninfer.max_request_mib",
+        "ninfer.media_cache_mib",
+        "ninfer.media_live_mib",
+        "ninfer.media_preprocess_threads",
+        "ninfer.response_store_max_records",
+        "ninfer.response_store_max_mib",
     ]) && !capabilities.bounded_server_start
     {
         return Err("NInfer server_start capability observation is unproven".to_owned());
@@ -217,32 +257,63 @@ fn ninfer_runtime_capabilities_for_installed(
     let managed_source = runtime.manifest.acquisition_method
         == RuntimeAcquisitionMethod::SourceBuild
         && runtime.manifest.identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
-        && runtime.manifest.identity.upstream_revision.as_deref()
-            == Some(PACKAGE_CAPABILITY_REVISION)
         && runtime.manifest.identity.variant == format!("{}-sm120a", catalog::RECIPE_VERSION);
-    NinferRuntimeCapabilities {
-        trustworthy_identity: managed_source,
-        thinking_control: managed_source,
-        process_sampler_overrides: managed_source,
-        bounded_server_start: managed_source,
-    }
+    let revision = runtime.manifest.identity.upstream_revision.as_deref();
+    let current = managed_source
+        && revision == Some(CURRENT_PACKAGE_CAPABILITY_REVISION)
+        && runtime.manifest.source_build.as_ref().is_some_and(|build| {
+            build.source.commit_sha == CURRENT_PACKAGE_CAPABILITY_REVISION
+                && build.source.tree_sha == CURRENT_PACKAGE_CAPABILITY_TREE
+                && build.recipe_version == catalog::RECIPE_VERSION
+        });
+    let legacy = managed_source
+        && revision == Some(LEGACY_PACKAGE_CAPABILITY_REVISION)
+        && runtime.manifest.source_build.as_ref().is_some_and(|build| {
+            build.source.commit_sha == LEGACY_PACKAGE_CAPABILITY_REVISION
+                && build.source.tree_sha == LEGACY_PACKAGE_CAPABILITY_TREE
+                && build.recipe_version == catalog::RECIPE_VERSION
+        });
+    ninfer_reviewed_capabilities(current, legacy)
 }
 
 fn ninfer_runtime_capabilities_for_available(
     runtime: &AvailableRuntime,
 ) -> NinferRuntimeCapabilities {
-    let managed_source = matches!(
-        runtime.acquisition,
-        norted_core::RuntimeAcquisitionPlan::SourceBuild(_)
-    ) && runtime.identity.package.repository.as_deref()
-        == Some(GITHUB_REPOSITORY)
-        && runtime.identity.upstream_revision.as_deref() == Some(PACKAGE_CAPABILITY_REVISION)
+    let source = match &runtime.acquisition {
+        norted_core::RuntimeAcquisitionPlan::SourceBuild(plan) => Some(&plan.source),
+        _ => None,
+    };
+    let managed_source = source.is_some()
+        && runtime.identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
         && runtime.identity.variant == format!("{}-sm120a", catalog::RECIPE_VERSION);
+    let current = managed_source
+        && runtime.identity.upstream_revision.as_deref()
+            == Some(CURRENT_PACKAGE_CAPABILITY_REVISION)
+        && source.is_some_and(|source| {
+            source.commit_sha == CURRENT_PACKAGE_CAPABILITY_REVISION
+                && source.tree_sha == CURRENT_PACKAGE_CAPABILITY_TREE
+        });
+    let legacy = managed_source
+        && runtime.identity.upstream_revision.as_deref()
+            == Some(LEGACY_PACKAGE_CAPABILITY_REVISION)
+        && source.is_some_and(|source| {
+            source.commit_sha == LEGACY_PACKAGE_CAPABILITY_REVISION
+                && source.tree_sha == LEGACY_PACKAGE_CAPABILITY_TREE
+        });
+    ninfer_reviewed_capabilities(current, legacy)
+}
+
+fn ninfer_reviewed_capabilities(current: bool, legacy: bool) -> NinferRuntimeCapabilities {
+    let reviewed = current || legacy;
     NinferRuntimeCapabilities {
-        trustworthy_identity: managed_source,
-        thinking_control: managed_source,
-        process_sampler_overrides: managed_source,
-        bounded_server_start: managed_source,
+        trustworthy_identity: reviewed,
+        thinking_control: reviewed,
+        process_sampler_overrides: reviewed,
+        bounded_server_start: reviewed,
+        protocol_semantics: reviewed,
+        tool_calling: reviewed,
+        vision: current,
+        request_log_schema: current.then_some(19).or_else(|| legacy.then_some(18)),
     }
 }
 
@@ -277,9 +348,48 @@ fn ninfer_startup_requirements(
             "setting `{id}` must be a number"
         ))),
     };
+    let integer = |id: &str| match settings.value(id) {
+        Some(SettingValue::Integer(value)) => Ok(Some(*value)),
+        None => Ok(None),
+        Some(_) => Err(EngineError::InvalidConfiguration(format!(
+            "setting `{id}` must be an integer"
+        ))),
+    };
+    let seed = match settings.value("seed") {
+        Some(SettingValue::UnsignedIntegerOrChoice(
+            norted_core::UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
+        )) => Some(*value),
+        Some(SettingValue::UnsignedIntegerOrChoice(
+            norted_core::UnsignedIntegerOrChoiceValue::Choice(value),
+        )) if value == "random" => None,
+        None => None,
+        Some(_) => {
+            return Err(EngineError::InvalidConfiguration(
+                "setting `seed` must be an unsigned integer or `random`".to_owned(),
+            ));
+        }
+    };
+    let mib_bytes = |id: &str| -> Result<Option<u64>, EngineError> {
+        unsigned(id)?
+            .map(|value| {
+                value.checked_mul(1_u64 << 20).ok_or_else(|| {
+                    EngineError::InvalidConfiguration(format!("setting `{id}` is too large"))
+                })
+            })
+            .transpose()
+    };
     let speculation = toggle("ninfer.speculation")?;
     let backend = choice("ninfer.speculative_backend")?;
     let speculation_enabled = speculation.unwrap_or(backend.is_some());
+    let default_thinking_budget = integer("reasoning_budget")?
+        .map(|value| {
+            u64::try_from(value).map_err(|_| {
+                EngineError::InvalidConfiguration(
+                    "setting `reasoning_budget` must be non-negative".to_owned(),
+                )
+            })
+        })
+        .transpose()?;
     Ok(NinferStartupRequirements {
         minimum_context_tokens: unsigned("context_length")?,
         kv_dtype: choice("ninfer.kv_dtype")?,
@@ -302,6 +412,20 @@ fn ninfer_startup_requirements(
         top_p: float("top_p")?,
         top_k: unsigned("top_k")?,
         min_p: float("min_p")?,
+        presence_penalty: float("presence_penalty")?,
+        frequency_penalty: float("frequency_penalty")?,
+        seed,
+        default_output_tokens: unsigned("max_output_tokens")?,
+        default_thinking_budget,
+        max_pending_requests: unsigned("ninfer.max_pending_requests")?,
+        pending_timeout_ms: unsigned("ninfer.pending_timeout_ms")?,
+        log_stats_interval_ms: unsigned("ninfer.log_stats_interval_ms")?,
+        max_request_bytes: mib_bytes("ninfer.max_request_mib")?,
+        media_cache_bytes: mib_bytes("ninfer.media_cache_mib")?,
+        media_live_bytes: mib_bytes("ninfer.media_live_mib")?,
+        media_preprocess_threads: unsigned("ninfer.media_preprocess_threads")?,
+        vision: toggle("ninfer.vision")?,
+        greedy: toggle("ninfer.greedy")?,
     })
 }
 
@@ -315,6 +439,14 @@ pub struct NinferAdapter {
     capability_cache: tokio::sync::RwLock<BTreeMap<String, String>>,
     pending_startups: tokio::sync::RwLock<BTreeMap<String, PendingStartup>>,
     observed_defaults: tokio::sync::RwLock<BTreeMap<String, EffectiveGenerationSettings>>,
+    active_executions: tokio::sync::RwLock<BTreeMap<String, NinferExecution>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NinferExecution {
+    capabilities: NinferRuntimeCapabilities,
+    vision: bool,
+    greedy: bool,
 }
 
 impl NinferAdapter {
@@ -434,6 +566,7 @@ impl NinferAdapter {
             capability_cache: tokio::sync::RwLock::new(BTreeMap::new()),
             pending_startups: tokio::sync::RwLock::new(BTreeMap::new()),
             observed_defaults: tokio::sync::RwLock::new(BTreeMap::new()),
+            active_executions: tokio::sync::RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -564,8 +697,44 @@ impl EngineAdapter for NinferAdapter {
         EngineCapabilities {
             artifact_formats: vec![ArtifactFormat::Ninfer],
             api: vec![ApiCapability::Responses, ApiCapability::ChatCompletions],
-            features: vec![EngineFeature::TextGeneration],
+            features: vec![
+                EngineFeature::TextGeneration,
+                EngineFeature::ToolCalling,
+                EngineFeature::Vision,
+            ],
         }
+    }
+
+    fn serving_features(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        settings: Option<&ResolvedSettings>,
+    ) -> Vec<EngineFeature> {
+        let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
+        let mut features = vec![EngineFeature::TextGeneration];
+        if capabilities.tool_calling {
+            features.push(EngineFeature::ToolCalling);
+        }
+        if capabilities.vision
+            && matches!(
+                model.native_identity,
+                Some(ArtifactNativeIdentity::Ninfer(_))
+            )
+            && settings.is_some_and(|settings| {
+                matches!(
+                    settings.value("ninfer.vision"),
+                    Some(SettingValue::Toggle(true))
+                )
+            })
+        {
+            features.push(EngineFeature::Vision);
+        }
+        features
+    }
+
+    fn uses_setting_as_request_default(&self, id: &str) -> bool {
+        id != "reasoning_budget"
     }
 
     fn runtime_variant_update_identity(
@@ -695,19 +864,28 @@ impl EngineAdapter for NinferAdapter {
             runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
         )
         .compatibility;
+        let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
         let base = combine_compatibility(native, device);
-        match settings.map(|settings| {
-            validate_ninfer_settings_prelaunch(
-                settings,
-                ninfer_runtime_capabilities_for_installed(runtime),
+        let base = if runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::SourceBuild
+            && !capabilities.trustworthy_identity
+        {
+            combine_compatibility(
+                base,
+                RuntimeCompatibility::NeedsAttention(
+                    "this exact NInfer source snapshot has not received a reviewed startup/request capability contract"
+                        .to_owned(),
+                ),
             )
-        }) {
+        } else {
+            base
+        };
+        match settings.map(|settings| validate_ninfer_settings_prelaunch(settings, capabilities)) {
             Some(Err(reason)) => RuntimeCompatibility::Incompatible(reason),
             Some(Ok(())) if !settings.is_some_and(ResolvedSettings::is_empty) => {
                 combine_compatibility(
                     base,
                     RuntimeCompatibility::NeedsAttention(
-                        "configured NInfer settings require final schema-18 startup proof"
+                        "configured NInfer settings require final exact-schema startup proof"
                             .to_owned(),
                     ),
                 )
@@ -751,19 +929,30 @@ impl EngineAdapter for NinferAdapter {
             false,
         )
         .compatibility;
+        let capabilities = ninfer_runtime_capabilities_for_available(runtime);
         let base = combine_compatibility(native, device);
-        match settings.map(|settings| {
-            validate_ninfer_settings_prelaunch(
-                settings,
-                ninfer_runtime_capabilities_for_available(runtime),
+        let base = if matches!(
+            &runtime.acquisition,
+            norted_core::RuntimeAcquisitionPlan::SourceBuild(_)
+        ) && !capabilities.trustworthy_identity
+        {
+            combine_compatibility(
+                base,
+                RuntimeCompatibility::NeedsAttention(
+                    "this exact NInfer source snapshot has not received a reviewed startup/request capability contract"
+                        .to_owned(),
+                ),
             )
-        }) {
+        } else {
+            base
+        };
+        match settings.map(|settings| validate_ninfer_settings_prelaunch(settings, capabilities)) {
             Some(Err(reason)) => RuntimeCompatibility::Incompatible(reason),
             Some(Ok(())) if !settings.is_some_and(ResolvedSettings::is_empty) => {
                 combine_compatibility(
                     base,
                     RuntimeCompatibility::NeedsAttention(
-                        "configured NInfer settings require final schema-18 startup proof"
+                        "configured NInfer settings require final exact-schema startup proof"
                             .to_owned(),
                     ),
                 )
@@ -919,19 +1108,32 @@ impl EngineAdapter for NinferAdapter {
             })?;
         let mut definitions = self.model_setting_definitions(model)?;
         settings::apply_runtime_bounds(&mut definitions);
+        let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
         for definition in &mut definitions {
-            if definition.id.as_str() == "reasoning_effort" {
-                definition.supported = false;
-                definition.unsupported_reason = Some(
-                    "the exact managed NInfer request contract does not expose reasoning effort"
-                        .to_owned(),
-                );
+            let id = definition.id.as_str();
+            if matches!(
+                id,
+                "reasoning" | "reasoning_effort" | "stop_strings" | "system_prompt"
+            ) {
+                if !capabilities.protocol_semantics {
+                    definition.supported = false;
+                    definition.unsupported_reason = Some(
+                        "the exact NInfer source revision has no reviewed request-protocol contract"
+                            .to_owned(),
+                    );
+                }
                 continue;
             }
-            let option = if definition.id.as_str() == "ninfer.speculation" {
+            if id == "repeat_penalty" || id == "structured_output_schema" {
+                definition.supported = false;
+                definition.unsupported_reason =
+                    Some("NInfer does not implement this generation semantic".to_owned());
+                continue;
+            }
+            let option = if id == "ninfer.speculation" {
                 "--spec"
             } else {
-                settings::option_for_setting(definition.id.as_str())
+                settings::option_for_setting(id)
             };
             if option.is_empty() || !usage_has_token(&help, option) {
                 definition.supported = false;
@@ -939,6 +1141,13 @@ impl EngineAdapter for NinferAdapter {
                     "the exact ninfer-serve help contract does not advertise `{option}`"
                 ));
             }
+        }
+        if let Some(definition) = definitions
+            .iter_mut()
+            .find(|definition| definition.id.as_str() == "ninfer.kv_dtype")
+            && let norted_core::SettingKind::Choice { choices } = &mut definition.kind
+        {
+            choices.retain(|choice| help.contains(choice));
         }
         Ok(norted_core::SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
@@ -1034,6 +1243,7 @@ impl EngineAdapter for NinferAdapter {
         let settings_requirements = (!request.settings.is_empty())
             .then(|| ninfer_startup_requirements(&request.settings))
             .transpose()?;
+        let runtime_capabilities = ninfer_runtime_capabilities_for_installed(&request.runtime);
         let model_path =
             canonical_regular_file(&request.model.primary.path, "NInfer model").await?;
         if model_path != request.model.primary.path {
@@ -1128,11 +1338,13 @@ impl EngineAdapter for NinferAdapter {
                 public_model_id: public_model_id.clone(),
                 accelerator: accelerator.clone(),
                 settings_requirements: settings_requirements.clone(),
+                capabilities: runtime_capabilities,
             },
         ) {
             let _ = tokio::fs::remove_file(previous.request_log_path).await;
         }
         self.observed_defaults.write().await.remove(&endpoint);
+        self.active_executions.write().await.remove(&endpoint);
 
         let mut normalized_settings = BTreeMap::from([
             (
@@ -1147,7 +1359,10 @@ impl EngineAdapter for NinferAdapter {
                 "native_weights_id".to_owned(),
                 json!(expected_identity.weights_id),
             ),
-            ("request_log_schema".to_owned(), json!(18)),
+            (
+                "request_log_schema".to_owned(),
+                json!(runtime_capabilities.request_log_schema),
+            ),
         ]);
         if let Some(requirements) = settings_requirements.as_ref() {
             normalized_settings.extend([
@@ -1303,7 +1518,33 @@ impl EngineAdapter for NinferAdapter {
             .write()
             .await
             .insert(endpoint.to_owned(), result);
+        self.active_executions.write().await.insert(
+            endpoint.to_owned(),
+            NinferExecution {
+                capabilities: pending.capabilities,
+                vision: pending
+                    .settings_requirements
+                    .as_ref()
+                    .and_then(|requirements| requirements.vision)
+                    .unwrap_or(false),
+                greedy: pending
+                    .settings_requirements
+                    .as_ref()
+                    .and_then(|requirements| requirements.greedy)
+                    .unwrap_or(false),
+            },
+        );
         Ok(true)
+    }
+
+    async fn clear_launch_state(&self, endpoint: Option<&str>) {
+        if let Some(endpoint) = endpoint {
+            if let Some(pending) = self.pending_startups.write().await.remove(endpoint) {
+                let _ = tokio::fs::remove_file(pending.request_log_path).await;
+            }
+            self.observed_defaults.write().await.remove(endpoint);
+            self.active_executions.write().await.remove(endpoint);
+        }
     }
 
     fn startup_progress(&self, stderr_tail: &[String]) -> Option<BackendLoadProgress> {
@@ -1334,15 +1575,9 @@ impl EngineAdapter for NinferAdapter {
         settings: &GenerationSettingsPatch,
         _backend_defaults: &EffectiveGenerationSettings,
     ) -> Result<(), EngineError> {
-        if settings.seed.is_some()
-            || settings.repeat_penalty.is_some()
-            || settings.presence_penalty.is_some()
-            || settings.stop.is_some()
-            || settings.reasoning_effort.is_some()
-        {
+        if settings.repeat_penalty.is_some_and(|value| value != 1.0) {
             return Err(EngineError::InvalidGenerationSettings(
-                "NInfer does not prove seed, penalties, stop strings, or reasoning request controls"
-                    .to_owned(),
+                "NInfer supports only the neutral repetition penalty 1.0".to_owned(),
             ));
         }
         if settings
@@ -1361,6 +1596,47 @@ impl EngineAdapter for NinferAdapter {
                 "NInfer top_p must be finite and in 0..=1".to_owned(),
             ));
         }
+        if settings.top_k.is_some_and(|value| value > 20) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "NInfer top_k must be in 0..=20".to_owned(),
+            ));
+        }
+        if settings
+            .min_p
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "NInfer min_p must be finite and in 0..=1".to_owned(),
+            ));
+        }
+        for (name, value) in [
+            ("presence_penalty", settings.presence_penalty),
+            ("frequency_penalty", settings.frequency_penalty),
+        ] {
+            if value.is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value)) {
+                return Err(EngineError::InvalidGenerationSettings(format!(
+                    "NInfer {name} must be finite and in -2..=2"
+                )));
+            }
+        }
+        if settings.seed.is_some_and(|seed| seed > i64::MAX as u64) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "NInfer seed must fit its signed 64-bit request contract".to_owned(),
+            ));
+        }
+        if let Some(stop) = settings.stop.as_ref()
+            && (stop.len() > 4 || stop.iter().any(String::is_empty))
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "NInfer accepts at most four non-empty stop strings".to_owned(),
+            ));
+        }
+        if settings.reasoning_budget.is_some() {
+            return Err(EngineError::InvalidGenerationSettings(
+                "NInfer has no Chat Completions per-request thinking budget; configure the launch default instead"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -1369,11 +1645,30 @@ impl EngineAdapter for NinferAdapter {
         endpoint: &str,
         request: InferenceRequest,
     ) -> Result<InferenceOutput, EngineError> {
+        let execution = self
+            .active_executions
+            .read()
+            .await
+            .get(endpoint)
+            .copied()
+            .ok_or_else(|| {
+                EngineError::Operation(
+                    "NInfer request capability proof is unavailable for this process".to_owned(),
+                )
+            })?;
+        let body = protocol::backend_request(
+            &request,
+            false,
+            execution.capabilities.protocol_semantics,
+            execution.capabilities.tool_calling,
+            execution.vision,
+            execution.greedy,
+        )?;
         let response = self
             .client
             .post(format!("{endpoint}/v1/chat/completions"))
             .timeout(INFERENCE_TIMEOUT)
-            .json(&protocol::backend_request(&request, false))
+            .json(&body)
             .send()
             .await
             .map_err(protocol::map_transport_error)?;
@@ -1385,11 +1680,30 @@ impl EngineAdapter for NinferAdapter {
         endpoint: &str,
         request: InferenceRequest,
     ) -> Result<InferenceStream, EngineError> {
+        let execution = self
+            .active_executions
+            .read()
+            .await
+            .get(endpoint)
+            .copied()
+            .ok_or_else(|| {
+                EngineError::Operation(
+                    "NInfer request capability proof is unavailable for this process".to_owned(),
+                )
+            })?;
+        let body = protocol::backend_request(
+            &request,
+            true,
+            execution.capabilities.protocol_semantics,
+            execution.capabilities.tool_calling,
+            execution.vision,
+            execution.greedy,
+        )?;
         let response = self
             .client
             .post(format!("{endpoint}/v1/chat/completions"))
             .timeout(INFERENCE_TIMEOUT)
-            .json(&protocol::backend_request(&request, true))
+            .json(&body)
             .send()
             .await
             .map_err(protocol::map_transport_error)?;
@@ -1538,6 +1852,18 @@ struct StartupRecord {
 struct StartupServer {
     public_model_id: String,
     default_thinking: bool,
+    #[serde(default)]
+    max_request_bytes: Option<u64>,
+    #[serde(default)]
+    media_cache_bytes: Option<u64>,
+    #[serde(default)]
+    media_live_bytes: Option<u64>,
+    #[serde(default)]
+    media_preprocess_threads: Option<u64>,
+    #[serde(default)]
+    default_output_tokens: Option<u64>,
+    #[serde(default)]
+    default_thinking_budget: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1552,11 +1878,19 @@ struct StartupEngine {
     kv_capacity_mode: String,
     kv_capacity: u64,
     kv_cache: String,
+    #[serde(default)]
+    vision: bool,
     cuda_graph: bool,
     prefix_reuse: bool,
     speculative_backend: String,
     speculative_draft_window: u64,
     proposal_head: String,
+    #[serde(default)]
+    max_pending_requests: Option<u64>,
+    #[serde(default)]
+    pending_timeout_ms: Option<u64>,
+    #[serde(default)]
+    log_stats_interval_ms: Option<u64>,
     context_cost: StartupContextCost,
 }
 
@@ -1588,6 +1922,12 @@ struct StartupOverrides {
     top_p: Option<f64>,
     top_k: Option<u64>,
     min_p: Option<f64>,
+    #[serde(default)]
+    presence_penalty: Option<f64>,
+    #[serde(default)]
+    frequency_penalty: Option<f64>,
+    #[serde(default)]
+    seed: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1686,8 +2026,12 @@ async fn read_and_validate_startup_log(
     let Some(startup) = startup else {
         return Ok(None);
     };
+    let schema_supported = pending.capabilities.request_log_schema.map_or_else(
+        || matches!(startup.schema_version, 18 | 19),
+        |expected| startup.schema_version == expected,
+    );
     if startup.artifact_type != "ninfer_serve_request_log"
-        || startup.schema_version != 18
+        || !schema_supported
         || startup.event != "server_start"
     {
         return Err(EngineError::Operation(
@@ -1731,22 +2075,21 @@ async fn read_and_validate_startup_log(
             "NInfer reported a different compute capability than the selected device".to_owned(),
         ));
     }
-    if startup.sampling_defaults.greedy {
-        return Err(EngineError::Operation(
-            "NInfer unexpectedly started with process-wide greedy sampling".to_owned(),
-        ));
-    }
     let preset = if startup.server.default_thinking {
         startup.sampling_defaults.thinking
     } else {
         startup.sampling_defaults.non_thinking
     };
     let defaults = EffectiveGenerationSettings {
-        temperature: startup
-            .sampling_defaults
-            .server_overrides
-            .temperature
-            .unwrap_or(preset.temperature),
+        temperature: if startup.sampling_defaults.greedy {
+            0.0
+        } else {
+            startup
+                .sampling_defaults
+                .server_overrides
+                .temperature
+                .unwrap_or(preset.temperature)
+        },
         top_p: startup
             .sampling_defaults
             .server_overrides
@@ -1773,6 +2116,11 @@ async fn read_and_validate_startup_log(
         ));
     }
     if let Some(requirements) = pending.settings_requirements.as_ref() {
+        if startup.sampling_defaults.greedy != requirements.greedy.unwrap_or(false) {
+            return Err(EngineError::Operation(
+                "NInfer startup greedy mode disagrees with the configured value".to_owned(),
+            ));
+        }
         if requirements
             .expected_thinking
             .is_some_and(|expected| startup.server.default_thinking != expected)
@@ -1781,6 +2129,59 @@ async fn read_and_validate_startup_log(
                 "NInfer startup default_thinking={} disagrees with the configured value {:?}",
                 startup.server.default_thinking, requirements.expected_thinking
             )));
+        }
+        if requirements
+            .vision
+            .is_some_and(|expected| startup.engine.vision != expected)
+        {
+            return Err(EngineError::Operation(
+                "NInfer startup vision residency disagrees with the configured value".to_owned(),
+            ));
+        }
+        if requirements
+            .default_output_tokens
+            .is_some_and(|expected| startup.server.default_output_tokens != Some(expected))
+            || requirements
+                .default_thinking_budget
+                .is_some_and(|expected| startup.server.default_thinking_budget != Some(expected))
+        {
+            return Err(EngineError::Operation(
+                "NInfer startup output/thinking defaults disagree with configured values"
+                    .to_owned(),
+            ));
+        }
+        if requirements
+            .max_pending_requests
+            .is_some_and(|expected| startup.engine.max_pending_requests != Some(expected))
+            || requirements
+                .pending_timeout_ms
+                .is_some_and(|expected| startup.engine.pending_timeout_ms != Some(expected))
+            || requirements
+                .log_stats_interval_ms
+                .is_some_and(|expected| startup.engine.log_stats_interval_ms != Some(expected))
+        {
+            return Err(EngineError::Operation(
+                "NInfer startup queue/statistics controls disagree with configured values"
+                    .to_owned(),
+            ));
+        }
+        if requirements
+            .max_request_bytes
+            .is_some_and(|expected| startup.server.max_request_bytes != Some(expected))
+            || requirements
+                .media_cache_bytes
+                .is_some_and(|expected| startup.server.media_cache_bytes != Some(expected))
+            || requirements
+                .media_live_bytes
+                .is_some_and(|expected| startup.server.media_live_bytes != Some(expected))
+            || requirements
+                .media_preprocess_threads
+                .is_some_and(|expected| startup.server.media_preprocess_threads != Some(expected))
+        {
+            return Err(EngineError::Operation(
+                "NInfer startup request/media resource controls disagree with configured values"
+                    .to_owned(),
+            ));
         }
         if let Some(minimum_context) = requirements.minimum_context_tokens
             && startup.engine.max_context < minimum_context
@@ -1852,6 +2253,25 @@ async fn read_and_validate_startup_log(
         {
             return Err(EngineError::Operation(
                 "NInfer startup did not resolve the configured sampler defaults".to_owned(),
+            ));
+        }
+        if requirements.presence_penalty.is_some_and(|expected| {
+            startup
+                .sampling_defaults
+                .server_overrides
+                .presence_penalty
+                .is_none_or(|observed| !approximately_equal(observed, expected))
+        }) || requirements.frequency_penalty.is_some_and(|expected| {
+            startup
+                .sampling_defaults
+                .server_overrides
+                .frequency_penalty
+                .is_none_or(|observed| !approximately_equal(observed, expected))
+        }) || requirements.seed.is_some_and(|expected| {
+            startup.sampling_defaults.server_overrides.seed != Some(expected)
+        }) {
+            return Err(EngineError::Operation(
+                "NInfer startup penalty/seed defaults disagree with configured values".to_owned(),
             ));
         }
     }
@@ -2228,10 +2648,7 @@ mod tests {
 
     #[test]
     fn native_arguments_are_strict_and_semantic_flags_are_reserved() {
-        assert!(
-            invalid_native_argument(&["--max-pending-requests".to_owned(), "12".to_owned()])
-                .is_none()
-        );
+        assert!(conflicts_with_managed_argument("--max-pending-requests"));
         assert!(invalid_native_argument(&["--unknown".to_owned()]).is_some());
         assert!(conflicts_with_managed_argument("--temperature=0.8"));
         assert!(conflicts_with_managed_argument("--no-thinking"));
@@ -2276,6 +2693,10 @@ mod tests {
             thinking_control: true,
             process_sampler_overrides: true,
             bounded_server_start: true,
+            protocol_semantics: true,
+            tool_calling: true,
+            vision: true,
+            request_log_schema: Some(19),
         };
         assert!(validate_ninfer_settings_prelaunch(&settings, exact).is_ok());
     }

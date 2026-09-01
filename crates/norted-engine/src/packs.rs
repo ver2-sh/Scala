@@ -25,7 +25,8 @@ use crate::store::{
     RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreIssue, RuntimeStoreSnapshot,
 };
 use crate::{
-    CompatibilityDecision, EngineError, EngineRegistry, InstallationState, ModelServingCapabilities,
+    CompatibilityDecision, EngineError, EngineFeature, EngineRegistry, InstallationState,
+    ModelServingCapabilities,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -1086,10 +1087,19 @@ impl RuntimePackManager {
         let selected_runtime_id = selected
             .as_ref()
             .map(|selection| selection.runtime.manifest.runtime_id.clone());
-        let structured_output = if let Some(selection) = selected.as_ref()
-            && let Some(adapter) = self
-                .registry
+        let selected_adapter = selected.as_ref().and_then(|selection| {
+            self.registry
                 .get(&selection.runtime.manifest.identity.engine_id)
+        });
+        let selected_features = selected
+            .as_ref()
+            .zip(selected_adapter.as_ref())
+            .map(|(selection, adapter)| {
+                adapter.serving_features(&selection.runtime, model, settings)
+            })
+            .unwrap_or_default();
+        let structured_output = if let Some(selection) = selected.as_ref()
+            && let Some(adapter) = selected_adapter.as_ref()
         {
             adapter
                 .settings_schema(&selection.runtime, model, &list.host)
@@ -1120,8 +1130,8 @@ impl RuntimePackManager {
             responses: true,
             chat_completions: true,
             streaming: true,
-            tools: false,
-            vision: false,
+            tools: selected_features.contains(&EngineFeature::ToolCalling),
+            vision: selected_features.contains(&EngineFeature::Vision),
             structured_output,
         })
     }

@@ -470,6 +470,9 @@ impl LlamaCppAdapter {
         if let Some(presence_penalty) = request.generation_settings.presence_penalty {
             body["presence_penalty"] = json!(presence_penalty);
         }
+        if let Some(frequency_penalty) = request.generation_settings.frequency_penalty {
+            body["frequency_penalty"] = json!(frequency_penalty);
+        }
         if let Some(stop) = &request.generation_settings.stop {
             body["stop"] = json!(stop);
         }
@@ -572,6 +575,13 @@ impl EngineAdapter for LlamaCppAdapter {
                 "llama.cpp presence penalty must be finite and in the range -2..=2".to_owned(),
             ));
         }
+        if let Some(value) = settings.frequency_penalty
+            && (!value.is_finite() || !(-2.0..=2.0).contains(&value))
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "llama.cpp frequency penalty must be finite and in the range -2..=2".to_owned(),
+            ));
+        }
         if settings.stop.as_ref().is_some_and(|values| {
             values.is_empty()
                 || values
@@ -601,6 +611,10 @@ impl EngineAdapter for LlamaCppAdapter {
             (
                 request.generation_settings.presence_penalty.is_some(),
                 "presence_penalty",
+            ),
+            (
+                request.generation_settings.frequency_penalty.is_some(),
+                "frequency_penalty",
             ),
             (request.generation_settings.stop.is_some(), "stop_strings"),
             (
@@ -1200,6 +1214,7 @@ impl EngineAdapter for LlamaCppAdapter {
         })?;
         Ok(InferenceOutput {
             text,
+            tool_calls: Vec::new(),
             usage: response.usage.map(Into::into),
             finish_reason,
         })
@@ -1501,7 +1516,7 @@ fn backend_messages(messages: &[InferenceMessage]) -> Vec<Value> {
                 InferenceRole::System | InferenceRole::Developer
             )
         })
-        .map(|message| message.text.as_str())
+        .filter_map(InferenceMessage::text_only)
         .collect::<Vec<_>>()
         .join("\n\n");
     let mut backend = Vec::with_capacity(messages.len());
@@ -1528,8 +1543,9 @@ fn message_json(message: &InferenceMessage) -> Value {
             InferenceRole::User => "user",
             InferenceRole::Assistant => "assistant",
             InferenceRole::System | InferenceRole::Developer => "system",
+            InferenceRole::Tool => "tool",
         },
-        "content": message.text,
+        "content": message.text_only().unwrap_or_default(),
     })
 }
 
@@ -1826,6 +1842,7 @@ fn llama_setting_contract(id: &str) -> &'static [&'static str] {
         "seed" => &["--seed"],
         "repeat_penalty" => &["--repeat-penalty"],
         "presence_penalty" => &["--presence-penalty"],
+        "frequency_penalty" => &["--frequency-penalty"],
         "max_output_tokens" => &["--predict"],
         "stop_strings" => &["--reverse-prompt"],
         "reasoning" => &["--reasoning"],
@@ -1874,6 +1891,7 @@ fn llama_setting_has_execution_path(id: &str) -> bool {
             | "seed"
             | "repeat_penalty"
             | "presence_penalty"
+            | "frequency_penalty"
             | "max_output_tokens"
             | "stop_strings"
             | "system_prompt"
@@ -2475,6 +2493,9 @@ fn translate_llama_settings_for_model(
             ("presence_penalty", SettingValue::Float(value)) => {
                 push_value_argument(&mut arguments, "--presence-penalty", *value);
             }
+            ("frequency_penalty", SettingValue::Float(value)) => {
+                push_value_argument(&mut arguments, "--frequency-penalty", *value);
+            }
             ("max_output_tokens", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--predict", *value);
             }
@@ -2636,6 +2657,7 @@ fn llama_setting_collision_contract(
         "seed" => (&["-s", "--seed"], &[]),
         "repeat_penalty" => (&["--repeat-penalty"], &[]),
         "presence_penalty" => (&["--presence-penalty"], &[]),
+        "frequency_penalty" => (&["--frequency-penalty"], &[]),
         "max_output_tokens" => (
             &["-n", "--predict", "--n-predict"],
             &["LLAMA_ARG_N_PREDICT"],
@@ -3185,11 +3207,11 @@ mod generation_settings_tests {
     fn request(generation_settings: GenerationSettingsPatch) -> InferenceRequest {
         InferenceRequest {
             model_profile_id: ModelProfileId::new("model").expect("profile ID"),
-            messages: vec![InferenceMessage {
-                role: InferenceRole::User,
-                text: "hello".to_owned(),
-            }],
+            messages: vec![InferenceMessage::text(InferenceRole::User, "hello")],
             generation_settings,
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
             output_format: None,
             max_output_tokens: Some(123),
             stream: false,

@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(responses.model_profile_id, chat.model_profile_id);
         assert_eq!(responses.messages.len(), chat.messages.len());
         assert_eq!(responses.messages[0].role, chat.messages[0].role);
-        assert_eq!(responses.messages[0].text, chat.messages[0].text);
+        assert_eq!(responses.messages[0].content, chat.messages[0].content);
         assert_eq!(responses.max_output_tokens, chat.max_output_tokens);
         assert_eq!(responses.generation_settings, chat.generation_settings);
         assert_eq!(responses.generation_settings.temperature, None);

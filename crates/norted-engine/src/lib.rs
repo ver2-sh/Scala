@@ -86,7 +86,7 @@ pub enum ApiCapability {
     Embeddings,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineFeature {
     TextGeneration,
@@ -253,7 +253,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             label: "Reasoning effort".to_owned(),
             description: "Default reasoning effort when the selected engine supports it".to_owned(),
             kind: norted_core::SettingKind::Choice {
-                choices: ["minimal", "low", "medium", "high", "xhigh", "max"]
+                choices: ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
                     .into_iter()
                     .map(str::to_owned)
                     .collect(),
@@ -292,6 +292,17 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             "presence_penalty",
             "Presence penalty",
             "Configured token-presence penalty in the OpenAI-compatible -2..=2 range",
+            norted_core::SettingKind::Float {
+                minimum: Some(-2.0),
+                maximum: Some(2.0),
+            },
+            norted_core::SettingCategory::Generation,
+            Some("runtime default"),
+        ),
+        common_definition(
+            "frequency_penalty",
+            "Frequency penalty",
+            "Configured token-frequency penalty in the OpenAI-compatible -2..=2 range",
             norted_core::SettingKind::Float {
                 minimum: Some(-2.0),
                 maximum: Some(2.0),
@@ -1005,17 +1016,72 @@ pub enum InferenceRole {
     Developer,
     User,
     Assistant,
+    Tool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum InferenceContentPart {
+    Text { text: String },
+    ImageUrl { url: String },
+    VideoUrl { url: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InferenceToolCall {
+    pub id: String,
+    pub name: String,
+    /// JSON-encoded function arguments, matching the OpenAI tool-call wire contract.
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InferenceMessage {
     pub role: InferenceRole,
-    pub text: String,
+    pub content: Vec<InferenceContentPart>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<InferenceToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl InferenceMessage {
+    pub fn text(role: InferenceRole, text: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: vec![InferenceContentPart::Text { text: text.into() }],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn text_only(&self) -> Option<String> {
+        let mut text = String::new();
+        for part in &self.content {
+            match part {
+                InferenceContentPart::Text { text: part } => text.push_str(part),
+                InferenceContentPart::ImageUrl { .. } | InferenceContentPart::VideoUrl { .. } => {
+                    return None;
+                }
+            }
+        }
+        Some(text)
+    }
+
+    pub fn has_media(&self) -> bool {
+        self.content.iter().any(|part| {
+            matches!(
+                part,
+                InferenceContentPart::ImageUrl { .. } | InferenceContentPart::VideoUrl { .. }
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    None,
     Minimal,
     Low,
     Medium,
@@ -1027,6 +1093,7 @@ pub enum ReasoningEffort {
 impl ReasoningEffort {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
@@ -1047,10 +1114,15 @@ impl std::fmt::Display for ReasoningEffort {
 pub struct GenerationSettingsPatch {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub top_k: Option<u64>,
+    pub min_p: Option<f64>,
     pub seed: Option<u64>,
     pub repeat_penalty: Option<f64>,
     pub presence_penalty: Option<f64>,
+    pub frequency_penalty: Option<f64>,
     pub stop: Option<Vec<String>>,
+    pub reasoning_enabled: Option<bool>,
+    pub reasoning_budget: Option<i64>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
@@ -1058,12 +1130,34 @@ impl GenerationSettingsPatch {
     pub fn is_empty(&self) -> bool {
         self.temperature.is_none()
             && self.top_p.is_none()
+            && self.top_k.is_none()
+            && self.min_p.is_none()
             && self.seed.is_none()
             && self.repeat_penalty.is_none()
             && self.presence_penalty.is_none()
+            && self.frequency_penalty.is_none()
             && self.stop.is_none()
+            && self.reasoning_enabled.is_none()
+            && self.reasoning_budget.is_none()
             && self.reasoning_effort.is_none()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InferenceTool {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum InferenceToolChoice {
+    Auto,
+    None,
+    Required,
+    Function { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1087,6 +1181,12 @@ pub struct InferenceRequest {
     pub model_profile_id: norted_core::ModelProfileId,
     pub messages: Vec<InferenceMessage>,
     pub generation_settings: GenerationSettingsPatch,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<InferenceTool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<InferenceToolChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_format: Option<OutputFormat>,
     pub max_output_tokens: Option<u32>,
@@ -1106,6 +1206,8 @@ pub struct InferenceUsage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceOutput {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<InferenceToolCall>,
     pub usage: Option<InferenceUsage>,
     pub finish_reason: InferenceFinishReason,
 }
@@ -1127,6 +1229,7 @@ pub struct RoutedInferenceStream {
 pub enum InferenceFinishReason {
     Stop,
     MaxOutputTokens,
+    ToolCalls,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1134,6 +1237,14 @@ pub enum InferenceFinishReason {
 pub enum InferenceEvent {
     TextDelta {
         delta: String,
+    },
+    ToolCallDelta {
+        index: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        arguments_delta: String,
     },
     Completed {
         usage: Option<InferenceUsage>,
@@ -1238,6 +1349,22 @@ pub trait EngineAdapter: Send + Sync {
                 RuntimeCompatibility::Incompatible(reason)
             }
         }
+    }
+    /// Returns only features that this exact runtime/model/settings tuple can
+    /// carry through Norted's public and private translations end to end.
+    fn serving_features(
+        &self,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _settings: Option<&ResolvedSettings>,
+    ) -> Vec<EngineFeature> {
+        self.capabilities().features
+    }
+    /// Whether a configured common setting should be copied into omitted
+    /// per-request generation fields. Engines may instead own a setting as an
+    /// upstream launch default while still accepting explicit request fields.
+    fn uses_setting_as_request_default(&self, _id: &str) -> bool {
+        true
     }
     /// Lower values are preferred after compatibility. Engines own the
     /// semantic ordering of their runtime variants.
@@ -1428,6 +1555,26 @@ pub trait EngineAdapter: Send + Sync {
         _settings_schema: &SettingsSchema,
     ) -> Result<(), EngineError> {
         self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
+        if !request.tools.is_empty()
+            || request.tool_choice.is_some()
+            || request.parallel_tool_calls.is_some()
+            || request.messages.iter().any(|message| {
+                message.role == InferenceRole::Tool
+                    || !message.tool_calls.is_empty()
+                    || message.tool_call_id.is_some()
+            })
+        {
+            return Err(EngineError::InvalidGenerationSettings(format!(
+                "engine `{}` does not support tool calling",
+                self.identity().id
+            )));
+        }
+        if request.messages.iter().any(InferenceMessage::has_media) {
+            return Err(EngineError::InvalidGenerationSettings(format!(
+                "engine `{}` does not support media input",
+                self.identity().id
+            )));
+        }
         if matches!(
             request.output_format.as_ref(),
             Some(OutputFormat::JsonObject | OutputFormat::JsonSchema { .. })
