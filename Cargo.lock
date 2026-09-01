@@ -1580,7 +1580,6 @@ dependencies = [
  "norted-tui",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
  "toml",
  "tracing",

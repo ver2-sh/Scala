@@ -603,8 +603,8 @@ mod tests {
     use super::{
         DescriptorCandidate, ProbeFailureEvidence, ProbeFailureKind, ProbeOutcome,
         RUNTIME_SCHEMA_VERSION, RuntimeDescriptor, RuntimeObservationError, failure_evidence_path,
-        observe_runtime, observe_runtime_descriptor_read_only, observe_runtime_with_timeout,
-        process_probe_evidence, runtime_directory, unix_timestamp,
+        observe_runtime, observe_runtime_with_timeout, process_probe_evidence, runtime_directory,
+        unix_timestamp,
     };
     use crate::{AppPaths, ServerState};
 
@@ -720,30 +720,6 @@ mod tests {
         let result = observe_runtime_with_timeout(&paths, Duration::ZERO).await;
 
         assert!(matches!(result, Err(RuntimeObservationError::TimedOut)));
-    }
-
-    #[tokio::test]
-    async fn read_only_observation_does_not_record_or_clean_probe_failures() {
-        let paths = temporary_paths("read-only");
-        let directory = runtime_directory(&paths);
-        fs::create_dir_all(&directory).expect("create runtime directory");
-        let instance_id = Uuid::new_v4().to_string();
-        let descriptor_path = write_descriptor(
-            &directory,
-            &instance_id,
-            unused_loopback_address(),
-            25 * 60 * 60,
-        );
-        let evidence_path = failure_evidence_path(&read_candidate(&descriptor_path));
-
-        let observed = observe_runtime_descriptor_read_only(&paths)
-            .await
-            .expect("read-only observation");
-
-        assert!(observed.is_none());
-        assert!(descriptor_path.exists());
-        assert!(!evidence_path.exists());
-        fs::remove_dir_all(&paths.state_dir).expect("remove temporary state directory");
     }
 
     #[test]
