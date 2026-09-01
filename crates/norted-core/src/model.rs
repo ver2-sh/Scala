@@ -107,9 +107,26 @@ pub enum NinferContainerError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelArtifactProvenance {
+    /// Acquisition mechanism (`huggingface` or `local_import`).
+    pub provider: String,
+    pub repository: Option<String>,
     pub logical_id: Option<String>,
     pub source: Option<String>,
     pub revision: Option<String>,
+    pub remote_filename: Option<String>,
+    pub acquired_at_unix: i64,
+    pub size_bytes: u64,
+    pub digest: Option<String>,
+}
+
+pub const MODEL_LIBRARY_RECEIPT_SUFFIX: &str = ".norted-library.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelLibraryReceipt {
+    pub schema_version: u32,
+    pub primary_filename: String,
+    pub provenance: ModelArtifactProvenance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,7 +207,11 @@ impl ModelRegistry {
                     .push(format!("model path does not exist: {}", root.display()));
                 continue;
             }
-            for entry in WalkDir::new(root).follow_links(false) {
+            for entry in WalkDir::new(root)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|entry| entry.file_name() != ".norted-staging")
+            {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
@@ -291,8 +312,13 @@ impl ModelRegistry {
                             }
                             _ => (None, None),
                         };
+                        let provenance =
+                            read_library_receipt(&canonical_path, &mut registry.warnings);
+                        let logical_identity = provenance
+                            .as_ref()
+                            .and_then(|value| value.logical_id.as_deref());
                         registry.artifacts.push(ModelArtifact {
-                            id: model_id(path, format, &identity, None),
+                            id: model_id(path, format, &identity, logical_identity),
                             display_name: path
                                 .file_stem()
                                 .and_then(|name| name.to_str())
@@ -302,10 +328,10 @@ impl ModelRegistry {
                             format,
                             size_bytes: metadata.len(),
                             created: artifact_timestamp(&metadata),
-                            hash: None,
                             architecture,
                             context_length,
-                            provenance: None,
+                            hash: provenance.as_ref().and_then(|value| value.digest.clone()),
+                            provenance,
                             native_identity,
                             auxiliary_artifacts,
                             norted_package: package_member.map(|member| member.binding),
@@ -805,12 +831,7 @@ fn discover_auxiliary_artifacts(
     }]
 }
 
-fn q27_tokenizer_candidate(primary: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
-    let exact = primary.with_extension("tok");
-    if exact.is_file() {
-        return Some(exact);
-    }
-    let model_stem = primary.file_stem()?.to_str()?;
+pub fn q27_tokenizer_candidate(primary: &Path, warnings: &mut Vec<String>) -> Option<PathBuf> {
     let parent = primary.parent()?;
     let entries = match std::fs::read_dir(parent) {
         Ok(entries) => entries,
@@ -822,7 +843,7 @@ fn q27_tokenizer_candidate(primary: &Path, warnings: &mut Vec<String>) -> Option
             return None;
         }
     };
-    let mut candidates = entries
+    let candidates = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
@@ -830,33 +851,72 @@ fn q27_tokenizer_candidate(primary: &Path, warnings: &mut Vec<String>) -> Option
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("tok"))
         })
-        .filter_map(|path| {
-            let stem = path.file_stem()?.to_str()?;
-            model_stem
-                .strip_prefix(stem)
-                .is_some_and(|suffix| suffix.starts_with('-'))
-                .then_some((stem.len(), path))
-        })
         .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| right.0.cmp(&left.0));
-    let longest = candidates.first()?.0;
-    let mut longest_candidates = candidates
-        .into_iter()
-        .take_while(|(length, _)| *length == longest)
-        .map(|(_, path)| path);
-    let candidate = longest_candidates.next()?;
-    if longest_candidates.next().is_some() {
-        warnings.push(format!(
-            "q27 tokenizer companion is ambiguous for {}",
-            primary.display()
-        ));
-        None
-    } else {
-        Some(candidate)
+    let filenames = candidates
+        .iter()
+        .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let primary_name = primary.file_name()?.to_str()?;
+    match select_q27_tokenizer_filename(primary_name, &filenames) {
+        Ok(Some(filename)) => Some(parent.join(filename)),
+        Ok(None) => None,
+        Err(reason) => {
+            warnings.push(format!("{reason} for {}", primary.display()));
+            None
+        }
     }
 }
 
-pub(crate) fn validate_q27_tokenizer_header(path: &Path) -> Result<(), String> {
+/// Selects the same tokenizer companion for local discovery and remote
+/// acquisition. Exact stem matches win, followed by the longest unambiguous
+/// prefix. A sole `.tok` file covers the common `MODEL.q27` + `TOKENIZER.tok`
+/// upstream layout.
+pub fn select_q27_tokenizer_filename(
+    primary_filename: &str,
+    tokenizer_filenames: &[String],
+) -> Result<Option<String>, String> {
+    let model_stem = Path::new(primary_filename)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "q27 primary filename is not valid UTF-8".to_owned())?;
+    let exact = tokenizer_filenames.iter().find(|candidate| {
+        Path::new(candidate)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case(model_stem))
+    });
+    if let Some(exact) = exact {
+        return Ok(Some(exact.clone()));
+    }
+    let mut candidates = tokenizer_filenames
+        .iter()
+        .filter_map(|candidate| {
+            let stem = Path::new(candidate).file_stem()?.to_str()?;
+            model_stem
+                .strip_prefix(stem)
+                .is_some_and(|suffix| suffix.starts_with('-'))
+                .then_some((stem.len(), candidate))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    if let Some((longest, candidate)) = candidates.first() {
+        if candidates
+            .iter()
+            .skip(1)
+            .any(|(length, _)| length == longest)
+        {
+            return Err("q27 tokenizer companion is ambiguous".to_owned());
+        }
+        return Ok(Some((*candidate).clone()));
+    }
+    match tokenizer_filenames {
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
+        _ => Err("q27 tokenizer companion is ambiguous".to_owned()),
+    }
+}
+
+pub fn validate_q27_tokenizer_header(path: &Path) -> Result<(), String> {
     let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
     let mut header = [0_u8; 8];
     file.read_exact(&mut header)
@@ -871,6 +931,51 @@ pub(crate) fn validate_q27_tokenizer_header(path: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+pub fn model_library_receipt_path(primary: &Path) -> PathBuf {
+    let filename = primary
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("model");
+    primary.with_file_name(format!("{filename}{MODEL_LIBRARY_RECEIPT_SUFFIX}"))
+}
+
+fn read_library_receipt(
+    primary: &Path,
+    warnings: &mut Vec<String>,
+) -> Option<ModelArtifactProvenance> {
+    let path = model_library_receipt_path(primary);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            warnings.push(format!(
+                "could not read model-library receipt {}: {error}",
+                path.display()
+            ));
+            return None;
+        }
+    };
+    let receipt: ModelLibraryReceipt = match serde_json::from_slice(&bytes) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            warnings.push(format!(
+                "could not parse model-library receipt {}: {error}",
+                path.display()
+            ));
+            return None;
+        }
+    };
+    let filename = primary.file_name().and_then(|value| value.to_str());
+    if receipt.schema_version != 1 || filename != Some(receipt.primary_filename.as_str()) {
+        warnings.push(format!(
+            "model-library receipt {} does not identify this artifact",
+            path.display()
+        ));
+        return None;
+    }
+    Some(receipt.provenance)
 }
 
 fn model_id(
@@ -974,6 +1079,29 @@ mod tests {
             artifact.auxiliary_artifacts[0].role,
             AuxiliaryArtifactRole::Tokenizer
         );
+        assert_eq!(
+            artifact.auxiliary_artifacts[0].path,
+            tokenizer.canonicalize().expect("canonical tokenizer")
+        );
+
+        std::fs::remove_dir_all(&root).expect("remove model fixture directory");
+    }
+
+    #[test]
+    fn q27_upstream_model_and_tokenizer_names_pair_when_tokenizer_is_unique() {
+        let root =
+            std::env::temp_dir().join(format!("norted-q27-upstream-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).expect("model fixture directory");
+        let model = root.join("MODEL.q27");
+        let tokenizer = root.join("TOKENIZER.tok");
+        std::fs::write(&model, b"fixture").expect("q27 fixture");
+        let mut tokenizer_bytes = b"Q27T".to_vec();
+        tokenizer_bytes.extend_from_slice(&1_u32.to_le_bytes());
+        std::fs::write(&tokenizer, tokenizer_bytes).expect("tokenizer fixture");
+
+        let registry = ModelRegistry::discover(std::slice::from_ref(&root));
+        let artifact = registry.artifacts().first().expect("q27 artifact");
+        assert_eq!(artifact.auxiliary_artifacts.len(), 1);
         assert_eq!(
             artifact.auxiliary_artifacts[0].path,
             tokenizer.canonicalize().expect("canonical tokenizer")

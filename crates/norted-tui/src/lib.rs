@@ -19,10 +19,12 @@ use norted_core::{
 use norted_engine::{
     BackendLifecycle, ControlClient, ControlClientError, ControlStatus, RuntimePackManager,
 };
+use norted_model_library::ModelLibrary;
 
 use app::{
-    App, ControlAction, ModelSettingsInspection, ProfileEngineSelection, RuntimeAction,
-    RuntimeTaskResult, SettingsAction, SettingsScope, SettingsTaskResult, Update,
+    App, ControlAction, ModelLibraryAction, ModelLibraryTaskResult, ModelSettingsInspection,
+    ProfileEngineSelection, RuntimeAction, RuntimeTaskResult, SettingsAction, SettingsScope,
+    SettingsTaskResult, Update,
 };
 use terminal::TerminalSession;
 use ui::layout::UiLayout;
@@ -89,6 +91,7 @@ impl ControlPollState {
 pub async fn run(
     core: Arc<ApplicationCore>,
     runtime_packs: Arc<RuntimePackManager>,
+    model_library: Arc<ModelLibrary>,
     setting_definitions: Vec<SettingDefinition>,
 ) -> Result<()> {
     let mut terminal = TerminalSession::enter()?;
@@ -111,9 +114,11 @@ pub async fn run(
     let (control_results, mut control_result_receiver) =
         tokio::sync::mpsc::channel::<std::result::Result<ControlStatus, String>>(2);
     let (runtime_results, mut runtime_result_receiver) = tokio::sync::mpsc::channel(4);
+    let (model_library_results, mut model_library_result_receiver) = tokio::sync::mpsc::channel(4);
     let (settings_results, mut settings_result_receiver) = tokio::sync::mpsc::channel(4);
     let (auth_updates, mut auth_update_receiver) = tokio::sync::mpsc::channel(2);
     let mut runtime_progress = runtime_packs.progress();
+    let mut model_progress = model_library.subscribe();
     spawn_runtime_action(
         Arc::clone(&runtime_packs),
         core.paths.clone(),
@@ -232,6 +237,13 @@ pub async fn run(
                 }
                 None => Update::None,
             },
+            result = model_library_result_receiver.recv() => match result {
+                Some(result) => {
+                    app.handle_model_library_result(result);
+                    Update::Render
+                }
+                None => Update::None,
+            },
             result = settings_result_receiver.recv() => match result {
                 Some(result) => {
                     app.handle_settings_task_result(result);
@@ -249,6 +261,14 @@ pub async fn run(
             progress = runtime_progress.recv() => match progress {
                 Ok(progress) => {
                     app.handle_runtime_progress(progress);
+                    Update::Render
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Update::Render,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => Update::None,
+            },
+            progress = model_progress.recv() => match progress {
+                Ok(progress) => {
+                    app.handle_model_operation_progress(progress);
                     Update::Render
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Update::Render,
@@ -284,6 +304,14 @@ pub async fn run(
                 action,
             );
         }
+        if let Some(action) = app.take_model_library_action() {
+            spawn_model_library_action(
+                Arc::clone(&model_library),
+                Arc::clone(&core),
+                model_library_results.clone(),
+                action,
+            );
+        }
         if let Some(action) = app.take_settings_action() {
             spawn_settings_action(
                 Arc::clone(&runtime_packs),
@@ -298,6 +326,48 @@ pub async fn run(
     auth_observer.abort();
     terminal.leave()?;
     Ok(())
+}
+
+fn spawn_model_library_action(
+    library: Arc<ModelLibrary>,
+    core: Arc<ApplicationCore>,
+    results: tokio::sync::mpsc::Sender<ModelLibraryTaskResult>,
+    action: ModelLibraryAction,
+) {
+    tokio::spawn(async move {
+        let result = match action {
+            ModelLibraryAction::Search { query, format } => ModelLibraryTaskResult::Searched(
+                library
+                    .search(&query, format)
+                    .await
+                    .map_err(|error| error.to_string()),
+            ),
+            ModelLibraryAction::Download(model_ref) => {
+                let result = match library.download(&model_ref).await {
+                    Ok(model) => match core.refresh_models().await {
+                        Ok(()) => Ok(model),
+                        Err(error) => Err(error.to_string()),
+                    },
+                    Err(error) => Err(error.to_string()),
+                };
+                ModelLibraryTaskResult::Downloaded(Box::new(result))
+            }
+            ModelLibraryAction::Remove(model_id) => {
+                let result = match core.model(&model_id).await {
+                    Some(model) => match library.remove(&model).await {
+                        Ok(()) => match core.refresh_models().await {
+                            Ok(()) => Ok(model_id),
+                            Err(error) => Err(error.to_string()),
+                        },
+                        Err(error) => Err(error.to_string()),
+                    },
+                    None => Err(format!("model `{model_id}` was not found")),
+                };
+                ModelLibraryTaskResult::Removed(result)
+            }
+        };
+        let _ = results.send(result).await;
+    });
 }
 
 async fn observe_public_auth(

@@ -20,6 +20,7 @@ norted-engine = { path = "../norted-engine" }
 norted-engine-llama-cpp = { path = "../norted-engine-llama-cpp" }
 norted-engine-ninfer = { path = "../norted-engine-ninfer" }
 norted-engine-q27 = { path = "../norted-engine-q27" }
+norted-model-library = { path = "../norted-model-library" }
 norted-tui = { path = "../norted-tui" }
 serde.workspace = true
 serde_json.workspace = true

@@ -1563,6 +1563,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "norted-model-library"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "norted-core",
+ "norted-engine-q27",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "norted-server"
 version = "0.1.0"
 dependencies = [
@@ -1577,6 +1596,7 @@ dependencies = [
  "norted-engine-llama-cpp",
  "norted-engine-ninfer",
  "norted-engine-q27",
+ "norted-model-library",
  "norted-tui",
  "serde",
  "serde_json",
@@ -1596,6 +1616,7 @@ dependencies = [
  "futures-util",
  "norted-core",
  "norted-engine",
+ "norted-model-library",
  "ratatui",
  "tokio",
  "unicode-width",

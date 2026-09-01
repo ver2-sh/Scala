@@ -26,9 +26,11 @@ pub use error::{CoreError, Result};
 pub use event::{AppEvent, LogLevel};
 pub use model::{
     ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifact, AuxiliaryArtifactRole,
-    GgufArtifactIdentity, GgufMetadataError, ModelArtifact, ModelArtifactProvenance, ModelId,
-    ModelRegistry, NinferArtifactIdentity, NinferContainerError, NinferContainerMetadata,
-    inspect_gguf_metadata, inspect_ninfer_container,
+    GgufArtifactIdentity, GgufMetadataError, MODEL_LIBRARY_RECEIPT_SUFFIX, ModelArtifact,
+    ModelArtifactProvenance, ModelId, ModelLibraryReceipt, ModelRegistry, NinferArtifactIdentity,
+    NinferContainerError, NinferContainerMetadata, inspect_gguf_metadata, inspect_ninfer_container,
+    model_library_receipt_path, q27_tokenizer_candidate, select_q27_tokenizer_filename,
+    validate_q27_tokenizer_header,
 };
 pub use model_profile::{
     EngineId, MODEL_PROFILES_STATE_VERSION, ModelProfile, ModelProfileId, ModelProfilesState,

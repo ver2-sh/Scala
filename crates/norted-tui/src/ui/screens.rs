@@ -7,7 +7,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap};
 
-use crate::app::{App, Screen};
+use crate::app::{App, ModelLibraryView, Screen};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{
     content_layout, format_bytes, key_value, load_progress_compact, render_empty,
@@ -239,6 +239,10 @@ fn render_models(
     ui_layout: &UiLayout,
 ) {
     let layout = content_layout(area);
+    if app.model_library_view == ModelLibraryView::Discover {
+        render_model_discover(frame, app, theme, glyphs, ui_layout, &layout);
+        return;
+    }
     let subtitle = match &app.snapshot.registry_state {
         RegistryState::NotScanned => "Model discovery has not started".to_owned(),
         RegistryState::Scanning => "Scanning configured search paths in the background".to_owned(),
@@ -251,7 +255,10 @@ fn render_models(
             app.snapshot.registry_warnings.len()
         ),
     };
-    frame.render_widget(section_title("Models", &subtitle, theme), layout[0]);
+    frame.render_widget(
+        section_title("Model Library · Installed", &subtitle, theme),
+        layout[0],
+    );
     if matches!(app.snapshot.registry_state, RegistryState::NotScanned) {
         render_empty(
             frame,
@@ -350,12 +357,19 @@ fn render_models(
             },
             Line::from(Span::styled(
                 format!(
-                    "Artifact: {} · provenance: {} · Enter/c creates Model Profile",
+                    "Artifact: {} · provenance: {} · Enter/c profile · s discover{}",
                     model.format,
                     if model.norted_package.is_some() {
                         "Norted package"
+                    } else if let Some(provenance) = &model.provenance {
+                        provenance.provider.as_str()
                     } else {
                         "raw/local"
+                    },
+                    if model.provenance.is_some() {
+                        " · d remove"
+                    } else {
+                        ""
                     },
                 ),
                 theme.hint,
@@ -373,7 +387,126 @@ fn render_models(
             theme,
             glyphs,
         );
+    } else if let Some(progress) = &app.model_operation {
+        render_model_library_progress(frame, ui_layout.model_progress, progress, theme);
     }
+}
+
+fn render_model_discover(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: &Theme,
+    glyphs: &Glyphs,
+    ui_layout: &UiLayout,
+    layout: &[Rect],
+) {
+    let filter = app
+        .model_search_format
+        .map(|format| format.as_str().to_ascii_uppercase())
+        .unwrap_or_else(|| "ALL".to_owned());
+    let cursor = if app.model_search_editing { "▌" } else { "" };
+    let subtitle = format!(
+        "Hugging Face · query: {}{} · format: {} · e edit · Enter search · f filter · i installed",
+        if app.model_search_query.is_empty() {
+            "<popular>"
+        } else {
+            &app.model_search_query
+        },
+        cursor,
+        filter,
+    );
+    frame.render_widget(
+        section_title("Model Library · Discover", &subtitle, theme),
+        layout[0],
+    );
+    if app.model_search_loading {
+        render_empty(
+            frame,
+            ui_layout.model_list,
+            &format!("{}  Searching Hugging Face", glyphs.transitional),
+            "Relevant GGUF, q27, and NInfer files will appear as concrete downloadable variants.",
+            theme,
+        );
+    } else if app.model_search.is_none() {
+        render_empty(
+            frame,
+            ui_layout.model_list,
+            "Search the remote model catalog",
+            "Press e to enter a query, choose a format with f, then press Enter. Remote compatibility is unverified until local inspection.",
+            theme,
+        );
+    } else if app.model_search_artifacts().is_empty() {
+        render_empty(
+            frame,
+            ui_layout.model_list,
+            &format!("{}  No matching artifacts", glyphs.empty),
+            "Try a broader repository or publisher query, or cycle the format filter.",
+            theme,
+        );
+    } else {
+        let artifacts = app.model_search_artifacts();
+        let items = ui_layout.model_rows.iter().map(|(index, _)| {
+            let artifact = artifacts[*index];
+            let style = if app.selected_model_search_result == Some(*index) {
+                theme.selected
+            } else {
+                ratatui::style::Style::default()
+            };
+            let size = artifact
+                .size_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "size unknown".to_owned());
+            let companion = if artifact.required_companions.is_empty() {
+                String::new()
+            } else {
+                format!(" · +{}", artifact.required_companions.join(", "))
+            };
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(artifact.format.as_str().to_ascii_uppercase(), theme.accent),
+                    Span::styled(format!("  {}", artifact.filename), theme.text),
+                ]),
+                Line::from(Span::styled(format!("{size}{companion}"), theme.muted)),
+                Line::from(Span::styled(
+                    "Format candidate · runtime compatibility unverified · d download",
+                    theme.hint,
+                )),
+            ])
+            .style(style)
+        });
+        frame.render_widget(List::new(items), ui_layout.model_list);
+    }
+    if let Some(progress) = &app.model_operation {
+        render_model_library_progress(frame, ui_layout.model_progress, progress, theme);
+    }
+}
+
+fn render_model_library_progress(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    progress: &norted_model_library::ModelOperationProgress,
+    theme: &Theme,
+) {
+    let bytes = progress.total_bytes.map_or_else(
+        || format_bytes(progress.downloaded_bytes),
+        |total| {
+            format!(
+                "{} / {}",
+                format_bytes(progress.downloaded_bytes),
+                format_bytes(total)
+            )
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(format!("{:?}", progress.phase), theme.accent),
+                Span::styled(format!("  {bytes}"), theme.text),
+            ]),
+            Line::from(Span::styled(&progress.message, theme.hint)),
+        ]),
+        area,
+    );
 }
 
 fn render_runtimes(

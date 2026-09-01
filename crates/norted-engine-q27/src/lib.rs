@@ -75,6 +75,12 @@ mod model;
 
 use model::{Q27Tier, inspect_q27_model};
 
+/// Performs the adapter-owned bounded Q27 architecture and capability
+/// inspection used before admitting an artifact to the managed model library.
+pub fn validate_model_artifact(path: &Path) -> Result<(), String> {
+    inspect_q27_model(path).map(|_| ())
+}
+
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(10 * 60);

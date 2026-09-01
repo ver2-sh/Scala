@@ -62,6 +62,7 @@ impl AppPaths {
             &self.cache_dir,
             &self.log_dir,
             &self.runtimes_dir,
+            &self.data_dir.join("models"),
             &self.runtime_cache_dir,
         ] {
             fs::create_dir_all(path).map_err(|source| CoreError::CreateDirectory {

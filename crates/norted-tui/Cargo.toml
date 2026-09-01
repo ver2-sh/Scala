@@ -10,6 +10,7 @@ crossterm.workspace = true
 futures-util.workspace = true
 norted-core = { path = "../norted-core" }
 norted-engine = { path = "../norted-engine" }
+norted-model-library = { path = "../norted-model-library" }
 ratatui.workspace = true
 tokio.workspace = true
 unicode-width.workspace = true

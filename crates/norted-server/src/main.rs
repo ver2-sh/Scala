@@ -3,6 +3,7 @@ mod composition;
 mod doctor;
 mod output;
 
+use std::io::Write;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -121,6 +122,38 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             ModelsCommand::List => output::models(core, cli.json).await?,
             ModelsCommand::Info { model_id } => {
                 model_info(core, ModelId(model_id), cli.json).await?
+            }
+            ModelsCommand::Search { query, format } => {
+                let library = norted_model_library::ModelLibrary::new(&core.paths);
+                let search = library
+                    .search(query.as_deref().unwrap_or(""), format)
+                    .await?;
+                output::models_search(&search, cli.json)?;
+            }
+            ModelsCommand::Download { model_ref } => {
+                let library = norted_model_library::ModelLibrary::new(&core.paths);
+                let artifact = download_model_with_progress(&library, &model_ref, cli.json).await?;
+                core.refresh_models().await?;
+                output::model_operation("download", &artifact, cli.json)?;
+            }
+            ModelsCommand::Import { path } => {
+                let library = norted_model_library::ModelLibrary::new(&core.paths);
+                let artifact = library.import(&path).await?;
+                core.refresh_models().await?;
+                output::model_operation("import", &artifact, cli.json)?;
+            }
+            ModelsCommand::Remove { model_id } => {
+                core.ensure_model_discovery().await?;
+                let model_id = ModelId(model_id);
+                let model = core.model(&model_id).await.ok_or_else(|| {
+                    color_eyre::eyre::eyre!(
+                        "model `{model_id}` does not exist in the discovered registry"
+                    )
+                })?;
+                let library = norted_model_library::ModelLibrary::new(&core.paths);
+                library.remove(&model).await?;
+                core.refresh_models().await?;
+                output::model_removed(&model_id, cli.json)?;
             }
         },
         Command::Engines(args) => match args.command {
@@ -263,7 +296,14 @@ async fn run_tui(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
     {
         drop(startup_guard);
         let _ = core.refresh_server_state().await;
-        return norted_tui::run(core, services.runtime_packs, setting_definitions).await;
+        let model_library = Arc::new(norted_model_library::ModelLibrary::new(&core.paths));
+        return norted_tui::run(
+            core,
+            services.runtime_packs,
+            model_library,
+            setting_definitions,
+        )
+        .await;
     }
 
     let server = match services
@@ -281,17 +321,26 @@ async fn run_tui(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
             {
                 drop(startup_guard);
                 let _ = core.refresh_server_state().await;
-                return norted_tui::run(core, services.runtime_packs, setting_definitions).await;
+                let model_library = Arc::new(norted_model_library::ModelLibrary::new(&core.paths));
+                return norted_tui::run(
+                    core,
+                    services.runtime_packs,
+                    model_library,
+                    setting_definitions,
+                )
+                .await;
             }
             return Err(startup_error);
         }
     };
     drop(startup_guard);
     report_insecure_remote(server.auth_status(), json_output);
+    let model_library = Arc::new(norted_model_library::ModelLibrary::new(&core.paths));
     server
         .run_while(norted_tui::run(
             core,
             services.runtime_packs,
+            model_library,
             setting_definitions,
         ))
         .await
@@ -345,6 +394,43 @@ async fn model_info(
         .await?;
     output::model_info(&capabilities, json_output)?;
     Ok(())
+}
+
+async fn download_model_with_progress(
+    library: &norted_model_library::ModelLibrary,
+    model_ref: &str,
+    json_output: bool,
+) -> Result<norted_core::ModelArtifact> {
+    if json_output {
+        return Ok(library.download(model_ref).await?);
+    }
+    let mut progress = library.subscribe();
+    let download = library.download(model_ref);
+    tokio::pin!(download);
+    let mut last_update = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    loop {
+        tokio::select! {
+            result = &mut download => {
+                eprintln!();
+                return Ok(result?);
+            }
+            event = progress.recv() => {
+                let Ok(event) = event else { continue; };
+                if last_update.elapsed() < std::time::Duration::from_millis(150)
+                    && event.phase == norted_model_library::ModelOperationPhase::Downloading
+                {
+                    continue;
+                }
+                last_update = std::time::Instant::now();
+                let bytes = event.total_bytes.map_or_else(
+                    || format!("{} bytes", event.downloaded_bytes),
+                    |total| format!("{} / {} bytes", event.downloaded_bytes, total),
+                );
+                eprint!("\r{: <12} {: <25} {bytes}", format!("{:?}", event.phase), event.filename);
+                let _ = std::io::stderr().flush();
+            }
+        }
+    }
 }
 
 async fn handle_auth(
