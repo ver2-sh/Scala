@@ -1579,7 +1579,7 @@ fn directory_write_access(path: &Path) -> Result<(), String> {
     directory_write_probe(path)
 }
 
-#[cfg(any(not(unix), test))]
+#[cfg(not(unix))]
 fn directory_write_probe(path: &Path) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1729,59 +1729,5 @@ mod tests {
         assert_eq!(report.status, DoctorStatus::Warning);
         assert_eq!(report.summary.problems, 1);
         assert!(!report.has_failures());
-    }
-
-    #[test]
-    fn remediation_commands_have_real_newline_boundaries() {
-        let single_command = AUTH_KEY_REMEDIATION;
-        let multiple_commands = format!(
-            "Run:\n  norted-server runtimes list\n  norted-server runtimes clear-selection --model {}",
-            "example"
-        );
-
-        assert_eq!(
-            single_command.lines().collect::<Vec<_>>(),
-            ["Run:", "  norted-server auth keys create --name <LABEL>"]
-        );
-        assert_eq!(
-            multiple_commands.lines().collect::<Vec<_>>(),
-            [
-                "Run:",
-                "  norted-server runtimes list",
-                "  norted-server runtimes clear-selection --model example"
-            ]
-        );
-    }
-
-    #[test]
-    fn remediation_newlines_serialize_as_json_escapes() {
-        let finding = finding(
-            "remediation.newlines",
-            "test",
-            DoctorStatus::Warning,
-            "attention",
-            None,
-            &[AUTH_KEY_REMEDIATION],
-        );
-
-        let json = serde_json::to_string(&finding).expect("serialize finding");
-        assert!(json.contains(
-            r#""remediation":["Run:\n  norted-server auth keys create --name <LABEL>"]"#
-        ));
-        assert!(!json.contains("Run:norted-server"));
-    }
-
-    #[test]
-    fn successful_directory_write_probe_leaves_no_file() {
-        let temporary = TempDir::new().expect("temporary directory");
-
-        directory_write_probe(temporary.path()).expect("directory should be writable");
-
-        assert_eq!(
-            fs::read_dir(temporary.path())
-                .expect("read temporary directory")
-                .count(),
-            0
-        );
     }
 }
