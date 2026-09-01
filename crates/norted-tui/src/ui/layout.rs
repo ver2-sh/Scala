@@ -1,4 +1,4 @@
-use norted_core::RegistryState;
+use norted_core::{ArtifactFormat, RegistryState};
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 
 use crate::app::{App, ModelLibraryView, Overlay, Screen};
@@ -12,6 +12,10 @@ pub const MODEL_ROW_HEIGHT: u16 = 3;
 pub enum HoverTarget {
     Navigation(Screen),
     ModelLibraryTab(ModelLibraryView),
+    ModelSearchField,
+    ModelSearchSubmit,
+    ModelFormatFilter(Option<ArtifactFormat>),
+    ModelDownloadAction(usize),
     Model(usize),
     Runtime(usize),
     RuntimeSearchAction,
@@ -40,9 +44,14 @@ pub struct UiLayout {
     pub overview_progress: Rect,
     pub model_installed_tab: Rect,
     pub model_discover_tab: Rect,
+    pub model_search_field: Rect,
+    pub model_search_submit: Rect,
+    pub model_format_row: Rect,
+    pub model_format_filters: Vec<(Option<ArtifactFormat>, Rect)>,
     pub model_list: Rect,
     pub model_progress: Rect,
     pub model_rows: Vec<(usize, Rect)>,
+    pub model_download_actions: Vec<(usize, Rect)>,
     pub server_details: Rect,
     pub server_progress: Rect,
     pub runtime_summary: Rect,
@@ -124,6 +133,10 @@ impl UiLayout {
 
         let mut model_installed_tab = Rect::default();
         let mut model_discover_tab = Rect::default();
+        let mut model_search_field = Rect::default();
+        let mut model_search_submit = Rect::default();
+        let mut model_format_row = Rect::default();
+        let mut model_format_filters = Vec::new();
         let (model_list, model_progress) = if app.screen == Screen::Models {
             let model_header = content_layout(content)[0];
             model_installed_tab = Rect::new(model_header.x, model_header.y + 1, 13, 1);
@@ -133,8 +146,68 @@ impl UiLayout {
                 if compact { 12 } else { 27 },
                 1,
             );
+            let mut model_body = screen_body;
+            if app.model_library_view == ModelLibraryView::Discover {
+                let search_row = Rect::new(
+                    model_header.x,
+                    model_header.y.saturating_add(2),
+                    model_header.width,
+                    u16::from(model_header.height > 2),
+                );
+                let submit_width = if compact { 6 } else { 10 }.min(search_row.width);
+                let search_prefix_width = 8.min(
+                    search_row
+                        .width
+                        .saturating_sub(submit_width.saturating_add(1)),
+                );
+                model_search_field = Rect::new(
+                    search_row.x.saturating_add(search_prefix_width),
+                    search_row.y,
+                    search_row
+                        .width
+                        .saturating_sub(search_prefix_width)
+                        .saturating_sub(submit_width.saturating_add(1)),
+                    search_row.height,
+                );
+                model_search_submit = Rect::new(
+                    model_search_field.right().saturating_add(1),
+                    search_row.y,
+                    submit_width,
+                    search_row.height,
+                );
+
+                model_format_row = Rect::new(
+                    model_body.x,
+                    model_body.y,
+                    model_body.width,
+                    u16::from(model_body.height > 0),
+                );
+                let mut filter_x = model_format_row.x.saturating_add(7);
+                for (format, width) in [
+                    (None, 7),
+                    (Some(ArtifactFormat::Gguf), 8),
+                    (Some(ArtifactFormat::Q27), 7),
+                    (Some(ArtifactFormat::Ninfer), 10),
+                ] {
+                    let width = width.min(model_format_row.right().saturating_sub(filter_x));
+                    if width == 0 {
+                        break;
+                    }
+                    model_format_filters.push((
+                        format,
+                        Rect::new(filter_x, model_format_row.y, width, model_format_row.height),
+                    ));
+                    filter_x = filter_x.saturating_add(width.saturating_add(1));
+                }
+                model_body = Rect::new(
+                    model_body.x,
+                    model_body.y.saturating_add(model_format_row.height),
+                    model_body.width,
+                    model_body.height.saturating_sub(model_format_row.height),
+                );
+            }
             reserve_bottom(
-                screen_body,
+                model_body,
                 app.selected_model_load_progress().is_some() || app.model_operation.is_some(),
                 3,
             )
@@ -143,6 +216,7 @@ impl UiLayout {
         };
 
         let mut model_rows = Vec::new();
+        let mut model_download_actions = Vec::new();
         let model_count = if app.model_library_view == ModelLibraryView::Discover {
             app.model_search_artifacts().len()
         } else {
@@ -166,15 +240,25 @@ impl UiLayout {
             };
             let end = (start + capacity).min(model_count);
             for index in start..end {
-                model_rows.push((
-                    index,
-                    Rect::new(
-                        model_list.x,
-                        model_list.y + ((index - start) as u16 * MODEL_ROW_HEIGHT),
-                        model_list.width,
-                        MODEL_ROW_HEIGHT,
-                    ),
-                ));
+                let row = Rect::new(
+                    model_list.x,
+                    model_list.y + ((index - start) as u16 * MODEL_ROW_HEIGHT),
+                    model_list.width,
+                    MODEL_ROW_HEIGHT,
+                );
+                model_rows.push((index, row));
+                if app.model_library_view == ModelLibraryView::Discover {
+                    let width = 12.min(row.width);
+                    model_download_actions.push((
+                        index,
+                        Rect::new(
+                            row.right().saturating_sub(width),
+                            row.y.saturating_add(2),
+                            width,
+                            u16::from(row.height > 2),
+                        ),
+                    ));
+                }
             }
         }
 
@@ -454,9 +538,14 @@ impl UiLayout {
             overview_progress,
             model_installed_tab,
             model_discover_tab,
+            model_search_field,
+            model_search_submit,
+            model_format_row,
+            model_format_filters,
             model_list,
             model_progress,
             model_rows,
+            model_download_actions,
             server_details,
             server_progress,
             runtime_summary,
@@ -544,6 +633,26 @@ impl UiLayout {
         }
         if contains(self.model_discover_tab, position) {
             return Some(HoverTarget::ModelLibraryTab(ModelLibraryView::Discover));
+        }
+        if contains(self.model_search_field, position) {
+            return Some(HoverTarget::ModelSearchField);
+        }
+        if contains(self.model_search_submit, position) {
+            return Some(HoverTarget::ModelSearchSubmit);
+        }
+        if let Some((format, _)) = self
+            .model_format_filters
+            .iter()
+            .find(|(_, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::ModelFormatFilter(*format));
+        }
+        if let Some((index, _)) = self
+            .model_download_actions
+            .iter()
+            .find(|(_, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::ModelDownloadAction(*index));
         }
         if let Some((index, _)) = self
             .model_rows

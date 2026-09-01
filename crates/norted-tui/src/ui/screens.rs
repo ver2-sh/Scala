@@ -309,12 +309,18 @@ fn render_model_header(
         return;
     }
 
-    let filter = app
-        .model_search_format
-        .map(|format| format.as_str().to_ascii_uppercase())
-        .unwrap_or_else(|| "ALL".to_owned());
-    let suffix = format!("   Format: {filter}");
-    let query_width = (detail_area.width as usize).saturating_sub("Search: ".len() + suffix.len());
+    let label_width = ui_layout.model_search_field.x.saturating_sub(detail_area.x);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("Search:", theme.hint))),
+        Rect::new(
+            detail_area.x,
+            detail_area.y,
+            label_width,
+            detail_area.height,
+        ),
+    );
+
+    let query_width = ui_layout.model_search_field.width.saturating_sub(2) as usize;
     let (query, query_style) = if app.model_search_query.is_empty() {
         let placeholder = format!("Search Hugging Face models{}", glyphs.ellipsis);
         let text = if app.model_search_editing {
@@ -342,14 +348,37 @@ fn render_model_header(
             theme.text,
         )
     };
+    let mut field_style = query_style;
+    if app.model_search_editing {
+        field_style = field_style.patch(theme.focused);
+    }
+    if app.hover == Some(HoverTarget::ModelSearchField) {
+        field_style = field_style.patch(theme.hovered);
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Search: ", theme.hint),
-            Span::styled(query, query_style),
-            Span::styled("   Format: ", theme.hint),
-            Span::styled(filter, theme.accent),
-        ])),
-        detail_area,
+        Paragraph::new(Line::from(Span::styled(
+            format!("[{query:<query_width$}]"),
+            field_style,
+        ))),
+        ui_layout.model_search_field,
+    );
+
+    let submit_label = if ui_layout.compact {
+        "[ Go ]"
+    } else {
+        "[ Search ]"
+    };
+    let mut submit_style = if app.model_library_busy() {
+        theme.muted
+    } else {
+        theme.accent
+    };
+    if app.hover == Some(HoverTarget::ModelSearchSubmit) {
+        submit_style = submit_style.patch(theme.hovered);
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(submit_label, submit_style))),
+        ui_layout.model_search_submit,
     );
 }
 
@@ -536,6 +565,31 @@ fn render_model_discover(
     glyphs: &Glyphs,
     ui_layout: &UiLayout,
 ) {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("Format", theme.hint))),
+        ui_layout.model_format_row,
+    );
+    for (format, area) in &ui_layout.model_format_filters {
+        let label = match format {
+            None => "[ All ]",
+            Some(ArtifactFormat::Gguf) => "[ GGUF ]",
+            Some(ArtifactFormat::Q27) => "[ Q27 ]",
+            Some(ArtifactFormat::Ninfer) => "[ NInfer ]",
+        };
+        let mut style = if app.model_search_format == *format {
+            theme.selected
+        } else {
+            theme.nav_inactive
+        };
+        if app.hover == Some(HoverTarget::ModelFormatFilter(*format)) {
+            style = style.patch(theme.hovered);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(label, style))),
+            *area,
+        );
+    }
+
     if app.model_search_loading {
         render_empty(
             frame,
@@ -549,7 +603,7 @@ fn render_model_discover(
             frame,
             ui_layout.model_list,
             "Search Hugging Face",
-            "Type a model, publisher, or repository name and press Enter. Formats: GGUF, q27, and NInfer.",
+            "Type a model, publisher, or repository name and search. Formats: GGUF, q27, and NInfer.",
             theme,
         );
     } else if app.model_search_artifacts().is_empty() {
@@ -584,6 +638,13 @@ fn render_model_discover(
                 format!("requires {}", artifact.required_companions.join(", "))
             };
             let revision = truncate_middle(&repository.revision, 12, glyphs.ellipsis);
+            let action_width = ui_layout
+                .model_download_actions
+                .iter()
+                .find(|(action_index, _)| action_index == index)
+                .map_or(0, |(_, area)| area.width as usize);
+            let status_width = (ui_layout.model_list.width as usize)
+                .saturating_sub(action_width.saturating_add(1));
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(artifact.format.as_str().to_ascii_uppercase(), theme.accent),
@@ -597,13 +658,37 @@ fn render_model_discover(
                     ),
                 ]),
                 Line::from(Span::styled(
-                    "Format candidate · runtime compatibility unverified · d download",
+                    truncate_middle(
+                        "Format candidate · runtime compatibility unverified",
+                        status_width,
+                        glyphs.ellipsis,
+                    ),
                     theme.hint,
                 )),
             ])
             .style(style)
         });
         frame.render_widget(List::new(items), ui_layout.model_list);
+        for (index, area) in &ui_layout.model_download_actions {
+            let label = "[ Download ]";
+            let mut style = if app.selected_model_search_result == Some(*index) {
+                theme.selected
+            } else {
+                ratatui::style::Style::default()
+            };
+            style = style.patch(if app.model_library_busy() {
+                theme.muted
+            } else {
+                theme.accent
+            });
+            if app.hover == Some(HoverTarget::ModelDownloadAction(*index)) {
+                style = style.patch(theme.hovered);
+            }
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(label, style))),
+                *area,
+            );
+        }
     }
     if let Some(progress) = &app.model_operation {
         render_model_library_progress(frame, ui_layout.model_progress, progress, theme);
@@ -1352,11 +1437,15 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         ),
         key_value("Left / Right", "change the Model Library view", theme),
         key_value(
-            "Enter / f",
-            "search while editing / change Discover format",
+            "Mouse",
+            "click Discover search, format filters, and Download",
             theme,
         ),
-        key_value("d", "download the selected remote artifact", theme),
+        key_value(
+            "e / Enter / f / d",
+            "edit, search, filter, or download",
+            theme,
+        ),
         key_value(
             "Model Profiles",
             "normal load and per-profile override screen",
