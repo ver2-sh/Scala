@@ -478,6 +478,7 @@ impl LlamaCppAdapter {
         }
         if let Some(output_format) = &request.output_format {
             body["response_format"] = match output_format {
+                OutputFormat::Text => json!({ "type": "text" }),
                 OutputFormat::JsonObject => json!({ "type": "json_object" }),
                 OutputFormat::JsonSchema {
                     name,
@@ -606,7 +607,13 @@ impl EngineAdapter for LlamaCppAdapter {
                 request.generation_settings.reasoning_effort.is_some(),
                 "reasoning_effort",
             ),
-            (request.output_format.is_some(), "structured_output_schema"),
+            (
+                matches!(
+                    request.output_format.as_ref(),
+                    Some(OutputFormat::JsonObject | OutputFormat::JsonSchema { .. })
+                ),
+                "structured_output_schema",
+            ),
         ];
         for (used, id) in required {
             if used {
@@ -2050,6 +2057,9 @@ fn llama_configured_runtime_compatibility(
     if configured.is_empty() {
         return RuntimeCompatibility::Compatible;
     }
+    if let Err(error) = validate_llama_semantic_settings(settings) {
+        return RuntimeCompatibility::Incompatible(error.to_string());
+    }
     if let Some(id) = configured
         .iter()
         .find(|id| !llama_setting_has_execution_path(id.as_str()))
@@ -2072,6 +2082,17 @@ fn llama_configured_runtime_compatibility(
         definitions,
     };
     match schema.validate(settings) {
+        Ok(())
+            if matches!(
+                settings.value("llama.cpp.speculative_mode"),
+                Some(SettingValue::Choice(mode)) if mode == "draft-mtp"
+            ) =>
+        {
+            RuntimeCompatibility::NeedsAttention(
+                "draft-mtp uses MTP heads from the main model, but Norted's bounded GGUF identity cannot statically prove that the target exposes usable MTP heads; exact llama-server load remains authoritative"
+                    .to_owned(),
+            )
+        }
         Ok(()) if settings.value("llama.cpp.speculative_draft_model").is_some() => {
             RuntimeCompatibility::NeedsAttention(
                 "draft tokenizer identity is checked by Norted; the exact llama-server launch remains authoritative for draft architecture/tensor compatibility"
@@ -2225,9 +2246,8 @@ struct LlamaStructuredArguments {
     environment_remove: Vec<OsString>,
 }
 
-async fn validate_llama_bound_files(
+fn validate_llama_semantic_settings(
     settings: &norted_core::ResolvedSettings,
-    model: &ModelArtifact,
 ) -> Result<(), EngineError> {
     if settings.value("llama.cpp.chat_template").is_some()
         && settings.value("llama.cpp.chat_template_file").is_some()
@@ -2245,6 +2265,56 @@ async fn validate_llama_bound_files(
                 .to_owned(),
         ));
     }
+
+    let mode = match settings.value("llama.cpp.speculative_mode") {
+        Some(SettingValue::Choice(value)) => Some(value.as_str()),
+        _ => None,
+    };
+    let has_draft = matches!(
+        settings.value("llama.cpp.speculative_draft_model"),
+        Some(SettingValue::Path(_))
+    );
+    if mode == Some("off") && has_draft {
+        return Err(EngineError::InvalidConfiguration(
+            "speculative decoding is off but a draft model is configured".to_owned(),
+        ));
+    }
+    if mode.is_none() && has_draft {
+        return Err(EngineError::InvalidConfiguration(
+            "a speculative draft model requires an explicit speculative mode".to_owned(),
+        ));
+    }
+    if mode.is_some_and(|mode| mode.starts_with("ngram-")) && has_draft {
+        return Err(EngineError::InvalidConfiguration(
+            "n-gram speculative modes do not use a draft-model artifact".to_owned(),
+        ));
+    }
+    if mode == Some("draft-mtp") && has_draft {
+        return Err(EngineError::InvalidConfiguration(
+            "speculative mode `draft-mtp` uses MTP heads from the main model and cannot be combined with an external draft-model artifact"
+                .to_owned(),
+        ));
+    }
+    if mode.is_some_and(|mode| {
+        matches!(
+            mode,
+            "draft-simple" | "draft-eagle3" | "draft-dflash" | "draft-dspark"
+        )
+    }) && !has_draft
+    {
+        return Err(EngineError::InvalidConfiguration(format!(
+            "speculative mode `{}` requires a bound draft model",
+            mode.expect("checked")
+        )));
+    }
+    Ok(())
+}
+
+async fn validate_llama_bound_files(
+    settings: &norted_core::ResolvedSettings,
+    model: &ModelArtifact,
+) -> Result<(), EngineError> {
+    validate_llama_semantic_settings(settings)?;
     verify_bound_file(
         settings,
         "llama.cpp.chat_template_file",
@@ -2273,41 +2343,10 @@ async fn validate_llama_bound_files(
     )
     .await?;
 
-    let mode = match settings.value("llama.cpp.speculative_mode") {
-        Some(SettingValue::Choice(value)) => Some(value.as_str()),
-        _ => None,
-    };
     let draft_path = match settings.value("llama.cpp.speculative_draft_model") {
         Some(SettingValue::Path(path)) => Some(path),
         _ => None,
     };
-    if mode == Some("off") && draft_path.is_some() {
-        return Err(EngineError::InvalidConfiguration(
-            "speculative decoding is off but a draft model is configured".to_owned(),
-        ));
-    }
-    if mode.is_none() && draft_path.is_some() {
-        return Err(EngineError::InvalidConfiguration(
-            "a speculative draft model requires an explicit speculative mode".to_owned(),
-        ));
-    }
-    if mode.is_some_and(|mode| mode.starts_with("ngram-")) && draft_path.is_some() {
-        return Err(EngineError::InvalidConfiguration(
-            "n-gram speculative modes do not use a draft-model artifact".to_owned(),
-        ));
-    }
-    if mode.is_some_and(|mode| {
-        matches!(
-            mode,
-            "draft-simple" | "draft-eagle3" | "draft-dflash" | "draft-dspark"
-        )
-    }) && draft_path.is_none()
-    {
-        return Err(EngineError::InvalidConfiguration(format!(
-            "speculative mode `{}` requires a bound draft model",
-            mode.expect("checked")
-        )));
-    }
     if let Some(path) = draft_path {
         let draft = norted_core::inspect_gguf_metadata(path).map_err(|error| {
             EngineError::InvalidConfiguration(format!(
@@ -2456,9 +2495,7 @@ fn translate_llama_settings_for_model(
             ("reasoning_budget_message", SettingValue::String(value)) => {
                 push_value_argument(&mut arguments, "--reasoning-budget-message", value);
             }
-            ("structured_output_schema", SettingValue::Json(value)) => {
-                push_value_argument(&mut arguments, "--json-schema", value.to_string());
-            }
+            ("structured_output_schema", SettingValue::Json(_)) => {}
             ("system_prompt" | "context_overflow", _) => {}
             ("llama.cpp.threads", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--threads", *value);

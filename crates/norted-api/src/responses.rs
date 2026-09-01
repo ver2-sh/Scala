@@ -68,7 +68,6 @@ pub(super) async fn create(
     let inference = parsed.normalized.inference_request()?;
     let public_model = parsed.normalized.model.clone();
     let max_output_tokens = parsed.normalized.max_output_tokens;
-    let output_format = parsed.normalized.output_format.clone();
     let reasoning_effort = parsed.normalized.generation_settings.reasoning_effort;
     if parsed.normalized.stream {
         let routed = state
@@ -84,7 +83,7 @@ pub(super) async fn create(
                 model: public_model,
                 instructions: parsed.instructions,
                 max_output_tokens,
-                output_format,
+                output_format: routed.effective_output_format,
                 reasoning_effort,
                 effective_generation_settings: routed.effective_generation_settings,
             },
@@ -108,7 +107,7 @@ pub(super) async fn create(
             model: public_model,
             instructions: parsed.instructions,
             max_output_tokens,
-            output_format,
+            output_format: routed.effective_output_format,
             reasoning_effort,
             effective_generation_settings: routed.effective_generation_settings,
         };
@@ -331,7 +330,7 @@ fn parse_text_format(value: Option<&Value>) -> Result<Option<OutputFormat>, Open
     match format.get("type").and_then(Value::as_str) {
         Some("text") => {
             reject_unknown_fields(format, &["type"], "Responses text format")?;
-            Ok(None)
+            Ok(Some(OutputFormat::Text))
         }
         Some("json_object") => {
             reject_unknown_fields(format, &["type"], "Responses text format")?;
@@ -528,7 +527,7 @@ fn response_document(
 
 fn responses_output_format(format: Option<&OutputFormat>) -> Value {
     match format {
-        None => json!({ "type": "text" }),
+        None | Some(OutputFormat::Text) => json!({ "type": "text" }),
         Some(OutputFormat::JsonObject) => json!({ "type": "json_object" }),
         Some(OutputFormat::JsonSchema {
             name,

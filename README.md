@@ -42,6 +42,10 @@ Global defaults
 Request generation fields may override configured generation defaults when the exact adapter and
 runtime support them. There is no model-default layer and no post-resolution hidden policy. An
 omitted value emits no corresponding control when omission is the upstream/runtime default.
+For llama.cpp semantic alternatives, a higher layer also suppresses inherited siblings: built-in
+versus bound-file chat templates, all-versus-exact CPU MoE placement, and draft artifacts made
+inapplicable by `off`, n-gram, or `draft-mtp` speculation. Contradictory alternatives in the same
+winning layer remain invalid.
 
 Persistent state is deliberately split:
 
@@ -84,6 +88,8 @@ only first-class model-loading policy: `mmap`, `mlock`, `mmap+mlock`, and `dio` 
 old “Try mmap” and “Keep Model in Memory” behavior without reviving deprecated standalone flags.
 Generation/profile defaults include seed/random, response limit, stop strings, repeat/presence
 penalties, system prompt, and an optional JSON Schema.
+The JSON Schema is a request default, not a process-wide constraint: an omitted request format uses
+it, while explicit text, JSON object, or request JSON Schema wins.
 
 q27 exposes ordinary settings for context/slots, generation samplers, thinking and budget,
 fast-head, KV mode, MTP depth/probability, suffix drafting and compiled-width behavior, external
@@ -107,7 +113,10 @@ Saving `q27.template_path`, `llama.cpp.chat_template_file`, or
 every load rereads the bound file and rejects a content mismatch. Draft GGUFs must additionally
 prove identical bounded tokenizer metadata with the target; the exact llama-server load remains
 authoritative for draft architecture/tensor compatibility and is reported as needs-attention until
-that definitive load succeeds.
+that definitive load succeeds. Current upstream `draft-mtp` uses MTP heads from the main model and
+does not consume an external draft GGUF. Because Norted's bounded GGUF identity does not currently
+prove usable MTP heads architecture-neutrally, selecting `draft-mtp` remains needs-attention until
+the exact llama-server load proves it.
 
 All commands honor global `--json`. The scriptable management surface includes:
 
@@ -511,7 +520,9 @@ Request-time sampler, stop, reasoning, structured-output, and output-limit value
 never mutate profiles, runtime selection, or launch provenance. Explicit request fields override
 configured defaults only where the active exact engine/runtime schema proves support. For
 llama.cpp, configured samplers and generation defaults become process defaults through advertised
-flags; request values are sent to its private Chat API. Unsupported runtimes receive a clear 400
+flags; structured-output schemas instead remain per-request defaults sent to its private Chat API.
+Responses reports this effective format after defaulting, including configured schemas used for
+omitted formats and explicit text/schema overrides. Unsupported runtimes receive a clear 400
 rather than an unknown flag or silently ignored request field. q27 and NInfer remain truthful about
 their narrower request contracts.
 
