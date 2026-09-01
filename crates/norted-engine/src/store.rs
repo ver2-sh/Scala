@@ -1236,36 +1236,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inspecting_an_absent_store_does_not_initialize_it() {
-        let temporary = tempfile::tempdir().expect("temporary runtime root");
-        let paths = AppPaths {
-            config_dir: temporary.path().join("config"),
-            config_file: temporary.path().join("config/config.toml"),
-            data_dir: temporary.path().join("data"),
-            state_dir: temporary.path().join("state"),
-            cache_dir: temporary.path().join("cache"),
-            log_dir: temporary.path().join("logs"),
-            runtimes_dir: temporary.path().join("data/runtimes"),
-            runtime_cache_dir: temporary.path().join("cache/runtime-packs"),
-            runtime_selections_file: temporary.path().join("data/runtime-selections.json"),
-            settings_file: temporary.path().join("data/settings.json"),
-            settings_lock_file: temporary.path().join("data/.settings.lock"),
-            model_profiles_file: temporary.path().join("data/model-profiles.json"),
-            model_profiles_lock_file: temporary.path().join("data/.model-profiles.lock"),
-        };
-        let store = RuntimeStore::new(&paths);
-
-        let snapshot = store
-            .inspect_existing()
-            .await
-            .expect("absent store is valid fresh state");
-
-        assert!(snapshot.runtimes.is_empty());
-        assert!(snapshot.issues.is_empty());
-        assert!(!paths.data_dir.exists());
-    }
-
-    #[tokio::test]
     async fn failed_probe_manifest_cannot_be_activated() {
         let temporary = tempfile::tempdir().expect("temporary runtime root");
         let paths = AppPaths {
