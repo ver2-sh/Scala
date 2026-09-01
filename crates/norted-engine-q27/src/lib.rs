@@ -30,12 +30,13 @@ use norted_engine::{
     GitHubReleaseAsset, GitHubReleaseClient, InferenceEvent, InferenceFinishReason,
     InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
     InferenceToolCall, InferenceToolChoice, InferenceUsage, InstallationState, LaunchRequest,
-    LaunchSpec, LoadProgressReporter, NativeOption, OptionValueKind, PreparedAuxiliaryArtifact,
-    PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider, StartupObservation, UpdateState,
-    capture_command, common_setting_definitions, compatibility_for,
-    compatibility_for_nvidia_device, isolated_cuda_environment, prepare_norted_package_input,
-    prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
-    revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
+    LaunchSpec, LoadProgressReporter, NativeOption, OptionValueKind, OutputFormat,
+    PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
+    StartupObservation, UpdateState, capture_command, common_setting_definitions,
+    compatibility_for, compatibility_for_nvidia_device, isolated_cuda_environment,
+    prepare_norted_package_input, prepare_norted_package_input_with_progress,
+    revalidate_norted_package_before_launch, revalidate_norted_package_before_launch_with_progress,
+    visible_nvidia_devices,
 };
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -2366,6 +2367,29 @@ impl EngineAdapter for Q27Adapter {
         {
             return Err(EngineError::InvalidGenerationSettings(
                 "q27 seed/top_k/min_p require a positive effective temperature".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_inference_request(
+        &self,
+        request: &InferenceRequest,
+        backend_defaults: &EffectiveGenerationSettings,
+        _settings_schema: &SettingsSchema,
+    ) -> Result<(), EngineError> {
+        self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
+        if request.messages.iter().any(InferenceMessage::has_media) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 does not support media content".to_owned(),
+            ));
+        }
+        if matches!(
+            request.output_format.as_ref(),
+            Some(OutputFormat::JsonObject | OutputFormat::JsonSchema { .. })
+        ) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 does not support structured output".to_owned(),
             ));
         }
         Ok(())

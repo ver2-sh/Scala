@@ -19,7 +19,7 @@ use norted_engine::{
     EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError, EngineFeature,
     EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceOutput, InferenceRequest,
     InferenceStream, InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter,
-    NativeOption, OptionValueKind, PreparedModelInput, ProcessDescriptor,
+    NativeOption, OptionValueKind, OutputFormat, PreparedModelInput, ProcessDescriptor,
     RuntimeVariantUpdateIdentity, UpdateState, capture_command, compatibility_for,
     isolated_cuda_environment, prepare_norted_package_input,
     prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
@@ -1619,6 +1619,24 @@ impl EngineAdapter for NinferAdapter {
             return Err(EngineError::InvalidGenerationSettings(
                 "NInfer has no Chat Completions per-request thinking budget; configure the launch default instead"
                     .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_inference_request(
+        &self,
+        request: &InferenceRequest,
+        backend_defaults: &EffectiveGenerationSettings,
+        _settings_schema: &norted_core::SettingsSchema,
+    ) -> Result<(), EngineError> {
+        self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
+        if matches!(
+            request.output_format.as_ref(),
+            Some(OutputFormat::JsonObject | OutputFormat::JsonSchema { .. })
+        ) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "NInfer does not support structured output".to_owned(),
             ));
         }
         Ok(())
