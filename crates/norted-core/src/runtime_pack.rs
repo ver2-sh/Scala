@@ -941,6 +941,7 @@ fn validate_native_identities(
     identities: &[ArtifactNativeIdentity],
 ) -> Result<(), RuntimeManifestError> {
     if identities.iter().any(|identity| match identity {
+        ArtifactNativeIdentity::Gguf(_) => !formats.contains(&ArtifactFormat::Gguf),
         ArtifactNativeIdentity::Ninfer(_) => !formats.contains(&ArtifactFormat::Ninfer),
     }) {
         return Err(RuntimeManifestError::InvalidNativeCapabilities);

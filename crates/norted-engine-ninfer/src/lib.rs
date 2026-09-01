@@ -652,6 +652,9 @@ impl EngineAdapter for NinferAdapter {
                     identity.container_version
                 ),
             },
+            Some(ArtifactNativeIdentity::Gguf(_)) => CompatibilityDecision::Unsupported {
+                reason: "NInfer model identity is GGUF, not a NInfer container".to_owned(),
+            },
             None => CompatibilityDecision::Unsupported {
                 reason: "NInfer model is missing inspected native container identity; rediscover the artifact"
                     .to_owned(),
@@ -1043,8 +1046,9 @@ impl EngineAdapter for NinferAdapter {
             .primary
             .native_identity
             .as_ref()
-            .map(|identity| match identity {
-                ArtifactNativeIdentity::Ninfer(identity) => identity.clone(),
+            .and_then(|identity| match identity {
+                ArtifactNativeIdentity::Ninfer(identity) => Some(identity.clone()),
+                ArtifactNativeIdentity::Gguf(_) => None,
             })
             .ok_or_else(|| {
                 EngineError::InvalidConfiguration(
@@ -1330,6 +1334,17 @@ impl EngineAdapter for NinferAdapter {
         settings: &GenerationSettingsPatch,
         _backend_defaults: &EffectiveGenerationSettings,
     ) -> Result<(), EngineError> {
+        if settings.seed.is_some()
+            || settings.repeat_penalty.is_some()
+            || settings.presence_penalty.is_some()
+            || settings.stop.is_some()
+            || settings.reasoning_effort.is_some()
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "NInfer does not prove seed, penalties, stop strings, or reasoning request controls"
+                    .to_owned(),
+            ));
+        }
         if settings
             .temperature
             .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
@@ -1468,11 +1483,17 @@ fn native_compatibility(
     } else if supported.contains(model) {
         RuntimeCompatibility::Recommended
     } else {
-        let ArtifactNativeIdentity::Ninfer(identity) = model;
-        RuntimeCompatibility::Incompatible(format!(
-            "runtime does not declare support for NInfer target `{}/{}`",
-            identity.model_id, identity.weights_id
-        ))
+        match model {
+            ArtifactNativeIdentity::Ninfer(identity) => {
+                RuntimeCompatibility::Incompatible(format!(
+                    "runtime does not declare support for NInfer target `{}/{}`",
+                    identity.model_id, identity.weights_id
+                ))
+            }
+            ArtifactNativeIdentity::Gguf(_) => RuntimeCompatibility::Incompatible(
+                "NInfer runtime received a GGUF native identity".to_owned(),
+            ),
+        }
     }
 }
 

@@ -74,6 +74,8 @@ pub enum SettingValue {
     UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue),
     Float(f64),
     String(String),
+    StringList(Vec<String>),
+    Json(serde_json::Value),
     Choice(String),
     Path(PathBuf),
     GpuOffload(GpuOffload),
@@ -110,6 +112,10 @@ impl std::fmt::Display for SettingValue {
             }
             Self::Float(value) => value.fmt(formatter),
             Self::String(value) | Self::Choice(value) => value.fmt(formatter),
+            Self::StringList(value) => serde_json::to_string(value)
+                .unwrap_or_else(|_| "[]".to_owned())
+                .fmt(formatter),
+            Self::Json(value) => value.fmt(formatter),
             Self::Path(value) => value.display().fmt(formatter),
             Self::GpuOffload(GpuOffload::None) => formatter.write_str("none"),
             Self::GpuOffload(GpuOffload::Auto) => formatter.write_str("auto"),
@@ -150,6 +156,8 @@ pub enum SettingKind {
         maximum: Option<f64>,
     },
     String,
+    StringList,
+    JsonObject,
     Choice {
         choices: Vec<String>,
     },
@@ -224,6 +232,30 @@ impl SettingKind {
             Self::String => (!raw.is_empty() && !raw.contains('\0'))
                 .then(|| SettingValue::String(raw.to_owned()))
                 .ok_or_else(|| invalid("expected a non-empty string without NUL bytes".to_owned())),
+            Self::StringList => {
+                let values = serde_json::from_str::<Vec<String>>(raw).map_err(|_| {
+                    invalid("expected a JSON array of non-empty strings".to_owned())
+                })?;
+                (!values.is_empty()
+                    && values
+                        .iter()
+                        .all(|value| !value.is_empty() && !value.contains('\0')))
+                .then_some(SettingValue::StringList(values))
+                .ok_or_else(|| {
+                    invalid(
+                        "expected a non-empty JSON array of non-empty strings without NUL bytes"
+                            .to_owned(),
+                    )
+                })
+            }
+            Self::JsonObject => {
+                let value = serde_json::from_str::<serde_json::Value>(raw)
+                    .map_err(|error| invalid(format!("expected a JSON object: {error}")))?;
+                value
+                    .is_object()
+                    .then_some(SettingValue::Json(value))
+                    .ok_or_else(|| invalid("expected a JSON object".to_owned()))
+            }
             Self::Choice { choices } => {
                 ((choices.is_empty() && !raw.is_empty() && !raw.contains('\0'))
                     || choices.iter().any(|choice| choice == raw))
@@ -259,6 +291,14 @@ impl SettingKind {
                 Self::String,
                 SettingValue::String(_),
                 SettingValue::String(_)
+            ) | (
+                Self::StringList,
+                SettingValue::StringList(_),
+                SettingValue::StringList(_)
+            ) | (
+                Self::JsonObject,
+                SettingValue::Json(_),
+                SettingValue::Json(_)
             ) | (
                 Self::Choice { .. },
                 SettingValue::Choice(_),
@@ -615,23 +655,39 @@ pub async fn bounded_setting_file_sha256(
                 value: path.display().to_string(),
                 reason: format!("could not open {}: {error}", resolved.display()),
             })?;
-    let mut bytes = Vec::new();
-    file.take(maximum_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
+    let metadata = file
+        .metadata()
         .await
         .map_err(|error| SettingsError::InvalidValue {
             setting_id: id.clone(),
             value: path.display().to_string(),
-            reason: format!("could not read {}: {error}", resolved.display()),
+            reason: format!("could not inspect {}: {error}", resolved.display()),
         })?;
-    if bytes.len() as u64 > maximum_bytes {
+    if !metadata.is_file() || metadata.len() > maximum_bytes {
         return Err(SettingsError::InvalidValue {
             setting_id: id.clone(),
             value: path.display().to_string(),
-            reason: format!("file exceeds the {maximum_bytes}-byte safety limit"),
+            reason: format!("file must be regular and no larger than {maximum_bytes} bytes"),
         });
     }
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    let mut file = file;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| SettingsError::InvalidValue {
+                setting_id: id.clone(),
+                value: path.display().to_string(),
+                reason: format!("could not read {}: {error}", resolved.display()),
+            })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

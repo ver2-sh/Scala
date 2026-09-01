@@ -1,6 +1,7 @@
 use norted_core::ModelProfileId;
 use norted_engine::{
-    GenerationSettingsPatch, InferenceMessage, InferenceRequest, InferenceRole, ReasoningEffort,
+    GenerationSettingsPatch, InferenceMessage, InferenceRequest, InferenceRole, OutputFormat,
+    ReasoningEffort,
 };
 use serde_json::{Map, Value};
 
@@ -12,6 +13,7 @@ pub(crate) struct NormalizedRequest {
     pub(crate) messages: Vec<InferenceMessage>,
     pub(crate) max_output_tokens: Option<u32>,
     pub(crate) generation_settings: GenerationSettingsPatch,
+    pub(crate) output_format: Option<OutputFormat>,
     pub(crate) stream: bool,
 }
 
@@ -28,7 +30,8 @@ impl NormalizedRequest {
             model_profile_id,
             messages: self.messages.clone(),
             max_output_tokens: self.max_output_tokens,
-            generation_settings: self.generation_settings,
+            generation_settings: self.generation_settings.clone(),
+            output_format: self.output_format.clone(),
             stream: self.stream,
         })
     }
@@ -152,8 +155,80 @@ pub(crate) fn generation_settings(
     Ok(GenerationSettingsPatch {
         temperature: optional_f64(object, "temperature", 0.0, 2.0)?,
         top_p: optional_f64(object, "top_p", 0.0, 1.0)?,
+        seed: optional_u32(object, "seed")?.map(u64::from),
+        repeat_penalty: None,
+        presence_penalty: optional_f64(object, "presence_penalty", -2.0, 2.0)?,
+        stop: optional_stop(object.get("stop"), "stop")?,
         reasoning_effort: None,
     })
+}
+
+pub(crate) fn optional_u32(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<u32>, OpenAiError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let value = value.as_u64().ok_or_else(|| {
+                OpenAiError::invalid(
+                    format!("`{field}` must be a non-negative integer."),
+                    Some(field),
+                    "invalid_type",
+                )
+            })?;
+            u32::try_from(value).map(Some).map_err(|_| {
+                OpenAiError::invalid(
+                    format!("`{field}` is outside the supported 32-bit seed range."),
+                    Some(field),
+                    "invalid_value",
+                )
+            })
+        }
+    }
+}
+
+pub(crate) fn optional_stop(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<Vec<String>>, OpenAiError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let values = match value {
+        Value::String(value) => vec![value.clone()],
+        Value::Array(values) => values
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    OpenAiError::invalid(
+                        format!("`{field}` array entries must be strings."),
+                        Some(field),
+                        "invalid_type",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => {
+            return Err(OpenAiError::invalid(
+                format!("`{field}` must be a string or an array of strings."),
+                Some(field),
+                "invalid_type",
+            ));
+        }
+    };
+    if values.is_empty()
+        || values
+            .iter()
+            .any(|value| value.is_empty() || value.contains('\0'))
+    {
+        return Err(OpenAiError::invalid(
+            format!("`{field}` must contain one or more non-empty strings."),
+            Some(field),
+            "invalid_value",
+        ));
+    }
+    Ok(Some(values))
 }
 
 pub(crate) fn optional_reasoning_effort(
@@ -163,11 +238,14 @@ pub(crate) fn optional_reasoning_effort(
     match value {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => match value.as_str() {
+            "minimal" => Ok(Some(ReasoningEffort::Minimal)),
             "low" => Ok(Some(ReasoningEffort::Low)),
             "medium" => Ok(Some(ReasoningEffort::Medium)),
             "high" => Ok(Some(ReasoningEffort::High)),
+            "xhigh" => Ok(Some(ReasoningEffort::Xhigh)),
+            "max" => Ok(Some(ReasoningEffort::Max)),
             _ => Err(OpenAiError::invalid(
-                format!("`{field}` must be `low`, `medium`, or `high`."),
+                format!("`{field}` must be `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`."),
                 Some(field),
                 "invalid_value",
             )),

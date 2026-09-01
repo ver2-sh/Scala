@@ -1080,10 +1080,31 @@ impl RuntimePackManager {
         compatible_installed_runtime_ids.sort();
         compatible_installed_runtime_ids.dedup();
 
-        let selected_runtime_id = self
+        let selected = self
             .resolve_from_snapshot(model, None, settings, None, &list)
-            .ok()
-            .map(|selection| selection.runtime.manifest.runtime_id);
+            .ok();
+        let selected_runtime_id = selected
+            .as_ref()
+            .map(|selection| selection.runtime.manifest.runtime_id.clone());
+        let structured_output = if let Some(selection) = selected.as_ref()
+            && let Some(adapter) = self
+                .registry
+                .get(&selection.runtime.manifest.identity.engine_id)
+        {
+            adapter
+                .settings_schema(&selection.runtime, model, &list.host)
+                .await
+                .ok()
+                .and_then(|schema| {
+                    let id = norted_core::SettingId::new("structured_output_schema").ok()?;
+                    schema
+                        .definition(&id)
+                        .map(|definition| definition.supported)
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
 
         Ok(ModelServingCapabilities {
             model_id: model.id.clone(),
@@ -1101,7 +1122,7 @@ impl RuntimePackManager {
             streaming: true,
             tools: false,
             vision: false,
-            structured_output: false,
+            structured_output,
         })
     }
 

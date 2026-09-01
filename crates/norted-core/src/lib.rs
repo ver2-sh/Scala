@@ -26,8 +26,9 @@ pub use error::{CoreError, Result};
 pub use event::{AppEvent, LogLevel};
 pub use model::{
     ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifact, AuxiliaryArtifactRole,
-    ModelArtifact, ModelArtifactProvenance, ModelId, ModelRegistry, NinferArtifactIdentity,
-    NinferContainerError, NinferContainerMetadata, inspect_ninfer_container,
+    GgufArtifactIdentity, GgufMetadataError, ModelArtifact, ModelArtifactProvenance, ModelId,
+    ModelRegistry, NinferArtifactIdentity, NinferContainerError, NinferContainerMetadata,
+    inspect_gguf_metadata, inspect_ninfer_container,
 };
 pub use model_profile::{
     EngineId, MODEL_PROFILES_STATE_VERSION, ModelProfile, ModelProfileId, ModelProfilesState,

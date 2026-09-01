@@ -102,7 +102,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             settings,
         } => {
             let registry = composition::engine_registry(&core)?;
-            let settings = registry.parse_settings(&settings)?;
+            let mut settings = registry.parse_settings(&settings)?;
+            record_q27_local_file_identity(&core, &mut settings).await?;
+            record_llama_local_file_identities(&core, &mut settings).await?;
             let client = ControlClient::discover(&core.paths).await?;
             let runtime = runtime.map(RuntimeId::new).transpose()?;
             let status = client
@@ -556,6 +558,7 @@ async fn handle_model_profiles(
                 4 * 1024 * 1024,
             )
             .await?;
+            record_llama_local_file_identities(&core, &mut patch).await?;
             let current = store.read().await?;
             let existing = current
                 .profiles
@@ -588,6 +591,7 @@ async fn handle_model_profiles(
             if ids.iter().any(|id| id.as_str() == "q27.template_path") {
                 ids.push(SettingId::new("q27.template_sha256")?);
             }
+            add_llama_bound_identity_ids(&mut ids)?;
             let selected = profile_id.clone();
             let state = store
                 .update(move |state| {
@@ -610,7 +614,9 @@ async fn handle_model_profiles(
         } => {
             let profile_id = ModelProfileId::new(profile)?;
             let registry = composition::engine_registry(&core)?;
-            let settings = registry.parse_settings(&settings)?;
+            let mut settings = registry.parse_settings(&settings)?;
+            record_q27_local_file_identity(&core, &mut settings).await?;
+            record_llama_local_file_identities(&core, &mut settings).await?;
             let runtime = runtime.map(RuntimeId::new).transpose()?;
             let status = ControlClient::discover(&core.paths)
                 .await?
@@ -765,6 +771,7 @@ async fn mutate_defaults(
         4 * 1024 * 1024,
     )
     .await?;
+    record_llama_local_file_identities(core, &mut patch).await?;
     let scope = defaults_scope(args.global, args.engine);
     validate_default_scope(&registry, &scope, &patch)?;
     let label = scope.to_string();
@@ -778,6 +785,62 @@ async fn mutate_defaults(
     Ok(())
 }
 
+async fn record_llama_local_file_identities(
+    core: &ApplicationCore,
+    patch: &mut SettingsPatch,
+) -> Result<()> {
+    norted_engine::record_local_file_setting_identity(
+        patch,
+        "llama.cpp.chat_template_file",
+        "llama.cpp.chat_template_sha256",
+        &core.paths.data_dir,
+        4 * 1024 * 1024,
+    )
+    .await?;
+    norted_engine::record_local_file_setting_identity(
+        patch,
+        "llama.cpp.speculative_draft_model",
+        "llama.cpp.speculative_draft_sha256",
+        &core.paths.data_dir,
+        1024_u64 * 1024 * 1024 * 1024,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn record_q27_local_file_identity(
+    core: &ApplicationCore,
+    patch: &mut SettingsPatch,
+) -> Result<()> {
+    norted_engine::record_local_file_setting_identity(
+        patch,
+        "q27.template_path",
+        "q27.template_sha256",
+        &core.paths.data_dir,
+        4 * 1024 * 1024,
+    )
+    .await?;
+    Ok(())
+}
+
+fn add_llama_bound_identity_ids(ids: &mut Vec<SettingId>) -> Result<()> {
+    for (path, sha256) in [
+        (
+            "llama.cpp.chat_template_file",
+            "llama.cpp.chat_template_sha256",
+        ),
+        (
+            "llama.cpp.speculative_draft_model",
+            "llama.cpp.speculative_draft_sha256",
+        ),
+    ] {
+        if ids.iter().any(|id| id.as_str() == path) {
+            ids.push(SettingId::new(sha256)?);
+        }
+    }
+    Ok(())
+}
+
 async fn unset_defaults(
     core: &Arc<ApplicationCore>,
     args: SettingsUnsetArgs,
@@ -788,6 +851,7 @@ async fn unset_defaults(
     if ids.iter().any(|id| id.as_str() == "q27.template_path") {
         ids.push(SettingId::new("q27.template_sha256")?);
     }
+    add_llama_bound_identity_ids(&mut ids)?;
     let scope = defaults_scope(args.global, args.engine);
     let patch = SettingsPatch(
         ids.iter()

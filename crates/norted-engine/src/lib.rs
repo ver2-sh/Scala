@@ -253,7 +253,10 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             label: "Reasoning effort".to_owned(),
             description: "Default reasoning effort when the selected engine supports it".to_owned(),
             kind: norted_core::SettingKind::Choice {
-                choices: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
+                choices: ["minimal", "low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
             },
             scope: norted_core::SettingScope::Common,
             category: norted_core::SettingCategory::Reasoning,
@@ -262,7 +265,143 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             unit: None,
             upstream_default: Some("runtime default".to_owned()),
         },
+        common_definition(
+            "seed",
+            "Random seed",
+            "Configured RNG seed, or `random` to request runtime randomness",
+            norted_core::SettingKind::UnsignedIntegerOrChoice {
+                minimum: Some(0),
+                maximum: Some(u64::from(u32::MAX)),
+                choices: vec!["random".to_owned()],
+            },
+            norted_core::SettingCategory::Generation,
+            Some("runtime random/default behavior"),
+        ),
+        common_definition(
+            "repeat_penalty",
+            "Repeat penalty",
+            "Configured repetition penalty; request values may override it",
+            norted_core::SettingKind::Float {
+                minimum: Some(0.0),
+                maximum: None,
+            },
+            norted_core::SettingCategory::Generation,
+            Some("runtime default"),
+        ),
+        common_definition(
+            "presence_penalty",
+            "Presence penalty",
+            "Configured token-presence penalty in the OpenAI-compatible -2..=2 range",
+            norted_core::SettingKind::Float {
+                minimum: Some(-2.0),
+                maximum: Some(2.0),
+            },
+            norted_core::SettingCategory::Generation,
+            Some("runtime default"),
+        ),
+        common_definition(
+            "max_output_tokens",
+            "Default response length",
+            "Default maximum generated tokens when a request omits its own limit",
+            norted_core::SettingKind::UnsignedInteger {
+                minimum: Some(1),
+                maximum: Some(u64::from(u32::MAX)),
+            },
+            norted_core::SettingCategory::Generation,
+            Some("runtime default/unlimited behavior"),
+        ),
+        common_definition(
+            "stop_strings",
+            "Stop strings",
+            "One or more configured generation stop strings as a JSON string array",
+            norted_core::SettingKind::StringList,
+            norted_core::SettingCategory::Prompt,
+            Some("none"),
+        ),
+        common_definition(
+            "system_prompt",
+            "System prompt",
+            "Default system instructions used only when the request supplies no system or developer message",
+            norted_core::SettingKind::String,
+            norted_core::SettingCategory::Prompt,
+            Some("none"),
+        ),
+        common_definition(
+            "reasoning",
+            "Enable thinking",
+            "Default reasoning/thinking mode: on, off, or template-driven auto",
+            norted_core::SettingKind::Choice {
+                choices: ["on", "off", "auto"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            norted_core::SettingCategory::Reasoning,
+            Some("runtime/template default"),
+        ),
+        common_definition(
+            "reasoning_budget",
+            "Reasoning budget",
+            "Thinking token budget: -1 is unrestricted, 0 ends immediately, positive values set a budget",
+            norted_core::SettingKind::Integer {
+                minimum: Some(-1),
+                maximum: Some(i64::from(i32::MAX)),
+            },
+            norted_core::SettingCategory::Reasoning,
+            Some("runtime default"),
+        ),
+        common_definition(
+            "reasoning_budget_message",
+            "Reasoning budget message",
+            "Message injected before the end-of-thinking tag when the budget is exhausted",
+            norted_core::SettingKind::String,
+            norted_core::SettingCategory::Reasoning,
+            Some("none"),
+        ),
+        common_definition(
+            "structured_output_schema",
+            "Structured output schema",
+            "Default JSON Schema object used to constrain generated output",
+            norted_core::SettingKind::JsonObject,
+            norted_core::SettingCategory::Generation,
+            Some("plain text"),
+        ),
+        common_definition(
+            "context_overflow",
+            "Context overflow",
+            "Request context policy; truncate_middle uses exact model token counts and preserves instructions and the newest tail",
+            norted_core::SettingKind::Choice {
+                choices: ["error", "truncate_middle"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            norted_core::SettingCategory::Advanced,
+            Some("error"),
+        ),
     ]
+}
+
+fn common_definition(
+    id: &str,
+    label: &str,
+    description: &str,
+    kind: norted_core::SettingKind,
+    category: norted_core::SettingCategory,
+    upstream_default: Option<&str>,
+) -> SettingDefinition {
+    SettingDefinition {
+        id: SettingId::new(id).expect("static common setting ID"),
+        label: label.to_owned(),
+        description: description.to_owned(),
+        kind,
+        scope: norted_core::SettingScope::Common,
+        category,
+        supported: true,
+        unsupported_reason: None,
+        unit: None,
+        upstream_default: upstream_default.map(str::to_owned),
+    }
 }
 
 pub async fn record_local_file_setting_identity(
@@ -877,17 +1016,23 @@ pub struct InferenceMessage {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    Minimal,
     Low,
     Medium,
     High,
+    Xhigh,
+    Max,
 }
 
 impl ReasoningEffort {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
         }
     }
 }
@@ -898,17 +1043,42 @@ impl std::fmt::Display for ReasoningEffort {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GenerationSettingsPatch {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub seed: Option<u64>,
+    pub repeat_penalty: Option<f64>,
+    pub presence_penalty: Option<f64>,
+    pub stop: Option<Vec<String>>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl GenerationSettingsPatch {
     pub fn is_empty(&self) -> bool {
-        self.temperature.is_none() && self.top_p.is_none() && self.reasoning_effort.is_none()
+        self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.seed.is_none()
+            && self.repeat_penalty.is_none()
+            && self.presence_penalty.is_none()
+            && self.stop.is_none()
+            && self.reasoning_effort.is_none()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum OutputFormat {
+    JsonObject,
+    JsonSchema {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        schema: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -916,6 +1086,8 @@ pub struct InferenceRequest {
     pub model_profile_id: norted_core::ModelProfileId,
     pub messages: Vec<InferenceMessage>,
     pub generation_settings: GenerationSettingsPatch,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_format: Option<OutputFormat>,
     pub max_output_tokens: Option<u32>,
     pub stream: bool,
 }
@@ -1246,6 +1418,35 @@ pub trait EngineAdapter: Send + Sync {
             )))
         }
     }
+    fn validate_inference_request(
+        &self,
+        request: &InferenceRequest,
+        backend_defaults: &EffectiveGenerationSettings,
+        _settings_schema: &SettingsSchema,
+    ) -> Result<(), EngineError> {
+        self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
+        if request.output_format.is_some() {
+            return Err(EngineError::InvalidGenerationSettings(format!(
+                "engine `{}` does not support structured output",
+                self.identity().id
+            )));
+        }
+        Ok(())
+    }
+    /// Returns the exact effective per-request context capacity when the
+    /// selected backend can prove it. `None` means the adapter has no exact
+    /// tokenizer/context contract and context rewriting must not proceed.
+    async fn context_capacity(&self, _endpoint: &str) -> Result<Option<u64>, EngineError> {
+        Ok(None)
+    }
+    /// Counts the fully rendered request with the selected model tokenizer.
+    async fn count_input_tokens(
+        &self,
+        _endpoint: &str,
+        _request: &InferenceRequest,
+    ) -> Result<Option<u64>, EngineError> {
+        Ok(None)
+    }
     async fn infer(
         &self,
         endpoint: &str,
@@ -1411,8 +1612,7 @@ mod tests {
         };
         let override_temperature = GenerationSettingsPatch {
             temperature: Some(0.2),
-            top_p: None,
-            reasoning_effort: None,
+            ..Default::default()
         };
 
         assert_eq!(
@@ -1725,8 +1925,7 @@ mod tests {
             adapter.validate_generation_settings(
                 &GenerationSettingsPatch {
                     temperature: Some(0.5),
-                    top_p: None,
-                    reasoning_effort: None,
+                    ..Default::default()
                 },
                 &EffectiveGenerationSettings {
                     temperature: 0.0,

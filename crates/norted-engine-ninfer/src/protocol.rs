@@ -421,6 +421,7 @@ mod tests {
                 },
             ],
             generation_settings: Default::default(),
+            output_format: None,
             max_output_tokens: None,
             stream: false,
         }

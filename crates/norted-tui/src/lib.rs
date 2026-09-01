@@ -402,6 +402,31 @@ async fn execute_settings_action(
             {
                 return SettingsTaskResult::Stored(Err(error.to_string()));
             }
+            for (path_setting, sha_setting, maximum_bytes) in [
+                (
+                    "llama.cpp.chat_template_file",
+                    "llama.cpp.chat_template_sha256",
+                    4_u64 * 1024 * 1024,
+                ),
+                (
+                    "llama.cpp.speculative_draft_model",
+                    "llama.cpp.speculative_draft_sha256",
+                    1024_u64 * 1024 * 1024 * 1024,
+                ),
+            ] {
+                if patch.0.keys().any(|id| id.as_str() == path_setting)
+                    && let Err(error) = norted_engine::record_local_file_setting_identity(
+                        &mut patch,
+                        path_setting,
+                        sha_setting,
+                        &paths.data_dir,
+                        maximum_bytes,
+                    )
+                    .await
+                {
+                    return SettingsTaskResult::Stored(Err(error.to_string()));
+                }
+            }
             if let SettingsScope::ModelProfile(profile_id) = &scope {
                 let Some(model) = model.as_deref() else {
                     return SettingsTaskResult::Stored(Err(format!(
@@ -500,6 +525,20 @@ async fn execute_settings_action(
             let mut ids = vec![id];
             if ids[0].as_str() == "q27.template_path" {
                 ids.push(SettingId::new("q27.template_sha256").expect("static setting ID"));
+            }
+            for (path, sha256) in [
+                (
+                    "llama.cpp.chat_template_file",
+                    "llama.cpp.chat_template_sha256",
+                ),
+                (
+                    "llama.cpp.speculative_draft_model",
+                    "llama.cpp.speculative_draft_sha256",
+                ),
+            ] {
+                if ids[0].as_str() == path {
+                    ids.push(SettingId::new(sha256).expect("static setting ID"));
+                }
             }
             let result = match scope {
                 SettingsScope::Global | SettingsScope::Engine(_) => settings_store
