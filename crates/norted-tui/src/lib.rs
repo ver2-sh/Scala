@@ -354,11 +354,33 @@ fn spawn_model_library_action(
             }
             ModelLibraryAction::Remove(model_id) => {
                 let result = match core.model(&model_id).await {
-                    Some(model) => match library.remove(&model).await {
-                        Ok(()) => match core.refresh_models().await {
-                            Ok(()) => Ok(model_id),
-                            Err(error) => Err(error.to_string()),
-                        },
+                    Some(model) => match library.plan_removal(&model) {
+                        Ok(plan) => {
+                            let active = match ControlClient::discover(&core.paths).await {
+                                Ok(client) => client
+                                    .status()
+                                    .await
+                                    .map(|status| status.backend.model_id)
+                                    .map_err(|error| error.to_string()),
+                                Err(ControlClientError::Unavailable) => Ok(None),
+                                Err(error) => Err(error.to_string()),
+                            };
+                            match active {
+                                Ok(Some(active)) if plan.affected_model_ids.contains(&active) => {
+                                    Err(format!(
+                                        "Model {active} is active and belongs to this managed acquisition; unload it before removal"
+                                    ))
+                                }
+                                Ok(_) => match library.remove(&plan).await {
+                                    Ok(()) => match core.refresh_models().await {
+                                        Ok(()) => Ok(model_id),
+                                        Err(error) => Err(error.to_string()),
+                                    },
+                                    Err(error) => Err(error.to_string()),
+                                },
+                                Err(error) => Err(error),
+                            }
+                        }
                         Err(error) => Err(error.to_string()),
                     },
                     None => Err(format!("model `{model_id}` was not found")),

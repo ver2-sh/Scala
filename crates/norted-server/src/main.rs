@@ -151,7 +151,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     )
                 })?;
                 let library = norted_model_library::ModelLibrary::new(&core.paths);
-                library.remove(&model).await?;
+                let plan = library.plan_removal(&model)?;
+                let active = match ControlClient::discover(&core.paths).await {
+                    Ok(client) => client.status().await?.backend.model_id,
+                    Err(ControlClientError::Unavailable) => None,
+                    Err(error) => return Err(error.into()),
+                };
+                if let Some(active) = active
+                    && plan.affected_model_ids.contains(&active)
+                {
+                    return Err(color_eyre::eyre::eyre!(
+                        "model `{active}` is active and belongs to this managed acquisition; unload it before removal"
+                    ));
+                }
+                library.remove(&plan).await?;
                 core.refresh_models().await?;
                 output::model_removed(&model_id, cli.json)?;
             }

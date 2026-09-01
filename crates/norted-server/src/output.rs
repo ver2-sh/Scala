@@ -256,6 +256,9 @@ pub fn models_search(
                         artifact.required_companions.join(", ")
                     );
                 }
+                if let Some(manifest) = &artifact.package_manifest {
+                    println!("           package manifest candidate: {manifest}");
+                }
                 println!("           compatibility: unverified until downloaded and inspected");
             }
         }

@@ -22,6 +22,43 @@ pub enum NortedPackageKind {
     Ninfer,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NortedPackageAcquisitionRole {
+    Manifest,
+    Primary,
+    Tokenizer,
+    Projector,
+    Sharp,
+    Other,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NortedPackageAcquisitionFile {
+    pub path: PathBuf,
+    pub role: NortedPackageAcquisitionRole,
+    pub output_key: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NortedPackageAcquisitionPlan {
+    pub kind: NortedPackageKind,
+    pub manifest_name: String,
+    pub manifest_schema: String,
+    pub manifest_version: u32,
+    pub files: Vec<NortedPackageAcquisitionFile>,
+}
+
+impl NortedPackageAcquisitionPlan {
+    pub fn primary_files(&self) -> impl Iterator<Item = &NortedPackageAcquisitionFile> {
+        self.files
+            .iter()
+            .filter(|file| file.role == NortedPackageAcquisitionRole::Primary)
+    }
+}
+
 impl std::fmt::Display for NortedPackageKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -211,15 +248,385 @@ struct BuildOutput {
     projector_key: Option<String>,
 }
 
+pub fn norted_package_manifest_name(format: ArtifactFormat) -> &'static str {
+    match format {
+        ArtifactFormat::Gguf => "BUILD-MANIFEST.json",
+        ArtifactFormat::Q27 => "Q27-MANIFEST.json",
+        ArtifactFormat::Ninfer => "NINFER-MANIFEST.json",
+    }
+}
+
+/// Produces the exact file closure required to reproduce a locally accepted
+/// Norted package. Paths are package-root-relative; transport concerns remain
+/// with the catalog provider.
+pub fn plan_norted_package_acquisition(
+    bytes: &[u8],
+    format: ArtifactFormat,
+) -> Result<NortedPackageAcquisitionPlan, String> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_PACKAGE_JSON_BYTES {
+        return Err(format!(
+            "package manifest must be between 1 and {MAX_PACKAGE_JSON_BYTES} bytes"
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid bounded package manifest JSON: {error}"))?;
+    match format {
+        ArtifactFormat::Gguf => plan_gguf(&value),
+        ArtifactFormat::Q27 => plan_q27(&value),
+        ArtifactFormat::Ninfer => plan_ninfer(&value),
+    }
+}
+
+/// Best-effort recovery used only to decide whether a malformed manifest
+/// explicitly claims a selected artifact. It never makes an invalid package
+/// installable.
+pub fn recover_norted_package_primary_paths(
+    bytes: &[u8],
+    format: ArtifactFormat,
+) -> Option<HashSet<PathBuf>> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_PACKAGE_JSON_BYTES {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let outputs = value.get("outputs")?.as_object()?;
+    let mut paths = HashSet::new();
+    for output in outputs.values() {
+        let filename = match format {
+            ArtifactFormat::Ninfer => output
+                .get("artifact")
+                .and_then(|artifact| artifact.get("filename"))
+                .and_then(serde_json::Value::as_str),
+            ArtifactFormat::Gguf | ArtifactFormat::Q27 => {
+                output.get("filename").and_then(serde_json::Value::as_str)
+            }
+        };
+        let Some(filename) = filename else {
+            continue;
+        };
+        let Ok(path) = package_relative_path(filename) else {
+            continue;
+        };
+        let is_primary = match format {
+            ArtifactFormat::Gguf => {
+                output.get("format").and_then(serde_json::Value::as_str)
+                    != Some("high-precision-projector")
+                    && output
+                        .get("projector_key")
+                        .is_none_or(serde_json::Value::is_null)
+                    && filename.to_ascii_lowercase().ends_with(".gguf")
+            }
+            ArtifactFormat::Q27 | ArtifactFormat::Ninfer => true,
+        };
+        if is_primary {
+            paths.insert(path);
+        }
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+fn plan_q27(value: &serde_json::Value) -> Result<NortedPackageAcquisitionPlan, String> {
+    let version = value
+        .get("schema")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "Q27-MANIFEST schema must be an integer".to_owned())?;
+    if version != 6 {
+        return Err(format!(
+            "unsupported Norted q27 package schema {version}; rebuild this artifact with the current Norted Builder"
+        ));
+    }
+    validate_lineage_value(&value["source_lineage"], "q27 package source lineage")?;
+    let manifest: Q27Manifest = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid Q27-MANIFEST v6: {error}"))?;
+    validate_sha(&manifest.source_lineage.key, "q27 source lineage key")?;
+    let mut files = vec![acquisition_file(
+        "Q27-MANIFEST.json",
+        NortedPackageAcquisitionRole::Manifest,
+        None,
+        None,
+        None,
+    )?];
+    files.push(acquisition_file(
+        &manifest.tokenizer.filename,
+        NortedPackageAcquisitionRole::Tokenizer,
+        None,
+        Some(manifest.tokenizer.size),
+        Some(&manifest.tokenizer.sha256),
+    )?);
+    files.push(acquisition_file(
+        &manifest.sharp.filename,
+        NortedPackageAcquisitionRole::Sharp,
+        None,
+        None,
+        Some(&manifest.sharp.template_sha256),
+    )?);
+    for (target, output) in &manifest.outputs {
+        if !matches!(target.as_str(), "q6" | "q6k") {
+            return Err(format!(
+                "q27 manifest contains unsupported output target `{target}`"
+            ));
+        }
+        if output.source_lineage.key != manifest.source_lineage.key
+            || output.tokenizer_sha256 != manifest.tokenizer.sha256
+        {
+            return Err(format!(
+                "q27 output `{target}` is not bound to package lineage/tokenizer"
+            ));
+        }
+        validate_lineage_value(
+            &value["outputs"][target]["source_lineage"],
+            &format!("q27 output `{target}` source lineage"),
+        )?;
+        files.push(acquisition_file(
+            &output.filename,
+            NortedPackageAcquisitionRole::Primary,
+            Some(target),
+            Some(output.size),
+            Some(&output.sha256),
+        )?);
+    }
+    finish_plan(
+        NortedPackageKind::Q27,
+        "Q27-MANIFEST.json",
+        "norted.q27-manifest",
+        6,
+        files,
+    )
+}
+
+fn plan_ninfer(value: &serde_json::Value) -> Result<NortedPackageAcquisitionPlan, String> {
+    let version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "NINFER-MANIFEST schema_version must be an integer".to_owned())?;
+    if value.get("schema").and_then(serde_json::Value::as_str) != Some("norted.ninfer-manifest") {
+        return Err("unsupported Norted NInfer manifest identity; rebuild this artifact with the current Norted Builder".to_owned());
+    }
+    if version != 6 {
+        return Err(format!(
+            "unsupported Norted NInfer package schema v{version}; rebuild this artifact with the current Norted Builder"
+        ));
+    }
+    let manifest: NinferManifest = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid NINFER-MANIFEST v6: {error}"))?;
+    validate_sha(
+        &manifest.canonical_source_lineage_key,
+        "NInfer canonical source lineage key",
+    )?;
+    let mut files = vec![acquisition_file(
+        "NINFER-MANIFEST.json",
+        NortedPackageAcquisitionRole::Manifest,
+        None,
+        None,
+        None,
+    )?];
+    files.push(acquisition_file(
+        &manifest.sharp.filename,
+        NortedPackageAcquisitionRole::Sharp,
+        None,
+        Some(manifest.sharp.size),
+        Some(&manifest.sharp.sha256),
+    )?);
+    for (key, output) in &manifest.outputs {
+        if output.source_lineage.key != manifest.canonical_source_lineage_key
+            || output.artifact.weights_id != *key
+        {
+            return Err(format!(
+                "NInfer output `{key}` is not bound to package lineage/identity"
+            ));
+        }
+        if output.artifact.container_version != 2 {
+            return Err(format!("NInfer output `{key}` is not container v2"));
+        }
+        files.push(acquisition_file(
+            &output.artifact.filename,
+            NortedPackageAcquisitionRole::Primary,
+            Some(key),
+            Some(output.artifact.size),
+            Some(&output.artifact.sha256),
+        )?);
+    }
+    finish_plan(
+        NortedPackageKind::Ninfer,
+        "NINFER-MANIFEST.json",
+        &manifest.schema,
+        6,
+        files,
+    )
+}
+
+fn plan_gguf(value: &serde_json::Value) -> Result<NortedPackageAcquisitionPlan, String> {
+    let version = value
+        .get("schema")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "BUILD-MANIFEST schema must be an integer".to_owned())?;
+    if !matches!(version, 2 | 3) {
+        return Err(format!(
+            "unsupported BUILD-MANIFEST schema {version}; expected 2 or 3"
+        ));
+    }
+    let manifest: BuildManifest = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid BUILD-MANIFEST schema {version}: {error}"))?;
+    validate_sha(&manifest.build_key, "GGUF build key")?;
+    if let Some(master) = &manifest.master {
+        validate_sha(&master.master_id, "GGUF master ID")?;
+    }
+    let mut files = vec![acquisition_file(
+        "BUILD-MANIFEST.json",
+        NortedPackageAcquisitionRole::Manifest,
+        None,
+        None,
+        None,
+    )?];
+    let mut projector_count = 0;
+    for (key, output) in &manifest.outputs {
+        validate_sha(&output.sha256, "package file SHA256")?;
+        let role = if output.format.as_deref() == Some("high-precision-projector")
+            || output.projector_key.is_some()
+        {
+            projector_count += 1;
+            NortedPackageAcquisitionRole::Projector
+        } else if output.filename.to_ascii_lowercase().ends_with(".gguf") {
+            let quant_lineage = output
+                .quant
+                .as_ref()
+                .and_then(|quant| manifest.lineage.as_ref()?.quants.get(quant));
+            if let Some(lineage) = quant_lineage {
+                validate_sha(&lineage.raw_quant_key, "GGUF raw quant key")?;
+                if let Some(recipe) = lineage
+                    .unsloth_quant_recipe_key
+                    .as_ref()
+                    .or(lineage.provider_recipe_key.as_ref())
+                {
+                    validate_sha(recipe, "GGUF quant recipe key")?;
+                }
+            }
+            if version == 3 {
+                let quant = output
+                    .quant
+                    .as_ref()
+                    .ok_or_else(|| format!("schema-3 GGUF output `{key}` has no quant identity"))?;
+                let lineage = quant_lineage.ok_or_else(|| {
+                    format!("schema-3 GGUF output `{key}` has no durable quant lineage")
+                })?;
+                let effective = lineage.effective_quant_source.as_ref().ok_or_else(|| {
+                    format!("schema-3 GGUF output `{key}` has no effective quant source")
+                })?;
+                validate_effective_quant_source(
+                    &value["lineage"]["quants"][quant]["effective_quant_source"],
+                    &format!("schema-3 GGUF output `{key}` effective quant source"),
+                )?;
+                if let Some(route_key) = manifest
+                    .route
+                    .as_ref()
+                    .and_then(|route| route.quants.get(quant))
+                    .and_then(|route| route.cache_source_key.as_ref())
+                {
+                    validate_sha(route_key, "GGUF route cache source key")?;
+                    if route_key != &effective.key {
+                        return Err(format!(
+                            "schema-3 GGUF output `{key}` route cache identity disagrees with durable lineage"
+                        ));
+                    }
+                }
+            }
+            NortedPackageAcquisitionRole::Primary
+        } else {
+            NortedPackageAcquisitionRole::Other
+        };
+        files.push(acquisition_file(
+            &output.filename,
+            role,
+            (role == NortedPackageAcquisitionRole::Primary).then_some(key.as_str()),
+            Some(output.size),
+            Some(&output.sha256),
+        )?);
+    }
+    if projector_count > 1 {
+        return Err("BUILD-MANIFEST declares multiple projectors".to_owned());
+    }
+    finish_plan(
+        NortedPackageKind::Gguf,
+        "BUILD-MANIFEST.json",
+        "norted.build-manifest",
+        version as u32,
+        files,
+    )
+}
+
+fn acquisition_file(
+    path: &str,
+    role: NortedPackageAcquisitionRole,
+    output_key: Option<&str>,
+    size_bytes: Option<u64>,
+    sha256: Option<&str>,
+) -> Result<NortedPackageAcquisitionFile, String> {
+    if let Some(sha256) = sha256 {
+        validate_sha(sha256, "package file SHA256")?;
+    }
+    Ok(NortedPackageAcquisitionFile {
+        path: package_relative_path(path)?,
+        role,
+        output_key: output_key.map(str::to_owned),
+        size_bytes,
+        sha256: sha256.map(str::to_owned),
+    })
+}
+
+fn finish_plan(
+    kind: NortedPackageKind,
+    manifest_name: &str,
+    manifest_schema: &str,
+    manifest_version: u32,
+    files: Vec<NortedPackageAcquisitionFile>,
+) -> Result<NortedPackageAcquisitionPlan, String> {
+    let mut seen = HashSet::new();
+    for file in &files {
+        if seen.iter().any(|existing: &PathBuf| {
+            existing == &file.path
+                || existing.starts_with(&file.path)
+                || file.path.starts_with(existing)
+        }) {
+            return Err(format!(
+                "package contains a colliding path at `{}`",
+                file.path.display()
+            ));
+        }
+        seen.insert(file.path.clone());
+    }
+    if !files
+        .iter()
+        .any(|file| file.role == NortedPackageAcquisitionRole::Primary)
+    {
+        return Err(format!("{kind} manifest declares no primary outputs"));
+    }
+    Ok(NortedPackageAcquisitionPlan {
+        kind,
+        manifest_name: manifest_name.to_owned(),
+        manifest_schema: manifest_schema.to_owned(),
+        manifest_version,
+        files,
+    })
+}
+
+fn package_relative_path(value: &str) -> Result<PathBuf, String> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || value.contains('\\')
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!("unsafe package-relative path `{value}`"));
+    }
+    Ok(path.to_path_buf())
+}
+
 pub(crate) fn discover_package_directory(
     root: &Path,
     format: ArtifactFormat,
 ) -> Option<PackageDirectory> {
-    let manifest_name = match format {
-        ArtifactFormat::Gguf => "BUILD-MANIFEST.json",
-        ArtifactFormat::Q27 => "Q27-MANIFEST.json",
-        ArtifactFormat::Ninfer => "NINFER-MANIFEST.json",
-    };
+    let manifest_name = norted_package_manifest_name(format);
     let manifest = root.join(manifest_name);
     if !manifest.exists() {
         return None;
@@ -239,6 +646,7 @@ fn discover_q27(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, S
     let root = canonical_root(root)?;
     let manifest_path = canonical_manifest(&root, manifest_path)?;
     let (value, manifest_sha): (serde_json::Value, _) = read_json(&manifest_path)?;
+    let _ = plan_q27(&value)?;
     let version = value
         .get("schema")
         .and_then(serde_json::Value::as_u64)
@@ -352,6 +760,7 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
     let root = canonical_root(root)?;
     let manifest_path = canonical_manifest(&root, manifest_path)?;
     let (value, manifest_sha): (serde_json::Value, _) = read_json(&manifest_path)?;
+    let _ = plan_ninfer(&value)?;
     let version = value
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
@@ -461,6 +870,7 @@ fn discover_gguf(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, 
     let root = canonical_root(root)?;
     let manifest_path = canonical_manifest(&root, manifest_path)?;
     let (manifest_value, manifest_sha): (serde_json::Value, _) = read_json(&manifest_path)?;
+    let _ = plan_gguf(&manifest_value)?;
     let manifest_file = package_file_from_observed(&manifest_path, &manifest_sha)?;
     let observed_schema = manifest_value
         .get("schema")

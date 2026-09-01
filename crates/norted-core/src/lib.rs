@@ -26,17 +26,21 @@ pub use error::{CoreError, Result};
 pub use event::{AppEvent, LogLevel};
 pub use model::{
     ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifact, AuxiliaryArtifactRole,
-    GgufArtifactIdentity, GgufMetadataError, MODEL_LIBRARY_RECEIPT_SUFFIX, ModelArtifact,
-    ModelArtifactProvenance, ModelId, ModelLibraryReceipt, ModelRegistry, NinferArtifactIdentity,
-    NinferContainerError, NinferContainerMetadata, inspect_gguf_metadata, inspect_ninfer_container,
-    model_library_receipt_path, q27_tokenizer_candidate, select_q27_tokenizer_filename,
-    validate_q27_tokenizer_header,
+    GgufArtifactIdentity, GgufMetadataError, MODEL_LIBRARY_RECEIPT_FILENAME, ModelArtifact,
+    ModelArtifactProvenance, ModelId, ModelLibraryReceipt, ModelLibraryReceiptMember,
+    ModelRegistry, NinferArtifactIdentity, NinferContainerError, NinferContainerMetadata,
+    inspect_gguf_metadata, inspect_ninfer_container, model_library_receipt_path,
+    q27_tokenizer_candidate, select_q27_tokenizer_filename, validate_q27_tokenizer_header,
 };
 pub use model_profile::{
     EngineId, MODEL_PROFILES_STATE_VERSION, ModelProfile, ModelProfileId, ModelProfilesState,
     ModelProfilesStore, validate_engine_id,
 };
-pub use norted_package::{NortedPackageBinding, NortedPackageFile, NortedPackageKind};
+pub use norted_package::{
+    NortedPackageAcquisitionFile, NortedPackageAcquisitionPlan, NortedPackageAcquisitionRole,
+    NortedPackageBinding, NortedPackageFile, NortedPackageKind, norted_package_manifest_name,
+    plan_norted_package_acquisition, recover_norted_package_primary_paths,
+};
 pub use provenance::{
     AcquisitionMethod, AuxiliaryRuntimeIdentity, BuildProvenance, EngineInstallation,
     EngineRevision, EnvironmentVariableProvenance, ModelProfileRuntimeIdentity,

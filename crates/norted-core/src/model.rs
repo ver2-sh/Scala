@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::norted_package::{PackageDirectory, discover_package_directory};
+use crate::norted_package::{
+    PackageDirectory, discover_package_directory, norted_package_manifest_name,
+};
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -107,6 +109,9 @@ pub enum NinferContainerError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelArtifactProvenance {
+    /// Stable identity shared by every primary member of one atomic managed
+    /// acquisition.
+    pub acquisition_id: String,
     /// Acquisition mechanism (`huggingface` or `local_import`).
     pub provider: String,
     pub repository: Option<String>,
@@ -119,14 +124,22 @@ pub struct ModelArtifactProvenance {
     pub digest: Option<String>,
 }
 
-pub const MODEL_LIBRARY_RECEIPT_SUFFIX: &str = ".norted-library.json";
+pub const MODEL_LIBRARY_RECEIPT_FILENAME: &str = ".norted-library.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelLibraryReceiptMember {
+    pub path: PathBuf,
+    pub format: ArtifactFormat,
+    pub provenance: ModelArtifactProvenance,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelLibraryReceipt {
     pub schema_version: u32,
-    pub primary_filename: String,
-    pub provenance: ModelArtifactProvenance,
+    pub acquisition_id: String,
+    pub members: Vec<ModelLibraryReceiptMember>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,12 +253,12 @@ impl ModelRegistry {
                 if !seen.insert(identity.clone()) {
                     continue;
                 }
-                let package = canonical_path.parent().and_then(|parent| {
-                    package_directories
-                        .entry((parent.to_path_buf(), format))
-                        .or_insert_with(|| discover_package_directory(parent, format))
-                        .clone()
-                });
+                let package = discover_package_for_artifact(
+                    root,
+                    &canonical_path,
+                    format,
+                    &mut package_directories,
+                );
                 let package_member = match package {
                     Some(PackageDirectory::Valid {
                         members: _,
@@ -312,8 +325,12 @@ impl ModelRegistry {
                             }
                             _ => (None, None),
                         };
-                        let provenance =
-                            read_library_receipt(&canonical_path, &mut registry.warnings);
+                        let provenance = read_library_receipt(
+                            root,
+                            &canonical_path,
+                            format,
+                            &mut registry.warnings,
+                        );
                         let logical_identity = provenance
                             .as_ref()
                             .and_then(|value| value.logical_id.as_deref());
@@ -330,7 +347,10 @@ impl ModelRegistry {
                             created: artifact_timestamp(&metadata),
                             architecture,
                             context_length,
-                            hash: provenance.as_ref().and_then(|value| value.digest.clone()),
+                            // Receipt digests describe acquisition-time source
+                            // verification. A current content digest is set only
+                            // by the load-time package verification path.
+                            hash: None,
                             provenance,
                             native_identity,
                             auxiliary_artifacts,
@@ -360,6 +380,48 @@ impl ModelRegistry {
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
+}
+
+fn discover_package_for_artifact(
+    search_root: &Path,
+    artifact: &Path,
+    format: ArtifactFormat,
+    cache: &mut HashMap<(PathBuf, ArtifactFormat), Option<PackageDirectory>>,
+) -> Option<PackageDirectory> {
+    let search_root = search_root.canonicalize().ok()?;
+    let mut directory = artifact.parent()?;
+    while directory.starts_with(&search_root) {
+        if directory
+            .join(norted_package_manifest_name(format))
+            .exists()
+        {
+            let package = cache
+                .entry((directory.to_path_buf(), format))
+                .or_insert_with(|| discover_package_directory(directory, format))
+                .clone();
+            match &package {
+                Some(PackageDirectory::Valid {
+                    members,
+                    suppressed,
+                }) if members.contains_key(artifact) || suppressed.contains(artifact) => {
+                    return package;
+                }
+                Some(PackageDirectory::Invalid { claimed, .. })
+                    if claimed
+                        .as_ref()
+                        .is_none_or(|claimed| claimed.contains(artifact)) =>
+                {
+                    return package;
+                }
+                _ => {}
+            }
+        }
+        if directory == search_root {
+            break;
+        }
+        directory = directory.parent()?;
+    }
+    None
 }
 
 const MAX_GGUF_METADATA_BYTES: u64 = 128 * 1024 * 1024;
@@ -933,19 +995,28 @@ pub fn validate_q27_tokenizer_header(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn model_library_receipt_path(primary: &Path) -> PathBuf {
-    let filename = primary
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("model");
-    primary.with_file_name(format!("{filename}{MODEL_LIBRARY_RECEIPT_SUFFIX}"))
+pub fn model_library_receipt_path(acquisition_root: &Path) -> PathBuf {
+    acquisition_root.join(MODEL_LIBRARY_RECEIPT_FILENAME)
 }
 
 fn read_library_receipt(
+    search_root: &Path,
     primary: &Path,
+    format: ArtifactFormat,
     warnings: &mut Vec<String>,
 ) -> Option<ModelArtifactProvenance> {
-    let path = model_library_receipt_path(primary);
+    let search_root = search_root.canonicalize().ok()?;
+    let mut acquisition_root = primary.parent()?;
+    let path = loop {
+        let candidate = model_library_receipt_path(acquisition_root);
+        if candidate.exists() {
+            break candidate;
+        }
+        if acquisition_root == search_root || !acquisition_root.starts_with(&search_root) {
+            return None;
+        }
+        acquisition_root = acquisition_root.parent()?;
+    };
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
@@ -967,15 +1038,77 @@ fn read_library_receipt(
             return None;
         }
     };
-    let filename = primary.file_name().and_then(|value| value.to_str());
-    if receipt.schema_version != 1 || filename != Some(receipt.primary_filename.as_str()) {
+    if receipt.schema_version != 2
+        || receipt.acquisition_id.is_empty()
+        || receipt.members.is_empty()
+    {
         warnings.push(format!(
-            "model-library receipt {} does not identify this artifact",
+            "model-library receipt {} has an unsupported or empty acquisition identity",
             path.display()
         ));
         return None;
     }
-    Some(receipt.provenance)
+    let acquisition_root = path.parent()?.canonicalize().ok()?;
+    let mut seen = HashSet::new();
+    let mut matched = None;
+    for member in &receipt.members {
+        if !safe_receipt_path(&member.path)
+            || !seen.insert(member.path.clone())
+            || member.provenance.acquisition_id != receipt.acquisition_id
+        {
+            warnings.push(format!(
+                "model-library receipt {} contains unsafe or conflicting acquisition members",
+                path.display()
+            ));
+            return None;
+        }
+        let member_path = acquisition_root.join(&member.path);
+        let Ok(canonical) = member_path.canonicalize() else {
+            warnings.push(format!(
+                "model-library receipt {} references a missing acquisition member {}",
+                path.display(),
+                member.path.display()
+            ));
+            return None;
+        };
+        let Ok(metadata) = canonical.metadata() else {
+            return None;
+        };
+        if !canonical.starts_with(&acquisition_root)
+            || !metadata.is_file()
+            || metadata.len() != member.provenance.size_bytes
+            || ArtifactFormat::from_path(&canonical) != Some(member.format)
+        {
+            warnings.push(format!(
+                "model-library receipt {} no longer matches acquisition member {}",
+                path.display(),
+                member.path.display()
+            ));
+            return None;
+        }
+        if canonical == primary && member.format == format {
+            matched = Some(member);
+        }
+    }
+    let member = matched;
+    let Some(member) = member else {
+        warnings.push(format!(
+            "model-library receipt {} does not identify artifact {}",
+            path.display(),
+            primary.display()
+        ));
+        return None;
+    };
+    Some(member.provenance.clone())
+}
+
+fn safe_receipt_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && !path.to_string_lossy().contains('\\')
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 fn model_id(

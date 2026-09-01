@@ -104,7 +104,7 @@ pub enum ModelsCommand {
     Download { model_ref: String },
     /// Safely copy an existing local artifact into the managed library
     Import { path: std::path::PathBuf },
-    /// Remove one managed library artifact
+    /// Remove the managed acquisition containing this model
     Remove { model_id: String },
 }
 
