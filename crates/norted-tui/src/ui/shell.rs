@@ -303,31 +303,29 @@ fn models_footer<'a>(
         return line;
     }
 
+    if !compact {
+        return vec![
+            hint("Left/Right", "view", theme),
+            hint("e", "search", theme),
+            hint("f", "format", theme),
+            hint("Up/Down", "select", theme),
+            hint("d", "download", theme),
+        ];
+    }
+
     let has_results = !app.model_search_artifacts().is_empty();
     let has_selection = app.selected_model_search_result.is_some() && has_results;
-    let mut line = if compact {
-        vec![
-            hint(
-                if glyphs.unicode { "←/i" } else { "</i" },
-                "Installed",
-                theme,
-            ),
-            hint("e", "search", theme),
-        ]
-    } else {
-        vec![
-            hint("Left/Right", "view", theme),
-            hint("e", "search/edit", theme),
-            hint("f", "format", theme),
-        ]
-    };
-    if has_results && !compact {
-        line.push(hint(glyphs.up_down, "select", theme));
-    }
+    let mut line = vec![
+        hint(
+            if glyphs.unicode { "←/i" } else { "</i" },
+            "Installed",
+            theme,
+        ),
+        hint("e", "search", theme),
+        hint("f", "format", theme),
+    ];
     if has_selection && !app.model_library_busy() {
         line.push(hint("d", "download", theme));
-    } else if compact {
-        line.push(hint("f", "format", theme));
     }
     line
 }

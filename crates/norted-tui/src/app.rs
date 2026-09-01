@@ -531,6 +531,13 @@ impl App {
             self.pending_model_remove_confirmation = None;
         }
         match key.code {
+            KeyCode::Char('/')
+                if self.screen == Screen::Models
+                    && self.model_library_view == ModelLibraryView::Discover
+                    && self.focus == FocusArea::Content =>
+            {
+                self.handle_model_discover_key(key)
+            }
             KeyCode::Char('/') => {
                 self.open_command(true);
                 self.command_input = "/".into();
@@ -1873,13 +1880,13 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char('r') => self.request_model_search(),
             KeyCode::Char('f') => {
-                self.model_search_format = match self.model_search_format {
+                let format = match self.model_search_format {
                     None => Some(ArtifactFormat::Gguf),
                     Some(ArtifactFormat::Gguf) => Some(ArtifactFormat::Q27),
                     Some(ArtifactFormat::Q27) => Some(ArtifactFormat::Ninfer),
                     Some(ArtifactFormat::Ninfer) => None,
                 };
-                Update::Render
+                self.set_model_search_format(format)
             }
             KeyCode::Up | KeyCode::Char('k') => self.move_model_search_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_model_search_selection(1),
@@ -1920,6 +1927,18 @@ impl App {
             format: self.model_search_format,
         });
         Update::Render
+    }
+
+    fn set_model_search_format(&mut self, format: Option<ArtifactFormat>) -> Update {
+        if self.model_search_format == format {
+            return Update::Render;
+        }
+        self.model_search_format = format;
+        if self.model_search.is_some() || self.model_library_busy {
+            self.request_model_search()
+        } else {
+            Update::Render
+        }
     }
 
     fn move_model_search_selection(&mut self, direction: isize) -> Update {
@@ -2552,6 +2571,27 @@ impl App {
                 self.focus = FocusArea::Content;
                 self.switch_model_library_view(view)
             }
+            Some(HoverTarget::ModelSearchField) => {
+                self.prepare_model_discover_click();
+                self.model_search_editing = true;
+                self.model_search_cursor = self.model_search_query.chars().count();
+                Update::Render
+            }
+            Some(HoverTarget::ModelSearchSubmit) => {
+                self.prepare_model_discover_click();
+                self.model_search_editing = false;
+                self.request_model_search()
+            }
+            Some(HoverTarget::ModelFormatFilter(format)) => {
+                self.prepare_model_discover_click();
+                self.set_model_search_format(format)
+            }
+            Some(HoverTarget::ModelDownloadAction(index)) => {
+                self.prepare_model_discover_click();
+                self.model_search_editing = false;
+                self.selected_model_search_result = Some(index);
+                self.request_model_download()
+            }
             Some(HoverTarget::Model(index)) => {
                 if self.command_active {
                     self.close_command();
@@ -2632,6 +2672,18 @@ impl App {
             ) => Update::None,
             None => Update::None,
         }
+    }
+
+    fn prepare_model_discover_click(&mut self) {
+        if self.command_active {
+            self.close_command();
+        }
+        self.screen = Screen::Models;
+        self.nav_focus = Screen::Models;
+        self.model_library_view = ModelLibraryView::Discover;
+        self.focus = FocusArea::Content;
+        self.pending_runtime_remove_confirmation = None;
+        self.pending_model_remove_confirmation = None;
     }
 
     fn handle_wheel(&mut self, position: Position, layout: &UiLayout, direction: isize) -> Update {
