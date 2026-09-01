@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use norted_core::{AppPaths, ModelProfileId, RuntimeId, SettingsPatch, observe_runtime_descriptor};
+use norted_core::{
+    AppPaths, ModelProfileId, RuntimeId, SettingsPatch, observe_runtime_descriptor,
+    observe_runtime_descriptor_read_only,
+};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -85,10 +88,23 @@ pub enum ControlClientError {
 
 impl ControlClient {
     pub async fn discover(paths: &AppPaths) -> Result<Self, ControlClientError> {
-        let descriptor = observe_runtime_descriptor(paths)
-            .await
-            .map_err(|error| ControlClientError::Discovery(error.to_string()))?
-            .ok_or(ControlClientError::Unavailable)?;
+        Self::discover_with(paths, false).await
+    }
+
+    /// Discovers private control without updating runtime-observation evidence
+    /// or cleaning stale descriptors.
+    pub async fn discover_read_only(paths: &AppPaths) -> Result<Self, ControlClientError> {
+        Self::discover_with(paths, true).await
+    }
+
+    async fn discover_with(paths: &AppPaths, read_only: bool) -> Result<Self, ControlClientError> {
+        let descriptor = if read_only {
+            observe_runtime_descriptor_read_only(paths).await
+        } else {
+            observe_runtime_descriptor(paths).await
+        }
+        .map_err(|error| ControlClientError::Discovery(error.to_string()))?
+        .ok_or(ControlClientError::Unavailable)?;
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .redirect(reqwest::redirect::Policy::none())

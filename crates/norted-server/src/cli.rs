@@ -69,8 +69,15 @@ pub enum Command {
     Settings(SettingsArgs),
     /// Inspect resolved application configuration
     Config(ConfigArgs),
-    /// Check configuration, paths, networking, and terminal environment
-    Doctor,
+    /// Run offline, read-only whole-system diagnostics
+    Doctor(DoctorArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Show successful checks in addition to warnings and failures
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Args)]

@@ -48,10 +48,14 @@ pub use manager::{
     RuntimeNoticeLevel,
 };
 pub use packs::{
-    InstalledRuntimeStatus, RuntimeListSnapshot, RuntimeModelCandidate, RuntimePackError,
-    RuntimePackManager, RuntimeSearchResult, RuntimeSearchSnapshot, RuntimeUpdateCheck,
+    InstalledRuntimeStatus, RuntimeListSnapshot, RuntimeLocalInspection, RuntimeModelCandidate,
+    RuntimePackError, RuntimePackManager, RuntimeSearchResult, RuntimeSearchSnapshot,
+    RuntimeUpdateCheck,
 };
-pub use store::{RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreSnapshot};
+pub use store::{
+    RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreIssue, RuntimeStoreIssueKind,
+    RuntimeStoreSnapshot,
+};
 pub use supervisor::{CapturedCommand, TokioProcessSupervisor, capture_command};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

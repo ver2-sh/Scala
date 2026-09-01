@@ -21,7 +21,9 @@ use crate::catalog::{
 use crate::installer::{
     RuntimeInstallError, RuntimeInstaller, SourceBuildPrerequisiteEvaluationKey,
 };
-use crate::store::{RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreSnapshot};
+use crate::store::{
+    RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreIssue, RuntimeStoreSnapshot,
+};
 use crate::{
     CompatibilityDecision, EngineError, EngineRegistry, InstallationState, ModelServingCapabilities,
 };
@@ -69,6 +71,23 @@ pub struct RuntimeListSnapshot {
     pub selections: RuntimeSelections,
     pub installed: Vec<InstalledRuntimeStatus>,
     pub warnings: Vec<String>,
+}
+
+/// A fail-soft, offline view of existing runtime state. Missing store and
+/// selection files are represented by empty defaults; malformed independent
+/// state is retained as a structured error without hiding valid runtimes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeLocalInspection {
+    pub host: HostCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selections: Option<RuntimeSelections>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selections_error: Option<String>,
+    pub installed: Vec<InstalledRuntimeStatus>,
+    pub store_issues: Vec<RuntimeStoreIssue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store_error: Option<String>,
+    pub adapter_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,10 +254,89 @@ impl RuntimePackManager {
     }
 
     pub async fn list(&self) -> Result<RuntimeListSnapshot, RuntimePackError> {
-        let RuntimeStoreSnapshot {
-            mut runtimes,
-            mut warnings,
-        } = self.store.scan().await?;
+        let RuntimeStoreSnapshot { runtimes, issues } = self.store.scan().await?;
+        let mut warnings = issues
+            .into_iter()
+            .map(|issue| issue.message)
+            .collect::<Vec<_>>();
+        let mut runtimes = self
+            .collect_external_runtimes(runtimes, &mut warnings)
+            .await;
+        runtimes.sort_by(|left, right| {
+            left.manifest
+                .identity
+                .engine_id
+                .cmp(&right.manifest.identity.engine_id)
+                .then_with(|| {
+                    left.manifest
+                        .identity
+                        .variant
+                        .cmp(&right.manifest.identity.variant)
+                })
+                .then_with(|| compare_installed_recency_with_registry(&self.registry, right, left))
+        });
+        let selections = self.store.selections().await?;
+        let host = self.host.read().await.clone();
+        let installed = self.assess_installed(runtimes, &selections, &host);
+        Ok(RuntimeListSnapshot {
+            host,
+            selections,
+            installed,
+            warnings,
+        })
+    }
+
+    /// Inspects installed runtimes, selections, adapters, and host compatibility
+    /// without initializing the store or consulting runtime providers.
+    pub async fn inspect_local(&self) -> RuntimeLocalInspection {
+        let host = self.refresh_host_capabilities().await;
+        let (runtimes, store_issues, store_error) = match self.store.inspect_existing().await {
+            Ok(snapshot) => (snapshot.runtimes, snapshot.issues, None),
+            Err(error) => (Vec::new(), Vec::new(), Some(error.to_string())),
+        };
+        let (selections, selections_error) = match self.store.selections().await {
+            Ok(selections) => (Some(selections), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let mut adapter_warnings = Vec::new();
+        let mut runtimes = self
+            .collect_external_runtimes(runtimes, &mut adapter_warnings)
+            .await;
+        runtimes.sort_by(|left, right| {
+            left.manifest
+                .identity
+                .engine_id
+                .cmp(&right.manifest.identity.engine_id)
+                .then_with(|| {
+                    left.manifest
+                        .identity
+                        .variant
+                        .cmp(&right.manifest.identity.variant)
+                })
+                .then_with(|| compare_installed_recency_with_registry(&self.registry, right, left))
+        });
+        let empty_selections = RuntimeSelections::default();
+        let installed = self.assess_installed(
+            runtimes,
+            selections.as_ref().unwrap_or(&empty_selections),
+            &host,
+        );
+        RuntimeLocalInspection {
+            host,
+            selections,
+            selections_error,
+            installed,
+            store_issues,
+            store_error,
+            adapter_warnings,
+        }
+    }
+
+    async fn collect_external_runtimes(
+        &self,
+        mut runtimes: Vec<InstalledRuntime>,
+        warnings: &mut Vec<String>,
+    ) -> Vec<InstalledRuntime> {
         for adapter in self.registry.adapters() {
             match adapter.probe().await {
                 Ok(probe) => match probe.installation {
@@ -265,22 +363,16 @@ impl RuntimePackManager {
                 )),
             }
         }
-        runtimes.sort_by(|left, right| {
-            left.manifest
-                .identity
-                .engine_id
-                .cmp(&right.manifest.identity.engine_id)
-                .then_with(|| {
-                    left.manifest
-                        .identity
-                        .variant
-                        .cmp(&right.manifest.identity.variant)
-                })
-                .then_with(|| compare_installed_recency_with_registry(&self.registry, right, left))
-        });
-        let selections = self.store.selections().await?;
-        let host = self.host.read().await.clone();
-        let installed = runtimes
+        runtimes
+    }
+
+    fn assess_installed(
+        &self,
+        runtimes: Vec<InstalledRuntime>,
+        selections: &RuntimeSelections,
+        host: &HostCapabilities,
+    ) -> Vec<InstalledRuntimeStatus> {
+        runtimes
             .into_iter()
             .map(|runtime| {
                 let compatibility = match self.registry.get(&runtime.manifest.identity.engine_id) {
@@ -288,7 +380,7 @@ impl RuntimePackManager {
                         CompatibilityDecision::Supported => {
                             match adapter.runtime_compatibility(&runtime) {
                                 CompatibilityDecision::Supported => {
-                                    compatibility_for_installed(&runtime, &host)
+                                    compatibility_for_installed(&runtime, host)
                                 }
                                 CompatibilityDecision::Unsupported { reason } => {
                                     RuntimeCompatibility::Incompatible(reason)
@@ -305,17 +397,11 @@ impl RuntimePackManager {
                 };
                 InstalledRuntimeStatus {
                     compatibility,
-                    selected_for: selected_for(&selections, &runtime.manifest.runtime_id),
+                    selected_for: selected_for(selections, &runtime.manifest.runtime_id),
                     runtime,
                 }
             })
-            .collect();
-        Ok(RuntimeListSnapshot {
-            host,
-            selections,
-            installed,
-            warnings,
-        })
+            .collect()
     }
 
     pub async fn search(
@@ -715,6 +801,65 @@ impl RuntimePackManager {
         self.refresh_host_capabilities().await;
         let list = self.list().await?;
         self.resolve_from_snapshot(model, explicit, settings, Some(engine_id), &list)
+    }
+
+    /// Applies the normal runtime-selection and compatibility authority to a
+    /// previously captured read-only local inspection.
+    pub fn resolve_from_local_inspection(
+        &self,
+        model: &ModelArtifact,
+        engine_id: Option<&str>,
+        settings: Option<&norted_core::ResolvedSettings>,
+        inspection: &RuntimeLocalInspection,
+    ) -> Result<RuntimeSelection, RuntimePackError> {
+        if let Some(error) = &inspection.store_error {
+            return Err(RuntimePackError::Selection(format!(
+                "runtime store is unavailable: {error}"
+            )));
+        }
+        let selections = inspection.selections.clone().ok_or_else(|| {
+            RuntimePackError::Selection(format!(
+                "runtime selections are unavailable: {}",
+                inspection
+                    .selections_error
+                    .as_deref()
+                    .unwrap_or("unknown error")
+            ))
+        })?;
+        let list = RuntimeListSnapshot {
+            host: inspection.host.clone(),
+            selections,
+            installed: inspection.installed.clone(),
+            warnings: inspection
+                .store_issues
+                .iter()
+                .map(|issue| issue.message.clone())
+                .chain(inspection.adapter_warnings.iter().cloned())
+                .collect(),
+        };
+        self.resolve_from_snapshot(model, None, settings, engine_id, &list)
+    }
+
+    /// Resolves a runtime from a read-only inspection and applies the exact
+    /// adapter/runtime settings contract without rescanning or initializing
+    /// any store state.
+    pub async fn settings_schema_from_local_inspection(
+        &self,
+        model: &ModelArtifact,
+        engine_id: &str,
+        settings: Option<&norted_core::ResolvedSettings>,
+        inspection: &RuntimeLocalInspection,
+    ) -> Result<(RuntimeSelection, norted_core::SettingsSchema), RuntimePackError> {
+        let selection =
+            self.resolve_from_local_inspection(model, Some(engine_id), settings, inspection)?;
+        let adapter = self.registry.get(engine_id).ok_or_else(|| {
+            RuntimePackError::Selection(format!("bound engine `{engine_id}` is not registered"))
+        })?;
+        let schema = adapter
+            .settings_schema(&selection.runtime, model, &inspection.host)
+            .await
+            .map_err(RuntimePackError::Adapter)?;
+        Ok((selection, schema))
     }
 
     fn resolve_from_snapshot(
