@@ -319,8 +319,8 @@ pub async fn run(
                     &model_library_results,
                     &mut refreshed_installed_jobs,
                 );
-                let load_changed = app.advance_load_animation();
-                if has_live_downloads || load_changed {
+                let animation_changed = app.advance_ui_animation(layout.has_active_marquee(&app));
+                if has_live_downloads || animation_changed {
                     Update::Render
                 } else {
                     Update::None

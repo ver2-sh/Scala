@@ -2,6 +2,8 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::{Glyphs, Theme};
 use norted_engine::BackendLoadProgress;
@@ -38,14 +40,21 @@ pub fn section_title<'a>(title: &'a str, subtitle: &'a str, theme: &Theme) -> Pa
     .wrap(Wrap { trim: true })
 }
 
-pub fn content_layout(area: Rect) -> std::rc::Rc<[Rect]> {
+pub fn content_layout(area: Rect, compact: bool) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3)])
+        .constraints([
+            Constraint::Length(if compact { 3 } else { 4 }),
+            Constraint::Min(3),
+        ])
         .split(area)
 }
 
 pub fn render_empty(frame: &mut Frame<'_>, area: Rect, title: &str, detail: &str, theme: &Theme) {
+    let area = area.inner(ratatui::layout::Margin {
+        horizontal: u16::from(area.width >= 72) * 2,
+        vertical: u16::from(area.height >= 8),
+    });
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(title, theme.text)),
@@ -73,14 +82,18 @@ pub fn hint<'a>(key: &'a str, label: &'a str, theme: &Theme) -> Vec<Span<'a>> {
     ]
 }
 
-pub fn popup_block<'a>(title: &'a str, theme: &Theme, glyphs: &Glyphs) -> Block<'a> {
+pub fn popup_block<'a>(title: &'a str, theme: &Theme, glyphs: &Glyphs, compact: bool) -> Block<'a> {
     Block::default()
         .title(Span::styled(title, theme.accent))
         .borders(Borders::ALL)
         .border_set(glyphs.border)
         .border_style(theme.border)
         .style(theme.panel)
-        .padding(Padding::horizontal(1))
+        .padding(if compact {
+            Padding::horizontal(1)
+        } else {
+            Padding::new(2, 2, 1, 1)
+        })
 }
 
 pub fn centered_message(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'_>>) {
@@ -99,22 +112,163 @@ pub fn centered_message(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'_>>)
 }
 
 pub fn truncate_middle(text: &str, max_width: usize, ellipsis: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max_width {
+    if UnicodeWidthStr::width(text) <= max_width {
         return text.to_owned();
     }
-    let ellipsis_width = ellipsis.chars().count();
+    let ellipsis_width = UnicodeWidthStr::width(ellipsis);
     if max_width <= ellipsis_width {
-        return chars[..max_width].iter().collect();
+        return display_prefix(ellipsis, max_width);
     }
     let keep = max_width - ellipsis_width;
     let front = keep / 2;
     let back = keep - front;
     format!(
         "{}{ellipsis}{}",
-        chars[..front].iter().collect::<String>(),
-        chars[chars.len() - back..].iter().collect::<String>()
+        display_prefix(text, front),
+        display_suffix(text, back)
     )
+}
+
+/// Returns a single-line viewport which reveals an overflowing read-only value.
+///
+/// The first and last views are held for a few animation steps. Movement only
+/// begins on grapheme boundaries, so combining marks and wide glyphs never get
+/// split during scrolling.
+pub fn marquee_text(text: &str, max_width: usize, animation_frame: u32) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_owned();
+    }
+
+    let graphemes = UnicodeSegmentation::graphemes(text, true).collect::<Vec<_>>();
+    let mut views = Vec::with_capacity(graphemes.len());
+    for start in 0..graphemes.len() {
+        let mut width: usize = 0;
+        let mut view = String::new();
+        for grapheme in &graphemes[start..] {
+            let grapheme_width = UnicodeWidthStr::width(*grapheme);
+            if width.saturating_add(grapheme_width) > max_width {
+                break;
+            }
+            view.push_str(grapheme);
+            width = width.saturating_add(grapheme_width);
+        }
+        if !view.is_empty() && views.last() != Some(&view) {
+            views.push(view);
+        }
+        if graphemes[start..]
+            .iter()
+            .map(|grapheme| UnicodeWidthStr::width(*grapheme))
+            .sum::<usize>()
+            <= max_width
+        {
+            break;
+        }
+    }
+    let Some(last_index) = views.len().checked_sub(1) else {
+        return String::new();
+    };
+
+    const START_HOLD: usize = 4;
+    const END_HOLD: usize = 3;
+    let cycle = START_HOLD + last_index + END_HOLD;
+    let phase = (animation_frame as usize) % cycle.max(1);
+    let index = phase.saturating_sub(START_HOLD).min(last_index);
+    views[index].clone()
+}
+
+pub fn needs_marquee(text: &str, max_width: u16) -> bool {
+    UnicodeWidthStr::width(text) > max_width as usize
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct InputWindow {
+    pub text: String,
+    pub cursor_column: u16,
+}
+
+/// Windows editable text around its cursor without allowing animation to move it.
+pub fn input_window(text: &str, cursor: usize, max_width: usize) -> InputWindow {
+    if max_width == 0 {
+        return InputWindow {
+            text: String::new(),
+            cursor_column: 0,
+        };
+    }
+    let cursor_byte = text
+        .char_indices()
+        .nth(cursor.min(text.chars().count()))
+        .map_or(text.len(), |(index, _)| index);
+    let prefix = &text[..cursor_byte];
+    let suffix = &text[cursor_byte..];
+    let full_width = UnicodeWidthStr::width(text);
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    if full_width < max_width || (full_width == max_width && prefix_width < max_width) {
+        return InputWindow {
+            text: text.to_owned(),
+            cursor_column: prefix_width as u16,
+        };
+    }
+
+    let before_budget = prefix_width.min(max_width.saturating_sub(1));
+    let before = display_suffix(prefix, before_budget);
+    let before_width = UnicodeWidthStr::width(before.as_str());
+    let after = display_prefix(suffix, max_width.saturating_sub(before_width));
+    InputWindow {
+        text: before + &after,
+        cursor_column: before_width as u16,
+    }
+}
+
+pub fn marked_input_window(text: &str, cursor: usize, max_width: usize, marker: &str) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let cursor = cursor.min(text.chars().count());
+    let byte = text
+        .char_indices()
+        .nth(cursor)
+        .map_or(text.len(), |(index, _)| index);
+    let marked = format!("{}{marker}{}", &text[..byte], &text[byte..]);
+    input_window(&marked, cursor, max_width).text
+}
+
+fn display_prefix(text: &str, max_width: usize) -> String {
+    let mut width: usize = 0;
+    UnicodeSegmentation::graphemes(text, true)
+        .take_while(|grapheme| {
+            let next = width.saturating_add(UnicodeWidthStr::width(*grapheme));
+            if next > max_width {
+                false
+            } else {
+                width = next;
+                true
+            }
+        })
+        .collect()
+}
+
+fn display_suffix(text: &str, max_width: usize) -> String {
+    let graphemes = UnicodeSegmentation::graphemes(text, true).collect::<Vec<_>>();
+    let mut width: usize = 0;
+    let start = graphemes
+        .iter()
+        .enumerate()
+        .rev()
+        .take_while(|(_, grapheme)| {
+            let next = width.saturating_add(UnicodeWidthStr::width(**grapheme));
+            if next > max_width {
+                false
+            } else {
+                width = next;
+                true
+            }
+        })
+        .last()
+        .map_or(graphemes.len(), |(index, _)| index);
+    graphemes[start..].concat()
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -431,5 +585,54 @@ mod tests {
         let progress = BackendLoadProgress::indeterminate(BackendLoadPhase::LoadingModel);
         let compact = load_progress_compact(&progress, 3, 40, &ascii_glyphs());
         assert!(!compact.contains('\u{2500}'));
+    }
+
+    #[test]
+    fn marquee_holds_scrolls_reaches_the_end_and_resets() {
+        assert_eq!(marquee_text("abcdef", 3, 0), "abc");
+        assert_eq!(marquee_text("abcdef", 3, 4), "abc");
+        assert_eq!(marquee_text("abcdef", 3, 5), "bcd");
+        assert_eq!(marquee_text("abcdef", 3, 7), "def");
+        assert_eq!(marquee_text("abcdef", 3, 9), "def");
+        assert_eq!(marquee_text("abcdef", 3, 10), "abc");
+    }
+
+    #[test]
+    fn marquee_is_display_width_aware_and_safe_at_tiny_widths() {
+        let text = "a界e\u{301}z";
+        assert_eq!(marquee_text(text, 0, 20), "");
+        for width in 1..=5 {
+            for frame in 0..20 {
+                let view = marquee_text(text, width, frame);
+                assert!(UnicodeWidthStr::width(view.as_str()) <= width);
+                assert!(!view.starts_with('\u{301}'));
+            }
+        }
+    }
+
+    #[test]
+    fn fitting_marquee_text_never_animates() {
+        for frame in 0..100 {
+            assert_eq!(marquee_text("界a", 3, frame), "界a");
+        }
+    }
+
+    #[test]
+    fn editable_window_keeps_a_unicode_cursor_visible() {
+        let end = input_window("ab界cdef", 7, 5);
+        assert!(end.cursor_column < 5);
+        assert!(UnicodeWidthStr::width(end.text.as_str()) <= 5);
+        assert!(end.text.ends_with("cdef"));
+
+        let middle = input_window("ab界cdef", 3, 4);
+        assert!(middle.cursor_column < 4);
+        assert!(UnicodeWidthStr::width(middle.text.as_str()) <= 4);
+    }
+
+    #[test]
+    fn middle_truncation_respects_wide_graphemes() {
+        let value = truncate_middle("ab界cd", 5, "…");
+        assert!(UnicodeWidthStr::width(value.as_str()) <= 5);
+        assert!(value.contains('…'));
     }
 }

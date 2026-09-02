@@ -1,13 +1,16 @@
 use ratatui::Frame;
+use ratatui::layout::Margin;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Clear, List, ListItem, Paragraph};
 
 use crate::app::{App, Overlay};
 use crate::theme::{Glyphs, Theme};
-use crate::ui::components::{ActionState, action_style, popup_block};
+use crate::ui::components::{
+    ActionState, action_style, marquee_text, popup_block, truncate_middle,
+};
 use crate::ui::layout::{HoverTarget, UiLayout};
-use crate::ui::screens::help_lines;
+use crate::ui::screens::render_help_body;
 
 pub fn render_overlays(
     frame: &mut Frame<'_>,
@@ -21,12 +24,13 @@ pub fn render_overlays(
             return;
         };
         frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(help_lines(theme, glyphs))
-                .block(popup_block(" Help ", theme, glyphs))
-                .wrap(Wrap { trim: true }),
-            area,
-        );
+        frame.render_widget(popup_block(" Help ", theme, glyphs, layout.compact), area);
+        let mut body = area.inner(Margin {
+            horizontal: if layout.compact { 2 } else { 3 },
+            vertical: if layout.compact { 1 } else { 2 },
+        });
+        body.height = body.height.saturating_sub(1);
+        render_help_body(frame, body, theme, glyphs, layout.compact);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "[ Close ]",
@@ -58,6 +62,13 @@ pub fn render_overlays(
         .enumerate()
         .map(|(visible_index, command)| {
             let index = app.suggestion_scroll + visible_index;
+            let row_width = layout
+                .suggestion_rows
+                .get(visible_index)
+                .map_or(0, |(_, row)| row.width as usize);
+            let name_width = if layout.compact { 12 } else { 18 };
+            let name = format!("{:<name_width$}  ", command.name);
+            let description_width = row_width.saturating_sub(name.len());
             let mut style = if index == app.suggestion_index {
                 theme.selected
             } else {
@@ -66,9 +77,20 @@ pub fn render_overlays(
             if app.hover == Some(HoverTarget::CommandSuggestion(index)) {
                 style = style.patch(theme.hovered);
             }
+            let description = if index == app.suggestion_index
+                || app.hover == Some(HoverTarget::CommandSuggestion(index))
+            {
+                marquee_text(
+                    command.description,
+                    description_width,
+                    app.ui_animation_frame / 3,
+                )
+            } else {
+                truncate_middle(command.description, description_width, glyphs.ellipsis)
+            };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{:<12}", command.name), theme.accent),
-                Span::styled(command.description, theme.muted),
+                Span::styled(name, theme.accent),
+                Span::styled(description, theme.muted),
             ]))
             .style(style)
         });
@@ -79,7 +101,7 @@ pub fn render_overlays(
         (false, false) => " Commands ",
     };
     frame.render_widget(
-        List::new(items).block(popup_block(title, theme, glyphs)),
+        List::new(items).block(popup_block(title, theme, glyphs, layout.compact)),
         area,
     );
 }

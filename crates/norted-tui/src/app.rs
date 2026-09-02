@@ -374,7 +374,7 @@ pub struct App {
     pub settings_validation_error: Option<String>,
     pub settings_input: Option<SettingsInput>,
     pub profile_engine_selection: Option<ProfileEngineSelection>,
-    pub load_animation_frame: u32,
+    pub ui_animation_frame: u32,
     focus_before_command: FocusArea,
     pending_control_action: Option<ControlAction>,
     active_control_action: Option<ControlAction>,
@@ -489,7 +489,7 @@ impl App {
             settings_validation_error: None,
             settings_input: None,
             profile_engine_selection: None,
-            load_animation_frame: 0,
+            ui_animation_frame: 0,
             focus_before_command: FocusArea::Navigation,
             pending_control_action: None,
             active_control_action: None,
@@ -809,19 +809,19 @@ impl App {
         (control.loading_backend()?.model_id == selected.id).then_some(progress)
     }
 
-    pub fn advance_load_animation(&mut self) -> bool {
+    pub fn advance_ui_animation(&mut self, marquee_active: bool) -> bool {
         let indeterminate = self
             .load_progress()
             .is_some_and(|progress| progress.fraction.is_none());
-        if !indeterminate {
-            if self.load_animation_frame != 0 {
-                self.load_animation_frame = 0;
+        if !indeterminate && !marquee_active {
+            if self.ui_animation_frame != 0 {
+                self.ui_animation_frame = 0;
                 return true;
             }
             return false;
         }
-        self.load_animation_frame = self.load_animation_frame.wrapping_add(1);
-        true
+        self.ui_animation_frame = self.ui_animation_frame.wrapping_add(1);
+        indeterminate || (marquee_active && self.ui_animation_frame % 3 == 0)
     }
 
     pub fn take_control_action(&mut self) -> Option<ControlAction> {
@@ -943,6 +943,23 @@ impl App {
                     .map(move |artifact| (repository, artifact))
             })
             .collect()
+    }
+
+    pub fn model_search_artifact(
+        &self,
+        index: usize,
+    ) -> Option<(&CatalogRepository, &CatalogFile)> {
+        self.model_search
+            .as_ref()?
+            .repositories
+            .iter()
+            .flat_map(|repository| {
+                repository
+                    .artifacts
+                    .iter()
+                    .map(move |artifact| (repository, artifact))
+            })
+            .nth(index)
     }
 
     pub fn model_removal_busy(&self) -> bool {
@@ -4388,6 +4405,7 @@ mod tests {
         RegistryState, ServerState, SettingCategory, SettingDefinition, SettingId, SettingKind,
         SettingScope, SettingsSchema,
     };
+    use ratatui::{Terminal, backend::TestBackend};
 
     use super::{
         App, Overlay, ProfileEngineSelection, Screen, SettingsAction, SettingsScope,
@@ -4538,7 +4556,7 @@ mod tests {
             ProfileEngineSelection {
                 id: ModelProfileId::new("quality").expect("profile ID"),
                 display_name: "Quality".to_owned(),
-                model: Box::new(model),
+                model: Box::new(model.clone()),
                 engines: vec![
                     EngineId::new("fake-a").expect("engine ID"),
                     EngineId::new("fake-b").expect("engine ID"),
@@ -4547,10 +4565,46 @@ mod tests {
             },
         ));
         assert_eq!(app.overlay, Some(Overlay::ProfileEngine));
+        for (width, height) in [(120, 40), (100, 30), (83, 27), (46, 13)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    crate::ui::render(frame, &app);
+                })
+                .expect("profile engine render");
+            let content = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(content.contains("Choose"));
+        }
 
         app.handle_profile_engine_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_profile_engine_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.overlay, None);
+
+        app.snapshot.models.push(model);
+        app.selected_model = Some(0);
+        app.overlay = Some(Overlay::ModelRuntime);
+        for (width, height) in [(120, 40), (100, 30), (83, 27), (46, 13)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    crate::ui::render(frame, &app);
+                })
+                .expect("model runtime render");
+            let content = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(content.contains("Model runtime"));
+        }
         assert!(matches!(
             app.take_settings_action(),
             Some(SettingsAction::CreateProfile {

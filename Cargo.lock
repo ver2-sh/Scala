@@ -1620,6 +1620,7 @@ dependencies = [
  "norted-model-library",
  "ratatui",
  "tokio",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

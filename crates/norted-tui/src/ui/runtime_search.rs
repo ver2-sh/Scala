@@ -3,12 +3,12 @@ use ratatui::Frame;
 use ratatui::layout::Position;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
-use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Overlay, RuntimeSearchFocus};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{
-    ActionState, KEY_COLUMN, action_style, format_bytes, key_value, popup_block,
+    ActionState, KEY_COLUMN, action_style, format_bytes, input_window, key_value, marquee_text,
+    popup_block, truncate_middle,
 };
 use crate::ui::layout::{HoverTarget, UiLayout};
 use crate::ui::screens::compatibility_label;
@@ -33,7 +33,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         " Runtime search ".to_owned()
     };
     frame.render_widget(Clear, area);
-    frame.render_widget(popup_block(&title, theme, glyphs), area);
+    frame.render_widget(popup_block(&title, theme, glyphs, layout.compact), area);
 
     let query_style = if app.runtime_search_focus == RuntimeSearchFocus::Query {
         theme.focused
@@ -51,9 +51,14 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             ),
         ])
     } else {
+        let window = input_window(
+            &app.runtime_search_query,
+            app.runtime_search_cursor,
+            layout.runtime_search_input.width.saturating_sub(8) as usize,
+        );
         Line::from(vec![
             Span::styled("Search  ", theme.accent),
-            Span::styled(&app.runtime_search_query, query_style),
+            Span::styled(window.text, query_style),
         ])
     };
     frame.render_widget(Paragraph::new(query), layout.runtime_search_input);
@@ -163,7 +168,7 @@ fn render_results(
         return;
     }
 
-    let items = layout.runtime_search_rows.iter().map(|(index, _)| {
+    let items = layout.runtime_search_rows.iter().map(|(index, row)| {
         let result = &search.results[*index];
         let available = &result.entry.available;
         let (compatibility, compatibility_style) =
@@ -197,10 +202,22 @@ fn render_results(
         if app.hover == Some(HoverTarget::RuntimeSearchResult(*index)) {
             style = style.patch(theme.hovered);
         }
-        ListItem::new(vec![
+        let active_row = app.selected_runtime_search_result == Some(*index)
+            || app.hover == Some(HoverTarget::RuntimeSearchResult(*index));
+        let name_width = row.width.saturating_sub(3 + compatibility.len() as u16 + 2) as usize;
+        let display_name = if active_row {
+            marquee_text(
+                &available.display_name,
+                name_width,
+                app.ui_animation_frame / 3,
+            )
+        } else {
+            truncate_middle(&available.display_name, name_width, glyphs.ellipsis)
+        };
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled(format!("{marker}  "), marker_style),
-                Span::styled(&available.display_name, theme.text),
+                Span::styled(display_name, theme.text),
                 Span::styled(format!("  {compatibility}"), compatibility_style),
             ]),
             Line::from(vec![
@@ -220,8 +237,11 @@ fn render_results(
                     theme.success,
                 ),
             ]),
-        ])
-        .style(style)
+        ];
+        if layout.overlay_row_height > 2 {
+            lines.push(Line::default());
+        }
+        ListItem::new(lines).style(style)
     });
     frame.render_widget(List::new(items), layout.runtime_search_results);
 }
@@ -263,6 +283,16 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
         .repository
         .as_deref()
         .unwrap_or(available.source_url.as_str());
+    let detail_value_width = layout
+        .runtime_search_details
+        .width
+        .saturating_sub(KEY_COLUMN as u16 + 1) as usize;
+    let source = marquee_text(source, detail_value_width, app.ui_animation_frame / 3);
+    let display_name = marquee_text(
+        &available.display_name,
+        layout.runtime_search_details.width as usize,
+        app.ui_animation_frame / 3,
+    );
     let target = format!("{} / {}", identity.platform, identity.architecture);
     let backend = format!("{} / {}", identity.accelerator, identity.variant);
     let (acquisition, size) = match available.download_size_bytes() {
@@ -271,7 +301,7 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
     };
     let selected_for = result.selected_for.join(", ");
     let mut lines = vec![
-        Line::from(Span::styled(&available.display_name, theme.text)),
+        Line::from(Span::styled(display_name, theme.text)),
         key_value("ENGINE", &identity.engine_id, theme),
         key_value("VERSION", &identity.version, theme),
         key_value("TARGET", &target, theme),
@@ -280,7 +310,7 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
         key_value("ACQUIRE", acquisition, theme),
         key_value("SIZE", &size, theme),
         key_value("PROVIDER", provider, theme),
-        key_value("SOURCE", source, theme),
+        key_value("SOURCE", &source, theme),
         Line::from(vec![
             Span::styled(format!("{:<KEY_COLUMN$} ", "FIT"), theme.hint),
             Span::styled(compatibility, compatibility_style),
@@ -442,10 +472,16 @@ fn render_action(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLay
         layout.runtime_overlay_cancel,
     );
     if let Some(progress) = &app.runtime_operation {
+        let phase = progress.phase;
+        let progress = progress_text(progress);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                progress_text(progress),
-                phase_style(progress.phase, theme),
+                marquee_text(
+                    &progress,
+                    layout.runtime_operation_status.width as usize,
+                    app.ui_animation_frame / 3,
+                ),
+                phase_style(phase, theme),
             ))),
             layout.runtime_operation_status,
         );
@@ -523,18 +559,16 @@ fn set_cursor(frame: &mut Frame<'_>, app: &App, layout: &UiLayout) {
     if app.runtime_search_focus != RuntimeSearchFocus::Query {
         return;
     }
-    let byte_index = app
-        .runtime_search_query
-        .char_indices()
-        .nth(app.runtime_search_cursor)
-        .map(|(index, _)| index)
-        .unwrap_or(app.runtime_search_query.len());
-    let prefix_width = UnicodeWidthStr::width(&app.runtime_search_query[..byte_index]) as u16;
+    let window = input_window(
+        &app.runtime_search_query,
+        app.runtime_search_cursor,
+        layout.runtime_search_input.width.saturating_sub(8) as usize,
+    );
     let cursor_x = layout
         .runtime_search_input
         .x
         .saturating_add(8)
-        .saturating_add(prefix_width)
+        .saturating_add(window.cursor_column)
         .min(layout.runtime_search_input.right().saturating_sub(1));
     frame.set_cursor_position(Position::new(cursor_x, layout.runtime_search_input.y));
 }

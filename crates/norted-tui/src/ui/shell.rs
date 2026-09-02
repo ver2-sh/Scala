@@ -2,11 +2,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
-use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, FocusArea, ModelLibraryView, Screen};
 use crate::theme::{Glyphs, Theme};
-use crate::ui::components::{centered_message, hint};
+use crate::ui::components::{centered_message, hint, input_window, marquee_text};
 use crate::ui::layout::{HoverTarget, UiLayout};
 
 pub const MIN_WIDTH: u16 = 46;
@@ -47,7 +46,7 @@ pub fn render_header(
         .constraints(if layout.compact {
             [Constraint::Length(1), Constraint::Length(3)]
         } else {
-            [Constraint::Length(2), Constraint::Length(2)]
+            [Constraint::Length(2), Constraint::Length(3)]
         })
         .split(area);
     let top = Layout::default()
@@ -131,12 +130,24 @@ pub fn render_command_bar(
         if app.command_input.is_empty() {
             Line::from(Span::styled("Type a /command", theme.hint))
         } else {
-            Line::from(Span::styled(&app.command_input, theme.command))
+            let window = input_window(
+                &app.command_input,
+                app.command_cursor,
+                area.width.saturating_sub(4) as usize,
+            );
+            Line::from(Span::styled(window.text, theme.command))
         }
     } else if let Some(notice) = &app.notice {
         Line::from(vec![
             Span::styled("!  ", theme.warning),
-            Span::styled(notice, theme.text),
+            Span::styled(
+                marquee_text(
+                    notice,
+                    area.width.saturating_sub(7) as usize,
+                    app.ui_animation_frame / 3,
+                ),
+                theme.text,
+            ),
         ])
     } else {
         Line::from(vec![
@@ -335,17 +346,15 @@ pub fn set_command_cursor(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if !app.command_active {
         return;
     }
-    let byte_index = app
-        .command_input
-        .char_indices()
-        .nth(app.command_cursor)
-        .map(|(index, _)| index)
-        .unwrap_or(app.command_input.len());
-    let prefix_width = UnicodeWidthStr::width(&app.command_input[..byte_index]) as u16;
+    let window = input_window(
+        &app.command_input,
+        app.command_cursor,
+        area.width.saturating_sub(4) as usize,
+    );
     let cursor_x = area
         .x
         .saturating_add(2)
-        .saturating_add(prefix_width)
+        .saturating_add(window.cursor_column)
         .min(area.right().saturating_sub(2));
     frame.set_cursor_position(Position::new(cursor_x, area.y + 1));
 }

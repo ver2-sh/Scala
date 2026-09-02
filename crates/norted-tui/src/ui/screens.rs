@@ -6,12 +6,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, ModelLibraryView, Screen};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{
-    ActionState, action_style, content_layout, format_bytes, key_value, load_progress_compact,
-    render_empty, render_load_progress, section_title, truncate_middle,
+    ActionState, KEY_COLUMN, action_style, content_layout, format_bytes, key_value,
+    load_progress_compact, marked_input_window, marquee_text, render_empty, render_load_progress,
+    section_title, truncate_middle,
 };
 use crate::ui::layout::{
     HoverTarget, InstalledModelAction, ModelProfileAction, SelectedRuntimeAction, UiLayout,
@@ -34,7 +36,7 @@ pub fn render_screen(
         Screen::Server => render_server(frame, area, app, theme, glyphs, ui_layout),
         Screen::Logs => render_logs(frame, area, app, theme, ui_layout),
         Screen::Settings => render_settings(frame, area, app, theme, ui_layout),
-        Screen::Help => render_help_content(frame, area, theme, glyphs),
+        Screen::Help => render_help_content(frame, area, theme, glyphs, ui_layout),
     }
 }
 
@@ -46,7 +48,7 @@ fn render_overview(
     glyphs: &Glyphs,
     ui_layout: &UiLayout,
 ) {
-    let title = content_layout(area)[0];
+    let title = content_layout(area, ui_layout.compact)[0];
     frame.render_widget(
         section_title(
             "Overview",
@@ -66,7 +68,7 @@ fn render_overview(
     if let Some(progress) = app.load_progress() {
         let compact_line = load_progress_compact(
             progress,
-            app.load_animation_frame,
+            app.ui_animation_frame,
             ui_layout.overview_progress.width,
             glyphs,
         );
@@ -228,7 +230,7 @@ fn render_metrics(
                     .borders(Borders::LEFT)
                     .border_set(glyphs.border)
                     .border_style(theme.accent)
-                    .padding(Padding::horizontal(1)),
+                    .padding(Padding::new(2, 1, 1, 0)),
             ),
             columns[index],
         );
@@ -357,10 +359,7 @@ fn render_model_header(
         field_style = field_style.patch(theme.hovered);
     }
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("[{query:<query_width$}]"),
-            field_style,
-        ))),
+        Paragraph::new(Line::from(Span::styled(format!("[{query}]"), field_style))),
         ui_layout.model_search_field,
     );
 
@@ -383,33 +382,8 @@ fn render_model_header(
     );
 }
 
-fn editable_query_text(query: &str, cursor: usize, max_width: usize, ellipsis: &str) -> String {
-    let mut characters = query.chars().collect::<Vec<_>>();
-    let marker = cursor.min(characters.len());
-    characters.insert(marker, '_');
-    if characters.len() <= max_width {
-        return characters.into_iter().collect();
-    }
-
-    let ellipsis_width = ellipsis.chars().count();
-    let window_width = max_width
-        .saturating_sub(ellipsis_width.saturating_mul(2))
-        .max(1);
-    let mut start = marker.saturating_sub(window_width / 2);
-    let mut end = (start + window_width).min(characters.len());
-    if marker >= end {
-        end = (marker + 1).min(characters.len());
-        start = end.saturating_sub(window_width);
-    }
-    let mut visible = String::new();
-    if start > 0 {
-        visible.push_str(ellipsis);
-    }
-    visible.extend(characters[start..end].iter());
-    if end < characters.len() {
-        visible.push_str(ellipsis);
-    }
-    visible
+fn editable_query_text(query: &str, cursor: usize, max_width: usize, _ellipsis: &str) -> String {
+    marked_input_window(query, cursor, max_width, "_")
 }
 
 fn render_models(
@@ -420,7 +394,7 @@ fn render_models(
     glyphs: &Glyphs,
     ui_layout: &UiLayout,
 ) {
-    let layout = content_layout(area);
+    let layout = content_layout(area, ui_layout.compact);
     render_model_header(frame, app, theme, glyphs, ui_layout, layout[0]);
     if app.model_library_view == ModelLibraryView::Discover {
         render_model_discover(frame, app, theme, glyphs, ui_layout);
@@ -461,7 +435,7 @@ fn render_models(
         );
         return;
     }
-    let items = ui_layout.model_rows.iter().map(|(index, _)| {
+    let items = ui_layout.model_rows.iter().map(|(index, row)| {
         let model = &app.snapshot.models[*index];
         let runtime_override = app.runtime_list.as_ref().and_then(|snapshot| {
             let runtime_id = snapshot.selections.model_overrides.get(&model.id)?;
@@ -484,7 +458,33 @@ fn render_models(
         if app.hover == Some(HoverTarget::Model(*index)) {
             style = style.patch(theme.hovered);
         }
-        ListItem::new(vec![
+        let active_row =
+            app.selected_model == Some(*index) || app.hover == Some(HoverTarget::Model(*index));
+        let primary_width = row.width.saturating_sub(3) as usize * 3 / 5;
+        let model_name = if active_row {
+            marquee_text(
+                &model.display_name,
+                primary_width,
+                app.ui_animation_frame / 3,
+            )
+        } else {
+            truncate_middle(&model.display_name, primary_width, glyphs.ellipsis)
+        };
+        let override_width = (row.width as usize).saturating_sub(
+            3 + UnicodeWidthStr::width(model_name.as_str())
+                + 2
+                + UnicodeWidthStr::width(model.format.as_str()),
+        );
+        let runtime_override = runtime_override
+            .map(|runtime| {
+                truncate_middle(
+                    &format!("  override: {runtime}"),
+                    override_width,
+                    glyphs.ellipsis,
+                )
+            })
+            .unwrap_or_default();
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled(
                     if app.control.as_ref().is_some_and(|control| {
@@ -502,24 +502,20 @@ fn render_models(
                     },
                     theme.success,
                 ),
-                Span::styled(&model.display_name, theme.text),
+                Span::styled(model_name, theme.text),
                 Span::styled(format!("  {}", model.format.as_str()), theme.accent),
-                Span::styled(
-                    runtime_override
-                        .map(|runtime| format!("  override: {runtime}"))
-                        .unwrap_or_default(),
-                    theme.hint,
-                ),
+                Span::styled(runtime_override, theme.hint),
             ]),
             {
                 let size_text = format_bytes(model.size_bytes);
-                let path_width = (ui_layout.model_list.width as usize)
-                    .saturating_sub(size_text.chars().count() + 2);
-                let path = truncate_middle(
-                    &model.path.display().to_string(),
-                    path_width,
-                    glyphs.ellipsis,
-                );
+                let path_width = (row.width as usize)
+                    .saturating_sub(UnicodeWidthStr::width(size_text.as_str()) + 2);
+                let full_path = model.path.display().to_string();
+                let path = if active_row {
+                    marquee_text(&full_path, path_width, app.ui_animation_frame / 3)
+                } else {
+                    truncate_middle(&full_path, path_width, glyphs.ellipsis)
+                };
                 Line::from(vec![
                     Span::styled(size_text, theme.muted),
                     Span::styled(format!("  {path}"), theme.hint),
@@ -539,8 +535,11 @@ fn render_models(
                 ),
                 theme.hint,
             )),
-        ])
-        .style(style)
+        ];
+        if ui_layout.model_row_height > 3 {
+            lines.push(Line::default());
+        }
+        ListItem::new(lines).style(style)
     });
     frame.render_widget(List::new(items), ui_layout.model_list);
     render_installed_model_actions(frame, app, theme, ui_layout);
@@ -549,7 +548,7 @@ fn render_models(
             frame,
             ui_layout.model_progress,
             progress,
-            app.load_animation_frame,
+            app.ui_animation_frame,
             theme,
             glyphs,
         );
@@ -689,7 +688,7 @@ fn render_model_discover(
         );
     } else {
         let artifacts = app.model_search_artifacts();
-        let items = ui_layout.model_rows.iter().map(|(index, _)| {
+        let items = ui_layout.model_rows.iter().map(|(index, row)| {
             let (repository, artifact) = artifacts[*index];
             let mut style = if app.selected_model_search_result == Some(*index) {
                 theme.selected
@@ -699,6 +698,8 @@ fn render_model_discover(
             if app.hover == Some(HoverTarget::Model(*index)) {
                 style = style.patch(theme.hovered);
             }
+            let active_row = app.selected_model_search_result == Some(*index)
+                || app.hover == Some(HoverTarget::Model(*index));
             let size = artifact
                 .size_bytes
                 .map(format_bytes)
@@ -718,10 +719,20 @@ fn render_model_discover(
                 .map_or(0, |(_, area)| area.width as usize);
             let status_width = (ui_layout.model_list.width as usize)
                 .saturating_sub(action_width.saturating_add(1));
-            ListItem::new(vec![
+            let filename_width = row.width.saturating_sub(9) as usize;
+            let filename = if active_row {
+                marquee_text(
+                    &artifact.filename,
+                    filename_width,
+                    app.ui_animation_frame / 3,
+                )
+            } else {
+                truncate_middle(&artifact.filename, filename_width, glyphs.ellipsis)
+            };
+            let mut lines = vec![
                 Line::from(vec![
                     Span::styled(artifact.format.as_str().to_ascii_uppercase(), theme.accent),
-                    Span::styled(format!("  {}", artifact.filename), theme.text),
+                    Span::styled(format!("  {filename}"), theme.text),
                 ]),
                 Line::from(vec![
                     Span::styled(&repository.repository, theme.text),
@@ -738,8 +749,11 @@ fn render_model_discover(
                     ),
                     theme.hint,
                 )),
-            ])
-            .style(style)
+            ];
+            if ui_layout.model_row_height > 3 {
+                lines.push(Line::default());
+            }
+            ListItem::new(lines).style(style)
         });
         frame.render_widget(List::new(items), ui_layout.model_list);
         for (index, area) in &ui_layout.model_download_actions {
@@ -924,7 +938,7 @@ fn render_runtimes(
     glyphs: &Glyphs,
     ui_layout: &UiLayout,
 ) {
-    let layout = content_layout(area);
+    let layout = content_layout(area, ui_layout.compact);
     let subtitle = if app.runtime_list_loading {
         "Refreshing installed packs in the background"
     } else {
@@ -1020,7 +1034,7 @@ fn render_runtimes(
             theme,
         );
     } else if let Some(snapshot) = &app.runtime_list {
-        let items = ui_layout.runtime_rows.iter().map(|(index, _)| {
+        let items = ui_layout.runtime_rows.iter().map(|(index, row)| {
             let status = &snapshot.installed[*index];
             let manifest = &status.runtime.manifest;
             let identity = &manifest.identity;
@@ -1071,11 +1085,20 @@ fn render_runtimes(
             if app.hover == Some(HoverTarget::Runtime(*index)) {
                 style = style.patch(theme.hovered);
             }
-            ListItem::new(vec![
+            let active_row = app.selected_runtime == Some(*index)
+                || app.hover == Some(HoverTarget::Runtime(*index));
+            let identity_text = format!("{}  {}", identity.engine_id, identity.version);
+            let identity_width =
+                row.width.saturating_sub(3 + compatibility.len() as u16 + 2) as usize;
+            let identity_text = if active_row {
+                marquee_text(&identity_text, identity_width, app.ui_animation_frame / 3)
+            } else {
+                truncate_middle(&identity_text, identity_width, glyphs.ellipsis)
+            };
+            let mut lines = vec![
                 Line::from(vec![
                     Span::styled(format!("{}  ", glyphs.running), theme.success),
-                    Span::styled(&identity.engine_id, theme.text),
-                    Span::styled(format!("  {}", identity.version), theme.accent),
+                    Span::styled(identity_text, theme.text),
                     Span::styled(format!("  {compatibility}"), compatibility_style),
                 ]),
                 Line::from(vec![
@@ -1087,8 +1110,11 @@ fn render_runtimes(
                     Span::styled(update, theme.warning),
                     Span::styled(source_build, theme.hint),
                 ]),
-            ])
-            .style(style)
+            ];
+            if ui_layout.runtime_row_height > 2 {
+                lines.push(Line::default());
+            }
+            ListItem::new(lines).style(style)
         });
         frame.render_widget(List::new(items), ui_layout.runtime_list);
     }
@@ -1295,7 +1321,7 @@ fn render_server(
     glyphs: &Glyphs,
     ui_layout: &UiLayout,
 ) {
-    let layout = content_layout(area);
+    let layout = content_layout(area, ui_layout.compact);
     frame.render_widget(
         section_title(
             "API Server",
@@ -1432,34 +1458,68 @@ fn render_server(
         auth.active_key_count.to_string()
     };
     let exposure = if auth.loopback { "loopback" } else { "remote" };
-    frame.render_widget(
-        Paragraph::new(vec![
+    let configured_auth = auth.configured_mode.to_string();
+    let effective_auth = auth.effective_mode.to_string();
+    let value_width = ui_layout
+        .server_details
+        .width
+        .saturating_sub(KEY_COLUMN as u16 + 1) as usize;
+    let endpoint = marquee_text(endpoint, value_width, app.ui_animation_frame / 3);
+    let active_profile = marquee_text(&active_profile, value_width, app.ui_animation_frame / 3);
+    let bind = marquee_text(&auth.bind, value_width, app.ui_animation_frame / 3);
+    let active_model = marquee_text(&active_model, value_width, app.ui_animation_frame / 3);
+    let active_engine = marquee_text(&active_engine, value_width, app.ui_animation_frame / 3);
+    let active_runtime = marquee_text(&active_runtime, value_width, app.ui_animation_frame / 3);
+    let private_backend = marquee_text(&private_backend, value_width, app.ui_animation_frame / 3);
+    let security = if auth.insecure_remote {
+        Line::from(Span::styled(
+            "SECURITY WARNING: remote authentication is disabled",
+            theme.error,
+        ))
+    } else if let Some(error) = &app.public_auth_error {
+        Line::from(Span::styled(
+            format!("AUTH STATE UNAVAILABLE: {error}"),
+            theme.error,
+        ))
+    } else {
+        Line::default()
+    };
+    let lines = if ui_layout.server_details.height < 20 {
+        vec![
             key_value("STATE", app.snapshot.server.label(), theme),
-            key_value("ENDPOINT", endpoint, theme),
+            key_value("ENDPOINT", &endpoint, theme),
             key_value("PROFILES", &active_profile, theme),
-            key_value("PUBLIC BIND", &auth.bind, theme),
             key_value("EXPOSURE", exposure, theme),
-            key_value("AUTH CONFIGURED", &auth.configured_mode.to_string(), theme),
-            key_value("AUTH EFFECTIVE", &auth.effective_mode.to_string(), theme),
+            key_value("AUTH EFFECTIVE", &effective_auth, theme),
+            key_value("RESIDENCY", &lifecycle, theme),
+            key_value("MODELS", &active_model, theme),
+            key_value("ENGINES", &active_engine, theme),
+            key_value("RUNTIMES", &active_runtime, theme),
+            security,
+            Line::from(Span::styled("Available now", theme.text)),
+            Line::from(Span::styled(
+                "GET  /health    GET  /v1/models",
+                theme.accent,
+            )),
+            Line::from(Span::styled("POST /v1/responses", theme.accent)),
+            Line::from(Span::styled("POST /v1/chat/completions", theme.accent)),
+        ]
+    } else {
+        vec![
+            key_value("STATE", app.snapshot.server.label(), theme),
+            key_value("ENDPOINT", &endpoint, theme),
+            key_value("PROFILES", &active_profile, theme),
+            key_value("PUBLIC BIND", &bind, theme),
+            key_value("EXPOSURE", exposure, theme),
+            key_value("AUTH CONFIGURED", &configured_auth, theme),
+            key_value("AUTH EFFECTIVE", &effective_auth, theme),
             key_value("ACTIVE API KEYS", &active_key_count, theme),
             key_value("RESIDENCY", &lifecycle, theme),
             key_value("MODELS", &active_model, theme),
             key_value("ENGINES", &active_engine, theme),
             key_value("RUNTIMES", &active_runtime, theme),
             key_value("PRIVATE ENDPOINTS", &private_backend, theme),
-            if auth.insecure_remote {
-                Line::from(Span::styled(
-                    "SECURITY WARNING: remote authentication is disabled",
-                    theme.error,
-                ))
-            } else if let Some(error) = &app.public_auth_error {
-                Line::from(Span::styled(
-                    format!("AUTH STATE UNAVAILABLE: {error}"),
-                    theme.error,
-                ))
-            } else {
-                Line::default()
-            },
+            security,
             Line::default(),
             Line::from(Span::styled("Available now", theme.text)),
             Line::from(Span::styled("GET  /health", theme.accent)),
@@ -1470,8 +1530,10 @@ fn render_server(
                 "PRIVATE is the selected engine's internal loopback endpoint.",
                 theme.muted,
             )),
-        ])
-        .wrap(Wrap { trim: true }),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }),
         ui_layout.server_details,
     );
     if let Some(progress) = app.load_progress() {
@@ -1479,7 +1541,7 @@ fn render_server(
             frame,
             ui_layout.server_progress,
             progress,
-            app.load_animation_frame,
+            app.ui_animation_frame,
             theme,
             glyphs,
         );
@@ -1487,7 +1549,7 @@ fn render_server(
 }
 
 fn render_logs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, ui_layout: &UiLayout) {
-    let layout = content_layout(area);
+    let layout = content_layout(area, ui_layout.compact);
     frame.render_widget(
         section_title("Logs", "Application and model-registry warnings", theme),
         layout[0],
@@ -1533,7 +1595,7 @@ fn render_settings(
     theme: &Theme,
     ui_layout: &UiLayout,
 ) {
-    let layout = content_layout(area);
+    let layout = content_layout(area, ui_layout.compact);
     frame.render_widget(
         section_title(
             "Settings",
@@ -1597,7 +1659,7 @@ fn render_model_profiles(
     theme: &Theme,
     ui_layout: &UiLayout,
 ) {
-    let layout = content_layout(area);
+    let layout = content_layout(area, ui_layout.compact);
     frame.render_widget(
         section_title(
             "Model Profiles",
@@ -1641,12 +1703,20 @@ fn render_model_profiles(
         ui_layout.settings_scopes.x,
         ui_layout.settings_scopes.y.saturating_add(1),
         ui_layout.settings_scopes.width,
-        5,
+        if ui_layout.compact { 4 } else { 5 },
     );
     let info = if app.settings_input.is_some() {
         Vec::new()
     } else if let Some(profile) = app.selected_model_profile_value() {
         let model = app.selected_profile_model();
+        let model_path = model
+            .map(|model| model.path.display().to_string())
+            .unwrap_or_default();
+        let model_path = marquee_text(
+            &model_path,
+            info_area.width as usize,
+            app.ui_animation_frame / 3,
+        );
         let definitions = app.settings_definitions();
         let selected_definition = definitions.get(app.settings_setting_index);
         let mut lines = vec![
@@ -1664,12 +1734,7 @@ fn render_model_profiles(
                     },
                 ),
             ]),
-            Line::from(Span::styled(
-                model
-                    .map(|model| model.path.display().to_string())
-                    .unwrap_or_default(),
-                theme.muted,
-            )),
+            Line::from(Span::styled(model_path, theme.muted)),
             Line::from(Span::styled(
                 if app.settings_busy() && app.settings_schema.is_none() {
                     "resolving runtime/model settings…".to_owned()
@@ -1714,6 +1779,9 @@ fn render_model_profiles(
     frame.render_widget(Paragraph::new(info).wrap(Wrap { trim: true }), info_area);
     render_settings_input(frame, app, theme, ui_layout);
     render_model_profile_actions(frame, app, theme, ui_layout);
+    if app.selected_model_profile_value().is_none() {
+        return;
+    }
     render_setting_rows(frame, app, theme, ui_layout);
 }
 
@@ -1732,7 +1800,7 @@ fn render_settings_input(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_lay
         .saturating_sub(prompt.len() as u16 + 4) as usize;
     let field = format!(
         "{prompt}: [{}]",
-        truncate_middle(&format!("{}_", input.text), field_width, "…")
+        marked_input_window(&input.text, input.cursor, field_width, "_")
     );
     let field_style = if app.hover == Some(HoverTarget::SettingsInputField) {
         theme.focused.patch(theme.hovered)
@@ -1964,6 +2032,14 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
             .map(|(_, area)| *area)
             .unwrap_or_default();
         let id_width = value_area.x.saturating_sub(rect.x).saturating_sub(2) as usize;
+        let active_row =
+            app.settings_setting_index == *index || app.hover == Some(HoverTarget::Setting(*index));
+        let setting_id = definition.id.to_string();
+        let id_text = if active_row {
+            marquee_text(&setting_id, id_width, app.ui_animation_frame / 3)
+        } else {
+            truncate_middle(&setting_id, id_width, "…")
+        };
         let lines = vec![
             Line::from(Span::styled(
                 heading,
@@ -1973,20 +2049,23 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
                     theme.muted
                 },
             )),
-            Line::from(vec![Span::styled(
-                format!(
-                    "  {:<id_width$}",
-                    truncate_middle(&definition.id.to_string(), id_width, "…")
-                ),
-                theme.text,
-            )]),
+            Line::from(vec![Span::styled(format!("  {id_text}"), theme.text)]),
         ];
         frame.render_widget(Paragraph::new(lines).style(style), *rect);
         let value_enabled = definition.supported && !app.settings_busy();
         let value_label = format!("[ {value} ]");
+        let value_text = if active_row || app.hover == Some(HoverTarget::SettingValue(*index)) {
+            marquee_text(
+                &value_label,
+                value_area.width as usize,
+                app.ui_animation_frame / 3,
+            )
+        } else {
+            truncate_middle(&value_label, value_area.width as usize, "…")
+        };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                truncate_middle(&value_label, value_area.width as usize, "…"),
+                value_text,
                 action_style(
                     theme,
                     if value_enabled {
@@ -2023,13 +2102,96 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
     }
 }
 
-fn render_help_content(frame: &mut Frame<'_>, area: Rect, theme: &Theme, glyphs: &Glyphs) {
-    let layout = content_layout(area);
+fn render_help_content(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &Theme,
+    glyphs: &Glyphs,
+    ui_layout: &UiLayout,
+) {
+    let layout = content_layout(area, ui_layout.compact);
     frame.render_widget(
         section_title("Help", "Navigate directly or use slash commands", theme),
         layout[0],
     );
-    frame.render_widget(Paragraph::new(help_lines(theme, glyphs)), layout[1]);
+    render_help_body(frame, layout[1], theme, glyphs, ui_layout.compact);
+}
+
+pub fn render_help_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &Theme,
+    glyphs: &Glyphs,
+    compact: bool,
+) {
+    if compact {
+        frame.render_widget(Paragraph::new(compact_help_lines(theme, glyphs)), area);
+        return;
+    }
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .spacing(4)
+        .split(area);
+    if area.height < 24 || area.width < 110 {
+        let (left, right) = concise_help_columns(theme, glyphs);
+        frame.render_widget(Paragraph::new(left), columns[0]);
+        frame.render_widget(Paragraph::new(right), columns[1]);
+    } else {
+        let lines = help_lines(theme, glyphs);
+        let split = 17.min(lines.len());
+        frame.render_widget(Paragraph::new(lines[..split].to_vec()), columns[0]);
+        frame.render_widget(Paragraph::new(lines[split..].to_vec()), columns[1]);
+    }
+}
+
+fn concise_help_columns<'a>(theme: &Theme, glyphs: &Glyphs) -> (Vec<Line<'a>>, Vec<Line<'a>>) {
+    let left = vec![
+        Line::from(Span::styled("NAVIGATION", theme.hint)),
+        key_value("Tab / Shift+Tab", "change focus", theme),
+        key_value("Left / Right", "move navigation focus", theme),
+        key_value("Enter", "open or activate", theme),
+        key_value("Mouse", "select rows / actions", theme),
+        Line::default(),
+        Line::from(Span::styled("MODELS AND PROFILES", theme.hint)),
+        key_value("Models", "Installed / Discover", theme),
+        key_value("Left / Right", "change library view", theme),
+        key_value("e / f / d", "search, filter, download", theme),
+        key_value("Model Profiles", "serving targets", theme),
+        key_value("l/u/e/Delete", "load, unload, bind, inherit", theme),
+    ];
+    let right = vec![
+        Line::from(Span::styled("SETTINGS AND RUNTIMES", theme.hint)),
+        key_value("Settings", "Global and engine defaults", theme),
+        key_value(glyphs.up_down, "select or scroll", theme),
+        key_value("s", "search available runtimes", theme),
+        key_value("g / Q / N", "set format default", theme),
+        key_value("u / Shift+U", "check / install update", theme),
+        key_value("d twice", "confirm runtime removal", theme),
+        Line::default(),
+        Line::from(Span::styled("COMMANDS", theme.hint)),
+        key_value("/", "open suggestions", theme),
+        key_value(glyphs.up_down, "select a suggestion", theme),
+        key_value("Enter / Esc", "run / cancel", theme),
+        key_value("? / Ctrl+C", "help / exit", theme),
+        Line::from(Span::styled("/status /models /runtimes /help", theme.muted)),
+    ];
+    (left, right)
+}
+
+fn compact_help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
+    vec![
+        Line::from(Span::styled("ESSENTIAL KEYS", theme.hint)),
+        key_value("Tab / arrows", "move focus and selection", theme),
+        key_value("Enter", "open or activate", theme),
+        key_value("Models", "e search, f format, d download", theme),
+        key_value("Runtimes", "s search, g/Q/N default", theme),
+        key_value("Settings", "Enter edit, Delete inherit", theme),
+        key_value("/", "commands", theme),
+        key_value("? / Ctrl+C", "help / exit", theme),
+        key_value(glyphs.up_down, "select or scroll", theme),
+    ]
 }
 
 pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
