@@ -14,9 +14,10 @@ use crate::app::App;
 use crate::theme::{Glyphs, Theme};
 use layout::UiLayout;
 
-pub fn render(frame: &mut Frame<'_>, app: &App) -> UiLayout {
+pub fn render(frame: &mut Frame<'_>, app: &mut App) -> UiLayout {
     let area = frame.area();
     let layout = UiLayout::calculate(area, app);
+    app.sync_marquee_target(layout.active_marquee_target(app));
     let theme = Theme::current(app.no_color);
     let glyphs = Glyphs::current(app.unicode);
     frame.render_widget(Block::default().style(theme.text), area);

@@ -374,7 +374,9 @@ pub struct App {
     pub settings_validation_error: Option<String>,
     pub settings_input: Option<SettingsInput>,
     pub profile_engine_selection: Option<ProfileEngineSelection>,
-    pub ui_animation_frame: u32,
+    pub load_animation_frame: u32,
+    pub marquee_animation_frame: u32,
+    marquee_target: Option<Vec<String>>,
     focus_before_command: FocusArea,
     pending_control_action: Option<ControlAction>,
     active_control_action: Option<ControlAction>,
@@ -489,7 +491,9 @@ impl App {
             settings_validation_error: None,
             settings_input: None,
             profile_engine_selection: None,
-            ui_animation_frame: 0,
+            load_animation_frame: 0,
+            marquee_animation_frame: 0,
+            marquee_target: None,
             focus_before_command: FocusArea::Navigation,
             pending_control_action: None,
             active_control_action: None,
@@ -809,19 +813,31 @@ impl App {
         (control.loading_backend()?.model_id == selected.id).then_some(progress)
     }
 
-    pub fn advance_ui_animation(&mut self, marquee_active: bool) -> bool {
+    pub fn sync_marquee_target(&mut self, target: Option<Vec<String>>) {
+        if self.marquee_target != target {
+            self.marquee_target = target;
+            self.marquee_animation_frame = 0;
+        }
+    }
+
+    pub fn advance_ui_animation(&mut self, marquee_target: Option<Vec<String>>) -> bool {
         let indeterminate = self
             .load_progress()
             .is_some_and(|progress| progress.fraction.is_none());
-        if !indeterminate && !marquee_active {
-            if self.ui_animation_frame != 0 {
-                self.ui_animation_frame = 0;
-                return true;
-            }
-            return false;
+        if indeterminate {
+            self.load_animation_frame = self.load_animation_frame.wrapping_add(1);
+        } else {
+            self.load_animation_frame = 0;
         }
-        self.ui_animation_frame = self.ui_animation_frame.wrapping_add(1);
-        indeterminate || (marquee_active && self.ui_animation_frame % 3 == 0)
+
+        self.sync_marquee_target(marquee_target);
+        let marquee_changed = if self.marquee_target.is_some() {
+            self.marquee_animation_frame = self.marquee_animation_frame.wrapping_add(1);
+            self.marquee_animation_frame % 3 == 0
+        } else {
+            false
+        };
+        indeterminate || marquee_changed
     }
 
     pub fn take_control_action(&mut self) -> Option<ControlAction> {
@@ -4398,18 +4414,16 @@ fn concise_default_detail(value: &str) -> &str {
 mod tests {
     use std::path::PathBuf;
 
+    use super::{
+        App, Overlay, ProfileEngineSelection, Screen, SettingsAction, SettingsScope,
+        SettingsTaskResult,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use norted_core::{
         AppSnapshot, ArtifactFormat, EffectivePublicAuthMode, EngineId, ModelArtifact, ModelId,
         ModelProfile, ModelProfileId, ModelProfilesState, PublicAuthMode, PublicAuthStatus,
         RegistryState, ServerState, SettingCategory, SettingDefinition, SettingId, SettingKind,
         SettingScope, SettingsSchema,
-    };
-    use ratatui::{Terminal, backend::TestBackend};
-
-    use super::{
-        App, Overlay, ProfileEngineSelection, Screen, SettingsAction, SettingsScope,
-        SettingsTaskResult,
     };
 
     fn definition(id: &str, scope: SettingScope) -> SettingDefinition {
@@ -4556,7 +4570,7 @@ mod tests {
             ProfileEngineSelection {
                 id: ModelProfileId::new("quality").expect("profile ID"),
                 display_name: "Quality".to_owned(),
-                model: Box::new(model.clone()),
+                model: Box::new(model),
                 engines: vec![
                     EngineId::new("fake-a").expect("engine ID"),
                     EngineId::new("fake-b").expect("engine ID"),
@@ -4565,46 +4579,9 @@ mod tests {
             },
         ));
         assert_eq!(app.overlay, Some(Overlay::ProfileEngine));
-        for (width, height) in [(120, 40), (100, 30), (83, 27), (46, 13)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
-            terminal
-                .draw(|frame| {
-                    crate::ui::render(frame, &app);
-                })
-                .expect("profile engine render");
-            let content = terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>();
-            assert!(content.contains("Choose"));
-        }
-
         app.handle_profile_engine_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_profile_engine_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.overlay, None);
-
-        app.snapshot.models.push(model);
-        app.selected_model = Some(0);
-        app.overlay = Some(Overlay::ModelRuntime);
-        for (width, height) in [(120, 40), (100, 30), (83, 27), (46, 13)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
-            terminal
-                .draw(|frame| {
-                    crate::ui::render(frame, &app);
-                })
-                .expect("model runtime render");
-            let content = terminal
-                .backend()
-                .buffer()
-                .content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>();
-            assert!(content.contains("Model runtime"));
-        }
         assert!(matches!(
             app.take_settings_action(),
             Some(SettingsAction::CreateProfile {

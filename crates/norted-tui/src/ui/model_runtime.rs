@@ -5,7 +5,8 @@ use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 use crate::app::{App, Overlay};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{
-    ActionState, KEY_COLUMN, action_style, key_value, marquee_text, popup_block, truncate_middle,
+    ActionState, KEY_COLUMN, action_style, key_value, marquee_text, popup_block, remaining_width,
+    truncate_middle,
 };
 use crate::ui::layout::{HoverTarget, UiLayout};
 use crate::ui::screens::compatibility_label;
@@ -33,23 +34,17 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
                 .norted_package
                 .as_ref()
                 .map_or_else(|| "Raw".to_owned(), |package| package.kind.to_string());
-            let reserved = 7 + model.format.as_str().len() + 2 + package.len();
-            let name_width = layout
-                .runtime_search_input
-                .width
-                .saturating_sub(reserved as u16);
+            let format = model.format.as_str().to_ascii_uppercase();
+            let name_width = heading_name_width(layout.runtime_search_input.width, model);
             let display_name = marquee_text(
                 &model.display_name,
-                name_width as usize,
-                app.ui_animation_frame / 3,
+                name_width,
+                app.marquee_animation_frame / 3,
             );
             Line::from(vec![
                 Span::styled("Model  ", theme.hint),
                 Span::styled(display_name, theme.text),
-                Span::styled(
-                    format!("  {}", model.format.as_str().to_ascii_uppercase()),
-                    theme.accent,
-                ),
+                Span::styled(format!("  {format}"), theme.accent),
                 Span::styled(format!("  {package}"), theme.hint),
             ])
         },
@@ -84,11 +79,27 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             let active_row = app.runtime_picker_selection == Some(*index)
                 || app.hover == Some(HoverTarget::RuntimePickerResult(*index));
             let identity_text = format!("{}  {}", identity.engine_id, identity.version);
-            let identity_width = row.width.saturating_sub(compatibility.len() as u16 + 2) as usize;
+            let identity_width = picker_identity_width(row.width, compatibility);
             let identity_text = if active_row {
-                marquee_text(&identity_text, identity_width, app.ui_animation_frame / 3)
+                marquee_text(
+                    &identity_text,
+                    identity_width,
+                    app.marquee_animation_frame / 3,
+                )
             } else {
                 truncate_middle(&identity_text, identity_width, glyphs.ellipsis)
+            };
+            let override_status = if is_override {
+                "  current override"
+            } else {
+                ""
+            };
+            let metadata = format!("{} / {}", identity.accelerator, identity.variant);
+            let metadata_width = picker_metadata_width(row.width, override_status);
+            let metadata = if active_row {
+                marquee_text(&metadata, metadata_width, app.marquee_animation_frame / 3)
+            } else {
+                truncate_middle(&metadata, metadata_width, glyphs.ellipsis)
             };
             let mut lines = vec![
                 Line::from(vec![
@@ -96,18 +107,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
                     Span::styled(format!("  {compatibility}"), compatibility_style),
                 ]),
                 Line::from(vec![
-                    Span::styled(
-                        format!("{} / {}", identity.accelerator, identity.variant),
-                        theme.muted,
-                    ),
-                    Span::styled(
-                        if is_override {
-                            "  current override"
-                        } else {
-                            ""
-                        },
-                        theme.success,
-                    ),
+                    Span::styled(metadata, theme.muted),
+                    Span::styled(override_status, theme.success),
                 ]),
             ];
             if layout.overlay_row_height > 2 {
@@ -276,4 +277,24 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         Paragraph::new(Line::from(Span::styled(shortcut_hint, theme.hint))),
         layout.runtime_operation_status,
     );
+}
+
+pub(super) fn heading_name_width(total_width: u16, model: &norted_core::ModelArtifact) -> usize {
+    let package = model
+        .norted_package
+        .as_ref()
+        .map_or_else(|| "Raw".to_owned(), |package| package.kind.to_string());
+    let format = model.format.as_str().to_ascii_uppercase();
+    let format_span = format!("  {format}");
+    let package_span = format!("  {package}");
+    remaining_width(total_width, &["Model  ", &format_span, &package_span])
+}
+
+pub(super) fn picker_identity_width(row_width: u16, compatibility: &str) -> usize {
+    let suffix = format!("  {compatibility}");
+    remaining_width(row_width, &[&suffix])
+}
+
+pub(super) fn picker_metadata_width(row_width: u16, override_status: &str) -> usize {
+    remaining_width(row_width, &[override_status])
 }
