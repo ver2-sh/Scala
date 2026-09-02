@@ -186,7 +186,7 @@ pub(crate) fn generation_settings(
         top_k: optional_u32(object, "top_k")?.map(u64::from),
         min_p: optional_f64(object, "min_p", 0.0, 1.0)?,
         seed: optional_u32(object, "seed")?.map(u64::from),
-        repeat_penalty: None,
+        repeat_penalty: optional_nonnegative_f64(object, "repeat_penalty")?,
         presence_penalty: optional_f64(object, "presence_penalty", -2.0, 2.0)?,
         frequency_penalty: optional_f64(object, "frequency_penalty", -2.0, 2.0)?,
         stop: optional_stop(object.get("stop"), "stop")?,
@@ -291,6 +291,32 @@ pub(crate) fn optional_reasoning_effort(
             Some(field),
             "invalid_type",
         )),
+    }
+}
+
+fn optional_nonnegative_f64(
+    object: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<f64>, OpenAiError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let number = value.as_f64().ok_or_else(|| {
+                OpenAiError::invalid(
+                    format!("`{field}` must be a number."),
+                    Some(field),
+                    "invalid_type",
+                )
+            })?;
+            if !number.is_finite() || number < 0.0 {
+                return Err(OpenAiError::invalid(
+                    format!("`{field}` must be finite and non-negative."),
+                    Some(field),
+                    "invalid_value",
+                ));
+            }
+            Ok(Some(number))
+        }
     }
 }
 
