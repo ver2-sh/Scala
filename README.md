@@ -622,8 +622,9 @@ storage, automatic OpenAI truncation, audio, generated-image output, arbitrary l
 and other unimplemented modalities remain explicit errors.
 
 Chat Completions accepts the same canonical messages and generation controls, plus non-null
-32-bit `seed`, local `top_k`/`min_p` extensions, string-or-array `stop`, presence/frequency
-penalties in `-2..=2`, reasoning effort and local thinking toggle/budget extensions,
+32-bit `seed`, local `top_k`/`min_p` and non-negative `repeat_penalty` extensions subject to exact
+engine/runtime support, string-or-array `stop`, presence/frequency penalties in `-2..=2`,
+reasoning effort and local thinking toggle/budget extensions,
 `response_format` text/JSON object/JSON Schema, and `max_completion_tokens` with its deprecated
 `max_tokens` alias. Equal token-limit aliases are accepted and conflicting aliases fail.
 Ordinary function tools use standard assistant `tool_calls` and tool-result history shapes.

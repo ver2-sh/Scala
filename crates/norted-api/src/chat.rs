@@ -43,6 +43,7 @@ const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
     "parallel_tool_calls",
     "prediction",
     "presence_penalty",
+    "repeat_penalty",
     "reasoning_effort",
     "response_format",
     "seed",
