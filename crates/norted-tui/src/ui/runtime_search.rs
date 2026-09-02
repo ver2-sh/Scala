@@ -7,8 +7,8 @@ use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 use crate::app::{App, Overlay, RuntimeSearchFocus};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{
-    ActionState, KEY_COLUMN, action_style, format_bytes, input_window, key_value, marquee_text,
-    popup_block, truncate_middle,
+    ActionState, KEY_COLUMN, action_style, format_bytes, input_window, key_value, key_value_width,
+    marquee_text, popup_block, remaining_width, truncate_middle,
 };
 use crate::ui::layout::{HoverTarget, UiLayout};
 use crate::ui::screens::compatibility_label;
@@ -183,17 +183,6 @@ fn render_results(
         } else {
             theme.muted
         };
-        let formats = available
-            .supported_formats
-            .iter()
-            .map(|format| format.as_str().to_ascii_uppercase())
-            .collect::<Vec<_>>()
-            .join("/");
-        let acquisition = if available.source_build().is_some() {
-            "source build"
-        } else {
-            "upstream binary"
-        };
         let mut style = if app.selected_runtime_search_result == Some(*index) {
             theme.selected
         } else {
@@ -204,15 +193,23 @@ fn render_results(
         }
         let active_row = app.selected_runtime_search_result == Some(*index)
             || app.hover == Some(HoverTarget::RuntimeSearchResult(*index));
-        let name_width = row.width.saturating_sub(3 + compatibility.len() as u16 + 2) as usize;
+        let name_width = result_name_width(row.width, marker, compatibility);
         let display_name = if active_row {
             marquee_text(
                 &available.display_name,
                 name_width,
-                app.ui_animation_frame / 3,
+                app.marquee_animation_frame / 3,
             )
         } else {
             truncate_middle(&available.display_name, name_width, glyphs.ellipsis)
+        };
+        let metadata = result_metadata_text(available);
+        let installed = if result.installed { "  installed" } else { "" };
+        let metadata_width = result_metadata_width(row.width, installed);
+        let metadata = if active_row {
+            marquee_text(&metadata, metadata_width, app.marquee_animation_frame / 3)
+        } else {
+            truncate_middle(&metadata, metadata_width, glyphs.ellipsis)
         };
         let mut lines = vec![
             Line::from(vec![
@@ -221,21 +218,8 @@ fn render_results(
                 Span::styled(format!("  {compatibility}"), compatibility_style),
             ]),
             Line::from(vec![
-                Span::styled(
-                    format!(
-                        "{}  {} / {}  {} · {}",
-                        available.identity.version,
-                        available.identity.accelerator,
-                        available.identity.variant,
-                        formats,
-                        acquisition,
-                    ),
-                    theme.muted,
-                ),
-                Span::styled(
-                    if result.installed { "  installed" } else { "" },
-                    theme.success,
-                ),
+                Span::styled(metadata, theme.muted),
+                Span::styled(installed, theme.success),
             ]),
         ];
         if layout.overlay_row_height > 2 {
@@ -283,15 +267,12 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
         .repository
         .as_deref()
         .unwrap_or(available.source_url.as_str());
-    let detail_value_width = layout
-        .runtime_search_details
-        .width
-        .saturating_sub(KEY_COLUMN as u16 + 1) as usize;
-    let source = marquee_text(source, detail_value_width, app.ui_animation_frame / 3);
+    let detail_value_width = key_value_width(layout.runtime_search_details.width);
+    let source = marquee_text(source, detail_value_width, app.marquee_animation_frame / 3);
     let display_name = marquee_text(
         &available.display_name,
         layout.runtime_search_details.width as usize,
-        app.ui_animation_frame / 3,
+        app.marquee_animation_frame / 3,
     );
     let target = format!("{} / {}", identity.platform, identity.architecture);
     let backend = format!("{} / {}", identity.accelerator, identity.variant);
@@ -479,7 +460,7 @@ fn render_action(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLay
                 marquee_text(
                     &progress,
                     layout.runtime_operation_status.width as usize,
-                    app.ui_animation_frame / 3,
+                    app.marquee_animation_frame / 3,
                 ),
                 phase_style(phase, theme),
             ))),
@@ -507,6 +488,38 @@ fn render_action(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLay
             layout.runtime_operation_status,
         );
     }
+}
+
+pub(super) fn result_name_width(row_width: u16, marker: &str, compatibility: &str) -> usize {
+    let prefix = format!("{marker}  ");
+    let suffix = format!("  {compatibility}");
+    remaining_width(row_width, &[&prefix, &suffix])
+}
+
+pub(super) fn result_metadata_width(row_width: u16, installed: &str) -> usize {
+    remaining_width(row_width, &[installed])
+}
+
+pub(super) fn result_metadata_text(available: &norted_core::AvailableRuntime) -> String {
+    let formats = available
+        .supported_formats
+        .iter()
+        .map(|format| format.as_str().to_ascii_uppercase())
+        .collect::<Vec<_>>()
+        .join("/");
+    let acquisition = if available.source_build().is_some() {
+        "source build"
+    } else {
+        "upstream binary"
+    };
+    format!(
+        "{}  {} / {}  {} · {}",
+        available.identity.version,
+        available.identity.accelerator,
+        available.identity.variant,
+        formats,
+        acquisition,
+    )
 }
 
 pub(crate) fn progress_text(progress: &norted_core::RuntimeOperationProgress) -> String {

@@ -112,7 +112,7 @@ pub async fn run(
         setting_definitions,
     );
     let mut layout = UiLayout::default();
-    terminal.draw(|frame| layout = ui::render(frame, &app))?;
+    terminal.draw(|frame| layout = ui::render(frame, &mut app))?;
 
     core.start_model_discovery().await;
     let mut terminal_events = EventStream::new();
@@ -197,7 +197,7 @@ pub async fn run(
 
     loop {
         if render {
-            terminal.draw(|frame| layout = ui::render(frame, &app))?;
+            terminal.draw(|frame| layout = ui::render(frame, &mut app))?;
         }
         let update = tokio::select! {
             event = terminal_events.next() => match event {
@@ -319,7 +319,8 @@ pub async fn run(
                     &model_library_results,
                     &mut refreshed_installed_jobs,
                 );
-                let animation_changed = app.advance_ui_animation(layout.has_active_marquee(&app));
+                let animation_changed =
+                    app.advance_ui_animation(layout.active_marquee_target(&app));
                 if has_live_downloads || animation_changed {
                     Update::Render
                 } else {

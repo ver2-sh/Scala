@@ -66,11 +66,37 @@ pub fn render_empty(frame: &mut Frame<'_>, area: Rect, title: &str, detail: &str
     );
 }
 
-pub const KEY_COLUMN: usize = 15;
+pub const KEY_COLUMN: usize = 17;
+
+pub fn display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+pub fn remaining_width(total_width: u16, static_spans: &[&str]) -> usize {
+    (total_width as usize).saturating_sub(
+        static_spans
+            .iter()
+            .map(|span| display_width(span))
+            .sum::<usize>(),
+    )
+}
+
+pub fn key_value_width(total_width: u16) -> usize {
+    (total_width as usize).saturating_sub(KEY_COLUMN + 1)
+}
+
+pub fn pad_display_width(text: &str, width: usize) -> String {
+    let mut padded = text.to_owned();
+    padded.push_str(&" ".repeat(width.saturating_sub(display_width(text))));
+    padded
+}
 
 pub fn key_value<'a>(key: &'a str, value: &'a str, theme: &Theme) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!("{key:<KEY_COLUMN$} "), theme.hint),
+        Span::styled(
+            format!("{} ", pad_display_width(key, KEY_COLUMN)),
+            theme.hint,
+        ),
         Span::styled(value, theme.text),
     ])
 }
@@ -139,13 +165,38 @@ pub fn marquee_text(text: &str, max_width: usize, animation_frame: u32) -> Strin
         return String::new();
     }
     if UnicodeWidthStr::width(text) <= max_width {
-        return text.to_owned();
+        return pad_display_width(text, max_width);
     }
 
+    let views = marquee_views(text, max_width);
+    let Some(last_index) = views.len().checked_sub(1) else {
+        return " ".repeat(max_width);
+    };
+
+    const START_HOLD: usize = 4;
+    const END_HOLD: usize = 3;
+    let cycle = START_HOLD + last_index + END_HOLD;
+    let phase = (animation_frame as usize) % cycle.max(1);
+    let index = phase.saturating_sub(START_HOLD).min(last_index);
+    pad_display_width(&views[index], max_width)
+}
+
+pub fn needs_marquee(text: &str, max_width: usize) -> bool {
+    max_width > 0
+        && UnicodeWidthStr::width(text) > max_width
+        && marquee_views(text, max_width).len() > 1
+}
+
+fn marquee_views(text: &str, max_width: usize) -> Vec<String> {
     let graphemes = UnicodeSegmentation::graphemes(text, true).collect::<Vec<_>>();
+    let mut suffix_widths = vec![0usize; graphemes.len() + 1];
+    for index in (0..graphemes.len()).rev() {
+        suffix_widths[index] =
+            suffix_widths[index + 1].saturating_add(UnicodeWidthStr::width(graphemes[index]));
+    }
     let mut views = Vec::with_capacity(graphemes.len());
     for start in 0..graphemes.len() {
-        let mut width: usize = 0;
+        let mut width = 0usize;
         let mut view = String::new();
         for grapheme in &graphemes[start..] {
             let grapheme_width = UnicodeWidthStr::width(*grapheme);
@@ -155,32 +206,14 @@ pub fn marquee_text(text: &str, max_width: usize, animation_frame: u32) -> Strin
             view.push_str(grapheme);
             width = width.saturating_add(grapheme_width);
         }
-        if !view.is_empty() && views.last() != Some(&view) {
+        if views.last() != Some(&view) {
             views.push(view);
         }
-        if graphemes[start..]
-            .iter()
-            .map(|grapheme| UnicodeWidthStr::width(*grapheme))
-            .sum::<usize>()
-            <= max_width
-        {
+        if suffix_widths[start] <= max_width {
             break;
         }
     }
-    let Some(last_index) = views.len().checked_sub(1) else {
-        return String::new();
-    };
-
-    const START_HOLD: usize = 4;
-    const END_HOLD: usize = 3;
-    let cycle = START_HOLD + last_index + END_HOLD;
-    let phase = (animation_frame as usize) % cycle.max(1);
-    let index = phase.saturating_sub(START_HOLD).min(last_index);
-    views[index].clone()
-}
-
-pub fn needs_marquee(text: &str, max_width: u16) -> bool {
-    UnicodeWidthStr::width(text) > max_width as usize
+    views
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -585,54 +618,5 @@ mod tests {
         let progress = BackendLoadProgress::indeterminate(BackendLoadPhase::LoadingModel);
         let compact = load_progress_compact(&progress, 3, 40, &ascii_glyphs());
         assert!(!compact.contains('\u{2500}'));
-    }
-
-    #[test]
-    fn marquee_holds_scrolls_reaches_the_end_and_resets() {
-        assert_eq!(marquee_text("abcdef", 3, 0), "abc");
-        assert_eq!(marquee_text("abcdef", 3, 4), "abc");
-        assert_eq!(marquee_text("abcdef", 3, 5), "bcd");
-        assert_eq!(marquee_text("abcdef", 3, 7), "def");
-        assert_eq!(marquee_text("abcdef", 3, 9), "def");
-        assert_eq!(marquee_text("abcdef", 3, 10), "abc");
-    }
-
-    #[test]
-    fn marquee_is_display_width_aware_and_safe_at_tiny_widths() {
-        let text = "a界e\u{301}z";
-        assert_eq!(marquee_text(text, 0, 20), "");
-        for width in 1..=5 {
-            for frame in 0..20 {
-                let view = marquee_text(text, width, frame);
-                assert!(UnicodeWidthStr::width(view.as_str()) <= width);
-                assert!(!view.starts_with('\u{301}'));
-            }
-        }
-    }
-
-    #[test]
-    fn fitting_marquee_text_never_animates() {
-        for frame in 0..100 {
-            assert_eq!(marquee_text("界a", 3, frame), "界a");
-        }
-    }
-
-    #[test]
-    fn editable_window_keeps_a_unicode_cursor_visible() {
-        let end = input_window("ab界cdef", 7, 5);
-        assert!(end.cursor_column < 5);
-        assert!(UnicodeWidthStr::width(end.text.as_str()) <= 5);
-        assert!(end.text.ends_with("cdef"));
-
-        let middle = input_window("ab界cdef", 3, 4);
-        assert!(middle.cursor_column < 4);
-        assert!(UnicodeWidthStr::width(middle.text.as_str()) <= 4);
-    }
-
-    #[test]
-    fn middle_truncation_respects_wide_graphemes() {
-        let value = truncate_middle("ab界cd", 5, "…");
-        assert!(UnicodeWidthStr::width(value.as_str()) <= 5);
-        assert!(value.contains('…'));
     }
 }

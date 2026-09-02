@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
 use crate::app::{App, Overlay};
 use crate::theme::{Glyphs, Theme};
-use crate::ui::components::{ActionState, action_style, marquee_text};
+use crate::ui::components::{ActionState, action_style, marquee_text, remaining_width};
 use crate::ui::layout::{HoverTarget, UiLayout};
 
 pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, layout: &UiLayout) {
@@ -35,17 +35,18 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         area.height
             .saturating_sub(if layout.compact { 2 } else { 4 }),
     );
+    let suffix = " · select the engine this profile binds";
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
                 marquee_text(
                     &selection.model.display_name,
-                    inner.width.saturating_sub(35) as usize,
-                    app.ui_animation_frame / 3,
+                    heading_name_width(inner.width),
+                    app.marquee_animation_frame / 3,
                 ),
                 theme.text,
             ),
-            Span::styled(" · select the engine this profile binds", theme.muted),
+            Span::styled(suffix, theme.muted),
         ])),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
@@ -103,4 +104,12 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         ))),
         layout.profile_engine_cancel,
     );
+}
+
+pub(super) fn popup_inner_width(popup_width: u16, compact: bool) -> u16 {
+    popup_width.saturating_sub(if compact { 4 } else { 6 })
+}
+
+pub(super) fn heading_name_width(inner_width: u16) -> usize {
+    remaining_width(inner_width, &[" · select the engine this profile binds"])
 }

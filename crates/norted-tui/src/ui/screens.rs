@@ -2,6 +2,7 @@ use norted_core::{
     ArtifactFormat, RegistryState, RuntimeCompatibility, RuntimeSourceBuildSystem,
     RuntimeUpdateState,
 };
+use norted_engine::InstalledRuntimeStatus;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -11,9 +12,9 @@ use unicode_width::UnicodeWidthStr;
 use crate::app::{App, ModelLibraryView, Screen};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{
-    ActionState, KEY_COLUMN, action_style, content_layout, format_bytes, key_value,
-    load_progress_compact, marked_input_window, marquee_text, render_empty, render_load_progress,
-    section_title, truncate_middle,
+    ActionState, action_style, content_layout, format_bytes, key_value, key_value_width,
+    load_progress_compact, marked_input_window, marquee_text, remaining_width, render_empty,
+    render_load_progress, section_title, truncate_middle,
 };
 use crate::ui::layout::{
     HoverTarget, InstalledModelAction, ModelProfileAction, SelectedRuntimeAction, UiLayout,
@@ -68,7 +69,7 @@ fn render_overview(
     if let Some(progress) = app.load_progress() {
         let compact_line = load_progress_compact(
             progress,
-            app.ui_animation_frame,
+            app.load_animation_frame,
             ui_layout.overview_progress.width,
             glyphs,
         );
@@ -460,21 +461,32 @@ fn render_models(
         }
         let active_row =
             app.selected_model == Some(*index) || app.hover == Some(HoverTarget::Model(*index));
-        let primary_width = row.width.saturating_sub(3) as usize * 3 / 5;
+        let marker = if app.control.as_ref().is_some_and(|control| {
+            control.backends.iter().any(|backend| {
+                matches!(
+                    backend.lifecycle,
+                    norted_engine::BackendLifecycle::Loading
+                        | norted_engine::BackendLifecycle::Running
+                ) && backend.model_id == model.id
+            })
+        }) {
+            format!("{}  ", glyphs.running)
+        } else {
+            "   ".to_owned()
+        };
+        let format_span = format!("  {}", model.format.as_str());
+        let primary_width = installed_model_name_width(row.width, &marker, &format_span);
         let model_name = if active_row {
             marquee_text(
                 &model.display_name,
                 primary_width,
-                app.ui_animation_frame / 3,
+                app.marquee_animation_frame / 3,
             )
         } else {
             truncate_middle(&model.display_name, primary_width, glyphs.ellipsis)
         };
-        let override_width = (row.width as usize).saturating_sub(
-            3 + UnicodeWidthStr::width(model_name.as_str())
-                + 2
-                + UnicodeWidthStr::width(model.format.as_str()),
-        );
+        let override_width =
+            remaining_width(row.width, &[&marker, &format_span]).saturating_sub(primary_width);
         let runtime_override = runtime_override
             .map(|runtime| {
                 truncate_middle(
@@ -486,24 +498,9 @@ fn render_models(
             .unwrap_or_default();
         let mut lines = vec![
             Line::from(vec![
-                Span::styled(
-                    if app.control.as_ref().is_some_and(|control| {
-                        control.backends.iter().any(|backend| {
-                            matches!(
-                                backend.lifecycle,
-                                norted_engine::BackendLifecycle::Loading
-                                    | norted_engine::BackendLifecycle::Running
-                            ) && backend.model_id == model.id
-                        })
-                    }) {
-                        format!("{}  ", glyphs.running)
-                    } else {
-                        "   ".to_owned()
-                    },
-                    theme.success,
-                ),
+                Span::styled(marker, theme.success),
                 Span::styled(model_name, theme.text),
-                Span::styled(format!("  {}", model.format.as_str()), theme.accent),
+                Span::styled(format_span, theme.accent),
                 Span::styled(runtime_override, theme.hint),
             ]),
             {
@@ -512,7 +509,7 @@ fn render_models(
                     .saturating_sub(UnicodeWidthStr::width(size_text.as_str()) + 2);
                 let full_path = model.path.display().to_string();
                 let path = if active_row {
-                    marquee_text(&full_path, path_width, app.ui_animation_frame / 3)
+                    marquee_text(&full_path, path_width, app.marquee_animation_frame / 3)
                 } else {
                     truncate_middle(&full_path, path_width, glyphs.ellipsis)
                 };
@@ -548,7 +545,7 @@ fn render_models(
             frame,
             ui_layout.model_progress,
             progress,
-            app.ui_animation_frame,
+            app.load_animation_frame,
             theme,
             glyphs,
         );
@@ -719,20 +716,21 @@ fn render_model_discover(
                 .map_or(0, |(_, area)| area.width as usize);
             let status_width = (ui_layout.model_list.width as usize)
                 .saturating_sub(action_width.saturating_add(1));
-            let filename_width = row.width.saturating_sub(9) as usize;
+            let format_span = available_format_span(artifact.format.as_str());
+            let filename_width = remaining_width(row.width, &[&format_span]);
             let filename = if active_row {
                 marquee_text(
                     &artifact.filename,
                     filename_width,
-                    app.ui_animation_frame / 3,
+                    app.marquee_animation_frame / 3,
                 )
             } else {
                 truncate_middle(&artifact.filename, filename_width, glyphs.ellipsis)
             };
             let mut lines = vec![
                 Line::from(vec![
-                    Span::styled(artifact.format.as_str().to_ascii_uppercase(), theme.accent),
-                    Span::styled(format!("  {filename}"), theme.text),
+                    Span::styled(format_span, theme.accent),
+                    Span::styled(filename, theme.text),
                 ]),
                 Line::from(vec![
                     Span::styled(&repository.repository, theme.text),
@@ -1040,43 +1038,6 @@ fn render_runtimes(
             let identity = &manifest.identity;
             let (compatibility, compatibility_style) =
                 compatibility_label(&status.compatibility, theme);
-            let formats = manifest
-                .supported_formats
-                .iter()
-                .map(|format| format.as_str().to_ascii_uppercase())
-                .collect::<Vec<_>>()
-                .join("/");
-            let selected = if status.selected_for.is_empty() {
-                String::new()
-            } else {
-                format!("  default: {}", status.selected_for.join(", "))
-            };
-            let update = app
-                .runtime_updates
-                .get(&manifest.runtime_id)
-                .map(runtime_update_text)
-                .unwrap_or_default();
-            let source_build = manifest
-                .source_build
-                .as_ref()
-                .map_or_else(String::new, |build| {
-                    let builder = match build.build_system {
-                        RuntimeSourceBuildSystem::Cmake => {
-                            format!("CMake {}", build.toolchain.cmake_version)
-                        }
-                        RuntimeSourceBuildSystem::Make => {
-                            format!("Make {}", build.toolchain.make_version)
-                        }
-                    };
-                    format!(
-                        "  source {} tree {} · {} · {} · CUDA {}",
-                        &build.source.commit_sha[..8],
-                        &build.source.tree_sha[..8],
-                        build.recipe_version,
-                        builder,
-                        build.toolchain.nvcc_version,
-                    )
-                });
             let mut style = if app.selected_runtime == Some(*index) {
                 theme.selected
             } else {
@@ -1088,27 +1049,35 @@ fn render_runtimes(
             let active_row = app.selected_runtime == Some(*index)
                 || app.hover == Some(HoverTarget::Runtime(*index));
             let identity_text = format!("{}  {}", identity.engine_id, identity.version);
-            let identity_width =
-                row.width.saturating_sub(3 + compatibility.len() as u16 + 2) as usize;
+            let marker = format!("{}  ", glyphs.running);
+            let identity_width = runtime_identity_width(row.width, &marker, compatibility);
             let identity_text = if active_row {
-                marquee_text(&identity_text, identity_width, app.ui_animation_frame / 3)
+                marquee_text(
+                    &identity_text,
+                    identity_width,
+                    app.marquee_animation_frame / 3,
+                )
             } else {
                 truncate_middle(&identity_text, identity_width, glyphs.ellipsis)
             };
+            let (metadata, selected, update) = runtime_secondary_text(app, status, row.width);
+            let stationary_state = format!("{selected}{update}");
+            let metadata_width = runtime_metadata_width(row.width, &stationary_state);
+            let metadata = if active_row {
+                marquee_text(&metadata, metadata_width, app.marquee_animation_frame / 3)
+            } else {
+                truncate_middle(&metadata, metadata_width, glyphs.ellipsis)
+            };
             let mut lines = vec![
                 Line::from(vec![
-                    Span::styled(format!("{}  ", glyphs.running), theme.success),
+                    Span::styled(marker, theme.success),
                     Span::styled(identity_text, theme.text),
                     Span::styled(format!("  {compatibility}"), compatibility_style),
                 ]),
                 Line::from(vec![
-                    Span::styled(
-                        format!("{formats}  {} / {}", identity.accelerator, identity.variant),
-                        theme.muted,
-                    ),
+                    Span::styled(metadata, theme.muted),
                     Span::styled(selected, theme.hint),
                     Span::styled(update, theme.warning),
-                    Span::styled(source_build, theme.hint),
                 ]),
             ];
             if ui_layout.runtime_row_height > 2 {
@@ -1301,15 +1270,109 @@ fn selection_text(app: &App, format: ArtifactFormat, compact: bool) -> String {
         .unwrap_or_else(|| runtime_id.to_string())
 }
 
+pub(super) fn installed_model_name_width(row_width: u16, marker: &str, format_span: &str) -> usize {
+    let preferred = row_width.saturating_sub(3) as usize * 3 / 5;
+    preferred.min(remaining_width(row_width, &[marker, format_span]))
+}
+
+pub(super) fn available_format_span(format: &str) -> String {
+    format!("{}  ", format.to_ascii_uppercase())
+}
+
+pub(super) fn runtime_identity_width(row_width: u16, marker: &str, compatibility: &str) -> usize {
+    let suffix = format!("  {compatibility}");
+    remaining_width(row_width, &[marker, &suffix])
+}
+
+pub(super) fn split_runtime_metadata(
+    row_width: u16,
+    metadata: String,
+    selected: String,
+    update: String,
+) -> (String, String, String) {
+    if UnicodeWidthStr::width(format!("{selected}{update}").as_str()) <= row_width as usize / 2 {
+        (metadata, selected, update)
+    } else {
+        (
+            format!("{metadata}{selected}{update}"),
+            String::new(),
+            String::new(),
+        )
+    }
+}
+
+pub(super) fn runtime_secondary_text(
+    app: &App,
+    status: &InstalledRuntimeStatus,
+    row_width: u16,
+) -> (String, String, String) {
+    let manifest = &status.runtime.manifest;
+    let identity = &manifest.identity;
+    let formats = manifest
+        .supported_formats
+        .iter()
+        .map(|format| format.as_str().to_ascii_uppercase())
+        .collect::<Vec<_>>()
+        .join("/");
+    let source_build = manifest
+        .source_build
+        .as_ref()
+        .map_or_else(String::new, |build| {
+            let builder = match build.build_system {
+                RuntimeSourceBuildSystem::Cmake => {
+                    format!("CMake {}", build.toolchain.cmake_version)
+                }
+                RuntimeSourceBuildSystem::Make => format!("Make {}", build.toolchain.make_version),
+            };
+            format!(
+                "  source {} tree {} · {} · {} · CUDA {}",
+                &build.source.commit_sha[..8],
+                &build.source.tree_sha[..8],
+                build.recipe_version,
+                builder,
+                build.toolchain.nvcc_version,
+            )
+        });
+    let metadata = format!(
+        "{formats}  {} / {}{source_build}",
+        identity.accelerator, identity.variant
+    );
+    let selected = if status.selected_for.is_empty() {
+        String::new()
+    } else {
+        format!("  default: {}", status.selected_for.join(", "))
+    };
+    let update = app
+        .runtime_updates
+        .get(&manifest.runtime_id)
+        .map(runtime_update_text)
+        .unwrap_or_default();
+    split_runtime_metadata(row_width, metadata, selected, update)
+}
+
+pub(super) fn runtime_metadata_width(row_width: u16, stationary_state: &str) -> usize {
+    remaining_width(row_width, &[stationary_state])
+}
+
 pub(crate) fn compatibility_label<'a>(
     compatibility: &'a RuntimeCompatibility,
     theme: &'a Theme,
 ) -> (&'a str, ratatui::style::Style) {
+    let style = match compatibility {
+        RuntimeCompatibility::Recommended => theme.success,
+        RuntimeCompatibility::Compatible => theme.accent,
+        RuntimeCompatibility::NeedsAttention(_) => theme.warning,
+        RuntimeCompatibility::Incompatible(_) => theme.error,
+    };
+    (compatibility_text(compatibility), style)
+}
+
+pub(super) fn compatibility_text(compatibility: &RuntimeCompatibility) -> &str {
     match compatibility {
-        RuntimeCompatibility::Recommended => ("recommended", theme.success),
-        RuntimeCompatibility::Compatible => ("compatible", theme.accent),
-        RuntimeCompatibility::NeedsAttention(_) => ("needs attention", theme.warning),
-        RuntimeCompatibility::Incompatible(_) => ("incompatible", theme.error),
+        RuntimeCompatibility::Recommended => "recommended",
+        RuntimeCompatibility::Compatible => "compatible",
+        RuntimeCompatibility::NeedsAttention(_) => "needs attention",
+        RuntimeCompatibility::Incompatible(_) => "incompatible",
     }
 }
 
@@ -1460,17 +1523,32 @@ fn render_server(
     let exposure = if auth.loopback { "loopback" } else { "remote" };
     let configured_auth = auth.configured_mode.to_string();
     let effective_auth = auth.effective_mode.to_string();
-    let value_width = ui_layout
-        .server_details
-        .width
-        .saturating_sub(KEY_COLUMN as u16 + 1) as usize;
-    let endpoint = marquee_text(endpoint, value_width, app.ui_animation_frame / 3);
-    let active_profile = marquee_text(&active_profile, value_width, app.ui_animation_frame / 3);
-    let bind = marquee_text(&auth.bind, value_width, app.ui_animation_frame / 3);
-    let active_model = marquee_text(&active_model, value_width, app.ui_animation_frame / 3);
-    let active_engine = marquee_text(&active_engine, value_width, app.ui_animation_frame / 3);
-    let active_runtime = marquee_text(&active_runtime, value_width, app.ui_animation_frame / 3);
-    let private_backend = marquee_text(&private_backend, value_width, app.ui_animation_frame / 3);
+    let value_width = key_value_width(ui_layout.server_details.width);
+    let state = truncate_middle(app.snapshot.server.label(), value_width, glyphs.ellipsis);
+    let exposure = truncate_middle(exposure, value_width, glyphs.ellipsis);
+    let configured_auth = truncate_middle(&configured_auth, value_width, glyphs.ellipsis);
+    let effective_auth = truncate_middle(&effective_auth, value_width, glyphs.ellipsis);
+    let active_key_count = truncate_middle(&active_key_count, value_width, glyphs.ellipsis);
+    let lifecycle = truncate_middle(&lifecycle, value_width, glyphs.ellipsis);
+    let endpoint = marquee_text(endpoint, value_width, app.marquee_animation_frame / 3);
+    let active_profile = marquee_text(
+        &active_profile,
+        value_width,
+        app.marquee_animation_frame / 3,
+    );
+    let bind = marquee_text(&auth.bind, value_width, app.marquee_animation_frame / 3);
+    let active_model = marquee_text(&active_model, value_width, app.marquee_animation_frame / 3);
+    let active_engine = marquee_text(&active_engine, value_width, app.marquee_animation_frame / 3);
+    let active_runtime = marquee_text(
+        &active_runtime,
+        value_width,
+        app.marquee_animation_frame / 3,
+    );
+    let private_backend = marquee_text(
+        &private_backend,
+        value_width,
+        app.marquee_animation_frame / 3,
+    );
     let security = if auth.insecure_remote {
         Line::from(Span::styled(
             "SECURITY WARNING: remote authentication is disabled",
@@ -1486,10 +1564,10 @@ fn render_server(
     };
     let lines = if ui_layout.server_details.height < 20 {
         vec![
-            key_value("STATE", app.snapshot.server.label(), theme),
+            key_value("STATE", &state, theme),
             key_value("ENDPOINT", &endpoint, theme),
             key_value("PROFILES", &active_profile, theme),
-            key_value("EXPOSURE", exposure, theme),
+            key_value("EXPOSURE", &exposure, theme),
             key_value("AUTH EFFECTIVE", &effective_auth, theme),
             key_value("RESIDENCY", &lifecycle, theme),
             key_value("MODELS", &active_model, theme),
@@ -1506,11 +1584,11 @@ fn render_server(
         ]
     } else {
         vec![
-            key_value("STATE", app.snapshot.server.label(), theme),
+            key_value("STATE", &state, theme),
             key_value("ENDPOINT", &endpoint, theme),
             key_value("PROFILES", &active_profile, theme),
             key_value("PUBLIC BIND", &bind, theme),
-            key_value("EXPOSURE", exposure, theme),
+            key_value("EXPOSURE", &exposure, theme),
             key_value("AUTH CONFIGURED", &configured_auth, theme),
             key_value("AUTH EFFECTIVE", &effective_auth, theme),
             key_value("ACTIVE API KEYS", &active_key_count, theme),
@@ -1541,7 +1619,7 @@ fn render_server(
             frame,
             ui_layout.server_progress,
             progress,
-            app.ui_animation_frame,
+            app.load_animation_frame,
             theme,
             glyphs,
         );
@@ -1715,7 +1793,7 @@ fn render_model_profiles(
         let model_path = marquee_text(
             &model_path,
             info_area.width as usize,
-            app.ui_animation_frame / 3,
+            app.marquee_animation_frame / 3,
         );
         let definitions = app.settings_definitions();
         let selected_definition = definitions.get(app.settings_setting_index);
@@ -2036,7 +2114,7 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
             app.settings_setting_index == *index || app.hover == Some(HoverTarget::Setting(*index));
         let setting_id = definition.id.to_string();
         let id_text = if active_row {
-            marquee_text(&setting_id, id_width, app.ui_animation_frame / 3)
+            marquee_text(&setting_id, id_width, app.marquee_animation_frame / 3)
         } else {
             truncate_middle(&setting_id, id_width, "…")
         };
@@ -2058,7 +2136,7 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
             marquee_text(
                 &value_label,
                 value_area.width as usize,
-                app.ui_animation_frame / 3,
+                app.marquee_animation_frame / 3,
             )
         } else {
             truncate_middle(&value_label, value_area.width as usize, "…")

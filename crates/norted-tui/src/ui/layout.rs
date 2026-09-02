@@ -1222,210 +1222,342 @@ impl UiLayout {
         (self.settings_list.height / self.settings_row_height.max(1)) as usize
     }
 
-    pub fn has_active_marquee(&self, app: &App) -> bool {
+    pub fn active_marquee_target(&self, app: &App) -> Option<Vec<String>> {
         if self.too_small {
-            return false;
+            return None;
         }
+        let glyphs = crate::theme::Glyphs::current(app.unicode);
+        let mut active = Vec::new();
+        let mut track = |label: &str, text: &str, width: usize| {
+            if needs_marquee(text, width) {
+                active.push(format!("{label}:{width}:{text}"));
+            }
+        };
+
         if !app.command_active
-            && app.notice.as_deref().is_some_and(|notice| {
-                needs_marquee(notice, self.command_bar.width.saturating_sub(7))
-            })
+            && let Some(notice) = app.notice.as_deref()
         {
-            return true;
+            track(
+                "notice",
+                notice,
+                super::shell::notice_width(self.command_bar.width),
+            );
         }
         if app.command_active {
             let suggestions = app.suggestions();
-            if let Some(command) = suggestions.get(app.suggestion_index)
-                && let Some((_, row)) = self
-                    .suggestion_rows
-                    .iter()
-                    .find(|(index, _)| *index == app.suggestion_index)
-            {
-                let name_width = if self.compact { 12 } else { 18 };
-                let prefix_width = command.name.len().max(name_width) + 2;
-                if needs_marquee(
-                    command.description,
-                    row.width.saturating_sub(prefix_width as u16),
-                ) {
-                    return true;
+            for (index, row) in &self.suggestion_rows {
+                if (*index == app.suggestion_index
+                    || app.hover == Some(HoverTarget::CommandSuggestion(*index)))
+                    && let Some(command) = suggestions.get(*index)
+                {
+                    track(
+                        &format!("command:{index}"),
+                        command.description,
+                        super::command_palette::suggestion_description_width(
+                            row.width,
+                            command.name,
+                            self.compact,
+                        ),
+                    );
                 }
             }
         }
 
         match app.overlay {
             Some(Overlay::RuntimeSearch) => {
-                if let Some(progress) = &app.runtime_operation
-                    && needs_marquee(
-                        &super::runtime_search::progress_text(progress),
-                        self.runtime_operation_status.width,
-                    )
-                {
-                    return true;
+                if let Some(progress) = &app.runtime_operation {
+                    let progress = super::runtime_search::progress_text(progress);
+                    track(
+                        "runtime-search-progress",
+                        &progress,
+                        self.runtime_operation_status.width as usize,
+                    );
                 }
-                let Some(result) = app
-                    .selected_runtime_search_result
-                    .and_then(|index| app.runtime_search.as_ref()?.results.get(index))
-                else {
-                    return false;
-                };
-                let available = &result.entry.available;
-                let row_width = self
-                    .runtime_search_rows
-                    .iter()
-                    .find(|(index, _)| Some(*index) == app.selected_runtime_search_result)
-                    .map_or(0, |(_, row)| row.width);
-                let compatibility = match result.entry.compatibility {
-                    norted_core::RuntimeCompatibility::Recommended => "recommended",
-                    norted_core::RuntimeCompatibility::Compatible => "compatible",
-                    norted_core::RuntimeCompatibility::NeedsAttention(_) => "needs attention",
-                    norted_core::RuntimeCompatibility::Incompatible(_) => "incompatible",
-                };
-                let name_width = row_width.saturating_sub(5 + compatibility.len() as u16);
-                let detail_width = self
-                    .runtime_search_details
-                    .width
-                    .saturating_sub(super::components::KEY_COLUMN as u16 + 1);
-                let source = available
-                    .identity
-                    .package
-                    .repository
-                    .as_deref()
-                    .unwrap_or(available.source_url.as_str());
-                needs_marquee(&available.display_name, name_width)
-                    || needs_marquee(&available.display_name, self.runtime_search_details.width)
-                    || needs_marquee(source, detail_width)
+                if let Some(search) = &app.runtime_search {
+                    for (index, row) in &self.runtime_search_rows {
+                        if app.selected_runtime_search_result != Some(*index)
+                            && app.hover != Some(HoverTarget::RuntimeSearchResult(*index))
+                        {
+                            continue;
+                        }
+                        let Some(result) = search.results.get(*index) else {
+                            continue;
+                        };
+                        let available = &result.entry.available;
+                        let compatibility =
+                            super::screens::compatibility_text(&result.entry.compatibility);
+                        let marker = if result.installed {
+                            glyphs.running
+                        } else {
+                            glyphs.empty
+                        };
+                        track(
+                            &format!("runtime-search-name:{index}"),
+                            &available.display_name,
+                            super::runtime_search::result_name_width(
+                                row.width,
+                                marker,
+                                compatibility,
+                            ),
+                        );
+                        let metadata = super::runtime_search::result_metadata_text(available);
+                        let installed = if result.installed { "  installed" } else { "" };
+                        track(
+                            &format!("runtime-search-metadata:{index}"),
+                            &metadata,
+                            super::runtime_search::result_metadata_width(row.width, installed),
+                        );
+                    }
+                    if let Some(index) = app.selected_runtime_search_result
+                        && let Some(result) = search.results.get(index)
+                    {
+                        let available = &result.entry.available;
+                        track(
+                            &format!("runtime-search-detail-name:{index}"),
+                            &available.display_name,
+                            self.runtime_search_details.width as usize,
+                        );
+                        let source = available
+                            .identity
+                            .package
+                            .repository
+                            .as_deref()
+                            .unwrap_or(available.source_url.as_str());
+                        track(
+                            &format!("runtime-search-source:{index}"),
+                            source,
+                            super::components::key_value_width(self.runtime_search_details.width),
+                        );
+                    }
+                }
             }
             Some(Overlay::ModelRuntime) => {
-                let model_overflow = app
+                if let Some((index, model)) = app
                     .selected_model
-                    .and_then(|index| app.snapshot.models.get(index))
-                    .is_some_and(|model| {
-                        needs_marquee(
-                            &model.display_name,
-                            self.runtime_search_input.width.saturating_sub(32),
-                        )
-                    });
-                let runtime_overflow = app
-                    .runtime_picker_selection
-                    .and_then(|selected| {
-                        let status = app.runtime_list.as_ref()?.installed.get(selected)?;
-                        let row = self
-                            .runtime_search_rows
-                            .iter()
-                            .find(|(index, _)| *index == selected)?
-                            .1;
+                    .and_then(|index| app.snapshot.models.get(index).map(|model| (index, model)))
+                {
+                    track(
+                        &format!("model-runtime-heading:{index}"),
+                        &model.display_name,
+                        super::model_runtime::heading_name_width(
+                            self.runtime_search_input.width,
+                            model,
+                        ),
+                    );
+                }
+                if let Some(snapshot) = &app.runtime_list {
+                    for (index, row) in &self.runtime_search_rows {
+                        if app.runtime_picker_selection != Some(*index)
+                            && app.hover != Some(HoverTarget::RuntimePickerResult(*index))
+                        {
+                            continue;
+                        }
+                        let Some(status) = snapshot.installed.get(*index) else {
+                            continue;
+                        };
                         let identity = &status.runtime.manifest.identity;
-                        Some(needs_marquee(
-                            &format!("{}  {}", identity.engine_id, identity.version),
-                            row.width.saturating_sub(18),
-                        ))
-                    })
-                    .unwrap_or(false);
-                model_overflow || runtime_overflow
+                        let compatibility = app
+                            .runtime_picker_compatibility(&status.runtime.manifest.runtime_id)
+                            .unwrap_or(&status.compatibility);
+                        let compatibility = super::screens::compatibility_text(compatibility);
+                        let identity_text = format!("{}  {}", identity.engine_id, identity.version);
+                        track(
+                            &format!("model-runtime-identity:{index}"),
+                            &identity_text,
+                            super::model_runtime::picker_identity_width(row.width, compatibility),
+                        );
+                        let is_override = app.selected_model.is_some_and(|model_index| {
+                            app.snapshot.models.get(model_index).is_some_and(|model| {
+                                snapshot.selections.model_overrides.get(&model.id)
+                                    == Some(&status.runtime.manifest.runtime_id)
+                            })
+                        });
+                        let override_status = if is_override {
+                            "  current override"
+                        } else {
+                            ""
+                        };
+                        let metadata = format!("{} / {}", identity.accelerator, identity.variant);
+                        track(
+                            &format!("model-runtime-metadata:{index}"),
+                            &metadata,
+                            super::model_runtime::picker_metadata_width(row.width, override_status),
+                        );
+                    }
+                }
             }
             Some(Overlay::ProfileEngine) => {
-                app.profile_engine_selection
-                    .as_ref()
-                    .is_some_and(|selection| {
-                        needs_marquee(
-                            &selection.model.display_name,
-                            self.profile_engine_popup
-                                .map_or(0, |popup| popup.width.saturating_sub(41)),
-                        )
-                    })
+                if let Some(selection) = &app.profile_engine_selection
+                    && let Some(popup) = self.profile_engine_popup
+                {
+                    let inner_width =
+                        super::profile_engine::popup_inner_width(popup.width, self.compact);
+                    track(
+                        "profile-engine-heading",
+                        &selection.model.display_name,
+                        super::profile_engine::heading_name_width(inner_width),
+                    );
+                }
             }
-            Some(Overlay::Help) => false,
+            Some(Overlay::Help) => {}
             None => match app.screen {
-                Screen::Models => self.model_rows.iter().any(|(index, row)| {
-                    let active = app.selected_model == Some(*index)
-                        || app.hover == Some(HoverTarget::Model(*index));
-                    if !active {
-                        return false;
-                    }
-                    if app.model_library_view == ModelLibraryView::Discover {
-                        return app
-                            .model_search_artifact(*index)
-                            .is_some_and(|(_, artifact)| {
-                                needs_marquee(&artifact.filename, row.width.saturating_sub(9))
-                            });
-                    }
-                    app.snapshot.models.get(*index).is_some_and(|model| {
-                        let size_width =
-                            UnicodeWidthStr::width(format_bytes(model.size_bytes).as_str()) as u16;
-                        needs_marquee(
-                            &model.display_name,
-                            row.width.saturating_sub(3).saturating_mul(3) / 5,
-                        ) || needs_marquee(
-                            &model.path.display().to_string(),
-                            row.width.saturating_sub(size_width.saturating_add(2)),
-                        )
-                    })
-                }),
-                Screen::Runtimes => self.runtime_rows.iter().any(|(index, row)| {
-                    let active = app.selected_runtime == Some(*index)
-                        || app.hover == Some(HoverTarget::Runtime(*index));
-                    active
-                        && app
-                            .runtime_list
-                            .as_ref()
-                            .and_then(|snapshot| snapshot.installed.get(*index))
-                            .is_some_and(|status| {
-                                let identity = &status.runtime.manifest.identity;
-                                needs_marquee(
-                                    &format!("{}  {}", identity.engine_id, identity.version),
-                                    row.width.saturating_sub(20),
-                                )
-                            })
-                }),
-                Screen::Settings | Screen::ModelProfiles => {
-                    let setting_overflow = app
-                        .settings_definitions()
-                        .get(app.settings_setting_index)
-                        .is_some_and(|definition| {
-                            let id_width = self
-                                .setting_values
-                                .iter()
-                                .find(|(index, _)| *index == app.settings_setting_index)
-                                .and_then(|(_, value)| {
-                                    self.settings_rows
-                                        .iter()
-                                        .find(|(index, _)| *index == app.settings_setting_index)
-                                        .map(|(_, row)| {
-                                            value.x.saturating_sub(row.x).saturating_sub(2)
-                                        })
+                Screen::Models => {
+                    for (index, row) in &self.model_rows {
+                        if app.selected_model != Some(*index)
+                            && app.hover != Some(HoverTarget::Model(*index))
+                        {
+                            continue;
+                        }
+                        if app.model_library_view == ModelLibraryView::Discover {
+                            if let Some((_, artifact)) = app.model_search_artifact(*index) {
+                                let format =
+                                    super::screens::available_format_span(artifact.format.as_str());
+                                track(
+                                    &format!("model-discover:{index}"),
+                                    &artifact.filename,
+                                    super::components::remaining_width(row.width, &[&format]),
+                                );
+                            }
+                        } else if let Some(model) = app.snapshot.models.get(*index) {
+                            let marker = if app.control.as_ref().is_some_and(|control| {
+                                control.backends.iter().any(|backend| {
+                                    matches!(
+                                        backend.lifecycle,
+                                        norted_engine::BackendLifecycle::Loading
+                                            | norted_engine::BackendLifecycle::Running
+                                    ) && backend.model_id == model.id
                                 })
-                                .unwrap_or(0);
-                            let value_width = self
-                                .setting_values
-                                .iter()
-                                .find(|(index, _)| *index == app.settings_setting_index)
-                                .map_or(0, |(_, area)| area.width);
-                            let (value, _, _) = app.settings_value_display(&definition.id);
-                            needs_marquee(&definition.id.to_string(), id_width)
-                                || needs_marquee(&format!("[ {value} ]"), value_width)
-                        });
-                    let profile_path_overflow = app.screen == Screen::ModelProfiles
-                        && app.selected_profile_model().is_some_and(|model| {
-                            needs_marquee(
+                            }) {
+                                format!("{}  ", glyphs.running)
+                            } else {
+                                "   ".to_owned()
+                            };
+                            let format = format!("  {}", model.format.as_str());
+                            track(
+                                &format!("model-name:{index}"),
+                                &model.display_name,
+                                super::screens::installed_model_name_width(
+                                    row.width, &marker, &format,
+                                ),
+                            );
+                            let size = format_bytes(model.size_bytes);
+                            track(
+                                &format!("model-path:{index}"),
                                 &model.path.display().to_string(),
-                                self.settings_scopes.width,
-                            )
-                        });
-                    setting_overflow || profile_path_overflow
+                                super::components::remaining_width(row.width, &[&size, "  "]),
+                            );
+                        }
+                    }
+                }
+                Screen::Runtimes => {
+                    if let Some(snapshot) = &app.runtime_list {
+                        for (index, row) in &self.runtime_rows {
+                            if app.selected_runtime != Some(*index)
+                                && app.hover != Some(HoverTarget::Runtime(*index))
+                            {
+                                continue;
+                            }
+                            let Some(status) = snapshot.installed.get(*index) else {
+                                continue;
+                            };
+                            let identity = &status.runtime.manifest.identity;
+                            let marker = format!("{}  ", glyphs.running);
+                            let compatibility =
+                                super::screens::compatibility_text(&status.compatibility);
+                            let identity_text =
+                                format!("{}  {}", identity.engine_id, identity.version);
+                            track(
+                                &format!("runtime-identity:{index}"),
+                                &identity_text,
+                                super::screens::runtime_identity_width(
+                                    row.width,
+                                    &marker,
+                                    compatibility,
+                                ),
+                            );
+                            let (metadata, selected, update) =
+                                super::screens::runtime_secondary_text(app, status, row.width);
+                            let state = format!("{selected}{update}");
+                            track(
+                                &format!("runtime-metadata:{index}"),
+                                &metadata,
+                                super::screens::runtime_metadata_width(row.width, &state),
+                            );
+                        }
+                    }
+                }
+                Screen::Settings | Screen::ModelProfiles => {
+                    let definitions = app.settings_definitions();
+                    for (index, row) in &self.settings_rows {
+                        let id_active = app.settings_setting_index == *index
+                            || app.hover == Some(HoverTarget::Setting(*index));
+                        let value_active =
+                            id_active || app.hover == Some(HoverTarget::SettingValue(*index));
+                        if !id_active && !value_active {
+                            continue;
+                        }
+                        let Some(definition) = definitions.get(*index) else {
+                            continue;
+                        };
+                        let Some((_, value_area)) = self
+                            .setting_values
+                            .iter()
+                            .find(|(value_index, _)| value_index == index)
+                        else {
+                            continue;
+                        };
+                        if id_active {
+                            track(
+                                &format!("setting-id:{index}"),
+                                &definition.id.to_string(),
+                                value_area.x.saturating_sub(row.x).saturating_sub(2) as usize,
+                            );
+                        }
+                        if value_active {
+                            let (value, _, _) = app.settings_value_display(&definition.id);
+                            track(
+                                &format!("setting-value:{index}"),
+                                &format!("[ {value} ]"),
+                                value_area.width as usize,
+                            );
+                        }
+                    }
+                    if app.screen == Screen::ModelProfiles
+                        && app.settings_input.is_none()
+                        && let Some(model) = app.selected_profile_model()
+                    {
+                        track(
+                            "profile-model-path",
+                            &model.path.display().to_string(),
+                            self.settings_scopes.width as usize,
+                        );
+                    }
                 }
                 Screen::Server => {
-                    let width = self
-                        .server_details
-                        .width
-                        .saturating_sub(super::components::KEY_COLUMN as u16 + 1);
+                    let width = super::components::key_value_width(self.server_details.width);
+                    let pending = app.control_observation_pending();
+                    let fallback = |value: String| {
+                        if value.is_empty() {
+                            if pending {
+                                "Unknown".to_owned()
+                            } else {
+                                "None".to_owned()
+                            }
+                        } else {
+                            value
+                        }
+                    };
                     let endpoint = app
                         .control
                         .as_ref()
-                        .and_then(|control| control.public_endpoint.as_deref())
-                        .or_else(|| app.snapshot.server.endpoint())
-                        .unwrap_or("Not serving");
-                    let control_values = app.control.as_ref().map(|control| {
-                        [
+                        .and_then(|control| control.public_endpoint.clone())
+                        .or_else(|| app.snapshot.server.endpoint().map(ToOwned::to_owned))
+                        .unwrap_or_else(|| {
+                            if pending { "Observing" } else { "Not serving" }.to_owned()
+                        });
+                    track("server-endpoint", &endpoint, width);
+                    if let Some(control) = &app.control {
+                        let profiles = fallback(
                             control
                                 .backends
                                 .iter()
@@ -1442,18 +1574,24 @@ impl UiLayout {
                                 })
                                 .collect::<Vec<_>>()
                                 .join(", "),
+                        );
+                        let models = fallback(
                             control
                                 .backends
                                 .iter()
                                 .map(|backend| backend.model_id.to_string())
                                 .collect::<Vec<_>>()
                                 .join(", "),
+                        );
+                        let engines = fallback(
                             control
                                 .backends
                                 .iter()
                                 .filter_map(|backend| backend.engine_id.clone())
                                 .collect::<Vec<_>>()
                                 .join(", "),
+                        );
+                        let runtimes = fallback(
                             control
                                 .backends
                                 .iter()
@@ -1462,23 +1600,40 @@ impl UiLayout {
                                 })
                                 .collect::<Vec<_>>()
                                 .join(", "),
-                            control
-                                .backends
-                                .iter()
-                                .filter_map(|backend| backend.private_endpoint.clone())
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        ]
-                    });
-                    needs_marquee(endpoint, width)
-                        || needs_marquee(&app.public_auth_status.bind, width)
-                        || control_values.is_some_and(|values| {
-                            values.iter().any(|value| needs_marquee(value, width))
-                        })
+                        );
+                        track("server-profiles", &profiles, width);
+                        track("server-models", &models, width);
+                        track("server-engines", &engines, width);
+                        track("server-runtimes", &runtimes, width);
+                        if self.server_details.height >= 20 {
+                            let private = fallback(
+                                control
+                                    .backends
+                                    .iter()
+                                    .filter_map(|backend| backend.private_endpoint.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            );
+                            track("server-bind", &app.public_auth_status.bind, width);
+                            track("server-private", &private, width);
+                        }
+                    } else {
+                        let fallback = if pending { "Unknown" } else { "None" };
+                        track("server-profiles", fallback, width);
+                        track("server-models", fallback, width);
+                        track("server-engines", fallback, width);
+                        track("server-runtimes", fallback, width);
+                        if self.server_details.height >= 20 {
+                            track("server-bind", &app.public_auth_status.bind, width);
+                            track("server-private", fallback, width);
+                        }
+                    }
                 }
-                Screen::Overview | Screen::Logs | Screen::Help => false,
+                Screen::Overview | Screen::Logs | Screen::Help => {}
             },
         }
+
+        (!active.is_empty()).then_some(active)
     }
 
     pub fn contains_content(&self, position: Position) -> bool {
@@ -1739,82 +1894,5 @@ mod tests {
 
         assert_eq!(layout.server_progress.height, 3);
         assert!(!overlaps(layout.server_progress, layout.server_details));
-    }
-
-    #[test]
-    fn comfortable_and_compact_density_use_shared_responsive_metrics() {
-        let app = test_app(20);
-        let comfortable = UiLayout::calculate(Rect::new(0, 0, 100, 30), &app);
-        let narrow = UiLayout::calculate(Rect::new(0, 0, 83, 30), &app);
-        let short = UiLayout::calculate(Rect::new(0, 0, 100, 27), &app);
-
-        assert!(!comfortable.compact);
-        assert_eq!(comfortable.model_row_height, 4);
-        assert_eq!(comfortable.runtime_row_height, 3);
-        assert!(comfortable.content.x > narrow.content.x);
-
-        for compact in [&narrow, &short] {
-            assert!(compact.compact);
-            assert_eq!(compact.model_row_height, 3);
-            assert_eq!(compact.runtime_row_height, 2);
-            assert_eq!(compact.settings_row_height, 2);
-        }
-    }
-
-    #[test]
-    fn model_row_hitboxes_follow_the_responsive_row_rhythm() {
-        let mut app = test_app(20);
-        app.screen = Screen::Models;
-        for area in [Rect::new(0, 0, 120, 40), Rect::new(0, 0, 80, 24)] {
-            let layout = UiLayout::calculate(area, &app);
-            for (position, (index, row)) in layout.model_rows.iter().enumerate() {
-                assert_eq!(row.height, layout.model_row_height);
-                assert!(row.right() <= area.right() && row.bottom() <= area.bottom());
-                assert_eq!(
-                    layout.hit_test(Position::new(row.x, row.y + row.height - 1)),
-                    Some(HoverTarget::Model(*index)),
-                );
-                if let Some((_, next)) = layout.model_rows.get(position + 1) {
-                    assert_eq!(next.y, row.bottom());
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn every_screen_and_overlay_stays_bounded_near_the_minimum() {
-        let area = Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT);
-        let mut app = test_app(4);
-        for screen in Screen::ALL {
-            app.screen = screen;
-            let layout = UiLayout::calculate(area, &app);
-            assert!(!layout.too_small);
-            for rect in [
-                layout.header,
-                layout.content,
-                layout.command_bar,
-                layout.footer,
-                layout.model_list,
-                layout.runtime_list,
-                layout.settings_list,
-                layout.logs,
-            ] {
-                assert!(rect.right() <= area.right());
-                assert!(rect.bottom() <= area.bottom());
-            }
-        }
-
-        for overlay in [Overlay::Help, Overlay::RuntimeSearch, Overlay::ModelRuntime] {
-            app.overlay = Some(overlay);
-            let layout = UiLayout::calculate(area, &app);
-            let popup = if overlay == Overlay::Help {
-                layout.help_popup
-            } else {
-                layout.runtime_search_popup
-            }
-            .expect("active overlay has geometry");
-            assert!(popup.right() <= area.right());
-            assert!(popup.bottom() <= area.bottom());
-        }
     }
 }

@@ -7,7 +7,8 @@ use ratatui::widgets::{Clear, List, ListItem, Paragraph};
 use crate::app::{App, Overlay};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{
-    ActionState, action_style, marquee_text, popup_block, truncate_middle,
+    ActionState, action_style, marquee_text, pad_display_width, popup_block, remaining_width,
+    truncate_middle,
 };
 use crate::ui::layout::{HoverTarget, UiLayout};
 use crate::ui::screens::render_help_body;
@@ -66,9 +67,9 @@ pub fn render_overlays(
                 .suggestion_rows
                 .get(visible_index)
                 .map_or(0, |(_, row)| row.width as usize);
-            let name_width = if layout.compact { 12 } else { 18 };
-            let name = format!("{:<name_width$}  ", command.name);
-            let description_width = row_width.saturating_sub(name.len());
+            let name = suggestion_name(command.name, layout.compact);
+            let description_width =
+                suggestion_description_width(row_width as u16, command.name, layout.compact);
             let mut style = if index == app.suggestion_index {
                 theme.selected
             } else {
@@ -83,7 +84,7 @@ pub fn render_overlays(
                 marquee_text(
                     command.description,
                     description_width,
-                    app.ui_animation_frame / 3,
+                    app.marquee_animation_frame / 3,
                 )
             } else {
                 truncate_middle(command.description, description_width, glyphs.ellipsis)
@@ -104,4 +105,16 @@ pub fn render_overlays(
         List::new(items).block(popup_block(title, theme, glyphs, layout.compact)),
         area,
     );
+}
+
+pub(super) fn suggestion_name(name: &str, compact: bool) -> String {
+    format!(
+        "{}  ",
+        pad_display_width(name, if compact { 12 } else { 18 })
+    )
+}
+
+pub(super) fn suggestion_description_width(row_width: u16, name: &str, compact: bool) -> usize {
+    let name = suggestion_name(name, compact);
+    remaining_width(row_width, &[&name])
 }

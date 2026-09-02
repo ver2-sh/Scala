@@ -1,11 +1,11 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::app::{App, FocusArea, ModelLibraryView, Screen};
 use crate::theme::{Glyphs, Theme};
-use crate::ui::components::{centered_message, hint, input_window, marquee_text};
+use crate::ui::components::{centered_message, hint, input_window, marquee_text, remaining_width};
 use crate::ui::layout::{HoverTarget, UiLayout};
 
 pub const MIN_WIDTH: u16 = 46;
@@ -143,8 +143,8 @@ pub fn render_command_bar(
             Span::styled(
                 marquee_text(
                     notice,
-                    area.width.saturating_sub(7) as usize,
-                    app.ui_animation_frame / 3,
+                    notice_width(area.width),
+                    app.marquee_animation_frame / 3,
                 ),
                 theme.text,
             ),
@@ -168,27 +168,27 @@ pub fn render_command_bar(
 }
 
 pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, glyphs: &Glyphs) {
-    let line = if app.overlay == Some(crate::app::Overlay::ProfileEngine) {
+    let hints = if app.overlay == Some(crate::app::Overlay::ProfileEngine) {
         vec![
-            hint(glyphs.up_down, "select engine", theme),
             hint("Enter", "create", theme),
             hint("Esc", "cancel", theme),
+            hint(glyphs.up_down, "select engine", theme),
         ]
     } else if app.overlay == Some(crate::app::Overlay::ModelRuntime) {
         vec![
-            hint(glyphs.up_down, "select", theme),
             hint("Enter", "apply / search", theme),
+            hint("Esc", "cancel", theme),
+            hint(glyphs.up_down, "select", theme),
             hint("s", "search available", theme),
             hint("x/Del", "clear override", theme),
             hint("wheel", "scroll", theme),
-            hint("Esc", "cancel", theme),
         ]
     } else if app.overlay == Some(crate::app::Overlay::RuntimeSearch) {
         vec![
-            hint("Tab", "query/results", theme),
-            hint(glyphs.up_down, "select", theme),
             hint("Enter/i", "install", theme),
             hint("Esc", "close", theme),
+            hint("Tab", "query/results", theme),
+            hint(glyphs.up_down, "select", theme),
         ]
     } else if app.command_active {
         vec![
@@ -198,12 +198,6 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
         ]
     } else if app.focus == FocusArea::Content && app.screen == Screen::Models {
         models_footer(app, area.width, theme, glyphs)
-    } else if area.width < 60 {
-        vec![
-            hint("Tab", "focus", theme),
-            hint("/", "commands", theme),
-            hint("?", "help", theme),
-        ]
     } else {
         match (app.focus, app.screen) {
             (FocusArea::Navigation, _) => vec![
@@ -211,15 +205,17 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
                 hint("Enter", "open", theme),
                 hint("Tab", "content", theme),
                 hint("/", "commands", theme),
+                hint("?", "help", theme),
             ],
             (FocusArea::Content, crate::app::Screen::ModelProfiles) => vec![
                 hint("Left/Right", "profile", theme),
                 hint(glyphs.up_down, "setting", theme),
                 hint("Enter", "edit/cycle", theme),
-                hint("Delete", "inherit", theme),
+                hint("e", "change engine", theme),
                 hint("l", "load profile", theme),
                 hint("u", "unload active", theme),
-                hint("e", "change engine", theme),
+                hint("Delete", "inherit", theme),
+                hint("?", "help", theme),
             ],
             (FocusArea::Content, crate::app::Screen::Logs) => vec![
                 hint(glyphs.up_down, "scroll", theme),
@@ -230,35 +226,56 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
             (FocusArea::Content, crate::app::Screen::Runtimes) => vec![
                 hint(glyphs.up_down, "select", theme),
                 hint("s", "search", theme),
+                hint("U", "update selected", theme),
+                hint("d d", "remove", theme),
+                hint("r", "refresh", theme),
                 hint("g", "GGUF default", theme),
                 hint("Q/2", "Q27 default", theme),
                 hint("N/3", "NInfer default", theme),
                 hint("u", "updates", theme),
-                hint("U", "update selected", theme),
-                hint("d d", "remove", theme),
-                hint("r", "refresh", theme),
                 hint("wheel", "scroll", theme),
+                hint("?", "help", theme),
             ],
             (FocusArea::Content, crate::app::Screen::Settings) => vec![
                 hint("Left/Right", "scope", theme),
                 hint(glyphs.up_down, "setting", theme),
                 hint("Enter", "edit/cycle", theme),
                 hint("Delete", "inherit", theme),
+                hint("?", "help", theme),
             ],
             _ => vec![
                 hint("Tab", "change focus", theme),
-                hint("mouse", "click / hover", theme),
                 hint("/", "commands", theme),
                 hint("?", "help", theme),
+                hint("mouse", "click / hover", theme),
                 hint("Ctrl+C", "exit", theme),
             ],
         }
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(line.into_iter().flatten().collect::<Vec<_>>()))
-            .wrap(Wrap { trim: true }),
-        area,
-    );
+    let line = fit_footer_hints(hints, area.width);
+    frame.render_widget(Paragraph::new(Line::from(line)), area);
+}
+
+pub(super) fn notice_width(area_width: u16) -> usize {
+    let content_width = area_width.saturating_sub(4);
+    remaining_width(content_width, &["!  "])
+}
+
+fn fit_footer_hints<'a>(hints: Vec<Vec<Span<'a>>>, width: u16) -> Vec<Span<'a>> {
+    let mut used = 0usize;
+    let mut line = Vec::new();
+    for hint in hints {
+        let hint_width = hint
+            .iter()
+            .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+            .sum::<usize>();
+        if used.saturating_add(hint_width) > width as usize {
+            continue;
+        }
+        used = used.saturating_add(hint_width);
+        line.extend(hint);
+    }
+    line
 }
 
 fn models_footer<'a>(
@@ -312,6 +329,7 @@ fn models_footer<'a>(
                 line.push(hint("d", "remove", theme));
             }
         }
+        line.push(hint("?", "help", theme));
         return line;
     }
 
@@ -322,6 +340,7 @@ fn models_footer<'a>(
             hint("f", "format", theme),
             hint("Up/Down", "select", theme),
             hint("d", "download", theme),
+            hint("?", "help", theme),
         ];
     }
 
@@ -339,6 +358,7 @@ fn models_footer<'a>(
     if has_selection {
         line.push(hint("d", "download", theme));
     }
+    line.push(hint("?", "help", theme));
     line
 }
 
