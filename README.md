@@ -71,10 +71,11 @@ Discover includes an in-process model download manager. Separate acquisitions ru
 releases its slot to the next queued request. Settings > Global > Downloads exposes the typed
 `server.max_parallel_model_downloads` value with a minimum of 1; raising it starts more queued jobs
 immediately, while lowering it lets current transfers finish and limits subsequent starts. Exact
-duplicate references are admitted only once while queued or active. The download panel retains a
-bounded recent history and shows each job's artifact, phase, real bytes/total and percentage when
-known, measured transfer rate, calculated ETA when meaningful, or queue position. Search and TUI
-navigation remain independent of downloads.
+duplicate references are admitted only once while queued or active. References that resolve to the
+same package acquisition wait for its owner and settle as already installed. The download panel
+retains a bounded recent history and shows each job's artifact, phase, real bytes/total and
+percentage when known, measured transfer rate, calculated ETA when meaningful, or queue position.
+Search and TUI navigation remain independent of downloads.
 
 Managed models use the platform-native Norted data directory shown by `config show`:
 
@@ -107,6 +108,9 @@ Large files stream to resumable partial files in the application cache. They are
 published or manifest size and SHA-256, inspected through the normal bounded format handling, and
 activated by directory rename only after every required file validates. Thus every member of a
 package becomes visible together, while failed/partial transfers never enter local discovery.
+Each canonical acquisition also holds its own inter-process file lock in the model-download cache
+through partial-cache mutation and final activation. TUI and CLI processes therefore share safe
+acquisition state without serializing unrelated downloads; managed removal takes the same lock.
 
 Raw q27 pairing uses one shared rule for discovery and acquisition: exact stems first, then a unique
 longest boundary-safe prefix, then the sole `.tok` file (including `MODEL.q27` plus

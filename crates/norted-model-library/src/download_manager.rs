@@ -70,6 +70,7 @@ struct JobRecord {
     message: String,
     enqueued_at: Instant,
     started_at: Option<Instant>,
+    finished_at: Option<Instant>,
     transfer_started_at: Option<Instant>,
     transfer_baseline_bytes: u64,
 }
@@ -128,6 +129,7 @@ impl DownloadManager {
             message: "Waiting for an available download slot".to_owned(),
             enqueued_at: Instant::now(),
             started_at: None,
+            finished_at: None,
             transfer_started_at: None,
             transfer_baseline_bytes: 0,
         };
@@ -186,6 +188,9 @@ impl DownloadManager {
             record.filename = Some(progress.filename.clone());
         }
         record.phase = progress.phase;
+        if progress.phase.is_terminal() && record.finished_at.is_none() {
+            record.finished_at = Some(Instant::now());
+        }
         record.downloaded_bytes = progress.downloaded_bytes;
         record.total_bytes = progress.total_bytes;
         record.message.clone_from(&progress.message);
@@ -201,6 +206,9 @@ impl DownloadManager {
         if let Some(record) = state.jobs.get_mut(id) {
             record.phase = phase;
             record.message = message;
+            if phase.is_terminal() && record.finished_at.is_none() {
+                record.finished_at = Some(Instant::now());
+            }
         }
         state.active.remove(id);
         let starts = schedule_locked(&mut state);
@@ -269,7 +277,7 @@ fn prune_locked(state: &mut State) {
 }
 
 fn snapshot(state: &State, record: &JobRecord) -> ModelDownloadJob {
-    let now = Instant::now();
+    let now = record.finished_at.unwrap_or_else(Instant::now);
     let elapsed = record.started_at.map_or_else(
         || now.duration_since(record.enqueued_at),
         |start| now.duration_since(start),

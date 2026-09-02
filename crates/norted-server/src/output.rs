@@ -282,10 +282,10 @@ pub fn model_operation(
     } else {
         println!(
             "{} {} as {} ({})",
-            if operation == "import" {
-                "Imported"
-            } else {
-                "Downloaded"
+            match operation {
+                "import" => "Imported",
+                "already_installed" => "Already installed",
+                _ => "Downloaded",
             },
             artifact.display_name,
             artifact.id,
