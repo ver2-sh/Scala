@@ -113,9 +113,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 .await?;
             output::control_operation("load", &status, cli.json)?;
         }
-        Command::Unload => {
+        Command::Unload { model_profile_id } => {
             let client = ControlClient::discover(&core.paths).await?;
-            let status = client.unload().await?;
+            let status = client
+                .unload(ModelProfileId::new(model_profile_id)?)
+                .await?;
             output::control_operation("unload", &status, cli.json)?;
         }
         Command::Models(args) => match args.command {
@@ -161,15 +163,22 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 let library = norted_model_library::ModelLibrary::new(&core.paths);
                 let plan = library.plan_removal(&model)?;
                 let active = match ControlClient::discover(&core.paths).await {
-                    Ok(client) => client.status().await?.backend.model_id,
-                    Err(ControlClientError::Unavailable) => None,
+                    Ok(client) => client
+                        .status()
+                        .await?
+                        .backends
+                        .into_iter()
+                        .map(|backend| backend.model_id)
+                        .collect::<Vec<_>>(),
+                    Err(ControlClientError::Unavailable) => Vec::new(),
                     Err(error) => return Err(error.into()),
                 };
-                if let Some(active) = active
-                    && plan.affected_model_ids.contains(&active)
+                if active
+                    .iter()
+                    .any(|active| plan.affected_model_ids.contains(active))
                 {
                     return Err(color_eyre::eyre::eyre!(
-                        "model `{active}` is active and belongs to this managed acquisition; unload it before removal"
+                        "an active model belongs to this managed acquisition; unload it before removal"
                     ));
                 }
                 library.remove(&plan).await?;
@@ -236,12 +245,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 RuntimesCommand::Remove { runtime_ref } => {
                     let runtime_id = RuntimeId::new(runtime_ref)?;
-                    let active = match ControlClient::discover(&core.paths).await {
-                        Ok(client) => client.status().await?.backend.runtime_id,
-                        Err(ControlClientError::Unavailable) => None,
-                        Err(error) => return Err(error.into()),
-                    };
-                    packs.remove(&runtime_id, active.as_ref()).await?;
+                    packs.remove(&runtime_id, None).await?;
                     output::runtime_removed(&runtime_id, cli.json)?;
                 }
                 RuntimesCommand::CheckUpdates => {
@@ -404,7 +408,13 @@ async fn model_info(
         color_eyre::eyre::eyre!("model `{model_id}` does not exist in the discovered registry")
     })?;
     let active_model = match ControlClient::discover(&core.paths).await {
-        Ok(client) => client.status().await?.backend.model_id,
+        Ok(client) => client
+            .status()
+            .await?
+            .backends
+            .into_iter()
+            .find(|backend| backend.model_id == model_id)
+            .map(|backend| backend.model_id),
         Err(ControlClientError::Unavailable) => None,
         Err(error) => return Err(error.into()),
     };
@@ -527,6 +537,7 @@ async fn handle_model_profiles(
             profile,
             model,
             engine,
+            role,
         } => {
             let profile_id = ModelProfileId::new(profile)?;
             let model_id = ModelId(model);
@@ -539,6 +550,11 @@ async fn handle_model_profiles(
             let state = store
                 .update(move |state| {
                     state.create(profile_id.clone(), profile_id.as_str(), model_id, engine_id)?;
+                    state
+                        .profiles
+                        .get_mut(&profile_id)
+                        .expect("new profile")
+                        .role = role.into();
                     Ok(state.clone())
                 })
                 .await?;
@@ -581,7 +597,7 @@ async fn handle_model_profiles(
         ModelProfilesCommand::Delete { profile } => {
             let profile_id = ModelProfileId::new(profile)?;
             if let Ok(client) = ControlClient::discover(&core.paths).await
-                && client.status().await?.backend.model_profile_id.as_ref() == Some(&profile_id)
+                && client.status().await?.backend(&profile_id).is_some()
             {
                 return Err(color_eyre::eyre::eyre!(
                     "cannot delete active Model Profile `{profile_id}`; unload it first"
@@ -650,6 +666,22 @@ async fn handle_model_profiles(
                 })
                 .await?;
             output_model_profile_mutation(&core, "set-engine", &state, &selected, json_output)
+                .await?;
+        }
+        ModelProfilesCommand::SetRole { profile, role } => {
+            let profile_id = ModelProfileId::new(profile)?;
+            let selected = profile_id.clone();
+            let state = store
+                .update(move |state| {
+                    state
+                        .profiles
+                        .get_mut(&profile_id)
+                        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?
+                        .role = role.into();
+                    Ok(state.clone())
+                })
+                .await?;
+            output_model_profile_mutation(&core, "set-role", &state, &selected, json_output)
                 .await?;
         }
         ModelProfilesCommand::Set { profile, settings } => {

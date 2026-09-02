@@ -4,7 +4,7 @@ use std::convert::Infallible;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, State, rejection::JsonRejection};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -64,6 +64,7 @@ const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
 pub(super) async fn create(
     State(state): State<PublicApiState>,
     Extension(correlation): Extension<RequestCorrelation>,
+    headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, OpenAiError> {
     let Json(value) = payload.map_err(|error| OpenAiError::malformed_json(&error))?;
@@ -73,6 +74,7 @@ pub(super) async fn create(
     let message_id = format!("msg_{}", Uuid::new_v4().simple());
     let created_at = unix_timestamp();
     let inference = parsed.normalized.inference_request()?;
+    let routing = crate::inference_routing_context(&headers)?;
     let public_model = parsed.normalized.model.clone();
     let max_output_tokens = parsed.normalized.max_output_tokens;
     let reasoning_effort = parsed.normalized.generation_settings.reasoning_effort;
@@ -82,7 +84,7 @@ pub(super) async fn create(
     if parsed.normalized.stream {
         let routed = state
             .runtime
-            .infer_stream(inference)
+            .infer_stream_routed(inference, routing)
             .await
             .map_err(runtime_error)?;
         Ok(streaming_response(
@@ -105,7 +107,7 @@ pub(super) async fn create(
     } else {
         let routed = state
             .runtime
-            .infer(inference)
+            .infer_routed(inference, routing)
             .await
             .map_err(runtime_error)?;
         let status = if routed.output.finish_reason == InferenceFinishReason::MaxOutputTokens {

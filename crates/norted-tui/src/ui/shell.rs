@@ -290,11 +290,12 @@ fn models_footer<'a>(
             if !compact {
                 line.push(hint("v", "runtime", theme));
             }
-            let is_active = app
-                .control
-                .as_ref()
-                .and_then(|control| control.backend.model_id.as_ref())
-                == Some(&model.id);
+            let is_active = app.control.as_ref().is_some_and(|control| {
+                control
+                    .backends
+                    .iter()
+                    .any(|backend| backend.model_id == model.id)
+            });
             if width >= 90 && !app.model_removal_busy() && model.provenance.is_some() && !is_active
             {
                 line.push(hint("d", "remove", theme));

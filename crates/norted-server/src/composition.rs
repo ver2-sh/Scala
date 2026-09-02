@@ -50,12 +50,20 @@ impl ApplicationServices {
     }
 
     pub async fn runtime_manager(&self, core: Arc<ApplicationCore>) -> Arc<RuntimeManager> {
+        let jit = &core.config.server.jit;
+        let options = RuntimeManagerOptions {
+            jit_enabled: jit.enabled,
+            primary_idle_ttl: Duration::from_secs(jit.primary_idle_ttl_seconds),
+            auxiliary_idle_ttl: Duration::from_secs(jit.auxiliary_idle_ttl_seconds),
+            max_idle_auxiliary_backends: jit.max_idle_auxiliary_backends,
+            ..RuntimeManagerOptions::default()
+        };
         RuntimeManager::initialize(
             core,
             self.registry.clone(),
             Arc::clone(&self.runtime_packs),
             Arc::new(TokioProcessSupervisor::default()),
-            RuntimeManagerOptions::default(),
+            options,
         )
         .await
     }
@@ -409,6 +417,7 @@ mod tests {
             host: "0.0.0.0".to_owned(),
             port: 8742,
             auth: PublicAuthMode::Auto,
+            ..ServerConfig::default()
         }
         .public_auth_status(0)
         .expect("auth status");
@@ -422,6 +431,7 @@ mod tests {
             host: "0.0.0.0".to_owned(),
             port: 8742,
             auth: PublicAuthMode::Disabled,
+            ..ServerConfig::default()
         }
         .public_auth_status(0)
         .expect("auth status");

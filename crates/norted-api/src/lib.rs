@@ -16,10 +16,11 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, middleware};
-use norted_core::{ApplicationCore, ModelProfilesStore, RuntimePublisher, ServerState};
+use norted_core::{ApplicationCore, ModelProfilesStore, ModelRole, RuntimePublisher, ServerState};
 use norted_engine::{
     CONTROL_LOAD_PATH, CONTROL_STATUS_PATH, CONTROL_UNLOAD_PATH, ControlErrorResponse,
-    ControlLoadRequest, ControlStatus, RuntimeManager,
+    ControlLoadRequest, ControlStatus, ControlUnloadRequest, InferenceRoutingContext,
+    RuntimeManager,
 };
 use serde::Serialize;
 use tokio::net::TcpListener;
@@ -28,6 +29,9 @@ use uuid::Uuid;
 pub use auth::{PublicAuth, PublicAuthVerifier};
 
 const GATEWAY_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const NORTED_SESSION_HEADER: &str = "x-norted-session";
+const NORTED_ROLE_HEADER: &str = "x-norted-role";
+const MAX_SESSION_ID_BYTES: usize = 128;
 /// Public inference bodies are buffered for JSON parsing, but never beyond this
 /// explicit large-context ceiling.
 pub const MAX_INFERENCE_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -367,8 +371,7 @@ async fn control_load(
                 norted_engine::RuntimeError::ModelProfileNotFound(_)
                 | norted_engine::RuntimeError::BoundModelMissing { .. }
                 | norted_engine::RuntimeError::ModelNotFound(_) => StatusCode::NOT_FOUND,
-                norted_engine::RuntimeError::AlreadyActive { .. }
-                | norted_engine::RuntimeError::Busy(_) => StatusCode::CONFLICT,
+                norted_engine::RuntimeError::Busy(_) => StatusCode::CONFLICT,
                 norted_engine::RuntimeError::Incompatible { .. } => {
                     StatusCode::UNPROCESSABLE_ENTITY
                 }
@@ -387,17 +390,65 @@ async fn control_load(
 async fn control_unload(
     State(state): State<ControlApiState>,
     headers: HeaderMap,
+    payload: Result<Json<ControlUnloadRequest>, JsonRejection>,
 ) -> Result<Json<ControlStatus>, ControlApiError> {
     authorize(&headers, &state.token)?;
+    let Json(request) = payload.map_err(|error| ControlApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: format!("invalid unload request: {}", error.body_text()),
+    })?;
     state
         .runtime
-        .unload()
+        .unload(request.model_profile_id)
         .await
         .map(Json)
         .map_err(|error| ControlApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: error.to_string(),
         })
+}
+
+fn inference_routing_context(
+    headers: &HeaderMap,
+) -> Result<InferenceRoutingContext, error::OpenAiError> {
+    let session_id = match headers.get(NORTED_SESSION_HEADER) {
+        None => "default".to_owned(),
+        Some(value) => {
+            let value = value.to_str().map_err(|_| {
+                error::OpenAiError::invalid(
+                    "`X-Norted-Session` must contain visible ASCII text.",
+                    None::<String>,
+                    "invalid_header",
+                )
+            })?;
+            if value.is_empty()
+                || value.len() > MAX_SESSION_ID_BYTES
+                || value.chars().any(char::is_control)
+            {
+                return Err(error::OpenAiError::invalid(
+                    "`X-Norted-Session` must be 1 to 128 bytes of visible text.",
+                    None::<String>,
+                    "invalid_header",
+                ));
+            }
+            value.to_owned()
+        }
+    };
+    let role = match headers.get(NORTED_ROLE_HEADER) {
+        None => None,
+        Some(value) => match value.to_str().ok() {
+            Some("primary") => Some(ModelRole::Primary),
+            Some("auxiliary") => Some(ModelRole::Auxiliary),
+            _ => {
+                return Err(error::OpenAiError::invalid(
+                    "`X-Norted-Role` must be `primary` or `auxiliary`.",
+                    None::<String>,
+                    "invalid_header",
+                ));
+            }
+        },
+    };
+    Ok(InferenceRoutingContext { session_id, role })
 }
 
 fn authorize(headers: &HeaderMap, expected: &str) -> Result<(), ControlApiError> {
@@ -627,15 +678,19 @@ mod tests {
             .await
             .expect("response body");
         let admitted: ControlStatus = serde_json::from_slice(&body).expect("control status");
-        assert_eq!(admitted.backend.lifecycle, BackendLifecycle::Loading);
-        assert_eq!(admitted.backend.model_id.as_ref(), Some(&model_id));
+        let admitted_backend = admitted.newest_backend().expect("admitted backend");
+        assert_eq!(admitted_backend.lifecycle, BackendLifecycle::Loading);
+        assert_eq!(&admitted_backend.model_id, &model_id);
 
         // The handler and response are gone, but the manager-owned task still
         // records its eventual failure in authoritative state.
         let failed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let status = runtime.status().await;
-                if status.backend.lifecycle == BackendLifecycle::Failed {
+                if status
+                    .newest_backend()
+                    .is_some_and(|backend| backend.lifecycle == BackendLifecycle::Failed)
+                {
                     return status;
                 }
                 tokio::task::yield_now().await;
@@ -643,7 +698,16 @@ mod tests {
         })
         .await
         .expect("background load completion");
-        assert_eq!(failed.backend.generation, admitted.backend.generation);
-        assert!(failed.backend.failure.is_some());
+        assert_eq!(
+            failed.newest_backend().expect("failed backend").generation,
+            admitted_backend.generation
+        );
+        assert!(
+            failed
+                .newest_backend()
+                .expect("failed backend")
+                .failure
+                .is_some()
+        );
     }
 }

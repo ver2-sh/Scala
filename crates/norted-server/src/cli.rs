@@ -55,8 +55,8 @@ pub enum Command {
         #[arg(long = "set", value_name = "SETTING_ID=VALUE")]
         settings: Vec<String>,
     },
-    /// Unload the active model from the running Norted Server instance
-    Unload,
+    /// Unload one Model Profile from the running Norted Server instance
+    Unload { model_profile_id: String },
     /// Inspect locally discovered model artifacts
     Models(ModelsArgs),
     /// Inspect available inference engines
@@ -233,6 +233,9 @@ pub enum ModelProfilesCommand {
         model: String,
         #[arg(long)]
         engine: String,
+        /// Default inference role for this profile
+        #[arg(long, value_enum, default_value_t)]
+        role: ProfileRole,
     },
     /// Duplicate a Model Profile under a new ID
     Duplicate { source: String, profile: String },
@@ -242,6 +245,8 @@ pub enum ModelProfilesCommand {
     SetModel { profile: String, model: String },
     /// Change the engine binding
     SetEngine { profile: String, engine: String },
+    /// Change the default inference role
+    SetRole { profile: String, role: ProfileRole },
     /// Set one or more Model Profile overrides
     Set {
         profile: String,
@@ -268,6 +273,22 @@ pub enum ModelProfilesCommand {
         #[arg(long)]
         runtime: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum ProfileRole {
+    #[default]
+    Primary,
+    Auxiliary,
+}
+
+impl From<ProfileRole> for norted_core::ModelRole {
+    fn from(value: ProfileRole) -> Self {
+        match value {
+            ProfileRole::Primary => Self::Primary,
+            ProfileRole::Auxiliary => Self::Auxiliary,
+        }
+    }
 }
 
 #[derive(Debug, Args)]

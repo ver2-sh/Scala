@@ -24,7 +24,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/unload",
-        description: "Unload the active Model Profile",
+        description: "Unload the selected resident Model Profile",
         action: CommandAction::Unload,
     },
     SlashCommand {

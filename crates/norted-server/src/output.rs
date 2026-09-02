@@ -70,46 +70,39 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
         }
         if let Some(control) = &control {
             println!(
-                "  Adapters:        {} registered, {} external binaries, {} backend running",
+                "  Adapters:        {} registered, {} external binaries, {} backends running",
                 control.available_engine_count,
                 control.installed_engine_count,
-                control.running_engine_count
+                control.running_backend_count
             );
-            println!("  Backend:         {:?}", control.backend.lifecycle);
-            println!(
-                "  Active profile:  {}",
-                control
-                    .backend
-                    .model_profile_id
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .as_deref()
-                    .unwrap_or("none")
-            );
-            println!(
-                "  Artifact model:  {}",
-                control
-                    .backend
-                    .model_id
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .as_deref()
-                    .unwrap_or("none")
-            );
-            if let Some(engine) = &control.backend.engine_id {
-                println!("  Active engine:   {engine}");
+            if control.backends.is_empty() {
+                println!("  Backends:        none");
             }
-            if let Some(runtime) = &control.backend.runtime_id {
-                println!("  Active runtime:  {runtime}");
-            }
-            if let Some(version) = &control.backend.runtime_version {
-                println!("  Runtime version: {version}");
-            }
-            if let Some(variant) = &control.backend.runtime_variant {
-                println!("  Runtime variant: {variant}");
-            }
-            if let Some(digest) = &control.backend.runtime_executable_sha256 {
-                println!("  Runtime SHA-256: {digest}");
+            for backend in &control.backends {
+                println!(
+                    "  Backend:         {} ({:?}, {:?}, {:?})",
+                    backend.model_profile_id, backend.role, backend.residency, backend.lifecycle
+                );
+                println!("    Model:         {}", backend.model_id);
+                println!(
+                    "    Requests:      {} active, {} primary leases",
+                    backend.active_request_count, backend.primary_lease_count
+                );
+                if let Some(engine) = &backend.engine_id {
+                    println!("    Engine:        {engine}");
+                }
+                if let Some(runtime) = &backend.runtime_id {
+                    println!("    Runtime:       {runtime}");
+                }
+                if let Some(version) = &backend.runtime_version {
+                    println!("    Version:       {version}");
+                }
+                if let Some(variant) = &backend.runtime_variant {
+                    println!("    Variant:       {variant}");
+                }
+                if let Some(digest) = &backend.runtime_executable_sha256 {
+                    println!("    SHA-256:       {digest}");
+                }
             }
         } else {
             println!("  Adapters:        unavailable (no private control observation)");
@@ -490,33 +483,19 @@ pub fn control_operation(operation: &str, status: &ControlStatus, json_output: b
                 "Unload"
             }
         );
-        println!("  Backend: {:?}", status.backend.lifecycle);
-        println!(
-            "  Model:   {}",
-            status
-                .backend
-                .model_id
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref()
-                .unwrap_or("none")
-        );
-        if let Some(engine) = &status.backend.engine_id {
-            println!("  Engine:  {engine}");
-        }
-        if let Some(runtime) = &status.backend.runtime_id {
-            println!("  Runtime: {runtime}");
-        }
-        if let Some(version) = &status.backend.runtime_version {
+        println!("  Resident backends: {}", status.backends.len());
+        for backend in &status.backends {
             println!(
-                "  Version: {version}{}",
-                status
-                    .backend
-                    .runtime_variant
-                    .as_deref()
-                    .map(|variant| format!(" / {variant}"))
-                    .unwrap_or_default()
+                "  {}: {:?} / {:?} / {:?}",
+                backend.model_profile_id, backend.role, backend.residency, backend.lifecycle
             );
+            println!("    Model: {}", backend.model_id);
+            if let Some(engine) = &backend.engine_id {
+                println!("    Engine: {engine}");
+            }
+            if let Some(runtime) = &backend.runtime_id {
+                println!("    Runtime: {runtime}");
+            }
         }
         for event in status.recent_events.iter().filter(|event| {
             matches!(
@@ -875,14 +854,15 @@ pub fn model_profiles(
         println!("No Model Profiles exist. Create one from a discovered model artifact.");
     } else {
         println!(
-            "{:<30} {:<12} {:<36} STATE",
-            "MODEL PROFILE", "ENGINE", "MODEL ID"
+            "{:<30} {:<10} {:<12} {:<36} STATE",
+            "MODEL PROFILE", "ROLE", "ENGINE", "MODEL ID"
         );
         for profile in state.profiles.values() {
             let available = models.iter().any(|model| model.id == profile.model_id);
             println!(
-                "{:<30} {:<12} {:<36} {}",
+                "{:<30} {:<10} {:<12} {:<36} {}",
                 profile.id,
+                format!("{:?}", profile.role).to_lowercase(),
                 profile.engine_id,
                 truncate(&profile.model_id.to_string(), 36),
                 if available { "available" } else { "missing" }
@@ -928,6 +908,7 @@ pub fn model_profile(
         println!("  Format:         {}", model.format);
     }
     println!("  Engine:         {}", profile.engine_id);
+    println!("  Role:           {:?}", profile.role);
     println!("  Content SHA:    {}", profile.content_hash());
     if profile.overrides.is_empty() {
         println!("  Overrides:      none (Global + engine defaults only)");

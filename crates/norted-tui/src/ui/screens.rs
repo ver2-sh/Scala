@@ -189,12 +189,11 @@ fn render_metrics(
             }
         },
         |control| {
-            control
-                .backend
-                .model_id
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "None".to_owned())
+            if control.backends.is_empty() {
+                "None".to_owned()
+            } else {
+                format!("{} resident", control.backends.len())
+            }
         },
     );
     let values = [
@@ -489,11 +488,13 @@ fn render_models(
             Line::from(vec![
                 Span::styled(
                     if app.control.as_ref().is_some_and(|control| {
-                        matches!(
-                            control.backend.lifecycle,
-                            norted_engine::BackendLifecycle::Loading
-                                | norted_engine::BackendLifecycle::Running
-                        ) && control.backend.model_id.as_ref() == Some(&model.id)
+                        control.backends.iter().any(|backend| {
+                            matches!(
+                                backend.lifecycle,
+                                norted_engine::BackendLifecycle::Loading
+                                    | norted_engine::BackendLifecycle::Running
+                            ) && backend.model_id == model.id
+                        })
                     }) {
                         format!("{}  ", glyphs.running)
                     } else {
@@ -1313,7 +1314,13 @@ fn render_server(
     let lifecycle = app
         .control
         .as_ref()
-        .map(|control| format!("{:?}", control.backend.lifecycle))
+        .map(|control| {
+            format!(
+                "{} resident / {} running",
+                control.backends.len(),
+                control.running_backend_count
+            )
+        })
         .unwrap_or_else(|| {
             if pending {
                 "Observing".to_owned()
@@ -1324,36 +1331,97 @@ fn render_server(
     let active_profile = app
         .control
         .as_ref()
-        .and_then(|control| control.backend.model_profile_id.as_ref())
-        .map(ToString::to_string)
+        .map(|control| {
+            let value = control
+                .backends
+                .iter()
+                .map(|backend| {
+                    format!(
+                        "{} [{:?}/{:?}/{:?}; req {}; leases {}]",
+                        backend.model_profile_id,
+                        backend.role,
+                        backend.residency,
+                        backend.lifecycle,
+                        backend.active_request_count,
+                        backend.primary_lease_count,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if value.is_empty() {
+                "None".to_owned()
+            } else {
+                value
+            }
+        })
         .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
     let active_model = app
         .control
         .as_ref()
-        .and_then(|control| control.backend.model_id.as_ref())
-        .map(ToString::to_string)
+        .map(|control| {
+            let value = control
+                .backends
+                .iter()
+                .map(|backend| backend.model_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if value.is_empty() {
+                "None".to_owned()
+            } else {
+                value
+            }
+        })
         .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
     let active_engine = app
         .control
         .as_ref()
-        .and_then(|control| control.backend.engine_id.clone())
+        .map(|control| {
+            let value = control
+                .backends
+                .iter()
+                .filter_map(|backend| backend.engine_id.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if value.is_empty() {
+                "None".to_owned()
+            } else {
+                value
+            }
+        })
         .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
     let active_runtime = app
         .control
         .as_ref()
-        .and_then(|control| {
-            control.backend.runtime_id.as_ref().map(|runtime_id| {
-                control.backend.runtime_version.as_deref().map_or_else(
-                    || runtime_id.to_string(),
-                    |version| format!("{runtime_id} / {version}"),
-                )
-            })
+        .map(|control| {
+            let value = control
+                .backends
+                .iter()
+                .filter_map(|backend| backend.runtime_id.as_ref().map(ToString::to_string))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if value.is_empty() {
+                "None".to_owned()
+            } else {
+                value
+            }
         })
         .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
     let private_backend = app
         .control
         .as_ref()
-        .and_then(|control| control.backend.private_endpoint.clone())
+        .map(|control| {
+            let value = control
+                .backends
+                .iter()
+                .filter_map(|backend| backend.private_endpoint.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if value.is_empty() {
+                "None".to_owned()
+            } else {
+                value
+            }
+        })
         .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
     let auth = &app.public_auth_status;
     let active_key_count = if app.public_auth_loading {
@@ -1368,17 +1436,17 @@ fn render_server(
         Paragraph::new(vec![
             key_value("STATE", app.snapshot.server.label(), theme),
             key_value("ENDPOINT", endpoint, theme),
-            key_value("MODEL PROFILE", &active_profile, theme),
+            key_value("PROFILES", &active_profile, theme),
             key_value("PUBLIC BIND", &auth.bind, theme),
             key_value("EXPOSURE", exposure, theme),
             key_value("AUTH CONFIGURED", &auth.configured_mode.to_string(), theme),
             key_value("AUTH EFFECTIVE", &auth.effective_mode.to_string(), theme),
             key_value("ACTIVE API KEYS", &active_key_count, theme),
-            key_value("BACKEND", &lifecycle, theme),
-            key_value("MODEL", &active_model, theme),
-            key_value("ENGINE", &active_engine, theme),
-            key_value("RUNTIME", &active_runtime, theme),
-            key_value("PRIVATE", &private_backend, theme),
+            key_value("RESIDENCY", &lifecycle, theme),
+            key_value("MODELS", &active_model, theme),
+            key_value("ENGINES", &active_engine, theme),
+            key_value("RUNTIMES", &active_runtime, theme),
+            key_value("PRIVATE ENDPOINTS", &private_backend, theme),
             if auth.insecure_remote {
                 Line::from(Span::styled(
                     "SECURITY WARNING: remote authentication is disabled",
@@ -1550,11 +1618,11 @@ fn render_model_profiles(
         let active = app
             .control
             .as_ref()
-            .and_then(|status| status.backend.model_profile_id.as_ref())
-            == Some(&profile.id);
+            .is_some_and(|status| status.backend(&profile.id).is_some());
         let label = format!(
-            " {}{}{} ",
+            " {} · {:?}{}{} ",
             profile.display_name,
+            profile.role,
             if active { " · active" } else { "" },
             if missing { " · missing" } else { "" },
         );
@@ -1744,6 +1812,14 @@ fn render_model_profile_actions(
                     ActionState::Normal
                 } else {
                     ActionState::Disabled
+                },
+            ),
+            ModelProfileAction::Role => (
+                "[ Role ]",
+                if app.settings_busy() {
+                    ActionState::Disabled
+                } else {
+                    ActionState::Normal
                 },
             ),
             ModelProfileAction::Duplicate => (

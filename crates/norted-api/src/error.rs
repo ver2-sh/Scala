@@ -129,6 +129,13 @@ pub(crate) fn runtime_error(error: RuntimeError) -> OpenAiError {
             parameter: None,
             code: "backend_unavailable",
         },
+        RuntimeError::AuxiliaryLoadFailed { .. } => OpenAiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "The auxiliary Model Profile could not be loaded after safe idle JIT cleanup; the session primary was retained. Free resources or select a smaller auxiliary profile.".to_owned(),
+            kind: "server_error",
+            parameter: Some("model".to_owned()),
+            code: "auxiliary_load_failed",
+        },
         RuntimeError::InferenceTimedOut(_) => OpenAiError {
             status: StatusCode::GATEWAY_TIMEOUT,
             message: "The local inference backend timed out while completing the request."
