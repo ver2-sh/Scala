@@ -519,16 +519,20 @@ fn render_models(
                 ])
             },
             Line::from(Span::styled(
-                format!(
-                    "Artifact: {} · provenance: {} · click row to select",
-                    model.format,
-                    if model.norted_package.is_some() {
-                        "Norted package"
-                    } else if let Some(provenance) = &model.provenance {
-                        provenance.provider.as_str()
-                    } else {
-                        "raw/local"
-                    },
+                truncate_middle(
+                    &format!(
+                        "Artifact: {} · provenance: {} · click row to select",
+                        model.format,
+                        if model.norted_package.is_some() {
+                            "Norted package"
+                        } else if let Some(provenance) = &model.provenance {
+                            provenance.provider.as_str()
+                        } else {
+                            "raw/local"
+                        },
+                    ),
+                    row.width as usize,
+                    glyphs.ellipsis,
                 ),
                 theme.hint,
             )),
@@ -727,18 +731,19 @@ fn render_model_discover(
             } else {
                 truncate_middle(&artifact.filename, filename_width, glyphs.ellipsis)
             };
+            let metadata = format!(
+                "{} · {size} · rev {revision} · {companion}",
+                repository.repository
+            );
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled(format_span, theme.accent),
                     Span::styled(filename, theme.text),
                 ]),
-                Line::from(vec![
-                    Span::styled(&repository.repository, theme.text),
-                    Span::styled(
-                        format!(" · {size} · rev {revision} · {companion}"),
-                        theme.muted,
-                    ),
-                ]),
+                Line::from(Span::styled(
+                    truncate_middle(&metadata, row.width as usize, glyphs.ellipsis),
+                    theme.muted,
+                )),
                 Line::from(Span::styled(
                     truncate_middle(
                         "Format candidate · runtime compatibility unverified",
@@ -1775,7 +1780,10 @@ fn render_model_profiles(
         } else {
             theme.muted
         };
-        frame.render_widget(Paragraph::new(label).style(style), *rect);
+        frame.render_widget(
+            Paragraph::new(truncate_middle(&label, rect.width as usize, "…")).style(style),
+            *rect,
+        );
     }
     let info_area = Rect::new(
         ui_layout.settings_scopes.x,
@@ -1797,21 +1805,49 @@ fn render_model_profiles(
         );
         let definitions = app.settings_definitions();
         let selected_definition = definitions.get(app.settings_setting_index);
-        let mut lines = vec![
+        let profile_id = format!(
+            "{}{}",
+            profile.id,
+            if ui_layout.compact { " · " } else { "  " }
+        );
+        let engine = if ui_layout.compact {
+            format!("{} · ", profile.engine_id)
+        } else {
+            format!("engine {}  ", profile.engine_id)
+        };
+        let model_name = model
+            .map(|model| model.display_name.clone())
+            .unwrap_or_else(|| format!("MISSING {}", profile.model_id));
+        let model_name_width = remaining_width(info_area.width, &[&profile_id, &engine]);
+        let identity = if model_name_width == 0 {
+            Line::from(Span::styled(
+                truncate_middle(
+                    &format!("{profile_id}{engine}{model_name}"),
+                    info_area.width as usize,
+                    "…",
+                ),
+                if model.is_some() {
+                    theme.text
+                } else {
+                    theme.warning
+                },
+            ))
+        } else {
             Line::from(vec![
-                Span::styled(format!("{}  ", profile.id), theme.text),
-                Span::styled(format!("engine {}  ", profile.engine_id), theme.accent),
+                Span::styled(profile_id, theme.text),
+                Span::styled(engine, theme.accent),
                 Span::styled(
-                    model
-                        .map(|model| model.display_name.clone())
-                        .unwrap_or_else(|| format!("MISSING {}", profile.model_id)),
+                    truncate_middle(&model_name, model_name_width, "…"),
                     if model.is_some() {
                         theme.hint
                     } else {
                         theme.warning
                     },
                 ),
-            ]),
+            ])
+        };
+        let mut lines = vec![
+            identity,
             Line::from(Span::styled(model_path, theme.muted)),
             Line::from(Span::styled(
                 if app.settings_busy() && app.settings_schema.is_none() {

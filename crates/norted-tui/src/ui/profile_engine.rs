@@ -5,8 +5,14 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
 use crate::app::{App, Overlay};
 use crate::theme::{Glyphs, Theme};
-use crate::ui::components::{ActionState, action_style, marquee_text, remaining_width};
+use crate::ui::components::{
+    ActionState, action_style, marquee_text, remaining_width, truncate_middle,
+};
 use crate::ui::layout::{HoverTarget, UiLayout};
+
+const DETAILED_HEADING_SUFFIX: &str = " · select the engine this profile binds";
+const COMPACT_HEADING_SUFFIX: &str = " · choose engine";
+const MIN_DETAILED_NAME_WIDTH: usize = 12;
 
 pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, layout: &UiLayout) {
     if app.overlay != Some(Overlay::ProfileEngine) {
@@ -35,7 +41,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         area.height
             .saturating_sub(if layout.compact { 2 } else { 4 }),
     );
-    let suffix = " · select the engine this profile binds";
+    let suffix = heading_suffix(inner.width);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -64,7 +70,15 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         if app.hover == Some(HoverTarget::ProfileEngineResult(index)) {
             style = style.patch(theme.hovered);
         }
-        let mut lines = vec![Line::from(format!("  {label}"))];
+        let row_width = layout
+            .profile_engine_rows
+            .get(index)
+            .map_or(0, |(_, area)| area.width as usize);
+        let mut lines = vec![Line::from(truncate_middle(
+            &format!("  {label}"),
+            row_width,
+            glyphs.ellipsis,
+        ))];
         if layout
             .profile_engine_rows
             .get(index)
@@ -111,5 +125,13 @@ pub(super) fn popup_inner_width(popup_width: u16, compact: bool) -> u16 {
 }
 
 pub(super) fn heading_name_width(inner_width: u16) -> usize {
-    remaining_width(inner_width, &[" · select the engine this profile binds"])
+    remaining_width(inner_width, &[heading_suffix(inner_width)])
+}
+
+fn heading_suffix(inner_width: u16) -> &'static str {
+    if remaining_width(inner_width, &[DETAILED_HEADING_SUFFIX]) >= MIN_DETAILED_NAME_WIDTH {
+        DETAILED_HEADING_SUFFIX
+    } else {
+        COMPACT_HEADING_SUFFIX
+    }
 }
