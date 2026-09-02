@@ -1235,6 +1235,7 @@ impl App {
         }
         let profile = self.selected_model_profile_value()?;
         let runtime_id = self.settings_runtime_id.as_ref()?;
+        let settings_resolved = self.settings_resolved.as_ref()?;
         let backend = &self.control.as_ref()?.backend;
         if backend.lifecycle != BackendLifecycle::Running
             || backend.model_profile_id.as_ref() != Some(&profile.id)
@@ -1244,9 +1245,13 @@ impl App {
         {
             return None;
         }
-        let value = backend
-            .provenance
-            .as_ref()?
+        let provenance = backend.provenance.as_ref()?;
+        if provenance.model_profile.content_sha256 != profile.content_hash()
+            || provenance.settings.effective != settings_resolved.effective
+        {
+            return None;
+        }
+        let value = provenance
             .normalized_settings
             .get("resolved_settings")?
             .as_object()?
