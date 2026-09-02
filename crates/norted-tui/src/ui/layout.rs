@@ -91,6 +91,7 @@ pub struct UiLayout {
     pub model_format_filters: Vec<(Option<ArtifactFormat>, Rect)>,
     pub model_list: Rect,
     pub model_progress: Rect,
+    pub model_downloads: Rect,
     pub model_rows: Vec<(usize, Rect)>,
     pub model_download_actions: Vec<(usize, Rect)>,
     pub installed_model_actions: Vec<(InstalledModelAction, Rect)>,
@@ -196,6 +197,7 @@ impl UiLayout {
         let mut model_format_row = Rect::default();
         let mut model_format_filters = Vec::new();
         let mut installed_model_actions = Vec::new();
+        let mut model_downloads = Rect::default();
         let (model_list, model_progress) = if app.screen == Screen::Models {
             let model_header = content_layout(content)[0];
             model_installed_tab = Rect::new(model_header.x, model_header.y + 1, 13, 1);
@@ -265,11 +267,28 @@ impl UiLayout {
                     model_body.height.saturating_sub(model_format_row.height),
                 );
             }
-            let (mut list, progress) = reserve_bottom(
+            let pending_downloads = app
+                .model_download_jobs
+                .iter()
+                .filter(|job| !job.is_terminal())
+                .count();
+            let recent_downloads = app
+                .model_download_jobs
+                .iter()
+                .filter(|job| job.is_terminal())
+                .count()
+                .min(if pending_downloads == 0 { 3 } else { 1 });
+            let download_height = (pending_downloads + recent_downloads + 1) as u16;
+            let download_height =
+                download_height.min(model_body.height.saturating_sub(MODEL_ROW_HEIGHT).max(3));
+            let (model_body, downloads) = reserve_bottom(
                 model_body,
-                app.selected_model_load_progress().is_some() || app.model_operation.is_some(),
-                3,
+                !app.model_download_jobs.is_empty(),
+                download_height,
             );
+            model_downloads = downloads;
+            let (mut list, progress) =
+                reserve_bottom(model_body, app.selected_model_load_progress().is_some(), 3);
             if app.model_library_view == ModelLibraryView::Installed {
                 if let Some(model) = app
                     .selected_model
@@ -883,6 +902,7 @@ impl UiLayout {
             model_format_filters,
             model_list,
             model_progress,
+            model_downloads,
             model_rows,
             model_download_actions,
             installed_model_actions,

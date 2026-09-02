@@ -22,6 +22,14 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 
+mod download_manager;
+
+use download_manager::DownloadManager;
+pub use download_manager::{
+    DEFAULT_MAX_PARALLEL_DOWNLOADS, DownloadAdmission, MAX_PARALLEL_DOWNLOADS_SETTING_ID,
+    ModelDownloadJob, ModelDownloadJobId,
+};
+
 const RECEIPT_SCHEMA_VERSION: u32 = 2;
 const MAX_PACKAGE_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -53,6 +61,8 @@ pub enum ModelLibraryError {
         expected: String,
         observed: String,
     },
+    #[error("an acquisition for this destination is already in progress: {0}")]
+    AcquisitionInProgress(PathBuf),
 }
 
 type Result<T> = std::result::Result<T, ModelLibraryError>;
@@ -144,6 +154,7 @@ pub trait ModelCatalogProvider: Send + Sync {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelOperationPhase {
+    Queued,
     Resolving,
     Downloading,
     Verifying,
@@ -151,11 +162,21 @@ pub enum ModelOperationPhase {
     Installing,
     Installed,
     Failed,
+    Cancelled,
+}
+
+impl ModelOperationPhase {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Installed | Self::Failed | Self::Cancelled)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelOperationProgress {
+    pub job_id: ModelDownloadJobId,
     pub model_ref: String,
+    pub provider: Option<String>,
+    pub repository: Option<String>,
     pub filename: String,
     pub phase: ModelOperationPhase,
     pub downloaded_bytes: u64,
@@ -169,10 +190,16 @@ pub struct ModelLibrary {
     download_cache: PathBuf,
     providers: Vec<Arc<dyn ModelCatalogProvider>>,
     progress: broadcast::Sender<ModelOperationProgress>,
+    downloads: DownloadManager,
+    active_destinations: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
 }
 
 impl ModelLibrary {
     pub fn new(paths: &AppPaths) -> Self {
+        Self::with_max_parallel_downloads(paths, DEFAULT_MAX_PARALLEL_DOWNLOADS)
+    }
+
+    pub fn with_max_parallel_downloads(paths: &AppPaths, maximum_parallel: usize) -> Self {
         let (progress, _) = broadcast::channel(256);
         Self {
             root: paths.data_dir.join("models"),
@@ -180,6 +207,8 @@ impl ModelLibrary {
             download_cache: paths.cache_dir.join("model-downloads"),
             providers: vec![Arc::new(HuggingFaceCatalogProvider::new())],
             progress,
+            downloads: DownloadManager::new(maximum_parallel),
+            active_destinations: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -189,6 +218,25 @@ impl ModelLibrary {
 
     pub fn subscribe(&self) -> broadcast::Receiver<ModelOperationProgress> {
         self.progress.subscribe()
+    }
+
+    pub fn download_jobs(&self) -> Vec<ModelDownloadJob> {
+        self.downloads.snapshots()
+    }
+
+    pub fn max_parallel_downloads(&self) -> usize {
+        self.downloads.maximum_parallel()
+    }
+
+    pub fn set_max_parallel_downloads(self: &Arc<Self>, maximum_parallel: usize) {
+        let starts = self.downloads.set_maximum_parallel(maximum_parallel);
+        self.spawn_download_jobs(starts);
+    }
+
+    pub fn enqueue_download(self: &Arc<Self>, model_ref: String) -> DownloadAdmission {
+        let (admission, starts) = self.downloads.admit(model_ref);
+        self.spawn_download_jobs(starts);
+        admission
     }
 
     pub async fn search(
@@ -207,8 +255,23 @@ impl ModelLibrary {
     }
 
     pub async fn download(&self, model_ref: &str) -> Result<ModelArtifact> {
-        self.emit(
+        let job_id = ModelDownloadJobId::new();
+        self.download_with_job(&job_id, model_ref).await
+    }
+
+    async fn download_with_job(
+        &self,
+        job_id: &ModelDownloadJobId,
+        model_ref: &str,
+    ) -> Result<ModelArtifact> {
+        let resolving = DownloadProgressContext {
+            job_id,
             model_ref,
+            provider: None,
+            repository: None,
+        };
+        self.emit(
+            &resolving,
             "",
             ModelOperationPhase::Resolving,
             0,
@@ -217,18 +280,32 @@ impl ModelLibrary {
         );
         let provider = self.provider_for(model_ref)?;
         let resolved = provider.resolve(model_ref).await?;
-        let result = self.download_resolved(model_ref, &resolved).await;
-        if let Err(error) = &result {
-            self.emit(
-                model_ref,
-                &resolved.primary.filename,
-                ModelOperationPhase::Failed,
-                0,
-                None,
-                &error.to_string(),
-            );
+        self.download_resolved(job_id, model_ref, &resolved).await
+    }
+
+    fn spawn_download_jobs(self: &Arc<Self>, starts: Vec<ModelDownloadJobId>) {
+        for job_id in starts {
+            let library = Arc::clone(self);
+            tokio::spawn(async move {
+                let Some(model_ref) = library.downloads.model_ref(&job_id) else {
+                    return;
+                };
+                let result = library.download_with_job(&job_id, &model_ref).await;
+                let (phase, message) = match &result {
+                    Ok(model) => (
+                        ModelOperationPhase::Installed,
+                        format!("Model installed as {}", model.id),
+                    ),
+                    Err(ModelLibraryError::AlreadyInstalled(path)) => (
+                        ModelOperationPhase::Installed,
+                        format!("Already installed at {}", path.display()),
+                    ),
+                    Err(error) => (ModelOperationPhase::Failed, error.to_string()),
+                };
+                let starts = library.downloads.finish(&job_id, phase, message);
+                library.spawn_download_jobs(starts);
+            });
         }
-        result
     }
 
     pub async fn import(&self, source: &Path) -> Result<ModelArtifact> {
@@ -557,6 +634,14 @@ impl ModelLibrary {
                 "managed acquisition removal target is no longer safe".to_owned(),
             ));
         }
+        if self
+            .active_destinations
+            .lock()
+            .expect("active model destination lock poisoned")
+            .contains(&acquisition_root)
+        {
+            return Err(ModelLibraryError::AcquisitionInProgress(acquisition_root));
+        }
         tokio::fs::remove_dir_all(&acquisition_root)
             .await
             .map_err(|source| ModelLibraryError::Io {
@@ -574,6 +659,7 @@ impl ModelLibrary {
 
     async fn download_resolved(
         &self,
+        job_id: &ModelDownloadJobId,
         model_ref: &str,
         resolved: &ResolvedArtifact,
     ) -> Result<ModelArtifact> {
@@ -583,7 +669,21 @@ impl ModelLibrary {
                 path: self.download_cache.clone(),
                 source,
             })?;
+        let destination = managed_destination(&self.root, resolved)?;
+        if destination.exists() {
+            return Err(ModelLibraryError::AlreadyInstalled(destination));
+        }
+        let _destination_guard = ActiveDestinationGuard::acquire(
+            Arc::clone(&self.active_destinations),
+            destination.clone(),
+        )?;
         let stage = self.create_stage().await?;
+        let context = DownloadProgressContext {
+            job_id,
+            model_ref,
+            provider: Some(&resolved.provider),
+            repository: Some(&resolved.repository),
+        };
         async {
             let total = resolved
                 .primary
@@ -615,7 +715,7 @@ impl ModelLibrary {
                 create_parent(&destination).await?;
                 let bytes = self
                     .download_file(
-                        model_ref,
+                        &context,
                         file,
                         &destination,
                         completed,
@@ -627,7 +727,7 @@ impl ModelLibrary {
             let primary_name = safe_remote_path(&resolved.primary.filename)?;
             let primary_path = stage.join(&primary_name);
             self.emit(
-                model_ref,
+                &context,
                 &resolved.primary.filename,
                 ModelOperationPhase::Validating,
                 completed,
@@ -730,12 +830,11 @@ impl ModelLibrary {
             };
             write_receipt(&stage, &acquisition_id, receipt_members).await?;
             let _ = discover_exact(&stage, &primary_name)?;
-            let destination = managed_destination(&self.root, resolved)?;
             if destination.exists() {
-                return Err(ModelLibraryError::AlreadyInstalled(destination));
+                return Err(ModelLibraryError::AlreadyInstalled(destination.clone()));
             }
             self.emit(
-                model_ref,
+                &context,
                 &resolved.primary.filename,
                 ModelOperationPhase::Installing,
                 completed,
@@ -745,7 +844,7 @@ impl ModelLibrary {
             activate_stage(&stage, &destination).await?;
             let artifact = discover_exact(&destination, &primary_name)?;
             self.emit(
-                model_ref,
+                &context,
                 &resolved.primary.filename,
                 ModelOperationPhase::Installed,
                 completed,
@@ -759,15 +858,16 @@ impl ModelLibrary {
 
     async fn download_file(
         &self,
-        model_ref: &str,
+        context: &DownloadProgressContext<'_>,
         file: &ResolvedFile,
         destination: &Path,
         completed_before: u64,
         total: Option<u64>,
     ) -> Result<u64> {
-        let partial = self
-            .download_cache
-            .join(format!("{}.part", sha256_text(file.url.as_str())));
+        let partial = self.download_cache.join(format!(
+            "{}.part",
+            sha256_text(&format!("{}\0{}", context.model_ref, file.url))
+        ));
         let mut existing = tokio::fs::metadata(&partial)
             .await
             .map(|metadata| metadata.len())
@@ -840,7 +940,7 @@ impl ModelLibrary {
                 })?;
             downloaded += chunk.len() as u64;
             self.emit(
-                model_ref,
+                context,
                 &file.filename,
                 ModelOperationPhase::Downloading,
                 completed_before + downloaded,
@@ -865,12 +965,16 @@ impl ModelLibrary {
             )));
         }
         self.emit(
-            model_ref,
+            context,
             &file.filename,
             ModelOperationPhase::Verifying,
             completed_before + downloaded,
             total,
-            "Verifying downloaded data",
+            if file.sha256.is_some() {
+                "Verifying SHA-256"
+            } else {
+                "Verifying downloaded size"
+            },
         );
         if let Some(expected) = &file.sha256 {
             let observed = sha256_file(&partial).await?;
@@ -911,21 +1015,98 @@ impl ModelLibrary {
 
     fn emit(
         &self,
-        model_ref: &str,
+        context: &DownloadProgressContext<'_>,
         filename: &str,
         phase: ModelOperationPhase,
         downloaded_bytes: u64,
         total_bytes: Option<u64>,
         message: &str,
     ) {
-        let _ = self.progress.send(ModelOperationProgress {
-            model_ref: model_ref.to_owned(),
+        let progress = ModelOperationProgress {
+            job_id: context.job_id.clone(),
+            model_ref: context.model_ref.to_owned(),
+            provider: context.provider.map(str::to_owned),
+            repository: context.repository.map(str::to_owned),
             filename: filename.to_owned(),
             phase,
             downloaded_bytes,
             total_bytes,
             message: message.to_owned(),
-        });
+        };
+        self.downloads.update(&progress);
+        let _ = self.progress.send(progress);
+    }
+}
+
+pub fn setting_definition() -> norted_core::SettingDefinition {
+    norted_core::SettingDefinition {
+        id: norted_core::SettingId::new(MAX_PARALLEL_DOWNLOADS_SETTING_ID)
+            .expect("static model download setting ID"),
+        label: "Max parallel downloads".to_owned(),
+        description: "Maximum number of separate model acquisitions that may download at once; additional downloads wait in FIFO order".to_owned(),
+        kind: norted_core::SettingKind::UnsignedInteger {
+            minimum: Some(1),
+            maximum: None,
+        },
+        scope: norted_core::SettingScope::Global,
+        category: norted_core::SettingCategory::Downloads,
+        supported: true,
+        unsupported_reason: None,
+        unit: Some("downloads".to_owned()),
+        upstream_default: Some(DEFAULT_MAX_PARALLEL_DOWNLOADS.to_string()),
+    }
+}
+
+pub fn max_parallel_downloads_from_settings(settings: &norted_core::SettingsState) -> usize {
+    settings
+        .global_defaults
+        .iter()
+        .find_map(|(id, value)| (id.as_str() == MAX_PARALLEL_DOWNLOADS_SETTING_ID).then_some(value))
+        .and_then(|value| match value {
+            norted_core::SettingValue::UnsignedInteger(value) => usize::try_from(*value).ok(),
+            _ => None,
+        })
+        .unwrap_or(DEFAULT_MAX_PARALLEL_DOWNLOADS)
+        .max(1)
+}
+
+struct DownloadProgressContext<'a> {
+    job_id: &'a ModelDownloadJobId,
+    model_ref: &'a str,
+    provider: Option<&'a str>,
+    repository: Option<&'a str>,
+}
+
+struct ActiveDestinationGuard {
+    active: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+    destination: PathBuf,
+}
+
+impl ActiveDestinationGuard {
+    fn acquire(
+        active: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+        destination: PathBuf,
+    ) -> Result<Self> {
+        if !active
+            .lock()
+            .expect("active model destination lock poisoned")
+            .insert(destination.clone())
+        {
+            return Err(ModelLibraryError::AcquisitionInProgress(destination));
+        }
+        Ok(Self {
+            active,
+            destination,
+        })
+    }
+}
+
+impl Drop for ActiveDestinationGuard {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .expect("active model destination lock poisoned")
+            .remove(&self.destination);
     }
 }
 

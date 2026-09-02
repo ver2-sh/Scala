@@ -1032,6 +1032,8 @@ pub fn settings_defaults(
         }
         _ => println!("  No configured defaults; values inherit the runtime/upstream default."),
     }
-    println!("Changes apply on the next Model Profile load.");
+    println!(
+        "Server operational settings apply to the running TUI; model settings apply on the next Model Profile load."
+    );
     Ok(())
 }

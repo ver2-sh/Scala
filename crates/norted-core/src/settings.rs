@@ -377,6 +377,7 @@ where
 pub enum SettingCategory {
     #[default]
     General,
+    Downloads,
     Load,
     Generation,
     Reasoning,
@@ -391,6 +392,7 @@ impl std::fmt::Display for SettingCategory {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::General => "General",
+            Self::Downloads => "Downloads",
             Self::Load => "Load",
             Self::Generation => "Generation",
             Self::Reasoning => "Reasoning",
@@ -406,6 +408,7 @@ impl std::fmt::Display for SettingCategory {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "scope")]
 pub enum SettingScope {
+    Global,
     Common,
     Engine { engine_id: String },
 }
@@ -492,7 +495,10 @@ impl SettingsState {
             });
         }
         for id in self.global_defaults.0.keys() {
-            if id.namespace().is_some() {
+            if id
+                .namespace()
+                .is_some_and(|namespace| namespace != "server")
+            {
                 return Err(SettingsError::InvalidGlobalSetting(id.clone()));
             }
         }

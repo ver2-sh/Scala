@@ -295,7 +295,7 @@ fn models_footer<'a>(
                 .as_ref()
                 .and_then(|control| control.backend.model_id.as_ref())
                 == Some(&model.id);
-            if width >= 90 && !app.model_library_busy() && model.provenance.is_some() && !is_active
+            if width >= 90 && !app.model_removal_busy() && model.provenance.is_some() && !is_active
             {
                 line.push(hint("d", "remove", theme));
             }
@@ -324,7 +324,7 @@ fn models_footer<'a>(
         hint("e", "search", theme),
         hint("f", "format", theme),
     ];
-    if has_selection && !app.model_library_busy() {
+    if has_selection {
         line.push(hint("d", "download", theme));
     }
     line
