@@ -10,10 +10,12 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap}
 use crate::app::{App, ModelLibraryView, Screen};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{
-    content_layout, format_bytes, key_value, load_progress_compact, render_empty,
-    render_load_progress, section_title, truncate_middle,
+    ActionState, action_style, content_layout, format_bytes, key_value, load_progress_compact,
+    render_empty, render_load_progress, section_title, truncate_middle,
 };
-use crate::ui::layout::{HoverTarget, UiLayout};
+use crate::ui::layout::{
+    HoverTarget, InstalledModelAction, ModelProfileAction, SelectedRuntimeAction, UiLayout,
+};
 use crate::ui::runtime_search::progress_text;
 
 pub fn render_screen(
@@ -373,7 +375,7 @@ fn render_model_header(
     } else {
         theme.accent
     };
-    if app.hover == Some(HoverTarget::ModelSearchSubmit) {
+    if !app.model_library_busy() && app.hover == Some(HoverTarget::ModelSearchSubmit) {
         submit_style = submit_style.patch(theme.hovered);
     }
     frame.render_widget(
@@ -523,7 +525,7 @@ fn render_models(
             },
             Line::from(Span::styled(
                 format!(
-                    "Artifact: {} · provenance: {} · Enter/c profile{}",
+                    "Artifact: {} · provenance: {} · click row to select",
                     model.format,
                     if model.norted_package.is_some() {
                         "Norted package"
@@ -532,11 +534,6 @@ fn render_models(
                     } else {
                         "raw/local"
                     },
-                    if model.provenance.is_some() {
-                        " · d remove"
-                    } else {
-                        ""
-                    },
                 ),
                 theme.hint,
             )),
@@ -544,6 +541,7 @@ fn render_models(
         .style(style)
     });
     frame.render_widget(List::new(items), ui_layout.model_list);
+    render_installed_model_actions(frame, app, theme, ui_layout);
     if let Some(progress) = app.selected_model_load_progress() {
         render_load_progress(
             frame,
@@ -555,6 +553,78 @@ fn render_models(
         );
     } else if let Some(progress) = &app.model_operation {
         render_model_library_progress(frame, ui_layout.model_progress, progress, theme);
+    }
+}
+
+fn render_installed_model_actions(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: &Theme,
+    ui_layout: &UiLayout,
+) {
+    let Some(model) = app
+        .selected_model
+        .and_then(|index| app.snapshot.models.get(index))
+    else {
+        return;
+    };
+    for (action, area) in &ui_layout.installed_model_actions {
+        let active = app.selected_model_is_active();
+        let (label, state) = match action {
+            InstalledModelAction::CreateProfile => (
+                if ui_layout.compact {
+                    "[ Profile ]"
+                } else {
+                    "[ Create Profile ]"
+                },
+                if app.settings_busy() {
+                    ActionState::Disabled
+                } else {
+                    ActionState::Primary
+                },
+            ),
+            InstalledModelAction::Runtime => (
+                "[ Runtime ]",
+                if app.runtime_mutation_busy() || app.runtime_picker_loading {
+                    ActionState::Disabled
+                } else {
+                    ActionState::Normal
+                },
+            ),
+            InstalledModelAction::Unload => (
+                "[ Unload ]",
+                if active && !app.control_busy() {
+                    ActionState::Normal
+                } else {
+                    ActionState::Disabled
+                },
+            ),
+            InstalledModelAction::Remove => {
+                let enabled = model.provenance.is_some() && !active && !app.model_library_busy();
+                (
+                    if app.model_remove_armed() {
+                        "[ Confirm Remove ]"
+                    } else {
+                        "[ Remove ]"
+                    },
+                    if !enabled {
+                        ActionState::Disabled
+                    } else if app.model_remove_armed() {
+                        ActionState::Confirm
+                    } else {
+                        ActionState::Destructive
+                    },
+                )
+            }
+        };
+        let hovered = app.hover == Some(HoverTarget::InstalledModelAction(*action));
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_middle(label, area.width as usize, "…"),
+                action_style(theme, state, hovered),
+            ))),
+            *area,
+        );
     }
 }
 
@@ -576,12 +646,14 @@ fn render_model_discover(
             Some(ArtifactFormat::Q27) => "[ Q27 ]",
             Some(ArtifactFormat::Ninfer) => "[ NInfer ]",
         };
-        let mut style = if app.model_search_format == *format {
+        let mut style = if app.model_library_busy() {
+            theme.muted
+        } else if app.model_search_format == *format {
             theme.selected
         } else {
             theme.nav_inactive
         };
-        if app.hover == Some(HoverTarget::ModelFormatFilter(*format)) {
+        if !app.model_library_busy() && app.hover == Some(HoverTarget::ModelFormatFilter(*format)) {
             style = style.patch(theme.hovered);
         }
         frame.render_widget(
@@ -681,7 +753,9 @@ fn render_model_discover(
             } else {
                 theme.accent
             });
-            if app.hover == Some(HoverTarget::ModelDownloadAction(*index)) {
+            if !app.model_library_busy()
+                && app.hover == Some(HoverTarget::ModelDownloadAction(*index))
+            {
                 style = style.patch(theme.hovered);
             }
             frame.render_widget(
@@ -815,9 +889,9 @@ fn render_runtimes(
         .is_some_and(|snapshot| snapshot.installed.is_empty())
     {
         let guidance = if app.snapshot.models.is_empty() {
-            "Search upstream runtimes to install a compatible runtime pack."
+            "Use Search available to install a compatible runtime."
         } else {
-            "Models detected: press s to see compatible upstream runtimes, recommended first. Installation stays explicit."
+            "Use Search available to install a compatible runtime. The s key remains a shortcut."
         };
         render_empty(
             frame,
@@ -901,19 +975,33 @@ fn render_runtimes(
     }
 
     if ui_layout.runtime_actions.height > 0 {
-        let search_style = if app.hover == Some(HoverTarget::RuntimeSearchAction) {
-            theme.hovered
-        } else {
-            theme.accent
-        };
-        let update_style = if app.hover == Some(HoverTarget::RuntimeUpdateAction) {
-            theme.hovered
-        } else {
-            theme.hint
-        };
+        let search_disabled = app.runtime_mutation_busy() || app.runtime_search_loading;
+        let search_style = action_style(
+            theme,
+            if search_disabled {
+                ActionState::Disabled
+            } else {
+                ActionState::Primary
+            },
+            app.hover == Some(HoverTarget::RuntimeSearchAction),
+        );
+        let update_disabled = app.runtime_mutation_busy() || app.runtime_update_loading;
+        let update_style = action_style(
+            theme,
+            if update_disabled {
+                ActionState::Disabled
+            } else {
+                ActionState::Normal
+            },
+            app.hover == Some(HoverTarget::RuntimeUpdateAction),
+        );
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "[s] Search available",
+                if ui_layout.compact {
+                    "[ Search ]"
+                } else {
+                    "[ Search Available ]"
+                },
                 search_style,
             ))),
             ui_layout.runtime_search_action,
@@ -922,13 +1010,16 @@ fn render_runtimes(
             Paragraph::new(Line::from(Span::styled(
                 if app.runtime_update_loading {
                     "Checking…"
+                } else if ui_layout.compact {
+                    "[ Updates ]"
                 } else {
-                    "[u] Check updates"
+                    "[ Check Updates ]"
                 },
                 update_style,
             ))),
             ui_layout.runtime_update_action,
         );
+        render_selected_runtime_actions(frame, app, theme, ui_layout);
         if let Some(operation) = &app.runtime_operation {
             let progress_x = ui_layout.runtime_update_action.right().saturating_add(2);
             let progress_area = Rect::new(
@@ -945,6 +1036,79 @@ fn render_runtimes(
                 progress_area,
             );
         }
+    }
+}
+
+fn render_selected_runtime_actions(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: &Theme,
+    ui_layout: &UiLayout,
+) {
+    let Some(status) = app
+        .selected_runtime
+        .and_then(|index| app.runtime_list.as_ref()?.installed.get(index))
+    else {
+        return;
+    };
+    let runtime_id = &status.runtime.manifest.runtime_id;
+    for (action, area) in &ui_layout.selected_runtime_actions {
+        let (label, state) = match action {
+            SelectedRuntimeAction::Default(format) => {
+                let format_label = format.as_str().to_ascii_uppercase();
+                let selected = app.runtime_list.as_ref().is_some_and(|snapshot| {
+                    snapshot.selections.format_defaults.get(format) == Some(runtime_id)
+                });
+                let enabled = !app.runtime_mutation_busy() && status.compatibility.is_usable();
+                (
+                    if area.width <= 10 {
+                        format!("[ {format_label} ]")
+                    } else {
+                        format!("[ {format_label} Default ]")
+                    },
+                    if !enabled {
+                        ActionState::Disabled
+                    } else if selected {
+                        ActionState::Primary
+                    } else {
+                        ActionState::Normal
+                    },
+                )
+            }
+            SelectedRuntimeAction::Update => (
+                "[ Update ]".to_owned(),
+                if app.selected_runtime_update_available() && !app.runtime_mutation_busy() {
+                    ActionState::Primary
+                } else {
+                    ActionState::Disabled
+                },
+            ),
+            SelectedRuntimeAction::Remove => (
+                if app.runtime_remove_armed() {
+                    "[ Confirm Remove ]".to_owned()
+                } else {
+                    "[ Remove ]".to_owned()
+                },
+                if !app.selected_runtime_removable() {
+                    ActionState::Disabled
+                } else if app.runtime_remove_armed() {
+                    ActionState::Confirm
+                } else {
+                    ActionState::Destructive
+                },
+            ),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_middle(&label, area.width as usize, "…"),
+                action_style(
+                    theme,
+                    state,
+                    app.hover == Some(HoverTarget::SelectedRuntimeAction(*action)),
+                ),
+            ))),
+            *area,
+        );
     }
 }
 
@@ -1142,6 +1306,19 @@ fn render_logs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, ui_l
         section_title("Logs", "Application and model-registry warnings", theme),
         layout[0],
     );
+    if app.log_scroll > 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "[ Follow latest ]",
+                action_style(
+                    theme,
+                    ActionState::Primary,
+                    app.hover == Some(HoverTarget::FollowLatest),
+                ),
+            ))),
+            ui_layout.logs_follow_latest,
+        );
+    }
     let visible = layout[1].height as usize;
     let offset = app
         .log_scroll
@@ -1201,10 +1378,10 @@ fn render_settings(
         };
         frame.render_widget(Paragraph::new(format!(" {label} ")).style(style), *rect);
     }
-    let info = if let Some(input) = &app.settings_input {
-        format!("Value: {}_  · Enter saves · Esc cancels", input.text)
+    let info = if app.settings_input.is_some() {
+        String::new()
     } else {
-        "Defaults inherit Global → selected engine. Enter edits; Delete clears and inherits."
+        "Rows select. Click a value to edit or change it; Inherit clears this layer's override."
             .to_owned()
     };
     frame.render_widget(
@@ -1216,6 +1393,7 @@ fn render_settings(
             4,
         ),
     );
+    render_settings_input(frame, app, theme, ui_layout);
     render_setting_rows(frame, app, theme, ui_layout);
 }
 
@@ -1257,6 +1435,8 @@ fn render_model_profiles(
         );
         let style = if app.selected_model_profile == Some(*index) {
             theme.selected
+        } else if !app.settings_busy() && app.hover == Some(HoverTarget::SettingsScope(*index)) {
+            theme.hovered
         } else if missing {
             theme.warning
         } else {
@@ -1270,19 +1450,8 @@ fn render_model_profiles(
         ui_layout.settings_scopes.width,
         5,
     );
-    let info = if let Some(input) = &app.settings_input {
-        let prompt = match input.kind {
-            crate::app::SettingsInputKind::ProfileName => "New Model Profile ID",
-            crate::app::SettingsInputKind::DuplicateProfile => "Duplicate Model Profile ID",
-            crate::app::SettingsInputKind::SettingValue => "Override value",
-        };
-        vec![
-            Line::from(vec![
-                Span::styled(format!("{prompt}: "), theme.hint),
-                Span::styled(format!("{}_", input.text), theme.text),
-            ]),
-            Line::from(Span::styled("Enter saves · Esc cancels", theme.muted)),
-        ]
+    let info = if app.settings_input.is_some() {
+        Vec::new()
     } else if let Some(profile) = app.selected_model_profile_value() {
         let model = app.selected_profile_model();
         vec![
@@ -1290,28 +1459,40 @@ fn render_model_profiles(
                 Span::styled(format!("{}  ", profile.id), theme.text),
                 Span::styled(format!("engine {}  ", profile.engine_id), theme.accent),
                 Span::styled(
-                    model.map(|model| model.display_name.clone())
+                    model
+                        .map(|model| model.display_name.clone())
                         .unwrap_or_else(|| format!("MISSING {}", profile.model_id)),
-                    if model.is_some() { theme.hint } else { theme.warning },
+                    if model.is_some() {
+                        theme.hint
+                    } else {
+                        theme.warning
+                    },
                 ),
             ]),
             Line::from(Span::styled(
-                model.map(|model| model.path.display().to_string()).unwrap_or_default(),
+                model
+                    .map(|model| model.path.display().to_string())
+                    .unwrap_or_default(),
                 theme.muted,
             )),
             Line::from(Span::styled(
-                format!(
-                    "hash {} · runtime {}",
-                    profile.content_hash(),
-                    app.settings_runtime_id.as_ref().map(ToString::to_string).unwrap_or_else(|| "not validated".to_owned()),
+                app.settings_validation_error.as_deref().map_or_else(
+                    || {
+                        format!(
+                            "runtime {} · rows select; explicit buttons act",
+                            app.settings_runtime_id
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "not validated".to_owned()),
+                        )
+                    },
+                    ToOwned::to_owned,
                 ),
-                theme.muted,
-            )),
-            Line::from(Span::styled(
-                app.settings_validation_error.as_deref().unwrap_or(
-                    "Left/Right profile · Enter override · Delete inherit · l load · D duplicate · d delete · m model · e engine",
-                ),
-                if app.settings_validation_error.is_some() { theme.warning } else { theme.hint },
+                if app.settings_validation_error.is_some() {
+                    theme.warning
+                } else {
+                    theme.hint
+                },
             )),
         ]
     } else {
@@ -1321,7 +1502,159 @@ fn render_model_profiles(
         ))]
     };
     frame.render_widget(Paragraph::new(info).wrap(Wrap { trim: true }), info_area);
+    render_settings_input(frame, app, theme, ui_layout);
+    render_model_profile_actions(frame, app, theme, ui_layout);
     render_setting_rows(frame, app, theme, ui_layout);
+}
+
+fn render_settings_input(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layout: &UiLayout) {
+    let Some(input) = &app.settings_input else {
+        return;
+    };
+    let prompt = match input.kind {
+        crate::app::SettingsInputKind::ProfileName => "New Model Profile ID",
+        crate::app::SettingsInputKind::DuplicateProfile => "Duplicate Model Profile ID",
+        crate::app::SettingsInputKind::SettingValue => "Override value",
+    };
+    let field_width = ui_layout
+        .settings_input_field
+        .width
+        .saturating_sub(prompt.len() as u16 + 4) as usize;
+    let field = format!(
+        "{prompt}: [{}]",
+        truncate_middle(&format!("{}_", input.text), field_width, "…")
+    );
+    let field_style = if app.hover == Some(HoverTarget::SettingsInputField) {
+        theme.focused.patch(theme.hovered)
+    } else {
+        theme.focused
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(field, field_style))),
+        ui_layout.settings_input_field,
+    );
+    let submit_label = match input.kind {
+        crate::app::SettingsInputKind::ProfileName => "[ Create ]",
+        crate::app::SettingsInputKind::DuplicateProfile => "[ Duplicate ]",
+        crate::app::SettingsInputKind::SettingValue => "[ Save ]",
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            submit_label,
+            action_style(
+                theme,
+                ActionState::Primary,
+                app.hover == Some(HoverTarget::SettingsInputSubmit),
+            ),
+        ))),
+        ui_layout.settings_input_submit,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "[ Cancel ]",
+            action_style(
+                theme,
+                ActionState::Normal,
+                app.hover == Some(HoverTarget::SettingsInputCancel),
+            ),
+        ))),
+        ui_layout.settings_input_cancel,
+    );
+}
+
+fn render_model_profile_actions(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: &Theme,
+    ui_layout: &UiLayout,
+) {
+    let has_model = app.selected_profile_model().is_some();
+    let active = app.selected_profile_is_active();
+    for (action, area) in &ui_layout.model_profile_actions {
+        let (label, state) = match action {
+            ModelProfileAction::Load => (
+                "[ Load ]",
+                if has_model && app.control.is_some() && !active && !app.control_busy() {
+                    ActionState::Primary
+                } else {
+                    ActionState::Disabled
+                },
+            ),
+            ModelProfileAction::Unload => (
+                "[ Unload ]",
+                if active && !app.control_busy() {
+                    ActionState::Normal
+                } else {
+                    ActionState::Disabled
+                },
+            ),
+            ModelProfileAction::Model => (
+                "[ Model ]",
+                if !app.settings_busy() && !app.snapshot.models.is_empty() {
+                    ActionState::Normal
+                } else {
+                    ActionState::Disabled
+                },
+            ),
+            ModelProfileAction::Engine => (
+                "[ Engine ]",
+                if !app.settings_busy() && has_model {
+                    ActionState::Normal
+                } else {
+                    ActionState::Disabled
+                },
+            ),
+            ModelProfileAction::Duplicate => (
+                if ui_layout.compact {
+                    "[ Copy ]"
+                } else {
+                    "[ Duplicate ]"
+                },
+                if app.settings_busy() {
+                    ActionState::Disabled
+                } else {
+                    ActionState::Normal
+                },
+            ),
+            ModelProfileAction::Delete => (
+                if app.profile_delete_armed() {
+                    "[ Confirm Delete ]"
+                } else {
+                    "[ Delete ]"
+                },
+                if app.settings_busy() {
+                    ActionState::Disabled
+                } else if app.profile_delete_armed() {
+                    ActionState::Confirm
+                } else {
+                    ActionState::Destructive
+                },
+            ),
+            ModelProfileAction::Refresh => (
+                if ui_layout.compact {
+                    "[ Sync ]"
+                } else {
+                    "[ Refresh ]"
+                },
+                if !app.settings_busy() && has_model {
+                    ActionState::Normal
+                } else {
+                    ActionState::Disabled
+                },
+            ),
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_middle(label, area.width as usize, "…"),
+                action_style(
+                    theme,
+                    state,
+                    app.hover == Some(HoverTarget::ModelProfileAction(*action)),
+                ),
+            ))),
+            *area,
+        );
+    }
 }
 
 fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layout: &UiLayout) {
@@ -1381,10 +1714,20 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
                 .get(index.saturating_sub(1))
                 .is_none_or(|previous| previous.category != definition.category);
         let heading = if starts_category {
-            format!("{}  ──  {label}", definition.category)
+            format!(
+                "{}  ──  {label} · {source} · {support}",
+                definition.category
+            )
         } else {
-            format!("              {label}")
+            format!("              {label} · {source} · {support}")
         };
+        let value_area = ui_layout
+            .setting_values
+            .iter()
+            .find(|(value_index, _)| value_index == index)
+            .map(|(_, area)| *area)
+            .unwrap_or_default();
+        let id_width = value_area.x.saturating_sub(rect.x).saturating_sub(2) as usize;
         let lines = vec![
             Line::from(Span::styled(
                 heading,
@@ -1394,21 +1737,53 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
                     theme.muted
                 },
             )),
-            Line::from(vec![
-                Span::styled(format!("  {:<28}  ", definition.id), theme.text),
-                Span::styled(format!("{value:<16}  "), theme.accent),
-                Span::styled(source, theme.muted),
-                Span::styled(
-                    format!("  {support}"),
-                    if definition.supported {
-                        theme.hint
-                    } else {
-                        theme.warning
-                    },
+            Line::from(vec![Span::styled(
+                format!(
+                    "  {:<id_width$}",
+                    truncate_middle(&definition.id.to_string(), id_width, "…")
                 ),
-            ]),
+                theme.text,
+            )]),
         ];
         frame.render_widget(Paragraph::new(lines).style(style), *rect);
+        let value_enabled = definition.supported && !app.settings_busy();
+        let value_label = format!("[ {value} ]");
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_middle(&value_label, value_area.width as usize, "…"),
+                action_style(
+                    theme,
+                    if value_enabled {
+                        ActionState::Primary
+                    } else {
+                        ActionState::Disabled
+                    },
+                    app.hover == Some(HoverTarget::SettingValue(*index)),
+                ),
+            ))),
+            value_area,
+        );
+        if let Some((_, inherit_area)) = ui_layout
+            .setting_inherit_actions
+            .iter()
+            .find(|(inherit_index, _)| inherit_index == index)
+        {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "[ Inherit ]",
+                    action_style(
+                        theme,
+                        if app.settings_busy() {
+                            ActionState::Disabled
+                        } else {
+                            ActionState::Normal
+                        },
+                        app.hover == Some(HoverTarget::SettingInherit(*index)),
+                    ),
+                ))),
+                *inherit_area,
+            );
+        }
     }
 }
 
@@ -1427,7 +1802,9 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         key_value("Tab / Shift+Tab", "change focus", theme),
         key_value("Left / Right", "move navigation focus", theme),
         key_value("Enter", "open the focused page", theme),
-        key_value("Mouse", "click pages and interactive rows", theme),
+        key_value("Mouse", "rows select; [ buttons ] perform actions", theme),
+        key_value("Hover", "highlights interactive controls", theme),
+        key_value("Keyboard", "shortcuts remain available everywhere", theme),
         Line::default(),
         Line::from(Span::styled("MODELS AND MODEL PROFILES", theme.hint)),
         key_value(
@@ -1438,7 +1815,7 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         key_value("Left / Right", "change the Model Library view", theme),
         key_value(
             "Mouse",
-            "click Discover search, format filters, and Download",
+            "click rows, values, tabs, filters, and visible actions",
             theme,
         ),
         key_value(

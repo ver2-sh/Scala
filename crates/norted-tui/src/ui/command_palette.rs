@@ -5,7 +5,7 @@ use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, Overlay};
 use crate::theme::{Glyphs, Theme};
-use crate::ui::components::{centered_rect, popup_block};
+use crate::ui::components::{ActionState, action_style, popup_block};
 use crate::ui::layout::{HoverTarget, UiLayout};
 use crate::ui::screens::help_lines;
 
@@ -17,13 +17,26 @@ pub fn render_overlays(
     layout: &UiLayout,
 ) {
     if app.overlay == Some(Overlay::Help) {
-        let area = centered_rect(74, 72, frame.area());
+        let Some(area) = layout.help_popup else {
+            return;
+        };
         frame.render_widget(Clear, area);
         frame.render_widget(
             Paragraph::new(help_lines(theme, glyphs))
                 .block(popup_block(" Help ", theme, glyphs))
                 .wrap(Wrap { trim: true }),
             area,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "[ Close ]",
+                action_style(
+                    theme,
+                    ActionState::Primary,
+                    app.hover == Some(HoverTarget::HelpClose),
+                ),
+            ))),
+            layout.help_close,
         );
         return;
     }

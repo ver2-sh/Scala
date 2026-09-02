@@ -32,7 +32,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) -> UiLayout {
     command_palette::render_overlays(frame, app, &theme, &glyphs, &layout);
     runtime_search::render(frame, app, &theme, &glyphs, &layout);
     model_runtime::render(frame, app, &theme, &glyphs, &layout);
-    profile_engine::render(frame, app, &theme, &glyphs);
+    profile_engine::render(frame, app, &theme, &glyphs, &layout);
     if app.overlay.is_none() {
         shell::set_command_cursor(frame, layout.command_bar, app);
     }

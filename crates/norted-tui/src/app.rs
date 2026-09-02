@@ -6,9 +6,9 @@ use crossterm::event::{
 use norted_core::{
     AppEvent, AppSnapshot, ArtifactFormat, EngineId, LogLevel, ModelArtifact, ModelId,
     ModelProfile, ModelProfileId, ModelProfilesState, PublicAuthStatus, RegistryState,
-    ResolvedSettings, RuntimeCompatibility, RuntimeId, RuntimeOperationPhase,
-    RuntimeOperationProgress, RuntimeUpdateState, SettingDefinition, SettingId, SettingScope,
-    SettingValue, SettingsSchema, SettingsState,
+    ResolvedSettings, RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId,
+    RuntimeOperationPhase, RuntimeOperationProgress, RuntimeUpdateState, SettingDefinition,
+    SettingId, SettingScope, SettingValue, SettingsSchema, SettingsState,
 };
 use norted_engine::{
     BackendLifecycle, BackendLoadProgress, ControlStatus, RuntimeListSnapshot,
@@ -19,7 +19,9 @@ use norted_model_library::{CatalogFile, CatalogRepository, CatalogSearch, ModelO
 use ratatui::layout::Position;
 
 use crate::commands::{self, CommandAction};
-use crate::ui::layout::{HoverTarget, UiLayout};
+use crate::ui::layout::{
+    HoverTarget, InstalledModelAction, ModelProfileAction, SelectedRuntimeAction, UiLayout,
+};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Screen {
@@ -369,6 +371,7 @@ pub struct App {
     pending_runtime_remove_confirmation: Option<RuntimeId>,
     pending_model_library_action: Option<ModelLibraryAction>,
     pending_model_remove_confirmation: Option<ModelId>,
+    pending_profile_delete_confirmation: Option<ModelProfileId>,
     model_library_busy: bool,
     pending_settings_action: Option<SettingsAction>,
     settings_busy: bool,
@@ -480,6 +483,7 @@ impl App {
             pending_runtime_remove_confirmation: None,
             pending_model_library_action: None,
             pending_model_remove_confirmation: None,
+            pending_profile_delete_confirmation: None,
             model_library_busy: false,
             pending_settings_action: None,
             settings_busy: false,
@@ -518,6 +522,7 @@ impl App {
         if self.command_active {
             return self.handle_command_key(key);
         }
+        self.pending_profile_delete_confirmation = None;
         if self.screen == Screen::Models
             && self.model_library_view == ModelLibraryView::Discover
             && self.focus == FocusArea::Content
@@ -576,12 +581,6 @@ impl App {
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent, layout: &UiLayout) -> Update {
         if let Some(overlay) = self.overlay {
-            if overlay == Overlay::Help {
-                if self.hover.take().is_some() {
-                    return Update::Render;
-                }
-                return Update::None;
-            }
             let position = Position::new(mouse.column, mouse.row);
             return match mouse.kind {
                 MouseEventKind::Moved => {
@@ -596,8 +595,15 @@ impl App {
                 MouseEventKind::Down(MouseButton::Left) => match overlay {
                     Overlay::RuntimeSearch => self.handle_runtime_search_click(position, layout),
                     Overlay::ModelRuntime => self.handle_model_runtime_click(position, layout),
-                    Overlay::ProfileEngine => Update::None,
-                    Overlay::Help => Update::None,
+                    Overlay::ProfileEngine => self.handle_profile_engine_click(position, layout),
+                    Overlay::Help => match layout.hit_test(position) {
+                        Some(HoverTarget::HelpClose) => {
+                            self.overlay = None;
+                            self.hover = None;
+                            Update::Render
+                        }
+                        _ => Update::None,
+                    },
                 },
                 MouseEventKind::ScrollUp => match overlay {
                     Overlay::RuntimeSearch => self.scroll_runtime_search(-3, layout),
@@ -610,6 +616,34 @@ impl App {
                     Overlay::ModelRuntime => self.scroll_model_runtime_picker(3, layout),
                     Overlay::ProfileEngine => Update::None,
                     Overlay::Help => Update::None,
+                },
+                _ => Update::None,
+            };
+        }
+        if self.settings_input.is_some() {
+            let position = Position::new(mouse.column, mouse.row);
+            return match mouse.kind {
+                MouseEventKind::Moved => {
+                    let hover = match layout.hit_test(position) {
+                        target @ Some(
+                            HoverTarget::SettingsInputSubmit
+                            | HoverTarget::SettingsInputCancel
+                            | HoverTarget::SettingsInputField,
+                        ) => target,
+                        _ => None,
+                    };
+                    if hover == self.hover {
+                        Update::None
+                    } else {
+                        self.hover = hover;
+                        Update::Render
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => match layout.hit_test(position) {
+                    Some(HoverTarget::SettingsInputSubmit) => self.submit_settings_input(),
+                    Some(HoverTarget::SettingsInputCancel) => self.cancel_settings_input(),
+                    Some(HoverTarget::SettingsInputField) => Update::Render,
+                    _ => Update::None,
                 },
                 _ => Update::None,
             };
@@ -861,6 +895,20 @@ impl App {
         self.model_library_busy
     }
 
+    pub fn model_remove_armed(&self) -> bool {
+        self.selected_model
+            .and_then(|index| self.snapshot.models.get(index))
+            .is_some_and(|model| self.pending_model_remove_confirmation.as_ref() == Some(&model.id))
+    }
+
+    pub fn settings_busy(&self) -> bool {
+        self.settings_busy
+    }
+
+    pub fn control_busy(&self) -> bool {
+        self.control_busy
+    }
+
     pub fn take_settings_action(&mut self) -> Option<SettingsAction> {
         self.pending_settings_action.take()
     }
@@ -1087,6 +1135,76 @@ impl App {
 
     pub fn runtime_mutation_busy(&self) -> bool {
         self.runtime_mutation_busy
+    }
+
+    pub fn runtime_remove_armed(&self) -> bool {
+        self.selected_runtime
+            .and_then(|index| self.runtime_list.as_ref()?.installed.get(index))
+            .is_some_and(|status| {
+                self.pending_runtime_remove_confirmation.as_ref()
+                    == Some(&status.runtime.manifest.runtime_id)
+            })
+    }
+
+    pub fn profile_delete_armed(&self) -> bool {
+        self.selected_model_profile_value().is_some_and(|profile| {
+            self.pending_profile_delete_confirmation.as_ref() == Some(&profile.id)
+        })
+    }
+
+    pub fn selected_profile_is_active(&self) -> bool {
+        self.selected_model_profile_value().is_some_and(|profile| {
+            self.control.as_ref().is_some_and(|control| {
+                control.backend.model_profile_id.as_ref() == Some(&profile.id)
+                    && !matches!(control.backend.lifecycle, BackendLifecycle::Stopped)
+            })
+        })
+    }
+
+    pub fn selected_model_is_active(&self) -> bool {
+        self.selected_model
+            .and_then(|index| self.snapshot.models.get(index))
+            .is_some_and(|model| {
+                self.control.as_ref().is_some_and(|control| {
+                    control.backend.model_id.as_ref() == Some(&model.id)
+                        && !matches!(control.backend.lifecycle, BackendLifecycle::Stopped)
+                })
+            })
+    }
+
+    pub fn selected_runtime_update_available(&self) -> bool {
+        self.selected_runtime
+            .and_then(|index| self.runtime_list.as_ref()?.installed.get(index))
+            .is_some_and(|status| {
+                matches!(
+                    self.runtime_updates
+                        .get(&status.runtime.manifest.runtime_id),
+                    Some(RuntimeUpdateState::NewerCompatibleVersion { .. })
+                        | Some(RuntimeUpdateState::Pinned {
+                            newer_runtime_id: Some(_),
+                            ..
+                        })
+                )
+            })
+    }
+
+    pub fn selected_runtime_removable(&self) -> bool {
+        if self.runtime_mutation_busy || self.control_observation_pending() {
+            return false;
+        }
+        let Some(status) = self
+            .selected_runtime
+            .and_then(|index| self.runtime_list.as_ref()?.installed.get(index))
+        else {
+            return false;
+        };
+        status.runtime.manifest.acquisition_method != RuntimeAcquisitionMethod::ExternalBinary
+            && status.selected_for.is_empty()
+            && self
+                .control
+                .as_ref()
+                .and_then(|control| control.backend.runtime_id.as_ref())
+                != Some(&status.runtime.manifest.runtime_id)
     }
 
     pub fn handle_runtime_task_result(&mut self, result: RuntimeTaskResult) {
@@ -2006,7 +2124,7 @@ impl App {
         if self.pending_model_remove_confirmation.as_ref() != Some(&model.id) {
             self.pending_model_remove_confirmation = Some(model.id.clone());
             self.notice = Some(format!(
-                "Press d again to remove the managed acquisition containing {}",
+                "Activate Remove again to remove the managed acquisition containing {}",
                 model.id
             ));
             return Update::Render;
@@ -2061,10 +2179,7 @@ impl App {
 
     fn handle_settings_input_key(&mut self, key: KeyEvent) -> Update {
         match key.code {
-            KeyCode::Esc => {
-                self.settings_input = None;
-                Update::Render
-            }
+            KeyCode::Esc => self.cancel_settings_input(),
             KeyCode::Enter => self.submit_settings_input(),
             KeyCode::Backspace => {
                 let input = self.settings_input.as_mut().expect("checked by caller");
@@ -2120,6 +2235,12 @@ impl App {
             }
             _ => Update::None,
         }
+    }
+
+    fn cancel_settings_input(&mut self) -> Update {
+        self.settings_input = None;
+        self.hover = None;
+        Update::Render
     }
 
     fn submit_settings_input(&mut self) -> Update {
@@ -2281,12 +2402,7 @@ impl App {
             return Update::Render;
         };
         match key.code {
-            KeyCode::Esc => {
-                self.overlay = None;
-                self.profile_engine_selection = None;
-                self.notice = Some("Model Profile creation cancelled".to_owned());
-                Update::Render
-            }
+            KeyCode::Esc => self.cancel_profile_engine(),
             KeyCode::Up | KeyCode::Char('k') => {
                 selection.selected = selection.selected.saturating_sub(1);
                 Update::Render
@@ -2296,22 +2412,50 @@ impl App {
                     (selection.selected + 1).min(selection.engines.len().saturating_sub(1));
                 Update::Render
             }
-            KeyCode::Enter => {
-                let Some(engine_id) = selection.engines.get(selection.selected).cloned() else {
-                    return Update::None;
-                };
-                let action = SettingsAction::CreateProfile {
-                    id: selection.id.clone(),
-                    display_name: selection.display_name.clone(),
-                    model: selection.model.clone(),
-                    engine_id: Some(engine_id),
-                };
-                self.overlay = None;
-                self.profile_engine_selection = None;
-                self.queue_settings_action(action)
-            }
+            KeyCode::Enter => self.submit_profile_engine(),
             _ => Update::None,
         }
+    }
+
+    fn handle_profile_engine_click(&mut self, position: Position, layout: &UiLayout) -> Update {
+        match layout.hit_test(position) {
+            Some(HoverTarget::ProfileEngineResult(index)) => {
+                if let Some(selection) = &mut self.profile_engine_selection {
+                    selection.selected = index.min(selection.engines.len().saturating_sub(1));
+                }
+                Update::Render
+            }
+            Some(HoverTarget::ProfileEngineApply) => self.submit_profile_engine(),
+            Some(HoverTarget::ProfileEngineCancel) => self.cancel_profile_engine(),
+            _ => Update::None,
+        }
+    }
+
+    fn submit_profile_engine(&mut self) -> Update {
+        let Some(selection) = self.profile_engine_selection.as_ref() else {
+            return Update::None;
+        };
+        let Some(engine_id) = selection.engines.get(selection.selected).cloned() else {
+            return Update::None;
+        };
+        let action = SettingsAction::CreateProfile {
+            id: selection.id.clone(),
+            display_name: selection.display_name.clone(),
+            model: selection.model.clone(),
+            engine_id: Some(engine_id),
+        };
+        self.overlay = None;
+        self.profile_engine_selection = None;
+        self.hover = None;
+        self.queue_settings_action(action)
+    }
+
+    fn cancel_profile_engine(&mut self) -> Update {
+        self.overlay = None;
+        self.profile_engine_selection = None;
+        self.hover = None;
+        self.notice = Some("Model Profile creation cancelled".to_owned());
+        Update::Render
     }
 
     fn clear_selected_setting(&mut self) -> Update {
@@ -2420,6 +2564,24 @@ impl App {
             return Update::Render;
         };
         self.queue_settings_action(SettingsAction::DeleteProfile(profile))
+    }
+
+    fn request_profile_delete_from_mouse(&mut self) -> Update {
+        let Some(profile) = self
+            .selected_model_profile_value()
+            .map(|profile| profile.id.clone())
+        else {
+            return Update::None;
+        };
+        if self.pending_profile_delete_confirmation.as_ref() != Some(&profile) {
+            self.pending_profile_delete_confirmation = Some(profile.clone());
+            self.notice = Some(format!(
+                "Activate Confirm Delete to delete Model Profile {profile}"
+            ));
+            return Update::Render;
+        }
+        self.pending_profile_delete_confirmation = None;
+        self.delete_selected_profile()
     }
 
     fn begin_duplicate_profile(&mut self) -> Update {
@@ -2558,7 +2720,33 @@ impl App {
     }
 
     fn handle_click(&mut self, position: Position, layout: &UiLayout) -> Update {
-        match layout.hit_test(position) {
+        let target = layout.hit_test(position);
+        if self.command_active
+            && !matches!(
+                target,
+                Some(HoverTarget::CommandBar | HoverTarget::CommandSuggestion(_))
+            )
+        {
+            self.close_command();
+        }
+        if target
+            != Some(HoverTarget::InstalledModelAction(
+                InstalledModelAction::Remove,
+            ))
+        {
+            self.pending_model_remove_confirmation = None;
+        }
+        if target
+            != Some(HoverTarget::SelectedRuntimeAction(
+                SelectedRuntimeAction::Remove,
+            ))
+        {
+            self.pending_runtime_remove_confirmation = None;
+        }
+        if target != Some(HoverTarget::ModelProfileAction(ModelProfileAction::Delete)) {
+            self.pending_profile_delete_confirmation = None;
+        }
+        match target {
             Some(HoverTarget::Navigation(screen)) => {
                 if self.command_active {
                     self.close_command();
@@ -2585,17 +2773,29 @@ impl App {
             Some(HoverTarget::ModelSearchSubmit) => {
                 self.prepare_model_discover_click();
                 self.model_search_editing = false;
-                self.request_model_search()
+                if self.model_library_busy {
+                    Update::None
+                } else {
+                    self.request_model_search()
+                }
             }
             Some(HoverTarget::ModelFormatFilter(format)) => {
                 self.prepare_model_discover_click();
-                self.set_model_search_format(format)
+                if self.model_library_busy {
+                    Update::None
+                } else {
+                    self.set_model_search_format(format)
+                }
             }
             Some(HoverTarget::ModelDownloadAction(index)) => {
                 self.prepare_model_discover_click();
                 self.model_search_editing = false;
                 self.selected_model_search_result = Some(index);
-                self.request_model_download()
+                if self.model_library_busy {
+                    Update::None
+                } else {
+                    self.request_model_download()
+                }
             }
             Some(HoverTarget::Model(index)) => {
                 if self.command_active {
@@ -2609,6 +2809,33 @@ impl App {
                 }
                 Update::Render
             }
+            Some(HoverTarget::InstalledModelAction(action)) => {
+                self.focus = FocusArea::Content;
+                match action {
+                    InstalledModelAction::CreateProfile if !self.settings_busy => {
+                        self.create_profile_for_selected_model()
+                    }
+                    InstalledModelAction::Runtime
+                        if !self.runtime_mutation_busy && !self.runtime_picker_loading =>
+                    {
+                        self.open_model_runtime_picker()
+                    }
+                    InstalledModelAction::Unload
+                        if self.selected_model_is_active() && !self.control_busy =>
+                    {
+                        self.request_unload()
+                    }
+                    InstalledModelAction::Remove
+                        if !self.model_library_busy && !self.selected_model_is_active() =>
+                    {
+                        self.request_model_removal()
+                    }
+                    InstalledModelAction::CreateProfile
+                    | InstalledModelAction::Runtime
+                    | InstalledModelAction::Unload
+                    | InstalledModelAction::Remove => Update::None,
+                }
+            }
             Some(HoverTarget::Runtime(index)) => {
                 if self.command_active {
                     self.close_command();
@@ -2620,14 +2847,40 @@ impl App {
             }
             Some(HoverTarget::RuntimeSearchAction) => {
                 self.focus = FocusArea::Content;
-                self.open_runtime_search()
+                if self.runtime_mutation_busy || self.runtime_search_loading {
+                    Update::None
+                } else {
+                    self.open_runtime_search()
+                }
             }
             Some(HoverTarget::RuntimeUpdateAction) => {
                 self.focus = FocusArea::Content;
-                self.request_runtime_updates()
+                if self.runtime_mutation_busy || self.runtime_update_loading {
+                    Update::None
+                } else {
+                    self.request_runtime_updates()
+                }
+            }
+            Some(HoverTarget::SelectedRuntimeAction(action)) => {
+                self.focus = FocusArea::Content;
+                match action {
+                    SelectedRuntimeAction::Default(format) => {
+                        self.request_runtime_selection(format)
+                    }
+                    SelectedRuntimeAction::Update if self.selected_runtime_update_available() => {
+                        self.request_selected_runtime_update()
+                    }
+                    SelectedRuntimeAction::Remove if self.selected_runtime_removable() => {
+                        self.request_runtime_removal()
+                    }
+                    SelectedRuntimeAction::Update | SelectedRuntimeAction::Remove => Update::None,
+                }
             }
             Some(HoverTarget::SettingsScope(index)) => {
                 self.focus = FocusArea::Content;
+                if self.settings_busy && self.screen == Screen::ModelProfiles {
+                    return Update::None;
+                }
                 if self.screen == Screen::ModelProfiles {
                     self.selected_model_profile =
                         Some(index.min(self.model_profile_values().len().saturating_sub(1)));
@@ -2645,10 +2898,79 @@ impl App {
             }
             Some(HoverTarget::Setting(index)) => {
                 self.focus = FocusArea::Content;
-                if self.settings_setting_index == index {
-                    return self.edit_selected_setting();
-                }
                 self.settings_setting_index = index;
+                Update::Render
+            }
+            Some(HoverTarget::SettingValue(index)) => {
+                self.focus = FocusArea::Content;
+                self.settings_setting_index = index;
+                let supported = self
+                    .settings_definitions()
+                    .get(index)
+                    .is_some_and(|definition| definition.supported);
+                if self.settings_busy || !supported {
+                    Update::Render
+                } else {
+                    self.edit_selected_setting()
+                }
+            }
+            Some(HoverTarget::SettingInherit(index)) => {
+                self.focus = FocusArea::Content;
+                self.settings_setting_index = index;
+                if self.settings_busy {
+                    Update::Render
+                } else {
+                    self.clear_selected_setting()
+                }
+            }
+            Some(HoverTarget::ModelProfileAction(action)) => {
+                self.focus = FocusArea::Content;
+                match action {
+                    ModelProfileAction::Load
+                        if self.selected_profile_model().is_some()
+                            && self.control.is_some()
+                            && !self.selected_profile_is_active()
+                            && !self.control_busy =>
+                    {
+                        self.request_load()
+                    }
+                    ModelProfileAction::Unload
+                        if self.selected_profile_is_active() && !self.control_busy =>
+                    {
+                        self.request_unload()
+                    }
+                    ModelProfileAction::Model
+                        if !self.settings_busy && !self.snapshot.models.is_empty() =>
+                    {
+                        self.cycle_profile_model()
+                    }
+                    ModelProfileAction::Engine
+                        if !self.settings_busy && self.selected_profile_model().is_some() =>
+                    {
+                        self.cycle_profile_engine()
+                    }
+                    ModelProfileAction::Duplicate if !self.settings_busy => {
+                        self.begin_duplicate_profile()
+                    }
+                    ModelProfileAction::Delete if !self.settings_busy => {
+                        self.request_profile_delete_from_mouse()
+                    }
+                    ModelProfileAction::Refresh
+                        if !self.settings_busy && self.selected_profile_model().is_some() =>
+                    {
+                        self.refresh_selected_model_profile()
+                    }
+                    ModelProfileAction::Load
+                    | ModelProfileAction::Unload
+                    | ModelProfileAction::Model
+                    | ModelProfileAction::Engine
+                    | ModelProfileAction::Duplicate
+                    | ModelProfileAction::Delete
+                    | ModelProfileAction::Refresh => Update::None,
+                }
+            }
+            Some(HoverTarget::FollowLatest) => {
+                self.log_scroll = 0;
                 Update::Render
             }
             Some(HoverTarget::CommandSuggestion(index)) => {
@@ -2673,7 +2995,15 @@ impl App {
                 | HoverTarget::RuntimeSearchSubmit
                 | HoverTarget::RuntimeInstall
                 | HoverTarget::RuntimePickerResult(_)
-                | HoverTarget::RuntimePickerApply,
+                | HoverTarget::RuntimePickerApply
+                | HoverTarget::RuntimeOverlayCancel
+                | HoverTarget::ProfileEngineResult(_)
+                | HoverTarget::ProfileEngineApply
+                | HoverTarget::ProfileEngineCancel
+                | HoverTarget::HelpClose
+                | HoverTarget::SettingsInputField
+                | HoverTarget::SettingsInputSubmit
+                | HoverTarget::SettingsInputCancel,
             ) => Update::None,
             None => Update::None,
         }
@@ -2724,11 +3054,7 @@ impl App {
 
     fn handle_runtime_search_key(&mut self, key: KeyEvent, layout: &UiLayout) -> Update {
         match key.code {
-            KeyCode::Esc => {
-                self.overlay = None;
-                self.hover = None;
-                Update::Render
-            }
+            KeyCode::Esc => self.close_runtime_overlay(),
             KeyCode::Tab | KeyCode::BackTab => {
                 self.runtime_search_focus = match (key.code, self.runtime_search_focus) {
                     (KeyCode::Tab, RuntimeSearchFocus::Query) => {
@@ -2761,11 +3087,7 @@ impl App {
 
     fn handle_model_runtime_key(&mut self, key: KeyEvent, layout: &UiLayout) -> Update {
         match key.code {
-            KeyCode::Esc => {
-                self.overlay = None;
-                self.hover = None;
-                Update::Render
-            }
+            KeyCode::Esc => self.close_runtime_overlay(),
             KeyCode::Up | KeyCode::Char('k') => self.move_model_runtime_picker(-1, layout),
             KeyCode::Down | KeyCode::Char('j') => self.move_model_runtime_picker(1, layout),
             KeyCode::PageUp => {
@@ -2797,8 +3119,15 @@ impl App {
                 Update::Render
             }
             Some(HoverTarget::RuntimePickerApply) => self.activate_model_runtime_primary(),
+            Some(HoverTarget::RuntimeOverlayCancel) => self.close_runtime_overlay(),
             _ => Update::None,
         }
+    }
+
+    fn close_runtime_overlay(&mut self) -> Update {
+        self.overlay = None;
+        self.hover = None;
+        Update::Render
     }
 
     fn open_model_runtime_picker(&mut self) -> Update {
@@ -3069,11 +3398,20 @@ impl App {
                 self.selected_runtime_search_result = Some(index);
                 Update::Render
             }
-            Some(HoverTarget::RuntimeSearchSubmit) => self.request_runtime_search(false),
+            Some(HoverTarget::RuntimeSearchSubmit)
+                if !self.runtime_search_loading && !self.runtime_mutation_busy =>
+            {
+                self.request_runtime_search(false)
+            }
             Some(HoverTarget::RuntimeSearchIncompatibleToggle) => {
                 self.toggle_runtime_search_incompatible(layout)
             }
-            Some(HoverTarget::RuntimeInstall) => self.request_runtime_install(),
+            Some(HoverTarget::RuntimeInstall)
+                if !self.runtime_search_loading && !self.runtime_mutation_busy =>
+            {
+                self.request_runtime_install()
+            }
+            Some(HoverTarget::RuntimeOverlayCancel) => self.close_runtime_overlay(),
             _ => Update::None,
         }
     }
@@ -3240,7 +3578,7 @@ impl App {
         if self.pending_runtime_remove_confirmation.as_ref() != Some(&runtime_id) {
             self.pending_runtime_remove_confirmation = Some(runtime_id.clone());
             self.notice = Some(format!(
-                "Press d again to confirm removal of exact runtime {runtime_id}"
+                "Activate Remove again to confirm removal of exact runtime {runtime_id}"
             ));
             return Update::Render;
         }

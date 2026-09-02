@@ -1,4 +1,4 @@
-use norted_core::{ArtifactFormat, RegistryState};
+use norted_core::{ArtifactFormat, RegistryState, RuntimeAcquisitionMethod};
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 
 use crate::app::{App, ModelLibraryView, Overlay, Screen};
@@ -9,6 +9,32 @@ use super::shell::{COMPACT_WIDTH, MIN_HEIGHT, MIN_WIDTH};
 pub const MODEL_ROW_HEIGHT: u16 = 3;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum InstalledModelAction {
+    CreateProfile,
+    Runtime,
+    Unload,
+    Remove,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ModelProfileAction {
+    Load,
+    Unload,
+    Model,
+    Engine,
+    Duplicate,
+    Delete,
+    Refresh,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SelectedRuntimeAction {
+    Default(ArtifactFormat),
+    Update,
+    Remove,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum HoverTarget {
     Navigation(Screen),
     ModelLibraryTab(ModelLibraryView),
@@ -17,18 +43,32 @@ pub enum HoverTarget {
     ModelFormatFilter(Option<ArtifactFormat>),
     ModelDownloadAction(usize),
     Model(usize),
+    InstalledModelAction(InstalledModelAction),
     Runtime(usize),
     RuntimeSearchAction,
     RuntimeUpdateAction,
+    SelectedRuntimeAction(SelectedRuntimeAction),
     RuntimeSearchInput,
     RuntimeSearchIncompatibleToggle,
     RuntimeSearchResult(usize),
     RuntimeSearchSubmit,
     RuntimeInstall,
+    RuntimeOverlayCancel,
     RuntimePickerResult(usize),
     RuntimePickerApply,
     SettingsScope(usize),
     Setting(usize),
+    SettingValue(usize),
+    SettingInherit(usize),
+    SettingsInputField,
+    SettingsInputSubmit,
+    SettingsInputCancel,
+    ModelProfileAction(ModelProfileAction),
+    ProfileEngineResult(usize),
+    ProfileEngineApply,
+    ProfileEngineCancel,
+    HelpClose,
+    FollowLatest,
     CommandSuggestion(usize),
     CommandBar,
 }
@@ -52,6 +92,7 @@ pub struct UiLayout {
     pub model_progress: Rect,
     pub model_rows: Vec<(usize, Rect)>,
     pub model_download_actions: Vec<(usize, Rect)>,
+    pub installed_model_actions: Vec<(InstalledModelAction, Rect)>,
     pub server_details: Rect,
     pub server_progress: Rect,
     pub runtime_summary: Rect,
@@ -60,6 +101,7 @@ pub struct UiLayout {
     pub runtime_actions: Rect,
     pub runtime_search_action: Rect,
     pub runtime_update_action: Rect,
+    pub selected_runtime_actions: Vec<(SelectedRuntimeAction, Rect)>,
     pub runtime_search_popup: Option<Rect>,
     pub runtime_search_input: Rect,
     pub runtime_search_incompatible_toggle: Rect,
@@ -68,13 +110,27 @@ pub struct UiLayout {
     pub runtime_search_details: Rect,
     pub runtime_search_submit: Rect,
     pub runtime_install_action: Rect,
+    pub runtime_overlay_cancel: Rect,
     pub runtime_operation_status: Rect,
     pub runtime_picker_active: bool,
     pub logs: Rect,
+    pub logs_follow_latest: Rect,
     pub settings_scopes: Rect,
     pub settings_list: Rect,
     pub settings_scope_rows: Vec<(usize, Rect)>,
     pub settings_rows: Vec<(usize, Rect)>,
+    pub setting_values: Vec<(usize, Rect)>,
+    pub setting_inherit_actions: Vec<(usize, Rect)>,
+    pub settings_input_field: Rect,
+    pub settings_input_submit: Rect,
+    pub settings_input_cancel: Rect,
+    pub model_profile_actions: Vec<(ModelProfileAction, Rect)>,
+    pub profile_engine_popup: Option<Rect>,
+    pub profile_engine_rows: Vec<(usize, Rect)>,
+    pub profile_engine_apply: Rect,
+    pub profile_engine_cancel: Rect,
+    pub help_popup: Option<Rect>,
+    pub help_close: Rect,
     pub command_bar: Rect,
     pub suggestion_popup: Option<Rect>,
     pub suggestion_rows: Vec<(usize, Rect)>,
@@ -137,6 +193,7 @@ impl UiLayout {
         let mut model_search_submit = Rect::default();
         let mut model_format_row = Rect::default();
         let mut model_format_filters = Vec::new();
+        let mut installed_model_actions = Vec::new();
         let (model_list, model_progress) = if app.screen == Screen::Models {
             let model_header = content_layout(content)[0];
             model_installed_tab = Rect::new(model_header.x, model_header.y + 1, 13, 1);
@@ -206,11 +263,48 @@ impl UiLayout {
                     model_body.height.saturating_sub(model_format_row.height),
                 );
             }
-            reserve_bottom(
+            let (mut list, progress) = reserve_bottom(
                 model_body,
                 app.selected_model_load_progress().is_some() || app.model_operation.is_some(),
                 3,
-            )
+            );
+            if app.model_library_view == ModelLibraryView::Installed {
+                if let Some(model) = app
+                    .selected_model
+                    .and_then(|index| app.snapshot.models.get(index))
+                {
+                    let action_height = if compact { 2 } else { 1 }.min(list.height);
+                    let action_area = Rect::new(
+                        list.x,
+                        list.bottom().saturating_sub(action_height),
+                        list.width,
+                        action_height,
+                    );
+                    list.height = list.height.saturating_sub(action_height);
+                    let mut actions = vec![
+                        (
+                            InstalledModelAction::CreateProfile,
+                            if compact { 11 } else { 18 },
+                        ),
+                        (InstalledModelAction::Runtime, 11),
+                    ];
+                    let is_active = app.control.as_ref().is_some_and(|control| {
+                        control.backend.model_id.as_ref() == Some(&model.id)
+                            && !matches!(
+                                control.backend.lifecycle,
+                                norted_engine::BackendLifecycle::Stopped
+                            )
+                    });
+                    if is_active {
+                        actions.push((InstalledModelAction::Unload, 10));
+                    }
+                    if model.provenance.is_some() {
+                        actions.push((InstalledModelAction::Remove, 18));
+                    }
+                    installed_model_actions = flow_actions(action_area, &actions);
+                }
+            }
+            (list, progress)
         } else {
             (Rect::default(), Rect::default())
         };
@@ -273,10 +367,23 @@ impl UiLayout {
         let mut runtime_actions = Rect::default();
         let mut runtime_search_action = Rect::default();
         let mut runtime_update_action = Rect::default();
+        let mut selected_runtime_actions = Vec::new();
         let mut runtime_rows = Vec::new();
         if app.screen == Screen::Runtimes {
             let summary_height = screen_body.height.min(if compact { 3 } else { 4 });
-            let action_height = u16::from(screen_body.height > summary_height);
+            let compact_runtime_actions = compact || screen_body.width < 83;
+            let has_selection = app
+                .selected_runtime
+                .and_then(|index| app.runtime_list.as_ref()?.installed.get(index));
+            let requested_action_height = if has_selection.is_some() {
+                if compact_runtime_actions { 3 } else { 2 }
+            } else {
+                1
+            };
+            let action_height = screen_body
+                .height
+                .saturating_sub(summary_height)
+                .min(requested_action_height);
             runtime_summary = Rect::new(
                 screen_body.x,
                 screen_body.y,
@@ -311,6 +418,45 @@ impl UiLayout {
                         .min(18),
                     1,
                 );
+                if let Some(status) = has_selection {
+                    let selected_area = Rect::new(
+                        runtime_actions.x,
+                        runtime_actions.y.saturating_add(1),
+                        runtime_actions.width,
+                        runtime_actions.height.saturating_sub(1),
+                    );
+                    let mut actions = status
+                        .runtime
+                        .manifest
+                        .supported_formats
+                        .iter()
+                        .copied()
+                        .map(|format| {
+                            (
+                                SelectedRuntimeAction::Default(format),
+                                if compact_runtime_actions {
+                                    match format {
+                                        ArtifactFormat::Gguf => 8,
+                                        ArtifactFormat::Q27 => 7,
+                                        ArtifactFormat::Ninfer => 10,
+                                    }
+                                } else {
+                                    16
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    actions.push((
+                        SelectedRuntimeAction::Update,
+                        if compact_runtime_actions { 10 } else { 12 },
+                    ));
+                    if status.runtime.manifest.acquisition_method
+                        != RuntimeAcquisitionMethod::ExternalBinary
+                    {
+                        actions.push((SelectedRuntimeAction::Remove, 18));
+                    }
+                    selected_runtime_actions = flow_actions(selected_area, &actions);
+                }
             }
             if let Some(snapshot) = &app.runtime_list {
                 let capacity = (runtime_list.height / 2) as usize;
@@ -336,6 +482,7 @@ impl UiLayout {
         let mut runtime_search_details = Rect::default();
         let mut runtime_search_submit = Rect::default();
         let mut runtime_install_action = Rect::default();
+        let mut runtime_overlay_cancel = Rect::default();
         let mut runtime_operation_status = Rect::default();
         let mut runtime_search_rows = Vec::new();
         let runtime_picker_active = app.overlay == Some(Overlay::ModelRuntime);
@@ -413,11 +560,21 @@ impl UiLayout {
                 inner.width.min(22),
                 u16::from(inner.height > 0),
             );
+            let cancel_width = inner
+                .width
+                .saturating_sub(runtime_install_action.width)
+                .min(10);
+            runtime_overlay_cancel = Rect::new(
+                inner.right().saturating_sub(cancel_width),
+                runtime_install_action.y,
+                cancel_width,
+                runtime_install_action.height,
+            );
             runtime_operation_status = Rect::new(
                 runtime_install_action.right().saturating_add(1),
                 runtime_install_action.y,
-                inner
-                    .right()
+                runtime_overlay_cancel
+                    .x
                     .saturating_sub(runtime_install_action.right().saturating_add(1)),
                 runtime_install_action.height,
             );
@@ -479,8 +636,19 @@ impl UiLayout {
         let mut settings_list = Rect::default();
         let mut settings_scope_rows = Vec::new();
         let mut settings_rows = Vec::new();
+        let mut setting_values = Vec::new();
+        let mut setting_inherit_actions = Vec::new();
+        let mut settings_input_field = Rect::default();
+        let mut settings_input_submit = Rect::default();
+        let mut settings_input_cancel = Rect::default();
+        let mut model_profile_actions = Vec::new();
         if matches!(app.screen, Screen::Settings | Screen::ModelProfiles) {
-            settings_scopes = Rect::new(screen_body.x, screen_body.y, screen_body.width, 2);
+            settings_scopes = Rect::new(
+                screen_body.x,
+                screen_body.y,
+                screen_body.width,
+                screen_body.height.min(2),
+            );
             settings_list = Rect::new(
                 screen_body.x,
                 screen_body.y.saturating_add(6),
@@ -509,24 +677,166 @@ impl UiLayout {
                 if width == 0 {
                     break;
                 }
-                settings_scope_rows.push((index, Rect::new(x, settings_scopes.y, width, 1)));
+                settings_scope_rows.push((
+                    index,
+                    Rect::new(
+                        x,
+                        settings_scopes.y,
+                        width,
+                        u16::from(settings_scopes.height > 0),
+                    ),
+                ));
                 x = x.saturating_add(width);
             }
             let definitions = app.settings_definitions();
             let capacity = (settings_list.height / 2) as usize;
             let end = (app.settings_scroll + capacity).min(definitions.len());
             for index in app.settings_scroll..end {
-                settings_rows.push((
+                let row = Rect::new(
+                    settings_list.x,
+                    settings_list.y + ((index - app.settings_scroll) as u16 * 2),
+                    settings_list.width,
+                    2,
+                );
+                settings_rows.push((index, row));
+                let inherited = app
+                    .settings_definitions()
+                    .get(index)
+                    .is_none_or(|definition| app.settings_value_display(&definition.id).2);
+                let inherit_width = if inherited { 11.min(row.width) } else { 0 };
+                if inherit_width > 0 {
+                    setting_inherit_actions.push((
+                        index,
+                        Rect::new(
+                            row.right().saturating_sub(inherit_width),
+                            row.y.saturating_add(1),
+                            inherit_width,
+                            u16::from(row.height > 1),
+                        ),
+                    ));
+                }
+                let value_width = row
+                    .width
+                    .saturating_sub(inherit_width.saturating_add(u16::from(inherit_width > 0)))
+                    .min(if compact { 16 } else { 20 });
+                let value_right = row
+                    .right()
+                    .saturating_sub(inherit_width.saturating_add(u16::from(inherit_width > 0)));
+                setting_values.push((
                     index,
                     Rect::new(
-                        settings_list.x,
-                        settings_list.y + ((index - app.settings_scroll) as u16 * 2),
-                        settings_list.width,
-                        2,
+                        value_right.saturating_sub(value_width),
+                        row.y.saturating_add(1),
+                        value_width,
+                        u16::from(row.height > 1),
                     ),
                 ));
             }
+
+            if app.settings_input.is_some() {
+                settings_input_field = Rect::new(
+                    settings_scopes.x,
+                    settings_scopes.y.saturating_add(1),
+                    settings_scopes.width,
+                    u16::from(screen_body.height > 1),
+                );
+                let labels = [((), 15_u16), ((), 10_u16)];
+                let actions = flow_actions(
+                    Rect::new(
+                        settings_scopes.x,
+                        settings_scopes.y.saturating_add(2),
+                        settings_scopes.width,
+                        u16::from(screen_body.height > 2),
+                    ),
+                    &labels,
+                );
+                settings_input_submit = actions.first().map_or(Rect::default(), |(_, rect)| *rect);
+                settings_input_cancel = actions.get(1).map_or(Rect::default(), |(_, rect)| *rect);
+            } else if app.screen == Screen::ModelProfiles
+                && app.selected_model_profile_value().is_some()
+            {
+                let action_area = Rect::new(
+                    settings_scopes.x,
+                    settings_scopes.y.saturating_add(4),
+                    settings_scopes.width,
+                    screen_body.height.saturating_sub(4).min(2),
+                );
+                let mut actions = vec![(ModelProfileAction::Load, 8)];
+                if app.selected_profile_is_active() {
+                    actions.push((ModelProfileAction::Unload, 10));
+                }
+                actions.extend([
+                    (ModelProfileAction::Model, 9),
+                    (ModelProfileAction::Engine, 10),
+                    (ModelProfileAction::Duplicate, if compact { 9 } else { 13 }),
+                    (ModelProfileAction::Delete, 18),
+                    (ModelProfileAction::Refresh, if compact { 9 } else { 11 }),
+                ]);
+                model_profile_actions = flow_actions(action_area, &actions);
+            }
         }
+
+        let mut profile_engine_popup = None;
+        let mut profile_engine_rows = Vec::new();
+        let mut profile_engine_apply = Rect::default();
+        let mut profile_engine_cancel = Rect::default();
+        if app.overlay == Some(Overlay::ProfileEngine) {
+            if let Some(selection) = &app.profile_engine_selection {
+                let popup =
+                    centered_fixed(area, 68, (selection.engines.len() as u16).saturating_add(7));
+                profile_engine_popup = Some(popup);
+                let inner = popup.inner(Margin {
+                    horizontal: 2,
+                    vertical: 1,
+                });
+                for index in 0..selection.engines.len() {
+                    profile_engine_rows.push((
+                        index,
+                        Rect::new(
+                            inner.x,
+                            inner.y.saturating_add(2 + index as u16),
+                            inner.width,
+                            1,
+                        ),
+                    ));
+                }
+                let actions = flow_actions(
+                    Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+                    &[((), 11), ((), 10)],
+                );
+                profile_engine_apply = actions.first().map_or(Rect::default(), |(_, rect)| *rect);
+                profile_engine_cancel = actions.get(1).map_or(Rect::default(), |(_, rect)| *rect);
+            }
+        }
+
+        let mut help_popup = None;
+        let mut help_close = Rect::default();
+        if app.overlay == Some(Overlay::Help) {
+            let popup = centered_percent(area, 74, 72);
+            help_popup = Some(popup);
+            help_close = Rect::new(
+                popup.right().saturating_sub(11),
+                popup.bottom().saturating_sub(2),
+                9.min(popup.width.saturating_sub(2)),
+                1,
+            );
+        }
+
+        let logs = if app.screen == Screen::Logs {
+            screen_body
+        } else {
+            Rect::default()
+        };
+        let logs_follow_latest = if app.screen == Screen::Logs && app.log_scroll > 0 {
+            Rect::new(
+                content.right().saturating_sub(18),
+                content.y.saturating_add(1),
+                18.min(content.width),
+                1,
+            )
+        } else {
+            Rect::default()
+        };
 
         Self {
             too_small: false,
@@ -546,6 +856,7 @@ impl UiLayout {
             model_progress,
             model_rows,
             model_download_actions,
+            installed_model_actions,
             server_details,
             server_progress,
             runtime_summary,
@@ -554,6 +865,7 @@ impl UiLayout {
             runtime_actions,
             runtime_search_action,
             runtime_update_action,
+            selected_runtime_actions,
             runtime_search_popup,
             runtime_search_input,
             runtime_search_incompatible_toggle,
@@ -562,17 +874,27 @@ impl UiLayout {
             runtime_search_details,
             runtime_search_submit,
             runtime_install_action,
+            runtime_overlay_cancel,
             runtime_operation_status,
             runtime_picker_active,
-            logs: if app.screen == Screen::Logs {
-                screen_body
-            } else {
-                Rect::default()
-            },
+            logs,
+            logs_follow_latest,
             settings_scopes,
             settings_list,
             settings_scope_rows,
             settings_rows,
+            setting_values,
+            setting_inherit_actions,
+            settings_input_field,
+            settings_input_submit,
+            settings_input_cancel,
+            model_profile_actions,
+            profile_engine_popup,
+            profile_engine_rows,
+            profile_engine_apply,
+            profile_engine_cancel,
+            help_popup,
+            help_close,
             command_bar: regions[2],
             suggestion_popup,
             suggestion_rows,
@@ -582,7 +904,26 @@ impl UiLayout {
     }
 
     pub fn hit_test(&self, position: Position) -> Option<HoverTarget> {
+        if self.help_popup.is_some() {
+            return contains(self.help_close, position).then_some(HoverTarget::HelpClose);
+        }
+        if self.profile_engine_popup.is_some() {
+            if contains(self.profile_engine_apply, position) {
+                return Some(HoverTarget::ProfileEngineApply);
+            }
+            if contains(self.profile_engine_cancel, position) {
+                return Some(HoverTarget::ProfileEngineCancel);
+            }
+            return self
+                .profile_engine_rows
+                .iter()
+                .find(|(_, area)| contains(*area, position))
+                .map(|(index, _)| HoverTarget::ProfileEngineResult(*index));
+        }
         if self.runtime_search_popup.is_some() {
+            if contains(self.runtime_overlay_cancel, position) {
+                return Some(HoverTarget::RuntimeOverlayCancel);
+            }
             if !self.runtime_picker_active && contains(self.runtime_search_input, position) {
                 return Some(HoverTarget::RuntimeSearchInput);
             }
@@ -654,6 +995,13 @@ impl UiLayout {
         {
             return Some(HoverTarget::ModelDownloadAction(*index));
         }
+        if let Some((action, _)) = self
+            .installed_model_actions
+            .iter()
+            .find(|(_, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::InstalledModelAction(*action));
+        }
         if let Some((index, _)) = self
             .model_rows
             .iter()
@@ -668,6 +1016,22 @@ impl UiLayout {
         {
             return Some(HoverTarget::Runtime(*index));
         }
+        if let Some((action, _)) = self
+            .selected_runtime_actions
+            .iter()
+            .find(|(_, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::SelectedRuntimeAction(*action));
+        }
+        if contains(self.settings_input_submit, position) {
+            return Some(HoverTarget::SettingsInputSubmit);
+        }
+        if contains(self.settings_input_cancel, position) {
+            return Some(HoverTarget::SettingsInputCancel);
+        }
+        if contains(self.settings_input_field, position) {
+            return Some(HoverTarget::SettingsInputField);
+        }
         if let Some((index, _)) = self
             .settings_scope_rows
             .iter()
@@ -676,17 +1040,41 @@ impl UiLayout {
             return Some(HoverTarget::SettingsScope(*index));
         }
         if let Some((index, _)) = self
+            .setting_inherit_actions
+            .iter()
+            .find(|(_, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::SettingInherit(*index));
+        }
+        if let Some((index, _)) = self
+            .setting_values
+            .iter()
+            .find(|(_, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::SettingValue(*index));
+        }
+        if let Some((index, _)) = self
             .settings_rows
             .iter()
             .find(|(_, area)| contains(*area, position))
         {
             return Some(HoverTarget::Setting(*index));
         }
+        if let Some((action, _)) = self
+            .model_profile_actions
+            .iter()
+            .find(|(_, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::ModelProfileAction(*action));
+        }
         if contains(self.runtime_search_action, position) {
             return Some(HoverTarget::RuntimeSearchAction);
         }
         if contains(self.runtime_update_action, position) {
             return Some(HoverTarget::RuntimeUpdateAction);
+        }
+        if contains(self.logs_follow_latest, position) {
+            return Some(HoverTarget::FollowLatest);
         }
         contains(self.command_bar, position).then_some(HoverTarget::CommandBar)
     }
@@ -719,6 +1107,54 @@ impl UiLayout {
         self.suggestion_popup
             .is_some_and(|area| contains(area, position))
     }
+}
+
+fn flow_actions<T: Copy>(area: Rect, actions: &[(T, u16)]) -> Vec<(T, Rect)> {
+    if area.width == 0 || area.height == 0 {
+        return Vec::new();
+    }
+    let mut x = area.x;
+    let mut y = area.y;
+    let mut result = Vec::with_capacity(actions.len());
+    for (action, requested_width) in actions {
+        let requested_width = (*requested_width).min(area.width);
+        if x > area.x && x.saturating_add(requested_width) > area.right() {
+            y = y.saturating_add(1);
+            x = area.x;
+        }
+        if y >= area.bottom() {
+            break;
+        }
+        let width = requested_width.min(area.right().saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        result.push((*action, Rect::new(x, y, width, 1)));
+        x = x.saturating_add(width.saturating_add(1));
+    }
+    result
+}
+
+fn centered_fixed(area: Rect, maximum_width: u16, requested_height: u16) -> Rect {
+    let width = maximum_width.min(area.width.saturating_sub(4)).max(1);
+    let height = requested_height.min(area.height.saturating_sub(2)).max(1);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn centered_percent(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let width = area.width.saturating_mul(percent_x) / 100;
+    let height = area.height.saturating_mul(percent_y) / 100;
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 fn reserve_bottom(area: Rect, enabled: bool, requested_height: u16) -> (Rect, Rect) {
