@@ -378,6 +378,7 @@ pub struct App {
     model_removal_busy: bool,
     pending_settings_action: Option<SettingsAction>,
     settings_busy: bool,
+    profile_inspection_stale: bool,
     seen_runtime_events: BTreeSet<(i64, u8, String)>,
 }
 
@@ -490,6 +491,7 @@ impl App {
             model_removal_busy: false,
             pending_settings_action: None,
             settings_busy: false,
+            profile_inspection_stale: false,
             seen_runtime_events: BTreeSet::new(),
         }
     }
@@ -960,6 +962,9 @@ impl App {
                     self.model_profiles = Some(profiles);
                     self.settings_error = None;
                     self.reconcile_settings_selection();
+                    if self.screen == Screen::ModelProfiles {
+                        let _ = self.refresh_selected_model_profile();
+                    }
                 }
                 Err(error) => {
                     self.settings_error = Some(error.clone());
@@ -1018,6 +1023,12 @@ impl App {
                 self.reconcile_settings_selection();
             }
         }
+        if self.profile_inspection_stale
+            && self.screen == Screen::ModelProfiles
+            && !self.settings_busy
+        {
+            let _ = self.refresh_selected_model_profile();
+        }
     }
 
     pub fn settings_scopes(&self) -> Vec<SettingsScope> {
@@ -1046,7 +1057,7 @@ impl App {
             self.settings_schema
                 .as_ref()
                 .map(|schema| schema.definitions.as_slice())
-                .unwrap_or(&self.setting_definitions)
+                .unwrap_or_default()
         } else {
             &self.setting_definitions
         };
@@ -1087,6 +1098,17 @@ impl App {
         let Some(state) = &self.settings_state else {
             return ("loading".to_owned(), "state".to_owned(), false);
         };
+        let definition = self
+            .settings_definitions()
+            .into_iter()
+            .find(|definition| &definition.id == id);
+        if definition.is_some_and(|definition| !definition.supported) {
+            return (
+                "Unsupported".to_owned(),
+                "unsupported".to_owned(),
+                self.current_layer_value(id).is_some(),
+            );
+        }
         if self.screen == Screen::ModelProfiles {
             let Some(profile) = self.selected_model_profile_value() else {
                 return (
@@ -1102,17 +1124,34 @@ impl App {
                     true,
                 );
             }
+            if let Some(value) = self.settings_runtime_resolved_value(id) {
+                return (value, "runtime resolved".to_owned(), false);
+            }
             if let Some(setting) = self
                 .settings_resolved
                 .as_ref()
                 .and_then(|resolved| resolved.effective.get(id))
             {
-                return (setting.value.to_string(), setting.source.to_string(), false);
+                let source = match &setting.source {
+                    norted_core::SettingSource::GlobalDefault => "inherited from global".to_owned(),
+                    norted_core::SettingSource::EngineDefault { .. } => {
+                        "inherited from engine".to_owned()
+                    }
+                    norted_core::SettingSource::ModelProfile { model_profile_id } => {
+                        format!("model-profile:{model_profile_id}")
+                    }
+                    norted_core::SettingSource::Invocation => "invocation".to_owned(),
+                };
+                return (setting.value.to_string(), source, false);
             }
             return self.settings_default_display(id);
         }
         let Some(scope) = self.selected_settings_scope() else {
-            return ("<runtime default>".to_owned(), "runtime".to_owned(), false);
+            return (
+                "varies by runtime".to_owned(),
+                "runtime/model dependent".to_owned(),
+                false,
+            );
         };
         let current = match &scope {
             SettingsScope::Global => state.global_defaults.0.get(id),
@@ -1153,26 +1192,30 @@ impl App {
             .into_iter()
             .find(|definition| &definition.id == id);
         let declared = definition.and_then(|definition| definition.upstream_default.as_deref());
-        if let Some(resolved) = self.settings_runtime_resolved_value(id) {
-            return (
-                format!("<default → {resolved}>"),
-                "runtime-resolved".to_owned(),
-                false,
-            );
-        }
-        (
-            compact_default_value(declared),
-            default_source_label(declared).to_owned(),
-            false,
-        )
+        let model_profile = self.screen == Screen::ModelProfiles;
+        let exact_runtime = model_profile && self.settings_runtime_id.is_some();
+        let (value, source) = declared_default_display(declared, model_profile, exact_runtime);
+        (value, source.to_owned(), false)
     }
 
     pub fn settings_default_detail(&self, id: &SettingId) -> String {
-        let declared = self
+        let definition = self
             .settings_definitions()
             .into_iter()
-            .find(|definition| &definition.id == id)
-            .and_then(|definition| definition.upstream_default.as_deref());
+            .find(|definition| &definition.id == id);
+        if let Some(definition) = definition
+            && !definition.supported
+        {
+            let mut detail = definition
+                .unsupported_reason
+                .clone()
+                .unwrap_or_else(|| "The exact runtime does not support this setting".to_owned());
+            if self.current_layer_value(id).is_some() {
+                detail.push_str(" · An existing override is set; use Inherit to remove it.");
+            }
+            return detail;
+        }
+        let declared = definition.and_then(|definition| definition.upstream_default.as_deref());
         let mut detail = format!(
             "If unset: {}",
             declared.unwrap_or("unknown runtime default")
@@ -1371,6 +1414,7 @@ impl App {
                                 "Runtime update installed side by side: {previous_runtime_id} -> {installed_runtime_id}"
                             ),
                         );
+                        self.runtime_context_changed();
                     }
                     Err(error) => {
                         self.notice = Some(error.clone());
@@ -1397,6 +1441,7 @@ impl App {
                             LogLevel::Info,
                             format!("Runtime installation completed: {runtime_id}"),
                         );
+                        self.runtime_context_changed();
                     }
                     Err(error) => {
                         self.notice = Some(error.clone());
@@ -1419,6 +1464,7 @@ impl App {
                             "Selected {selected} as the {} runtime",
                             format.as_str().to_ascii_uppercase()
                         ));
+                        self.runtime_context_changed();
                     }
                     Err(error) => {
                         self.notice = Some(error.clone());
@@ -1440,6 +1486,7 @@ impl App {
                         self.overlay = None;
                         self.hover = None;
                         self.notice = Some(format!("Selected {selected} for model {model_id}"));
+                        self.runtime_context_changed();
                     }
                     Err(error) => {
                         self.notice = Some(error.clone());
@@ -1454,6 +1501,7 @@ impl App {
                         self.apply_runtime_list(snapshot);
                         self.notice =
                             Some(format!("Cleared the runtime override for model {model_id}"));
+                        self.runtime_context_changed();
                     }
                     Err(error) => {
                         self.notice = Some(error.clone());
@@ -1518,6 +1566,7 @@ impl App {
                         self.runtime_updates.remove(&runtime_id);
                         self.apply_runtime_list(snapshot);
                         self.notice = Some(format!("Removed runtime {runtime_id}"));
+                        self.runtime_context_changed();
                     }
                     Err(error) => {
                         self.notice = Some(error.clone());
@@ -1881,11 +1930,10 @@ impl App {
         self.notice = None;
         match command.action {
             CommandAction::Navigate(screen) => {
-                self.screen = screen;
                 self.nav_focus = screen;
                 self.focus = FocusArea::Content;
                 self.hover = None;
-                Update::Render
+                self.activate_screen(screen)
             }
             CommandAction::LoadSelected => self.request_load(),
             CommandAction::Unload => self.request_unload(),
@@ -1905,6 +1953,19 @@ impl App {
         let count = Screen::ALL.len() as isize;
         let next = (current + direction).rem_euclid(count) as usize;
         self.nav_focus = Screen::ALL[next];
+    }
+
+    fn activate_screen(&mut self, screen: Screen) -> Update {
+        let entering_model_profiles =
+            self.screen != Screen::ModelProfiles && screen == Screen::ModelProfiles;
+        self.screen = screen;
+        if entering_model_profiles {
+            self.reconcile_settings_selection();
+            if !self.settings_loading && !self.settings_busy {
+                return self.refresh_selected_model_profile();
+            }
+        }
+        Update::Render
     }
 
     fn ensure_suggestion_visible(&mut self) {
@@ -1963,9 +2024,8 @@ impl App {
                 Update::Render
             }
             KeyCode::Enter => {
-                self.screen = self.nav_focus;
                 self.notice = None;
-                Update::Render
+                self.activate_screen(self.nav_focus)
             }
             _ => Update::None,
         }
@@ -2750,6 +2810,11 @@ impl App {
     }
 
     fn refresh_selected_model_profile(&mut self) -> Update {
+        self.profile_inspection_stale = false;
+        self.settings_schema = None;
+        self.settings_resolved = None;
+        self.settings_runtime_id = None;
+        self.settings_validation_error = None;
         let Some(profile) = self.selected_model_profile_value().cloned() else {
             return Update::Render;
         };
@@ -2760,9 +2825,6 @@ impl App {
             .find(|model| model.id == profile.model_id)
             .cloned()
         else {
-            self.settings_schema = None;
-            self.settings_resolved = None;
-            self.settings_runtime_id = None;
             self.settings_validation_error =
                 Some(format!("Bound model `{}` is missing", profile.model_id));
             return Update::Render;
@@ -2774,6 +2836,17 @@ impl App {
         self.settings_busy = true;
         self.settings_validation_error = None;
         Update::Render
+    }
+
+    fn runtime_context_changed(&mut self) {
+        if self.screen != Screen::ModelProfiles {
+            return;
+        }
+        if self.settings_busy {
+            self.profile_inspection_stale = true;
+        } else {
+            let _ = self.refresh_selected_model_profile();
+        }
     }
 
     fn create_profile_for_selected_model(&mut self) -> Update {
@@ -2812,6 +2885,12 @@ impl App {
     }
 
     fn reconcile_settings_selection(&mut self) {
+        let profile_len = self.model_profile_values().len();
+        self.selected_model_profile = match (self.selected_model_profile, profile_len) {
+            (_, 0) => None,
+            (Some(index), len) => Some(index.min(len - 1)),
+            (None, _) => Some(0),
+        };
         let scope_len = self.settings_scopes().len();
         self.settings_scope_index = self.settings_scope_index.min(scope_len.saturating_sub(1));
         let setting_len = self.settings_definitions().len();
@@ -2855,9 +2934,8 @@ impl App {
                 }
                 self.focus = FocusArea::Navigation;
                 self.nav_focus = screen;
-                self.screen = screen;
                 self.notice = None;
-                Update::Render
+                self.activate_screen(screen)
             }
             Some(HoverTarget::ModelLibraryTab(view)) => {
                 if self.command_active {
@@ -4118,60 +4196,53 @@ fn byte_index(value: &str, character_index: usize) -> usize {
         .map_or(value.len(), |(index, _)| index)
 }
 
-fn compact_default_value(value: Option<&str>) -> String {
-    let Some(value) = value else {
-        return "<runtime default>".to_owned();
+fn declared_default_display(
+    declared: Option<&str>,
+    model_profile: bool,
+    exact_runtime: bool,
+) -> (String, &'static str) {
+    if let Some(value) = declared.and_then(|value| value.strip_prefix("Norted default: ")) {
+        return (concise_default_detail(value).to_owned(), "Norted default");
+    }
+    for prefix in ["model default: ", "model metadata: "] {
+        if let Some(value) = declared.and_then(|declared| declared.strip_prefix(prefix)) {
+            return (concise_default_detail(value).to_owned(), "model default");
+        }
+    }
+    if !exact_runtime {
+        if model_profile {
+            let source = if declared.is_some_and(|value| value.starts_with("model")) {
+                "model dependent"
+            } else {
+                "runtime dependent"
+            };
+            return ("unresolved".to_owned(), source);
+        }
+        return ("varies by runtime".to_owned(), "runtime/model dependent");
+    }
+    let Some(declared) = declared else {
+        return ("unresolved".to_owned(), "runtime dependent");
     };
-    match value {
-        "runtime default" | "exact runtime default" => "<runtime default>".to_owned(),
-        "runtime-selected" => "<runtime-selected>".to_owned(),
-        "runtime-selected; omission preserves the exact runtime default" => {
-            "<runtime-selected>".to_owned()
+    for prefix in ["runtime default: ", "runtime profile default: "] {
+        if let Some(value) = declared.strip_prefix(prefix) {
+            return (concise_default_detail(value).to_owned(), "runtime default");
         }
-        "runtime/model-selected" => "<runtime/model-selected>".to_owned(),
-        "runtime/model automatic" => "<runtime/model auto>".to_owned(),
-        "runtime/model default" => "<runtime/model default>".to_owned(),
-        "runtime/model default or unlimited" => "<runtime/model default>".to_owned(),
-        "runtime/model template default" => "<model/template default>".to_owned(),
-        "model metadata" => "<model metadata>".to_owned(),
-        "model/thinking-mode default" => "<model/mode default>".to_owned(),
-        "exact runtime automatic" => "<runtime-selected>".to_owned(),
-        "exact runtime profile default" => "<runtime default>".to_owned(),
-        "auto in current runtimes" => "<runtime default: auto>".to_owned(),
-        "enabled in current runtimes" => "<runtime default: enabled>".to_owned(),
-        _ => {
-            for (prefix, label) in [
-                ("Norted default: ", "default"),
-                ("runtime default: ", "default"),
-                ("runtime profile default: ", "default"),
-                ("runtime automatic: ", "auto"),
-                ("runtime-selected ", "runtime-selected"),
-            ] {
-                if let Some(detail) = value.strip_prefix(prefix) {
-                    let detail = detail
-                        .split_once(';')
-                        .map_or(detail, |(concise, _)| concise);
-                    let detail = detail
-                        .split_once(" unless ")
-                        .map_or(detail, |(concise, _)| concise);
-                    return format!("<{label}: {detail}>");
-                }
-            }
-            format!("<default: {value}>")
+    }
+    match declared {
+        "auto in current runtimes" => ("auto".to_owned(), "runtime default"),
+        "enabled in current runtimes" => ("enabled".to_owned(), "runtime default"),
+        value if value.starts_with("model") || value.contains("model metadata") => {
+            ("unresolved".to_owned(), "model dependent")
         }
+        _ => ("unresolved".to_owned(), "runtime dependent"),
     }
 }
 
-fn default_source_label(value: Option<&str>) -> &'static str {
-    match value {
-        Some(value) if value.starts_with("Norted default:") => "Norted",
-        Some(value) if value.starts_with("model") || value.contains("model metadata") => "model",
-        Some(value) if value.starts_with("runtime") || value.starts_with("exact runtime") => {
-            "runtime"
-        }
-        Some(_) => "default",
-        None => "runtime",
-    }
+fn concise_default_detail(value: &str) -> &str {
+    let value = value.split_once(';').map_or(value, |(concise, _)| concise);
+    value
+        .split_once(" unless ")
+        .map_or(value, |(concise, _)| concise)
 }
 
 #[cfg(test)]
@@ -4182,8 +4253,8 @@ mod tests {
     use norted_core::{
         AppSnapshot, ArtifactFormat, EffectivePublicAuthMode, EngineId, ModelArtifact, ModelId,
         ModelProfile, ModelProfileId, ModelProfilesState, PublicAuthMode, PublicAuthStatus,
-        RegistryState, ServerState, SettingCategory, SettingDefinition, SettingId, SettingKind,
-        SettingScope, SettingsSchema,
+        RegistryState, RuntimeId, ServerState, SettingCategory, SettingDefinition, SettingId,
+        SettingKind, SettingScope, SettingValue, SettingsSchema, SettingsState,
     };
 
     use super::{
@@ -4233,6 +4304,52 @@ mod tests {
             true,
             definitions,
         )
+    }
+
+    fn artifact() -> ModelArtifact {
+        ModelArtifact {
+            id: ModelId("artifact".to_owned()),
+            display_name: "Artifact".to_owned(),
+            path: PathBuf::from("artifact.gguf"),
+            format: ArtifactFormat::Gguf,
+            size_bytes: 1,
+            created: 1,
+            hash: None,
+            architecture: None,
+            context_length: None,
+            provenance: None,
+            native_identity: None,
+            auxiliary_artifacts: Vec::new(),
+            norted_package: None,
+        }
+    }
+
+    fn profile_app(definitions: Vec<SettingDefinition>) -> App {
+        let mut app = test_app(definitions.clone());
+        let model = artifact();
+        let id = ModelProfileId::new("quality").expect("profile ID");
+        let profile = ModelProfile::new(
+            id.clone(),
+            "Quality",
+            model.id.clone(),
+            EngineId::new("q27").expect("engine ID"),
+        )
+        .expect("profile");
+        let mut profiles = ModelProfilesState::default();
+        profiles.profiles.insert(id, profile);
+        app.snapshot.models.push(model);
+        app.model_profiles = Some(profiles);
+        app.settings_state = Some(SettingsState::default());
+        app.settings_loading = false;
+        app.selected_model_profile = Some(0);
+        app.screen = Screen::ModelProfiles;
+        app.settings_runtime_id = Some(RuntimeId::new("q27-reviewed").expect("runtime ID"));
+        app.settings_schema = Some(SettingsSchema {
+            engine_id: "q27".to_owned(),
+            runtime_id: app.settings_runtime_id.clone(),
+            definitions,
+        });
+        app
     }
 
     #[test]
@@ -4311,6 +4428,157 @@ mod tests {
             .map(|definition| definition.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, ["temperature", "q27.mtp"]);
+    }
+
+    #[test]
+    fn model_profile_without_inspection_never_uses_generic_definitions() {
+        let mut app = profile_app(vec![definition("min_p", SettingScope::Common)]);
+        app.settings_schema = None;
+
+        assert!(app.settings_definitions().is_empty());
+    }
+
+    #[test]
+    fn entering_model_profiles_automatically_inspects_the_selected_profile() {
+        let mut app = profile_app(vec![definition("min_p", SettingScope::Common)]);
+        app.screen = Screen::Overview;
+        app.settings_schema = Some(SettingsSchema {
+            engine_id: "stale".to_owned(),
+            runtime_id: None,
+            definitions: vec![definition("temperature", SettingScope::Common)],
+        });
+
+        app.activate_screen(Screen::ModelProfiles);
+
+        assert!(app.settings_busy());
+        assert!(app.settings_schema.is_none());
+        assert!(app.settings_definitions().is_empty());
+        assert!(matches!(
+            app.take_settings_action(),
+            Some(SettingsAction::InspectProfile { .. })
+        ));
+    }
+
+    #[test]
+    fn initial_settings_load_inspects_an_already_open_profile_page() {
+        let mut app = profile_app(vec![definition("min_p", SettingScope::Common)]);
+        let profiles = app.model_profiles.clone().expect("profiles");
+        app.settings_loading = true;
+        app.settings_state = None;
+        app.settings_schema = None;
+
+        app.handle_settings_task_result(SettingsTaskResult::Loaded(Ok((
+            SettingsState::default(),
+            profiles,
+        ))));
+
+        assert!(app.settings_busy());
+        assert!(matches!(
+            app.take_settings_action(),
+            Some(SettingsAction::InspectProfile { .. })
+        ));
+    }
+
+    #[test]
+    fn reviewed_runtime_defaults_render_as_plain_values() {
+        let mut min_p = definition("min_p", SettingScope::Common);
+        min_p.upstream_default = Some("runtime default: 0.0".to_owned());
+        let app = profile_app(vec![min_p]);
+        let id = SettingId::new("min_p").expect("setting ID");
+
+        assert_eq!(
+            app.settings_value_display(&id),
+            ("0.0".to_owned(), "runtime default".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn norted_defaults_and_profile_overrides_render_as_plain_values() {
+        let mut overflow = definition("context_overflow", SettingScope::Common);
+        overflow.upstream_default = Some("Norted default: error".to_owned());
+        let overflow_id = overflow.id.clone();
+        let mut app = profile_app(vec![overflow]);
+        assert_eq!(
+            app.settings_value_display(&overflow_id),
+            ("error".to_owned(), "Norted default".to_owned(), false)
+        );
+
+        app.model_profiles
+            .as_mut()
+            .expect("profiles")
+            .profiles
+            .values_mut()
+            .next()
+            .expect("profile")
+            .overrides
+            .insert(
+                overflow_id.clone(),
+                SettingValue::Choice("truncate".to_owned()),
+            );
+        assert_eq!(
+            app.settings_value_display(&overflow_id),
+            (
+                "truncate".to_owned(),
+                "model-profile:quality".to_owned(),
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn unsupported_settings_render_as_unsupported_and_keep_clear_available() {
+        let mut presence = definition("presence_penalty", SettingScope::Common);
+        presence.supported = false;
+        presence.unsupported_reason = Some("not proved by the exact runtime".to_owned());
+        presence.upstream_default = Some("runtime/model default".to_owned());
+        let mut app = profile_app(vec![presence]);
+        let id = SettingId::new("presence_penalty").expect("setting ID");
+        app.model_profiles
+            .as_mut()
+            .expect("profiles")
+            .profiles
+            .values_mut()
+            .next()
+            .expect("profile")
+            .overrides
+            .insert(id.clone(), SettingValue::Float(0.5));
+
+        assert_eq!(
+            app.settings_value_display(&id),
+            ("Unsupported".to_owned(), "unsupported".to_owned(), true)
+        );
+        assert!(app.settings_default_detail(&id).contains("not proved"));
+        assert!(app.settings_default_detail(&id).contains("Inherit"));
+    }
+
+    #[test]
+    fn dynamic_defaults_are_context_honest() {
+        let mut temperature = definition("temperature", SettingScope::Common);
+        temperature.upstream_default = Some("runtime/model default".to_owned());
+        let id = temperature.id.clone();
+        let mut global = test_app(vec![temperature.clone()]);
+        global.settings_state = Some(SettingsState::default());
+        global.settings_loading = false;
+        global.screen = Screen::Settings;
+        assert_eq!(
+            global.settings_value_display(&id),
+            (
+                "varies by runtime".to_owned(),
+                "runtime/model dependent".to_owned(),
+                false
+            )
+        );
+
+        let mut profile = profile_app(vec![temperature]);
+        profile.settings_runtime_id = None;
+        assert_eq!(
+            profile.settings_value_display(&id),
+            (
+                "unresolved".to_owned(),
+                "runtime dependent".to_owned(),
+                false
+            )
+        );
     }
 
     #[test]

@@ -1603,18 +1603,22 @@ fn render_model_profiles(
                 theme.muted,
             )),
             Line::from(Span::styled(
-                app.settings_validation_error.as_deref().map_or_else(
-                    || {
-                        format!(
-                            "runtime {} · rows select; explicit buttons act",
-                            app.settings_runtime_id
-                                .as_ref()
-                                .map(ToString::to_string)
-                                .unwrap_or_else(|| "not validated".to_owned()),
-                        )
-                    },
-                    ToOwned::to_owned,
-                ),
+                if app.settings_busy() && app.settings_schema.is_none() {
+                    "resolving runtime/model settings…".to_owned()
+                } else {
+                    app.settings_validation_error.as_deref().map_or_else(
+                        || {
+                            format!(
+                                "runtime {} · rows select; explicit buttons act",
+                                app.settings_runtime_id
+                                    .as_ref()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_else(|| "not validated".to_owned()),
+                            )
+                        },
+                        ToOwned::to_owned,
+                    )
+                },
                 if app.settings_validation_error.is_some() {
                     theme.warning
                 } else {
@@ -1812,6 +1816,22 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
         );
         return;
     }
+    if app.screen == crate::app::Screen::ModelProfiles && app.settings_schema.is_none() {
+        let (message, style) = if app.settings_busy() {
+            ("Resolving runtime/model settings…", theme.muted)
+        } else if let Some(error) = &app.settings_validation_error {
+            (error.as_str(), theme.warning)
+        } else {
+            ("Runtime/model settings are not resolved.", theme.muted)
+        };
+        frame.render_widget(
+            Paragraph::new(message)
+                .style(style)
+                .wrap(Wrap { trim: true }),
+            ui_layout.settings_list,
+        );
+        return;
+    }
     let definitions = app.settings_definitions();
     if definitions.is_empty() {
         frame.render_widget(
@@ -1851,13 +1871,15 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
             || definitions
                 .get(index.saturating_sub(1))
                 .is_none_or(|previous| previous.category != definition.category);
-        let heading = if starts_category {
-            format!(
-                "{}  ──  {label} · {source} · {support}",
-                definition.category
-            )
+        let status = if definition.supported {
+            format!("{label} · {source} · {support}")
         } else {
-            format!("              {label} · {source} · {support}")
+            format!("{label} · unsupported")
+        };
+        let heading = if starts_category {
+            format!("{}  ──  {status}", definition.category)
+        } else {
+            format!("              {status}")
         };
         let value_area = ui_layout
             .setting_values
