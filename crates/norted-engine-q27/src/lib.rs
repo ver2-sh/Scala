@@ -4379,7 +4379,7 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(1),
                 maximum: Some(262_144),
             },
-            Some("runtime automatic: same as slot 0"),
+            Some("derived by exact runtime"),
         ),
         q27_definition(
             "q27.kv_mode",
@@ -4391,7 +4391,7 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
                     .map(str::to_owned)
                     .collect(),
             },
-            Some("runtime-selected by architecture"),
+            Some("exact runtime default"),
         ),
         q27_definition(
             "q27.fast_head",
@@ -4419,14 +4419,14 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
             "Per-request thinking",
             "Allow explicit request thinking enable/disable and budget fields to override the server/profile default",
             SettingKind::Toggle,
-            Some("runtime default: off"),
+            Some("exact runtime default"),
         ),
         q27_definition(
             "q27.constrain_tools",
             "Constrain tool calls",
             "Grammar-constrain eligible greedy automatic tool-call bodies; sampled and forced calls retain upstream behavior",
             SettingKind::Toggle,
-            Some("runtime default: off"),
+            Some("exact runtime default"),
         ),
         q27_definition(
             "q27.continuous_batching",
@@ -4440,7 +4440,7 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
             "Sampled decoding graphs",
             "Capture sampled decoding graphs; disabling saves VRAM but rejects positive-temperature requests",
             SettingKind::Toggle,
-            Some("runtime default: enabled"),
+            Some("exact runtime default"),
         ),
         q27_definition(
             "q27.mtp",
@@ -4480,7 +4480,7 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
                     .map(str::to_owned)
                     .collect(),
             },
-            Some("runtime-selected compiled W_MAX"),
+            Some("derived by exact runtime"),
         ),
         q27_definition(
             "q27.prompt_mode",
@@ -4492,7 +4492,7 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
                     .map(str::to_owned)
                     .collect(),
             },
-            Some("runtime default: runtime template"),
+            Some("Norted default: runtime template"),
         ),
         q27_definition(
             "q27.prompt_delivery",
@@ -4504,7 +4504,7 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
                     .map(str::to_owned)
                     .collect(),
             },
-            Some("runtime default: runtime chat"),
+            Some("Norted default: runtime chat"),
         ),
         q27_definition(
             "q27.template_path",
@@ -4525,14 +4525,14 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
             "Render generation prompt",
             "Ask the external template to append its generation prompt",
             SettingKind::Toggle,
-            Some("runtime default: enabled"),
+            Some("Norted default: enabled"),
         ),
         q27_definition(
             "q27.template_thinking",
             "Template thinking",
             "Pass positive thinking state to the external template",
             SettingKind::Toggle,
-            Some("runtime default: disabled"),
+            Some("Norted default: disabled"),
         ),
         q27_definition(
             "q27.response_filter",
@@ -4551,7 +4551,7 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
             "Prefix cache path",
             "Directory for q27's persistent prefix cache",
             SettingKind::Path,
-            Some("runtime default: disabled unless a path is supplied"),
+            Some("exact runtime default"),
         ),
         q27_definition(
             "q27.prefix_cache_max_gb",
@@ -4561,7 +4561,7 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(0.0),
                 maximum: None,
             },
-            Some("runtime default: 20 GB"),
+            Some("exact runtime default"),
         ),
         q27_definition(
             "q27.prefix_cache_min_tokens",
@@ -4571,7 +4571,7 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(1),
                 maximum: None,
             },
-            Some("runtime default: 4096"),
+            Some("exact runtime default"),
         ),
         q27_definition(
             "q27.prefix_cache_max_tokens",
@@ -4581,7 +4581,7 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(1),
                 maximum: None,
             },
-            Some("runtime default: 32768"),
+            Some("exact runtime default"),
         ),
         q27_definition(
             "q27.prefix_cache_step_tokens",
@@ -4591,7 +4591,7 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(1),
                 maximum: None,
             },
-            Some("runtime default: 8192"),
+            Some("exact runtime default"),
         ),
         q27_definition(
             "q27.prefix_cache_ram_gb",
@@ -4601,7 +4601,7 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(0.0),
                 maximum: None,
             },
-            Some("runtime default: disabled"),
+            Some("exact runtime default"),
         ),
     ]);
     definitions
@@ -4628,6 +4628,10 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
         ("top_k", "runtime default: 0"),
         ("min_p", "runtime default: 0.0"),
         ("max_output_tokens", "runtime default: 8192"),
+        (
+            "q27.slot1_context_length",
+            "runtime automatic: same as slot 0",
+        ),
         ("q27.kv_mode", "runtime-selected by architecture"),
         ("q27.fast_head", "runtime profile default: enabled"),
         ("q27.thinking", "runtime profile default: disabled"),
@@ -4635,6 +4639,8 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
             "q27.thinking_budget",
             "runtime automatic for prompt-seeded thinking",
         ),
+        ("q27.request_thinking", "runtime default: off"),
+        ("q27.constrain_tools", "runtime default: off"),
         (
             "q27.continuous_batching",
             "runtime profile default: enabled; compatibility may auto-disable",
@@ -4648,6 +4654,15 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
             "q27.suffix_width_mode",
             "runtime profile default: compiled W_MAX",
         ),
+        (
+            "q27.prefix_cache_path",
+            "runtime default: disabled unless a path is supplied",
+        ),
+        ("q27.prefix_cache_max_gb", "runtime default: 20 GB"),
+        ("q27.prefix_cache_min_tokens", "runtime default: 4096"),
+        ("q27.prefix_cache_max_tokens", "runtime default: 32768"),
+        ("q27.prefix_cache_step_tokens", "runtime default: 8192"),
+        ("q27.prefix_cache_ram_gb", "runtime default: disabled"),
     ] {
         if let Some(definition) = definitions
             .iter_mut()

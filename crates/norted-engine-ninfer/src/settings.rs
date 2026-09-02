@@ -18,7 +18,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             SettingKind::Choice {
                 choices: choices(&["bf16", "int8", "fp8", "nvfp4", "k8v4"]),
             },
-            Some("runtime default: BF16"),
+            Some("exact runtime default"),
         ),
         definition(
             "ninfer.kv_capacity",
@@ -29,7 +29,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
                 maximum: Some(MAX_NINFER_CLI_INTEGER),
                 choices: choices(&["auto"]),
             },
-            Some("runtime default: matches context"),
+            Some("derived by exact runtime"),
         ),
         definition(
             "ninfer.prefill_chunk",
@@ -39,23 +39,23 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
                 minimum: Some(128),
                 maximum: Some(MAX_NINFER_CLI_INTEGER),
             },
-            Some("runtime default: 1024"),
+            Some("exact runtime default"),
         ),
         definition(
             "ninfer.speculation",
             "Speculation",
             "Enable or disable speculative decoding",
             SettingKind::Toggle,
-            Some("runtime default: off"),
+            Some("exact runtime default"),
         ),
         definition(
             "ninfer.speculative_backend",
             "Speculative backend",
-            "Explicit NInfer speculative backend; unset keeps speculation off/default",
+            "Explicit NInfer speculative backend; unset preserves exact runtime behavior",
             SettingKind::Choice {
                 choices: choices(&["mtp", "dflash"]),
             },
-            Some("runtime default: off"),
+            Some("exact runtime default"),
         ),
         definition(
             "ninfer.draft_tokens",
@@ -65,7 +65,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
                 minimum: Some(1),
                 maximum: Some(15),
             },
-            Some("runtime default: unused"),
+            Some("exact runtime default"),
         ),
         toggle(
             "ninfer.lm_head_draft",
@@ -223,6 +223,12 @@ pub(crate) fn apply_reviewed_runtime_defaults(definitions: &mut [SettingDefiniti
         ("presence_penalty", "model/thinking-mode default"),
         ("frequency_penalty", "model/thinking-mode default"),
         ("max_output_tokens", "runtime default: 8192"),
+        ("ninfer.kv_dtype", "runtime default: BF16"),
+        ("ninfer.kv_capacity", "runtime default: matches context"),
+        ("ninfer.prefill_chunk", "runtime default: 1024"),
+        ("ninfer.speculation", "runtime default: off"),
+        ("ninfer.speculative_backend", "runtime default: off"),
+        ("ninfer.draft_tokens", "runtime default: unused"),
         ("ninfer.lm_head_draft", "runtime default: off"),
         ("ninfer.vision", "runtime default: off"),
         ("ninfer.greedy", "runtime default: off"),

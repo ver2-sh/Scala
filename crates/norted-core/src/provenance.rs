@@ -131,8 +131,9 @@ pub struct RuntimeProvenance {
     pub model_profile: ModelProfileRuntimeIdentity,
     #[serde(default)]
     pub settings: SettingsProvenance,
-    /// Current adapter/runtime and generation facts. This is intentionally
-    /// distinct from structured setting provenance.
+    /// Current adapter/runtime and generation facts. Trustworthy effective
+    /// SettingId values live in the `resolved_settings` JSON object. This is
+    /// intentionally distinct from structured configured-setting provenance.
     pub normalized_settings: BTreeMap<String, serde_json::Value>,
     pub native_arguments: Vec<NativeArgumentProvenance>,
     pub native_environment: Vec<EnvironmentVariableProvenance>,
