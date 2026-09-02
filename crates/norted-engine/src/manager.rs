@@ -1,19 +1,21 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use futures_util::Stream;
 use norted_core::{
     ApplicationCore, EnvironmentVariableProvenance, ModelId, ModelProfile, ModelProfileId,
-    ModelProfileRuntimeIdentity, ModelProfilesStore, NativeArgumentProvenance, ProcessIdentity,
-    RuntimeId, RuntimeProvenance, RuntimeSelection, SettingsPatch, SettingsProvenance,
-    SettingsStore,
+    ModelProfileRuntimeIdentity, ModelProfilesStore, ModelRole, NativeArgumentProvenance,
+    ProcessIdentity, RuntimeId, RuntimeProvenance, RuntimeSelection, SettingsPatch,
+    SettingsProvenance, SettingsStore,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, oneshot};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, RwLock, oneshot};
 
 use crate::{
     EffectiveGenerationSettings, EngineAdapter, EngineError, EngineIdentity, EngineProbe,
@@ -167,8 +169,10 @@ pub struct BackendStatus {
     #[serde(default)]
     pub generation: u64,
     pub lifecycle: BackendLifecycle,
-    pub model_profile_id: Option<ModelProfileId>,
-    pub model_id: Option<ModelId>,
+    pub model_profile_id: ModelProfileId,
+    pub model_id: ModelId,
+    pub role: ModelRole,
+    pub residency: BackendResidency,
     pub engine_id: Option<String>,
     pub runtime_id: Option<RuntimeId>,
     pub runtime_version: Option<String>,
@@ -180,6 +184,32 @@ pub struct BackendStatus {
     pub load_progress: Option<BackendLoadProgress>,
     pub failure: Option<String>,
     pub provenance: Option<RuntimeProvenance>,
+    pub active_request_count: usize,
+    pub primary_lease_count: usize,
+    pub last_used_unix: i64,
+    pub retiring: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendResidency {
+    Jit,
+    Pinned,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct InferenceRoutingContext {
+    pub session_id: String,
+    pub role: Option<ModelRole>,
+}
+
+impl Default for InferenceRoutingContext {
+    fn default() -> Self {
+        Self {
+            session_id: "default".to_owned(),
+            role: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,16 +232,41 @@ pub struct ControlStatus {
     pub public_endpoint: Option<String>,
     pub available_engine_count: usize,
     pub installed_engine_count: usize,
-    pub running_engine_count: usize,
+    pub running_backend_count: usize,
     pub engines: Vec<EngineStatus>,
-    pub backend: BackendStatus,
+    pub backends: Vec<BackendStatus>,
     pub recent_events: Vec<RuntimeNotice>,
+}
+
+impl ControlStatus {
+    pub fn backend(&self, profile_id: &ModelProfileId) -> Option<&BackendStatus> {
+        self.backends
+            .iter()
+            .find(|backend| &backend.model_profile_id == profile_id)
+    }
+
+    pub fn newest_backend(&self) -> Option<&BackendStatus> {
+        self.backends
+            .iter()
+            .max_by_key(|backend| backend.generation)
+    }
+
+    pub fn loading_backend(&self) -> Option<&BackendStatus> {
+        self.backends
+            .iter()
+            .filter(|backend| backend.lifecycle.is_loading())
+            .max_by_key(|backend| backend.generation)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct RuntimeManagerOptions {
     pub startup_timeout: Duration,
     pub health_poll_interval: Duration,
+    pub jit_enabled: bool,
+    pub primary_idle_ttl: Duration,
+    pub auxiliary_idle_ttl: Duration,
+    pub max_idle_auxiliary_backends: usize,
 }
 
 impl Default for RuntimeManagerOptions {
@@ -219,6 +274,10 @@ impl Default for RuntimeManagerOptions {
         Self {
             startup_timeout: Duration::from_secs(5 * 60),
             health_poll_interval: Duration::from_millis(250),
+            jit_enabled: true,
+            primary_idle_ttl: Duration::from_secs(3600),
+            auxiliary_idle_ttl: Duration::from_secs(300),
+            max_idle_auxiliary_backends: 2,
         }
     }
 }
@@ -238,11 +297,6 @@ pub enum RuntimeError {
     ModelNotFound(ModelId),
     #[error("Model Profile `{0}` is not loaded")]
     ModelProfileNotLoaded(ModelProfileId),
-    #[error("model `{model_id}` is already active with engine `{engine_id}`")]
-    AlreadyActive {
-        model_id: ModelId,
-        engine_id: String,
-    },
     #[error("the backend is currently {0:?}")]
     Busy(BackendLifecycle),
     #[error("the runtime is shutting down")]
@@ -265,21 +319,96 @@ pub enum RuntimeError {
     InferenceTimedOut(String),
     #[error("backend inference is unavailable: {0}")]
     InferenceUnavailable(String),
+    #[error(
+        "auxiliary Model Profile `{profile_id}` could not be loaded without evicting a leased primary: {reason}"
+    )]
+    AuxiliaryLoadFailed {
+        profile_id: ModelProfileId,
+        reason: String,
+    },
     #[error("runtime operation failed: {0}")]
     Operation(String),
 }
 
-struct ActiveBackend {
+struct RunningBackend {
     adapter: Arc<dyn EngineAdapter>,
     process: ProcessDescriptor,
-    model_profile_id: ModelProfileId,
-    model_id: ModelId,
-    engine_id: String,
     endpoint: String,
     effective_generation_settings: EffectiveGenerationSettings,
     settings: norted_core::ResolvedSettings,
     settings_schema: norted_core::SettingsSchema,
     _runtime_lease: RuntimeLease,
+}
+
+struct BackendActivity {
+    active_requests: AtomicUsize,
+    last_used_unix: AtomicI64,
+    drained: Notify,
+}
+
+impl BackendActivity {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            active_requests: AtomicUsize::new(0),
+            last_used_unix: AtomicI64::new(unix_timestamp()),
+            drained: Notify::new(),
+        })
+    }
+}
+
+struct InferenceLease {
+    activity: Arc<BackendActivity>,
+}
+
+struct InferenceTarget {
+    adapter: Arc<dyn EngineAdapter>,
+    endpoint: String,
+    generation_settings: EffectiveGenerationSettings,
+    settings: norted_core::ResolvedSettings,
+    settings_schema: norted_core::SettingsSchema,
+    lease: InferenceLease,
+}
+
+impl InferenceLease {
+    fn acquire(activity: Arc<BackendActivity>) -> Self {
+        activity.active_requests.fetch_add(1, Ordering::AcqRel);
+        activity
+            .last_used_unix
+            .store(unix_timestamp(), Ordering::Release);
+        Self { activity }
+    }
+}
+
+impl Drop for InferenceLease {
+    fn drop(&mut self) {
+        self.activity
+            .last_used_unix
+            .store(unix_timestamp(), Ordering::Release);
+        if self.activity.active_requests.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.activity.drained.notify_one();
+        }
+    }
+}
+
+struct LeasedInferenceStream {
+    inner: crate::InferenceStream,
+    lease: Option<InferenceLease>,
+}
+
+impl Stream for LeasedInferenceStream {
+    type Item = Result<crate::InferenceEvent, EngineError>;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let result = this.inner.as_mut().poll_next(cx);
+        if matches!(&result, std::task::Poll::Ready(None | Some(Err(_)))) {
+            this.lease.take();
+        }
+        result
+    }
 }
 
 struct LoadAdmission {
@@ -294,17 +423,24 @@ struct AdmittedLoad {
     settings: SettingsPatch,
     cancellation_epoch: u64,
     generation: u64,
+    role: ModelRole,
+    residency: BackendResidency,
 }
 
-struct ManagerState {
-    public_endpoint: Option<String>,
-    engines: BTreeMap<String, EngineStatus>,
+#[derive(Clone, Copy)]
+enum LoadIntent {
+    Manual,
+}
+
+struct ManagedBackend {
     lifecycle: BackendLifecycle,
-    model_profile_id: Option<ModelProfileId>,
-    model_id: Option<ModelId>,
+    model_profile_id: ModelProfileId,
+    model_id: ModelId,
+    role: ModelRole,
+    residency: BackendResidency,
     engine_id: Option<String>,
     runtime_id: Option<RuntimeId>,
-    active: Option<ActiveBackend>,
+    running: Option<RunningBackend>,
     loading_process: Option<ProcessDescriptor>,
     loading_runtime_lease: Option<RuntimeLease>,
     cancel_loading: bool,
@@ -312,18 +448,30 @@ struct ManagerState {
     failure: Option<String>,
     provenance: Option<RuntimeProvenance>,
     generation: u64,
-    notices: VecDeque<RuntimeNotice>,
+    activity: Arc<BackendActivity>,
+    retiring: bool,
 }
 
-impl ManagerState {
-    /// Applies a load-progress update only when it still belongs to the
-    /// current load generation; an observation from an older load can never
-    /// overwrite a newer load operation.
+impl ManagedBackend {
     fn apply_load_progress(&mut self, generation: u64, progress: BackendLoadProgress) {
         if self.generation == generation && self.lifecycle == BackendLifecycle::Loading {
             self.load_progress = Some(progress.sanitized());
         }
     }
+}
+
+struct SessionState {
+    primary: Option<ModelProfileId>,
+    last_used_unix: i64,
+}
+
+struct ManagerState {
+    public_endpoint: Option<String>,
+    engines: BTreeMap<String, EngineStatus>,
+    backends: BTreeMap<ModelProfileId, ManagedBackend>,
+    sessions: BTreeMap<String, SessionState>,
+    next_generation: u64,
+    notices: VecDeque<RuntimeNotice>,
 }
 
 pub struct RuntimeManager {
@@ -336,6 +484,7 @@ pub struct RuntimeManager {
     operation: Arc<Mutex<()>>,
     cancellation_epoch: AtomicU64,
     shutting_down: AtomicBool,
+    reaper: Mutex<Option<tokio::task::JoinHandle<()>>>,
     settings: SettingsStore,
     model_profiles: ModelProfilesStore,
     #[cfg(test)]
@@ -361,30 +510,33 @@ impl RuntimeManager {
             state: RwLock::new(ManagerState {
                 public_endpoint: None,
                 engines: BTreeMap::new(),
-                lifecycle: BackendLifecycle::Stopped,
-                model_profile_id: None,
-                model_id: None,
-                engine_id: None,
-                runtime_id: None,
-                active: None,
-                loading_process: None,
-                loading_runtime_lease: None,
-                cancel_loading: false,
-                load_progress: None,
-                failure: None,
-                provenance: None,
-                generation: 0,
+                backends: BTreeMap::new(),
+                sessions: BTreeMap::new(),
+                next_generation: 0,
                 notices: VecDeque::new(),
             }),
             operation: Arc::new(Mutex::new(())),
             cancellation_epoch: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
+            reaper: Mutex::new(None),
             settings,
             model_profiles,
             #[cfg(test)]
             load_start_gate: Mutex::new(None),
         });
         manager.refresh_engine_probes().await;
+        let weak = Arc::downgrade(&manager);
+        *manager.reaper.lock().await = Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                interval.tick().await;
+                let Some(manager) = weak.upgrade() else { break };
+                if manager.shutting_down.load(Ordering::Acquire) {
+                    break;
+                }
+                manager.reap_idle().await;
+            }
+        }));
         manager
     }
 
@@ -413,68 +565,7 @@ impl RuntimeManager {
 
     pub async fn status(&self) -> ControlStatus {
         let state = self.state.read().await;
-        let engines = state.engines.values().cloned().collect::<Vec<_>>();
-        let installed_engine_count = engines
-            .iter()
-            .filter(|status| {
-                matches!(
-                    status.probe.installation,
-                    InstallationState::Installed { .. }
-                )
-            })
-            .count();
-        let active = state.active.as_ref();
-        let process_id = active.map(|active| active.process.process_id).or_else(|| {
-            state
-                .loading_process
-                .as_ref()
-                .map(|process| process.process_id)
-        });
-        ControlStatus {
-            public_endpoint: state.public_endpoint.clone(),
-            available_engine_count: engines.len(),
-            installed_engine_count,
-            running_engine_count: usize::from(state.lifecycle == BackendLifecycle::Running),
-            engines,
-            backend: BackendStatus {
-                generation: state.generation,
-                lifecycle: state.lifecycle,
-                model_profile_id: state.model_profile_id.clone(),
-                model_id: state.model_id.clone(),
-                engine_id: state.engine_id.clone(),
-                runtime_id: state.runtime_id.clone(),
-                runtime_version: state
-                    .runtime_id
-                    .as_ref()
-                    .and(state.provenance.as_ref())
-                    .map(|provenance| provenance.runtime.identity.version.clone()),
-                runtime_variant: state
-                    .runtime_id
-                    .as_ref()
-                    .and(state.provenance.as_ref())
-                    .map(|provenance| provenance.runtime.identity.variant.clone()),
-                runtime_executable_sha256: state
-                    .runtime_id
-                    .as_ref()
-                    .and(state.provenance.as_ref())
-                    .map(|provenance| provenance.runtime.entrypoint_sha256.clone()),
-                process_id,
-                private_endpoint: if state.lifecycle == BackendLifecycle::Stopped {
-                    None
-                } else {
-                    active.map(|active| active.endpoint.clone()).or_else(|| {
-                        state
-                            .provenance
-                            .as_ref()
-                            .map(|provenance| provenance.private_backend_endpoint.clone())
-                    })
-                },
-                load_progress: state.load_progress.clone(),
-                failure: state.failure.clone(),
-                provenance: state.provenance.clone(),
-            },
-            recent_events: state.notices.iter().cloned().collect(),
-        }
+        self.status_from_state(&state)
     }
 
     pub async fn load(
@@ -500,7 +591,7 @@ impl RuntimeManager {
         settings: SettingsPatch,
     ) -> Result<ControlStatus, RuntimeError> {
         let admission = self
-            .admit_load_with_settings(profile_id, runtime_id, settings)
+            .admit_load_with_settings(profile_id, runtime_id, settings, LoadIntent::Manual)
             .await?;
         admission.completion.await.map_err(|_| {
             RuntimeError::Operation("server-owned load task ended without a result".to_owned())
@@ -533,7 +624,7 @@ impl RuntimeManager {
         settings: SettingsPatch,
     ) -> Result<ControlStatus, RuntimeError> {
         let admission = self
-            .admit_load_with_settings(profile_id, runtime_id, settings)
+            .admit_load_with_settings(profile_id, runtime_id, settings, LoadIntent::Manual)
             .await?;
         Ok(admission.status)
     }
@@ -543,6 +634,7 @@ impl RuntimeManager {
         profile_id: ModelProfileId,
         runtime_id: Option<RuntimeId>,
         settings: SettingsPatch,
+        intent: LoadIntent,
     ) -> Result<LoadAdmission, RuntimeError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(RuntimeError::ShuttingDown);
@@ -553,28 +645,6 @@ impl RuntimeManager {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(RuntimeError::ShuttingDown);
         }
-        let active = self.state.read().await.active.as_ref().map(|active| {
-            (
-                active.model_profile_id.clone(),
-                active.model_id.clone(),
-                active.engine_id.clone(),
-            )
-        });
-        if let Some((active_profile_id, active_model_id, active_engine_id)) = active {
-            if active_profile_id == profile_id {
-                return Err(RuntimeError::AlreadyActive {
-                    model_id: active_model_id,
-                    engine_id: active_engine_id,
-                });
-            }
-            self.cancellation_epoch.fetch_add(1, Ordering::AcqRel);
-            self.stop_backend_with_operation_held().await?;
-        }
-        // Capture after a profile switch has cleanly stopped the previous
-        // backend. A concurrent unload beginning from here invalidates this
-        // reservation.
-        let cancellation_epoch = self.cancellation_epoch.load(Ordering::Acquire);
-        self.ensure_idle_for_load().await?;
         let profiles = self
             .model_profiles
             .read()
@@ -593,8 +663,48 @@ impl RuntimeManager {
                 profile_id: profile_id.clone(),
                 model_id: model_profile.model_id.clone(),
             })?;
+        let expected_profile_hash = model_profile.content_hash();
+        let failed_backend = {
+            let mut state = self.state.write().await;
+            if let Some(backend) = state.backends.get_mut(&profile_id) {
+                match backend.lifecycle {
+                    BackendLifecycle::Running => {
+                        let reusable = settings.is_empty()
+                            && runtime_id
+                                .as_ref()
+                                .is_none_or(|runtime| backend.runtime_id.as_ref() == Some(runtime))
+                            && backend.provenance.as_ref().is_some_and(|provenance| {
+                                provenance.model_profile.content_sha256 == expected_profile_hash
+                            });
+                        if reusable && matches!(intent, LoadIntent::Manual) {
+                            backend.residency = BackendResidency::Pinned;
+                        } else if !reusable {
+                            backend.retiring = true;
+                        }
+                        if reusable {
+                            let status = self.status_from_state(&state);
+                            let (sender, completion) = oneshot::channel();
+                            let _ = sender.send(Ok(status.clone()));
+                            return Ok(LoadAdmission { status, completion });
+                        }
+                        true
+                    }
+                    BackendLifecycle::Failed => true,
+                    lifecycle => return Err(RuntimeError::Busy(lifecycle)),
+                }
+            } else {
+                false
+            }
+        };
+        if failed_backend {
+            self.stop_backend_with_operation_held(&profile_id).await?;
+        }
+        let cancellation_epoch = self.cancellation_epoch.load(Ordering::Acquire);
+        let (role, residency) = match intent {
+            LoadIntent::Manual => (model_profile.role, BackendResidency::Pinned),
+        };
         let generation = self
-            .reserve_loading(&profile_id, &model.id, cancellation_epoch)
+            .reserve_loading(&profile_id, &model.id, role, residency, cancellation_epoch)
             .await?;
         let status = self.status().await;
         let (completion_sender, completion) = oneshot::channel();
@@ -609,6 +719,8 @@ impl RuntimeManager {
                         settings,
                         cancellation_epoch,
                         generation,
+                        role,
+                        residency,
                     },
                     operation,
                 )
@@ -622,6 +734,8 @@ impl RuntimeManager {
         &self,
         profile_id: &ModelProfileId,
         model_id: &ModelId,
+        role: ModelRole,
+        residency: BackendResidency,
         cancellation_epoch: u64,
     ) -> Result<u64, RuntimeError> {
         if self.load_cancelled(cancellation_epoch) {
@@ -632,33 +746,57 @@ impl RuntimeManager {
             });
         }
         let mut state = self.state.write().await;
-        state.generation = state.generation.wrapping_add(1);
-        state.lifecycle = BackendLifecycle::Loading;
-        state.model_profile_id = Some(profile_id.clone());
-        state.model_id = Some(model_id.clone());
-        state.engine_id = None;
-        state.runtime_id = None;
-        state.failure = None;
-        state.active = None;
-        state.loading_process = None;
-        state.loading_runtime_lease = None;
-        state.cancel_loading = false;
-        state.load_progress = Some(BackendLoadProgress::indeterminate(
-            BackendLoadPhase::Starting,
-        ));
-        state.provenance = None;
+        state.next_generation = state.next_generation.wrapping_add(1);
+        let generation = state.next_generation;
+        state.backends.insert(
+            profile_id.clone(),
+            ManagedBackend {
+                lifecycle: BackendLifecycle::Loading,
+                model_profile_id: profile_id.clone(),
+                model_id: model_id.clone(),
+                role,
+                residency,
+                engine_id: None,
+                runtime_id: None,
+                running: None,
+                loading_process: None,
+                loading_runtime_lease: None,
+                cancel_loading: false,
+                load_progress: Some(BackendLoadProgress::indeterminate(
+                    BackendLoadPhase::Starting,
+                )),
+                failure: None,
+                provenance: None,
+                generation,
+                activity: BackendActivity::new(),
+                retiring: false,
+            },
+        );
         push_notice(
             &mut state,
             RuntimeNoticeLevel::Info,
             format!("Loading Model Profile {profile_id} (artifact {model_id})"),
         );
-        Ok(state.generation)
+        Ok(generation)
     }
 
     fn current_lifecycle(&self) -> BackendLifecycle {
         self.state
             .try_read()
-            .map_or(BackendLifecycle::Loading, |state| state.lifecycle)
+            .ok()
+            .and_then(|state| {
+                state
+                    .backends
+                    .values()
+                    .find(|backend| {
+                        matches!(
+                            backend.lifecycle,
+                            BackendLifecycle::Loading | BackendLifecycle::Stopping
+                        )
+                    })
+                    .map(|backend| backend.lifecycle)
+            })
+            .unwrap_or(BackendLifecycle::Stopped)
     }
 
     async fn load_admitted(
@@ -673,6 +811,8 @@ impl RuntimeManager {
             settings: invocation_settings,
             cancellation_epoch,
             generation,
+            role,
+            residency,
         } = admitted;
         let profile_id = model_profile.id.clone();
         let model_id = model.id.clone();
@@ -787,16 +927,19 @@ impl RuntimeManager {
         };
         let cancelled = {
             let mut state = self.state.write().await;
-            if state.generation != generation
-                || state.lifecycle != BackendLifecycle::Loading
-                || state.cancel_loading
-                || self.load_cancelled(cancellation_epoch)
+            let backend = state.backends.get_mut(&profile_id);
+            if backend.as_ref().is_none_or(|backend| {
+                backend.generation != generation
+                    || backend.lifecycle != BackendLifecycle::Loading
+                    || backend.cancel_loading
+            }) || self.load_cancelled(cancellation_epoch)
             {
                 true
             } else {
-                state.engine_id = Some(engine_id.clone());
-                state.runtime_id = Some(selected_runtime_id.clone());
-                state.loading_runtime_lease = Some(runtime_lease);
+                let backend = backend.expect("checked above");
+                backend.engine_id = Some(engine_id.clone());
+                backend.runtime_id = Some(selected_runtime_id.clone());
+                backend.loading_runtime_lease = Some(runtime_lease);
                 for notice in &selection.notices {
                     push_notice(&mut state, RuntimeNoticeLevel::Warning, notice.clone());
                 }
@@ -952,14 +1095,16 @@ impl RuntimeManager {
             };
             let cancelled = {
                 let mut state = self.state.write().await;
-                if state.generation != generation
-                    || state.lifecycle != BackendLifecycle::Loading
-                    || state.cancel_loading
-                    || self.load_cancelled(cancellation_epoch)
+                let backend = state.backends.get_mut(&profile_id);
+                if backend.as_ref().is_none_or(|backend| {
+                    backend.generation != generation
+                        || backend.lifecycle != BackendLifecycle::Loading
+                        || backend.cancel_loading
+                }) || self.load_cancelled(cancellation_epoch)
                 {
                     true
                 } else {
-                    state.loading_process = Some(process.clone());
+                    backend.expect("checked above").loading_process = Some(process.clone());
                     false
                 }
             };
@@ -999,6 +1144,7 @@ impl RuntimeManager {
                     content_sha256: model_profile.content_hash(),
                     bound_model_id: model_profile.model_id.clone(),
                     bound_engine_id: model_profile.engine_id.clone(),
+                    role: model_profile.role,
                 },
                 settings: SettingsProvenance {
                     effective: settings.effective,
@@ -1014,7 +1160,9 @@ impl RuntimeManager {
                 private_backend_endpoint: endpoint.clone(),
                 launched_at_unix: process.launched_at_unix,
             };
-            self.state.write().await.provenance = Some(provenance);
+            if let Some(backend) = self.state.write().await.backends.get_mut(&profile_id) {
+                backend.provenance = Some(provenance);
+            }
             let mut exit = match self.supervisor.subscribe(&process).await {
                 Ok(exit) => exit,
                 Err(error) => {
@@ -1148,7 +1296,9 @@ impl RuntimeManager {
                         return Err(RuntimeError::StartupFailed(detail));
                     }
                     adapter.clear_launch_state(Some(&endpoint)).await;
-                    self.state.write().await.loading_process = None;
+                    if let Some(backend) = self.state.write().await.backends.get_mut(&profile_id) {
+                        backend.loading_process = None;
+                    }
                     if launch_attempts.is_empty() {
                         let attempts = context_attempts
                             .iter()
@@ -1199,13 +1349,13 @@ impl RuntimeManager {
 
         {
             let mut state = self.state.write().await;
-            if state.generation != generation
-                || state.lifecycle != BackendLifecycle::Loading
-                || self.load_cancelled(cancellation_epoch)
-            {
-                let detail = if state.cancel_loading
-                    || state.lifecycle == BackendLifecycle::Stopping
-                    || self.load_cancelled(cancellation_epoch)
+            let invalid = state.backends.get(&profile_id).is_none_or(|backend| {
+                backend.generation != generation || backend.lifecycle != BackendLifecycle::Loading
+            }) || self.load_cancelled(cancellation_epoch);
+            if invalid {
+                let detail = if state.backends.get(&profile_id).is_some_and(|backend| {
+                    backend.cancel_loading || backend.lifecycle == BackendLifecycle::Stopping
+                }) || self.load_cancelled(cancellation_epoch)
                 {
                     "model load was cancelled"
                 } else {
@@ -1221,11 +1371,14 @@ impl RuntimeManager {
                     .await;
                 return Err(RuntimeError::Operation(detail));
             }
-            state.lifecycle = BackendLifecycle::Running;
-            state.loading_process = None;
-            state.cancel_loading = false;
-            state.load_progress = None;
-            if let Some(provenance) = state.provenance.as_mut() {
+            let backend = state.backends.get_mut(&profile_id).expect("checked above");
+            backend.lifecycle = BackendLifecycle::Running;
+            backend.loading_process = None;
+            backend.cancel_loading = false;
+            backend.load_progress = None;
+            backend.role = role;
+            backend.residency = residency;
+            if let Some(provenance) = backend.provenance.as_mut() {
                 provenance.normalized_settings.extend(startup_observation);
                 provenance.normalized_settings.insert(
                     "temperature".to_owned(),
@@ -1236,16 +1389,13 @@ impl RuntimeManager {
                     serde_json::json!(effective_generation_settings.top_p),
                 );
             }
-            let runtime_lease = state
+            let runtime_lease = backend
                 .loading_runtime_lease
                 .take()
                 .expect("a loading runtime must retain its store lease");
-            state.active = Some(ActiveBackend {
+            backend.running = Some(RunningBackend {
                 adapter,
                 process: process.clone(),
-                model_profile_id: profile_id.clone(),
-                model_id: model_id.clone(),
-                engine_id: engine_id.clone(),
                 endpoint,
                 effective_generation_settings,
                 settings: resolved_settings.clone(),
@@ -1258,132 +1408,195 @@ impl RuntimeManager {
                 format!("Model Profile {profile_id} is ready (artifact {model_id})"),
             );
         }
-        spawn_exit_monitor(Arc::downgrade(self), generation, process, exit);
+        spawn_exit_monitor(Arc::downgrade(self), profile_id, generation, process, exit);
         Ok(self.status().await)
     }
 
-    pub async fn unload(self: &Arc<Self>) -> Result<ControlStatus, RuntimeError> {
-        self.cancellation_epoch.fetch_add(1, Ordering::AcqRel);
+    pub async fn unload(
+        self: &Arc<Self>,
+        profile_id: ModelProfileId,
+    ) -> Result<ControlStatus, RuntimeError> {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            manager.cancel_loading().await;
-            manager.unload_inner().await
+            manager.cancel_loading(&profile_id).await;
+            let _operation = manager.operation.lock().await;
+            manager.stop_backend_with_operation_held(&profile_id).await
         })
         .await
         .map_err(|error| RuntimeError::Operation(format!("unload task failed: {error}")))?
     }
 
-    async fn unload_inner(&self) -> Result<ControlStatus, RuntimeError> {
-        let _operation = self.operation.lock().await;
-        self.stop_backend_with_operation_held().await
+    async fn wait_until_drained(activity: &BackendActivity) {
+        while activity.active_requests.load(Ordering::Acquire) != 0 {
+            activity.drained.notified().await;
+        }
     }
 
-    async fn stop_backend_with_operation_held(&self) -> Result<ControlStatus, RuntimeError> {
-        let (process, adapter) = {
+    async fn stop_backend_with_operation_held(
+        self: &Arc<Self>,
+        profile_id: &ModelProfileId,
+    ) -> Result<ControlStatus, RuntimeError> {
+        let (process, adapter, activity) = {
             let mut state = self.state.write().await;
-            match state.lifecycle {
-                BackendLifecycle::Stopped => {
-                    return Ok(self.status_from_state(&state));
-                }
-                BackendLifecycle::Loading | BackendLifecycle::Stopping => {
-                    return Err(RuntimeError::Busy(state.lifecycle));
-                }
-                BackendLifecycle::Running => {
-                    state.lifecycle = BackendLifecycle::Stopping;
-                    state.generation = state.generation.wrapping_add(1);
-                    push_notice(
-                        &mut state,
-                        RuntimeNoticeLevel::Info,
-                        "Stopping the active backend".to_owned(),
-                    );
-                    (
-                        state.active.as_ref().map(|active| active.process.clone()),
-                        state
-                            .active
-                            .as_ref()
-                            .map(|active| Arc::clone(&active.adapter)),
-                    )
-                }
-                BackendLifecycle::Failed => (
-                    state
-                        .active
-                        .as_ref()
-                        .map(|active| active.process.clone())
-                        .or_else(|| state.loading_process.clone()),
-                    state
-                        .active
-                        .as_ref()
-                        .map(|active| Arc::clone(&active.adapter))
-                        .or_else(|| {
-                            state
-                                .engine_id
-                                .as_deref()
-                                .and_then(|engine_id| self.registry.get(engine_id))
-                        }),
-                ),
-            }
+            let Some(backend) = state.backends.get_mut(profile_id) else {
+                return Ok(self.status_from_state(&state));
+            };
+            backend.retiring = true;
+            backend.lifecycle = BackendLifecycle::Stopping;
+            let process = backend
+                .running
+                .as_ref()
+                .map(|running| running.process.clone())
+                .or_else(|| backend.loading_process.clone());
+            let adapter = backend
+                .running
+                .as_ref()
+                .map(|running| Arc::clone(&running.adapter))
+                .or_else(|| {
+                    backend
+                        .engine_id
+                        .as_deref()
+                        .and_then(|id| self.registry.get(id))
+                });
+            let activity = Arc::clone(&backend.activity);
+            push_notice(
+                &mut state,
+                RuntimeNoticeLevel::Info,
+                format!("Draining Model Profile {profile_id} before unload"),
+            );
+            (process, adapter, activity)
         };
+        let fallback_manager = Arc::clone(self);
+        let fallback_profile = profile_id.clone();
+        let fallback_activity = Arc::clone(&activity);
+        tokio::spawn(async move {
+            Self::wait_until_drained(&fallback_activity).await;
+            let _operation = fallback_manager.operation.lock().await;
+            if let Err(error) = fallback_manager
+                .finish_backend_stop(&fallback_profile)
+                .await
+            {
+                tracing::warn!(profile = %fallback_profile, %error, "background backend retirement failed");
+            }
+        });
+        Self::wait_until_drained(&activity).await;
+        self.finish_backend_stop_with_parts(profile_id, process, adapter)
+            .await
+    }
+
+    async fn finish_backend_stop(
+        &self,
+        profile_id: &ModelProfileId,
+    ) -> Result<ControlStatus, RuntimeError> {
+        let (process, adapter) = {
+            let state = self.state.read().await;
+            let Some(backend) = state.backends.get(profile_id) else {
+                return Ok(self.status_from_state(&state));
+            };
+            let process = backend
+                .running
+                .as_ref()
+                .map(|running| running.process.clone())
+                .or_else(|| backend.loading_process.clone());
+            let adapter = backend
+                .running
+                .as_ref()
+                .map(|running| Arc::clone(&running.adapter))
+                .or_else(|| {
+                    backend
+                        .engine_id
+                        .as_deref()
+                        .and_then(|id| self.registry.get(id))
+                });
+            (process, adapter)
+        };
+        self.finish_backend_stop_with_parts(profile_id, process, adapter)
+            .await
+    }
+
+    async fn finish_backend_stop_with_parts(
+        &self,
+        profile_id: &ModelProfileId,
+        process: Option<ProcessDescriptor>,
+        adapter: Option<Arc<dyn EngineAdapter>>,
+    ) -> Result<ControlStatus, RuntimeError> {
         if let Some(process) = process.as_ref()
             && let Err(error) = self.supervisor.terminate(process).await
         {
             let mut state = self.state.write().await;
-            state.lifecycle = BackendLifecycle::Failed;
-            state.failure = Some(error.to_string());
+            if let Some(backend) = state.backends.get_mut(profile_id) {
+                backend.lifecycle = BackendLifecycle::Failed;
+                backend.failure = Some(error.to_string());
+            }
             push_notice(
                 &mut state,
                 RuntimeNoticeLevel::Error,
-                format!("Backend termination failed: {error}"),
+                format!("Backend {profile_id} termination failed: {error}"),
             );
             return Err(RuntimeError::Operation(error.to_string()));
         }
         if let Some(adapter) = adapter {
             adapter
-                .clear_launch_state(
-                    process
-                        .as_ref()
-                        .and_then(|process| process.endpoint.as_deref()),
-                )
+                .clear_launch_state(process.as_ref().and_then(|p| p.endpoint.as_deref()))
                 .await;
         }
         let mut state = self.state.write().await;
-        state.lifecycle = BackendLifecycle::Stopped;
-        state.model_profile_id = None;
-        state.model_id = None;
-        state.engine_id = None;
-        state.runtime_id = None;
-        state.active = None;
-        state.loading_process = None;
-        state.loading_runtime_lease = None;
-        state.cancel_loading = false;
-        state.load_progress = None;
-        state.failure = None;
+        state.backends.remove(profile_id);
+        for session in state.sessions.values_mut() {
+            if session.primary.as_ref() == Some(profile_id) {
+                session.primary = None;
+            }
+        }
         push_notice(
             &mut state,
             RuntimeNoticeLevel::Info,
-            "Backend stopped".to_owned(),
+            format!("Model Profile {profile_id} unloaded"),
         );
         Ok(self.status_from_state(&state))
     }
 
     pub async fn infer(
-        &self,
-        mut request: InferenceRequest,
+        self: &Arc<Self>,
+        request: InferenceRequest,
     ) -> Result<RoutedInferenceOutput, RuntimeError> {
-        let (adapter, endpoint, backend_generation_settings, settings, settings_schema) =
-            self.inference_target(&request.model_profile_id).await?;
-        prepare_inference_request(&adapter, &endpoint, &settings, &mut request)
+        self.infer_routed(request, InferenceRoutingContext::default())
             .await
+    }
+
+    pub async fn infer_routed(
+        self: &Arc<Self>,
+        mut request: InferenceRequest,
+        routing: InferenceRoutingContext,
+    ) -> Result<RoutedInferenceOutput, RuntimeError> {
+        let target = self
+            .inference_target(&request.model_profile_id, routing)
+            .await?;
+        prepare_inference_request(
+            &target.adapter,
+            &target.endpoint,
+            &target.settings,
+            &mut request,
+        )
+        .await
+        .map_err(map_inference_error)?;
+        target
+            .adapter
+            .validate_inference_request(
+                &request,
+                &target.generation_settings,
+                &target.settings_schema,
+            )
             .map_err(map_inference_error)?;
-        adapter
-            .validate_inference_request(&request, &backend_generation_settings, &settings_schema)
-            .map_err(map_inference_error)?;
-        let effective_generation_settings =
-            backend_generation_settings.merged(&request.generation_settings);
+        let effective_generation_settings = target
+            .generation_settings
+            .merged(&request.generation_settings);
         let effective_output_format = request.output_format.clone();
-        let output = adapter
-            .infer(&endpoint, request)
+        let output = target
+            .adapter
+            .infer(&target.endpoint, request)
             .await
             .map_err(map_inference_error)?;
+        drop(target.lease);
         Ok(RoutedInferenceOutput {
             output,
             effective_generation_settings,
@@ -1392,24 +1605,50 @@ impl RuntimeManager {
     }
 
     pub async fn infer_stream(
-        &self,
-        mut request: InferenceRequest,
+        self: &Arc<Self>,
+        request: InferenceRequest,
     ) -> Result<RoutedInferenceStream, RuntimeError> {
-        let (adapter, endpoint, backend_generation_settings, settings, settings_schema) =
-            self.inference_target(&request.model_profile_id).await?;
-        prepare_inference_request(&adapter, &endpoint, &settings, &mut request)
+        self.infer_stream_routed(request, InferenceRoutingContext::default())
             .await
+    }
+
+    pub async fn infer_stream_routed(
+        self: &Arc<Self>,
+        mut request: InferenceRequest,
+        routing: InferenceRoutingContext,
+    ) -> Result<RoutedInferenceStream, RuntimeError> {
+        let target = self
+            .inference_target(&request.model_profile_id, routing)
+            .await?;
+        prepare_inference_request(
+            &target.adapter,
+            &target.endpoint,
+            &target.settings,
+            &mut request,
+        )
+        .await
+        .map_err(map_inference_error)?;
+        target
+            .adapter
+            .validate_inference_request(
+                &request,
+                &target.generation_settings,
+                &target.settings_schema,
+            )
             .map_err(map_inference_error)?;
-        adapter
-            .validate_inference_request(&request, &backend_generation_settings, &settings_schema)
-            .map_err(map_inference_error)?;
-        let effective_generation_settings =
-            backend_generation_settings.merged(&request.generation_settings);
+        let effective_generation_settings = target
+            .generation_settings
+            .merged(&request.generation_settings);
         let effective_output_format = request.output_format.clone();
-        let stream = adapter
-            .infer_stream(&endpoint, request)
+        let stream = target
+            .adapter
+            .infer_stream(&target.endpoint, request)
             .await
             .map_err(map_inference_error)?;
+        let stream = Box::pin(LeasedInferenceStream {
+            inner: stream,
+            lease: Some(target.lease),
+        });
         Ok(RoutedInferenceStream {
             stream,
             effective_generation_settings,
@@ -1417,21 +1656,42 @@ impl RuntimeManager {
         })
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(self: &Arc<Self>) {
         self.shutting_down.store(true, Ordering::Release);
         self.cancellation_epoch.fetch_add(1, Ordering::AcqRel);
-        self.cancel_loading().await;
-        if let Err(error) = self.unload_inner().await {
-            tracing::warn!(%error, "could not unload active backend during shutdown");
+        if let Some(reaper) = self.reaper.lock().await.take() {
+            reaper.abort();
+            let _ = reaper.await;
+        }
+        let profiles = self
+            .state
+            .read()
+            .await
+            .backends
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for profile in &profiles {
+            self.cancel_loading(profile).await;
+        }
+        let _operation = self.operation.lock().await;
+        for profile in profiles {
+            if let Err(error) = self.stop_backend_with_operation_held(&profile).await {
+                tracing::warn!(%profile, %error, "could not unload backend during shutdown");
+            }
         }
         self.supervisor.shutdown().await;
     }
 
     async fn set_load_progress(&self, generation: u64, progress: BackendLoadProgress) {
-        self.state
-            .write()
-            .await
-            .apply_load_progress(generation, progress);
+        let mut state = self.state.write().await;
+        if let Some(backend) = state
+            .backends
+            .values_mut()
+            .find(|b| b.generation == generation)
+        {
+            backend.apply_load_progress(generation, progress);
+        }
     }
 
     fn load_progress_reporter(
@@ -1467,27 +1727,29 @@ impl RuntimeManager {
             || self.cancellation_epoch.load(Ordering::Acquire) != cancellation_epoch
     }
 
-    async fn cancel_loading(&self) {
+    async fn cancel_loading(&self, profile_id: &ModelProfileId) {
         let (process, adapter) = {
             let mut state = self.state.write().await;
-            if state.lifecycle != BackendLifecycle::Loading {
+            let Some(backend) = state.backends.get_mut(profile_id) else {
+                return;
+            };
+            if backend.lifecycle != BackendLifecycle::Loading {
                 return;
             }
-            state.lifecycle = BackendLifecycle::Stopping;
-            state.cancel_loading = true;
-            state.load_progress = None;
+            backend.lifecycle = BackendLifecycle::Stopping;
+            backend.cancel_loading = true;
+            backend.load_progress = None;
+            let process = backend.loading_process.clone();
+            let adapter = backend
+                .engine_id
+                .as_deref()
+                .and_then(|id| self.registry.get(id));
             push_notice(
                 &mut state,
                 RuntimeNoticeLevel::Info,
-                "Cancelling the model load".to_owned(),
+                format!("Cancelling Model Profile {profile_id} load"),
             );
-            (
-                state.loading_process.clone(),
-                state
-                    .engine_id
-                    .as_deref()
-                    .and_then(|engine_id| self.registry.get(engine_id)),
-            )
+            (process, adapter)
         };
         if let Some(process) = process.as_ref()
             && let Err(error) = self.supervisor.terminate(process).await
@@ -1506,23 +1768,6 @@ impl RuntimeManager {
                         .and_then(|process| process.endpoint.as_deref()),
                 )
                 .await;
-        }
-    }
-
-    async fn ensure_idle_for_load(&self) -> Result<(), RuntimeError> {
-        let state = self.state.read().await;
-        if let Some(active) = &state.active {
-            return Err(RuntimeError::AlreadyActive {
-                model_id: active.model_id.clone(),
-                engine_id: active.engine_id.clone(),
-            });
-        }
-        if state.loading_process.is_some() {
-            return Err(RuntimeError::Busy(state.lifecycle));
-        }
-        match state.lifecycle {
-            BackendLifecycle::Stopped | BackendLifecycle::Failed => Ok(()),
-            lifecycle => Err(RuntimeError::Busy(lifecycle)),
         }
     }
 
@@ -1607,40 +1852,45 @@ impl RuntimeManager {
         process: Option<&ProcessDescriptor>,
     ) {
         let mut state = self.state.write().await;
-        if state.generation != generation {
+        let Some(backend) = state
+            .backends
+            .values_mut()
+            .find(|backend| backend.generation == generation)
+        else {
             return;
-        }
-        let failed_phase = state
+        };
+        let profile_id = backend.model_profile_id.clone();
+        let failed_phase = backend
             .load_progress
             .take()
             .map(|progress| progress.phase)
             .filter(|_| {
-                !state.cancel_loading
-                    && state.lifecycle == BackendLifecycle::Loading
+                !backend.cancel_loading
+                    && backend.lifecycle == BackendLifecycle::Loading
                     && detail != "model load was cancelled"
             });
         let detail = match failed_phase {
             Some(phase) => format!("failed while {}: {detail}", phase.failure_label()),
             None => detail,
         };
-        state.lifecycle = BackendLifecycle::Failed;
-        state.failure = Some(detail.clone());
-        state.active = None;
-        state.loading_process = process.cloned();
+        backend.lifecycle = BackendLifecycle::Failed;
+        backend.failure = Some(detail.clone());
+        backend.running = None;
+        backend.loading_process = process.cloned();
         if process.is_none() {
-            state.runtime_id = None;
-            state.loading_runtime_lease = None;
+            backend.runtime_id = None;
+            backend.loading_runtime_lease = None;
         }
-        state.cancel_loading = false;
+        backend.cancel_loading = false;
         if let Some(process) = process
-            && let Some(provenance) = &mut state.provenance
+            && let Some(provenance) = &mut backend.provenance
         {
             provenance.process.process_id = process.process_id;
         }
         push_notice(
             &mut state,
             RuntimeNoticeLevel::Error,
-            format!("Backend startup failed: {detail}"),
+            format!("Model Profile {profile_id} startup failed: {detail}"),
         );
     }
 
@@ -1659,71 +1909,360 @@ impl RuntimeManager {
     }
 
     async fn inference_target(
-        &self,
-        requested_alias: &ModelProfileId,
-    ) -> Result<
-        (
-            Arc<dyn EngineAdapter>,
-            String,
-            EffectiveGenerationSettings,
-            norted_core::ResolvedSettings,
-            norted_core::SettingsSchema,
-        ),
-        RuntimeError,
-    > {
-        let state = self.state.read().await;
-        match (&state.lifecycle, &state.active) {
-            (BackendLifecycle::Running, Some(active))
-                if active.model_profile_id == *requested_alias =>
-            {
-                Ok((
-                    Arc::clone(&active.adapter),
-                    active.endpoint.clone(),
-                    active.effective_generation_settings,
-                    active.settings.clone(),
-                    active.settings_schema.clone(),
-                ))
+        self: &Arc<Self>,
+        requested: &ModelProfileId,
+        routing: InferenceRoutingContext,
+    ) -> Result<InferenceTarget, RuntimeError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(RuntimeError::ShuttingDown);
+        }
+        let profiles = self
+            .model_profiles
+            .read()
+            .await
+            .map_err(|error| RuntimeError::Operation(error.to_string()))?;
+        let profile = profiles
+            .profiles
+            .get(requested)
+            .cloned()
+            .ok_or_else(|| RuntimeError::ModelProfileNotFound(requested.clone()))?;
+        let role = routing.role.unwrap_or(profile.role);
+        let profile_hash = profile.content_hash();
+        if let Some(target) = self
+            .try_fast_target(requested, &profile_hash, role, &routing.session_id)
+            .await
+        {
+            return Ok(target);
+        }
+        if !self.options.jit_enabled && !self.state.read().await.backends.contains_key(requested) {
+            return Err(RuntimeError::ModelProfileNotLoaded(requested.clone()));
+        }
+        let operation = Arc::clone(&self.operation).lock_owned().await;
+
+        if role == ModelRole::Primary {
+            let previous = {
+                let mut state = self.state.write().await;
+                let now = unix_timestamp();
+                let session =
+                    state
+                        .sessions
+                        .entry(routing.session_id.clone())
+                        .or_insert(SessionState {
+                            primary: None,
+                            last_used_unix: now,
+                        });
+                session.last_used_unix = now;
+                let previous = session.primary.replace(requested.clone());
+                previous.filter(|old| old != requested)
+            };
+            if let Some(previous) = previous {
+                let eligible = {
+                    let state = self.state.read().await;
+                    state.backends.get(&previous).is_some_and(|backend| {
+                        backend.residency == BackendResidency::Jit
+                            && !state
+                                .sessions
+                                .values()
+                                .any(|session| session.primary.as_ref() == Some(&previous))
+                    })
+                };
+                if eligible {
+                    self.stop_backend_with_operation_held(&previous).await?;
+                }
             }
-            (BackendLifecycle::Failed, _) => Err(RuntimeError::BackendCrashed(
-                state
+        } else {
+            self.reclaim_idle_with_operation_held(Some(&routing.session_id), Some(requested))
+                .await;
+        }
+
+        let existing = self
+            .state
+            .read()
+            .await
+            .backends
+            .get(requested)
+            .map(|backend| {
+                let compatible = backend.provenance.as_ref().is_some_and(|provenance| {
+                    provenance.model_profile.content_sha256 == profile_hash
+                });
+                (backend.lifecycle, backend.residency, compatible)
+            });
+        match existing {
+            Some((BackendLifecycle::Running, _, true)) => {
+                let target = self.acquire_target(requested).await;
+                drop(operation);
+                return target;
+            }
+            Some((BackendLifecycle::Running, BackendResidency::Jit, false))
+            | Some((BackendLifecycle::Failed, _, _)) => {
+                self.stop_backend_with_operation_held(requested).await?;
+            }
+            Some((BackendLifecycle::Running, BackendResidency::Pinned, false)) => {
+                return Err(RuntimeError::Operation(format!(
+                    "pinned Model Profile `{requested}` was launched from an older profile configuration; unload it before inference"
+                )));
+            }
+            Some((lifecycle, _, _)) => return Err(RuntimeError::Busy(lifecycle)),
+            None => {}
+        }
+        if !self.options.jit_enabled {
+            return Err(RuntimeError::ModelProfileNotLoaded(requested.clone()));
+        }
+        let model = self.core.model(&profile.model_id).await.ok_or_else(|| {
+            RuntimeError::BoundModelMissing {
+                profile_id: requested.clone(),
+                model_id: profile.model_id.clone(),
+            }
+        })?;
+        let cancellation_epoch = self.cancellation_epoch.load(Ordering::Acquire);
+        let generation = self
+            .reserve_loading(
+                requested,
+                &model.id,
+                role,
+                BackendResidency::Jit,
+                cancellation_epoch,
+            )
+            .await?;
+        self.load_admitted(
+            AdmittedLoad {
+                model_profile: profile,
+                model,
+                runtime_id: None,
+                settings: SettingsPatch::default(),
+                cancellation_epoch,
+                generation,
+                role,
+                residency: BackendResidency::Jit,
+            },
+            operation,
+        )
+        .await
+        .map_err(|error| {
+            if role == ModelRole::Auxiliary {
+                RuntimeError::AuxiliaryLoadFailed {
+                    profile_id: requested.clone(),
+                    reason: error.to_string(),
+                }
+            } else {
+                error
+            }
+        })?;
+        let operation = Arc::clone(&self.operation).lock_owned().await;
+        let target = self.acquire_target(requested).await;
+        drop(operation);
+        target
+    }
+
+    async fn acquire_target(
+        &self,
+        requested: &ModelProfileId,
+    ) -> Result<InferenceTarget, RuntimeError> {
+        let state = self.state.read().await;
+        let backend = state
+            .backends
+            .get(requested)
+            .ok_or_else(|| RuntimeError::ModelProfileNotLoaded(requested.clone()))?;
+        if backend.lifecycle == BackendLifecycle::Failed {
+            return Err(RuntimeError::BackendCrashed(
+                backend
                     .failure
                     .clone()
                     .unwrap_or_else(|| "backend is in a failed state".to_owned()),
-            )),
-            _ => Err(RuntimeError::ModelProfileNotLoaded(requested_alias.clone())),
+            ));
+        }
+        let active = backend
+            .running
+            .as_ref()
+            .filter(|_| backend.lifecycle == BackendLifecycle::Running && !backend.retiring)
+            .ok_or_else(|| RuntimeError::ModelProfileNotLoaded(requested.clone()))?;
+        let lease = InferenceLease::acquire(Arc::clone(&backend.activity));
+        Ok(InferenceTarget {
+            adapter: Arc::clone(&active.adapter),
+            endpoint: active.endpoint.clone(),
+            generation_settings: active.effective_generation_settings,
+            settings: active.settings.clone(),
+            settings_schema: active.settings_schema.clone(),
+            lease,
+        })
+    }
+
+    async fn try_fast_target(
+        &self,
+        requested: &ModelProfileId,
+        profile_hash: &str,
+        role: ModelRole,
+        session_id: &str,
+    ) -> Option<InferenceTarget> {
+        let mut state = self.state.write().await;
+        let can_route = state.backends.get(requested).is_some_and(|backend| {
+            backend.lifecycle == BackendLifecycle::Running
+                && !backend.retiring
+                && backend.provenance.as_ref().is_some_and(|provenance| {
+                    provenance.model_profile.content_sha256 == profile_hash
+                })
+        });
+        if !can_route {
+            return None;
+        }
+        if role == ModelRole::Primary {
+            if state
+                .sessions
+                .get(session_id)
+                .is_none_or(|session| session.primary.as_ref() != Some(requested))
+            {
+                return None;
+            }
+            let now = unix_timestamp();
+            let session = state.sessions.get_mut(session_id).expect("checked above");
+            session.last_used_unix = now;
+        }
+        let backend = state.backends.get(requested).expect("checked above");
+        let active = backend
+            .running
+            .as_ref()
+            .expect("running backend has process state");
+        let lease = InferenceLease::acquire(Arc::clone(&backend.activity));
+        Some(InferenceTarget {
+            adapter: Arc::clone(&active.adapter),
+            endpoint: active.endpoint.clone(),
+            generation_settings: active.effective_generation_settings,
+            settings: active.settings.clone(),
+            settings_schema: active.settings_schema.clone(),
+            lease,
+        })
+    }
+
+    async fn reap_idle(self: &Arc<Self>) {
+        let Ok(_operation) = Arc::clone(&self.operation).try_lock_owned() else {
+            return;
+        };
+        self.reclaim_idle_with_operation_held(None, None).await;
+    }
+
+    async fn reclaim_idle_with_operation_held(
+        self: &Arc<Self>,
+        requesting_session: Option<&str>,
+        requested_profile: Option<&ModelProfileId>,
+    ) {
+        let now = unix_timestamp();
+        let protected_primary = {
+            let mut state = self.state.write().await;
+            let session_ttl = duration_seconds_i64(self.options.primary_idle_ttl);
+            state
+                .sessions
+                .retain(|_, session| now.saturating_sub(session.last_used_unix) < session_ttl);
+            requesting_session
+                .and_then(|id| state.sessions.get(id))
+                .and_then(|s| s.primary.clone())
+        };
+        let candidates = {
+            let state = self.state.read().await;
+            let auxiliary_ttl = duration_seconds_i64(self.options.auxiliary_idle_ttl);
+            let primary_ttl = duration_seconds_i64(self.options.primary_idle_ttl);
+            let mut idle_auxiliary = state
+                .backends
+                .values()
+                .filter(|backend| {
+                    backend.residency == BackendResidency::Jit
+                        && backend.role == ModelRole::Auxiliary
+                        && backend.lifecycle == BackendLifecycle::Running
+                        && backend.activity.active_requests.load(Ordering::Acquire) == 0
+                        && Some(&backend.model_profile_id) != requested_profile
+                        && protected_primary.as_ref() != Some(&backend.model_profile_id)
+                })
+                .map(|backend| {
+                    (
+                        backend.model_profile_id.clone(),
+                        backend.activity.last_used_unix.load(Ordering::Acquire),
+                    )
+                })
+                .collect::<Vec<_>>();
+            idle_auxiliary.sort_by_key(|(_, last_used)| *last_used);
+            let incoming_auxiliary = usize::from(requested_profile.is_some());
+            let excess = idle_auxiliary
+                .len()
+                .saturating_add(incoming_auxiliary)
+                .saturating_sub(self.options.max_idle_auxiliary_backends);
+            let mut selected = idle_auxiliary
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (id, last_used))| {
+                    (now.saturating_sub(*last_used) >= auxiliary_ttl || index < excess)
+                        .then_some(id.clone())
+                })
+                .collect::<Vec<_>>();
+            selected.extend(state.backends.values().filter_map(|backend| {
+                let unleased = !state
+                    .sessions
+                    .values()
+                    .any(|session| session.primary.as_ref() == Some(&backend.model_profile_id));
+                (backend.residency == BackendResidency::Jit
+                    && backend.role == ModelRole::Primary
+                    && backend.lifecycle == BackendLifecycle::Running
+                    && backend.activity.active_requests.load(Ordering::Acquire) == 0
+                    && unleased
+                    && protected_primary.as_ref() != Some(&backend.model_profile_id)
+                    && Some(&backend.model_profile_id) != requested_profile
+                    && now.saturating_sub(backend.activity.last_used_unix.load(Ordering::Acquire))
+                        >= primary_ttl)
+                    .then_some(backend.model_profile_id.clone())
+            }));
+            selected.extend(state.backends.values().filter_map(|backend| {
+                let ttl = match backend.role {
+                    ModelRole::Primary => primary_ttl,
+                    ModelRole::Auxiliary => auxiliary_ttl,
+                };
+                (backend.residency == BackendResidency::Jit
+                    && backend.lifecycle == BackendLifecycle::Failed
+                    && backend.activity.active_requests.load(Ordering::Acquire) == 0
+                    && now.saturating_sub(backend.activity.last_used_unix.load(Ordering::Acquire))
+                        >= ttl)
+                    .then_some(backend.model_profile_id.clone())
+            }));
+            selected
+        };
+        for profile in candidates {
+            if let Err(error) = self.stop_backend_with_operation_held(&profile).await {
+                tracing::warn!(%profile, %error, "could not reap idle JIT backend");
+            }
         }
     }
 
     async fn handle_unexpected_exit(
         &self,
+        profile_id: ModelProfileId,
         generation: u64,
         process: ProcessDescriptor,
         exit: ProcessExit,
     ) {
         let mut state = self.state.write().await;
-        if state.generation != generation
-            || state.lifecycle != BackendLifecycle::Running
-            || state
-                .active
+        let Some(backend) = state.backends.get_mut(&profile_id) else {
+            return;
+        };
+        if backend.generation != generation
+            || backend.lifecycle != BackendLifecycle::Running
+            || backend
+                .running
                 .as_ref()
                 .is_none_or(|active| active.process.supervisor_id != process.supervisor_id)
         {
             return;
         }
         let detail = exit_detail(&exit);
-        let adapter = state
-            .active
+        let adapter = backend
+            .running
             .as_ref()
             .map(|active| Arc::clone(&active.adapter));
-        state.lifecycle = BackendLifecycle::Failed;
-        state.failure = Some(detail.clone());
-        state.active = None;
-        state.runtime_id = None;
-        state.load_progress = None;
+        backend.lifecycle = BackendLifecycle::Failed;
+        backend.failure = Some(detail.clone());
+        backend.running = None;
+        backend.runtime_id = None;
+        backend.load_progress = None;
         push_notice(
             &mut state,
             RuntimeNoticeLevel::Error,
-            format!("Backend exited unexpectedly: {detail}"),
+            format!("Model Profile {profile_id} exited unexpectedly: {detail}"),
         );
         drop(state);
         if let Some(adapter) = adapter {
@@ -1744,56 +2283,70 @@ impl RuntimeManager {
                 )
             })
             .count();
-        let active = state.active.as_ref();
-        let process_id = active.map(|active| active.process.process_id).or_else(|| {
-            state
-                .loading_process
-                .as_ref()
-                .map(|process| process.process_id)
-        });
+        let backends = state
+            .backends
+            .values()
+            .map(|backend| {
+                let active = backend.running.as_ref();
+                let process_id = active.map(|active| active.process.process_id).or_else(|| {
+                    backend
+                        .loading_process
+                        .as_ref()
+                        .map(|process| process.process_id)
+                });
+                let primary_lease_count = state
+                    .sessions
+                    .values()
+                    .filter(|session| session.primary.as_ref() == Some(&backend.model_profile_id))
+                    .count();
+                BackendStatus {
+                    generation: backend.generation,
+                    lifecycle: backend.lifecycle,
+                    model_profile_id: backend.model_profile_id.clone(),
+                    model_id: backend.model_id.clone(),
+                    role: backend.role,
+                    residency: backend.residency,
+                    engine_id: backend.engine_id.clone(),
+                    runtime_id: backend.runtime_id.clone(),
+                    runtime_version: backend
+                        .provenance
+                        .as_ref()
+                        .map(|p| p.runtime.identity.version.clone()),
+                    runtime_variant: backend
+                        .provenance
+                        .as_ref()
+                        .map(|p| p.runtime.identity.variant.clone()),
+                    runtime_executable_sha256: backend
+                        .provenance
+                        .as_ref()
+                        .map(|p| p.runtime.entrypoint_sha256.clone()),
+                    process_id,
+                    private_endpoint: active.map(|active| active.endpoint.clone()).or_else(|| {
+                        backend
+                            .provenance
+                            .as_ref()
+                            .map(|p| p.private_backend_endpoint.clone())
+                    }),
+                    load_progress: backend.load_progress.clone(),
+                    failure: backend.failure.clone(),
+                    provenance: backend.provenance.clone(),
+                    active_request_count: backend.activity.active_requests.load(Ordering::Acquire),
+                    primary_lease_count,
+                    last_used_unix: backend.activity.last_used_unix.load(Ordering::Acquire),
+                    retiring: backend.retiring,
+                }
+            })
+            .collect::<Vec<_>>();
         ControlStatus {
             public_endpoint: state.public_endpoint.clone(),
             available_engine_count: engines.len(),
             installed_engine_count,
-            running_engine_count: usize::from(state.lifecycle == BackendLifecycle::Running),
+            running_backend_count: backends
+                .iter()
+                .filter(|backend| backend.lifecycle == BackendLifecycle::Running)
+                .count(),
             engines,
-            backend: BackendStatus {
-                generation: state.generation,
-                lifecycle: state.lifecycle,
-                model_profile_id: state.model_profile_id.clone(),
-                model_id: state.model_id.clone(),
-                engine_id: state.engine_id.clone(),
-                runtime_id: state.runtime_id.clone(),
-                runtime_version: state
-                    .runtime_id
-                    .as_ref()
-                    .and(state.provenance.as_ref())
-                    .map(|provenance| provenance.runtime.identity.version.clone()),
-                runtime_variant: state
-                    .runtime_id
-                    .as_ref()
-                    .and(state.provenance.as_ref())
-                    .map(|provenance| provenance.runtime.identity.variant.clone()),
-                runtime_executable_sha256: state
-                    .runtime_id
-                    .as_ref()
-                    .and(state.provenance.as_ref())
-                    .map(|provenance| provenance.runtime.entrypoint_sha256.clone()),
-                process_id,
-                private_endpoint: if state.lifecycle == BackendLifecycle::Stopped {
-                    None
-                } else {
-                    active.map(|active| active.endpoint.clone()).or_else(|| {
-                        state
-                            .provenance
-                            .as_ref()
-                            .map(|provenance| provenance.private_backend_endpoint.clone())
-                    })
-                },
-                load_progress: state.load_progress.clone(),
-                failure: state.failure.clone(),
-                provenance: state.provenance.clone(),
-            },
+            backends,
             recent_events: state.notices.iter().cloned().collect(),
         }
     }
@@ -1979,6 +2532,7 @@ async fn prepare_inference_request(
 
 fn spawn_exit_monitor(
     manager: Weak<RuntimeManager>,
+    profile_id: ModelProfileId,
     generation: u64,
     process: ProcessDescriptor,
     mut exit: tokio::sync::watch::Receiver<Option<ProcessExit>>,
@@ -1997,7 +2551,7 @@ fn spawn_exit_monitor(
         }
         if let Some(manager) = manager.upgrade() {
             manager
-                .handle_unexpected_exit(generation, process, observed)
+                .handle_unexpected_exit(profile_id, generation, process, observed)
                 .await;
         }
     });
@@ -2139,6 +2693,10 @@ fn unix_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
+fn duration_seconds_i64(duration: Duration) -> i64 {
+    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+}
+
 fn retry_context_capacity_message(
     kv_mode: &str,
     observed_context: u64,
@@ -2249,7 +2807,10 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let status = manager.status().await;
-                if status.backend.lifecycle == expected {
+                if status
+                    .newest_backend()
+                    .is_some_and(|backend| backend.lifecycle == expected)
+                {
                     return status;
                 }
                 tokio::task::yield_now().await;
@@ -2259,16 +2820,16 @@ mod tests {
         .expect("lifecycle transition")
     }
 
-    fn empty_state() -> ManagerState {
-        ManagerState {
-            public_endpoint: None,
-            engines: BTreeMap::new(),
+    fn empty_backend() -> ManagedBackend {
+        ManagedBackend {
             lifecycle: BackendLifecycle::Loading,
-            model_profile_id: None,
-            model_id: None,
+            model_profile_id: ModelProfileId::new("fixture").expect("profile ID"),
+            model_id: ModelId("fixture".to_owned()),
+            role: ModelRole::Primary,
+            residency: BackendResidency::Jit,
             engine_id: None,
             runtime_id: None,
-            active: None,
+            running: None,
             loading_process: None,
             loading_runtime_lease: None,
             cancel_loading: false,
@@ -2276,7 +2837,8 @@ mod tests {
             failure: None,
             provenance: None,
             generation: 7,
-            notices: VecDeque::new(),
+            activity: BackendActivity::new(),
+            retiring: false,
         }
     }
 
@@ -2291,15 +2853,21 @@ mod tests {
             .start_load(fixture.profile_id.clone())
             .await
             .expect("load admission");
-        assert_eq!(admitted.backend.lifecycle, BackendLifecycle::Loading);
+        let backend = admitted
+            .backend(&fixture.profile_id)
+            .expect("admitted backend");
+        assert_eq!(backend.lifecycle, BackendLifecycle::Loading);
+        assert_eq!(&backend.model_profile_id, &fixture.profile_id);
+        assert_eq!(&backend.model_id, &fixture.model_id);
         assert_eq!(
-            admitted.backend.model_profile_id.as_ref(),
-            Some(&fixture.profile_id)
-        );
-        assert_eq!(admitted.backend.model_id.as_ref(), Some(&fixture.model_id));
-        assert_eq!(
-            fixture.manager.status().await.backend.generation,
-            admitted.backend.generation
+            fixture
+                .manager
+                .status()
+                .await
+                .backend(&fixture.profile_id)
+                .expect("backend")
+                .generation,
+            backend.generation
         );
 
         gate.notify_one();
@@ -2342,14 +2910,17 @@ mod tests {
 
         let error = fixture
             .manager
-            .reserve_loading(&fixture.profile_id, &fixture.model_id, stale_epoch)
+            .reserve_loading(
+                &fixture.profile_id,
+                &fixture.model_id,
+                ModelRole::Primary,
+                BackendResidency::Jit,
+                stale_epoch,
+            )
             .await
             .expect_err("stale admission epoch");
         assert!(error.to_string().contains("cancelled before admission"));
-        assert_eq!(
-            fixture.manager.status().await.backend.lifecycle,
-            BackendLifecycle::Stopped
-        );
+        assert!(fixture.manager.status().await.backends.is_empty());
     }
 
     #[tokio::test]
@@ -2362,10 +2933,20 @@ mod tests {
             .expect("load admission");
         let failed = wait_for_lifecycle(&fixture.manager, BackendLifecycle::Failed).await;
 
-        assert_eq!(failed.backend.generation, admitted.backend.generation);
+        assert_eq!(
+            failed
+                .backend(&fixture.profile_id)
+                .expect("failed backend")
+                .generation,
+            admitted
+                .backend(&fixture.profile_id)
+                .expect("admitted backend")
+                .generation
+        );
         assert!(
             failed
-                .backend
+                .backend(&fixture.profile_id)
+                .expect("failed backend")
                 .failure
                 .as_deref()
                 .is_some_and(|failure| failure.contains("compatible installed engine"))
@@ -2384,12 +2965,12 @@ mod tests {
             .expect("load admission");
 
         let manager = Arc::clone(&fixture.manager);
-        let unload = tokio::spawn(async move { manager.unload().await });
+        let profile_id = fixture.profile_id.clone();
+        let unload = tokio::spawn(async move { manager.unload(profile_id).await });
         let _ = wait_for_lifecycle(&fixture.manager, BackendLifecycle::Stopping).await;
         gate.notify_one();
         let stopped = unload.await.expect("unload task").expect("unload");
-        assert_eq!(stopped.backend.lifecycle, BackendLifecycle::Stopped);
-        assert!(stopped.backend.model_id.is_none());
+        assert!(stopped.backends.is_empty());
     }
 
     #[tokio::test]
@@ -2408,38 +2989,35 @@ mod tests {
         let _ = wait_for_lifecycle(&fixture.manager, BackendLifecycle::Stopping).await;
         gate.notify_one();
         shutdown.await.expect("shutdown task");
-        assert_eq!(
-            fixture.manager.status().await.backend.lifecycle,
-            BackendLifecycle::Stopped
-        );
+        assert!(fixture.manager.status().await.backends.is_empty());
     }
 
     #[test]
     fn apply_load_progress_updates_the_current_generation() {
-        let mut state = empty_state();
-        state.apply_load_progress(
+        let mut backend = empty_backend();
+        backend.apply_load_progress(
             7,
             BackendLoadProgress::indeterminate(BackendLoadPhase::SelectingRuntime),
         );
-        let progress = state.load_progress.expect("progress was set");
+        let progress = backend.load_progress.expect("progress was set");
         assert_eq!(progress.phase, BackendLoadPhase::SelectingRuntime);
         assert_eq!(progress.fraction, None);
     }
 
     #[test]
     fn an_old_load_generation_cannot_overwrite_newer_load_progress() {
-        let mut state = empty_state();
-        state.apply_load_progress(
+        let mut backend = empty_backend();
+        backend.apply_load_progress(
             7,
             BackendLoadProgress::indeterminate(BackendLoadPhase::LoadingModel),
         );
         // A newer load started under generation 8.
-        state.generation = 8;
-        state.apply_load_progress(
+        backend.generation = 8;
+        backend.apply_load_progress(
             7,
             BackendLoadProgress::indeterminate(BackendLoadPhase::SpawningBackend),
         );
-        let progress = state.load_progress.expect("progress is unchanged");
+        let progress = backend.load_progress.expect("progress is unchanged");
         assert_eq!(
             progress.phase,
             BackendLoadPhase::LoadingModel,
@@ -2452,12 +3030,13 @@ mod tests {
         let fixture = manager_fixture().await;
         {
             let mut state = fixture.manager.state.write().await;
-            state.generation = 8;
-            state.lifecycle = BackendLifecycle::Loading;
-            state.load_progress = Some(BackendLoadProgress::with_message(
+            let mut backend = empty_backend();
+            backend.generation = 8;
+            backend.load_progress = Some(BackendLoadProgress::with_message(
                 BackendLoadPhase::SelectingRuntime,
                 "newer load",
             ));
+            state.backends.insert(fixture.profile_id.clone(), backend);
         }
         let (reporter, pump) = fixture.manager.load_progress_reporter(7);
         reporter(BackendLoadProgress {
@@ -2471,40 +3050,46 @@ mod tests {
         pump.await.expect("progress pump");
 
         let state = fixture.manager.state.read().await;
-        let progress = state.load_progress.as_ref().expect("new load progress");
+        let progress = state
+            .backends
+            .get(&fixture.profile_id)
+            .expect("backend")
+            .load_progress
+            .as_ref()
+            .expect("new load progress");
         assert_eq!(progress.phase, BackendLoadPhase::SelectingRuntime);
         assert_eq!(progress.message.as_deref(), Some("newer load"));
     }
 
     #[test]
     fn apply_load_progress_is_ignored_once_loading_is_no_longer_active() {
-        let mut state = empty_state();
-        state.lifecycle = BackendLifecycle::Running;
-        state.apply_load_progress(
+        let mut backend = empty_backend();
+        backend.lifecycle = BackendLifecycle::Running;
+        backend.apply_load_progress(
             7,
             BackendLoadProgress::indeterminate(BackendLoadPhase::VerifyingStartup),
         );
         assert!(
-            state.load_progress.is_none(),
+            backend.load_progress.is_none(),
             "progress is not attached once the backend is Running"
         );
 
-        let mut state = empty_state();
-        state.lifecycle = BackendLifecycle::Failed;
-        state.apply_load_progress(
+        let mut backend = empty_backend();
+        backend.lifecycle = BackendLifecycle::Failed;
+        backend.apply_load_progress(
             7,
             BackendLoadProgress::indeterminate(BackendLoadPhase::VerifyingStartup),
         );
         assert!(
-            state.load_progress.is_none(),
+            backend.load_progress.is_none(),
             "progress is not attached once the backend is Failed"
         );
     }
 
     #[test]
     fn apply_load_progress_sanitizes_untrustworthy_adapter_values() {
-        let mut state = empty_state();
-        state.apply_load_progress(
+        let mut backend = empty_backend();
+        backend.apply_load_progress(
             7,
             BackendLoadProgress {
                 phase: BackendLoadPhase::LoadingModel,
@@ -2514,7 +3099,7 @@ mod tests {
                 message: None,
             },
         );
-        let progress = state.load_progress.expect("progress was sanitized");
+        let progress = backend.load_progress.expect("progress was sanitized");
         assert_eq!(progress.fraction, None);
         assert_eq!(progress.current, None);
         assert_eq!(progress.total, None);

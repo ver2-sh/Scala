@@ -9,6 +9,14 @@ use crate::{AppPaths, ModelId, SettingsError, SettingsPatch, StateStoreError};
 
 pub const MODEL_PROFILES_STATE_VERSION: u32 = 1;
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRole {
+    #[default]
+    Primary,
+    Auxiliary,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ModelProfileId(String);
@@ -128,6 +136,8 @@ pub struct ModelProfile {
     pub model_id: ModelId,
     pub engine_id: EngineId,
     #[serde(default)]
+    pub role: ModelRole,
+    #[serde(default)]
     pub overrides: SettingsPatch,
 }
 
@@ -143,6 +153,7 @@ impl ModelProfile {
             display_name: display_name.into(),
             model_id,
             engine_id,
+            role: ModelRole::default(),
             overrides: SettingsPatch::default(),
         };
         profile.validate()?;
@@ -172,6 +183,7 @@ impl ModelProfile {
             id: &'a ModelProfileId,
             model_id: &'a ModelId,
             engine_id: &'a EngineId,
+            role: ModelRole,
             overrides: &'a SettingsPatch,
         }
 
@@ -179,6 +191,7 @@ impl ModelProfile {
             id: &self.id,
             model_id: &self.model_id,
             engine_id: &self.engine_id,
+            role: self.role,
             overrides: &self.overrides,
         })
         .expect("Model Profile content is serializable");

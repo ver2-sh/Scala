@@ -135,6 +135,27 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub auth: PublicAuthMode,
+    pub jit: JitConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JitConfig {
+    pub enabled: bool,
+    pub primary_idle_ttl_seconds: u64,
+    pub auxiliary_idle_ttl_seconds: u64,
+    pub max_idle_auxiliary_backends: usize,
+}
+
+impl Default for JitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            primary_idle_ttl_seconds: 3600,
+            auxiliary_idle_ttl_seconds: 300,
+            max_idle_auxiliary_backends: 2,
+        }
+    }
 }
 
 impl Default for ServerConfig {
@@ -143,6 +164,7 @@ impl Default for ServerConfig {
             host: "127.0.0.1".into(),
             port: 8742,
             auth: PublicAuthMode::Auto,
+            jit: JitConfig::default(),
         }
     }
 }
@@ -314,6 +336,7 @@ mod tests {
                 host: host.to_owned(),
                 port: 8742,
                 auth,
+                ..ServerConfig::default()
             };
             let status = server.public_auth_status(0).expect("auth status");
             assert_eq!(status.effective_mode, effective, "host {host}");
@@ -328,6 +351,7 @@ mod tests {
             host: "::".to_owned(),
             port: 8742,
             auth: PublicAuthMode::Auto,
+            ..ServerConfig::default()
         };
         assert!(
             server

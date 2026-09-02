@@ -9,7 +9,7 @@ model artifact = one discovered physical GGUF, q27, or NInfer file
 engine         = adapter, compatibility rules, launch semantics, health, protocol translation
 runtime        = one concrete executable package and version
 settings       = Global and per-engine defaults
-Model Profile  = a user-owned serving target binding one artifact, one engine, and overrides
+Model Profile  = a user-owned serving target binding one artifact, one engine, role, and overrides
 ```
 
 A GGUF model is not permanently tied to llama.cpp, a q27 model is not permanently tied to q27,
@@ -25,7 +25,7 @@ ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 - Model Profiles are user-created mutable serving targets and the normal load unit.
 - Runtimes are installed executable implementations selected for the profile's bound engine.
 
-Two Model Profiles may bind the same artifact and carry different overrides. The active status and
+Two Model Profiles may bind the same artifact and carry different roles or overrides. Multi-backend status and
 runtime provenance retain both the Model Profile ID and the underlying artifact Model ID. The
 OpenAI-compatible model alias is the loaded Model Profile ID, including `GET /v1/models` entries and
 the `model` value accepted by inference requests.
@@ -211,16 +211,18 @@ All commands honor global `--json`. The scriptable management surface includes:
 ```console
 norted-server model-profiles list
 norted-server model-profiles show <PROFILE>
-norted-server model-profiles create <PROFILE> --model <MODEL_ID> --engine <ENGINE_ID>
+norted-server model-profiles create <PROFILE> --model <MODEL_ID> --engine <ENGINE_ID> [--role primary|auxiliary]
 norted-server model-profiles duplicate <SOURCE> <PROFILE>
 norted-server model-profiles delete <PROFILE>
 norted-server model-profiles set-model <PROFILE> <MODEL_ID>
 norted-server model-profiles set-engine <PROFILE> <ENGINE_ID>
+norted-server model-profiles set-role <PROFILE> <primary|auxiliary>
 norted-server model-profiles set <PROFILE> <SETTING=VALUE>...
 norted-server model-profiles unset <PROFILE> <SETTING>...
 norted-server model-profiles load <PROFILE> [--runtime <RUNTIME_ID>] [--set <SETTING=VALUE>...]
 norted-server model-profiles compatibility <PROFILE> [--runtime <RUNTIME_ID>]
 norted-server load <PROFILE> [--runtime <RUNTIME_ID>] [--set <SETTING=VALUE>...]
+norted-server unload <PROFILE>
 norted-server settings show --global
 norted-server settings set --global <SETTING=VALUE>...
 norted-server settings unset --global <SETTING>...
@@ -474,7 +476,11 @@ cargo run -p norted-server -- status
 cargo run -p norted-server -- unload
 ```
 
-`load` contacts the already-running serving process; it does not launch a hidden second server. One backend may be active at a time.
+`load` contacts the already-running serving process; it does not launch a hidden second server. Explicit loads are pinned, may coexist, and are never removed by JIT cleanup. `unload <PROFILE>` drains and removes only that profile.
+
+Inference is JIT-loaded by Model Profile. With zero resident models, the first Responses or Chat Completions request resolves the profile's exact artifact, engine, runtime, settings, and provenance, waits for startup, and then runs. Requests without Norted attribution share one deterministic default logical session, so changing its primary model drains and replaces the previous unpinned JIT primary. A profile declared `auxiliary`, or a request carrying `X-Norted-Role: auxiliary`, loads alongside the session primary and remains warm until its auxiliary TTL.
+
+Both inference endpoints accept two optional orchestration headers: `X-Norted-Session` is an opaque 1–128 byte visible value retained only in memory, and `X-Norted-Role` is exactly `primary` or `auxiliary`. Role overrides the profile default for that request. Session and role metadata are never forwarded to engines or included in immutable provenance. Distinct explicit sessions may retain different primary profiles, while sessions choosing the same profile share one backend.
 
 Private `POST /control/v1/load` is a short authenticated admission request. A successful request reserves a manager generation as Loading, starts a server-owned background operation, and returns `202 Accepted`; the TUI then observes progress and the final state through private status. The scriptable `norted-server load` command preserves blocking semantics by polling that exact generation until Running or Failed. Disconnecting a CLI or attached TUI does not cancel an accepted load; unloading, server shutdown, or exiting a TUI that owns its server still uses the normal manager cancellation path.
 
@@ -487,7 +493,7 @@ cargo run -p norted-server
 cargo run -p norted-server -- tui
 ```
 
-At startup the TUI safely chooses one of two modes: it attaches to a healthy instance discovered through the existing runtime descriptor, public identity probe, and authenticated private control `status`, or it starts and owns the same serving composition used by headless `serve`. In owned mode the configured OpenAI-compatible endpoint is live while the TUI runs. Exiting shuts down the owned listeners and active backend and removes the owned descriptor; exiting an attached TUI leaves the external server running.
+At startup the TUI safely chooses one of two modes: it attaches to a healthy instance discovered through the existing runtime descriptor, public identity probe, and authenticated private control `status`, or it starts and owns the same serving composition used by headless `serve`. In owned mode the configured OpenAI-compatible endpoint is live while the TUI runs. Exiting shuts down the owned listeners and all managed backends and removes the owned descriptor; exiting an attached TUI leaves the external server running.
 
 Its top-level pages are Overview, Models, Model Profiles, Runtimes, Server, Logs, Settings, and Help. Models is an integrated Model Library: Installed preserves the local artifact/profile/runtime workflow, while Discover provides Hugging Face query editing, format filtering, repository-qualified artifact details, compact revision and size, known companion/package-manifest status, live download bytes, and explicit managed removal. Identical filenames from different repositories remain visibly distinct and retain their exact repository-qualified download reference. Remote rows say compatibility is unverified; the existing runtime picker continues to provide proven engine/runtime/host compatibility after acquisition. Model Profiles lists, creates, duplicates, deletes, rebinds, edits, validates, and loads user serving targets; it displays missing/incompatible state, active identity, and inherited versus overridden values. Settings shows only Global and engine defaults. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Incompatible candidates are hidden by default and can be revealed with the keyboard- and mouse-accessible `Show incompatible` checkbox; Recommended, Compatible, and Needs Attention results remain visible. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Installed source-runtime details include short commit/tree, recipe, Make or CMake, and CUDA provenance.
 
@@ -514,6 +520,12 @@ version = 1
 host = "127.0.0.1"
 port = 8742
 auth = "auto"
+
+[server.jit]
+enabled = true
+primary_idle_ttl_seconds = 3600
+auxiliary_idle_ttl_seconds = 300
+max_idle_auxiliary_backends = 2
 
 [models]
 paths = ["D:/models"]
@@ -611,7 +623,7 @@ auth = "disabled"
 
 Bearer authentication does not encrypt transport. Loopback needs no network transport layer; Tailscale or another trusted VPN can provide encrypted transport, and a reverse proxy can provide TLS. Plain HTTP on an untrusted LAN exposes bearer credentials, prompts, and outputs. Norted does not manage certificates and does not enable permissive browser CORS.
 
-Each backend and the separately authenticated private control listener use OS-assigned loopback ports. Public API keys cannot authorize control operations, and clients are never redirected to or given the private upstream server.
+Each backend and the separately authenticated private control listener use OS-assigned loopback ports. JIT is enabled by default with a 3600-second session/primary idle TTL, a 300-second auxiliary idle TTL, and at most two idle auxiliary JIT backends. Cleanup is LRU/oldest-idle, ignores pinned or active backends, and never evicts the requesting session's leased primary to launch an auxiliary. Public API keys cannot authorize control operations, and clients are never redirected to or given the private upstream server.
 
 The Responses surface accepts `model`; string or message/`function_call`/`function_call_output`
 input Items; canonical roles; optional `instructions`; output and sampler controls; reasoning;
@@ -709,7 +721,7 @@ Focused tests cover bounded NInfer admission, typed identity, source manifests a
 
 ## Current limitations
 
-- Only one model/backend can run at a time; there is no scheduler or implicit swap.
+- Residency cleanup is TTL/LRU based and does not attempt speculative GPU-memory accounting; an auxiliary load that still cannot fit fails without sacrificing its parent primary.
 - Managed q27 is Linux x86_64 CUDA only because those are the currently supported upstream binary/source contracts; Windows can use only a separately supplied compatible external binary.
 - Managed source builds are provider-specific: llama.cpp supports the newest exact tagged Linux x86_64 portable CUDA source recipe, q27 supports exact tagged Linux x86_64 CUDA releases whose upstream Makefile contract is recognized, and NInfer supports its exact Linux x86_64/RTX 5090/sm_120a contract. Other providers do not gain source support automatically.
 - The llama.cpp Linux managed-source provider exposes two intentional parallel CUDA variants — CUDA-12 `managed-portable-v4` (`>=12.8,<13.0`, driver `>=525.60.13`) and CUDA-13 `managed-portable-cuda13-v2` (`>=13.0,<14.0`, driver `>=580.65.06`); see the runtime documentation above for their exact toolkit, compiler, and target contracts. Norted validates the prerequisite tools but does not install system, CUDA, driver, or toolchain packages.

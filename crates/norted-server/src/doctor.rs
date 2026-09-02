@@ -1267,21 +1267,26 @@ async fn inspect_control_and_bind(
         Ok(client) => match client.status().await {
             Ok(status) => {
                 verified_running = true;
-                match status.backend.lifecycle {
-                    BackendLifecycle::Failed => checks.push(finding(
+                if let Some(backend) = status
+                    .backends
+                    .iter()
+                    .find(|backend| backend.lifecycle == BackendLifecycle::Failed)
+                {
+                    checks.push(finding(
                         "control.backend_failed",
                         "control",
                         DoctorStatus::Fail,
                         "The running Server backend is in a failed lifecycle.",
-                        status.backend.failure.map(bounded_detail),
+                        backend.failure.clone().map(bounded_detail),
                         &["Review recent Server logs and unload or retry the Model Profile explicitly after correcting the reported cause."],
-                    )),
-                    lifecycle => checks.push(pass(
+                    ));
+                } else {
+                    checks.push(pass(
                         "control.healthy",
                         "control",
                         "A running Norted Server passed authenticated private-control verification.",
-                        Some(format!("Backend lifecycle: {lifecycle:?}.")),
-                    )),
+                        Some(format!("{} managed backend(s), {} running.", status.backends.len(), status.running_backend_count)),
+                    ));
                 }
             }
             Err(error) => {

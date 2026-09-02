@@ -22,6 +22,7 @@ pub enum ModelProfileAction {
     Unload,
     Model,
     Engine,
+    Role,
     Duplicate,
     Delete,
     Refresh,
@@ -310,11 +311,13 @@ impl UiLayout {
                         (InstalledModelAction::Runtime, 11),
                     ];
                     let is_active = app.control.as_ref().is_some_and(|control| {
-                        control.backend.model_id.as_ref() == Some(&model.id)
-                            && !matches!(
-                                control.backend.lifecycle,
-                                norted_engine::BackendLifecycle::Stopped
-                            )
+                        control.backends.iter().any(|backend| {
+                            backend.model_id == model.id
+                                && !matches!(
+                                    backend.lifecycle,
+                                    norted_engine::BackendLifecycle::Stopped
+                                )
+                        })
                     });
                     if is_active {
                         actions.push((InstalledModelAction::Unload, 10));
@@ -816,6 +819,7 @@ impl UiLayout {
                 actions.extend([
                     (ModelProfileAction::Model, 9),
                     (ModelProfileAction::Engine, 10),
+                    (ModelProfileAction::Role, 8),
                     (ModelProfileAction::Duplicate, if compact { 9 } else { 13 }),
                     (ModelProfileAction::Delete, 18),
                     (ModelProfileAction::Refresh, if compact { 9 } else { 11 }),
@@ -1314,13 +1318,15 @@ mod tests {
             public_endpoint: Some("http://127.0.0.1:8080".to_owned()),
             available_engine_count: 1,
             installed_engine_count: 1,
-            running_engine_count: 1,
+            running_backend_count: 0,
             engines: Vec::new(),
-            backend: BackendStatus {
-                model_profile_id: None,
+            backends: vec![BackendStatus {
+                model_profile_id: norted_core::ModelProfileId::new("fixture").expect("profile ID"),
                 generation: 1,
                 lifecycle: BackendLifecycle::Loading,
-                model_id: Some(app.snapshot.models[model_index].id.clone()),
+                model_id: app.snapshot.models[model_index].id.clone(),
+                role: norted_core::ModelRole::Primary,
+                residency: norted_engine::BackendResidency::Pinned,
                 engine_id: Some("llama.cpp".to_owned()),
                 runtime_id: None,
                 runtime_version: None,
@@ -1333,7 +1339,11 @@ mod tests {
                 )),
                 failure: None,
                 provenance: None,
-            },
+                active_request_count: 0,
+                primary_lease_count: 0,
+                last_used_unix: 0,
+                retiring: false,
+            }],
             recent_events: Vec::new(),
         });
     }

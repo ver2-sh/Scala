@@ -95,7 +95,7 @@ pub enum Update {
 #[derive(Debug, Clone)]
 pub enum ControlAction {
     Load(ModelProfileId),
-    Unload,
+    Unload(ModelProfileId),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -233,6 +233,9 @@ pub enum SettingsAction {
     CycleProfileEngine {
         profile_id: ModelProfileId,
         model: Box<ModelArtifact>,
+    },
+    CycleProfileRole {
+        profile_id: ModelProfileId,
     },
     InspectProfile {
         profile: Box<ModelProfile>,
@@ -775,21 +778,25 @@ impl App {
     pub fn is_loading(&self) -> bool {
         self.control
             .as_ref()
-            .is_some_and(|status| status.backend.lifecycle.is_loading())
+            .is_some_and(|status| status.loading_backend().is_some())
     }
 
     pub fn load_progress(&self) -> Option<&BackendLoadProgress> {
         if !self.is_loading() {
             return None;
         }
-        self.control.as_ref()?.backend.load_progress.as_ref()
+        self.control
+            .as_ref()?
+            .loading_backend()?
+            .load_progress
+            .as_ref()
     }
 
     pub fn selected_model_load_progress(&self) -> Option<&BackendLoadProgress> {
         let progress = self.load_progress()?;
         let control = self.control.as_ref()?;
         let selected = self.snapshot.models.get(self.selected_model?)?;
-        (control.backend.model_id.as_ref() == Some(&selected.id)).then_some(progress)
+        (control.loading_backend()?.model_id == selected.id).then_some(progress)
     }
 
     pub fn advance_load_animation(&mut self) -> bool {
@@ -1236,10 +1243,9 @@ impl App {
         let profile = self.selected_model_profile_value()?;
         let runtime_id = self.settings_runtime_id.as_ref()?;
         let settings_resolved = self.settings_resolved.as_ref()?;
-        let backend = &self.control.as_ref()?.backend;
+        let backend = self.control.as_ref()?.backend(&profile.id)?;
         if backend.lifecycle != BackendLifecycle::Running
-            || backend.model_profile_id.as_ref() != Some(&profile.id)
-            || backend.model_id.as_ref() != Some(&profile.model_id)
+            || backend.model_id != profile.model_id
             || backend.engine_id.as_deref() != Some(profile.engine_id.as_str())
             || backend.runtime_id.as_ref() != Some(runtime_id)
         {
@@ -1314,10 +1320,9 @@ impl App {
 
     pub fn selected_profile_is_active(&self) -> bool {
         self.selected_model_profile_value().is_some_and(|profile| {
-            self.control.as_ref().is_some_and(|control| {
-                control.backend.model_profile_id.as_ref() == Some(&profile.id)
-                    && !matches!(control.backend.lifecycle, BackendLifecycle::Stopped)
-            })
+            self.control
+                .as_ref()
+                .is_some_and(|control| control.backend(&profile.id).is_some())
         })
     }
 
@@ -1326,8 +1331,10 @@ impl App {
             .and_then(|index| self.snapshot.models.get(index))
             .is_some_and(|model| {
                 self.control.as_ref().is_some_and(|control| {
-                    control.backend.model_id.as_ref() == Some(&model.id)
-                        && !matches!(control.backend.lifecycle, BackendLifecycle::Stopped)
+                    control
+                        .backends
+                        .iter()
+                        .any(|backend| backend.model_id == model.id)
                 })
             })
     }
@@ -1360,11 +1367,11 @@ impl App {
         };
         status.runtime.manifest.acquisition_method != RuntimeAcquisitionMethod::ExternalBinary
             && status.selected_for.is_empty()
-            && self
-                .control
-                .as_ref()
-                .and_then(|control| control.backend.runtime_id.as_ref())
-                != Some(&status.runtime.manifest.runtime_id)
+            && self.control.as_ref().is_none_or(|control| {
+                !control.backends.iter().any(|backend| {
+                    backend.runtime_id.as_ref() == Some(&status.runtime.manifest.runtime_id)
+                })
+            })
     }
 
     pub fn handle_runtime_task_result(&mut self, result: RuntimeTaskResult) {
@@ -1721,15 +1728,8 @@ impl App {
         let previous = self
             .control
             .as_ref()
-            .map(|current| (current.backend.generation, current.backend.lifecycle));
-        let incoming = (status.backend.generation, status.backend.lifecycle);
-
-        if previous.is_some_and(|(generation, lifecycle)| {
-            incoming.0 < generation
-                || (incoming.0 == generation && incoming.1.is_loading() && !lifecycle.is_loading())
-        }) {
-            return false;
-        }
+            .and_then(ControlStatus::newest_backend)
+            .map(|backend| (backend.generation, backend.lifecycle));
 
         if source == ControlStatusSource::ControlResult {
             self.set_control_result_notice(&status);
@@ -1743,15 +1743,19 @@ impl App {
     }
 
     fn set_control_result_notice(&mut self, status: &ControlStatus) {
-        let lifecycle = status.backend.lifecycle;
+        let Some(backend) = status.newest_backend() else {
+            self.notice = Some("Model Profile unloaded".to_owned());
+            return;
+        };
+        let lifecycle = backend.lifecycle;
         if lifecycle.is_loading() {
             self.notice = Some("Model load started".to_owned());
             self.push_log(LogLevel::Info, "Model load started".to_owned());
             return;
         }
 
-        let runtime = status.backend.runtime_id.as_ref().map(|runtime_id| {
-            status.backend.runtime_version.as_deref().map_or_else(
+        let runtime = backend.runtime_id.as_ref().map(|runtime_id| {
+            backend.runtime_version.as_deref().map_or_else(
                 || runtime_id.to_string(),
                 |version| format!("{runtime_id} / {version}"),
             )
@@ -1772,8 +1776,11 @@ impl App {
         previous: Option<(u64, BackendLifecycle)>,
         status: &ControlStatus,
     ) {
-        let generation = status.backend.generation;
-        let lifecycle = status.backend.lifecycle;
+        let Some(backend) = status.newest_backend() else {
+            return;
+        };
+        let generation = backend.generation;
+        let lifecycle = backend.lifecycle;
         let generation_advanced =
             previous.is_some_and(|(previous_generation, _)| generation > previous_generation);
         let lifecycle_changed =
@@ -1782,7 +1789,7 @@ impl App {
             });
 
         if lifecycle == BackendLifecycle::Failed {
-            if let Some(failure) = &status.backend.failure {
+            if let Some(failure) = &backend.failure {
                 self.notice = Some(failure.clone());
             }
             return;
@@ -2285,12 +2292,12 @@ impl App {
             );
             return Update::Render;
         }
-        if self
-            .control
-            .as_ref()
-            .and_then(|control| control.backend.model_id.as_ref())
-            == Some(&model.id)
-        {
+        if self.control.as_ref().is_some_and(|control| {
+            control
+                .backends
+                .iter()
+                .any(|backend| backend.model_id == model.id)
+        }) {
             self.notice = Some("Unload the active model before removing it".to_owned());
             return Update::Render;
         }
@@ -2829,6 +2836,15 @@ impl App {
         })
     }
 
+    fn cycle_profile_role(&mut self) -> Update {
+        let Some(profile) = self.selected_model_profile_value() else {
+            return Update::None;
+        };
+        self.queue_settings_action(SettingsAction::CycleProfileRole {
+            profile_id: profile.id.clone(),
+        })
+    }
+
     fn refresh_selected_model_profile(&mut self) -> Update {
         self.profile_inspection_stale = false;
         self.settings_schema = None;
@@ -3157,6 +3173,7 @@ impl App {
                     {
                         self.cycle_profile_engine()
                     }
+                    ModelProfileAction::Role if !self.settings_busy => self.cycle_profile_role(),
                     ModelProfileAction::Duplicate if !self.settings_busy => {
                         self.begin_duplicate_profile()
                     }
@@ -3172,6 +3189,7 @@ impl App {
                     | ModelProfileAction::Unload
                     | ModelProfileAction::Model
                     | ModelProfileAction::Engine
+                    | ModelProfileAction::Role
                     | ModelProfileAction::Duplicate
                     | ModelProfileAction::Delete
                     | ModelProfileAction::Refresh => Update::None,
@@ -3779,11 +3797,13 @@ impl App {
             ));
             return Update::Render;
         }
-        let active_runtime = self
-            .control
-            .as_ref()
-            .and_then(|control| control.backend.runtime_id.clone());
-        if active_runtime.as_ref() == Some(&runtime_id) {
+        let active_runtime = self.control.as_ref().is_some_and(|control| {
+            control
+                .backends
+                .iter()
+                .any(|backend| backend.runtime_id.as_ref() == Some(&runtime_id))
+        });
+        if active_runtime {
             self.notice = Some("The active runtime cannot be removed".to_owned());
             return Update::Render;
         }
@@ -4187,8 +4207,9 @@ impl App {
             });
             return Update::Render;
         };
-        if control.backend.lifecycle == BackendLifecycle::Running
-            && control.backend.model_profile_id.as_ref() == Some(&profile.id)
+        if control
+            .backend(&profile.id)
+            .is_some_and(|backend| backend.lifecycle == BackendLifecycle::Running)
         {
             self.notice = Some("The selected Model Profile is already active".to_owned());
             return Update::Render;
@@ -4212,13 +4233,21 @@ impl App {
             });
             return Update::Render;
         };
-        if matches!(control.backend.lifecycle, BackendLifecycle::Stopped) {
+        let Some(profile_id) = self
+            .selected_model_profile_value()
+            .and_then(|profile| control.backend(&profile.id).map(|_| profile.id.clone()))
+            .or_else(|| {
+                control
+                    .newest_backend()
+                    .map(|backend| backend.model_profile_id.clone())
+            })
+        else {
             self.notice = Some("No Model Profile is currently loaded".to_owned());
             return Update::Render;
-        }
-        self.pending_control_action = Some(ControlAction::Unload);
+        };
+        self.pending_control_action = Some(ControlAction::Unload(profile_id));
         self.control_busy = true;
-        self.notice = Some("Unloading the active Model Profile…".to_owned());
+        self.notice = Some("Unloading the selected Model Profile…".to_owned());
         Update::Render
     }
 }

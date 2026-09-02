@@ -19,7 +19,7 @@ pub use auth::{
     PublicAuthMode, PublicAuthStatus,
 };
 pub use config::{
-    AppConfig, AppPaths, ConfigSource, EngineConfig, LoadedConfig, ModelConfig,
+    AppConfig, AppPaths, ConfigSource, EngineConfig, JitConfig, LoadedConfig, ModelConfig,
     SUPPORTED_CONFIG_VERSION, ServerConfig, TuiConfig,
 };
 pub use error::{CoreError, Result};
@@ -34,7 +34,7 @@ pub use model::{
 };
 pub use model_profile::{
     EngineId, MODEL_PROFILES_STATE_VERSION, ModelProfile, ModelProfileId, ModelProfilesState,
-    ModelProfilesStore, validate_engine_id,
+    ModelProfilesStore, ModelRole, validate_engine_id,
 };
 pub use norted_package::{
     NortedPackageAcquisitionFile, NortedPackageAcquisitionPlan, NortedPackageAcquisitionRole,

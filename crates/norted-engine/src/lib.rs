@@ -40,12 +40,12 @@ pub use catalog::{
 
 pub use control::{
     CONTROL_LOAD_PATH, CONTROL_STATUS_PATH, CONTROL_UNLOAD_PATH, ControlClient, ControlClientError,
-    ControlErrorResponse, ControlLoadRequest,
+    ControlErrorResponse, ControlLoadRequest, ControlUnloadRequest,
 };
 pub use manager::{
-    BackendLifecycle, BackendLoadPhase, BackendLoadProgress, BackendStatus, ControlStatus,
-    EngineStatus, RuntimeError, RuntimeManager, RuntimeManagerOptions, RuntimeNotice,
-    RuntimeNoticeLevel,
+    BackendLifecycle, BackendLoadPhase, BackendLoadProgress, BackendResidency, BackendStatus,
+    ControlStatus, EngineStatus, InferenceRoutingContext, RuntimeError, RuntimeManager,
+    RuntimeManagerOptions, RuntimeNotice, RuntimeNoticeLevel,
 };
 pub use packs::{
     InstalledRuntimeStatus, RuntimeListSnapshot, RuntimeLocalInspection, RuntimeModelCandidate,
@@ -2382,10 +2382,10 @@ mod tests {
         let with_progress = BackendStatus {
             generation: 9,
             lifecycle: BackendLifecycle::Loading,
-            model_profile_id: Some(
-                norted_core::ModelProfileId::new("qwen-quality").expect("profile ID"),
-            ),
-            model_id: Some(ModelId("qwen3.8-27b".to_owned())),
+            model_profile_id: norted_core::ModelProfileId::new("qwen-quality").expect("profile ID"),
+            model_id: ModelId("qwen3.8-27b".to_owned()),
+            role: norted_core::ModelRole::Primary,
+            residency: crate::BackendResidency::Jit,
             engine_id: Some("q27".to_owned()),
             runtime_id: None,
             runtime_version: Some("0.10.0".to_owned()),
@@ -2402,6 +2402,10 @@ mod tests {
             }),
             failure: None,
             provenance: None,
+            active_request_count: 0,
+            primary_lease_count: 0,
+            last_used_unix: 0,
+            retiring: false,
         };
         let value = serde_json::to_value(&with_progress).expect("serialize");
         assert_eq!(value["lifecycle"], "loading");
@@ -2420,25 +2424,6 @@ mod tests {
             value.get("load_progress").is_none(),
             "absent progress is skipped, not null"
         );
-
-        // Older descriptors that omit load_progress still deserialize.
-        let legacy = serde_json::json!({
-            "lifecycle": "stopped",
-            "model_id": null,
-            "engine_id": null,
-            "runtime_id": null,
-            "runtime_version": null,
-            "runtime_variant": null,
-            "runtime_executable_sha256": null,
-            "process_id": null,
-            "private_endpoint": null,
-            "failure": null,
-            "provenance": null,
-        });
-        let parsed: BackendStatus =
-            serde_json::from_value(legacy).expect("legacy status without load_progress");
-        assert_eq!(parsed.lifecycle, BackendLifecycle::Stopped);
-        assert_eq!(parsed.load_progress, None);
     }
 
     #[test]

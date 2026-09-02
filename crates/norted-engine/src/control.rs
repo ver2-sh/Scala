@@ -27,6 +27,11 @@ pub struct ControlLoadRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlUnloadRequest {
+    pub model_profile_id: ModelProfileId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlErrorResponse {
     pub error: String,
 }
@@ -154,8 +159,17 @@ impl ControlClient {
         let admitted = self
             .start_load_with_settings(profile_id.clone(), runtime_id, settings)
             .await?;
-        self.wait_for_admitted_load(profile_id, admitted.backend.generation)
-            .await
+        let generation = admitted
+            .backends
+            .iter()
+            .find(|backend| backend.model_profile_id == profile_id)
+            .ok_or_else(|| {
+                ControlClientError::InvalidResponse(
+                    "accepted load response omitted the requested Model Profile".to_owned(),
+                )
+            })?
+            .generation;
+        self.wait_for_admitted_load(profile_id, generation).await
     }
 
     pub async fn start_load(
@@ -200,9 +214,12 @@ impl ControlClient {
                 "load admission returned {response_status}, expected 202 Accepted"
             )));
         }
-        if status.backend.lifecycle != BackendLifecycle::Loading
-            || status.backend.model_profile_id.as_ref() != Some(&expected_profile)
-        {
+        if !status.backends.iter().any(|backend| {
+            matches!(
+                backend.lifecycle,
+                BackendLifecycle::Loading | BackendLifecycle::Running
+            ) && backend.model_profile_id == expected_profile
+        }) {
             return Err(ControlClientError::InvalidResponse(
                 "accepted load response did not identify the requested Model Profile as Loading"
                     .to_owned(),
@@ -211,10 +228,16 @@ impl ControlClient {
         Ok(status)
     }
 
-    pub async fn unload(&self) -> Result<ControlStatus, ControlClientError> {
+    pub async fn unload(
+        &self,
+        profile_id: ModelProfileId,
+    ) -> Result<ControlStatus, ControlClientError> {
         self.send(
             self.client
                 .post(format!("{}{}", self.endpoint, CONTROL_UNLOAD_PATH))
+                .json(&ControlUnloadRequest {
+                    model_profile_id: profile_id,
+                })
                 .timeout(UNLOAD_TIMEOUT),
             "unload request",
             UNLOAD_TIMEOUT,
@@ -271,35 +294,29 @@ impl ControlClient {
     ) -> Result<ControlStatus, ControlClientError> {
         loop {
             let status = self.status().await?;
-            if status.backend.generation != generation {
+            let Some(backend) = status
+                .backends
+                .iter()
+                .find(|backend| backend.model_profile_id == profile_id)
+            else {
+                return Err(ControlClientError::LoadCancelled(format!(
+                    "load generation {generation} for Model Profile `{profile_id}` disappeared"
+                )));
+            };
+            if backend.generation != generation {
                 return Err(ControlClientError::LoadCancelled(format!(
                     "load generation {generation} for Model Profile `{profile_id}` was superseded by generation {}",
-                    status.backend.generation
+                    backend.generation
                 )));
             }
-            if status
-                .backend
-                .model_profile_id
-                .as_ref()
-                .is_some_and(|observed| observed != &profile_id)
-            {
-                return Err(ControlClientError::LoadCancelled(format!(
-                    "load generation {generation} changed from Model Profile `{profile_id}` to `{}`",
-                    status
-                        .backend
-                        .model_profile_id
-                        .as_ref()
-                        .expect("checked as present")
-                )));
-            }
-            match status.backend.lifecycle {
+            match backend.lifecycle {
                 BackendLifecycle::Loading => {
                     tokio::time::sleep(LOAD_POLL_INTERVAL).await;
                 }
                 BackendLifecycle::Running => return Ok(status),
                 BackendLifecycle::Failed => {
                     return Err(ControlClientError::LoadFailed(
-                        status.backend.failure.unwrap_or_else(|| {
+                        backend.failure.clone().unwrap_or_else(|| {
                             format!(
                                 "load generation {generation} for Model Profile `{profile_id}` failed without a reason"
                             )
@@ -374,13 +391,15 @@ mod tests {
             public_endpoint: None,
             available_engine_count: 0,
             installed_engine_count: 0,
-            running_engine_count: usize::from(lifecycle == BackendLifecycle::Running),
+            running_backend_count: usize::from(lifecycle == BackendLifecycle::Running),
             engines: Vec::new(),
-            backend: BackendStatus {
+            backends: vec![BackendStatus {
                 generation,
                 lifecycle,
-                model_profile_id: Some(ModelProfileId::new("fixture").expect("profile ID")),
-                model_id: Some(ModelId("fixture".to_owned())),
+                model_profile_id: ModelProfileId::new("fixture").expect("profile ID"),
+                model_id: ModelId("fixture".to_owned()),
+                role: norted_core::ModelRole::Primary,
+                residency: crate::BackendResidency::Pinned,
                 engine_id: None,
                 runtime_id: None,
                 runtime_version: None,
@@ -391,7 +410,11 @@ mod tests {
                 load_progress: None,
                 failure: failure.map(str::to_owned),
                 provenance: None,
-            },
+                active_request_count: 0,
+                primary_lease_count: 0,
+                last_used_unix: 0,
+                retiring: false,
+            }],
             recent_events: Vec::new(),
         }
     }
@@ -446,8 +469,8 @@ mod tests {
         .expect("short-lived admission")
         .expect("accepted load");
 
-        assert_eq!(admitted.backend.lifecycle, BackendLifecycle::Loading);
-        assert_eq!(admitted.backend.generation, 12);
+        assert_eq!(admitted.backends[0].lifecycle, BackendLifecycle::Loading);
+        assert_eq!(admitted.backends[0].generation, 12);
         server.await.expect("server task");
     }
 
@@ -467,8 +490,11 @@ mod tests {
             .await
             .expect("blocking load");
 
-        assert_eq!(final_status.backend.lifecycle, BackendLifecycle::Running);
-        assert_eq!(final_status.backend.generation, 22);
+        assert_eq!(
+            final_status.backends[0].lifecycle,
+            BackendLifecycle::Running
+        );
+        assert_eq!(final_status.backends[0].generation, 22);
         server.await.expect("server task");
     }
 

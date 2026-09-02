@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AcceleratorDevice, ArtifactNativeIdentity, AuxiliaryArtifactRole, EngineId, ModelId,
-    ModelProfileId, ResolvedSetting, RuntimeManifest, RuntimeSelectionSource, SettingId,
+    ModelProfileId, ModelRole, ResolvedSetting, RuntimeManifest, RuntimeSelectionSource, SettingId,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +15,7 @@ pub struct ModelProfileRuntimeIdentity {
     pub content_sha256: String,
     pub bound_model_id: ModelId,
     pub bound_engine_id: EngineId,
+    pub role: ModelRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

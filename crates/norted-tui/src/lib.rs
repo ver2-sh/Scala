@@ -173,7 +173,17 @@ pub async fn run(
                 observation
                     .status
                     .as_ref()
-                    .map(|status| (status.backend.generation, status.backend.lifecycle)),
+                    .and_then(|status| match poll_state.local_load_intent {
+                        LocalLoadIntent::Accepted { generation } => status
+                            .backends
+                            .iter()
+                            .find(|backend| backend.generation == generation)
+                            .or_else(|| status.loading_backend()),
+                        LocalLoadIntent::Idle | LocalLoadIntent::PendingAdmission => {
+                            status.loading_backend()
+                        }
+                    })
+                    .map(|backend| (backend.generation, backend.lifecycle)),
             );
             if control_updates.send(observation).await.is_err() {
                 break;
@@ -224,9 +234,9 @@ pub async fn run(
             result = control_result_receiver.recv() => match result {
                 Some(result) => {
                     let intent = match &result {
-                        Ok(status) if status.backend.lifecycle.is_loading() => {
+                        Ok(status) if status.loading_backend().is_some() => {
                             LocalLoadIntent::Accepted {
-                                generation: status.backend.generation,
+                                generation: status.loading_backend().expect("checked above").generation,
                             }
                         }
                         _ => LocalLoadIntent::Idle,
@@ -426,16 +436,24 @@ fn spawn_model_library_action(
                                 Ok(client) => client
                                     .status()
                                     .await
-                                    .map(|status| status.backend.model_id)
+                                    .map(|status| {
+                                        status
+                                            .backends
+                                            .into_iter()
+                                            .map(|backend| backend.model_id)
+                                            .collect::<Vec<_>>()
+                                    })
                                     .map_err(|error| error.to_string()),
-                                Err(ControlClientError::Unavailable) => Ok(None),
+                                Err(ControlClientError::Unavailable) => Ok(Vec::new()),
                                 Err(error) => Err(error.to_string()),
                             };
                             match active {
-                                Ok(Some(active)) if plan.affected_model_ids.contains(&active) => {
-                                    Err(format!(
-                                        "Model {active} is active and belongs to this managed acquisition; unload it before removal"
-                                    ))
+                                Ok(active)
+                                    if active
+                                        .iter()
+                                        .any(|model| plan.affected_model_ids.contains(model)) =>
+                                {
+                                    Err("An active model belongs to this managed acquisition; unload it before removal".to_owned())
                                 }
                                 Ok(_) => match library.remove(&plan).await {
                                     Ok(()) => match core.refresh_models().await {
@@ -808,14 +826,15 @@ async fn execute_settings_action(
         }
         SettingsAction::DeleteProfile(profile_id) => {
             let active = match ControlClient::discover(paths).await {
-                Ok(client) => client
-                    .status()
-                    .await
-                    .ok()
-                    .and_then(|status| status.backend.model_profile_id),
-                Err(_) => None,
+                Ok(client) => client.status().await.ok().is_some_and(|status| {
+                    status
+                        .backends
+                        .iter()
+                        .any(|backend| backend.model_profile_id == profile_id)
+                }),
+                Err(_) => false,
             };
-            let result = if active.as_ref() == Some(&profile_id) {
+            let result = if active {
                 Err(format!(
                     "Active Model Profile `{profile_id}` cannot be deleted; unload it first"
                 ))
@@ -904,6 +923,26 @@ async fn execute_settings_action(
                         .overrides
                         .0
                         .retain(|id, _| id.applies_to_engine(profile.engine_id.as_str()));
+                    Ok(())
+                })
+                .await
+                .map_err(|error| error.to_string());
+            SettingsTaskResult::Stored(match result {
+                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
+                Err(error) => Err(error),
+            })
+        }
+        SettingsAction::CycleProfileRole { profile_id } => {
+            let result = profiles_store
+                .update(move |state| {
+                    let profile = state
+                        .profiles
+                        .get_mut(&profile_id)
+                        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+                    profile.role = match profile.role {
+                        norted_core::ModelRole::Primary => norted_core::ModelRole::Auxiliary,
+                        norted_core::ModelRole::Auxiliary => norted_core::ModelRole::Primary,
+                    };
                     Ok(())
                 })
                 .await
@@ -1080,7 +1119,10 @@ async fn execute_runtime_action(
         RuntimeAction::Remove { runtime_id } => {
             let active_runtime = match ControlClient::discover(paths).await {
                 Ok(client) => match client.status().await {
-                    Ok(status) => status.backend.runtime_id,
+                    Ok(status) => status
+                        .backends
+                        .into_iter()
+                        .find_map(|backend| backend.runtime_id),
                     Err(error) => {
                         return RuntimeTaskResult::Removed {
                             runtime_id,
@@ -1185,7 +1227,7 @@ async fn execute_control(
         .map_err(|error| error.to_string())?;
     match action {
         ControlAction::Load(profile_id) => client.start_load(profile_id).await,
-        ControlAction::Unload => client.unload().await,
+        ControlAction::Unload(profile_id) => client.unload(profile_id).await,
     }
     .map_err(|error| error.to_string())
 }
