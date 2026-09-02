@@ -32,9 +32,10 @@ use norted_engine::{
     InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
     InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter,
     NativeOption, OptionValueKind, OutputFormat, PreparedModelInput, ProcessDescriptor,
-    RuntimeVariantUpdateIdentity, UpdateState, capture_command, common_setting_definitions,
-    prepare_norted_package_input, prepare_norted_package_input_with_progress,
-    revalidate_norted_package_before_launch, revalidate_norted_package_before_launch_with_progress,
+    RuntimeVariantUpdateIdentity, StartupObservation, UpdateState, capture_command,
+    common_setting_definitions, prepare_norted_package_input,
+    prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
+    revalidate_norted_package_before_launch_with_progress,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -1134,6 +1135,23 @@ impl EngineAdapter for LlamaCppAdapter {
         Ok(health.status == "ok")
     }
 
+    async fn startup_observation(
+        &self,
+        process: &ProcessDescriptor,
+        _stderr_tail: &[String],
+    ) -> Result<StartupObservation, EngineError> {
+        let endpoint = process.endpoint.as_deref().ok_or_else(|| {
+            EngineError::Operation("llama.cpp process has no backend endpoint".to_owned())
+        })?;
+        let Some(context) = self.context_capacity(endpoint).await? else {
+            return Ok(StartupObservation::Ready(BTreeMap::new()));
+        };
+        Ok(StartupObservation::Ready(BTreeMap::from([(
+            "resolved_settings".to_owned(),
+            json!({"context_length": context}),
+        )])))
+    }
+
     fn startup_progress(&self, stderr_tail: &[String]) -> Option<BackendLoadProgress> {
         parse_llama_startup_progress(stderr_tail)
     }
@@ -1616,7 +1634,7 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
             SettingKind::Choice {
                 choices: llama_cache_types(),
             },
-            Some("runtime-selected"),
+            Some("runtime/model-selected"),
         ),
         llama_definition(
             "llama.cpp.kv_cache_v",
@@ -1625,7 +1643,7 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
             SettingKind::Choice {
                 choices: llama_cache_types(),
             },
-            Some("runtime-selected"),
+            Some("runtime/model-selected"),
         ),
         llama_definition(
             "llama.cpp.load_mode",
@@ -1641,21 +1659,21 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
             "RoPE frequency base",
             "RoPE base frequency used by NTK-aware scaling",
             SettingKind::Float { minimum: Some(f64::MIN_POSITIVE), maximum: None },
-            Some("loaded from model"),
+            Some("model metadata"),
         ),
         llama_definition(
             "llama.cpp.rope_frequency_scale",
             "RoPE frequency scale",
             "RoPE frequency scaling factor; context expands by 1/value",
             SettingKind::Float { minimum: Some(f64::MIN_POSITIVE), maximum: None },
-            Some("loaded from model"),
+            Some("model metadata"),
         ),
         llama_definition(
             "llama.cpp.unified_kv_cache",
             "Unified KV cache",
             "Use one KV buffer shared across server sequences",
             SettingKind::Toggle,
-            Some("exact runtime automatic behavior"),
+            Some("exact runtime automatic"),
         ),
         llama_definition(
             "llama.cpp.kv_cache_gpu_offload",
@@ -1676,21 +1694,21 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
             "MoE layers on CPU",
             "Keep expert weights for the first N model layers on CPU",
             SettingKind::UnsignedInteger { minimum: Some(0), maximum: None },
-            Some("none"),
+            Some("runtime default: none"),
         ),
         llama_definition(
             "llama.cpp.cpu_moe_all",
             "All MoE weights on CPU",
             "Keep all Mixture-of-Experts weights on CPU",
             SettingKind::OneWayFlag,
-            Some("disabled"),
+            Some("runtime default: disabled"),
         ),
         llama_definition(
             "llama.cpp.active_experts",
             "Number of active experts",
             "Override the architecture-specific GGUF expert_used_count metadata only when the selected model proves that key",
             SettingKind::UnsignedInteger { minimum: Some(1), maximum: None },
-            Some("loaded from model metadata"),
+            Some("model metadata"),
         ),
         llama_definition(
             "llama.cpp.chat_template",
@@ -1711,28 +1729,28 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
             "Chat template SHA-256",
             "Recorded content identity for the selected local chat-template file",
             SettingKind::String,
-            None,
+            Some("Norted default: none"),
         ),
         llama_definition(
             "llama.cpp.speculative_mode",
             "Speculative decoding",
             "Exact runtime-advertised speculative decoding mode; off emits the runtime's none mode",
             SettingKind::Choice { choices: Vec::new() },
-            Some("off"),
+            Some("runtime default: off"),
         ),
         llama_definition(
             "llama.cpp.speculative_draft_model",
             "Speculative draft model",
             "Bound local GGUF draft artifact used by draft-model speculative modes",
             SettingKind::Path,
-            Some("unused"),
+            Some("runtime default: unused"),
         ),
         llama_definition(
             "llama.cpp.speculative_draft_sha256",
             "Draft model SHA-256",
             "Recorded content identity for the selected speculative draft artifact",
             SettingKind::String,
-            None,
+            Some("Norted default: none"),
         ),
     ]);
     definitions

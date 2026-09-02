@@ -422,7 +422,7 @@ pub struct NinferAdapter {
     client: reqwest::Client,
     capability_cache: tokio::sync::RwLock<BTreeMap<String, String>>,
     pending_startups: tokio::sync::RwLock<BTreeMap<String, PendingStartup>>,
-    observed_defaults: tokio::sync::RwLock<BTreeMap<String, EffectiveGenerationSettings>>,
+    observed_defaults: tokio::sync::RwLock<BTreeMap<String, ObservedNinferStartup>>,
     active_executions: tokio::sync::RwLock<BTreeMap<String, NinferExecution>>,
 }
 
@@ -1093,6 +1093,9 @@ impl EngineAdapter for NinferAdapter {
         let mut definitions = self.model_setting_definitions(model)?;
         settings::apply_runtime_bounds(&mut definitions);
         let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
+        if capabilities.protocol_semantics {
+            settings::apply_reviewed_runtime_defaults(&mut definitions);
+        }
         for definition in &mut definitions {
             let id = definition.id.as_str();
             if matches!(
@@ -1535,6 +1538,37 @@ impl EngineAdapter for NinferAdapter {
         parse_ninfer_startup_progress(stderr_tail)
     }
 
+    async fn startup_observation(
+        &self,
+        process: &ProcessDescriptor,
+        _stderr_tail: &[String],
+    ) -> Result<norted_engine::StartupObservation, EngineError> {
+        let endpoint = process.endpoint.as_deref().ok_or_else(|| {
+            EngineError::Operation("NInfer process has no backend endpoint".to_owned())
+        })?;
+        let observed = self
+            .observed_defaults
+            .read()
+            .await
+            .get(endpoint)
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::BackendUnavailable(
+                    "NInfer startup settings have not been observed yet".to_owned(),
+                )
+            })?;
+        Ok(norted_engine::StartupObservation::Ready(BTreeMap::from([
+            (
+                "resolved_settings".to_owned(),
+                serde_json::to_value(observed.resolved_settings).map_err(|error| {
+                    EngineError::Operation(format!(
+                        "could not serialize NInfer resolved settings: {error}"
+                    ))
+                })?,
+            ),
+        ])))
+    }
+
     async fn effective_generation_settings(
         &self,
         process: &ProcessDescriptor,
@@ -1546,7 +1580,7 @@ impl EngineAdapter for NinferAdapter {
             .read()
             .await
             .get(endpoint)
-            .copied()
+            .map(|observed| observed.generation_settings)
             .ok_or_else(|| {
                 EngineError::Operation(
                     "NInfer effective sampler defaults were not validated at startup".to_owned(),
@@ -1880,6 +1914,7 @@ struct StartupEngine {
     kv_capacity_mode: String,
     kv_capacity: u64,
     kv_cache: String,
+    max_concurrency: u64,
     #[serde(default)]
     vision: bool,
     cuda_graph: bool,
@@ -1894,6 +1929,12 @@ struct StartupEngine {
     #[serde(default)]
     log_stats_interval_ms: Option<u64>,
     context_cost: StartupContextCost,
+}
+
+#[derive(Clone)]
+struct ObservedNinferStartup {
+    generation_settings: EffectiveGenerationSettings,
+    resolved_settings: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -1980,7 +2021,7 @@ fn parse_ninfer_startup_progress(stderr_tail: &[String]) -> Option<BackendLoadPr
 
 async fn read_and_validate_startup_log(
     pending: &PendingStartup,
-) -> Result<Option<EffectiveGenerationSettings>, EngineError> {
+) -> Result<Option<ObservedNinferStartup>, EngineError> {
     let file = tokio::fs::File::open(&pending.request_log_path)
         .await
         .map_err(|error| {
@@ -2278,7 +2319,25 @@ async fn read_and_validate_startup_log(
             ));
         }
     }
-    Ok(Some(defaults))
+    let resolved_settings = BTreeMap::from([
+        (
+            "context_length".to_owned(),
+            json!(startup.engine.max_context),
+        ),
+        (
+            "parallel_requests".to_owned(),
+            json!(startup.engine.max_concurrency),
+        ),
+        ("ninfer.kv_dtype".to_owned(), json!(startup.engine.kv_cache)),
+        (
+            "ninfer.kv_capacity".to_owned(),
+            json!(startup.engine.kv_capacity),
+        ),
+    ]);
+    Ok(Some(ObservedNinferStartup {
+        generation_settings: defaults,
+        resolved_settings,
+    }))
 }
 
 fn approximately_equal(left: f64, right: f64) -> bool {

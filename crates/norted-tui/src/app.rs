@@ -1109,14 +1109,10 @@ impl App {
             {
                 return (setting.value.to_string(), setting.source.to_string(), false);
             }
-            return ("<runtime default>".to_owned(), "runtime".to_owned(), false);
+            return self.settings_default_display(id);
         }
         let Some(scope) = self.selected_settings_scope() else {
-            return (
-                "<upstream default>".to_owned(),
-                "upstream".to_owned(),
-                false,
-            );
+            return ("<runtime default>".to_owned(), "runtime".to_owned(), false);
         };
         let current = match &scope {
             SettingsScope::Global => state.global_defaults.0.get(id),
@@ -1146,23 +1142,69 @@ impl App {
                 .map(|value| (value, "global-default".to_owned())),
         };
         inherited.map_or_else(
-            || {
-                self.setting_definitions
-                    .iter()
-                    .find(|definition| &definition.id == id)
-                    .and_then(|definition| definition.upstream_default.clone())
-                    .map_or_else(
-                        || {
-                            (
-                                "<upstream default>".to_owned(),
-                                "upstream".to_owned(),
-                                false,
-                            )
-                        },
-                        |value| (value, "default".to_owned(), false),
-                    )
-            },
+            || self.settings_default_display(id),
             |(value, source)| (value.to_string(), source, false),
+        )
+    }
+
+    fn settings_default_display(&self, id: &SettingId) -> (String, String, bool) {
+        let definition = self
+            .settings_definitions()
+            .into_iter()
+            .find(|definition| &definition.id == id);
+        let declared = definition.and_then(|definition| definition.upstream_default.as_deref());
+        if let Some(resolved) = self.settings_runtime_resolved_value(id) {
+            return (
+                format!("<default → {resolved}>"),
+                "runtime-resolved".to_owned(),
+                false,
+            );
+        }
+        (
+            compact_default_value(declared),
+            default_source_label(declared).to_owned(),
+            false,
+        )
+    }
+
+    pub fn settings_default_detail(&self, id: &SettingId) -> String {
+        let declared = self
+            .settings_definitions()
+            .into_iter()
+            .find(|definition| &definition.id == id)
+            .and_then(|definition| definition.upstream_default.as_deref());
+        let mut detail = format!(
+            "If unset: {}",
+            declared.unwrap_or("unknown runtime default")
+        );
+        if let Some(resolved) = self.settings_runtime_resolved_value(id) {
+            detail.push_str(&format!(" · Running backend resolved: {resolved}"));
+        }
+        detail
+    }
+
+    fn settings_runtime_resolved_value(&self, id: &SettingId) -> Option<String> {
+        if self.screen != Screen::ModelProfiles {
+            return None;
+        }
+        let profile = self.selected_model_profile_value()?;
+        let backend = &self.control.as_ref()?.backend;
+        if backend.lifecycle != BackendLifecycle::Running
+            || backend.model_profile_id.as_ref() != Some(&profile.id)
+        {
+            return None;
+        }
+        let value = backend
+            .provenance
+            .as_ref()?
+            .normalized_settings
+            .get("resolved_settings")?
+            .as_object()?
+            .get(id.as_str())?;
+        Some(
+            value
+                .as_str()
+                .map_or_else(|| value.to_string(), ToOwned::to_owned),
         )
     }
 
@@ -4074,6 +4116,62 @@ fn byte_index(value: &str, character_index: usize) -> usize {
         .char_indices()
         .nth(character_index)
         .map_or(value.len(), |(index, _)| index)
+}
+
+fn compact_default_value(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "<runtime default>".to_owned();
+    };
+    match value {
+        "runtime default" | "exact runtime default" => "<runtime default>".to_owned(),
+        "runtime-selected" => "<runtime-selected>".to_owned(),
+        "runtime-selected; omission preserves the exact runtime default" => {
+            "<runtime-selected>".to_owned()
+        }
+        "runtime/model-selected" => "<runtime/model-selected>".to_owned(),
+        "runtime/model automatic" => "<runtime/model auto>".to_owned(),
+        "runtime/model default" => "<runtime/model default>".to_owned(),
+        "runtime/model default or unlimited" => "<runtime/model default>".to_owned(),
+        "runtime/model template default" => "<model/template default>".to_owned(),
+        "model metadata" => "<model metadata>".to_owned(),
+        "model/thinking-mode default" => "<model/mode default>".to_owned(),
+        "exact runtime automatic" => "<runtime-selected>".to_owned(),
+        "exact runtime profile default" => "<runtime default>".to_owned(),
+        "auto in current runtimes" => "<runtime default: auto>".to_owned(),
+        "enabled in current runtimes" => "<runtime default: enabled>".to_owned(),
+        _ => {
+            for (prefix, label) in [
+                ("Norted default: ", "default"),
+                ("runtime default: ", "default"),
+                ("runtime profile default: ", "default"),
+                ("runtime automatic: ", "auto"),
+                ("runtime-selected ", "runtime-selected"),
+            ] {
+                if let Some(detail) = value.strip_prefix(prefix) {
+                    let detail = detail
+                        .split_once(';')
+                        .map_or(detail, |(concise, _)| concise);
+                    let detail = detail
+                        .split_once(" unless ")
+                        .map_or(detail, |(concise, _)| concise);
+                    return format!("<{label}: {detail}>");
+                }
+            }
+            format!("<default: {value}>")
+        }
+    }
+}
+
+fn default_source_label(value: Option<&str>) -> &'static str {
+    match value {
+        Some(value) if value.starts_with("Norted default:") => "Norted",
+        Some(value) if value.starts_with("model") || value.contains("model metadata") => "model",
+        Some(value) if value.starts_with("runtime") || value.starts_with("exact runtime") => {
+            "runtime"
+        }
+        Some(_) => "default",
+        None => "runtime",
+    }
 }
 
 #[cfg(test)]
