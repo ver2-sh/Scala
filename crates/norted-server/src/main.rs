@@ -132,9 +132,17 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             }
             ModelsCommand::Download { model_ref } => {
                 let library = norted_model_library::ModelLibrary::new(&core.paths);
-                let artifact = download_model_with_progress(&library, &model_ref, cli.json).await?;
+                let download = download_model_with_progress(&library, &model_ref, cli.json).await?;
                 core.refresh_models().await?;
-                output::model_operation("download", &artifact, cli.json)?;
+                output::model_operation(
+                    if download.already_installed {
+                        "already_installed"
+                    } else {
+                        "download"
+                    },
+                    &download.artifact,
+                    cli.json,
+                )?;
             }
             ModelsCommand::Import { path } => {
                 let library = norted_model_library::ModelLibrary::new(&core.paths);
@@ -413,12 +421,12 @@ async fn download_model_with_progress(
     library: &norted_model_library::ModelLibrary,
     model_ref: &str,
     json_output: bool,
-) -> Result<norted_core::ModelArtifact> {
+) -> Result<norted_model_library::ModelDownloadResult> {
     if json_output {
-        return Ok(library.download(model_ref).await?);
+        return Ok(library.download_with_status(model_ref).await?);
     }
     let mut progress = library.subscribe();
-    let download = library.download(model_ref);
+    let download = library.download_with_status(model_ref);
     tokio::pin!(download);
     let mut last_update = std::time::Instant::now() - std::time::Duration::from_secs(1);
     loop {

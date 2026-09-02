@@ -98,14 +98,21 @@ and status. Up to `server.max_parallel_model_downloads` acquisitions run at once
 minimum 1); the rest remain in a FIFO queue. Raising the Global setting fills newly available slots
 immediately. Lowering it never cancels work already running and suppresses starts until active work
 falls below the new limit. Completion and failure both release a slot. Exact active/queued
-references are deduplicated, final destinations are independently guarded after resolution, and a
-per-reference cache key plus per-job staging directory prevents cross-acquisition file mixing.
-Companion files remain sequential within one acquisition.
+references are deduplicated, and a per-reference cache key plus per-job staging directory prevents
+cross-acquisition file mixing. Companion files remain sequential within one acquisition.
+
+After resolution, downloads take a per-acquisition `fs2` file lock keyed by the canonical receipt
+acquisition identity. The lock lives in the stable model-download cache lock area and covers all
+partial-cache mutation, staging, validation, and atomic activation. Managed removal takes the same
+lock. Separate process-local schedulers (TUI or synchronous CLI) can therefore run unrelated
+acquisitions concurrently, while a same-acquisition waiter rechecks the destination and reports it
+as already installed after the owner completes.
 
 Progress broadcasts carry the job UUID, but they are presentation invalidations rather than the
-source of truth; the TUI re-snapshots all jobs after events and on its render cadence, so subscriber
-lag cannot corrupt state. Search is a separate task and managed removal uses only its own narrow
-busy/conflict checks. Terminal history is bounded. Scheduler state is process-local and survives
+source of truth; the TUI re-snapshots all jobs after events and on its render cadence, reconciles
+unseen Installed job IDs into model discovery refreshes, and therefore does not depend on receiving
+an individual completion broadcast. Search is a separate task and managed removal uses only its own
+narrow acquisition lock. Terminal history is bounded. Scheduler state is process-local and survives
 ordinary TUI navigation but not restart; resumable partial cache files do survive and are reused by
 the same exact reference.
 

@@ -6,6 +6,7 @@ mod terminal;
 mod theme;
 mod ui;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use norted_core::{
 use norted_engine::{
     BackendLifecycle, ControlClient, ControlClientError, ControlStatus, RuntimePackManager,
 };
-use norted_model_library::ModelLibrary;
+use norted_model_library::{ModelDownloadJobId, ModelLibrary, ModelOperationPhase};
 
 use app::{
     App, ControlAction, ModelLibraryAction, ModelLibraryTaskResult, ModelSettingsInspection,
@@ -180,6 +181,7 @@ pub async fn run(
         }
     });
     let mut render = false;
+    let mut refreshed_installed_jobs = HashSet::new();
     let mut render_tick = tokio::time::interval(Duration::from_millis(150));
     render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -277,32 +279,38 @@ pub async fn run(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => Update::None,
             },
             progress = model_progress.recv() => match progress {
-                Ok(progress) => {
-                    if progress.phase == norted_model_library::ModelOperationPhase::Installed {
-                        let core = Arc::clone(&core);
-                        let results = model_library_results.clone();
-                        tokio::spawn(async move {
-                            let result = core.refresh_models().await.map_err(|error| error.to_string());
-                            let _ = results
-                                .send(ModelLibraryTaskResult::ModelsRefreshed(result))
-                                .await;
-                        });
-                    }
-                    app.replace_model_download_jobs(model_library.download_jobs());
+                Ok(_) => {
+                    reconcile_model_download_jobs(
+                        &mut app,
+                        &model_library,
+                        &core,
+                        &model_library_results,
+                        &mut refreshed_installed_jobs,
+                    );
                     Update::Render
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    app.replace_model_download_jobs(model_library.download_jobs());
+                    reconcile_model_download_jobs(
+                        &mut app,
+                        &model_library,
+                        &core,
+                        &model_library_results,
+                        &mut refreshed_installed_jobs,
+                    );
                     Update::Render
                 },
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => Update::None,
             },
             _ = render_tick.tick() => {
-                let jobs = model_library.download_jobs();
-                let has_downloads = !jobs.is_empty();
-                app.replace_model_download_jobs(jobs);
+                let has_live_downloads = reconcile_model_download_jobs(
+                    &mut app,
+                    &model_library,
+                    &core,
+                    &model_library_results,
+                    &mut refreshed_installed_jobs,
+                );
                 let load_changed = app.advance_load_animation();
-                if has_downloads || load_changed {
+                if has_live_downloads || load_changed {
                     Update::Render
                 } else {
                     Update::None
@@ -353,6 +361,44 @@ pub async fn run(
     auth_observer.abort();
     terminal.leave()?;
     Ok(())
+}
+
+fn reconcile_model_download_jobs(
+    app: &mut App,
+    library: &ModelLibrary,
+    core: &Arc<ApplicationCore>,
+    results: &tokio::sync::mpsc::Sender<ModelLibraryTaskResult>,
+    refreshed_installed_jobs: &mut HashSet<ModelDownloadJobId>,
+) -> bool {
+    let jobs = library.download_jobs();
+    let current_ids = jobs
+        .iter()
+        .map(|job| job.id.clone())
+        .collect::<HashSet<_>>();
+    refreshed_installed_jobs.retain(|job_id| current_ids.contains(job_id));
+    let installed = jobs
+        .iter()
+        .filter(|job| job.phase == ModelOperationPhase::Installed)
+        .map(|job| job.id.clone())
+        .filter(|job_id| !refreshed_installed_jobs.contains(job_id))
+        .collect::<Vec<_>>();
+    if !installed.is_empty() {
+        refreshed_installed_jobs.extend(installed);
+        let core = Arc::clone(core);
+        let results = results.clone();
+        tokio::spawn(async move {
+            let result = core
+                .refresh_models()
+                .await
+                .map_err(|error| error.to_string());
+            let _ = results
+                .send(ModelLibraryTaskResult::ModelsRefreshed(result))
+                .await;
+        });
+    }
+    let has_live_downloads = jobs.iter().any(|job| !job.is_terminal());
+    app.replace_model_download_jobs(jobs);
+    has_live_downloads
 }
 
 fn spawn_model_library_action(

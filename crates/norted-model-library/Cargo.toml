@@ -8,6 +8,7 @@ description = "Managed local model library and remote model catalogs"
 [dependencies]
 async-trait.workspace = true
 futures-util.workspace = true
+fs2.workspace = true
 norted-core = { path = "../norted-core" }
 norted-engine-q27 = { path = "../norted-engine-q27" }
 reqwest.workspace = true
@@ -19,4 +20,3 @@ tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
-

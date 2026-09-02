@@ -1,12 +1,14 @@
 //! Managed model acquisition without model transformation or runtime ownership.
 
 use std::collections::HashSet;
+use std::fs::OpenOptions;
 use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use fs2::FileExt;
 use futures_util::StreamExt;
 use norted_core::{
     AppPaths, ArtifactFormat, ModelArtifact, ModelArtifactProvenance, ModelId, ModelLibraryReceipt,
@@ -61,8 +63,6 @@ pub enum ModelLibraryError {
         expected: String,
         observed: String,
     },
-    #[error("an acquisition for this destination is already in progress: {0}")]
-    AcquisitionInProgress(PathBuf),
 }
 
 type Result<T> = std::result::Result<T, ModelLibraryError>;
@@ -184,6 +184,12 @@ pub struct ModelOperationProgress {
     pub message: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelDownloadResult {
+    pub artifact: ModelArtifact,
+    pub already_installed: bool,
+}
+
 pub struct ModelLibrary {
     root: PathBuf,
     staging: PathBuf,
@@ -191,7 +197,6 @@ pub struct ModelLibrary {
     providers: Vec<Arc<dyn ModelCatalogProvider>>,
     progress: broadcast::Sender<ModelOperationProgress>,
     downloads: DownloadManager,
-    active_destinations: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
 }
 
 impl ModelLibrary {
@@ -208,7 +213,6 @@ impl ModelLibrary {
             providers: vec![Arc::new(HuggingFaceCatalogProvider::new())],
             progress,
             downloads: DownloadManager::new(maximum_parallel),
-            active_destinations: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -255,15 +259,23 @@ impl ModelLibrary {
     }
 
     pub async fn download(&self, model_ref: &str) -> Result<ModelArtifact> {
+        self.download_with_status(model_ref)
+            .await
+            .map(|result| result.artifact)
+    }
+
+    pub async fn download_with_status(&self, model_ref: &str) -> Result<ModelDownloadResult> {
         let job_id = ModelDownloadJobId::new();
-        self.download_with_job(&job_id, model_ref).await
+        self.download_with_job(&job_id, model_ref)
+            .await
+            .map(DownloadOutcome::into_result)
     }
 
     async fn download_with_job(
         &self,
         job_id: &ModelDownloadJobId,
         model_ref: &str,
-    ) -> Result<ModelArtifact> {
+    ) -> Result<DownloadOutcome> {
         let resolving = DownloadProgressContext {
             job_id,
             model_ref,
@@ -292,13 +304,13 @@ impl ModelLibrary {
                 };
                 let result = library.download_with_job(&job_id, &model_ref).await;
                 let (phase, message) = match &result {
-                    Ok(model) => (
+                    Ok(DownloadOutcome::Installed(model)) => (
                         ModelOperationPhase::Installed,
                         format!("Model installed as {}", model.id),
                     ),
-                    Err(ModelLibraryError::AlreadyInstalled(path)) => (
+                    Ok(DownloadOutcome::AlreadyInstalled(model)) => (
                         ModelOperationPhase::Installed,
-                        format!("Already installed at {}", path.display()),
+                        format!("Already installed as {}", model.id),
                     ),
                     Err(error) => (ModelOperationPhase::Failed, error.to_string()),
                 };
@@ -360,6 +372,7 @@ impl ModelLibrary {
         );
         let acquisition_id = logical.clone();
         let destination = self.root.join("imports").join(&logical[13..25]);
+        let _acquisition_lock = self.acquisition_lock(&acquisition_id).await?;
         if destination.exists() {
             return Err(ModelLibraryError::AlreadyInstalled(destination));
         }
@@ -610,6 +623,7 @@ impl ModelLibrary {
     }
 
     pub async fn remove(&self, plan: &ModelRemovalPlan) -> Result<()> {
+        let _acquisition_lock = self.acquisition_lock(&plan.acquisition_id).await?;
         let root = self
             .root
             .canonicalize()
@@ -634,14 +648,6 @@ impl ModelLibrary {
                 "managed acquisition removal target is no longer safe".to_owned(),
             ));
         }
-        if self
-            .active_destinations
-            .lock()
-            .expect("active model destination lock poisoned")
-            .contains(&acquisition_root)
-        {
-            return Err(ModelLibraryError::AcquisitionInProgress(acquisition_root));
-        }
         tokio::fs::remove_dir_all(&acquisition_root)
             .await
             .map_err(|source| ModelLibraryError::Io {
@@ -662,7 +668,7 @@ impl ModelLibrary {
         job_id: &ModelDownloadJobId,
         model_ref: &str,
         resolved: &ResolvedArtifact,
-    ) -> Result<ModelArtifact> {
+    ) -> Result<DownloadOutcome> {
         tokio::fs::create_dir_all(&self.download_cache)
             .await
             .map_err(|source| ModelLibraryError::Io {
@@ -670,20 +676,28 @@ impl ModelLibrary {
                 source,
             })?;
         let destination = managed_destination(&self.root, resolved)?;
-        if destination.exists() {
-            return Err(ModelLibraryError::AlreadyInstalled(destination));
-        }
-        let _destination_guard = ActiveDestinationGuard::acquire(
-            Arc::clone(&self.active_destinations),
-            destination.clone(),
-        )?;
-        let stage = self.create_stage().await?;
         let context = DownloadProgressContext {
             job_id,
             model_ref,
             provider: Some(&resolved.provider),
             repository: Some(&resolved.repository),
         };
+        let acquisition_id = remote_acquisition_id(resolved);
+        let _acquisition_lock = self.acquisition_lock(&acquisition_id).await?;
+        let primary_name = safe_remote_path(&resolved.primary.filename)?;
+        if destination.exists() {
+            let artifact = discover_exact(&destination, &primary_name)?;
+            self.emit(
+                &context,
+                &resolved.primary.filename,
+                ModelOperationPhase::Installed,
+                artifact.size_bytes,
+                Some(artifact.size_bytes),
+                "Already installed",
+            );
+            return Ok(DownloadOutcome::AlreadyInstalled(artifact));
+        }
+        let stage = self.create_stage().await?;
         async {
             let total = resolved
                 .primary
@@ -724,7 +738,6 @@ impl ModelLibrary {
                     .await?;
                 completed += bytes;
             }
-            let primary_name = safe_remote_path(&resolved.primary.filename)?;
             let primary_path = stage.join(&primary_name);
             self.emit(
                 &context,
@@ -733,18 +746,6 @@ impl ModelLibrary {
                 completed,
                 total_known.then_some(total),
                 "Inspecting downloaded artifact",
-            );
-            let acquisition_id = format!(
-                "{}:{}@{}:{}",
-                resolved.provider,
-                resolved.repository,
-                resolved.revision,
-                resolved
-                    .package
-                    .as_ref()
-                    .map_or(resolved.primary.filename.as_str(), |package| package
-                        .manifest_filename
-                        .as_str())
             );
             let receipt_members = if let Some(package) = &resolved.package {
                 let manifest_path = stage.join(safe_remote_path(&package.manifest_filename)?);
@@ -851,9 +852,47 @@ impl ModelLibrary {
                 total_known.then_some(total),
                 "Model installed",
             );
-            Ok(artifact)
+            Ok(DownloadOutcome::Installed(artifact))
         }
         .await
+    }
+
+    async fn acquisition_lock(&self, acquisition_id: &str) -> Result<AcquisitionLock> {
+        let lock_path = self
+            .download_cache
+            .join("locks")
+            .join(format!("{}.lock", sha256_text(acquisition_id)));
+        let task_path = lock_path.clone();
+        let file = tokio::task::spawn_blocking(move || {
+            if let Some(parent) = task_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|source| ModelLibraryError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            }
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&task_path)
+                .map_err(|source| ModelLibraryError::Io {
+                    path: task_path.clone(),
+                    source,
+                })?;
+            file.lock_exclusive()
+                .map_err(|source| ModelLibraryError::Io {
+                    path: task_path,
+                    source,
+                })?;
+            Ok::<std::fs::File, ModelLibraryError>(file)
+        })
+        .await
+        .map_err(|error| ModelLibraryError::Io {
+            path: lock_path,
+            source: std::io::Error::other(error),
+        })??;
+        Ok(AcquisitionLock { _file: file })
     }
 
     async fn download_file(
@@ -1077,37 +1116,28 @@ struct DownloadProgressContext<'a> {
     repository: Option<&'a str>,
 }
 
-struct ActiveDestinationGuard {
-    active: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
-    destination: PathBuf,
+enum DownloadOutcome {
+    Installed(ModelArtifact),
+    AlreadyInstalled(ModelArtifact),
 }
 
-impl ActiveDestinationGuard {
-    fn acquire(
-        active: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
-        destination: PathBuf,
-    ) -> Result<Self> {
-        if !active
-            .lock()
-            .expect("active model destination lock poisoned")
-            .insert(destination.clone())
-        {
-            return Err(ModelLibraryError::AcquisitionInProgress(destination));
+impl DownloadOutcome {
+    fn into_result(self) -> ModelDownloadResult {
+        match self {
+            Self::Installed(artifact) => ModelDownloadResult {
+                artifact,
+                already_installed: false,
+            },
+            Self::AlreadyInstalled(artifact) => ModelDownloadResult {
+                artifact,
+                already_installed: true,
+            },
         }
-        Ok(Self {
-            active,
-            destination,
-        })
     }
 }
 
-impl Drop for ActiveDestinationGuard {
-    fn drop(&mut self) {
-        self.active
-            .lock()
-            .expect("active model destination lock poisoned")
-            .remove(&self.destination);
-    }
+struct AcquisitionLock {
+    _file: std::fs::File,
 }
 
 struct StagingDirectory(PathBuf);
@@ -1625,6 +1655,21 @@ fn managed_destination(root: &Path, resolved: &ResolvedArtifact) -> Result<PathB
         .join(repository)
         .join(revision)
         .join(artifact))
+}
+
+fn remote_acquisition_id(resolved: &ResolvedArtifact) -> String {
+    format!(
+        "{}:{}@{}:{}",
+        resolved.provider,
+        resolved.repository,
+        resolved.revision,
+        resolved
+            .package
+            .as_ref()
+            .map_or(resolved.primary.filename.as_str(), |package| package
+                .manifest_filename
+                .as_str())
+    )
 }
 
 fn safe_segment(value: &str) -> Result<&str> {
