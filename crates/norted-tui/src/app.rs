@@ -1137,6 +1137,15 @@ impl App {
         self.runtime_mutation_busy
     }
 
+    pub fn model_runtime_picker_available(&self) -> bool {
+        self.selected_model
+            .and_then(|index| self.snapshot.models.get(index))
+            .is_some()
+            && (!self.runtime_list_loading || self.runtime_list.is_some())
+            && !self.runtime_picker_loading
+            && !self.runtime_mutation_busy
+    }
+
     pub fn runtime_remove_armed(&self) -> bool {
         self.selected_runtime
             .and_then(|index| self.runtime_list.as_ref()?.installed.get(index))
@@ -2815,9 +2824,7 @@ impl App {
                     InstalledModelAction::CreateProfile if !self.settings_busy => {
                         self.create_profile_for_selected_model()
                     }
-                    InstalledModelAction::Runtime
-                        if !self.runtime_mutation_busy && !self.runtime_picker_loading =>
-                    {
+                    InstalledModelAction::Runtime if self.model_runtime_picker_available() => {
                         self.open_model_runtime_picker()
                     }
                     InstalledModelAction::Unload
@@ -2996,6 +3003,7 @@ impl App {
                 | HoverTarget::RuntimeInstall
                 | HoverTarget::RuntimePickerResult(_)
                 | HoverTarget::RuntimePickerApply
+                | HoverTarget::RuntimePickerClear
                 | HoverTarget::RuntimeOverlayCancel
                 | HoverTarget::ProfileEngineResult(_)
                 | HoverTarget::ProfileEngineApply
@@ -3119,6 +3127,9 @@ impl App {
                 Update::Render
             }
             Some(HoverTarget::RuntimePickerApply) => self.activate_model_runtime_primary(),
+            Some(HoverTarget::RuntimePickerClear) if !self.runtime_mutation_busy => {
+                self.request_clear_model_runtime_selection()
+            }
             Some(HoverTarget::RuntimeOverlayCancel) => self.close_runtime_overlay(),
             _ => Update::None,
         }

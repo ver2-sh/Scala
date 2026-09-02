@@ -56,6 +56,7 @@ pub enum HoverTarget {
     RuntimeOverlayCancel,
     RuntimePickerResult(usize),
     RuntimePickerApply,
+    RuntimePickerClear,
     SettingsScope(usize),
     Setting(usize),
     SettingValue(usize),
@@ -110,6 +111,7 @@ pub struct UiLayout {
     pub runtime_search_details: Rect,
     pub runtime_search_submit: Rect,
     pub runtime_install_action: Rect,
+    pub runtime_picker_clear_action: Rect,
     pub runtime_overlay_cancel: Rect,
     pub runtime_operation_status: Rect,
     pub runtime_picker_active: bool,
@@ -482,6 +484,7 @@ impl UiLayout {
         let mut runtime_search_details = Rect::default();
         let mut runtime_search_submit = Rect::default();
         let mut runtime_install_action = Rect::default();
+        let mut runtime_picker_clear_action = Rect::default();
         let mut runtime_overlay_cancel = Rect::default();
         let mut runtime_operation_status = Rect::default();
         let mut runtime_search_rows = Vec::new();
@@ -560,6 +563,23 @@ impl UiLayout {
                 inner.width.min(22),
                 u16::from(inner.height > 0),
             );
+            if runtime_picker_active && app.selected_model_has_runtime_override() {
+                let clear_width = inner.width.min(if compact { 9 } else { 18 });
+                runtime_picker_clear_action = Rect::new(
+                    inner
+                        .right()
+                        .saturating_sub(10)
+                        .saturating_sub(clear_width.saturating_add(1)),
+                    runtime_install_action.y,
+                    clear_width,
+                    runtime_install_action.height,
+                );
+                runtime_install_action.width = runtime_install_action.width.min(
+                    runtime_picker_clear_action
+                        .x
+                        .saturating_sub(runtime_install_action.x.saturating_add(1)),
+                );
+            }
             let cancel_width = inner
                 .width
                 .saturating_sub(runtime_install_action.width)
@@ -570,14 +590,23 @@ impl UiLayout {
                 cancel_width,
                 runtime_install_action.height,
             );
-            runtime_operation_status = Rect::new(
-                runtime_install_action.right().saturating_add(1),
-                runtime_install_action.y,
-                runtime_overlay_cancel
-                    .x
-                    .saturating_sub(runtime_install_action.right().saturating_add(1)),
-                runtime_install_action.height,
-            );
+            runtime_operation_status = if runtime_picker_active {
+                Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(1),
+                    inner.width,
+                    u16::from(inner.height > 1),
+                )
+            } else {
+                Rect::new(
+                    runtime_install_action.right().saturating_add(1),
+                    runtime_install_action.y,
+                    runtime_overlay_cancel
+                        .x
+                        .saturating_sub(runtime_install_action.right().saturating_add(1)),
+                    runtime_install_action.height,
+                )
+            };
             let (indices, scroll) = if runtime_picker_active {
                 (app.runtime_picker_indices(), app.runtime_picker_scroll)
             } else {
@@ -874,6 +903,7 @@ impl UiLayout {
             runtime_search_details,
             runtime_search_submit,
             runtime_install_action,
+            runtime_picker_clear_action,
             runtime_overlay_cancel,
             runtime_operation_status,
             runtime_picker_active,
@@ -923,6 +953,9 @@ impl UiLayout {
         if self.runtime_search_popup.is_some() {
             if contains(self.runtime_overlay_cancel, position) {
                 return Some(HoverTarget::RuntimeOverlayCancel);
+            }
+            if self.runtime_picker_active && contains(self.runtime_picker_clear_action, position) {
+                return Some(HoverTarget::RuntimePickerClear);
             }
             if !self.runtime_picker_active && contains(self.runtime_search_input, position) {
                 return Some(HoverTarget::RuntimeSearchInput);

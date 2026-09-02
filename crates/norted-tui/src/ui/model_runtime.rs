@@ -203,6 +203,27 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         ))),
         layout.runtime_install_action,
     );
+    if app.selected_model_has_runtime_override() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                if layout.compact {
+                    "[ Clear ]"
+                } else {
+                    "[ Clear Override ]"
+                },
+                action_style(
+                    theme,
+                    if app.runtime_mutation_busy() {
+                        ActionState::Disabled
+                    } else {
+                        ActionState::Normal
+                    },
+                    app.hover == Some(HoverTarget::RuntimePickerClear),
+                ),
+            ))),
+            layout.runtime_picker_clear_action,
+        );
+    }
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "[ Cancel ]",
@@ -214,20 +235,19 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         ))),
         layout.runtime_overlay_cancel,
     );
-    let clear_hint = if app.selected_model_has_runtime_override() {
-        "  x/Delete clears override"
+    let shortcut_hint = if app.selected_model_has_runtime_override() {
+        if layout.compact {
+            "Use actions; Enter/x are shortcuts."
+        } else {
+            "Select a runtime, then use the actions below. Enter/x remain shortcuts."
+        }
+    } else if layout.compact {
+        "Use actions below; Enter is a shortcut."
     } else {
-        ""
+        "Select a runtime, then use the actions below. Enter remains a shortcut."
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            if has_candidates {
-                format!("Single click selects; Enter applies{clear_hint}")
-            } else {
-                format!("s/Enter opens format search{clear_hint}")
-            },
-            theme.hint,
-        ))),
+        Paragraph::new(Line::from(Span::styled(shortcut_hint, theme.hint))),
         layout.runtime_operation_status,
     );
 }
