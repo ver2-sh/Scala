@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
@@ -171,6 +171,7 @@ pub struct BackendStatus {
     pub lifecycle: BackendLifecycle,
     pub model_profile_id: ModelProfileId,
     pub model_id: ModelId,
+    /// Persistent/default role from the Model Profile, never a request override.
     pub role: ModelRole,
     pub residency: BackendResidency,
     pub engine_id: Option<String>,
@@ -423,7 +424,7 @@ struct AdmittedLoad {
     settings: SettingsPatch,
     cancellation_epoch: u64,
     generation: u64,
-    role: ModelRole,
+    profile_role: ModelRole,
     residency: BackendResidency,
 }
 
@@ -436,7 +437,7 @@ struct ManagedBackend {
     lifecycle: BackendLifecycle,
     model_profile_id: ModelProfileId,
     model_id: ModelId,
-    role: ModelRole,
+    profile_role: ModelRole,
     residency: BackendResidency,
     engine_id: Option<String>,
     runtime_id: Option<RuntimeId>,
@@ -639,7 +640,7 @@ impl RuntimeManager {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(RuntimeError::ShuttingDown);
         }
-        let operation = Arc::clone(&self.operation)
+        let mut operation = Arc::clone(&self.operation)
             .try_lock_owned()
             .map_err(|_| RuntimeError::Busy(self.current_lifecycle()))?;
         if self.shutting_down.load(Ordering::Acquire) {
@@ -678,8 +679,6 @@ impl RuntimeManager {
                             });
                         if reusable && matches!(intent, LoadIntent::Manual) {
                             backend.residency = BackendResidency::Pinned;
-                        } else if !reusable {
-                            backend.retiring = true;
                         }
                         if reusable {
                             let status = self.status_from_state(&state);
@@ -697,7 +696,11 @@ impl RuntimeManager {
             }
         };
         if failed_backend {
-            self.stop_backend_with_operation_held(&profile_id).await?;
+            let (returned_operation, result) = self
+                .stop_backend_with_operation_held(&profile_id, operation)
+                .await;
+            operation = returned_operation;
+            result?;
         }
         let cancellation_epoch = self.cancellation_epoch.load(Ordering::Acquire);
         let (role, residency) = match intent {
@@ -719,7 +722,7 @@ impl RuntimeManager {
                         settings,
                         cancellation_epoch,
                         generation,
-                        role,
+                        profile_role: role,
                         residency,
                     },
                     operation,
@@ -734,7 +737,7 @@ impl RuntimeManager {
         &self,
         profile_id: &ModelProfileId,
         model_id: &ModelId,
-        role: ModelRole,
+        profile_role: ModelRole,
         residency: BackendResidency,
         cancellation_epoch: u64,
     ) -> Result<u64, RuntimeError> {
@@ -754,7 +757,7 @@ impl RuntimeManager {
                 lifecycle: BackendLifecycle::Loading,
                 model_profile_id: profile_id.clone(),
                 model_id: model_id.clone(),
-                role,
+                profile_role,
                 residency,
                 engine_id: None,
                 runtime_id: None,
@@ -811,7 +814,7 @@ impl RuntimeManager {
             settings: invocation_settings,
             cancellation_epoch,
             generation,
-            role,
+            profile_role,
             residency,
         } = admitted;
         let profile_id = model_profile.id.clone();
@@ -1376,7 +1379,7 @@ impl RuntimeManager {
             backend.loading_process = None;
             backend.cancel_loading = false;
             backend.load_progress = None;
-            backend.role = role;
+            backend.profile_role = profile_role;
             backend.residency = residency;
             if let Some(provenance) = backend.provenance.as_mut() {
                 provenance.normalized_settings.extend(startup_observation);
@@ -1419,8 +1422,11 @@ impl RuntimeManager {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             manager.cancel_loading(&profile_id).await;
-            let _operation = manager.operation.lock().await;
-            manager.stop_backend_with_operation_held(&profile_id).await
+            let operation = Arc::clone(&manager.operation).lock_owned().await;
+            let (_operation, result) = manager
+                .stop_backend_with_operation_held(&profile_id, operation)
+                .await;
+            result
         })
         .await
         .map_err(|error| RuntimeError::Operation(format!("unload task failed: {error}")))?
@@ -1435,11 +1441,12 @@ impl RuntimeManager {
     async fn stop_backend_with_operation_held(
         self: &Arc<Self>,
         profile_id: &ModelProfileId,
-    ) -> Result<ControlStatus, RuntimeError> {
+        operation: OwnedMutexGuard<()>,
+    ) -> (OwnedMutexGuard<()>, Result<ControlStatus, RuntimeError>) {
         let (process, adapter, activity) = {
             let mut state = self.state.write().await;
             let Some(backend) = state.backends.get_mut(profile_id) else {
-                return Ok(self.status_from_state(&state));
+                return (operation, Ok(self.status_from_state(&state)));
             };
             backend.retiring = true;
             backend.lifecycle = BackendLifecycle::Stopping;
@@ -1466,52 +1473,31 @@ impl RuntimeManager {
             );
             (process, adapter, activity)
         };
-        let fallback_manager = Arc::clone(self);
-        let fallback_profile = profile_id.clone();
-        let fallback_activity = Arc::clone(&activity);
+        let manager = Arc::clone(self);
+        let profile_id = profile_id.clone();
+        let (completion_sender, completion) = oneshot::channel();
         tokio::spawn(async move {
-            Self::wait_until_drained(&fallback_activity).await;
-            let _operation = fallback_manager.operation.lock().await;
-            if let Err(error) = fallback_manager
-                .finish_backend_stop(&fallback_profile)
-                .await
-            {
-                tracing::warn!(profile = %fallback_profile, %error, "background backend retirement failed");
+            Self::wait_until_drained(&activity).await;
+            let result = manager
+                .finish_backend_stop_with_parts(&profile_id, process, adapter)
+                .await;
+            if let Err(error) = &result {
+                tracing::warn!(profile = %profile_id, %error, "backend retirement failed");
             }
+            let _ = completion_sender.send((operation, result));
         });
-        Self::wait_until_drained(&activity).await;
-        self.finish_backend_stop_with_parts(profile_id, process, adapter)
-            .await
-    }
-
-    async fn finish_backend_stop(
-        &self,
-        profile_id: &ModelProfileId,
-    ) -> Result<ControlStatus, RuntimeError> {
-        let (process, adapter) = {
-            let state = self.state.read().await;
-            let Some(backend) = state.backends.get(profile_id) else {
-                return Ok(self.status_from_state(&state));
-            };
-            let process = backend
-                .running
-                .as_ref()
-                .map(|running| running.process.clone())
-                .or_else(|| backend.loading_process.clone());
-            let adapter = backend
-                .running
-                .as_ref()
-                .map(|running| Arc::clone(&running.adapter))
-                .or_else(|| {
-                    backend
-                        .engine_id
-                        .as_deref()
-                        .and_then(|id| self.registry.get(id))
-                });
-            (process, adapter)
-        };
-        self.finish_backend_stop_with_parts(profile_id, process, adapter)
-            .await
+        match completion.await {
+            Ok(completion) => completion,
+            Err(error) => {
+                let operation = Arc::clone(&self.operation).lock_owned().await;
+                (
+                    operation,
+                    Err(RuntimeError::Operation(format!(
+                        "backend retirement task failed: {error}"
+                    ))),
+                )
+            }
+        }
     }
 
     async fn finish_backend_stop_with_parts(
@@ -1674,9 +1660,13 @@ impl RuntimeManager {
         for profile in &profiles {
             self.cancel_loading(profile).await;
         }
-        let _operation = self.operation.lock().await;
+        let mut operation = Arc::clone(&self.operation).lock_owned().await;
         for profile in profiles {
-            if let Err(error) = self.stop_backend_with_operation_held(&profile).await {
+            let (returned_operation, result) = self
+                .stop_backend_with_operation_held(&profile, operation)
+                .await;
+            operation = returned_operation;
+            if let Err(error) = result {
                 tracing::warn!(%profile, %error, "could not unload backend during shutdown");
             }
         }
@@ -1927,7 +1917,14 @@ impl RuntimeManager {
             .cloned()
             .ok_or_else(|| RuntimeError::ModelProfileNotFound(requested.clone()))?;
         let role = routing.role.unwrap_or(profile.role);
+        let profile_role = profile.role;
         let profile_hash = profile.content_hash();
+        {
+            let mut state = self.state.write().await;
+            if let Some(session) = state.sessions.get_mut(&routing.session_id) {
+                session.last_used_unix = unix_timestamp();
+            }
+        }
         if let Some(target) = self
             .try_fast_target(requested, &profile_hash, role, &routing.session_id)
             .await
@@ -1937,7 +1934,7 @@ impl RuntimeManager {
         if !self.options.jit_enabled && !self.state.read().await.backends.contains_key(requested) {
             return Err(RuntimeError::ModelProfileNotLoaded(requested.clone()));
         }
-        let operation = Arc::clone(&self.operation).lock_owned().await;
+        let mut operation = Arc::clone(&self.operation).lock_owned().await;
 
         if role == ModelRole::Primary {
             let previous = {
@@ -1967,11 +1964,16 @@ impl RuntimeManager {
                     })
                 };
                 if eligible {
-                    self.stop_backend_with_operation_held(&previous).await?;
+                    let (returned_operation, result) = self
+                        .stop_backend_with_operation_held(&previous, operation)
+                        .await;
+                    operation = returned_operation;
+                    result?;
                 }
             }
         } else {
-            self.reclaim_idle_with_operation_held(Some(&routing.session_id), Some(requested))
+            operation = self
+                .reclaim_idle_with_operation_held(Some(requested), operation)
                 .await;
         }
 
@@ -1995,7 +1997,11 @@ impl RuntimeManager {
             }
             Some((BackendLifecycle::Running, BackendResidency::Jit, false))
             | Some((BackendLifecycle::Failed, _, _)) => {
-                self.stop_backend_with_operation_held(requested).await?;
+                let (returned_operation, result) = self
+                    .stop_backend_with_operation_held(requested, operation)
+                    .await;
+                operation = returned_operation;
+                result?;
             }
             Some((BackendLifecycle::Running, BackendResidency::Pinned, false)) => {
                 return Err(RuntimeError::Operation(format!(
@@ -2019,7 +2025,7 @@ impl RuntimeManager {
             .reserve_loading(
                 requested,
                 &model.id,
-                role,
+                profile_role,
                 BackendResidency::Jit,
                 cancellation_epoch,
             )
@@ -2032,7 +2038,7 @@ impl RuntimeManager {
                 settings: SettingsPatch::default(),
                 cancellation_epoch,
                 generation,
-                role,
+                profile_role,
                 residency: BackendResidency::Jit,
             },
             operation,
@@ -2134,27 +2140,29 @@ impl RuntimeManager {
     }
 
     async fn reap_idle(self: &Arc<Self>) {
-        let Ok(_operation) = Arc::clone(&self.operation).try_lock_owned() else {
+        let Ok(operation) = Arc::clone(&self.operation).try_lock_owned() else {
             return;
         };
-        self.reclaim_idle_with_operation_held(None, None).await;
+        self.reclaim_idle_with_operation_held(None, operation).await;
     }
 
     async fn reclaim_idle_with_operation_held(
         self: &Arc<Self>,
-        requesting_session: Option<&str>,
         requested_profile: Option<&ModelProfileId>,
-    ) {
+        mut operation: OwnedMutexGuard<()>,
+    ) -> OwnedMutexGuard<()> {
         let now = unix_timestamp();
-        let protected_primary = {
+        let leased_primaries = {
             let mut state = self.state.write().await;
             let session_ttl = duration_seconds_i64(self.options.primary_idle_ttl);
             state
                 .sessions
                 .retain(|_, session| now.saturating_sub(session.last_used_unix) < session_ttl);
-            requesting_session
-                .and_then(|id| state.sessions.get(id))
-                .and_then(|s| s.primary.clone())
+            state
+                .sessions
+                .values()
+                .filter_map(|session| session.primary.clone())
+                .collect::<BTreeSet<_>>()
         };
         let candidates = {
             let state = self.state.read().await;
@@ -2165,11 +2173,11 @@ impl RuntimeManager {
                 .values()
                 .filter(|backend| {
                     backend.residency == BackendResidency::Jit
-                        && backend.role == ModelRole::Auxiliary
+                        && backend.profile_role == ModelRole::Auxiliary
                         && backend.lifecycle == BackendLifecycle::Running
                         && backend.activity.active_requests.load(Ordering::Acquire) == 0
                         && Some(&backend.model_profile_id) != requested_profile
-                        && protected_primary.as_ref() != Some(&backend.model_profile_id)
+                        && !leased_primaries.contains(&backend.model_profile_id)
                 })
                 .map(|backend| {
                     (
@@ -2193,29 +2201,25 @@ impl RuntimeManager {
                 })
                 .collect::<Vec<_>>();
             selected.extend(state.backends.values().filter_map(|backend| {
-                let unleased = !state
-                    .sessions
-                    .values()
-                    .any(|session| session.primary.as_ref() == Some(&backend.model_profile_id));
                 (backend.residency == BackendResidency::Jit
-                    && backend.role == ModelRole::Primary
+                    && backend.profile_role == ModelRole::Primary
                     && backend.lifecycle == BackendLifecycle::Running
                     && backend.activity.active_requests.load(Ordering::Acquire) == 0
-                    && unleased
-                    && protected_primary.as_ref() != Some(&backend.model_profile_id)
+                    && !leased_primaries.contains(&backend.model_profile_id)
                     && Some(&backend.model_profile_id) != requested_profile
                     && now.saturating_sub(backend.activity.last_used_unix.load(Ordering::Acquire))
                         >= primary_ttl)
                     .then_some(backend.model_profile_id.clone())
             }));
             selected.extend(state.backends.values().filter_map(|backend| {
-                let ttl = match backend.role {
+                let ttl = match backend.profile_role {
                     ModelRole::Primary => primary_ttl,
                     ModelRole::Auxiliary => auxiliary_ttl,
                 };
                 (backend.residency == BackendResidency::Jit
                     && backend.lifecycle == BackendLifecycle::Failed
                     && backend.activity.active_requests.load(Ordering::Acquire) == 0
+                    && !leased_primaries.contains(&backend.model_profile_id)
                     && now.saturating_sub(backend.activity.last_used_unix.load(Ordering::Acquire))
                         >= ttl)
                     .then_some(backend.model_profile_id.clone())
@@ -2223,10 +2227,15 @@ impl RuntimeManager {
             selected
         };
         for profile in candidates {
-            if let Err(error) = self.stop_backend_with_operation_held(&profile).await {
+            let (returned_operation, result) = self
+                .stop_backend_with_operation_held(&profile, operation)
+                .await;
+            operation = returned_operation;
+            if let Err(error) = result {
                 tracing::warn!(%profile, %error, "could not reap idle JIT backend");
             }
         }
+        operation
     }
 
     async fn handle_unexpected_exit(
@@ -2304,7 +2313,7 @@ impl RuntimeManager {
                     lifecycle: backend.lifecycle,
                     model_profile_id: backend.model_profile_id.clone(),
                     model_id: backend.model_id.clone(),
-                    role: backend.role,
+                    role: backend.profile_role,
                     residency: backend.residency,
                     engine_id: backend.engine_id.clone(),
                     runtime_id: backend.runtime_id.clone(),
@@ -2825,7 +2834,7 @@ mod tests {
             lifecycle: BackendLifecycle::Loading,
             model_profile_id: ModelProfileId::new("fixture").expect("profile ID"),
             model_id: ModelId("fixture".to_owned()),
-            role: ModelRole::Primary,
+            profile_role: ModelRole::Primary,
             residency: BackendResidency::Jit,
             engine_id: None,
             runtime_id: None,
