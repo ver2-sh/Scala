@@ -1089,7 +1089,7 @@ impl RuntimeManager {
                 }
             };
             match observation {
-                StartupObservation::Ready(observation) => {
+                StartupObservation::Ready(mut observation) => {
                     let settings = match adapter.effective_generation_settings(&process).await {
                         Ok(settings) => settings,
                         Err(error) => {
@@ -1104,6 +1104,19 @@ impl RuntimeManager {
                             return Err(RuntimeError::StartupFailed(detail));
                         }
                     };
+                    if let Err(error) =
+                        merge_effective_generation_settings(&mut observation, settings)
+                    {
+                        cleanup_pending_launch_files(&launch_attempts).await;
+                        let detail = format!(
+                            "could not record effective generation settings from the engine: {error}"
+                        );
+                        let retained = self.terminate_or_retain(&process).await;
+                        adapter.clear_launch_state(Some(&endpoint)).await;
+                        self.fail_loading(generation, detail.clone(), retained.as_ref())
+                            .await;
+                        return Err(RuntimeError::StartupFailed(detail));
+                    }
                     break (process, endpoint, exit, observation, settings);
                 }
                 StartupObservation::RetryContextCapacity {
@@ -1995,6 +2008,27 @@ fn reserve_loopback_address() -> std::io::Result<SocketAddr> {
     let address = listener.local_addr()?;
     drop(listener);
     Ok(address)
+}
+
+fn merge_effective_generation_settings(
+    normalized_settings: &mut BTreeMap<String, serde_json::Value>,
+    effective: EffectiveGenerationSettings,
+) -> Result<(), EngineError> {
+    let resolved_settings = normalized_settings
+        .entry("resolved_settings".to_owned())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| {
+            EngineError::Operation(
+                "startup observation `resolved_settings` must be a JSON object".to_owned(),
+            )
+        })?;
+    resolved_settings.insert(
+        "temperature".to_owned(),
+        serde_json::json!(effective.temperature),
+    );
+    resolved_settings.insert("top_p".to_owned(), serde_json::json!(effective.top_p));
+    Ok(())
 }
 
 fn native_argument_provenance(arguments: Vec<String>) -> Vec<NativeArgumentProvenance> {
