@@ -473,14 +473,14 @@ cargo run -p norted-server -- load coding-large-context
 cargo run -p norted-server -- load coding-large-context --set parallel_requests=2
 cargo run -p norted-server -- settings show --engine llama.cpp
 cargo run -p norted-server -- status
-cargo run -p norted-server -- unload
+cargo run -p norted-server -- unload coding-large-context
 ```
 
 `load` contacts the already-running serving process; it does not launch a hidden second server. Explicit loads are pinned, may coexist, and are never removed by JIT cleanup. `unload <PROFILE>` drains and removes only that profile.
 
-Inference is JIT-loaded by Model Profile. With zero resident models, the first Responses or Chat Completions request resolves the profile's exact artifact, engine, runtime, settings, and provenance, waits for startup, and then runs. Requests without Norted attribution share one deterministic default logical session, so changing its primary model drains and replaces the previous unpinned JIT primary. A profile declared `auxiliary`, or a request carrying `X-Norted-Role: auxiliary`, loads alongside the session primary and remains warm until its auxiliary TTL.
+Inference is JIT-loaded by Model Profile. With zero resident models, the first Responses or Chat Completions request resolves the profile's exact artifact, engine, runtime, settings, and provenance, waits for startup, and then runs. Requests without Norted attribution share one deterministic default logical session, so changing its primary model drains and replaces the previous unpinned JIT primary. A profile declared `auxiliary` uses the auxiliary cache policy. A request carrying `X-Norted-Role: auxiliary` routes alongside the session primary without changing the backend's Model Profile role or immutable identity.
 
-Both inference endpoints accept two optional orchestration headers: `X-Norted-Session` is an opaque 1–128 byte visible value retained only in memory, and `X-Norted-Role` is exactly `primary` or `auxiliary`. Role overrides the profile default for that request. Session and role metadata are never forwarded to engines or included in immutable provenance. Distinct explicit sessions may retain different primary profiles, while sessions choosing the same profile share one backend.
+Both inference endpoints accept two optional orchestration headers: `X-Norted-Session` is an opaque 1–128 byte visible value retained only in memory, and `X-Norted-Role` is exactly `primary` or `auxiliary`. Role overrides the profile default for that request. Session and role metadata are never forwarded to engines or included in immutable provenance. Distinct explicit sessions may retain different primary profiles, while sessions choosing the same profile share one backend. Every attributed request renews an existing session, but only primary requests create a session or change its primary. Any backend held as a live session primary is protected from JIT eviction regardless of its configured profile role.
 
 Private `POST /control/v1/load` is a short authenticated admission request. A successful request reserves a manager generation as Loading, starts a server-owned background operation, and returns `202 Accepted`; the TUI then observes progress and the final state through private status. The scriptable `norted-server load` command preserves blocking semantics by polling that exact generation until Running or Failed. Disconnecting a CLI or attached TUI does not cancel an accepted load; unloading, server shutdown, or exiting a TUI that owns its server still uses the normal manager cancellation path.
 

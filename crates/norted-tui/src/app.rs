@@ -98,6 +98,12 @@ pub enum ControlAction {
     Unload(ModelProfileId),
 }
 
+fn control_action_profile_id(action: &ControlAction) -> &ModelProfileId {
+    match action {
+        ControlAction::Load(profile_id) | ControlAction::Unload(profile_id) => profile_id,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum ControlStatusSource {
     Observation,
@@ -371,6 +377,8 @@ pub struct App {
     pub load_animation_frame: u32,
     focus_before_command: FocusArea,
     pending_control_action: Option<ControlAction>,
+    active_control_action: Option<ControlAction>,
+    lifecycle_notice_target: Option<ModelProfileId>,
     control_busy: bool,
     pending_runtime_action: Option<RuntimeAction>,
     runtime_mutation_busy: bool,
@@ -484,6 +492,8 @@ impl App {
             load_animation_frame: 0,
             focus_before_command: FocusArea::Navigation,
             pending_control_action: None,
+            active_control_action: None,
+            lifecycle_notice_target: None,
             control_busy: false,
             pending_runtime_action: None,
             runtime_mutation_busy: false,
@@ -815,7 +825,10 @@ impl App {
     }
 
     pub fn take_control_action(&mut self) -> Option<ControlAction> {
-        self.pending_control_action.take()
+        let action = self.pending_control_action.take();
+        self.lifecycle_notice_target = action.as_ref().map(control_action_profile_id).cloned();
+        self.active_control_action = action.clone();
+        action
     }
 
     pub fn handle_control_result(&mut self, result: Result<ControlStatus, String>) {
@@ -829,8 +842,10 @@ impl App {
             Err(error) => {
                 self.notice = Some(error.clone());
                 self.push_log(LogLevel::Error, error);
+                self.lifecycle_notice_target = None;
             }
         }
+        self.active_control_action = None;
     }
 
     pub fn take_runtime_action(&mut self) -> Option<RuntimeAction> {
@@ -1725,32 +1740,59 @@ impl App {
     }
 
     fn apply_control_status(&mut self, source: ControlStatusSource, status: ControlStatus) -> bool {
-        let previous = self
-            .control
-            .as_ref()
-            .and_then(ControlStatus::newest_backend)
-            .map(|backend| (backend.generation, backend.lifecycle));
+        let target = match source {
+            ControlStatusSource::ControlResult => self
+                .active_control_action
+                .as_ref()
+                .map(control_action_profile_id),
+            ControlStatusSource::Observation => self.lifecycle_notice_target.as_ref(),
+        }
+        .cloned();
+        let previous = self.control.as_ref().and_then(|control| {
+            target
+                .as_ref()
+                .and_then(|profile_id| control.backend(profile_id))
+                .or_else(|| target.is_none().then(|| control.newest_backend()).flatten())
+        });
+        let previous = previous.map(|backend| (backend.generation, backend.lifecycle));
 
         if source == ControlStatusSource::ControlResult {
             self.set_control_result_notice(&status);
         }
         self.ingest_control_events(&status);
         if source == ControlStatusSource::Observation {
-            self.reconcile_lifecycle_notice(previous, &status);
+            self.reconcile_lifecycle_notice(target.as_ref(), previous, &status);
         }
         self.control = Some(status);
         true
     }
 
     fn set_control_result_notice(&mut self, status: &ControlStatus) {
-        let Some(backend) = status.newest_backend() else {
-            self.notice = Some("Model Profile unloaded".to_owned());
+        let action = self.active_control_action.clone();
+        let target = action.as_ref().map(control_action_profile_id);
+        let backend = target
+            .and_then(|profile_id| status.backend(profile_id))
+            .or_else(|| target.is_none().then(|| status.newest_backend()).flatten());
+        if let Some(ControlAction::Unload(profile_id)) = action.as_ref()
+            && backend.is_none()
+        {
+            let completion = format!("Model Profile {profile_id} unloaded");
+            self.notice = Some(completion.clone());
+            self.push_log(LogLevel::Info, completion);
+            self.lifecycle_notice_target = None;
+            return;
+        }
+        let Some(backend) = backend else {
+            self.notice = Some("Control operation completed".to_owned());
+            self.lifecycle_notice_target = None;
             return;
         };
+        let profile_id = &backend.model_profile_id;
         let lifecycle = backend.lifecycle;
         if lifecycle.is_loading() {
-            self.notice = Some("Model load started".to_owned());
-            self.push_log(LogLevel::Info, "Model load started".to_owned());
+            let notice = format!("Model Profile {profile_id} load started");
+            self.notice = Some(notice.clone());
+            self.push_log(LogLevel::Info, notice);
             return;
         }
 
@@ -1761,24 +1803,43 @@ impl App {
             )
         });
         let completion = runtime.map_or_else(
-            || format!("Backend is now {lifecycle:?}"),
-            |runtime| format!("Backend is now {lifecycle:?} with runtime {runtime}"),
+            || format!("Model Profile {profile_id} is now {lifecycle:?}"),
+            |runtime| {
+                format!("Model Profile {profile_id} is now {lifecycle:?} with runtime {runtime}")
+            },
         );
         self.notice = Some(completion.clone());
         self.push_log(
             LogLevel::Info,
             format!("Control operation completed: {completion}"),
         );
+        if !matches!(
+            lifecycle,
+            BackendLifecycle::Loading | BackendLifecycle::Stopping
+        ) {
+            self.lifecycle_notice_target = None;
+        }
     }
 
     fn reconcile_lifecycle_notice(
         &mut self,
+        target: Option<&ModelProfileId>,
         previous: Option<(u64, BackendLifecycle)>,
         status: &ControlStatus,
     ) {
-        let Some(backend) = status.newest_backend() else {
+        let backend = target
+            .and_then(|profile_id| status.backend(profile_id))
+            .or_else(|| target.is_none().then(|| status.newest_backend()).flatten());
+        let Some(backend) = backend else {
+            if let (Some(profile_id), Some(_)) = (target, previous) {
+                let notice = format!("Model Profile {profile_id} unloaded");
+                self.notice = Some(notice.clone());
+                self.push_log(LogLevel::Info, notice);
+                self.lifecycle_notice_target = None;
+            }
             return;
         };
+        let profile_id = backend.model_profile_id.clone();
         let generation = backend.generation;
         let lifecycle = backend.lifecycle;
         let generation_advanced =
@@ -1792,6 +1853,9 @@ impl App {
             if let Some(failure) = &backend.failure {
                 self.notice = Some(failure.clone());
             }
+            if target.is_some() {
+                self.lifecycle_notice_target = None;
+            }
             return;
         }
         if !lifecycle_changed {
@@ -1803,22 +1867,27 @@ impl App {
             BackendLifecycle::Running
                 if generation_advanced || previous_lifecycle == Some(BackendLifecycle::Loading) =>
             {
-                Some("Model loaded")
+                Some(format!("Model Profile {profile_id} loaded"))
             }
             BackendLifecycle::Stopping
                 if generation_advanced || previous_lifecycle == Some(BackendLifecycle::Loading) =>
             {
-                Some("Model load stopping")
+                Some(format!("Model Profile {profile_id} load stopping"))
             }
-            BackendLifecycle::Stopped => Some(match previous_lifecycle {
-                Some(BackendLifecycle::Loading) => "Model load stopped",
-                _ => "Backend stopped",
-            }),
+            BackendLifecycle::Stopped => Some(format!("Model Profile {profile_id} stopped")),
             _ => None,
         };
         if let Some(notice) = notice {
-            self.notice = Some(notice.to_owned());
-            self.push_log(LogLevel::Info, notice.to_owned());
+            self.notice = Some(notice.clone());
+            self.push_log(LogLevel::Info, notice);
+        }
+        if target.is_some()
+            && matches!(
+                lifecycle,
+                BackendLifecycle::Running | BackendLifecycle::Stopped
+            )
+        {
+            self.lifecycle_notice_target = None;
         }
     }
 
