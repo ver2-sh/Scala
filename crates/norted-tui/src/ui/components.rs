@@ -6,6 +6,30 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 use crate::theme::{Glyphs, Theme};
 use norted_engine::BackendLoadProgress;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ActionState {
+    Normal,
+    Primary,
+    Disabled,
+    Destructive,
+    Confirm,
+}
+
+pub fn action_style(theme: &Theme, state: ActionState, hovered: bool) -> ratatui::style::Style {
+    let style = match state {
+        ActionState::Normal => theme.text,
+        ActionState::Primary => theme.accent,
+        ActionState::Disabled => theme.muted,
+        ActionState::Destructive => theme.warning,
+        ActionState::Confirm => theme.error,
+    };
+    if hovered && state != ActionState::Disabled {
+        style.patch(theme.hovered)
+    } else {
+        style
+    }
+}
+
 pub fn section_title<'a>(title: &'a str, subtitle: &'a str, theme: &Theme) -> Paragraph<'a> {
     Paragraph::new(vec![
         Line::from(Span::styled(title, theme.accent)),
@@ -57,25 +81,6 @@ pub fn popup_block<'a>(title: &'a str, theme: &Theme, glyphs: &Glyphs) -> Block<
         .border_style(theme.border)
         .style(theme.panel)
         .padding(Padding::horizontal(1))
-}
-
-pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
 }
 
 pub fn centered_message(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'_>>) {

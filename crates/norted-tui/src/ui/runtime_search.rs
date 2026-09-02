@@ -7,7 +7,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, Overlay, RuntimeSearchFocus};
 use crate::theme::{Glyphs, Theme};
-use crate::ui::components::{KEY_COLUMN, format_bytes, key_value, popup_block};
+use crate::ui::components::{
+    ActionState, KEY_COLUMN, action_style, format_bytes, key_value, popup_block,
+};
 use crate::ui::layout::{HoverTarget, UiLayout};
 use crate::ui::screens::compatibility_label;
 
@@ -56,11 +58,15 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     };
     frame.render_widget(Paragraph::new(query), layout.runtime_search_input);
 
-    let submit_style = if app.hover == Some(HoverTarget::RuntimeSearchSubmit) {
-        theme.hovered
-    } else {
-        theme.accent
-    };
+    let submit_style = action_style(
+        theme,
+        if app.runtime_search_loading || app.runtime_mutation_busy() {
+            ActionState::Disabled
+        } else {
+            ActionState::Primary
+        },
+        app.hover == Some(HoverTarget::RuntimeSearchSubmit),
+    );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             if app.runtime_search_loading {
@@ -402,28 +408,38 @@ fn render_action(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLay
     let selected = app
         .selected_runtime_search_result
         .and_then(|index| app.runtime_search.as_ref()?.results.get(index));
-    let (label, style) = match selected {
-        Some(result) if result.installed => ("Installed", theme.success),
+    let (label, state) = match selected {
+        Some(result) if result.installed => ("Installed", ActionState::Disabled),
         Some(result)
             if matches!(
                 result.entry.compatibility,
                 RuntimeCompatibility::Incompatible(_)
             ) =>
         {
-            ("Incompatible", theme.error)
+            ("Incompatible", ActionState::Disabled)
         }
-        Some(_) if app.runtime_mutation_busy() => ("Installing…", theme.warning),
-        Some(_) => ("[Enter/i] Install", theme.accent),
-        None => ("Select a runtime", theme.hint),
-    };
-    let style = if app.hover == Some(HoverTarget::RuntimeInstall) {
-        style.patch(theme.hovered)
-    } else {
-        style
+        Some(_) if app.runtime_mutation_busy() => ("Installing…", ActionState::Disabled),
+        Some(_) if app.runtime_search_loading => ("Searching…", ActionState::Disabled),
+        Some(_) => ("[ Install ]", ActionState::Primary),
+        None => ("Select a runtime", ActionState::Disabled),
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(label, style))),
+        Paragraph::new(Line::from(Span::styled(
+            label,
+            action_style(theme, state, app.hover == Some(HoverTarget::RuntimeInstall)),
+        ))),
         layout.runtime_install_action,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "[ Close ]",
+            action_style(
+                theme,
+                ActionState::Normal,
+                app.hover == Some(HoverTarget::RuntimeOverlayCancel),
+            ),
+        ))),
+        layout.runtime_overlay_cancel,
     );
     if let Some(progress) = &app.runtime_operation {
         frame.render_widget(
@@ -449,7 +465,7 @@ fn render_action(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLay
     } else {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "Tab focus  Space toggle  Up/Down or j/k select  F5 refresh  Esc close",
+                "Tab focus  Space toggle  Up/Down or j/k select  F5 refresh",
                 theme.hint,
             ))),
             layout.runtime_operation_status,

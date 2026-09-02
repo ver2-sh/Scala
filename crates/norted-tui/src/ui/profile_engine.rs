@@ -5,19 +5,19 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
 use crate::app::{App, Overlay};
 use crate::theme::{Glyphs, Theme};
+use crate::ui::components::{ActionState, action_style};
+use crate::ui::layout::{HoverTarget, UiLayout};
 
-pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs) {
+pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, layout: &UiLayout) {
     if app.overlay != Some(Overlay::ProfileEngine) {
         return;
     }
     let Some(selection) = &app.profile_engine_selection else {
         return;
     };
-    let area = centered(
-        frame.area(),
-        68,
-        (selection.engines.len() as u16).saturating_add(6),
-    );
+    let Some(area) = layout.profile_engine_popup else {
+        return;
+    };
     frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default()
@@ -46,11 +46,15 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs) 
         } else {
             engine.as_str()
         };
-        ListItem::new(format!("  {label}")).style(if selection.selected == index {
+        let mut style = if selection.selected == index {
             theme.selected
         } else {
             theme.text
-        })
+        };
+        if app.hover == Some(HoverTarget::ProfileEngineResult(index)) {
+            style = style.patch(theme.hovered);
+        }
+        ListItem::new(format!("  {label}")).style(style)
     });
     frame.render_widget(
         List::new(items),
@@ -62,18 +66,25 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs) 
         ),
     );
     frame.render_widget(
-        Paragraph::new("↑/↓ or j/k selects · Enter creates · Esc cancels").style(theme.hint),
-        Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+        Paragraph::new(Line::from(Span::styled(
+            "[ Create ]",
+            action_style(
+                theme,
+                ActionState::Primary,
+                app.hover == Some(HoverTarget::ProfileEngineApply),
+            ),
+        ))),
+        layout.profile_engine_apply,
     );
-}
-
-fn centered(area: Rect, maximum_width: u16, requested_height: u16) -> Rect {
-    let width = maximum_width.min(area.width.saturating_sub(4)).max(1);
-    let height = requested_height.min(area.height.saturating_sub(2)).max(1);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "[ Cancel ]",
+            action_style(
+                theme,
+                ActionState::Normal,
+                app.hover == Some(HoverTarget::ProfileEngineCancel),
+            ),
+        ))),
+        layout.profile_engine_cancel,
+    );
 }

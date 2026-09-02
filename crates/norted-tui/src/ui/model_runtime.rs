@@ -4,7 +4,7 @@ use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, Overlay};
 use crate::theme::{Glyphs, Theme};
-use crate::ui::components::{KEY_COLUMN, key_value, popup_block};
+use crate::ui::components::{ActionState, KEY_COLUMN, action_style, key_value, popup_block};
 use crate::ui::layout::{HoverTarget, UiLayout};
 use crate::ui::screens::compatibility_label;
 
@@ -178,24 +178,41 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         );
     }
 
-    let action_style = if app.hover == Some(HoverTarget::RuntimePickerApply) {
-        theme.hovered
-    } else {
-        theme.accent
-    };
     let format_label = model
         .map(|model| model.format.as_str().to_ascii_uppercase())
         .unwrap_or_else(|| "MODEL".to_owned());
     let action_label = if app.runtime_mutation_busy() {
         "Saving…".to_owned()
     } else if !has_candidates {
-        format!("[s/Enter] Search {format_label}")
+        format!("[ Search {format_label} ]")
     } else {
-        "[Enter] Use selected".to_owned()
+        "[ Use selected ]".to_owned()
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(action_label, action_style))),
+        Paragraph::new(Line::from(Span::styled(
+            action_label,
+            action_style(
+                theme,
+                if app.runtime_mutation_busy() {
+                    ActionState::Disabled
+                } else {
+                    ActionState::Primary
+                },
+                app.hover == Some(HoverTarget::RuntimePickerApply),
+            ),
+        ))),
         layout.runtime_install_action,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "[ Cancel ]",
+            action_style(
+                theme,
+                ActionState::Normal,
+                app.hover == Some(HoverTarget::RuntimeOverlayCancel),
+            ),
+        ))),
+        layout.runtime_overlay_cancel,
     );
     let clear_hint = if app.selected_model_has_runtime_override() {
         "  x/Delete clears override"
@@ -205,9 +222,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             if has_candidates {
-                format!("Single click selects; Enter applies{clear_hint}  Esc cancel")
+                format!("Single click selects; Enter applies{clear_hint}")
             } else {
-                format!("s/Enter opens format search{clear_hint}  Esc cancel")
+                format!("s/Enter opens format search{clear_hint}")
             },
             theme.hint,
         ))),
