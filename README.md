@@ -66,6 +66,16 @@ revision context, filters by format, and labels remote results as format candida
 compatibility is unverified. Download, import, and removal are explicit operations; only
 receipt-backed acquisitions below the managed root can be removed by the library.
 
+Discover includes an in-process model download manager. Separate acquisitions run concurrently
+(four by default), overflow requests wait in FIFO order, and a completed or failed job immediately
+releases its slot to the next queued request. Settings > Global > Downloads exposes the typed
+`server.max_parallel_model_downloads` value with a minimum of 1; raising it starts more queued jobs
+immediately, while lowering it lets current transfers finish and limits subsequent starts. Exact
+duplicate references are admitted only once while queued or active. The download panel retains a
+bounded recent history and shows each job's artifact, phase, real bytes/total and percentage when
+known, measured transfer rate, calculated ETA when meaningful, or queue position. Search and TUI
+navigation remain independent of downloads.
+
 Managed models use the platform-native Norted data directory shown by `config show`:
 
 ```text
@@ -135,8 +145,9 @@ observed technical capabilities match.
 
 Common and engine-specific settings share `SettingId`, `SettingValue`, `SettingDefinition`,
 `SettingsPatch`, `ResolvedSettings`, and setting-source attribution. Presentation categories are
-General, Load, Generation, Reasoning, Prompt, KV / Memory, Speculation, Cache, and Advanced. An
-engine or Model Profile editor shows common controls plus only that engine's namespace.
+General, Downloads, Load, Generation, Reasoning, Prompt, KV / Memory, Speculation, Cache, and
+Advanced. Server-operational definitions appear only in Global; an engine or Model Profile editor
+shows common controls plus only that engine's namespace.
 
 llama.cpp exposes load/runtime controls for context and slots; CPU threads and logical/physical
 batches; weight and KV offload; unified KV, checkpointing, Flash Attention, and K/V cache types;
@@ -475,6 +486,14 @@ cargo run -p norted-server -- tui
 At startup the TUI safely chooses one of two modes: it attaches to a healthy instance discovered through the existing runtime descriptor, public identity probe, and authenticated private control `status`, or it starts and owns the same serving composition used by headless `serve`. In owned mode the configured OpenAI-compatible endpoint is live while the TUI runs. Exiting shuts down the owned listeners and active backend and removes the owned descriptor; exiting an attached TUI leaves the external server running.
 
 Its top-level pages are Overview, Models, Model Profiles, Runtimes, Server, Logs, Settings, and Help. Models is an integrated Model Library: Installed preserves the local artifact/profile/runtime workflow, while Discover provides Hugging Face query editing, format filtering, repository-qualified artifact details, compact revision and size, known companion/package-manifest status, live download bytes, and explicit managed removal. Identical filenames from different repositories remain visibly distinct and retain their exact repository-qualified download reference. Remote rows say compatibility is unverified; the existing runtime picker continues to provide proven engine/runtime/host compatibility after acquisition. Model Profiles lists, creates, duplicates, deletes, rebinds, edits, validates, and loads user serving targets; it displays missing/incompatible state, active identity, and inherited versus overridden values. Settings shows only Global and engine defaults. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Incompatible candidates are hidden by default and can be revealed with the keyboard- and mouse-accessible `Show incompatible` checkbox; Recommended, Compatible, and Needs Attention results remain visible. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Installed source-runtime details include short commit/tree, recipe, Make or CMake, and CUDA provenance.
+
+The Models download panel presents active, queued, completed, and failed acquisitions independently
+with phase, progress bar, bytes, percentage, measured rate, ETA, and FIFO position whenever those
+values are knowable. It remains available after navigating away and returning. The download queue
+lives only for the current TUI process and does not survive an application restart; resumable
+`.part` cache files do survive, so requesting the interrupted exact acquisition again resumes
+through the normal verified path. The CLI `models download` command remains synchronous and waits
+for its requested acquisition.
 
 Owned startup establishes the serving and authenticated control stack without waiting for complete local model discovery. The TUI promptly draws its pending first frame, then starts model discovery asynchronously; the existing NotScanned, Scanning, Ready/Ready with warnings, and Failed registry states report real progress. A Model Profile cannot load until its exact bound artifact is discovered. Headless `serve` continues to complete discovery before announcing that it is listening. Neither interactive path performs catalog network I/O merely to start. The editor shows only common settings plus the bound engine namespace, and clearing an override restores inheritance. Runtime help/usage probing runs in the background. Keyboard, mouse/wheel navigation, narrow layout, `NO_COLOR`, and configured ASCII mode remain supported. Edits never hot-mutate a running backend and apply on its next load.
 

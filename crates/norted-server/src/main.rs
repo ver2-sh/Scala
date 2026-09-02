@@ -300,7 +300,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
 
 async fn run_tui(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
     let services = composition::ApplicationServices::new(&core)?;
-    let setting_definitions = services.registry.setting_definitions()?;
+    let setting_definitions = server_setting_definitions(&services.registry)?;
     let startup_guard = composition::ServerStartupGuard::acquire(&core.paths).await?;
 
     if composition::discover_existing_control(&core.paths)
@@ -861,7 +861,7 @@ async fn mutate_defaults(
     json_output: bool,
 ) -> Result<()> {
     let registry = composition::engine_registry(core)?;
-    let mut patch = registry.parse_settings(&args.settings)?;
+    let mut patch = parse_server_settings(&registry, &args.settings)?;
     norted_engine::record_local_file_setting_identity(
         &mut patch,
         "q27.template_path",
@@ -1006,13 +1006,29 @@ fn validate_default_scope(
 ) -> Result<()> {
     match scope {
         DefaultsScope::Global => {
-            if let Some(id) = patch.0.keys().find(|id| id.namespace().is_some()) {
+            if let Some(id) = patch.0.keys().find(|id| {
+                id.namespace()
+                    .is_some_and(|namespace| namespace != "server")
+            }) {
                 return Err(SettingsError::InvalidGlobalSetting(id.clone()).into());
             }
         }
         DefaultsScope::Engine(engine) => {
             if registry.get(engine).is_none() {
                 return Err(color_eyre::eyre::eyre!("unknown engine `{engine}`"));
+            }
+            let definitions = server_setting_definitions(registry)?
+                .into_iter()
+                .map(|definition| (definition.id.clone(), definition))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            if let Some(id) = patch.0.keys().find(|id| {
+                definitions
+                    .get(*id)
+                    .is_some_and(|definition| definition.scope == norted_core::SettingScope::Global)
+            }) {
+                return Err(color_eyre::eyre::eyre!(
+                    "setting `{id}` is available only in Global settings"
+                ));
             }
             validate_patch_for_engine(patch, engine)?;
         }
@@ -1072,8 +1088,7 @@ fn validate_patch_for_model(
 }
 
 fn parse_known_setting_ids(registry: &EngineRegistry, values: &[String]) -> Result<Vec<SettingId>> {
-    let known = registry
-        .setting_definitions()?
+    let known = server_setting_definitions(registry)?
         .into_iter()
         .map(|definition| definition.id)
         .collect::<std::collections::BTreeSet<_>>();
@@ -1088,6 +1103,37 @@ fn parse_known_setting_ids(registry: &EngineRegistry, values: &[String]) -> Resu
         })
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+fn server_setting_definitions(
+    registry: &EngineRegistry,
+) -> Result<Vec<norted_core::SettingDefinition>> {
+    let mut definitions = registry.setting_definitions()?;
+    definitions.push(norted_model_library::setting_definition());
+    definitions.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(definitions)
+}
+
+fn parse_server_settings(
+    registry: &EngineRegistry,
+    assignments: &[String],
+) -> Result<SettingsPatch> {
+    let definitions = server_setting_definitions(registry)?
+        .into_iter()
+        .map(|definition| (definition.id.clone(), definition))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut patch = SettingsPatch::default();
+    for assignment in assignments {
+        let (raw_id, raw_value) = assignment.split_once('=').ok_or_else(|| {
+            color_eyre::eyre::eyre!("setting `{assignment}` must use SETTING_ID=VALUE")
+        })?;
+        let id = SettingId::new(raw_id.to_owned())?;
+        let definition = definitions
+            .get(&id)
+            .ok_or_else(|| SettingsError::UnknownSetting(id.clone()))?;
+        patch.insert(id, definition.parse(raw_value)?);
+    }
+    Ok(patch)
 }
 
 async fn require_model(

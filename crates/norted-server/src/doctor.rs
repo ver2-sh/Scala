@@ -569,10 +569,13 @@ fn inspect_setting_values(
     checks: &mut Vec<DoctorFinding>,
 ) {
     let definitions = match registry.setting_definitions() {
-        Ok(definitions) => definitions
-            .into_iter()
-            .map(|definition| (definition.id.clone(), definition))
-            .collect::<BTreeMap<_, _>>(),
+        Ok(mut definitions) => {
+            definitions.push(norted_model_library::setting_definition());
+            definitions
+                .into_iter()
+                .map(|definition| (definition.id.clone(), definition))
+                .collect::<BTreeMap<_, _>>()
+        }
         Err(error) => {
             checks.push(finding(
                 "settings.definitions",
@@ -630,7 +633,8 @@ fn validate_patch(
             continue;
         };
         if let Some(engine_id) = engine_id
-            && !id.applies_to_engine(engine_id)
+            && (definition.scope == norted_core::SettingScope::Global
+                || !id.applies_to_engine(engine_id))
         {
             errors.push(format!(
                 "setting `{id}` does not apply to engine `{engine_id}`"

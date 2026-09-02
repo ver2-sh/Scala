@@ -94,6 +94,11 @@ pub async fn run(
     model_library: Arc<ModelLibrary>,
     setting_definitions: Vec<SettingDefinition>,
 ) -> Result<()> {
+    if let Ok(settings) = SettingsStore::new(&core.paths).read().await {
+        model_library.set_max_parallel_downloads(
+            norted_model_library::max_parallel_downloads_from_settings(&settings),
+        );
+    }
     let mut terminal = TerminalSession::enter()?;
     let mut core_events = core.subscribe();
     let snapshot = core.snapshot().await;
@@ -247,6 +252,11 @@ pub async fn run(
             result = settings_result_receiver.recv() => match result {
                 Some(result) => {
                     app.handle_settings_task_result(result);
+                    if let Some(settings) = &app.settings_state {
+                        model_library.set_max_parallel_downloads(
+                            norted_model_library::max_parallel_downloads_from_settings(settings),
+                        );
+                    }
                     Update::Render
                 }
                 None => Update::None,
@@ -268,14 +278,31 @@ pub async fn run(
             },
             progress = model_progress.recv() => match progress {
                 Ok(progress) => {
-                    app.handle_model_operation_progress(progress);
+                    if progress.phase == norted_model_library::ModelOperationPhase::Installed {
+                        let core = Arc::clone(&core);
+                        let results = model_library_results.clone();
+                        tokio::spawn(async move {
+                            let result = core.refresh_models().await.map_err(|error| error.to_string());
+                            let _ = results
+                                .send(ModelLibraryTaskResult::ModelsRefreshed(result))
+                                .await;
+                        });
+                    }
+                    app.replace_model_download_jobs(model_library.download_jobs());
                     Update::Render
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Update::Render,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    app.replace_model_download_jobs(model_library.download_jobs());
+                    Update::Render
+                },
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => Update::None,
             },
             _ = render_tick.tick() => {
-                if app.advance_load_animation() {
+                let jobs = model_library.download_jobs();
+                let has_downloads = !jobs.is_empty();
+                app.replace_model_download_jobs(jobs);
+                let load_changed = app.advance_load_animation();
+                if has_downloads || load_changed {
                     Update::Render
                 } else {
                     Update::None
@@ -342,16 +369,9 @@ fn spawn_model_library_action(
                     .await
                     .map_err(|error| error.to_string()),
             ),
-            ModelLibraryAction::Download(model_ref) => {
-                let result = match library.download(&model_ref).await {
-                    Ok(model) => match core.refresh_models().await {
-                        Ok(()) => Ok(model),
-                        Err(error) => Err(error.to_string()),
-                    },
-                    Err(error) => Err(error.to_string()),
-                };
-                ModelLibraryTaskResult::Downloaded(Box::new(result))
-            }
+            ModelLibraryAction::Download(model_ref) => ModelLibraryTaskResult::DownloadAdmitted(
+                Box::new(library.enqueue_download(model_ref)),
+            ),
             ModelLibraryAction::Remove(model_id) => {
                 let result = match core.model(&model_id).await {
                     Some(model) => match library.plan_removal(&model) {
@@ -560,8 +580,10 @@ async fn execute_settings_action(
                     .update(move |state| {
                         match scope {
                             SettingsScope::Global => {
-                                if let Some(id) = patch.0.keys().find(|id| id.namespace().is_some())
-                                {
+                                if let Some(id) = patch.0.keys().find(|id| {
+                                    id.namespace()
+                                        .is_some_and(|namespace| namespace != "server")
+                                }) {
                                     return Err(SettingsError::InvalidGlobalSetting(id.clone()));
                                 }
                                 state.global_defaults.0.extend(patch.0);

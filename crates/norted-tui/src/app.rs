@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -15,7 +15,9 @@ use norted_engine::{
     RuntimeModelCandidate, RuntimeNoticeLevel, RuntimeSearchResult, RuntimeSearchSnapshot,
     RuntimeUpdateCheck,
 };
-use norted_model_library::{CatalogFile, CatalogRepository, CatalogSearch, ModelOperationProgress};
+use norted_model_library::{
+    CatalogFile, CatalogRepository, CatalogSearch, DownloadAdmission, ModelDownloadJob,
+};
 use ratatui::layout::Position;
 
 use crate::commands::{self, CommandAction};
@@ -153,7 +155,8 @@ pub enum ModelLibraryAction {
 #[derive(Debug)]
 pub enum ModelLibraryTaskResult {
     Searched(Result<CatalogSearch, String>),
-    Downloaded(Box<Result<ModelArtifact, String>>),
+    DownloadAdmitted(Box<DownloadAdmission>),
+    ModelsRefreshed(Result<(), String>),
     Removed(Result<ModelId, String>),
 }
 
@@ -319,7 +322,7 @@ pub struct App {
     pub model_search: Option<CatalogSearch>,
     pub model_search_loading: bool,
     pub selected_model_search_result: Option<usize>,
-    pub model_operation: Option<ModelOperationProgress>,
+    pub model_download_jobs: Vec<ModelDownloadJob>,
     pub selected_model_profile: Option<usize>,
     pub log_scroll: usize,
     pub runtime_list: Option<RuntimeListSnapshot>,
@@ -369,10 +372,10 @@ pub struct App {
     pending_runtime_action: Option<RuntimeAction>,
     runtime_mutation_busy: bool,
     pending_runtime_remove_confirmation: Option<RuntimeId>,
-    pending_model_library_action: Option<ModelLibraryAction>,
+    pending_model_library_actions: VecDeque<ModelLibraryAction>,
     pending_model_remove_confirmation: Option<ModelId>,
     pending_profile_delete_confirmation: Option<ModelProfileId>,
-    model_library_busy: bool,
+    model_removal_busy: bool,
     pending_settings_action: Option<SettingsAction>,
     settings_busy: bool,
     seen_runtime_events: BTreeSet<(i64, u8, String)>,
@@ -431,7 +434,7 @@ impl App {
             model_search: None,
             model_search_loading: false,
             selected_model_search_result: None,
-            model_operation: None,
+            model_download_jobs: Vec::new(),
             selected_model_profile: None,
             log_scroll: 0,
             runtime_list: None,
@@ -481,10 +484,10 @@ impl App {
             pending_runtime_action: None,
             runtime_mutation_busy: false,
             pending_runtime_remove_confirmation: None,
-            pending_model_library_action: None,
+            pending_model_library_actions: VecDeque::new(),
             pending_model_remove_confirmation: None,
             pending_profile_delete_confirmation: None,
-            model_library_busy: false,
+            model_removal_busy: false,
             pending_settings_action: None,
             settings_busy: false,
             seen_runtime_events: BTreeSet::new(),
@@ -826,11 +829,10 @@ impl App {
     }
 
     pub fn take_model_library_action(&mut self) -> Option<ModelLibraryAction> {
-        self.pending_model_library_action.take()
+        self.pending_model_library_actions.pop_front()
     }
 
     pub fn handle_model_library_result(&mut self, result: ModelLibraryTaskResult) {
-        self.model_library_busy = false;
         match result {
             ModelLibraryTaskResult::Searched(result) => {
                 self.model_search_loading = false;
@@ -846,21 +848,32 @@ impl App {
                     }
                 }
             }
-            ModelLibraryTaskResult::Downloaded(result) => match *result {
-                Ok(model) => {
-                    self.notice =
-                        Some(format!("Downloaded {} as {}", model.display_name, model.id));
-                    self.push_log(
-                        LogLevel::Info,
-                        format!("Model download completed: {}", model.id),
-                    );
+            ModelLibraryTaskResult::DownloadAdmitted(admission) => match *admission {
+                DownloadAdmission::Started(job) => {
+                    self.notice = Some(format!("Downloading now: {}", job.model_ref));
                 }
-                Err(error) => {
+                DownloadAdmission::Queued(job) => {
+                    self.notice = Some(format!(
+                        "Queued {} at position {}",
+                        job.model_ref,
+                        job.queue_position.unwrap_or(1)
+                    ));
+                }
+                DownloadAdmission::Duplicate(job) => {
+                    self.notice = Some(format!(
+                        "Already queued or downloading: {} ({:?})",
+                        job.model_ref, job.phase
+                    ));
+                }
+            },
+            ModelLibraryTaskResult::ModelsRefreshed(result) => {
+                if let Err(error) = result {
                     self.notice = Some(error.clone());
                     self.push_log(LogLevel::Error, error);
                 }
-            },
+            }
             ModelLibraryTaskResult::Removed(result) => {
+                self.model_removal_busy = false;
                 self.pending_model_remove_confirmation = None;
                 match result {
                     Ok(model_id) => self.notice = Some(format!("Removed managed model {model_id}")),
@@ -873,8 +886,25 @@ impl App {
         }
     }
 
-    pub fn handle_model_operation_progress(&mut self, progress: ModelOperationProgress) {
-        self.model_operation = Some(progress);
+    pub fn replace_model_download_jobs(&mut self, jobs: Vec<ModelDownloadJob>) {
+        for job in jobs.iter().filter(|job| job.is_terminal()) {
+            let was_terminal = self
+                .model_download_jobs
+                .iter()
+                .find(|previous| previous.id == job.id)
+                .is_some_and(ModelDownloadJob::is_terminal);
+            if !was_terminal {
+                let level = if job.phase == norted_model_library::ModelOperationPhase::Failed {
+                    LogLevel::Error
+                } else {
+                    LogLevel::Info
+                };
+                let message = format!("{}: {}", job.model_ref, job.message);
+                self.notice = Some(message.clone());
+                self.push_log(level, message);
+            }
+        }
+        self.model_download_jobs = jobs;
     }
 
     pub fn model_search_artifacts(&self) -> Vec<(&CatalogRepository, &CatalogFile)> {
@@ -891,8 +921,15 @@ impl App {
             .collect()
     }
 
-    pub fn model_library_busy(&self) -> bool {
-        self.model_library_busy
+    pub fn model_removal_busy(&self) -> bool {
+        self.model_removal_busy
+    }
+
+    pub fn max_parallel_model_downloads(&self) -> usize {
+        self.settings_state.as_ref().map_or(
+            norted_model_library::DEFAULT_MAX_PARALLEL_DOWNLOADS,
+            norted_model_library::max_parallel_downloads_from_settings,
+        )
     }
 
     pub fn model_remove_armed(&self) -> bool {
@@ -934,7 +971,10 @@ impl App {
                     self.settings_state = Some(state);
                     self.model_profiles = Some(profiles);
                     self.settings_error = None;
-                    self.notice = Some("Settings saved; changes apply on the next load".to_owned());
+                    self.notice = Some(
+                        "Settings saved; operational changes apply now and model settings on the next load"
+                            .to_owned(),
+                    );
                     self.reconcile_settings_selection();
                     if self.screen == Screen::ModelProfiles {
                         let _ = self.refresh_selected_model_profile();
@@ -986,7 +1026,7 @@ impl App {
             .setting_definitions
             .iter()
             .filter_map(|definition| match &definition.scope {
-                SettingScope::Common => None,
+                SettingScope::Global | SettingScope::Common => None,
                 SettingScope::Engine { engine_id } => Some(engine_id.clone()),
             })
             .collect::<BTreeSet<_>>();
@@ -1016,13 +1056,18 @@ impl App {
                 _ if self.screen == Screen::ModelProfiles => self
                     .selected_model_profile_value()
                     .is_some_and(|profile| match &definition.scope {
+                        SettingScope::Global => false,
                         SettingScope::Common => true,
                         SettingScope::Engine { engine_id } => {
                             engine_id == profile.engine_id.as_str()
                         }
                     }),
-                Some(SettingsScope::Global) => definition.scope == SettingScope::Common,
+                Some(SettingsScope::Global) => matches!(
+                    definition.scope,
+                    SettingScope::Global | SettingScope::Common
+                ),
                 Some(SettingsScope::Engine(selected)) => match &definition.scope {
+                    SettingScope::Global => false,
                     SettingScope::Common => true,
                     SettingScope::Engine { engine_id } => engine_id == selected,
                 },
@@ -1102,11 +1147,20 @@ impl App {
         };
         inherited.map_or_else(
             || {
-                (
-                    "<upstream default>".to_owned(),
-                    "upstream".to_owned(),
-                    false,
-                )
+                self.setting_definitions
+                    .iter()
+                    .find(|definition| &definition.id == id)
+                    .and_then(|definition| definition.upstream_default.clone())
+                    .map_or_else(
+                        || {
+                            (
+                                "<upstream default>".to_owned(),
+                                "upstream".to_owned(),
+                                false,
+                            )
+                        },
+                        |value| (value, "default".to_owned(), false),
+                    )
             },
             |(value, source)| (value.to_string(), source, false),
         )
@@ -2043,16 +2097,16 @@ impl App {
     }
 
     fn request_model_search(&mut self) -> Update {
-        if self.model_library_busy {
-            self.notice = Some("A Model Library operation is already in progress".to_owned());
+        if self.model_search_loading {
+            self.notice = Some("A model search is already in progress".to_owned());
             return Update::Render;
         }
-        self.model_library_busy = true;
         self.model_search_loading = true;
-        self.pending_model_library_action = Some(ModelLibraryAction::Search {
-            query: self.model_search_query.clone(),
-            format: self.model_search_format,
-        });
+        self.pending_model_library_actions
+            .push_back(ModelLibraryAction::Search {
+                query: self.model_search_query.clone(),
+                format: self.model_search_format,
+            });
         Update::Render
     }
 
@@ -2060,8 +2114,8 @@ impl App {
         if self.model_search_format == format {
             return Update::Render;
         }
-        if self.model_library_busy {
-            self.notice = Some("A Model Library operation is already in progress".to_owned());
+        if self.model_search_loading {
+            self.notice = Some("A model search is already in progress".to_owned());
             return Update::Render;
         }
         self.model_search_format = format;
@@ -2085,10 +2139,6 @@ impl App {
     }
 
     fn request_model_download(&mut self) -> Update {
-        if self.model_library_busy {
-            self.notice = Some("A Model Library operation is already in progress".to_owned());
-            return Update::Render;
-        }
         let model_ref = self.selected_model_search_result.and_then(|index| {
             self.model_search_artifacts()
                 .get(index)
@@ -2098,14 +2148,14 @@ impl App {
             self.notice = Some("Select a concrete artifact before downloading".to_owned());
             return Update::Render;
         };
-        self.model_library_busy = true;
-        self.pending_model_library_action = Some(ModelLibraryAction::Download(model_ref));
+        self.pending_model_library_actions
+            .push_back(ModelLibraryAction::Download(model_ref));
         Update::Render
     }
 
     fn request_model_removal(&mut self) -> Update {
-        if self.model_library_busy {
-            self.notice = Some("A Model Library operation is already in progress".to_owned());
+        if self.model_removal_busy {
+            self.notice = Some("A managed model removal is already in progress".to_owned());
             return Update::Render;
         }
         let Some(model) = self
@@ -2138,8 +2188,9 @@ impl App {
             ));
             return Update::Render;
         }
-        self.model_library_busy = true;
-        self.pending_model_library_action = Some(ModelLibraryAction::Remove(model.id.clone()));
+        self.model_removal_busy = true;
+        self.pending_model_library_actions
+            .push_back(ModelLibraryAction::Remove(model.id.clone()));
         Update::Render
     }
 
@@ -2782,7 +2833,7 @@ impl App {
             Some(HoverTarget::ModelSearchSubmit) => {
                 self.prepare_model_discover_click();
                 self.model_search_editing = false;
-                if self.model_library_busy {
+                if self.model_search_loading {
                     Update::None
                 } else {
                     self.request_model_search()
@@ -2790,7 +2841,7 @@ impl App {
             }
             Some(HoverTarget::ModelFormatFilter(format)) => {
                 self.prepare_model_discover_click();
-                if self.model_library_busy {
+                if self.model_search_loading {
                     Update::None
                 } else {
                     self.set_model_search_format(format)
@@ -2800,11 +2851,7 @@ impl App {
                 self.prepare_model_discover_click();
                 self.model_search_editing = false;
                 self.selected_model_search_result = Some(index);
-                if self.model_library_busy {
-                    Update::None
-                } else {
-                    self.request_model_download()
-                }
+                self.request_model_download()
             }
             Some(HoverTarget::Model(index)) => {
                 if self.command_active {
@@ -2833,7 +2880,7 @@ impl App {
                         self.request_unload()
                     }
                     InstalledModelAction::Remove
-                        if !self.model_library_busy && !self.selected_model_is_active() =>
+                        if !self.model_removal_busy && !self.selected_model_is_active() =>
                     {
                         self.request_model_removal()
                     }

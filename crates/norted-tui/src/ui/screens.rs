@@ -370,12 +370,12 @@ fn render_model_header(
     } else {
         "[ Search ]"
     };
-    let mut submit_style = if app.model_library_busy() {
+    let mut submit_style = if app.model_search_loading {
         theme.muted
     } else {
         theme.accent
     };
-    if !app.model_library_busy() && app.hover == Some(HoverTarget::ModelSearchSubmit) {
+    if !app.model_search_loading && app.hover == Some(HoverTarget::ModelSearchSubmit) {
         submit_style = submit_style.patch(theme.hovered);
     }
     frame.render_widget(
@@ -425,6 +425,7 @@ fn render_models(
     render_model_header(frame, app, theme, glyphs, ui_layout, layout[0]);
     if app.model_library_view == ModelLibraryView::Discover {
         render_model_discover(frame, app, theme, glyphs, ui_layout);
+        render_model_downloads(frame, app, theme, glyphs, ui_layout.model_downloads);
         return;
     }
     if matches!(app.snapshot.registry_state, RegistryState::NotScanned) {
@@ -551,9 +552,8 @@ fn render_models(
             theme,
             glyphs,
         );
-    } else if let Some(progress) = &app.model_operation {
-        render_model_library_progress(frame, ui_layout.model_progress, progress, theme);
     }
+    render_model_downloads(frame, app, theme, glyphs, ui_layout.model_downloads);
 }
 
 fn render_installed_model_actions(
@@ -600,7 +600,7 @@ fn render_installed_model_actions(
                 },
             ),
             InstalledModelAction::Remove => {
-                let enabled = model.provenance.is_some() && !active && !app.model_library_busy();
+                let enabled = model.provenance.is_some() && !active && !app.model_removal_busy();
                 (
                     if app.model_remove_armed() {
                         "[ Confirm Remove ]"
@@ -646,14 +646,14 @@ fn render_model_discover(
             Some(ArtifactFormat::Q27) => "[ Q27 ]",
             Some(ArtifactFormat::Ninfer) => "[ NInfer ]",
         };
-        let mut style = if app.model_library_busy() {
+        let mut style = if app.model_search_loading {
             theme.muted
         } else if app.model_search_format == *format {
             theme.selected
         } else {
             theme.nav_inactive
         };
-        if !app.model_library_busy() && app.hover == Some(HoverTarget::ModelFormatFilter(*format)) {
+        if !app.model_search_loading && app.hover == Some(HoverTarget::ModelFormatFilter(*format)) {
             style = style.patch(theme.hovered);
         }
         frame.render_widget(
@@ -748,14 +748,8 @@ fn render_model_discover(
             } else {
                 ratatui::style::Style::default()
             };
-            style = style.patch(if app.model_library_busy() {
-                theme.muted
-            } else {
-                theme.accent
-            });
-            if !app.model_library_busy()
-                && app.hover == Some(HoverTarget::ModelDownloadAction(*index))
-            {
+            style = style.patch(theme.accent);
+            if app.hover == Some(HoverTarget::ModelDownloadAction(*index)) {
                 style = style.patch(theme.hovered);
             }
             frame.render_widget(
@@ -764,37 +758,161 @@ fn render_model_discover(
             );
         }
     }
-    if let Some(progress) = &app.model_operation {
-        render_model_library_progress(frame, ui_layout.model_progress, progress, theme);
-    }
 }
 
-fn render_model_library_progress(
+fn render_model_downloads(
     frame: &mut Frame<'_>,
-    area: Rect,
-    progress: &norted_model_library::ModelOperationProgress,
+    app: &App,
     theme: &Theme,
+    glyphs: &Glyphs,
+    area: Rect,
 ) {
-    let bytes = progress.total_bytes.map_or_else(
-        || format_bytes(progress.downloaded_bytes),
-        |total| {
-            format!(
-                "{} / {}",
-                format_bytes(progress.downloaded_bytes),
-                format_bytes(total)
-            )
-        },
+    if area.height == 0 || app.model_download_jobs.is_empty() {
+        return;
+    }
+    let active = app
+        .model_download_jobs
+        .iter()
+        .filter(|job| {
+            !job.is_terminal() && job.phase != norted_model_library::ModelOperationPhase::Queued
+        })
+        .count();
+    let queued = app
+        .model_download_jobs
+        .iter()
+        .filter(|job| job.phase == norted_model_library::ModelOperationPhase::Queued)
+        .count();
+    let separator = if glyphs.unicode { " · " } else { " | " };
+    let title = format!(
+        "Downloads  {active} active{separator}{queued} queued{separator}limit {}",
+        app.max_parallel_model_downloads()
     );
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(format!("{:?}", progress.phase), theme.accent),
-                Span::styled(format!("  {bytes}"), theme.text),
-            ]),
-            Line::from(Span::styled(&progress.message, theme.hint)),
-        ]),
-        area,
+        Paragraph::new(Line::from(Span::styled(
+            truncate_middle(&title, area.width as usize, glyphs.ellipsis),
+            theme.hint,
+        ))),
+        Rect::new(area.x, area.y, area.width, 1),
     );
+
+    let mut jobs = app
+        .model_download_jobs
+        .iter()
+        .filter(|job| !job.is_terminal())
+        .collect::<Vec<_>>();
+    jobs.extend(
+        app.model_download_jobs
+            .iter()
+            .rev()
+            .filter(|job| job.is_terminal()),
+    );
+    let lines = jobs
+        .into_iter()
+        .take(area.height.saturating_sub(1) as usize)
+        .map(|job| {
+            let phase = match job.phase {
+                norted_model_library::ModelOperationPhase::Queued => {
+                    job.queue_position.map_or_else(
+                        || "Queued".to_owned(),
+                        |position| format!("Queued #{position}"),
+                    )
+                }
+                norted_model_library::ModelOperationPhase::Resolving => "Resolving".to_owned(),
+                norted_model_library::ModelOperationPhase::Downloading => "Downloading".to_owned(),
+                norted_model_library::ModelOperationPhase::Verifying => "Verifying".to_owned(),
+                norted_model_library::ModelOperationPhase::Validating => "Validating".to_owned(),
+                norted_model_library::ModelOperationPhase::Installing => "Installing".to_owned(),
+                norted_model_library::ModelOperationPhase::Installed => "Installed".to_owned(),
+                norted_model_library::ModelOperationPhase::Failed => "Failed".to_owned(),
+                norted_model_library::ModelOperationPhase::Cancelled => "Cancelled".to_owned(),
+            };
+            let identity = job
+                .filename
+                .as_deref()
+                .or(job.repository.as_deref())
+                .unwrap_or(&job.model_ref);
+            let mut metrics = Vec::new();
+            if job.phase != norted_model_library::ModelOperationPhase::Queued {
+                metrics.push(job.total_bytes.map_or_else(
+                    || format_bytes(job.downloaded_bytes),
+                    |total| {
+                        format!(
+                            "{} / {}",
+                            format_bytes(job.downloaded_bytes),
+                            format_bytes(total)
+                        )
+                    },
+                ));
+            }
+            if let Some(percent) = job.progress_percent {
+                metrics.push(format!("{percent:.1}%"));
+            }
+            if let Some(rate) = job.transfer_bytes_per_second {
+                metrics.push(format!("{}/s", format_bytes(rate as u64)));
+            }
+            if let Some(eta) = job.estimated_remaining {
+                metrics.push(format!("~{}", compact_duration(eta)));
+            }
+            if matches!(
+                job.phase,
+                norted_model_library::ModelOperationPhase::Verifying
+                    | norted_model_library::ModelOperationPhase::Validating
+                    | norted_model_library::ModelOperationPhase::Installing
+                    | norted_model_library::ModelOperationPhase::Installed
+                    | norted_model_library::ModelOperationPhase::Failed
+            ) {
+                metrics.push(job.message.clone());
+            }
+            let progress_bar = job.progress_percent.map_or_else(String::new, |percent| {
+                let width = if area.width >= 90 { 12 } else { 8 };
+                let filled = ((percent / 100.0) * f64::from(width)).round() as usize;
+                format!(
+                    "[{}{}] ",
+                    "=".repeat(filled.min(width as usize)),
+                    ".".repeat(width as usize - filled.min(width as usize))
+                )
+            });
+            let text = format!(
+                "{phase:<11} {progress_bar}{identity}{}",
+                if metrics.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", metrics.join("  "))
+                }
+            );
+            let style = match job.phase {
+                norted_model_library::ModelOperationPhase::Installed => theme.success,
+                norted_model_library::ModelOperationPhase::Failed
+                | norted_model_library::ModelOperationPhase::Cancelled => theme.error,
+                norted_model_library::ModelOperationPhase::Queued => theme.muted,
+                _ => theme.text,
+            };
+            Line::from(Span::styled(
+                truncate_middle(&text, area.width as usize, glyphs.ellipsis),
+                style,
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect::new(
+            area.x,
+            area.y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(1),
+        ),
+    );
+}
+
+fn compact_duration(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 3600 {
+        format!("{}h{}m", seconds / 3600, (seconds % 3600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn render_runtimes(
@@ -1381,8 +1499,13 @@ fn render_settings(
     let info = if app.settings_input.is_some() {
         String::new()
     } else {
-        "Rows select. Click a value to edit or change it; Inherit clears this layer's override."
-            .to_owned()
+        let description = app
+            .settings_definitions()
+            .get(app.settings_setting_index)
+            .map_or("", |definition| definition.description.as_str());
+        format!(
+            "Rows select. Click a value to edit or change it; Inherit clears this layer's override.\n{description}"
+        )
     };
     frame.render_widget(
         Paragraph::new(info).style(theme.hint),

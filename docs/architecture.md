@@ -55,7 +55,7 @@ The interactive process preserves this boundary in both lifecycle modes. The TUI
 ## Crate responsibilities
 
 - `norted-core` owns platform paths, schema-version-1 configuration, public-auth policy, the versioned atomic API-key store, typed serving settings and resolution, user-owned Model Profiles, model/auxiliary-artifact discovery, stable IDs, runtime identity/manifest/preferences data, host-independent provenance, application state, and process descriptors.
-- `norted-model-library` owns the provider-neutral model catalog/acquisition contract, Hugging Face API provider, streamed/resumable downloads, receipts, safe import, atomic activation, and managed-only removal. It performs no model transformation or runtime acquisition.
+- `norted-model-library` owns the provider-neutral model catalog/acquisition contract, Hugging Face API provider, bounded in-process download scheduler and authoritative job snapshots, streamed/resumable downloads, receipts, safe import, atomic activation, and managed-only removal. It performs no model transformation or runtime acquisition.
 - `norted-engine` owns `EngineAdapter`, `EngineRegistry`, the provider/catalog/cache, secure installer, runtime store and resolver, runtime/backend manager, generic process supervisor, control client, and normalized inference types.
 - `norted-engine-llama-cpp` owns official llama.cpp asset classification, the immutable managed Linux CUDA source recipe/provider, binary probes, flags/environment policy, readiness and `/props`, and Chat Completions JSON/SSE translation.
 - `norted-engine-q27` owns official q27 binary/source capability classification, exact Makefile target recipes, tokenizer requirements, usage-signature probes, flags/environment policy, readiness, provable sampler settings, and Chat Completions JSON/SSE translation.
@@ -90,6 +90,24 @@ checks authoritative size and SHA-256, then assembles all files in a registry-ex
 `.norted-staging` directory on the managed root's filesystem. Raw q27 tokenizer selection calls the
 same core selector used by local discovery, including the upstream `MODEL.q27` + sole
 `TOKENIZER.tok` layout.
+
+`ModelLibrary` owns a bounded acquisition scheduler. Every request receives a stable UUID and an
+authoritative record containing exact reference, resolved provider/repository/artifact identity,
+phase, bytes, optional total/percentage, measured rate, elapsed time, optional ETA, queue position,
+and status. Up to `server.max_parallel_model_downloads` acquisitions run at once (default 4,
+minimum 1); the rest remain in a FIFO queue. Raising the Global setting fills newly available slots
+immediately. Lowering it never cancels work already running and suppresses starts until active work
+falls below the new limit. Completion and failure both release a slot. Exact active/queued
+references are deduplicated, final destinations are independently guarded after resolution, and a
+per-reference cache key plus per-job staging directory prevents cross-acquisition file mixing.
+Companion files remain sequential within one acquisition.
+
+Progress broadcasts carry the job UUID, but they are presentation invalidations rather than the
+source of truth; the TUI re-snapshots all jobs after events and on its render cadence, so subscriber
+lag cannot corrupt state. Search is a separate task and managed removal uses only its own narrow
+busy/conflict checks. Terminal history is bounded. Scheduler state is process-local and survives
+ordinary TUI navigation but not restart; resumable partial cache files do survive and are reused by
+the same exact reference.
 
 Norted package acquisition planning is a pure `norted-core` interpretation of the same locally
 accepted `BUILD-MANIFEST.json`, `Q27-MANIFEST.json`, and `NINFER-MANIFEST.json` schemas. A provider
@@ -128,8 +146,9 @@ compare that full set with private control state and refuse deletion if any memb
 remove only the acquisition root below `<data>/models`. Configured external artifacts are read-only.
 
 The TUI Models screen is one integrated Model Library with Installed and Discover modes, query and
-format controls, concrete artifact details, byte progress, download, managed removal, and the
-existing runtime picker for verified compatibility. The CLI exposes the same search, download,
+format controls, concrete artifact details, a responsive multi-job panel with progress/rate/ETA or
+FIFO position when calculable, download, managed removal, and the existing runtime picker for
+verified compatibility. The CLI exposes the same search, synchronous download,
 import, remove, list, and info model. Runtime search/install/update and model build/transformation
 remain separate systems.
 
@@ -141,8 +160,9 @@ artifact ID, bound engine ID, and typed overrides. It is always user-owned and m
 compatibility comes from the bound artifact, registered engine, exact runtime, and resulting
 settings—not from profile-authored applicability declarations.
 
-`SettingsState` schema 1 lives at `<data>/settings.json` and stores only Global and per-engine
-defaults. `ModelProfilesState` schema 1 lives at `<data>/model-profiles.json`. Both stores have
+`SettingsState` schema 1 lives at `<data>/settings.json` and stores Global (including Global-only
+server operational values) and per-engine defaults. `ModelProfilesState` schema 1 lives at
+`<data>/model-profiles.json`. Both stores have
 independent locks and atomic replacement. No older combined state is read or migrated.
 
 One resolver applies Global defaults, the bound engine defaults, Model Profile overrides, then
