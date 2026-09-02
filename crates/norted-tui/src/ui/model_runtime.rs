@@ -4,7 +4,9 @@ use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, Overlay};
 use crate::theme::{Glyphs, Theme};
-use crate::ui::components::{ActionState, KEY_COLUMN, action_style, key_value, popup_block};
+use crate::ui::components::{
+    ActionState, KEY_COLUMN, action_style, key_value, marquee_text, popup_block, truncate_middle,
+};
 use crate::ui::layout::{HoverTarget, UiLayout};
 use crate::ui::screens::compatibility_label;
 
@@ -16,7 +18,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         return;
     };
     frame.render_widget(Clear, area);
-    frame.render_widget(popup_block(" Model runtime override ", theme, glyphs), area);
+    frame.render_widget(
+        popup_block(" Model runtime override ", theme, glyphs, layout.compact),
+        area,
+    );
 
     let model = app
         .selected_model
@@ -28,9 +33,19 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
                 .norted_package
                 .as_ref()
                 .map_or_else(|| "Raw".to_owned(), |package| package.kind.to_string());
+            let reserved = 7 + model.format.as_str().len() + 2 + package.len();
+            let name_width = layout
+                .runtime_search_input
+                .width
+                .saturating_sub(reserved as u16);
+            let display_name = marquee_text(
+                &model.display_name,
+                name_width as usize,
+                app.ui_animation_frame / 3,
+            );
             Line::from(vec![
                 Span::styled("Model  ", theme.hint),
-                Span::styled(&model.display_name, theme.text),
+                Span::styled(display_name, theme.text),
                 Span::styled(
                     format!("  {}", model.format.as_str().to_ascii_uppercase()),
                     theme.accent,
@@ -46,7 +61,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     };
     let has_candidates = !app.runtime_picker_indices().is_empty();
     if has_candidates {
-        let items = layout.runtime_search_rows.iter().map(|(index, _)| {
+        let items = layout.runtime_search_rows.iter().map(|(index, row)| {
             let status = &snapshot.installed[*index];
             let manifest = &status.runtime.manifest;
             let identity = &manifest.identity;
@@ -66,10 +81,18 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             if app.hover == Some(HoverTarget::RuntimePickerResult(*index)) {
                 style = style.patch(theme.hovered);
             }
-            ListItem::new(vec![
+            let active_row = app.runtime_picker_selection == Some(*index)
+                || app.hover == Some(HoverTarget::RuntimePickerResult(*index));
+            let identity_text = format!("{}  {}", identity.engine_id, identity.version);
+            let identity_width = row.width.saturating_sub(compatibility.len() as u16 + 2) as usize;
+            let identity_text = if active_row {
+                marquee_text(&identity_text, identity_width, app.ui_animation_frame / 3)
+            } else {
+                truncate_middle(&identity_text, identity_width, glyphs.ellipsis)
+            };
+            let mut lines = vec![
                 Line::from(vec![
-                    Span::styled(&identity.engine_id, theme.text),
-                    Span::styled(format!("  {}", identity.version), theme.accent),
+                    Span::styled(identity_text, theme.text),
                     Span::styled(format!("  {compatibility}"), compatibility_style),
                 ]),
                 Line::from(vec![
@@ -86,8 +109,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
                         theme.success,
                     ),
                 ]),
-            ])
-            .style(style)
+            ];
+            if layout.overlay_row_height > 2 {
+                lines.push(Line::default());
+            }
+            ListItem::new(lines).style(style)
         });
         frame.render_widget(List::new(items), layout.runtime_search_results);
     } else {

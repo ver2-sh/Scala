@@ -5,7 +5,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 
 use crate::app::{App, Overlay};
 use crate::theme::{Glyphs, Theme};
-use crate::ui::components::{ActionState, action_style};
+use crate::ui::components::{ActionState, action_style, marquee_text};
 use crate::ui::layout::{HoverTarget, UiLayout};
 
 pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, layout: &UiLayout) {
@@ -28,14 +28,23 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         area,
     );
     let inner = Rect::new(
-        area.x.saturating_add(2),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(4),
-        area.height.saturating_sub(2),
+        area.x.saturating_add(if layout.compact { 2 } else { 3 }),
+        area.y.saturating_add(if layout.compact { 1 } else { 2 }),
+        area.width
+            .saturating_sub(if layout.compact { 4 } else { 6 }),
+        area.height
+            .saturating_sub(if layout.compact { 2 } else { 4 }),
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(&selection.model.display_name, theme.text),
+            Span::styled(
+                marquee_text(
+                    &selection.model.display_name,
+                    inner.width.saturating_sub(35) as usize,
+                    app.ui_animation_frame / 3,
+                ),
+                theme.text,
+            ),
             Span::styled(" · select the engine this profile binds", theme.muted),
         ])),
         Rect::new(inner.x, inner.y, inner.width, 1),
@@ -54,17 +63,24 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         if app.hover == Some(HoverTarget::ProfileEngineResult(index)) {
             style = style.patch(theme.hovered);
         }
-        ListItem::new(format!("  {label}")).style(style)
+        let mut lines = vec![Line::from(format!("  {label}"))];
+        if layout
+            .profile_engine_rows
+            .get(index)
+            .is_some_and(|(_, area)| area.height > 1)
+        {
+            lines.push(Line::default());
+        }
+        ListItem::new(lines).style(style)
     });
-    frame.render_widget(
-        List::new(items),
-        Rect::new(
-            inner.x,
-            inner.y.saturating_add(2),
-            inner.width,
-            selection.engines.len() as u16,
-        ),
-    );
+    let list_area = layout
+        .profile_engine_rows
+        .first()
+        .zip(layout.profile_engine_rows.last())
+        .map_or(Rect::default(), |((_, first), (_, last))| {
+            Rect::new(first.x, first.y, first.width, last.bottom() - first.y)
+        });
+    frame.render_widget(List::new(items), list_area);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "[ Create ]",

@@ -1,12 +1,16 @@
 use norted_core::{ArtifactFormat, RegistryState, RuntimeAcquisitionMethod};
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, ModelLibraryView, Overlay, Screen};
 
-use super::components::content_layout;
+use super::components::{content_layout, format_bytes, needs_marquee};
 use super::shell::{COMPACT_WIDTH, MIN_HEIGHT, MIN_WIDTH};
 
-pub const MODEL_ROW_HEIGHT: u16 = 3;
+const MODEL_ROW_HEIGHT_COMPACT: u16 = 3;
+const MODEL_ROW_HEIGHT_COMFORTABLE: u16 = 4;
+const TWO_LINE_ROW_HEIGHT_COMPACT: u16 = 2;
+const TWO_LINE_ROW_HEIGHT_COMFORTABLE: u16 = 3;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InstalledModelAction {
@@ -79,6 +83,10 @@ pub enum HoverTarget {
 pub struct UiLayout {
     pub too_small: bool,
     pub compact: bool,
+    pub model_row_height: u16,
+    pub runtime_row_height: u16,
+    pub settings_row_height: u16,
+    pub overlay_row_height: u16,
     pub nav_items: Vec<(Screen, Rect)>,
     pub content: Rect,
     pub overview_metrics: Rect,
@@ -151,15 +159,25 @@ impl UiLayout {
             };
         }
 
-        let compact = area.width < COMPACT_WIDTH || area.height < 23;
+        let compact = area.width < COMPACT_WIDTH || area.height < 28;
+        let model_row_height = if compact {
+            MODEL_ROW_HEIGHT_COMPACT
+        } else {
+            MODEL_ROW_HEIGHT_COMFORTABLE
+        };
+        let two_line_row_height = if compact {
+            TWO_LINE_ROW_HEIGHT_COMPACT
+        } else {
+            TWO_LINE_ROW_HEIGHT_COMFORTABLE
+        };
         let shell_area = area.inner(Margin {
-            horizontal: if compact { 1 } else { 2 },
-            vertical: 0,
+            horizontal: if compact { 1 } else { 3 },
+            vertical: u16::from(!compact && area.height >= 34),
         });
         let regions = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(4),
+                Constraint::Length(if compact { 4 } else { 5 }),
                 Constraint::Min(5),
                 Constraint::Length(3),
                 Constraint::Length(if area.height == MIN_HEIGHT { 1 } else { 2 }),
@@ -167,21 +185,21 @@ impl UiLayout {
             .split(shell_area);
         let content = regions[1].inner(Margin {
             horizontal: if compact { 1 } else { 2 },
-            vertical: 1,
+            vertical: u16::from(area.height >= 20),
         });
-        let screen_body = content_layout(content)[1];
+        let screen_body = content_layout(content, compact)[1];
         let nav_items = nav_rects(regions[0], compact);
 
         let mut overview_metrics = Rect::default();
         let mut overview_body = Rect::default();
         let mut overview_progress = Rect::default();
         if app.screen == Screen::Overview {
-            let progress_height = u16::from(app.load_progress().is_some());
+            let progress_height = if app.load_progress().is_some() { 1 } else { 0 };
             let overview = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),
-                    Constraint::Length(if compact { 6 } else { 4 }),
+                    Constraint::Length(if compact { 3 } else { 4 }),
+                    Constraint::Length(if compact { 6 } else { 5 }),
                     Constraint::Length(progress_height),
                     Constraint::Min(5),
                 ])
@@ -200,7 +218,7 @@ impl UiLayout {
         let mut installed_model_actions = Vec::new();
         let mut model_downloads = Rect::default();
         let (model_list, model_progress) = if app.screen == Screen::Models {
-            let model_header = content_layout(content)[0];
+            let model_header = content_layout(content, compact)[0];
             model_installed_tab = Rect::new(model_header.x, model_header.y + 1, 13, 1);
             model_discover_tab = Rect::new(
                 model_installed_tab.right().saturating_add(2),
@@ -261,11 +279,17 @@ impl UiLayout {
                     ));
                     filter_x = filter_x.saturating_add(width.saturating_add(1));
                 }
+                let format_gap = u16::from(!compact && model_body.height > 1);
                 model_body = Rect::new(
                     model_body.x,
-                    model_body.y.saturating_add(model_format_row.height),
+                    model_body
+                        .y
+                        .saturating_add(model_format_row.height)
+                        .saturating_add(format_gap),
                     model_body.width,
-                    model_body.height.saturating_sub(model_format_row.height),
+                    model_body
+                        .height
+                        .saturating_sub(model_format_row.height.saturating_add(format_gap)),
                 );
             }
             let pending_downloads = app
@@ -281,7 +305,7 @@ impl UiLayout {
                 .min(if pending_downloads == 0 { 3 } else { 1 });
             let download_height = (pending_downloads + recent_downloads + 1) as u16;
             let download_height =
-                download_height.min(model_body.height.saturating_sub(MODEL_ROW_HEIGHT).max(3));
+                download_height.min(model_body.height.saturating_sub(model_row_height).max(3));
             let (model_body, downloads) = reserve_bottom(
                 model_body,
                 !app.model_download_jobs.is_empty(),
@@ -295,12 +319,14 @@ impl UiLayout {
                     .selected_model
                     .and_then(|index| app.snapshot.models.get(index))
                 {
-                    let action_height = if compact { 2 } else { 1 }.min(list.height);
+                    let action_height = 2.min(list.height);
                     let action_area = Rect::new(
                         list.x,
-                        list.bottom().saturating_sub(action_height),
+                        list.bottom()
+                            .saturating_sub(action_height)
+                            .saturating_add(u16::from(!compact && action_height > 1)),
                         list.width,
-                        action_height,
+                        if compact { action_height } else { 1 },
                     );
                     list.height = list.height.saturating_sub(action_height);
                     let mut actions = vec![
@@ -325,7 +351,7 @@ impl UiLayout {
                     if model.provenance.is_some() {
                         actions.push((InstalledModelAction::Remove, 18));
                     }
-                    installed_model_actions = flow_actions(action_area, &actions);
+                    installed_model_actions = flow_actions(action_area, &actions, compact);
                 }
             }
             (list, progress)
@@ -348,7 +374,7 @@ impl UiLayout {
                 ))
             && model_count > 0
         {
-            let capacity = (model_list.height / MODEL_ROW_HEIGHT) as usize;
+            let capacity = (model_list.height / model_row_height) as usize;
             let start = if app.model_library_view == ModelLibraryView::Discover {
                 app.selected_model_search_result
                     .unwrap_or_default()
@@ -360,9 +386,9 @@ impl UiLayout {
             for index in start..end {
                 let row = Rect::new(
                     model_list.x,
-                    model_list.y + ((index - start) as u16 * MODEL_ROW_HEIGHT),
+                    model_list.y + ((index - start) as u16 * model_row_height),
                     model_list.width,
-                    MODEL_ROW_HEIGHT,
+                    model_row_height,
                 );
                 model_rows.push((index, row));
                 if app.model_library_view == ModelLibraryView::Discover {
@@ -394,16 +420,12 @@ impl UiLayout {
         let mut selected_runtime_actions = Vec::new();
         let mut runtime_rows = Vec::new();
         if app.screen == Screen::Runtimes {
-            let summary_height = screen_body.height.min(if compact { 3 } else { 4 });
+            let summary_height = screen_body.height.min(if compact { 3 } else { 5 });
             let compact_runtime_actions = compact || screen_body.width < 83;
             let has_selection = app
                 .selected_runtime
                 .and_then(|index| app.runtime_list.as_ref()?.installed.get(index));
-            let requested_action_height = if has_selection.is_some() {
-                if compact_runtime_actions { 3 } else { 2 }
-            } else {
-                1
-            };
+            let requested_action_height = if has_selection.is_some() { 3 } else { 1 };
             let action_height = screen_body
                 .height
                 .saturating_sub(summary_height)
@@ -434,20 +456,30 @@ impl UiLayout {
                     1,
                 );
                 runtime_update_action = Rect::new(
-                    runtime_search_action.right().saturating_add(1),
+                    runtime_search_action
+                        .right()
+                        .saturating_add(if compact { 1 } else { 2 }),
                     runtime_actions.y,
                     runtime_actions
                         .right()
-                        .saturating_sub(runtime_search_action.right().saturating_add(1))
+                        .saturating_sub(runtime_search_action.right().saturating_add(if compact {
+                            1
+                        } else {
+                            2
+                        }))
                         .min(18),
                     1,
                 );
                 if let Some(status) = has_selection {
                     let selected_area = Rect::new(
                         runtime_actions.x,
-                        runtime_actions.y.saturating_add(1),
+                        runtime_actions
+                            .y
+                            .saturating_add(if compact { 1 } else { 2 }),
                         runtime_actions.width,
-                        runtime_actions.height.saturating_sub(1),
+                        runtime_actions
+                            .height
+                            .saturating_sub(if compact { 1 } else { 2 }),
                     );
                     let mut actions = status
                         .runtime
@@ -479,20 +511,21 @@ impl UiLayout {
                     {
                         actions.push((SelectedRuntimeAction::Remove, 18));
                     }
-                    selected_runtime_actions = flow_actions(selected_area, &actions);
+                    selected_runtime_actions = flow_actions(selected_area, &actions, compact);
                 }
             }
             if let Some(snapshot) = &app.runtime_list {
-                let capacity = (runtime_list.height / 2) as usize;
+                let capacity = (runtime_list.height / two_line_row_height) as usize;
                 let end = (app.runtime_scroll + capacity).min(snapshot.installed.len());
                 for index in app.runtime_scroll..end {
                     runtime_rows.push((
                         index,
                         Rect::new(
                             runtime_list.x,
-                            runtime_list.y + ((index - app.runtime_scroll) as u16 * 2),
+                            runtime_list.y
+                                + ((index - app.runtime_scroll) as u16 * two_line_row_height),
                             runtime_list.width,
-                            2,
+                            two_line_row_height,
                         ),
                     ));
                 }
@@ -515,20 +548,16 @@ impl UiLayout {
             app.overlay,
             Some(Overlay::RuntimeSearch | Overlay::ModelRuntime)
         ) {
-            let horizontal_margin = if area.width < COMPACT_WIDTH {
-                1
-            } else {
-                (area.width / 16).max(2)
-            };
-            let vertical_margin = if area.height < 20 { 1 } else { 2 };
+            let horizontal_margin = if compact { 1 } else { (area.width / 10).max(4) };
+            let vertical_margin = if compact { 1 } else { 3 };
             let popup = area.inner(Margin {
                 horizontal: horizontal_margin,
                 vertical: vertical_margin,
             });
             runtime_search_popup = Some(popup);
             let inner = popup.inner(Margin {
-                horizontal: 2,
-                vertical: 1,
+                horizontal: if compact { 2 } else { 3 },
+                vertical: if compact { 1 } else { 2 },
             });
             if runtime_picker_active {
                 runtime_search_input =
@@ -554,19 +583,23 @@ impl UiLayout {
                     u16::from(inner.height > 1),
                 );
             }
+            let body_top = if compact { 2 } else { 3 };
+            let body_bottom = if compact { 1 } else { 2 };
             let body = Rect::new(
                 inner.x,
-                inner.y.saturating_add(2),
+                inner.y.saturating_add(body_top),
                 inner.width,
-                inner.height.saturating_sub(3),
+                inner
+                    .height
+                    .saturating_sub(body_top.saturating_add(body_bottom)),
             );
-            if inner.width >= COMPACT_WIDTH {
+            if !compact && body.width >= 68 {
                 let result_width = body.width.saturating_mul(3) / 5;
                 runtime_search_results = Rect::new(body.x, body.y, result_width, body.height);
                 runtime_search_details = Rect::new(
-                    body.x.saturating_add(result_width).saturating_add(2),
+                    body.x.saturating_add(result_width).saturating_add(3),
                     body.y,
-                    body.width.saturating_sub(result_width.saturating_add(2)),
+                    body.width.saturating_sub(result_width.saturating_add(3)),
                     body.height,
                 );
             } else {
@@ -634,7 +667,7 @@ impl UiLayout {
             } else {
                 (app.runtime_search_indices(), app.runtime_search_scroll)
             };
-            let capacity = (runtime_search_results.height / 2) as usize;
+            let capacity = (runtime_search_results.height / two_line_row_height) as usize;
             let end = (scroll + capacity).min(indices.len());
             for (visible_position, index) in indices
                 .iter()
@@ -646,9 +679,10 @@ impl UiLayout {
                     *index,
                     Rect::new(
                         runtime_search_results.x,
-                        runtime_search_results.y + ((visible_position - scroll) as u16 * 2),
+                        runtime_search_results.y
+                            + ((visible_position - scroll) as u16 * two_line_row_height),
                         runtime_search_results.width,
-                        2,
+                        two_line_row_height,
                     ),
                 ));
             }
@@ -657,7 +691,9 @@ impl UiLayout {
         let suggestions = app.suggestions();
         let (suggestion_popup, suggestion_rows) = if app.command_active && !suggestions.is_empty() {
             let visible_count = suggestions.len().min(8);
-            let height = visible_count as u16 + 2;
+            let popup_inset_x = if compact { 2 } else { 3 };
+            let popup_inset_y = if compact { 1 } else { 2 };
+            let height = visible_count as u16 + popup_inset_y * 2;
             let popup = Rect::new(
                 regions[2].x,
                 regions[2].y.saturating_sub(height),
@@ -670,9 +706,9 @@ impl UiLayout {
                     (
                         index,
                         Rect::new(
-                            popup.x.saturating_add(1),
-                            popup.y + 1 + (index - app.suggestion_scroll) as u16,
-                            popup.width.saturating_sub(2),
+                            popup.x.saturating_add(popup_inset_x),
+                            popup.y + popup_inset_y + (index - app.suggestion_scroll) as u16,
+                            popup.width.saturating_sub(popup_inset_x * 2),
                             1,
                         ),
                     )
@@ -700,11 +736,17 @@ impl UiLayout {
                 screen_body.width,
                 screen_body.height.min(2),
             );
+            let settings_intro_height = match (app.screen, compact) {
+                (Screen::ModelProfiles, true) => 7,
+                (Screen::ModelProfiles, false) => 8,
+                (_, true) => 6,
+                (_, false) => 7,
+            };
             settings_list = Rect::new(
                 screen_body.x,
-                screen_body.y.saturating_add(6),
+                screen_body.y.saturating_add(settings_intro_height),
                 screen_body.width,
-                screen_body.height.saturating_sub(6),
+                screen_body.height.saturating_sub(settings_intro_height),
             );
             let labels = if app.screen == Screen::ModelProfiles {
                 app.model_profile_values()
@@ -723,7 +765,7 @@ impl UiLayout {
             };
             let mut x = settings_scopes.x;
             for (index, label) in labels.iter().enumerate() {
-                let width = (label.chars().count() as u16 + 2)
+                let width = (UnicodeWidthStr::width(label.as_str()) as u16 + 2)
                     .min(settings_scopes.right().saturating_sub(x));
                 if width == 0 {
                     break;
@@ -740,14 +782,14 @@ impl UiLayout {
                 x = x.saturating_add(width);
             }
             let definitions = app.settings_definitions();
-            let capacity = (settings_list.height / 2) as usize;
+            let capacity = (settings_list.height / two_line_row_height) as usize;
             let end = (app.settings_scroll + capacity).min(definitions.len());
             for index in app.settings_scroll..end {
                 let row = Rect::new(
                     settings_list.x,
-                    settings_list.y + ((index - app.settings_scroll) as u16 * 2),
+                    settings_list.y + ((index - app.settings_scroll) as u16 * two_line_row_height),
                     settings_list.width,
-                    2,
+                    two_line_row_height,
                 );
                 settings_rows.push((index, row));
                 let inherited = app
@@ -800,6 +842,7 @@ impl UiLayout {
                         u16::from(screen_body.height > 2),
                     ),
                     &labels,
+                    compact,
                 );
                 settings_input_submit = actions.first().map_or(Rect::default(), |(_, rect)| *rect);
                 settings_input_cancel = actions.get(1).map_or(Rect::default(), |(_, rect)| *rect);
@@ -808,9 +851,14 @@ impl UiLayout {
             {
                 let action_area = Rect::new(
                     settings_scopes.x,
-                    settings_scopes.y.saturating_add(4),
+                    settings_scopes
+                        .y
+                        .saturating_add(if compact { 5 } else { 6 }),
                     settings_scopes.width,
-                    screen_body.height.saturating_sub(4).min(2),
+                    screen_body
+                        .height
+                        .saturating_sub(if compact { 5 } else { 6 })
+                        .min(2),
                 );
                 let mut actions = vec![(ModelProfileAction::Load, 8)];
                 if app.selected_profile_is_active() {
@@ -824,7 +872,7 @@ impl UiLayout {
                     (ModelProfileAction::Delete, 18),
                     (ModelProfileAction::Refresh, if compact { 9 } else { 11 }),
                 ]);
-                model_profile_actions = flow_actions(action_area, &actions);
+                model_profile_actions = flow_actions(action_area, &actions, compact);
             }
         }
 
@@ -834,27 +882,34 @@ impl UiLayout {
         let mut profile_engine_cancel = Rect::default();
         if app.overlay == Some(Overlay::ProfileEngine) {
             if let Some(selection) = &app.profile_engine_selection {
-                let popup =
-                    centered_fixed(area, 68, (selection.engines.len() as u16).saturating_add(7));
+                let popup = centered_fixed(
+                    area,
+                    if compact { 68 } else { 76 },
+                    (selection.engines.len() as u16)
+                        .saturating_mul(if compact { 1 } else { 2 })
+                        .saturating_add(if compact { 7 } else { 9 }),
+                );
                 profile_engine_popup = Some(popup);
                 let inner = popup.inner(Margin {
-                    horizontal: 2,
-                    vertical: 1,
+                    horizontal: if compact { 2 } else { 3 },
+                    vertical: if compact { 1 } else { 2 },
                 });
+                let engine_row_height = if compact { 1 } else { 2 };
                 for index in 0..selection.engines.len() {
                     profile_engine_rows.push((
                         index,
                         Rect::new(
                             inner.x,
-                            inner.y.saturating_add(2 + index as u16),
+                            inner.y.saturating_add(2 + index as u16 * engine_row_height),
                             inner.width,
-                            1,
+                            engine_row_height,
                         ),
                     ));
                 }
                 let actions = flow_actions(
                     Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
                     &[((), 11), ((), 10)],
+                    compact,
                 );
                 profile_engine_apply = actions.first().map_or(Rect::default(), |(_, rect)| *rect);
                 profile_engine_cancel = actions.get(1).map_or(Rect::default(), |(_, rect)| *rect);
@@ -864,11 +919,18 @@ impl UiLayout {
         let mut help_popup = None;
         let mut help_close = Rect::default();
         if app.overlay == Some(Overlay::Help) {
-            let popup = centered_percent(area, 74, 72);
+            let popup = if compact {
+                area.inner(Margin {
+                    horizontal: 1,
+                    vertical: 1,
+                })
+            } else {
+                centered_fixed(area, area.width.saturating_mul(82) / 100, 22)
+            };
             help_popup = Some(popup);
             help_close = Rect::new(
                 popup.right().saturating_sub(11),
-                popup.bottom().saturating_sub(2),
+                popup.bottom().saturating_sub(if compact { 2 } else { 3 }),
                 9.min(popup.width.saturating_sub(2)),
                 1,
             );
@@ -893,6 +955,10 @@ impl UiLayout {
         Self {
             too_small: false,
             compact,
+            model_row_height,
+            runtime_row_height: two_line_row_height,
+            settings_row_height: two_line_row_height,
+            overlay_row_height: two_line_row_height,
             nav_items,
             content,
             overview_metrics,
@@ -1137,7 +1203,7 @@ impl UiLayout {
     }
 
     pub fn model_capacity(&self) -> usize {
-        (self.model_list.height / MODEL_ROW_HEIGHT) as usize
+        (self.model_list.height / self.model_row_height.max(1)) as usize
     }
 
     pub fn log_capacity(&self) -> usize {
@@ -1145,15 +1211,274 @@ impl UiLayout {
     }
 
     pub fn runtime_capacity(&self) -> usize {
-        (self.runtime_list.height / 2) as usize
+        (self.runtime_list.height / self.runtime_row_height.max(1)) as usize
     }
 
     pub fn runtime_search_capacity(&self) -> usize {
-        (self.runtime_search_results.height / 2) as usize
+        (self.runtime_search_results.height / self.overlay_row_height.max(1)) as usize
     }
 
     pub fn settings_capacity(&self) -> usize {
-        (self.settings_list.height / 2) as usize
+        (self.settings_list.height / self.settings_row_height.max(1)) as usize
+    }
+
+    pub fn has_active_marquee(&self, app: &App) -> bool {
+        if self.too_small {
+            return false;
+        }
+        if !app.command_active
+            && app.notice.as_deref().is_some_and(|notice| {
+                needs_marquee(notice, self.command_bar.width.saturating_sub(7))
+            })
+        {
+            return true;
+        }
+        if app.command_active {
+            let suggestions = app.suggestions();
+            if let Some(command) = suggestions.get(app.suggestion_index)
+                && let Some((_, row)) = self
+                    .suggestion_rows
+                    .iter()
+                    .find(|(index, _)| *index == app.suggestion_index)
+            {
+                let name_width = if self.compact { 12 } else { 18 };
+                let prefix_width = command.name.len().max(name_width) + 2;
+                if needs_marquee(
+                    command.description,
+                    row.width.saturating_sub(prefix_width as u16),
+                ) {
+                    return true;
+                }
+            }
+        }
+
+        match app.overlay {
+            Some(Overlay::RuntimeSearch) => {
+                if let Some(progress) = &app.runtime_operation
+                    && needs_marquee(
+                        &super::runtime_search::progress_text(progress),
+                        self.runtime_operation_status.width,
+                    )
+                {
+                    return true;
+                }
+                let Some(result) = app
+                    .selected_runtime_search_result
+                    .and_then(|index| app.runtime_search.as_ref()?.results.get(index))
+                else {
+                    return false;
+                };
+                let available = &result.entry.available;
+                let row_width = self
+                    .runtime_search_rows
+                    .iter()
+                    .find(|(index, _)| Some(*index) == app.selected_runtime_search_result)
+                    .map_or(0, |(_, row)| row.width);
+                let compatibility = match result.entry.compatibility {
+                    norted_core::RuntimeCompatibility::Recommended => "recommended",
+                    norted_core::RuntimeCompatibility::Compatible => "compatible",
+                    norted_core::RuntimeCompatibility::NeedsAttention(_) => "needs attention",
+                    norted_core::RuntimeCompatibility::Incompatible(_) => "incompatible",
+                };
+                let name_width = row_width.saturating_sub(5 + compatibility.len() as u16);
+                let detail_width = self
+                    .runtime_search_details
+                    .width
+                    .saturating_sub(super::components::KEY_COLUMN as u16 + 1);
+                let source = available
+                    .identity
+                    .package
+                    .repository
+                    .as_deref()
+                    .unwrap_or(available.source_url.as_str());
+                needs_marquee(&available.display_name, name_width)
+                    || needs_marquee(&available.display_name, self.runtime_search_details.width)
+                    || needs_marquee(source, detail_width)
+            }
+            Some(Overlay::ModelRuntime) => {
+                let model_overflow = app
+                    .selected_model
+                    .and_then(|index| app.snapshot.models.get(index))
+                    .is_some_and(|model| {
+                        needs_marquee(
+                            &model.display_name,
+                            self.runtime_search_input.width.saturating_sub(32),
+                        )
+                    });
+                let runtime_overflow = app
+                    .runtime_picker_selection
+                    .and_then(|selected| {
+                        let status = app.runtime_list.as_ref()?.installed.get(selected)?;
+                        let row = self
+                            .runtime_search_rows
+                            .iter()
+                            .find(|(index, _)| *index == selected)?
+                            .1;
+                        let identity = &status.runtime.manifest.identity;
+                        Some(needs_marquee(
+                            &format!("{}  {}", identity.engine_id, identity.version),
+                            row.width.saturating_sub(18),
+                        ))
+                    })
+                    .unwrap_or(false);
+                model_overflow || runtime_overflow
+            }
+            Some(Overlay::ProfileEngine) => {
+                app.profile_engine_selection
+                    .as_ref()
+                    .is_some_and(|selection| {
+                        needs_marquee(
+                            &selection.model.display_name,
+                            self.profile_engine_popup
+                                .map_or(0, |popup| popup.width.saturating_sub(41)),
+                        )
+                    })
+            }
+            Some(Overlay::Help) => false,
+            None => match app.screen {
+                Screen::Models => self.model_rows.iter().any(|(index, row)| {
+                    let active = app.selected_model == Some(*index)
+                        || app.hover == Some(HoverTarget::Model(*index));
+                    if !active {
+                        return false;
+                    }
+                    if app.model_library_view == ModelLibraryView::Discover {
+                        return app
+                            .model_search_artifact(*index)
+                            .is_some_and(|(_, artifact)| {
+                                needs_marquee(&artifact.filename, row.width.saturating_sub(9))
+                            });
+                    }
+                    app.snapshot.models.get(*index).is_some_and(|model| {
+                        let size_width =
+                            UnicodeWidthStr::width(format_bytes(model.size_bytes).as_str()) as u16;
+                        needs_marquee(
+                            &model.display_name,
+                            row.width.saturating_sub(3).saturating_mul(3) / 5,
+                        ) || needs_marquee(
+                            &model.path.display().to_string(),
+                            row.width.saturating_sub(size_width.saturating_add(2)),
+                        )
+                    })
+                }),
+                Screen::Runtimes => self.runtime_rows.iter().any(|(index, row)| {
+                    let active = app.selected_runtime == Some(*index)
+                        || app.hover == Some(HoverTarget::Runtime(*index));
+                    active
+                        && app
+                            .runtime_list
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.installed.get(*index))
+                            .is_some_and(|status| {
+                                let identity = &status.runtime.manifest.identity;
+                                needs_marquee(
+                                    &format!("{}  {}", identity.engine_id, identity.version),
+                                    row.width.saturating_sub(20),
+                                )
+                            })
+                }),
+                Screen::Settings | Screen::ModelProfiles => {
+                    let setting_overflow = app
+                        .settings_definitions()
+                        .get(app.settings_setting_index)
+                        .is_some_and(|definition| {
+                            let id_width = self
+                                .setting_values
+                                .iter()
+                                .find(|(index, _)| *index == app.settings_setting_index)
+                                .and_then(|(_, value)| {
+                                    self.settings_rows
+                                        .iter()
+                                        .find(|(index, _)| *index == app.settings_setting_index)
+                                        .map(|(_, row)| {
+                                            value.x.saturating_sub(row.x).saturating_sub(2)
+                                        })
+                                })
+                                .unwrap_or(0);
+                            let value_width = self
+                                .setting_values
+                                .iter()
+                                .find(|(index, _)| *index == app.settings_setting_index)
+                                .map_or(0, |(_, area)| area.width);
+                            let (value, _, _) = app.settings_value_display(&definition.id);
+                            needs_marquee(&definition.id.to_string(), id_width)
+                                || needs_marquee(&format!("[ {value} ]"), value_width)
+                        });
+                    let profile_path_overflow = app.screen == Screen::ModelProfiles
+                        && app.selected_profile_model().is_some_and(|model| {
+                            needs_marquee(
+                                &model.path.display().to_string(),
+                                self.settings_scopes.width,
+                            )
+                        });
+                    setting_overflow || profile_path_overflow
+                }
+                Screen::Server => {
+                    let width = self
+                        .server_details
+                        .width
+                        .saturating_sub(super::components::KEY_COLUMN as u16 + 1);
+                    let endpoint = app
+                        .control
+                        .as_ref()
+                        .and_then(|control| control.public_endpoint.as_deref())
+                        .or_else(|| app.snapshot.server.endpoint())
+                        .unwrap_or("Not serving");
+                    let control_values = app.control.as_ref().map(|control| {
+                        [
+                            control
+                                .backends
+                                .iter()
+                                .map(|backend| {
+                                    format!(
+                                        "{} [{:?}/{:?}/{:?}; req {}; leases {}]",
+                                        backend.model_profile_id,
+                                        backend.role,
+                                        backend.residency,
+                                        backend.lifecycle,
+                                        backend.active_request_count,
+                                        backend.primary_lease_count,
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            control
+                                .backends
+                                .iter()
+                                .map(|backend| backend.model_id.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            control
+                                .backends
+                                .iter()
+                                .filter_map(|backend| backend.engine_id.clone())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            control
+                                .backends
+                                .iter()
+                                .filter_map(|backend| {
+                                    backend.runtime_id.as_ref().map(ToString::to_string)
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            control
+                                .backends
+                                .iter()
+                                .filter_map(|backend| backend.private_endpoint.clone())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ]
+                    });
+                    needs_marquee(endpoint, width)
+                        || needs_marquee(&app.public_auth_status.bind, width)
+                        || control_values.is_some_and(|values| {
+                            values.iter().any(|value| needs_marquee(value, width))
+                        })
+                }
+                Screen::Overview | Screen::Logs | Screen::Help => false,
+            },
+        }
     }
 
     pub fn contains_content(&self, position: Position) -> bool {
@@ -1166,7 +1491,7 @@ impl UiLayout {
     }
 }
 
-fn flow_actions<T: Copy>(area: Rect, actions: &[(T, u16)]) -> Vec<(T, Rect)> {
+fn flow_actions<T: Copy>(area: Rect, actions: &[(T, u16)], compact: bool) -> Vec<(T, Rect)> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
     }
@@ -1187,7 +1512,7 @@ fn flow_actions<T: Copy>(area: Rect, actions: &[(T, u16)]) -> Vec<(T, Rect)> {
             break;
         }
         result.push((*action, Rect::new(x, y, width, 1)));
-        x = x.saturating_add(width.saturating_add(1));
+        x = x.saturating_add(width.saturating_add(if compact { 1 } else { 2 }));
     }
     result
 }
@@ -1195,17 +1520,6 @@ fn flow_actions<T: Copy>(area: Rect, actions: &[(T, u16)]) -> Vec<(T, Rect)> {
 fn centered_fixed(area: Rect, maximum_width: u16, requested_height: u16) -> Rect {
     let width = maximum_width.min(area.width.saturating_sub(4)).max(1);
     let height = requested_height.min(area.height.saturating_sub(2)).max(1);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
-}
-
-fn centered_percent(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let width = area.width.saturating_mul(percent_x) / 100;
-    let height = area.height.saturating_mul(percent_y) / 100;
     Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
@@ -1406,13 +1720,13 @@ mod tests {
         let mut app = test_app(20);
         app.screen = Screen::Models;
         let layout = UiLayout::calculate(Rect::new(0, 0, 100, 30), &app);
-        let screen_body = content_layout(layout.content)[1];
+        let screen_body = content_layout(layout.content, layout.compact)[1];
 
         assert_eq!(layout.model_progress, Rect::default());
         assert_eq!(layout.model_list, screen_body);
         assert_eq!(
             layout.model_capacity(),
-            (screen_body.height / MODEL_ROW_HEIGHT) as usize
+            (screen_body.height / layout.model_row_height) as usize
         );
     }
 
@@ -1425,5 +1739,82 @@ mod tests {
 
         assert_eq!(layout.server_progress.height, 3);
         assert!(!overlaps(layout.server_progress, layout.server_details));
+    }
+
+    #[test]
+    fn comfortable_and_compact_density_use_shared_responsive_metrics() {
+        let app = test_app(20);
+        let comfortable = UiLayout::calculate(Rect::new(0, 0, 100, 30), &app);
+        let narrow = UiLayout::calculate(Rect::new(0, 0, 83, 30), &app);
+        let short = UiLayout::calculate(Rect::new(0, 0, 100, 27), &app);
+
+        assert!(!comfortable.compact);
+        assert_eq!(comfortable.model_row_height, 4);
+        assert_eq!(comfortable.runtime_row_height, 3);
+        assert!(comfortable.content.x > narrow.content.x);
+
+        for compact in [&narrow, &short] {
+            assert!(compact.compact);
+            assert_eq!(compact.model_row_height, 3);
+            assert_eq!(compact.runtime_row_height, 2);
+            assert_eq!(compact.settings_row_height, 2);
+        }
+    }
+
+    #[test]
+    fn model_row_hitboxes_follow_the_responsive_row_rhythm() {
+        let mut app = test_app(20);
+        app.screen = Screen::Models;
+        for area in [Rect::new(0, 0, 120, 40), Rect::new(0, 0, 80, 24)] {
+            let layout = UiLayout::calculate(area, &app);
+            for (position, (index, row)) in layout.model_rows.iter().enumerate() {
+                assert_eq!(row.height, layout.model_row_height);
+                assert!(row.right() <= area.right() && row.bottom() <= area.bottom());
+                assert_eq!(
+                    layout.hit_test(Position::new(row.x, row.y + row.height - 1)),
+                    Some(HoverTarget::Model(*index)),
+                );
+                if let Some((_, next)) = layout.model_rows.get(position + 1) {
+                    assert_eq!(next.y, row.bottom());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_screen_and_overlay_stays_bounded_near_the_minimum() {
+        let area = Rect::new(0, 0, MIN_WIDTH, MIN_HEIGHT);
+        let mut app = test_app(4);
+        for screen in Screen::ALL {
+            app.screen = screen;
+            let layout = UiLayout::calculate(area, &app);
+            assert!(!layout.too_small);
+            for rect in [
+                layout.header,
+                layout.content,
+                layout.command_bar,
+                layout.footer,
+                layout.model_list,
+                layout.runtime_list,
+                layout.settings_list,
+                layout.logs,
+            ] {
+                assert!(rect.right() <= area.right());
+                assert!(rect.bottom() <= area.bottom());
+            }
+        }
+
+        for overlay in [Overlay::Help, Overlay::RuntimeSearch, Overlay::ModelRuntime] {
+            app.overlay = Some(overlay);
+            let layout = UiLayout::calculate(area, &app);
+            let popup = if overlay == Overlay::Help {
+                layout.help_popup
+            } else {
+                layout.runtime_search_popup
+            }
+            .expect("active overlay has geometry");
+            assert!(popup.right() <= area.right());
+            assert!(popup.bottom() <= area.bottom());
+        }
     }
 }
