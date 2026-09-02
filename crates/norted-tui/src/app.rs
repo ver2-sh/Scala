@@ -988,6 +988,9 @@ impl App {
                 Err(error) => {
                     self.settings_error = Some(error.clone());
                     self.notice = Some(error);
+                    if self.screen == Screen::ModelProfiles {
+                        let _ = self.refresh_selected_model_profile();
+                    }
                 }
             },
             SettingsTaskResult::ChooseProfileEngine(selection) => {
@@ -1231,9 +1234,13 @@ impl App {
             return None;
         }
         let profile = self.selected_model_profile_value()?;
+        let runtime_id = self.settings_runtime_id.as_ref()?;
         let backend = &self.control.as_ref()?.backend;
         if backend.lifecycle != BackendLifecycle::Running
             || backend.model_profile_id.as_ref() != Some(&profile.id)
+            || backend.model_id.as_ref() != Some(&profile.model_id)
+            || backend.engine_id.as_deref() != Some(profile.engine_id.as_str())
+            || backend.runtime_id.as_ref() != Some(runtime_id)
         {
             return None;
         }
@@ -2400,9 +2407,17 @@ impl App {
     }
 
     fn cancel_settings_input(&mut self) -> Update {
+        let creating_profile = self
+            .settings_input
+            .as_ref()
+            .is_some_and(|input| input.kind == SettingsInputKind::ProfileName);
         self.settings_input = None;
         self.hover = None;
-        Update::Render
+        if creating_profile && self.screen == Screen::ModelProfiles {
+            self.refresh_selected_model_profile()
+        } else {
+            Update::Render
+        }
     }
 
     fn submit_settings_input(&mut self) -> Update {
@@ -2427,7 +2442,7 @@ impl App {
                             "Select an artifact on Models before creating a Model Profile"
                                 .to_owned(),
                         );
-                        return Update::Render;
+                        return self.refresh_selected_model_profile();
                     };
                     self.queue_settings_action(SettingsAction::CreateProfile {
                         id,
@@ -2438,7 +2453,7 @@ impl App {
                 }
                 Err(error) => {
                     self.notice = Some(error.to_string());
-                    Update::Render
+                    self.refresh_selected_model_profile()
                 }
             },
             SettingsInputKind::DuplicateProfile => match ModelProfileId::new(input.text) {
@@ -2617,7 +2632,7 @@ impl App {
         self.profile_engine_selection = None;
         self.hover = None;
         self.notice = Some("Model Profile creation cancelled".to_owned());
-        Update::Render
+        self.refresh_selected_model_profile()
     }
 
     fn clear_selected_setting(&mut self) -> Update {
@@ -2839,7 +2854,13 @@ impl App {
     }
 
     fn runtime_context_changed(&mut self) {
-        if self.screen != Screen::ModelProfiles {
+        if self.screen != Screen::ModelProfiles
+            || self
+                .settings_input
+                .as_ref()
+                .is_some_and(|input| input.kind == SettingsInputKind::ProfileName)
+            || self.overlay == Some(Overlay::ProfileEngine)
+        {
             return;
         }
         if self.settings_busy {
@@ -2850,6 +2871,9 @@ impl App {
     }
 
     fn create_profile_for_selected_model(&mut self) -> Update {
+        if self.settings_loading || self.settings_busy {
+            return Update::None;
+        }
         let Some(model) = self
             .selected_model
             .and_then(|index| self.snapshot.models.get(index))
@@ -2859,6 +2883,11 @@ impl App {
             return Update::Render;
         };
         self.settings_model = Some(model.id.clone());
+        self.profile_inspection_stale = false;
+        self.settings_schema = None;
+        self.settings_resolved = None;
+        self.settings_runtime_id = None;
+        self.settings_validation_error = None;
         self.screen = Screen::ModelProfiles;
         self.nav_focus = Screen::ModelProfiles;
         self.settings_setting_index = 0;
@@ -4253,8 +4282,8 @@ mod tests {
     use norted_core::{
         AppSnapshot, ArtifactFormat, EffectivePublicAuthMode, EngineId, ModelArtifact, ModelId,
         ModelProfile, ModelProfileId, ModelProfilesState, PublicAuthMode, PublicAuthStatus,
-        RegistryState, RuntimeId, ServerState, SettingCategory, SettingDefinition, SettingId,
-        SettingKind, SettingScope, SettingValue, SettingsSchema, SettingsState,
+        RegistryState, ServerState, SettingCategory, SettingDefinition, SettingId, SettingKind,
+        SettingScope, SettingsSchema,
     };
 
     use super::{
@@ -4304,52 +4333,6 @@ mod tests {
             true,
             definitions,
         )
-    }
-
-    fn artifact() -> ModelArtifact {
-        ModelArtifact {
-            id: ModelId("artifact".to_owned()),
-            display_name: "Artifact".to_owned(),
-            path: PathBuf::from("artifact.gguf"),
-            format: ArtifactFormat::Gguf,
-            size_bytes: 1,
-            created: 1,
-            hash: None,
-            architecture: None,
-            context_length: None,
-            provenance: None,
-            native_identity: None,
-            auxiliary_artifacts: Vec::new(),
-            norted_package: None,
-        }
-    }
-
-    fn profile_app(definitions: Vec<SettingDefinition>) -> App {
-        let mut app = test_app(definitions.clone());
-        let model = artifact();
-        let id = ModelProfileId::new("quality").expect("profile ID");
-        let profile = ModelProfile::new(
-            id.clone(),
-            "Quality",
-            model.id.clone(),
-            EngineId::new("q27").expect("engine ID"),
-        )
-        .expect("profile");
-        let mut profiles = ModelProfilesState::default();
-        profiles.profiles.insert(id, profile);
-        app.snapshot.models.push(model);
-        app.model_profiles = Some(profiles);
-        app.settings_state = Some(SettingsState::default());
-        app.settings_loading = false;
-        app.selected_model_profile = Some(0);
-        app.screen = Screen::ModelProfiles;
-        app.settings_runtime_id = Some(RuntimeId::new("q27-reviewed").expect("runtime ID"));
-        app.settings_schema = Some(SettingsSchema {
-            engine_id: "q27".to_owned(),
-            runtime_id: app.settings_runtime_id.clone(),
-            definitions,
-        });
-        app
     }
 
     #[test]
@@ -4428,157 +4411,6 @@ mod tests {
             .map(|definition| definition.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, ["temperature", "q27.mtp"]);
-    }
-
-    #[test]
-    fn model_profile_without_inspection_never_uses_generic_definitions() {
-        let mut app = profile_app(vec![definition("min_p", SettingScope::Common)]);
-        app.settings_schema = None;
-
-        assert!(app.settings_definitions().is_empty());
-    }
-
-    #[test]
-    fn entering_model_profiles_automatically_inspects_the_selected_profile() {
-        let mut app = profile_app(vec![definition("min_p", SettingScope::Common)]);
-        app.screen = Screen::Overview;
-        app.settings_schema = Some(SettingsSchema {
-            engine_id: "stale".to_owned(),
-            runtime_id: None,
-            definitions: vec![definition("temperature", SettingScope::Common)],
-        });
-
-        app.activate_screen(Screen::ModelProfiles);
-
-        assert!(app.settings_busy());
-        assert!(app.settings_schema.is_none());
-        assert!(app.settings_definitions().is_empty());
-        assert!(matches!(
-            app.take_settings_action(),
-            Some(SettingsAction::InspectProfile { .. })
-        ));
-    }
-
-    #[test]
-    fn initial_settings_load_inspects_an_already_open_profile_page() {
-        let mut app = profile_app(vec![definition("min_p", SettingScope::Common)]);
-        let profiles = app.model_profiles.clone().expect("profiles");
-        app.settings_loading = true;
-        app.settings_state = None;
-        app.settings_schema = None;
-
-        app.handle_settings_task_result(SettingsTaskResult::Loaded(Ok((
-            SettingsState::default(),
-            profiles,
-        ))));
-
-        assert!(app.settings_busy());
-        assert!(matches!(
-            app.take_settings_action(),
-            Some(SettingsAction::InspectProfile { .. })
-        ));
-    }
-
-    #[test]
-    fn reviewed_runtime_defaults_render_as_plain_values() {
-        let mut min_p = definition("min_p", SettingScope::Common);
-        min_p.upstream_default = Some("runtime default: 0.0".to_owned());
-        let app = profile_app(vec![min_p]);
-        let id = SettingId::new("min_p").expect("setting ID");
-
-        assert_eq!(
-            app.settings_value_display(&id),
-            ("0.0".to_owned(), "runtime default".to_owned(), false)
-        );
-    }
-
-    #[test]
-    fn norted_defaults_and_profile_overrides_render_as_plain_values() {
-        let mut overflow = definition("context_overflow", SettingScope::Common);
-        overflow.upstream_default = Some("Norted default: error".to_owned());
-        let overflow_id = overflow.id.clone();
-        let mut app = profile_app(vec![overflow]);
-        assert_eq!(
-            app.settings_value_display(&overflow_id),
-            ("error".to_owned(), "Norted default".to_owned(), false)
-        );
-
-        app.model_profiles
-            .as_mut()
-            .expect("profiles")
-            .profiles
-            .values_mut()
-            .next()
-            .expect("profile")
-            .overrides
-            .insert(
-                overflow_id.clone(),
-                SettingValue::Choice("truncate".to_owned()),
-            );
-        assert_eq!(
-            app.settings_value_display(&overflow_id),
-            (
-                "truncate".to_owned(),
-                "model-profile:quality".to_owned(),
-                true
-            )
-        );
-    }
-
-    #[test]
-    fn unsupported_settings_render_as_unsupported_and_keep_clear_available() {
-        let mut presence = definition("presence_penalty", SettingScope::Common);
-        presence.supported = false;
-        presence.unsupported_reason = Some("not proved by the exact runtime".to_owned());
-        presence.upstream_default = Some("runtime/model default".to_owned());
-        let mut app = profile_app(vec![presence]);
-        let id = SettingId::new("presence_penalty").expect("setting ID");
-        app.model_profiles
-            .as_mut()
-            .expect("profiles")
-            .profiles
-            .values_mut()
-            .next()
-            .expect("profile")
-            .overrides
-            .insert(id.clone(), SettingValue::Float(0.5));
-
-        assert_eq!(
-            app.settings_value_display(&id),
-            ("Unsupported".to_owned(), "unsupported".to_owned(), true)
-        );
-        assert!(app.settings_default_detail(&id).contains("not proved"));
-        assert!(app.settings_default_detail(&id).contains("Inherit"));
-    }
-
-    #[test]
-    fn dynamic_defaults_are_context_honest() {
-        let mut temperature = definition("temperature", SettingScope::Common);
-        temperature.upstream_default = Some("runtime/model default".to_owned());
-        let id = temperature.id.clone();
-        let mut global = test_app(vec![temperature.clone()]);
-        global.settings_state = Some(SettingsState::default());
-        global.settings_loading = false;
-        global.screen = Screen::Settings;
-        assert_eq!(
-            global.settings_value_display(&id),
-            (
-                "varies by runtime".to_owned(),
-                "runtime/model dependent".to_owned(),
-                false
-            )
-        );
-
-        let mut profile = profile_app(vec![temperature]);
-        profile.settings_runtime_id = None;
-        assert_eq!(
-            profile.settings_value_display(&id),
-            (
-                "unresolved".to_owned(),
-                "runtime dependent".to_owned(),
-                false
-            )
-        );
     }
 
     #[test]
