@@ -18,7 +18,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             SettingKind::Choice {
                 choices: choices(&["bf16", "int8", "fp8", "nvfp4", "k8v4"]),
             },
-            Some("exact runtime default"),
+            Some("runtime default: BF16"),
         ),
         definition(
             "ninfer.kv_capacity",
@@ -29,7 +29,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
                 maximum: Some(MAX_NINFER_CLI_INTEGER),
                 choices: choices(&["auto"]),
             },
-            Some("derived by the exact runtime when omitted"),
+            Some("runtime default: matches context"),
         ),
         definition(
             "ninfer.prefill_chunk",
@@ -39,14 +39,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
                 minimum: Some(128),
                 maximum: Some(MAX_NINFER_CLI_INTEGER),
             },
-            Some("exact runtime default"),
+            Some("runtime default: 1024"),
         ),
         definition(
             "ninfer.speculation",
             "Speculation",
             "Enable or disable speculative decoding",
             SettingKind::Toggle,
-            Some("runtime default/off when omitted"),
+            Some("runtime default: off"),
         ),
         definition(
             "ninfer.speculative_backend",
@@ -55,7 +55,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             SettingKind::Choice {
                 choices: choices(&["mtp", "dflash"]),
             },
-            Some("off when omitted"),
+            Some("runtime default: off"),
         ),
         definition(
             "ninfer.draft_tokens",
@@ -65,7 +65,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
                 minimum: Some(1),
                 maximum: Some(15),
             },
-            Some("requires an explicit speculative backend"),
+            Some("runtime default: unused"),
         ),
         toggle(
             "ninfer.lm_head_draft",
@@ -211,6 +211,65 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
     definitions
 }
 
+pub(crate) fn apply_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
+    for (id, value) in [
+        ("context_length", "runtime default: 8192"),
+        ("parallel_requests", "runtime default: 1"),
+        ("temperature", "model/thinking-mode default"),
+        ("top_p", "model/thinking-mode default"),
+        ("top_k", "model/thinking-mode default"),
+        ("min_p", "model/thinking-mode default"),
+        ("seed", "runtime-selected random seed"),
+        ("presence_penalty", "model/thinking-mode default"),
+        ("frequency_penalty", "model/thinking-mode default"),
+        ("max_output_tokens", "runtime default: 8192"),
+        ("ninfer.lm_head_draft", "runtime default: off"),
+        ("ninfer.vision", "runtime default: off"),
+        ("ninfer.greedy", "runtime default: off"),
+        ("ninfer.cuda_graph", "runtime default: enabled"),
+        ("ninfer.prefix_reuse", "runtime default: enabled"),
+        ("ninfer.thinking", "runtime default: enabled"),
+        ("ninfer.preserve_thinking", "runtime default: disabled"),
+        (
+            "ninfer.device_state_slots",
+            "runtime automatic: concurrency",
+        ),
+        ("ninfer.host_state_slots", "runtime default: 8"),
+        ("ninfer.host_kv_mib", "runtime default: 8192 MiB"),
+        (
+            "ninfer.max_private_continuations",
+            "runtime automatic: 2 × concurrency",
+        ),
+        (
+            "ninfer.max_shared_prefixes",
+            "runtime automatic: concurrency",
+        ),
+        (
+            "ninfer.max_long_anchors_per_continuation",
+            "runtime default: 2",
+        ),
+        ("ninfer.max_pending_requests", "runtime default: 16"),
+        ("ninfer.pending_timeout_ms", "runtime default: 30000 ms"),
+        ("ninfer.log_stats_interval_ms", "runtime default: 5000 ms"),
+        ("ninfer.max_request_mib", "runtime default: 384 MiB"),
+        ("ninfer.media_cache_mib", "runtime default: 1024 MiB"),
+        ("ninfer.media_live_mib", "runtime default: 2048 MiB"),
+        (
+            "ninfer.media_preprocess_threads",
+            "runtime-selected from host concurrency",
+        ),
+        ("ninfer.response_store_max_records", "runtime default: 1024"),
+        ("ninfer.response_store_max_mib", "runtime default: 256 MiB"),
+    ] {
+        if let Some(definition) = definitions
+            .iter_mut()
+            .find(|definition| definition.id.as_str() == id)
+        {
+            definition.upstream_default = Some(value.to_owned());
+        }
+    }
+}
+
 pub(crate) fn apply_runtime_bounds(definitions: &mut [SettingDefinition]) {
     if let Some(context) = definitions
         .iter_mut()
@@ -329,7 +388,7 @@ fn toggle(id: &str, label: &str, description: &str) -> SettingDefinition {
         label,
         description,
         SettingKind::Toggle,
-        Some("runtime default when omitted"),
+        Some("exact runtime default"),
     )
 }
 

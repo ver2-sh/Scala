@@ -1499,12 +1499,14 @@ fn render_settings(
     let info = if app.settings_input.is_some() {
         String::new()
     } else {
-        let description = app
-            .settings_definitions()
-            .get(app.settings_setting_index)
-            .map_or("", |definition| definition.description.as_str());
+        let definitions = app.settings_definitions();
+        let definition = definitions.get(app.settings_setting_index);
+        let description = definition.map_or("", |definition| definition.description.as_str());
+        let default = definition.map_or_else(String::new, |definition| {
+            app.settings_default_detail(&definition.id)
+        });
         format!(
-            "Rows select. Click a value to edit or change it; Inherit clears this layer's override.\n{description}"
+            "Rows select. Click a value to edit or change it; Inherit clears this layer's override.\n{description}\n{default}"
         )
     };
     frame.render_widget(
@@ -1577,7 +1579,9 @@ fn render_model_profiles(
         Vec::new()
     } else if let Some(profile) = app.selected_model_profile_value() {
         let model = app.selected_profile_model();
-        vec![
+        let definitions = app.settings_definitions();
+        let selected_definition = definitions.get(app.settings_setting_index);
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled(format!("{}  ", profile.id), theme.text),
                 Span::styled(format!("engine {}  ", profile.engine_id), theme.accent),
@@ -1617,7 +1621,18 @@ fn render_model_profiles(
                     theme.hint
                 },
             )),
-        ]
+        ];
+        if let Some(definition) = selected_definition {
+            lines.push(Line::from(Span::styled(
+                definition.description.clone(),
+                theme.hint,
+            )));
+            lines.push(Line::from(Span::styled(
+                app.settings_default_detail(&definition.id),
+                theme.muted,
+            )));
+        }
+        lines
     } else {
         vec![Line::from(Span::styled(
             "No Model Profiles. Select an artifact on Models and use Create Profile.",
