@@ -456,7 +456,7 @@ fn render_models(
             frame,
             layout[1],
             &format!("{}  No models installed", glyphs.empty),
-            "Press Right Arrow or s to browse Hugging Face, or configure external model paths.",
+            "Open Discover to browse Hugging Face, or configure external model paths.",
             theme,
         );
         return;
@@ -585,10 +585,10 @@ fn render_installed_model_actions(
             ),
             InstalledModelAction::Runtime => (
                 "[ Runtime ]",
-                if app.runtime_mutation_busy() || app.runtime_picker_loading {
-                    ActionState::Disabled
-                } else {
+                if app.model_runtime_picker_available() {
                     ActionState::Normal
+                } else {
+                    ActionState::Disabled
                 },
             ),
             InstalledModelAction::Unload => (
@@ -1497,7 +1497,7 @@ fn render_model_profiles(
         ]
     } else {
         vec![Line::from(Span::styled(
-            "No Model Profiles. Select an artifact on Models and press Enter/c to create one.",
+            "No Model Profiles. Select an artifact on Models and use Create Profile.",
             theme.muted,
         ))]
     };

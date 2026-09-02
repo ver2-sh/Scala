@@ -72,7 +72,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             if app.runtime_search_loading {
                 "Searching…"
             } else {
-                "[Enter] Go"
+                "[ Search ]"
             },
             submit_style,
         ))),
@@ -146,7 +146,7 @@ fn render_results(
         } else if app.runtime_search_query.is_empty() {
             "No runtime candidates were returned by the configured providers.".to_owned()
         } else {
-            "No fetched runtime matches this filter. Press Enter to search providers with it."
+            "No fetched runtime matches this filter. Use Search to query providers; Enter remains a shortcut."
                 .to_owned()
         };
         frame.render_widget(
