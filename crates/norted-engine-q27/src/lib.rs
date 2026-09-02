@@ -87,9 +87,9 @@ const INFERENCE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SSE_FRAME_LIMIT: usize = 1024 * 1024;
 const SHARP_TEMPLATE_LIMIT: u64 = 4 * 1024 * 1024;
 
-// These values can change authentication, sampling, or prompt semantics behind
-// Norted's back. They are removed from the inherited environment and rejected
-// in the adapter-specific environment map.
+// These values can change authentication, sampling, prompt semantics, or the
+// final context/slot contract behind Norted's back. They are removed from the
+// inherited environment and rejected in the adapter-specific environment map.
 const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &[
     "Q27_API_KEY",
     "Q27_FORCE_TEMP",
@@ -102,11 +102,15 @@ const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &[
     "Q27_PMIN",
     "Q27_SUFFIX",
     "Q27_SUFFIX_W",
+    "Q27_PROFILE",
+    "Q27_KV_POOL",
+    "Q27_PF_ARENA",
     "CUDA_VISIBLE_DEVICES",
 ];
 
 // q27 parses MODEL and TOKENIZER positionally. Norted owns those arguments,
-// its private bind, authentication state, thinking mode, and sampler defaults.
+// its private bind, authentication state, thinking mode, sampler defaults, and
+// the structured context/slot process contract.
 const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "--host",
     "--port",
@@ -121,15 +125,15 @@ const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "--top-k",
     "--min-p",
     "--constrain-tools",
+    "--ctx",
+    "--slots",
+    "--slot1-ctx",
 ];
 
 // q27 v0.6.2 parses options with a hand-written exact-match argv loop. Keep
 // this allowlist at that managed binary contract: unknown arguments are
 // silently ignored upstream, and boolean/value arity must not be guessed.
 const ALLOWED_VALUE_NATIVE_ARGUMENTS: &[&str] = &[
-    "--ctx",
-    "--slots",
-    "--slot1-ctx",
     "--prefix-cache",
     "--prefix-cache-max-gb",
     "--prefix-cache-min",
@@ -1541,11 +1545,36 @@ fn setting_choice<'a>(settings: &'a norted_core::ResolvedSettings, id: &str) -> 
     }
 }
 
+fn setting_unsigned_with_source<'a>(
+    settings: &'a norted_core::ResolvedSettings,
+    id: &str,
+) -> Option<(u64, &'a norted_core::SettingSource)> {
+    settings.effective.iter().find_map(|(candidate, setting)| {
+        if candidate.as_str() != id {
+            return None;
+        }
+        match &setting.value {
+            SettingValue::UnsignedInteger(value) => Some((*value, &setting.source)),
+            _ => None,
+        }
+    })
+}
+
+fn setting_source_label(source: &norted_core::SettingSource) -> &'static str {
+    match source {
+        norted_core::SettingSource::GlobalDefault => "Global Default",
+        norted_core::SettingSource::EngineDefault { .. } => "Engine Default",
+        norted_core::SettingSource::ModelProfile { .. } => "Model Profile",
+        norted_core::SettingSource::Invocation => "invocation",
+    }
+}
+
 fn q27_has_configured_execution(settings: &norted_core::ResolvedSettings) -> bool {
     settings.effective.keys().any(|id| {
         matches!(
             id.as_str(),
             "context_length"
+                | "parallel_requests"
                 | "temperature"
                 | "top_p"
                 | "top_k"
@@ -1680,6 +1709,53 @@ fn q27_configured_launch(
         environment,
         normalized_settings,
     })
+}
+
+fn verify_q27_process_setting_arguments(
+    settings: &norted_core::ResolvedSettings,
+    arguments: &[OsString],
+) -> Result<(), EngineError> {
+    for (id, option) in [
+        ("context_length", "--ctx"),
+        ("parallel_requests", "--slots"),
+        ("q27.slot1_context_length", "--slot1-ctx"),
+    ] {
+        let expected = setting_unsigned(settings, id).map(|value| value.to_string());
+        let mut observed = Vec::new();
+        let mut index = 0;
+        while let Some(argument) = arguments.get(index) {
+            if argument == option {
+                let value = arguments.get(index + 1).ok_or_else(|| {
+                    EngineError::InvalidConfiguration(format!(
+                        "q27 launch option `{option}` omitted its value"
+                    ))
+                })?;
+                observed.push(value.to_string_lossy().into_owned());
+                index += 2;
+                continue;
+            }
+            if argument
+                .to_string_lossy()
+                .strip_prefix(option)
+                .is_some_and(|suffix| suffix.starts_with('='))
+            {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "q27 launch option `{option}` did not come from structured settings"
+                )));
+            }
+            index += 1;
+        }
+        let matches = match expected.as_deref() {
+            Some(expected) => observed.as_slice() == [expected],
+            None => observed.is_empty(),
+        };
+        if !matches {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "q27 structured setting `{id}` disagrees with the launch arguments"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl Q27Adapter {
@@ -2010,6 +2086,7 @@ impl Q27Adapter {
                 "q27 launch has no proven numeric compiled W_MAX".to_owned(),
             ));
         }
+        verify_q27_process_setting_arguments(&spec.settings, &spec.arguments)?;
         self.configured_executions.write().await.insert(
             endpoint.to_owned(),
             Q27ConfiguredExecution {
@@ -3079,16 +3156,28 @@ impl EngineAdapter for Q27Adapter {
                 selected_kv_mode.as_str()
             )));
         }
-        if setting_choice(&execution.settings, "q27.suffix_width_mode") == Some("runtime_w_max")
-            && execution.compiled_w_max.is_some_and(|compiled_w_max| {
-                observed.compiled_w_max != compiled_w_max || observed.suffix_width != compiled_w_max
-            })
+        let compiled_w_max = execution.compiled_w_max.ok_or_else(|| {
+            EngineError::Operation(
+                "q27 startup has no immutable exact-runtime compiled W_MAX authority".to_owned(),
+            )
+        })?;
+        if observed
+            .auto_compiled_w_max
+            .is_some_and(|observed| observed != compiled_w_max)
         {
             return Err(EngineError::Operation(format!(
-                "q27 startup W_MAX/suffix proof ({}/{}) disagrees with the pre-launch numeric W_MAX {}",
-                observed.compiled_w_max,
-                observed.suffix_width,
-                execution.compiled_w_max.expect("checked")
+                "q27 auto-context diagnostic W_MAX {} disagrees with exact-runtime compiled W_MAX {compiled_w_max}",
+                observed.auto_compiled_w_max.expect("checked")
+            )));
+        }
+        if (observed.suffix_drafting
+            || setting_choice(&execution.settings, "q27.suffix_width_mode")
+                == Some("runtime_w_max"))
+            && observed.suffix_width != compiled_w_max
+        {
+            return Err(EngineError::Operation(format!(
+                "q27 startup applied suffix width {} instead of exact-runtime compiled W_MAX {compiled_w_max}",
+                observed.suffix_width
             )));
         }
         let thinking_mismatch = setting_toggle(&execution.settings, "q27.thinking")
@@ -3114,12 +3203,71 @@ impl EngineAdapter for Q27Adapter {
                     .to_owned(),
             ));
         }
-        if let Some(requested_context) = setting_unsigned(&execution.settings, "context_length")
-            && observed.served_context < requested_context
+        if let Some((requested_context, source)) =
+            setting_unsigned_with_source(&execution.settings, "context_length")
+        {
+            if observed.initial_auto_context.is_some() {
+                return Err(EngineError::Operation(
+                    "q27 emitted automatic context sizing for an explicit structured `--ctx` launch"
+                        .to_owned(),
+                ));
+            }
+            if observed.served_context != requested_context {
+                let changed = if observed.served_context < requested_context {
+                    "reduced"
+                } else {
+                    "changed"
+                };
+                return Err(EngineError::Operation(format!(
+                    "q27 started with context {} but {} explicitly requested {requested_context}; the runtime {changed} the requested context during startup",
+                    observed.served_context,
+                    setting_source_label(source)
+                )));
+            }
+        }
+        let ready_slot_count = observed.slot_contexts.len() as u64;
+        if let Some((requested_slots, source)) =
+            setting_unsigned_with_source(&execution.settings, "parallel_requests")
+            && ready_slot_count != requested_slots
+        {
+            let changed = if ready_slot_count < requested_slots {
+                "reduced"
+            } else {
+                "changed"
+            };
+            return Err(EngineError::Operation(format!(
+                "q27 started {ready_slot_count} ready slots but {} explicitly requested {requested_slots}; the runtime {changed} the requested slot count during startup",
+                setting_source_label(source)
+            )));
+        }
+        if let Some((requested_background_context, source)) =
+            setting_unsigned_with_source(&execution.settings, "q27.slot1_context_length")
+        {
+            if let Some((slot, final_context)) = observed
+                .slot_contexts
+                .iter()
+                .find(|(slot, context)| **slot > 0 && **context != requested_background_context)
+            {
+                let changed = if *final_context < requested_background_context {
+                    "reduced"
+                } else {
+                    "changed"
+                };
+                return Err(EngineError::Operation(format!(
+                    "q27 started background slot {slot} with context {final_context} but {} explicitly requested {requested_background_context}; the runtime {changed} the requested background context during startup",
+                    setting_source_label(source)
+                )));
+            }
+        }
+        let background_context = observed.slot_contexts.get(&1).copied();
+        if let Some(expected) = background_context
+            && let Some((slot, context)) = observed
+                .slot_contexts
+                .iter()
+                .find(|(slot, context)| **slot > 1 && **context != expected)
         {
             return Err(EngineError::Operation(format!(
-                "q27 served context {} is smaller than configured context {requested_context}",
-                observed.served_context
+                "q27 background slot {slot} started with context {context} instead of the slot-1 context {expected}"
             )));
         }
         let mut proof = BTreeMap::from([
@@ -3131,23 +3279,59 @@ impl EngineAdapter for Q27Adapter {
                 "observed_kv_mode".to_owned(),
                 json!(observed.kv_mode.clone()),
             ),
+            ("observed_ready_slots".to_owned(), json!(ready_slot_count)),
             (
-                "observed_compiled_w_max".to_owned(),
-                json!(observed.compiled_w_max),
+                "observed_slot_contexts".to_owned(),
+                json!(observed.slot_contexts),
+            ),
+            (
+                "observed_suffix_width".to_owned(),
+                json!(observed.suffix_width),
+            ),
+            ("compiled_w_max".to_owned(), json!(compiled_w_max)),
+            (
+                "compiled_w_max_authority".to_owned(),
+                json!("exact-runtime-capability"),
             ),
         ]);
+        if let Some(initial_auto_context) = observed.initial_auto_context {
+            proof.insert(
+                "initial_auto_context_estimate".to_owned(),
+                json!(initial_auto_context),
+            );
+        }
+        if let Some(auto_kv_mode) = observed.auto_kv_mode.as_deref() {
+            proof.insert("auto_context_kv_mode".to_owned(), json!(auto_kv_mode));
+        }
+        let mut resolved_settings = serde_json::Map::from_iter([
+            ("context_length".to_owned(), json!(observed.served_context)),
+            ("parallel_requests".to_owned(), json!(ready_slot_count)),
+            ("q27.kv_mode".to_owned(), json!(observed.kv_mode)),
+            ("q27.fast_head".to_owned(), json!(observed.fast_head)),
+            ("q27.thinking".to_owned(), json!(observed.thinking)),
+            (
+                "q27.mtp_max_depth".to_owned(),
+                json!(observed.maximum_mtp_depth),
+            ),
+            (
+                "q27.mtp_min_probability".to_owned(),
+                json!(observed.mtp_minimum_probability()),
+            ),
+            (
+                "q27.suffix_drafting".to_owned(),
+                json!(observed.suffix_drafting),
+            ),
+            ("q27.suffix_width_mode".to_owned(), json!("runtime_w_max")),
+        ]);
+        if let Some(background_context) = background_context {
+            resolved_settings.insert(
+                "q27.slot1_context_length".to_owned(),
+                json!(background_context),
+            );
+        }
         proof.insert(
             "resolved_settings".to_owned(),
-            json!({
-                "context_length": observed.served_context,
-                "q27.kv_mode": observed.kv_mode,
-                "q27.fast_head": observed.fast_head,
-                "q27.thinking": observed.thinking,
-                "q27.mtp_max_depth": observed.maximum_mtp_depth,
-                "q27.mtp_min_probability": observed.mtp_minimum_probability(),
-                "q27.suffix_drafting": observed.suffix_drafting,
-                "q27.suffix_width_mode": observed.suffix_width,
-            }),
+            Value::Object(resolved_settings),
         );
         if execution.sharp_template.is_some() {
             proof.insert(
@@ -3429,8 +3613,11 @@ fn validate_configured_template(
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct Q27StartupObservation {
     served_context: u64,
+    slot_contexts: BTreeMap<u64, u64>,
+    initial_auto_context: Option<u64>,
+    auto_kv_mode: Option<String>,
+    auto_compiled_w_max: Option<u64>,
     kv_mode: String,
-    compiled_w_max: u64,
     suffix_width: u64,
     maximum_mtp_depth: String,
     mtp_minimum_probability_bits: u64,
@@ -3465,21 +3652,39 @@ fn parse_q27_startup_observation(
     let auto = stderr_tail
         .iter()
         .rev()
-        .find(|line| line.starts_with("--ctx auto:"))
-        .ok_or_else(|| {
-            EngineError::BackendUnavailable(
-                "q27 auto-context resolution has not been observed yet".to_owned(),
-            )
+        .find(|line| line.starts_with("--ctx auto:"));
+    let mut slot_contexts = BTreeMap::new();
+    for line in stderr_tail {
+        let Some(rest) = line.strip_prefix("slot ") else {
+            continue;
+        };
+        let Some((slot, context)) = rest.split_once(" ready: ctx=") else {
+            continue;
+        };
+        let slot = slot.parse::<u64>().map_err(|_| {
+            EngineError::Operation("q27 ready slot number was not numeric".to_owned())
         })?;
-    let slot = stderr_tail
-        .iter()
-        .rev()
-        .find(|line| line.starts_with("slot 0 ready: ctx="))
-        .ok_or_else(|| {
-            EngineError::BackendUnavailable(
-                "q27 served slot context has not been observed yet".to_owned(),
-            )
+        let context = context.trim().parse::<u64>().map_err(|_| {
+            EngineError::Operation("q27 ready slot context was not numeric".to_owned())
         })?;
+        if slot_contexts.insert(slot, context).is_some() {
+            return Err(EngineError::Operation(format!(
+                "q27 startup reported ready slot {slot} more than once"
+            )));
+        }
+    }
+    let served_context = slot_contexts.get(&0).copied().ok_or_else(|| {
+        EngineError::BackendUnavailable(
+            "q27 served slot context has not been observed yet".to_owned(),
+        )
+    })?;
+    for (expected, observed) in (0_u64..).zip(slot_contexts.keys().copied()) {
+        if expected != observed {
+            return Err(EngineError::Operation(format!(
+                "q27 startup ready slots were not contiguous at slot {expected}"
+            )));
+        }
+    }
 
     let profile_kv = startup_token(profile, "kv=")?;
     let maximum_mtp_depth = startup_token(profile, "maxd=")?.to_owned();
@@ -3496,39 +3701,46 @@ fn parse_q27_startup_observation(
     let fast_head = parse_startup_bool(startup_token(profile, "fast-head=")?, "fast-head")?;
     let thinking = parse_startup_bool(startup_token(profile, "think=")?, "thinking")?;
 
-    let auto_context = auto
-        .strip_prefix("--ctx auto:")
-        .and_then(|rest| rest.split_whitespace().next())
+    let (initial_auto_context, auto_kv_mode, auto_compiled_w_max) = if let Some(auto) = auto {
+        let rest = auto.strip_prefix("--ctx auto:").expect("matched prefix");
+        let mut words = rest.split_whitespace();
+        let first = words.next();
+        let context = match first {
+            Some("only") => words.next(),
+            value => value,
+        }
         .and_then(|value| value.parse::<u64>().ok())
         .ok_or_else(|| {
-            EngineError::Operation("q27 resolved auto context was not numeric".to_owned())
+            EngineError::Operation("q27 initial auto-context estimate was not numeric".to_owned())
         })?;
-    let served_context = slot
-        .strip_prefix("slot 0 ready: ctx=")
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .ok_or_else(|| EngineError::Operation("q27 served context was not numeric".to_owned()))?;
-    if served_context != auto_context {
-        return Err(EngineError::Operation(format!(
-            "q27 served context {served_context} disagrees with auto-context resolution {auto_context}"
-        )));
-    }
-    let compiled_w_max = startup_parenthesized_value(auto, "W_MAX=")?
-        .parse::<u64>()
-        .map_err(|_| EngineError::Operation("q27 startup W_MAX was not numeric".to_owned()))?;
-    let kv_mode = ["fp8", "turbo5k", "turbo3", "turbo3v", "fp16"]
-        .into_iter()
-        .find(|mode| auto.contains(&format!("{mode} KV")))
-        .ok_or_else(|| EngineError::Operation("q27 startup KV mode was not recognized".to_owned()))?
-        .to_owned();
-    if kv_mode != profile_kv {
-        return Err(EngineError::Operation(format!(
-            "q27 startup KV profile `{profile_kv}` disagrees with auto-context mode `{kv_mode}`"
-        )));
-    }
+        let compiled_w_max = startup_parenthesized_value(auto, "W_MAX=")?
+            .parse::<u64>()
+            .map_err(|_| {
+                EngineError::Operation("q27 auto-context W_MAX was not numeric".to_owned())
+            })?;
+        let kv_mode = ["fp8", "turbo5k", "turbo3", "turbo3v", "fp16"]
+            .into_iter()
+            .find(|mode| auto.contains(&format!("{mode} KV")))
+            .ok_or_else(|| {
+                EngineError::Operation("q27 auto-context KV mode was not recognized".to_owned())
+            })?
+            .to_owned();
+        if kv_mode != profile_kv {
+            return Err(EngineError::Operation(format!(
+                "q27 startup KV profile `{profile_kv}` disagrees with auto-context mode `{kv_mode}`"
+            )));
+        }
+        (Some(context), Some(kv_mode), Some(compiled_w_max))
+    } else {
+        (None, None, None)
+    };
     Ok(Q27StartupObservation {
         served_context,
-        kv_mode,
-        compiled_w_max,
+        slot_contexts,
+        initial_auto_context,
+        auto_kv_mode,
+        auto_compiled_w_max,
+        kv_mode: profile_kv.to_owned(),
         suffix_width,
         maximum_mtp_depth,
         mtp_minimum_probability_bits: pmin.to_bits(),
@@ -5392,17 +5604,28 @@ mod tests {
     }
 
     #[test]
-    fn bounded_startup_parser_proves_context_kv_and_numeric_width() {
+    fn bounded_startup_parser_uses_final_slots_and_profile_evidence() {
         let observation = parse_q27_startup_observation(&[
             "profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=0 think=1".to_owned(),
             "--ctx auto: 262144 (free 30.0GB post-weights, fp8 KV, W_MAX=12)".to_owned(),
-            "slot 0 ready: ctx=262144".to_owned(),
+            "[pool] ctx 262144 -> 200704 (pool-entitlable window)".to_owned(),
+            "slot 0 ready: ctx=200704".to_owned(),
         ])
         .expect("startup observation");
-        assert_eq!(observation.served_context, 262_144);
+        assert_eq!(observation.initial_auto_context, Some(262_144));
+        assert_eq!(observation.served_context, 200_704);
         assert_eq!(observation.kv_mode, "fp8");
-        assert_eq!(observation.compiled_w_max, 12);
+        assert_eq!(observation.auto_compiled_w_max, Some(12));
         assert!(observation.thinking);
+
+        let explicit = parse_q27_startup_observation(&[
+            "profile: cc (sm_120) | kv=fp8 fd=mma pmin=0.5 maxd=auto7 suffix=1/w12 fast-head=0 think=1".to_owned(),
+            "slot 0 ready: ctx=262144".to_owned(),
+            "slot 1 ready: ctx=32768".to_owned(),
+        ])
+        .expect("explicit-context startup observation");
+        assert_eq!(explicit.initial_auto_context, None);
+        assert_eq!(explicit.slot_contexts.get(&1), Some(&32_768));
     }
 
     #[test]
