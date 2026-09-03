@@ -60,6 +60,7 @@ const REVIEWED_SOURCE_BLOBS: &[(&str, &str)] = &[
     ("src/runtime/contract/sampling.cpp", "495963c88468f215f63132ae901a7cbf455c1164"),
     ("src/runtime/contract/sampling.h", "8770f7f39208bf26da731ecd6e60b33ba8fe8a1e"),
     ("src/runtime/engine/engine.cpp", "ee15cf8ab8c961677bc8f8e27f0fab559f5b2f22"),
+    ("src/runtime/engine/engine_core.h", "d4d9b2d678f21b0033009b873d2448e7c9d0b365"),
     ("src/serve/generation_service.cpp", "686992f1017c73cc52a0043980ea4d52bea05d3e"),
     ("src/serve/generation_service.h", "8540d6ddc0b65b556d8c674167c10a63cf784e04"),
     ("src/serve/http_server.cpp", "e1c12dcd32881149656a894ef11319d4bc011d5e"),
@@ -108,7 +109,15 @@ const CORE_PROCESS_FILES: &[&str] = &[
     "src/serve/serve_options.cpp",
     "src/serve/serve_options.h",
 ];
-const CONTEXT_CACHE_FILES: &[&str] = CORE_PROCESS_FILES;
+const CONTEXT_CACHE_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/runtime/engine/engine.cpp",
+    "src/runtime/engine/engine_core.h",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/serve_options.cpp",
+    "src/serve/serve_options.h",
+];
 const SPECULATION_FILES: &[&str] = &[
     "include/ninfer/types.h",
     "src/product/speculative_options.h",
@@ -120,6 +129,7 @@ const SPECULATION_FILES: &[&str] = &[
 ];
 const SERVING_LIMIT_FILES: &[&str] = &[
     "include/ninfer/types.h",
+    "src/runtime/engine/engine_core.h",
     "src/serve/generation_service.cpp",
     "src/serve/generation_service.h",
     "src/serve/http_server.cpp",
@@ -520,7 +530,7 @@ fn setting_capability_is_reviewed(id: &str, capabilities: NinferRuntimeCapabilit
         | "frequency_penalty" | "ninfer.greedy" => capabilities.process_sampler_controls,
         "max_output_tokens" => capabilities.request_default_controls,
         "reasoning_budget" | "ninfer.thinking" | "ninfer.preserve_thinking" => {
-            capabilities.thinking_process_controls && capabilities.thinking_request_semantics
+            capabilities.thinking_process_controls
         }
         "context_length"
         | "ninfer.kv_dtype"
@@ -549,9 +559,7 @@ fn setting_capability_is_reviewed(id: &str, capabilities: NinferRuntimeCapabilit
         "ninfer.vision"
         | "ninfer.media_cache_mib"
         | "ninfer.media_live_mib"
-        | "ninfer.media_preprocess_threads" => {
-            capabilities.vision_process_controls && capabilities.media_request_semantics
-        }
+        | "ninfer.media_preprocess_threads" => capabilities.vision_process_controls,
         _ => false,
     }
 }
@@ -587,16 +595,25 @@ fn apply_ninfer_runtime_contract(
             );
             continue;
         }
-        let option = if id == "ninfer.speculation" {
-            "--spec"
-        } else {
-            settings::option_for_setting(id)
-        };
-        if option.is_empty() || !usage_has_token(help, option) {
-            definition.supported = false;
-            definition.unsupported_reason = Some(format!(
-                "the exact ninfer-serve help contract does not advertise `{option}`"
-            ));
+        match settings::execution_path_for_setting(id) {
+            settings::SettingExecutionPath::LaunchOption(option)
+            | settings::SettingExecutionPath::VirtualLaunchControl(option)
+                if !usage_has_token(help, option) =>
+            {
+                unsupported(
+                    definition,
+                    &format!("the exact ninfer-serve help contract does not advertise `{option}`"),
+                );
+            }
+            settings::SettingExecutionPath::Unsupported => {
+                unsupported(
+                    definition,
+                    "NInfer has no reviewed execution path for this setting",
+                );
+            }
+            settings::SettingExecutionPath::LaunchOption(_)
+            | settings::SettingExecutionPath::VirtualLaunchControl(_)
+            | settings::SettingExecutionPath::NortedRequestDefault => {}
         }
     }
     if let Some(definition) = definitions
@@ -2203,11 +2220,15 @@ impl EngineAdapter for NinferAdapter {
         let body = protocol::backend_request(
             &request,
             false,
-            execution.capabilities.request_protocol_semantics,
-            execution.capabilities.request_sampler_semantics,
-            execution.capabilities.tool_calling,
-            execution.vision,
-            execution.greedy,
+            protocol::RequestAdmission {
+                protocol_semantics: execution.capabilities.request_protocol_semantics,
+                sampler_semantics: execution.capabilities.request_sampler_semantics,
+                thinking_semantics: execution.capabilities.thinking_request_semantics,
+                tool_calling: execution.capabilities.tool_calling,
+                media_semantics: execution.capabilities.media_request_semantics,
+                vision: execution.vision,
+                greedy: execution.greedy,
+            },
         )?;
         let response = self
             .client
@@ -2240,11 +2261,15 @@ impl EngineAdapter for NinferAdapter {
         let body = protocol::backend_request(
             &request,
             true,
-            execution.capabilities.request_protocol_semantics,
-            execution.capabilities.request_sampler_semantics,
-            execution.capabilities.tool_calling,
-            execution.vision,
-            execution.greedy,
+            protocol::RequestAdmission {
+                protocol_semantics: execution.capabilities.request_protocol_semantics,
+                sampler_semantics: execution.capabilities.request_sampler_semantics,
+                thinking_semantics: execution.capabilities.thinking_request_semantics,
+                tool_calling: execution.capabilities.tool_calling,
+                media_semantics: execution.capabilities.media_request_semantics,
+                vision: execution.vision,
+                greedy: execution.greedy,
+            },
         )?;
         let response = self
             .client
