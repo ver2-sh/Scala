@@ -850,6 +850,22 @@ impl EngineAdapter for LlamaCppAdapter {
         Ok(llama_model_setting_definitions(Some(model)))
     }
 
+    async fn runtime_settings_schema(
+        &self,
+        runtime: &InstalledRuntime,
+        _host: &HostCapabilities,
+    ) -> Result<SettingsSchema, EngineError> {
+        self.probe_runtime(runtime).await?;
+        let help = self.cached_runtime_help(runtime).await?;
+        let mut definitions = self.setting_definitions();
+        apply_llama_exact_help_contract(&mut definitions, &help);
+        Ok(SettingsSchema {
+            engine_id: ENGINE_ID.to_owned(),
+            runtime_id: Some(runtime.manifest.runtime_id.clone()),
+            definitions,
+        })
+    }
+
     async fn settings_schema(
         &self,
         runtime: &InstalledRuntime,
@@ -1841,13 +1857,22 @@ fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<Setting
             ),
             (
                 "llama.cpp.rope_frequency_base",
-                identity.rope_frequency_base.clone(),
+                identity
+                    .rope_frequency_base
+                    .as_deref()
+                    .and_then(valid_positive_decimal),
                 format!("{}.rope.freq_base", identity.architecture),
             ),
             (
                 "llama.cpp.rope_frequency_scale",
-                identity.rope_frequency_scale.clone(),
-                format!("{}.rope.scaling.factor", identity.architecture),
+                identity
+                    .rope_scaling_factor
+                    .as_deref()
+                    .and_then(effective_rope_frequency_scale),
+                identity
+                    .rope_scaling_factor_key
+                    .clone()
+                    .unwrap_or_else(|| format!("{}.rope.scaling.factor", identity.architecture)),
             ),
         ] {
             if let Some(value) = value
@@ -1855,9 +1880,16 @@ fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<Setting
                     .iter_mut()
                     .find(|definition| definition.id.as_str() == id)
             {
+                let detail = if id == "llama.cpp.rope_frequency_scale" {
+                    format!(
+                        "Derived with llama.cpp semantics as the inverse of selected GGUF metadata `{metadata_key}`"
+                    )
+                } else {
+                    format!("Selected GGUF metadata `{metadata_key}`")
+                };
                 definition.default_preview = Some(
                     SettingDefaultPreview::new(value, SettingDefaultSource::Model)
-                        .with_detail(format!("Selected GGUF metadata `{metadata_key}`")),
+                        .with_detail(detail),
                 );
             }
         }
@@ -1878,6 +1910,33 @@ fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<Setting
         }
     }
     definitions
+}
+
+fn valid_positive_decimal(raw: &str) -> Option<String> {
+    raw.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|_| raw.to_owned())
+}
+
+fn effective_rope_frequency_scale(raw_scaling_factor: &str) -> Option<String> {
+    let scaling_factor = raw_scaling_factor.parse::<f64>().ok()?;
+    if !scaling_factor.is_finite() || scaling_factor < 0.0 {
+        return None;
+    }
+    let frequency_scale = if scaling_factor == 0.0 {
+        1.0
+    } else {
+        1.0 / scaling_factor
+    };
+    if !frequency_scale.is_finite() || frequency_scale <= 0.0 {
+        return None;
+    }
+    Some(if frequency_scale.fract() == 0.0 {
+        format!("{frequency_scale:.1}")
+    } else {
+        frequency_scale.to_string()
+    })
 }
 
 fn llama_definition(

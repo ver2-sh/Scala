@@ -24,8 +24,8 @@ use norted_model_library::{ModelDownloadJobId, ModelLibrary, ModelOperationPhase
 
 use app::{
     App, ControlAction, ModelLibraryAction, ModelLibraryTaskResult, ModelSettingsInspection,
-    ProfileEngineSelection, RuntimeAction, RuntimeTaskResult, SettingsAction, SettingsScope,
-    SettingsTaskResult, Update,
+    ProfileEngineSelection, RuntimeAction, RuntimeTaskResult, SettingsAction, SettingsLoad,
+    SettingsScope, SettingsTaskResult, Update,
 };
 use terminal::TerminalSession;
 use ui::layout::UiLayout;
@@ -557,7 +557,23 @@ async fn execute_settings_action(
     let profiles_store = ModelProfilesStore::new(paths);
     match action {
         SettingsAction::Refresh => {
-            SettingsTaskResult::Loaded(read_tui_settings(&settings_store, &profiles_store).await)
+            let (settings, runtime_schemas) = tokio::join!(
+                read_tui_settings(&settings_store, &profiles_store),
+                runtime_packs.selected_runtime_settings_schemas()
+            );
+            let (runtime_schemas, runtime_schema_error) = match runtime_schemas {
+                Ok(schemas) => (schemas, None),
+                Err(error) => (Default::default(), Some(error.to_string())),
+            };
+            SettingsTaskResult::Loaded(match settings {
+                Ok((state, profiles)) => Ok(SettingsLoad {
+                    state,
+                    profiles,
+                    runtime_schemas,
+                    runtime_schema_error,
+                }),
+                Err(error) => Err(error),
+            })
         }
         SettingsAction::Set {
             scope,

@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -209,6 +209,51 @@ impl RuntimePackManager {
             .await
             .map_err(RuntimePackError::Adapter)?;
         Ok((selection, schema))
+    }
+
+    /// Returns runtime-owned, model-independent schemas for engines whose
+    /// format runtime has been explicitly selected. If one engine is selected
+    /// through multiple formats with different runtimes, no single engine
+    /// default can be represented truthfully and that engine is omitted.
+    pub async fn selected_runtime_settings_schemas(
+        &self,
+    ) -> Result<BTreeMap<String, norted_core::SettingsSchema>, RuntimePackError> {
+        let host = self.refresh_host_capabilities().await;
+        let list = self.list().await?;
+        let mut schemas = BTreeMap::<String, norted_core::SettingsSchema>::new();
+        let mut ambiguous = BTreeSet::new();
+        for runtime_id in list.selections.format_defaults.values() {
+            let Some(status) = list
+                .installed
+                .iter()
+                .find(|status| &status.runtime.manifest.runtime_id == runtime_id)
+            else {
+                continue;
+            };
+            let engine_id = status.runtime.manifest.identity.engine_id.clone();
+            if ambiguous.contains(&engine_id) {
+                continue;
+            }
+            if schemas
+                .get(&engine_id)
+                .is_some_and(|schema| schema.runtime_id.as_ref() != Some(runtime_id))
+            {
+                schemas.remove(&engine_id);
+                ambiguous.insert(engine_id);
+                continue;
+            }
+            let adapter = self.registry.get(&engine_id).ok_or_else(|| {
+                RuntimePackError::Selection(format!(
+                    "selected runtime uses unregistered engine `{engine_id}`"
+                ))
+            })?;
+            let schema = adapter
+                .runtime_settings_schema(&status.runtime, &host)
+                .await
+                .map_err(RuntimePackError::Adapter)?;
+            schemas.insert(engine_id, schema);
+        }
+        Ok(schemas)
     }
 
     pub fn model_settings_schema_for_engine(

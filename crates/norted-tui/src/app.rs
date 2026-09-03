@@ -208,6 +208,35 @@ pub enum SettingsScope {
     ModelProfile(ModelProfileId),
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SettingPresentationState {
+    Override,
+    Inherited,
+    Default,
+    Resolved,
+    Unsupported,
+}
+
+impl SettingPresentationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Override => "override",
+            Self::Inherited => "inherited",
+            Self::Default => "default",
+            Self::Resolved => "resolved",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SettingValueDisplay {
+    pub value: String,
+    pub source: String,
+    pub state: SettingPresentationState,
+    pub can_clear: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum SettingsAction {
     Refresh,
@@ -259,6 +288,14 @@ pub struct ModelSettingsInspection {
     pub validation_error: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct SettingsLoad {
+    pub state: SettingsState,
+    pub profiles: ModelProfilesState,
+    pub runtime_schemas: BTreeMap<String, SettingsSchema>,
+    pub runtime_schema_error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProfileEngineSelection {
     pub id: ModelProfileId,
@@ -270,7 +307,7 @@ pub struct ProfileEngineSelection {
 
 #[derive(Debug)]
 pub enum SettingsTaskResult {
-    Loaded(Result<(SettingsState, ModelProfilesState), String>),
+    Loaded(Result<SettingsLoad, String>),
     Stored(Result<(SettingsState, ModelProfilesState), String>),
     ChooseProfileEngine(ProfileEngineSelection),
     Inspected {
@@ -364,6 +401,7 @@ pub struct App {
     pub settings_error: Option<String>,
     pub settings_loading: bool,
     pub setting_definitions: Vec<SettingDefinition>,
+    pub runtime_settings_schemas: BTreeMap<String, SettingsSchema>,
     pub settings_scope_index: usize,
     pub settings_setting_index: usize,
     pub settings_scroll: usize,
@@ -481,6 +519,7 @@ impl App {
             settings_error: None,
             settings_loading: true,
             setting_definitions,
+            runtime_settings_schemas: BTreeMap::new(),
             settings_scope_index: 0,
             settings_setting_index: 0,
             settings_scroll: 0,
@@ -1012,10 +1051,20 @@ impl App {
         self.settings_loading = false;
         match result {
             SettingsTaskResult::Loaded(result) => match result {
-                Ok((state, profiles)) => {
-                    self.settings_state = Some(state);
-                    self.model_profiles = Some(profiles);
+                Ok(loaded) => {
+                    self.settings_state = Some(loaded.state);
+                    self.model_profiles = Some(loaded.profiles);
+                    self.runtime_settings_schemas = loaded.runtime_schemas;
                     self.settings_error = None;
+                    if let Some(error) = loaded.runtime_schema_error {
+                        self.notice = Some(format!(
+                            "Selected-runtime defaults are unavailable: {error}"
+                        ));
+                    } else if self.notice.as_deref()
+                        == Some("Refreshing selected-runtime defaults…")
+                    {
+                        self.notice = None;
+                    }
                     self.reconcile_settings_selection();
                     if self.screen == Screen::ModelProfiles {
                         let _ = self.refresh_selected_model_profile();
@@ -1116,8 +1165,13 @@ impl App {
                 .as_ref()
                 .map(|schema| schema.definitions.as_slice())
                 .unwrap_or_default()
+        } else if let Some(SettingsScope::Engine(engine_id)) = scope.as_ref() {
+            self.runtime_settings_schemas
+                .get(engine_id)
+                .map(|schema| schema.definitions.as_slice())
+                .unwrap_or(self.setting_definitions.as_slice())
         } else {
-            &self.setting_definitions
+            self.setting_definitions.as_slice()
         };
         let mut definitions = source
             .iter()
@@ -1152,31 +1206,51 @@ impl App {
         definitions
     }
 
-    pub fn settings_value_display(&self, id: &SettingId) -> (String, String, bool) {
+    pub fn settings_value_display(&self, id: &SettingId) -> SettingValueDisplay {
         let Some(state) = &self.settings_state else {
-            return ("loading".to_owned(), "state".to_owned(), false);
+            return SettingValueDisplay {
+                value: "loading".to_owned(),
+                source: "state".to_owned(),
+                state: SettingPresentationState::Default,
+                can_clear: false,
+            };
         };
         let definition = self
             .settings_definitions()
             .into_iter()
             .find(|definition| &definition.id == id);
         if definition.is_some_and(|definition| !definition.supported) {
-            return (
-                "Unsupported".to_owned(),
-                "unsupported".to_owned(),
-                self.current_layer_value(id).is_some(),
-            );
+            return SettingValueDisplay {
+                value: "Unsupported".to_owned(),
+                source: "unsupported".to_owned(),
+                state: SettingPresentationState::Unsupported,
+                can_clear: self.current_layer_value(id).is_some(),
+            };
         }
         if self.screen == Screen::ModelProfiles {
             let Some(profile) = self.selected_model_profile_value() else {
-                return (
-                    "<missing profile>".to_owned(),
-                    "unavailable".to_owned(),
-                    false,
-                );
+                return SettingValueDisplay {
+                    value: "<missing profile>".to_owned(),
+                    source: "unavailable".to_owned(),
+                    state: SettingPresentationState::Default,
+                    can_clear: false,
+                };
             };
             if let Some(value) = profile.overrides.0.get(id) {
-                return (value.to_string(), "profile override".to_owned(), true);
+                return SettingValueDisplay {
+                    value: value.to_string(),
+                    source: "profile override".to_owned(),
+                    state: SettingPresentationState::Override,
+                    can_clear: true,
+                };
+            }
+            if let Some(value) = self.settings_runtime_resolved_value(id) {
+                return SettingValueDisplay {
+                    value,
+                    source: "runtime resolved".to_owned(),
+                    state: SettingPresentationState::Resolved,
+                    can_clear: false,
+                };
             }
             if let Some(setting) = self
                 .settings_resolved
@@ -1193,15 +1267,31 @@ impl App {
                     }
                     norted_core::SettingSource::Invocation => "invocation".to_owned(),
                 };
-                return (setting.value.to_string(), source, false);
-            }
-            if let Some(value) = self.settings_runtime_resolved_value(id) {
-                return (value, "runtime resolved".to_owned(), false);
+                return SettingValueDisplay {
+                    value: setting.value.to_string(),
+                    source,
+                    state: match setting.source {
+                        norted_core::SettingSource::GlobalDefault
+                        | norted_core::SettingSource::EngineDefault { .. } => {
+                            SettingPresentationState::Inherited
+                        }
+                        norted_core::SettingSource::ModelProfile { .. }
+                        | norted_core::SettingSource::Invocation => {
+                            SettingPresentationState::Override
+                        }
+                    },
+                    can_clear: false,
+                };
             }
             return self.settings_default_display(id);
         }
         let Some(scope) = self.selected_settings_scope() else {
-            return ("Default".to_owned(), "configured state".to_owned(), false);
+            return SettingValueDisplay {
+                value: "Default".to_owned(),
+                source: "configured state".to_owned(),
+                state: SettingPresentationState::Default,
+                can_clear: false,
+            };
         };
         let current = match &scope {
             SettingsScope::Global => state.global_defaults.0.get(id),
@@ -1216,43 +1306,64 @@ impl App {
                 .and_then(|profile| profile.overrides.0.get(id)),
         };
         if let Some(value) = current {
-            return (value.to_string(), "set here".to_owned(), true);
+            return SettingValueDisplay {
+                value: value.to_string(),
+                source: match scope {
+                    SettingsScope::Global => "global override".to_owned(),
+                    SettingsScope::Engine(_) => "engine override".to_owned(),
+                    SettingsScope::ModelProfile(_) => "profile override".to_owned(),
+                },
+                state: SettingPresentationState::Override,
+                can_clear: true,
+            };
         }
-        let inherited = match id.namespace() {
-            Some(engine) => state
-                .engine_defaults
-                .get(engine)
-                .and_then(|patch| patch.0.get(id))
-                .map(|value| (value, format!("engine-default:{engine}"))),
-            None => state
+        let inherited = match (&scope, id.namespace()) {
+            (SettingsScope::Engine(_), None) => state
                 .global_defaults
                 .0
                 .get(id)
-                .map(|value| (value, "global-default".to_owned())),
+                .map(|value| (value, "inherited from global".to_owned())),
+            _ => None,
         };
         inherited.map_or_else(
             || self.settings_default_display(id),
-            |(value, source)| (value.to_string(), source, false),
+            |(value, source)| SettingValueDisplay {
+                value: value.to_string(),
+                source,
+                state: SettingPresentationState::Inherited,
+                can_clear: false,
+            },
         )
     }
 
-    fn settings_default_display(&self, id: &SettingId) -> (String, String, bool) {
+    fn settings_default_display(&self, id: &SettingId) -> SettingValueDisplay {
         let definition = self
             .settings_definitions()
             .into_iter()
             .find(|definition| &definition.id == id);
         if let Some(preview) = definition.and_then(|definition| definition.default_preview.as_ref())
         {
-            return (preview.value.clone(), preview.source.to_string(), false);
+            return SettingValueDisplay {
+                value: preview.value.clone(),
+                source: preview.source.to_string(),
+                state: SettingPresentationState::Default,
+                can_clear: false,
+            };
         }
         if self.screen == Screen::ModelProfiles {
-            (
-                "runtime fallback".to_owned(),
-                "runtime dependent".to_owned(),
-                false,
-            )
+            SettingValueDisplay {
+                value: "runtime fallback".to_owned(),
+                source: "runtime dependent".to_owned(),
+                state: SettingPresentationState::Default,
+                can_clear: false,
+            }
         } else {
-            ("Default".to_owned(), "configured state".to_owned(), false)
+            SettingValueDisplay {
+                value: "Default".to_owned(),
+                source: "configured state".to_owned(),
+                state: SettingPresentationState::Default,
+                can_clear: false,
+            }
         }
     }
 
@@ -1268,34 +1379,56 @@ impl App {
                 .unsupported_reason
                 .clone()
                 .unwrap_or_else(|| "The exact runtime does not support this setting".to_owned());
+            if let Some(upstream) = definition.upstream_default.as_deref()
+                && !detail_covers_upstream(&detail, upstream)
+            {
+                detail.push_str(&format!(" · Upstream: {upstream}"));
+            }
             if self.current_layer_value(id).is_some() {
                 detail.push_str(" · An existing override is set; use Inherit to remove it.");
             }
-            return detail;
+            return format!("Value: Unsupported\nDetail: {detail}");
         }
-        let mut detail = definition
-            .and_then(|definition| definition.default_preview.as_ref())
-            .map(|preview| {
-                let summary = format!("If unset: {} ({})", preview.value, preview.source);
-                preview
-                    .detail
-                    .as_deref()
-                    .map_or(summary.clone(), |explanation| {
-                        format!("{summary} · {explanation}")
-                    })
-            })
-            .unwrap_or_else(|| {
+        let preview = definition.and_then(|definition| definition.default_preview.as_ref());
+        let value = preview.map_or_else(
+            || {
+                if self.screen == Screen::ModelProfiles {
+                    "runtime fallback".to_owned()
+                } else {
+                    "Default".to_owned()
+                }
+            },
+            |preview| preview.value.clone(),
+        );
+        let mut detail = preview.map_or_else(
+            || {
                 if self.screen == Screen::ModelProfiles {
                     "If unset: the selected runtime/model does not expose a pre-launch literal; runtime fallback remains authoritative".to_owned()
                 } else {
-                    "Unset: no model-specific preview is available in this configuration scope"
+                    "If unset: no model-specific preview is available in this configuration scope"
                         .to_owned()
                 }
-            });
+            },
+            |preview| {
+                let mut detail = format!("If unset: {} ({})", preview.value, preview.source);
+                if let Some(explanation) = preview.detail.as_deref() {
+                    detail.push_str(&format!(" · {explanation}"));
+                }
+                detail
+            },
+        );
+        if let Some(upstream) =
+            definition.and_then(|definition| definition.upstream_default.as_deref())
+            && !preview
+                .and_then(|preview| preview.detail.as_deref())
+                .is_some_and(|preview_detail| detail_covers_upstream(preview_detail, upstream))
+        {
+            detail.push_str(&format!(" · Upstream: {upstream}"));
+        }
         if let Some(resolved) = self.settings_runtime_resolved_value(id) {
             detail.push_str(&format!(" · Running backend resolved: {resolved}"));
         }
-        detail
+        format!("Value: {value}\nDetail: {detail}")
     }
 
     fn settings_runtime_resolved_value(&self, id: &SettingId) -> Option<String> {
@@ -2093,12 +2226,18 @@ impl App {
     fn activate_screen(&mut self, screen: Screen) -> Update {
         let entering_model_profiles =
             self.screen != Screen::ModelProfiles && screen == Screen::ModelProfiles;
+        let entering_settings = self.screen != Screen::Settings && screen == Screen::Settings;
         self.screen = screen;
         if entering_model_profiles {
             self.reconcile_settings_selection();
             if !self.settings_loading && !self.settings_busy {
                 return self.refresh_selected_model_profile();
             }
+        }
+        if entering_settings && !self.settings_loading && !self.settings_busy {
+            self.pending_settings_action = Some(SettingsAction::Refresh);
+            self.settings_busy = true;
+            self.notice = Some("Refreshing selected-runtime defaults…".to_owned());
         }
         Update::Render
     }
@@ -4373,6 +4512,19 @@ fn byte_index(value: &str, character_index: usize) -> usize {
         .char_indices()
         .nth(character_index)
         .map_or(value.len(), |(index, _)| index)
+}
+
+fn detail_covers_upstream(preview_detail: &str, upstream: &str) -> bool {
+    let normalize = |value: &str| {
+        value
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let preview_detail = normalize(preview_detail);
+    let upstream = normalize(upstream);
+    !upstream.is_empty() && preview_detail.contains(&upstream)
 }
 
 #[cfg(test)]

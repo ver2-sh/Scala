@@ -1789,7 +1789,7 @@ fn render_model_profiles(
         ui_layout.settings_scopes.x,
         ui_layout.settings_scopes.y.saturating_add(1),
         ui_layout.settings_scopes.width,
-        if ui_layout.compact { 4 } else { 5 },
+        if ui_layout.compact { 5 } else { 6 },
     );
     let info = if app.settings_input.is_some() {
         Vec::new()
@@ -1878,10 +1878,11 @@ fn render_model_profiles(
                 definition.description.clone(),
                 theme.hint,
             )));
-            lines.push(Line::from(Span::styled(
-                app.settings_default_detail(&definition.id),
-                theme.muted,
-            )));
+            lines.extend(
+                app.settings_default_detail(&definition.id)
+                    .lines()
+                    .map(|detail| Line::from(Span::styled(detail.to_owned(), theme.muted))),
+            );
         }
         lines
     } else {
@@ -2102,7 +2103,7 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
         let Some(definition) = definitions.get(*index) else {
             continue;
         };
-        let (value, source, set_here) = app.settings_value_display(&definition.id);
+        let display = app.settings_value_display(&definition.id);
         let mut style = if app.settings_setting_index == *index {
             theme.selected
         } else {
@@ -2111,11 +2112,6 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
         if app.hover == Some(HoverTarget::Setting(*index)) {
             style = style.patch(theme.hovered);
         }
-        let support = if definition.supported {
-            if set_here { "override" } else { "inherited" }
-        } else {
-            "unsupported"
-        };
         let label = match &definition.kind {
             norted_core::SettingKind::Choice { choices } => {
                 format!("{} [{}]", definition.label, choices.join("|"))
@@ -2130,7 +2126,7 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
                 .get(index.saturating_sub(1))
                 .is_none_or(|previous| previous.category != definition.category);
         let status = if definition.supported {
-            format!("{label} · {source} · {support}")
+            format!("{label} · {} · {}", display.source, display.state.as_str())
         } else {
             format!("{label} · unsupported")
         };
@@ -2167,7 +2163,7 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
         ];
         frame.render_widget(Paragraph::new(lines).style(style), *rect);
         let value_enabled = definition.supported && !app.settings_busy();
-        let value_label = format!("[ {value} ]");
+        let value_label = format!("[ {} ]", display.value);
         let value_text = if active_row || app.hover == Some(HoverTarget::SettingValue(*index)) {
             marquee_text(
                 &value_label,
