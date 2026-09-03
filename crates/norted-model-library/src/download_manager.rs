@@ -77,7 +77,7 @@ struct JobRecord {
     generation: u64,
     active_control: Option<ActiveControl>,
     resume_after_stop: bool,
-    partial_paths: HashSet<std::path::PathBuf>,
+    partial_paths: HashMap<String, HashSet<std::path::PathBuf>>,
     cancellation_cleanup_pending: bool,
 }
 
@@ -98,7 +98,19 @@ pub(crate) struct DownloadStart {
 pub(crate) struct DownloadTransition {
     pub(crate) starts: Vec<DownloadStart>,
     pub(crate) cleanup: Vec<std::path::PathBuf>,
-    pub(crate) cancellation_cleanup: Option<ModelDownloadJobId>,
+    pub(crate) cancellation_cleanup: Option<CancellationCleanup>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CancellationCleanup {
+    pub(crate) job_id: ModelDownloadJobId,
+    pub(crate) acquisitions: Vec<AcquisitionPartials>,
+}
+
+#[derive(Debug)]
+pub(crate) struct AcquisitionPartials {
+    pub(crate) acquisition_id: String,
+    pub(crate) paths: Vec<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -160,7 +172,7 @@ impl DownloadManager {
             generation: 0,
             active_control: None,
             resume_after_stop: false,
-            partial_paths: HashSet::new(),
+            partial_paths: HashMap::new(),
             cancellation_cleanup_pending: false,
         };
         state.order.push(id.clone());
@@ -241,6 +253,7 @@ impl DownloadManager {
         &self,
         id: &ModelDownloadJobId,
         generation: Option<u64>,
+        acquisition_id: String,
         paths: impl IntoIterator<Item = std::path::PathBuf>,
     ) {
         let mut state = self.state.lock().expect("download manager lock poisoned");
@@ -255,7 +268,11 @@ impl DownloadManager {
         }) {
             return;
         }
-        record.partial_paths.extend(paths);
+        record
+            .partial_paths
+            .entry(acquisition_id)
+            .or_default()
+            .extend(paths);
     }
 
     pub(crate) fn pause(
@@ -360,14 +377,9 @@ impl DownloadManager {
         record.transfer_started_at = None;
         record.cancellation_cleanup_pending =
             record.active_control.is_some() || !record.partial_paths.is_empty();
-        let cleanup = if record.active_control.is_none() {
-            record.partial_paths.drain().collect()
-        } else {
-            Vec::new()
-        };
         let cancellation_cleanup = (record.cancellation_cleanup_pending
             && record.active_control.is_none())
-        .then(|| id.clone());
+        .then(|| take_cancellation_cleanup(record, id.clone()));
         let starts = schedule_locked(&mut state);
         let job = snapshot(
             &state,
@@ -378,7 +390,7 @@ impl DownloadManager {
             job,
             DownloadTransition {
                 starts,
-                cleanup,
+                cleanup: Vec::new(),
                 cancellation_cleanup,
             },
         ))
@@ -405,6 +417,7 @@ impl DownloadManager {
         state.active.remove(id);
 
         let mut cleanup = Vec::new();
+        let mut cancellation_cleanup = None;
         let phase = state
             .jobs
             .get(id)
@@ -422,13 +435,11 @@ impl DownloadManager {
                 state.queue.push_back(id.clone());
             }
         } else if phase == ModelOperationPhase::Cancelled {
-            cleanup = state
+            let record = state
                 .jobs
                 .get_mut(id)
-                .expect("download job remains present")
-                .partial_paths
-                .drain()
-                .collect();
+                .expect("download job remains present");
+            cancellation_cleanup = Some(take_cancellation_cleanup(record, id.clone()));
         } else if let Some((phase, message)) = completion {
             let record = state
                 .jobs
@@ -440,11 +451,14 @@ impl DownloadManager {
                 record.finished_at = Some(Instant::now());
             }
             if phase == ModelOperationPhase::Installed {
-                cleanup = record.partial_paths.drain().collect();
+                cleanup = record
+                    .partial_paths
+                    .drain()
+                    .flat_map(|(_, paths)| paths)
+                    .collect();
             }
         }
         let starts = schedule_locked(&mut state);
-        let cancellation_cleanup = (phase == ModelOperationPhase::Cancelled).then(|| id.clone());
         prune_locked(&mut state);
         DownloadTransition {
             starts,
@@ -472,6 +486,23 @@ impl DownloadManager {
             .filter_map(|id| state.jobs.get(id))
             .map(|record| snapshot(&state, record))
             .collect()
+    }
+}
+
+fn take_cancellation_cleanup(
+    record: &mut JobRecord,
+    job_id: ModelDownloadJobId,
+) -> CancellationCleanup {
+    CancellationCleanup {
+        job_id,
+        acquisitions: record
+            .partial_paths
+            .drain()
+            .map(|(acquisition_id, paths)| AcquisitionPartials {
+                acquisition_id,
+                paths: paths.into_iter().collect(),
+            })
+            .collect(),
     }
 }
 

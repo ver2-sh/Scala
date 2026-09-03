@@ -379,17 +379,61 @@ impl ModelLibrary {
         }
         let library = Arc::clone(self);
         tokio::spawn(async move {
-            let mut cleanup_complete = true;
             for path in cleanup {
                 if let Err(error) = tokio::fs::remove_file(&path).await
                     && error.kind() != std::io::ErrorKind::NotFound
                 {
-                    cleanup_complete = false;
                     tracing::warn!(path = %path.display(), %error, "could not clean model download partial");
                 }
             }
-            if cleanup_complete && let Some(job_id) = cancellation_cleanup {
-                library.downloads.acknowledge_cancellation_cleanup(&job_id);
+            let Some(cancellation_cleanup) = cancellation_cleanup else {
+                return;
+            };
+            let mut cleanup_complete = true;
+            for acquisition in cancellation_cleanup.acquisitions {
+                if acquisition.acquisition_id.is_empty() && !acquisition.paths.is_empty() {
+                    cleanup_complete = false;
+                    tracing::warn!(
+                        job_id = %cancellation_cleanup.job_id,
+                        "cancellation cleanup has partials without a canonical acquisition identity; cleanup remains pending"
+                    );
+                    continue;
+                }
+                let _acquisition_lock = match library
+                    .acquisition_lock(&acquisition.acquisition_id)
+                    .await
+                {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        cleanup_complete = false;
+                        tracing::warn!(
+                            job_id = %cancellation_cleanup.job_id,
+                            acquisition_id = %acquisition.acquisition_id,
+                            %error,
+                            "could not acquire model acquisition lock for cancellation cleanup; cleanup remains pending"
+                        );
+                        continue;
+                    }
+                };
+                for path in acquisition.paths {
+                    if let Err(error) = tokio::fs::remove_file(&path).await
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        cleanup_complete = false;
+                        tracing::warn!(
+                            job_id = %cancellation_cleanup.job_id,
+                            acquisition_id = %acquisition.acquisition_id,
+                            path = %path.display(),
+                            %error,
+                            "could not clean cancelled model download partial; cleanup remains pending"
+                        );
+                    }
+                }
+            }
+            if cleanup_complete {
+                library
+                    .downloads
+                    .acknowledge_cancellation_cleanup(&cancellation_cleanup.job_id);
             }
         });
     }
@@ -758,14 +802,15 @@ impl ModelLibrary {
             repository: Some(&resolved.repository),
             generation,
         };
+        let acquisition_id = remote_acquisition_id(resolved);
         self.downloads.register_partial_paths(
             job_id,
             generation,
+            acquisition_id.clone(),
             std::iter::once(&resolved.primary)
                 .chain(resolved.companions.iter())
                 .map(|file| download_partial_path(&self.download_cache, model_ref, file)),
         );
-        let acquisition_id = remote_acquisition_id(resolved);
         let _acquisition_lock = self.acquisition_lock(&acquisition_id).await?;
         let primary_name = safe_remote_path(&resolved.primary.filename)?;
         if destination.exists() {
