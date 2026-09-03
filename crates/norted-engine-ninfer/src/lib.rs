@@ -185,6 +185,53 @@ struct NinferRuntimeCapabilities {
     request_log_schema: Option<u32>,
 }
 
+fn apply_ninfer_runtime_contract(
+    definitions: &mut [norted_core::SettingDefinition],
+    help: &str,
+    capabilities: NinferRuntimeCapabilities,
+) {
+    for definition in definitions.iter_mut() {
+        let id = definition.id.as_str();
+        if matches!(
+            id,
+            "reasoning" | "reasoning_effort" | "stop_strings" | "system_prompt"
+        ) {
+            if !capabilities.protocol_semantics {
+                definition.supported = false;
+                definition.unsupported_reason = Some(
+                    "the exact NInfer source revision has no reviewed request-protocol contract"
+                        .to_owned(),
+                );
+            }
+            continue;
+        }
+        if id == "repeat_penalty" || id == "structured_output_schema" {
+            definition.supported = false;
+            definition.unsupported_reason =
+                Some("NInfer does not implement this generation semantic".to_owned());
+            continue;
+        }
+        let option = if id == "ninfer.speculation" {
+            "--spec"
+        } else {
+            settings::option_for_setting(id)
+        };
+        if option.is_empty() || !usage_has_token(help, option) {
+            definition.supported = false;
+            definition.unsupported_reason = Some(format!(
+                "the exact ninfer-serve help contract does not advertise `{option}`"
+            ));
+        }
+    }
+    if let Some(definition) = definitions
+        .iter_mut()
+        .find(|definition| definition.id.as_str() == "ninfer.kv_dtype")
+        && let norted_core::SettingKind::Choice { choices } = &mut definition.kind
+    {
+        choices.retain(|choice| help.contains(choice));
+    }
+}
+
 fn validate_ninfer_settings_prelaunch(
     settings: &ResolvedSettings,
     capabilities: NinferRuntimeCapabilities,
@@ -1074,6 +1121,35 @@ impl EngineAdapter for NinferAdapter {
         Ok(definitions)
     }
 
+    async fn runtime_settings_schema(
+        &self,
+        runtime: &InstalledRuntime,
+        _host: &HostCapabilities,
+    ) -> Result<norted_core::SettingsSchema, EngineError> {
+        self.probe_runtime(runtime).await?;
+        let help = self
+            .capability_cache
+            .read()
+            .await
+            .get(&runtime.manifest.entrypoint_sha256.to_ascii_lowercase())
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Operation("NInfer help observation was not cached".to_owned())
+            })?;
+        let mut definitions = settings::definitions();
+        settings::apply_runtime_bounds(&mut definitions);
+        let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
+        if capabilities.protocol_semantics {
+            settings::apply_reviewed_runtime_defaults(&mut definitions, None);
+        }
+        apply_ninfer_runtime_contract(&mut definitions, &help, capabilities);
+        Ok(norted_core::SettingsSchema {
+            engine_id: ENGINE_ID.to_owned(),
+            runtime_id: Some(runtime.manifest.runtime_id.clone()),
+            definitions,
+        })
+    }
+
     async fn settings_schema(
         &self,
         runtime: &InstalledRuntime,
@@ -1095,48 +1171,10 @@ impl EngineAdapter for NinferAdapter {
         settings::apply_runtime_bounds(&mut definitions);
         let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
         if capabilities.protocol_semantics {
-            settings::apply_reviewed_runtime_defaults(&mut definitions, model, settings);
+            settings::apply_reviewed_runtime_defaults(&mut definitions, settings);
+            settings::apply_model_sampler_defaults(&mut definitions, model, settings);
         }
-        for definition in &mut definitions {
-            let id = definition.id.as_str();
-            if matches!(
-                id,
-                "reasoning" | "reasoning_effort" | "stop_strings" | "system_prompt"
-            ) {
-                if !capabilities.protocol_semantics {
-                    definition.supported = false;
-                    definition.unsupported_reason = Some(
-                        "the exact NInfer source revision has no reviewed request-protocol contract"
-                            .to_owned(),
-                    );
-                }
-                continue;
-            }
-            if id == "repeat_penalty" || id == "structured_output_schema" {
-                definition.supported = false;
-                definition.unsupported_reason =
-                    Some("NInfer does not implement this generation semantic".to_owned());
-                continue;
-            }
-            let option = if id == "ninfer.speculation" {
-                "--spec"
-            } else {
-                settings::option_for_setting(id)
-            };
-            if option.is_empty() || !usage_has_token(&help, option) {
-                definition.supported = false;
-                definition.unsupported_reason = Some(format!(
-                    "the exact ninfer-serve help contract does not advertise `{option}`"
-                ));
-            }
-        }
-        if let Some(definition) = definitions
-            .iter_mut()
-            .find(|definition| definition.id.as_str() == "ninfer.kv_dtype")
-            && let norted_core::SettingKind::Choice { choices } = &mut definition.kind
-        {
-            choices.retain(|choice| help.contains(choice));
-        }
+        apply_ninfer_runtime_contract(&mut definitions, &help, capabilities);
         Ok(norted_core::SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),

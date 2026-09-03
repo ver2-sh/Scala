@@ -214,7 +214,6 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
 
 pub(crate) fn apply_reviewed_runtime_defaults(
     definitions: &mut [SettingDefinition],
-    model: &ModelArtifact,
     settings: Option<&ResolvedSettings>,
 ) {
     for (id, value) in [
@@ -378,7 +377,6 @@ pub(crate) fn apply_reviewed_runtime_defaults(
                 "Derived from detected host concurrency using the reviewed runtime's maximum of 16 workers",
             ),
     );
-    apply_model_sampler_defaults(definitions, model, settings);
 }
 
 fn set_default(definitions: &mut [SettingDefinition], id: &str, preview: SettingDefaultPreview) {
@@ -390,7 +388,7 @@ fn set_default(definitions: &mut [SettingDefinition], id: &str, preview: Setting
     }
 }
 
-fn apply_model_sampler_defaults(
+pub(crate) fn apply_model_sampler_defaults(
     definitions: &mut [SettingDefinition],
     model: &ModelArtifact,
     settings: Option<&ResolvedSettings>,
@@ -398,13 +396,22 @@ fn apply_model_sampler_defaults(
     let Some(ArtifactNativeIdentity::Ninfer(identity)) = model.native_identity.as_ref() else {
         return;
     };
-    let thinking = settings
+    let request_thinking = settings
+        .and_then(|settings| settings.value("reasoning"))
+        .and_then(|value| match value {
+            SettingValue::Choice(value) if value == "on" => Some(true),
+            SettingValue::Choice(value) if value == "off" => Some(false),
+            SettingValue::Choice(value) if value == "auto" => None,
+            _ => None,
+        });
+    let process_thinking = settings
         .and_then(|settings| settings.value("ninfer.thinking"))
         .and_then(|value| match value {
             SettingValue::Toggle(value) => Some(*value),
             _ => None,
         })
         .unwrap_or(true);
+    let thinking = request_thinking.unwrap_or(process_thinking);
     let (mut temperature, top_p, top_k, min_p, presence_penalty, frequency_penalty) =
         match (identity.model_id.as_str(), thinking) {
             ("qwen3.6-27b" | "qwen3.8-27b", true) => ("1.0", "0.95", "20", "0.0", "0.0", "0.0"),

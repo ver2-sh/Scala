@@ -66,7 +66,9 @@ pub struct GgufArtifactIdentity {
     #[serde(default)]
     pub rope_frequency_base: Option<String>,
     #[serde(default)]
-    pub rope_frequency_scale: Option<String>,
+    pub rope_scaling_factor: Option<String>,
+    #[serde(default)]
+    pub rope_scaling_factor_key: Option<String>,
     #[serde(default)]
     pub chat_template_sha256: Option<String>,
     pub tokenizer_metadata_sha256: Option<String>,
@@ -485,6 +487,7 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
             || key.ends_with(".expert_used_count")
             || key.ends_with(".rope.freq_base")
             || key.ends_with(".rope.scaling.factor")
+            || key.ends_with(".rope.scale_linear")
             || key == "tokenizer.chat_template";
         let value = reader.value(value_type, capture.then_some(&key), None)?;
         if key == "general.architecture" {
@@ -494,7 +497,10 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
                 let digest = Sha256::digest(template.as_bytes());
                 format!("{digest:x}")
             });
-        } else if key.ends_with(".rope.freq_base") || key.ends_with(".rope.scaling.factor") {
+        } else if key.ends_with(".rope.freq_base")
+            || key.ends_with(".rope.scaling.factor")
+            || key.ends_with(".rope.scale_linear")
+        {
             if let Some(value) = value.and_then(GgufScalar::into_decimal_string) {
                 architecture_decimals.insert(key, value);
             }
@@ -522,8 +528,15 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
     let rope_frequency_base = architecture_decimals
         .get(&format!("{architecture}.rope.freq_base"))
         .cloned();
-    let rope_frequency_scale = architecture_decimals
-        .get(&format!("{architecture}.rope.scaling.factor"))
+    let rope_scaling_factor_key = [
+        format!("{architecture}.rope.scaling.factor"),
+        format!("{architecture}.rope.scale_linear"),
+    ]
+    .into_iter()
+    .find(|key| architecture_decimals.contains_key(key));
+    let rope_scaling_factor = rope_scaling_factor_key
+        .as_ref()
+        .and_then(|key| architecture_decimals.get(key))
         .cloned();
     Ok(GgufArtifactIdentity {
         version,
@@ -532,7 +545,8 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
         expert_count,
         expert_used_count,
         rope_frequency_base,
-        rope_frequency_scale,
+        rope_scaling_factor,
+        rope_scaling_factor_key,
         chat_template_sha256,
         tokenizer_metadata_sha256: (tokenizer_fields > 0)
             .then(|| format!("{:x}", tokenizer.finalize())),

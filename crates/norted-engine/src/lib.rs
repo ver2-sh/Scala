@@ -1467,6 +1467,20 @@ pub trait EngineAdapter: Send + Sync {
     ) -> Result<Vec<SettingDefinition>, EngineError> {
         Ok(self.setting_definitions())
     }
+    /// Applies one exact installed runtime's model-independent settings
+    /// contract. This is used by engine-level settings clients that have no
+    /// truthful model context to supply.
+    async fn runtime_settings_schema(
+        &self,
+        runtime: &InstalledRuntime,
+        _host: &HostCapabilities,
+    ) -> Result<SettingsSchema, EngineError> {
+        Ok(SettingsSchema {
+            engine_id: self.identity().id,
+            runtime_id: Some(runtime.manifest.runtime_id.clone()),
+            definitions: self.setting_definitions(),
+        })
+    }
     /// Gates the curated semantic settings against one exact runtime contract.
     async fn settings_schema(
         &self,

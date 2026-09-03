@@ -737,8 +737,8 @@ impl UiLayout {
                 screen_body.height.min(2),
             );
             let settings_intro_height = match (app.screen, compact) {
-                (Screen::ModelProfiles, true) => 7,
-                (Screen::ModelProfiles, false) => 8,
+                (Screen::ModelProfiles, true) => 8,
+                (Screen::ModelProfiles, false) => 9,
                 (_, true) => 6,
                 (_, false) => 7,
             };
@@ -792,11 +792,11 @@ impl UiLayout {
                     two_line_row_height,
                 );
                 settings_rows.push((index, row));
-                let inherited = app
+                let can_clear = app
                     .settings_definitions()
                     .get(index)
-                    .is_none_or(|definition| app.settings_value_display(&definition.id).2);
-                let inherit_width = if inherited { 11.min(row.width) } else { 0 };
+                    .is_some_and(|definition| app.settings_value_display(&definition.id).can_clear);
+                let inherit_width = if can_clear { 11.min(row.width) } else { 0 };
                 if inherit_width > 0 {
                     setting_inherit_actions.push((
                         index,
@@ -853,11 +853,11 @@ impl UiLayout {
                     settings_scopes.x,
                     settings_scopes
                         .y
-                        .saturating_add(if compact { 5 } else { 6 }),
+                        .saturating_add(if compact { 6 } else { 7 }),
                     settings_scopes.width,
                     screen_body
                         .height
-                        .saturating_sub(if compact { 5 } else { 6 })
+                        .saturating_sub(if compact { 6 } else { 7 })
                         .min(2),
                 );
                 let mut actions = vec![(ModelProfileAction::Load, 8)];
@@ -1514,7 +1514,7 @@ impl UiLayout {
                             );
                         }
                         if value_active {
-                            let (value, _, _) = app.settings_value_display(&definition.id);
+                            let value = app.settings_value_display(&definition.id).value;
                             track(
                                 &format!("setting-value:{index}"),
                                 &format!("[ {value} ]"),

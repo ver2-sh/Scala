@@ -2757,6 +2757,34 @@ impl EngineAdapter for Q27Adapter {
         q27_model_setting_definitions(model)
     }
 
+    async fn runtime_settings_schema(
+        &self,
+        runtime: &InstalledRuntime,
+        _host: &HostCapabilities,
+    ) -> Result<SettingsSchema, EngineError> {
+        self.probe_runtime(runtime).await?;
+        let usage = self
+            .capability_cache
+            .read()
+            .await
+            .get(&runtime.manifest.entrypoint_sha256.to_ascii_lowercase())
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::Operation("q27 usage observation was not cached".to_owned())
+            })?;
+        Ok(q27_settings_schema_from_usage(
+            Some(runtime.manifest.runtime_id.clone()),
+            &runtime.manifest.identity,
+            &runtime.manifest.acquisition_method,
+            runtime
+                .manifest
+                .source_build
+                .as_ref()
+                .map(Q27SourceBuildEvidence::Provenance),
+            &usage,
+        ))
+    }
+
     async fn settings_schema(
         &self,
         runtime: &InstalledRuntime,
@@ -4899,8 +4927,8 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
         ("max_output_tokens", "8192"),
         ("q27.fast_head", "enabled"),
         ("q27.thinking", "disabled"),
-        ("q27.request_thinking", "off"),
-        ("q27.constrain_tools", "off"),
+        ("q27.request_thinking", "disabled"),
+        ("q27.constrain_tools", "disabled"),
         ("q27.continuous_batching", "enabled"),
         ("q27.sampled_graphs", "enabled"),
         ("q27.mtp", "enabled"),
