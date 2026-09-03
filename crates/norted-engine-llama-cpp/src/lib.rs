@@ -860,6 +860,16 @@ impl EngineAdapter for LlamaCppAdapter {
         let help = self.cached_runtime_help(runtime).await?;
         let mut definitions = self.setting_definitions();
         apply_llama_exact_help_contract(&mut definitions, &help);
+        if let Some(definition) = definitions
+            .iter_mut()
+            .find(|definition| definition.id.as_str() == "llama.cpp.active_experts")
+        {
+            definition.supported = false;
+            definition.unsupported_reason = Some(
+                "active experts requires a bound model with inspected expert metadata".to_owned(),
+            );
+        }
+        ensure_llama_runtime_defaults(&mut definitions);
         Ok(SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -878,6 +888,7 @@ impl EngineAdapter for LlamaCppAdapter {
         let help = self.cached_runtime_help(runtime).await?;
         let mut definitions = self.model_setting_definitions(model)?;
         apply_llama_exact_help_contract(&mut definitions, &help);
+        ensure_llama_runtime_defaults(&mut definitions);
         Ok(SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -1598,7 +1609,7 @@ fn invalid_probe(reason: String) -> EngineProbe {
 }
 
 fn llama_setting_definitions() -> Vec<SettingDefinition> {
-    let mut definitions = common_setting_definitions();
+    let mut definitions = common_setting_definitions(ENGINE_ID);
     definitions.extend([
         llama_definition(
             "llama.cpp.threads",
@@ -1608,7 +1619,6 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(1),
                 maximum: None,
             },
-            Some("runtime-selected"),
         ),
         llama_definition(
             "llama.cpp.batch_size",
@@ -1618,7 +1628,6 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(1),
                 maximum: None,
             },
-            Some("runtime-selected"),
         ),
         llama_definition(
             "llama.cpp.micro_batch_size",
@@ -1628,14 +1637,12 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(1),
                 maximum: None,
             },
-            Some("runtime-selected"),
         ),
         llama_definition(
             "llama.cpp.gpu_offload",
             "GPU offload",
             "Weight layers placed in VRAM: none, auto, all, or an exact count",
             SettingKind::GpuOffload,
-            Some("auto in current runtimes"),
         ),
         llama_definition(
             "llama.cpp.flash_attention",
@@ -1644,7 +1651,6 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
             SettingKind::Choice {
                 choices: vec!["auto".to_owned(), "on".to_owned(), "off".to_owned()],
             },
-            Some("auto in current runtimes"),
         ),
         llama_definition(
             "llama.cpp.kv_cache_k",
@@ -1653,7 +1659,6 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
             SettingKind::Choice {
                 choices: llama_cache_types(),
             },
-            Some("runtime/model-selected"),
         ),
         llama_definition(
             "llama.cpp.kv_cache_v",
@@ -1662,7 +1667,6 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
             SettingKind::Choice {
                 choices: llama_cache_types(),
             },
-            Some("runtime/model-selected"),
         ),
         llama_definition(
             "llama.cpp.load_mode",
@@ -1671,105 +1675,90 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
             SettingKind::Choice {
                 choices: llama_load_modes(),
             },
-            Some("runtime-selected; omission preserves the exact runtime default"),
         ),
         llama_definition(
             "llama.cpp.rope_frequency_base",
             "RoPE frequency base",
             "RoPE base frequency used by NTK-aware scaling",
             SettingKind::Float { minimum: Some(f64::MIN_POSITIVE), maximum: None },
-            Some("model metadata"),
         ),
         llama_definition(
             "llama.cpp.rope_frequency_scale",
             "RoPE frequency scale",
             "RoPE frequency scaling factor; context expands by 1/value",
             SettingKind::Float { minimum: Some(f64::MIN_POSITIVE), maximum: None },
-            Some("model metadata"),
         ),
         llama_definition(
             "llama.cpp.unified_kv_cache",
             "Unified KV cache",
             "Use one KV buffer shared across server sequences",
             SettingKind::Toggle,
-            Some("exact runtime automatic"),
         ),
         llama_definition(
             "llama.cpp.kv_cache_gpu_offload",
             "KV cache GPU offload",
             "Place KV cache storage on an accelerator when enabled",
             SettingKind::Toggle,
-            Some("enabled in current runtimes"),
         ),
         llama_definition(
             "llama.cpp.context_checkpoints",
             "Context checkpoints",
             "Maximum context checkpoints per server slot; omission preserves the exact runtime default",
             SettingKind::UnsignedInteger { minimum: Some(0), maximum: None },
-            Some("exact runtime default"),
         ),
         llama_definition(
             "llama.cpp.cpu_moe_layers",
             "MoE layers on CPU",
             "Keep expert weights for the first N model layers on CPU",
             SettingKind::UnsignedInteger { minimum: Some(0), maximum: None },
-            Some("runtime default: none"),
         ),
         llama_definition(
             "llama.cpp.cpu_moe_all",
             "All MoE weights on CPU",
             "Keep all Mixture-of-Experts weights on CPU",
             SettingKind::OneWayFlag,
-            Some("runtime default: disabled"),
         ),
         llama_definition(
             "llama.cpp.active_experts",
             "Number of active experts",
             "Override the architecture-specific GGUF expert_used_count metadata only when the selected model proves that key",
             SettingKind::UnsignedInteger { minimum: Some(1), maximum: None },
-            Some("model metadata"),
         ),
         llama_definition(
             "llama.cpp.chat_template",
             "Chat template",
             "Exact runtime-advertised built-in chat template name; omission keeps model metadata authoritative",
             SettingKind::Choice { choices: Vec::new() },
-            Some("model metadata"),
         ),
         llama_definition(
             "llama.cpp.chat_template_file",
             "Chat template file",
             "Bound local Jinja chat-template file; content identity is recorded with the profile/default",
             SettingKind::Path,
-            Some("model metadata"),
         ),
         llama_definition(
             "llama.cpp.chat_template_sha256",
             "Chat template SHA-256",
             "Recorded content identity for the selected local chat-template file",
             SettingKind::String,
-            Some("Norted default: none"),
         ),
         llama_definition(
             "llama.cpp.speculative_mode",
             "Speculative decoding",
             "Exact runtime-advertised speculative decoding mode; off emits the runtime's none mode",
             SettingKind::Choice { choices: Vec::new() },
-            Some("runtime default: off"),
         ),
         llama_definition(
             "llama.cpp.speculative_draft_model",
             "Speculative draft model",
             "Bound local GGUF draft artifact used by draft-model speculative modes",
             SettingKind::Path,
-            Some("runtime default: unused"),
         ),
         llama_definition(
             "llama.cpp.speculative_draft_sha256",
             "Draft model SHA-256",
             "Recorded content identity for the selected speculative draft artifact",
             SettingKind::String,
-            Some("Norted default: none"),
         ),
     ]);
     definitions
@@ -1789,12 +1778,9 @@ fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<Setting
                 .find(|definition| definition.id.as_str() == id)
             {
                 definition.default_preview = Some(
-                    SettingDefaultPreview::new(
-                        "runtime fallback",
-                        SettingDefaultSource::StartupDynamic,
-                    )
+                    SettingDefaultPreview::new("none", SettingDefaultSource::Runtime)
                     .with_detail(
-                        "The selected GGUF does not contain this inspected metadata value; the exact runtime fallback remains authoritative",
+                        "The selected GGUF does not contain this metadata value, so Norted applies no model-derived customization",
                     ),
                 );
             }
@@ -1945,14 +1931,13 @@ fn llama_definition(
     label: &str,
     description: &str,
     kind: SettingKind,
-    upstream_default: Option<&str>,
 ) -> SettingDefinition {
     SettingDefinition {
         id: SettingId::new(id).expect("static llama.cpp setting ID"),
         label: label.to_owned(),
         description: description.to_owned(),
         kind,
-        scope: SettingScope::Engine {
+        scope: SettingScope::Runtime {
             engine_id: ENGINE_ID.to_owned(),
         },
         category: if id.contains("unified_kv")
@@ -1974,7 +1959,6 @@ fn llama_definition(
         supported: true,
         unsupported_reason: None,
         unit: None,
-        upstream_default: upstream_default.map(str::to_owned),
         default_preview: match id {
             "llama.cpp.chat_template_file"
             | "llama.cpp.chat_template_sha256"
@@ -2255,73 +2239,85 @@ fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &s
     let lower = reported.to_ascii_lowercase();
     let preview = match id {
         "parallel_requests" if lower == "-1" => SettingDefaultPreview::new(
-            "automatic slots",
-            SettingDefaultSource::StartupDynamic,
+            "1",
+            SettingDefaultSource::Norted,
         )
         .with_detail(
-            "The exact runtime reports `-1 = auto` and finalizes its server slot count during startup",
+            "Norted owns a deterministic single-slot baseline instead of the runtime's dynamic -1 policy",
         ),
         "llama.cpp.threads" if matches!(lower.as_str(), "-1" | "0" | "auto") => {
-            SettingDefaultPreview::new("host-selected", SettingDefaultSource::StartupDynamic)
+            SettingDefaultPreview::new(
+                std::thread::available_parallelism()
+                    .map(|value| value.get())
+                    .unwrap_or(1)
+                    .to_string(),
+                SettingDefaultSource::Derived,
+            )
                 .with_detail(format!(
                     "The exact runtime reports `{reported}` and resolves the worker count from the launch host"
                 ))
         }
         "llama.cpp.gpu_offload" if matches!(lower.as_str(), "-1" | "auto") => {
             SettingDefaultPreview::new(
-                "automatic offload",
-                SettingDefaultSource::StartupDynamic,
+                "auto",
+                SettingDefaultSource::Runtime,
             )
             .with_detail(format!(
                 "The exact runtime reports `{reported}` and resolves offload from model and accelerator capacity"
             ))
         }
         "llama.cpp.flash_attention" if lower == "auto" => SettingDefaultPreview::new(
-            "automatic",
-            SettingDefaultSource::StartupDynamic,
+            "auto",
+            SettingDefaultSource::Runtime,
         )
         .with_detail("The exact runtime selects Flash Attention after inspecting model/backend support"),
         "llama.cpp.load_mode" if lower == "auto" => SettingDefaultPreview::new(
-            "runtime-selected load mode",
-            SettingDefaultSource::StartupDynamic,
+            "auto",
+            SettingDefaultSource::Runtime,
         )
         .with_detail(
             "The exact runtime reports `auto` and selects its model loading strategy during startup",
         ),
         "context_length" if matches!(lower.as_str(), "0" | "auto") => {
-            SettingDefaultPreview::new("runtime fallback", SettingDefaultSource::StartupDynamic)
-                .with_detail("The exact runtime reports a model/runtime fallback and the selected GGUF has no inspected context metadata")
+            SettingDefaultPreview::new("4096", SettingDefaultSource::Norted)
+                .with_detail("Norted owns a deterministic fallback when GGUF context metadata is unavailable")
         }
         "llama.cpp.rope_frequency_base" | "llama.cpp.rope_frequency_scale"
             if matches!(lower.as_str(), "0" | "auto") =>
         {
-            SettingDefaultPreview::new("runtime fallback", SettingDefaultSource::StartupDynamic)
-                .with_detail("The exact runtime defers to model metadata, which is absent from the selected GGUF inspection")
+            SettingDefaultPreview::new("1.0", SettingDefaultSource::Norted)
+                .with_detail("Norted owns the neutral RoPE fallback when model metadata is unavailable")
         }
         "seed" if matches!(lower.as_str(), "-1" | "random") => {
-            SettingDefaultPreview::new("random per request", SettingDefaultSource::StartupDynamic)
+            SettingDefaultPreview::new("random", SettingDefaultSource::Runtime)
         }
         "max_output_tokens" if lower == "-1" => {
             SettingDefaultPreview::new("unlimited", SettingDefaultSource::Runtime)
         }
         "reasoning" if lower == "auto" => SettingDefaultPreview::new(
-            "template-detected",
-            SettingDefaultSource::StartupDynamic,
+            "auto",
+            SettingDefaultSource::Runtime,
         )
         .with_detail(
             "The exact runtime detects the reasoning mode from the selected chat template",
         ),
-        "reasoning_effort" if lower == "default" => SettingDefaultPreview::new(
-            "template-defined",
-            SettingDefaultSource::StartupDynamic,
-        )
-        .with_detail("The exact runtime preserves the selected chat template's reasoning default"),
+        "reasoning_effort" if lower == "default" => {
+            let value = match &definition.kind {
+                SettingKind::Choice { choices } if choices.iter().any(|choice| choice == "medium") => {
+                    "medium".to_owned()
+                }
+                SettingKind::Choice { choices } => choices.first().cloned().unwrap_or_else(|| "none".to_owned()),
+                _ => "none".to_owned(),
+            };
+            SettingDefaultPreview::new(value, SettingDefaultSource::Norted)
+                .with_detail("Norted selects a concrete effort from the exact runtime's advertised choices")
+        }
         "llama.cpp.speculative_mode" if lower == "none" => {
             SettingDefaultPreview::new("off", SettingDefaultSource::Runtime)
         }
         "llama.cpp.chat_template" if matches!(lower.as_str(), "model" | "auto" | "none") => {
-            SettingDefaultPreview::new("runtime fallback", SettingDefaultSource::StartupDynamic)
-                .with_detail("The exact runtime defers to selected-model template metadata")
+            SettingDefaultPreview::new("none", SettingDefaultSource::Runtime)
+                .with_detail("No runtime-scope chat-template override is applied; a bound model may provide a concrete embedded template")
         }
         _ if matches!(definition.kind, SettingKind::Toggle | SettingKind::OneWayFlag) => {
             let value = match lower.as_str() {
@@ -2338,6 +2334,137 @@ fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &s
     } else {
         preview.with_detail("Reported by this exact llama-server help contract")
     });
+}
+
+fn ensure_llama_runtime_defaults(definitions: &mut [SettingDefinition]) {
+    let host_threads = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .to_string();
+    for (id, value, detail) in [
+        ("context_length", "4096", "Norted deterministic fallback"),
+        ("parallel_requests", "1", "Norted deterministic baseline"),
+        ("temperature", "0.8", "llama.cpp runtime baseline"),
+        ("top_p", "0.95", "llama.cpp runtime baseline"),
+        ("top_k", "40", "llama.cpp runtime baseline"),
+        ("min_p", "0.05", "llama.cpp runtime baseline"),
+        ("seed", "random", "fresh randomness for each request"),
+        ("repeat_penalty", "1.0", "neutral repetition penalty"),
+        ("presence_penalty", "0.0", "neutral presence penalty"),
+        ("frequency_penalty", "0.0", "neutral frequency penalty"),
+        ("max_output_tokens", "unlimited", "no runtime response cap"),
+        ("reasoning", "auto", "chat-template reasoning policy"),
+        ("reasoning_budget", "-1", "unrestricted reasoning budget"),
+        ("llama.cpp.batch_size", "2048", "llama.cpp runtime baseline"),
+        (
+            "llama.cpp.micro_batch_size",
+            "512",
+            "llama.cpp runtime baseline",
+        ),
+        (
+            "llama.cpp.gpu_offload",
+            "auto",
+            "model and accelerator aware policy",
+        ),
+        (
+            "llama.cpp.flash_attention",
+            "auto",
+            "model and backend aware policy",
+        ),
+        ("llama.cpp.kv_cache_k", "f16", "llama.cpp cache baseline"),
+        ("llama.cpp.kv_cache_v", "f16", "llama.cpp cache baseline"),
+        ("llama.cpp.load_mode", "auto", "llama.cpp load policy"),
+        (
+            "llama.cpp.rope_frequency_base",
+            "1.0",
+            "neutral RoPE fallback",
+        ),
+        (
+            "llama.cpp.rope_frequency_scale",
+            "1.0",
+            "neutral RoPE fallback",
+        ),
+        (
+            "llama.cpp.unified_kv_cache",
+            "disabled",
+            "separate sequence caches",
+        ),
+        (
+            "llama.cpp.kv_cache_gpu_offload",
+            "enabled",
+            "GPU KV cache baseline",
+        ),
+        (
+            "llama.cpp.context_checkpoints",
+            "0",
+            "no context checkpoints",
+        ),
+        (
+            "llama.cpp.cpu_moe_layers",
+            "0",
+            "no forced CPU expert layers",
+        ),
+        (
+            "llama.cpp.cpu_moe_all",
+            "disabled",
+            "no forced CPU expert placement",
+        ),
+        (
+            "llama.cpp.chat_template",
+            "none",
+            "no runtime-scope template override",
+        ),
+        ("llama.cpp.speculative_mode", "off", "speculation disabled"),
+        (
+            "llama.cpp.speculative_draft_model",
+            "none",
+            "no draft model",
+        ),
+    ] {
+        if let Some(definition) = definitions.iter_mut().find(|definition| {
+            definition.id.as_str() == id
+                && definition.supported
+                && definition.default_preview.is_none()
+        }) {
+            let source = if value == "unlimited" || id == "llama.cpp.chat_template" {
+                SettingDefaultSource::Runtime
+            } else {
+                SettingDefaultSource::Norted
+            };
+            definition.default_preview =
+                Some(SettingDefaultPreview::new(value, source).with_detail(detail));
+        }
+    }
+    if let Some(definition) = definitions.iter_mut().find(|definition| {
+        definition.id.as_str() == "reasoning_effort"
+            && definition.supported
+            && definition.default_preview.is_none()
+    }) {
+        let value = match &definition.kind {
+            SettingKind::Choice { choices } if choices.iter().any(|choice| choice == "medium") => {
+                "medium".to_owned()
+            }
+            SettingKind::Choice { choices } => choices
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "none".to_owned()),
+            _ => "none".to_owned(),
+        };
+        definition.default_preview = Some(
+            SettingDefaultPreview::new(value, SettingDefaultSource::Norted)
+                .with_detail("Norted selects a concrete advertised effort baseline"),
+        );
+    }
+    if let Some(definition) = definitions.iter_mut().find(|definition| {
+        definition.id.as_str() == "llama.cpp.threads"
+            && definition.supported
+            && definition.default_preview.is_none()
+    }) {
+        definition.default_preview = Some(
+            SettingDefaultPreview::new(host_threads, SettingDefaultSource::Derived)
+                .with_detail("Derived from detected host concurrency"),
+        );
+    }
 }
 
 fn llama_help_reported_default(contract: &str) -> Option<String> {
@@ -2365,7 +2492,7 @@ fn llama_configured_runtime_compatibility(
     exact_help: Option<&str>,
 ) -> RuntimeCompatibility {
     let configured = settings
-        .effective
+        .configured
         .keys()
         .filter(|id| id.applies_to_engine(ENGINE_ID))
         .collect::<Vec<_>>();
@@ -2734,7 +2861,7 @@ fn translate_llama_settings_for_model(
 ) -> Result<LlamaStructuredArguments, EngineError> {
     let mut arguments = Vec::new();
     let mut environment_remove = Vec::new();
-    for (id, resolved) in &settings.effective {
+    for (id, resolved) in &settings.configured {
         let (aliases, environment_names) = llama_setting_collision_contract(id.as_str());
         if let Some(argument) = find_native_option(native_arguments, aliases) {
             return Err(EngineError::InvalidConfiguration(format!(
@@ -3609,9 +3736,9 @@ mod settings_tests {
     use super::*;
 
     fn resolved(values: &[(&str, SettingValue)]) -> ResolvedSettings {
-        let mut effective = BTreeMap::new();
+        let mut configured = BTreeMap::new();
         for (id, value) in values {
-            effective.insert(
+            configured.insert(
                 SettingId::new(*id).expect("setting ID"),
                 ResolvedSetting {
                     value: value.clone(),
@@ -3622,7 +3749,8 @@ mod settings_tests {
         ResolvedSettings {
             engine_id: ENGINE_ID.to_owned(),
             model_profile_id: None,
-            effective,
+            configured,
+            effective: BTreeMap::new(),
         }
     }
 
@@ -3712,7 +3840,7 @@ mod settings_tests {
             )
             .expect("profile setting resolution");
         assert!(matches!(
-            resolved.effective[&temperature_id].source,
+            resolved.configured[&temperature_id].source,
             SettingSource::ModelProfile { ref model_profile_id } if model_profile_id == &profile_id
         ));
         assert_eq!(

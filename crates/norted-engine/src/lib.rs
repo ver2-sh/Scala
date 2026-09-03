@@ -156,7 +156,7 @@ pub enum OptionValueKind {
     Path,
 }
 
-pub fn common_setting_definitions() -> Vec<SettingDefinition> {
+pub fn common_setting_definitions(engine_id: &str) -> Vec<SettingDefinition> {
     vec![
         SettingDefinition {
             id: SettingId::new("context_length").expect("static setting ID"),
@@ -166,12 +166,13 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(1),
                 maximum: None,
             },
-            scope: norted_core::SettingScope::Common,
+            scope: norted_core::SettingScope::Runtime {
+                engine_id: engine_id.to_owned(),
+            },
             category: norted_core::SettingCategory::General,
             supported: true,
             unsupported_reason: None,
             unit: Some("tokens".to_owned()),
-            upstream_default: Some("runtime/model automatic".to_owned()),
             default_preview: None,
         },
         SettingDefinition {
@@ -182,12 +183,13 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(1),
                 maximum: None,
             },
-            scope: norted_core::SettingScope::Common,
+            scope: norted_core::SettingScope::Runtime {
+                engine_id: engine_id.to_owned(),
+            },
             category: norted_core::SettingCategory::General,
             supported: true,
             unsupported_reason: None,
             unit: Some("slots".to_owned()),
-            upstream_default: Some("runtime-selected".to_owned()),
             default_preview: None,
         },
         SettingDefinition {
@@ -199,12 +201,13 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(0.0),
                 maximum: None,
             },
-            scope: norted_core::SettingScope::Common,
+            scope: norted_core::SettingScope::Runtime {
+                engine_id: engine_id.to_owned(),
+            },
             category: norted_core::SettingCategory::Generation,
             supported: true,
             unsupported_reason: None,
             unit: None,
-            upstream_default: Some("runtime/model default".to_owned()),
             default_preview: None,
         },
         SettingDefinition {
@@ -215,12 +218,13 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(0.0),
                 maximum: Some(1.0),
             },
-            scope: norted_core::SettingScope::Common,
+            scope: norted_core::SettingScope::Runtime {
+                engine_id: engine_id.to_owned(),
+            },
             category: norted_core::SettingCategory::Generation,
             supported: true,
             unsupported_reason: None,
             unit: None,
-            upstream_default: Some("runtime/model default".to_owned()),
             default_preview: None,
         },
         SettingDefinition {
@@ -231,12 +235,13 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(0),
                 maximum: None,
             },
-            scope: norted_core::SettingScope::Common,
+            scope: norted_core::SettingScope::Runtime {
+                engine_id: engine_id.to_owned(),
+            },
             category: norted_core::SettingCategory::Generation,
             supported: true,
             unsupported_reason: None,
             unit: None,
-            upstream_default: Some("runtime/model default".to_owned()),
             default_preview: None,
         },
         SettingDefinition {
@@ -247,12 +252,13 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                 minimum: Some(0.0),
                 maximum: Some(1.0),
             },
-            scope: norted_core::SettingScope::Common,
+            scope: norted_core::SettingScope::Runtime {
+                engine_id: engine_id.to_owned(),
+            },
             category: norted_core::SettingCategory::Generation,
             supported: true,
             unsupported_reason: None,
             unit: None,
-            upstream_default: Some("runtime/model default".to_owned()),
             default_preview: None,
         },
         SettingDefinition {
@@ -265,12 +271,13 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                     .map(str::to_owned)
                     .collect(),
             },
-            scope: norted_core::SettingScope::Common,
+            scope: norted_core::SettingScope::Runtime {
+                engine_id: engine_id.to_owned(),
+            },
             category: norted_core::SettingCategory::Reasoning,
             supported: true,
             unsupported_reason: None,
             unit: None,
-            upstream_default: Some("runtime/model default".to_owned()),
             default_preview: None,
         },
         common_definition(
@@ -283,7 +290,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                 choices: vec!["random".to_owned()],
             },
             norted_core::SettingCategory::Generation,
-            Some("runtime/model default"),
+            engine_id,
         ),
         common_definition(
             "repeat_penalty",
@@ -294,7 +301,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                 maximum: None,
             },
             norted_core::SettingCategory::Generation,
-            Some("runtime/model default"),
+            engine_id,
         ),
         common_definition(
             "presence_penalty",
@@ -305,7 +312,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                 maximum: Some(2.0),
             },
             norted_core::SettingCategory::Generation,
-            Some("runtime/model default"),
+            engine_id,
         ),
         common_definition(
             "frequency_penalty",
@@ -316,7 +323,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                 maximum: Some(2.0),
             },
             norted_core::SettingCategory::Generation,
-            Some("runtime/model default"),
+            engine_id,
         ),
         common_definition(
             "max_output_tokens",
@@ -327,7 +334,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                 maximum: Some(u64::from(u32::MAX)),
             },
             norted_core::SettingCategory::Generation,
-            Some("runtime/model default or unlimited"),
+            engine_id,
         ),
         common_definition(
             "stop_strings",
@@ -335,7 +342,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             "One or more configured generation stop strings as a JSON string array",
             norted_core::SettingKind::StringList,
             norted_core::SettingCategory::Prompt,
-            Some("Norted default: none"),
+            engine_id,
         ),
         common_definition(
             "system_prompt",
@@ -343,7 +350,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             "Default system instructions used only when the request supplies no system or developer message",
             norted_core::SettingKind::String,
             norted_core::SettingCategory::Prompt,
-            Some("Norted default: none"),
+            engine_id,
         ),
         common_definition(
             "reasoning",
@@ -356,7 +363,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                     .collect(),
             },
             norted_core::SettingCategory::Reasoning,
-            Some("runtime/model template default"),
+            engine_id,
         ),
         common_definition(
             "reasoning_budget",
@@ -367,7 +374,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                 maximum: Some(i64::from(i32::MAX)),
             },
             norted_core::SettingCategory::Reasoning,
-            Some("runtime/model default"),
+            engine_id,
         ),
         common_definition(
             "reasoning_budget_message",
@@ -375,7 +382,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             "Message injected before the end-of-thinking tag when the budget is exhausted",
             norted_core::SettingKind::String,
             norted_core::SettingCategory::Reasoning,
-            Some("Norted default: none"),
+            engine_id,
         ),
         common_definition(
             "structured_output_schema",
@@ -383,7 +390,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             "Default per-request JSON Schema object used when the request omits its output format",
             norted_core::SettingKind::JsonObject,
             norted_core::SettingCategory::Generation,
-            Some("Norted default: plain text"),
+            engine_id,
         ),
         common_definition(
             "context_overflow",
@@ -396,7 +403,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
                     .collect(),
             },
             norted_core::SettingCategory::Advanced,
-            Some("Norted default: error"),
+            engine_id,
         ),
     ]
 }
@@ -407,19 +414,20 @@ fn common_definition(
     description: &str,
     kind: norted_core::SettingKind,
     category: norted_core::SettingCategory,
-    upstream_default: Option<&str>,
+    engine_id: &str,
 ) -> SettingDefinition {
     SettingDefinition {
         id: SettingId::new(id).expect("static common setting ID"),
         label: label.to_owned(),
         description: description.to_owned(),
         kind,
-        scope: norted_core::SettingScope::Common,
+        scope: norted_core::SettingScope::Runtime {
+            engine_id: engine_id.to_owned(),
+        },
         category,
         supported: true,
         unsupported_reason: None,
         unit: None,
-        upstream_default: upstream_default.map(str::to_owned),
         default_preview: match id {
             "stop_strings" | "system_prompt" | "reasoning_budget_message" => Some(
                 SettingDefaultPreview::new("None", SettingDefaultSource::Norted),
@@ -1705,24 +1713,29 @@ impl EngineRegistry {
     }
 
     pub fn setting_definitions(&self) -> Result<Vec<SettingDefinition>, EngineError> {
-        let mut definitions = BTreeMap::<SettingId, SettingDefinition>::new();
+        let mut definitions = Vec::<SettingDefinition>::new();
         for adapter in self.adapters.values() {
             for definition in adapter.setting_definitions() {
-                match definitions.entry(definition.id.clone()) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(definition);
-                    }
-                    Entry::Occupied(entry) if entry.get() == &definition => {}
-                    Entry::Occupied(entry) => {
+                if let Some(existing) = definitions.iter().find(|existing| {
+                    existing.id == definition.id && existing.scope == definition.scope
+                }) {
+                    if existing != &definition {
                         return Err(EngineError::InvalidConfiguration(format!(
                             "setting `{}` has conflicting adapter definitions",
-                            entry.key()
+                            definition.id
                         )));
                     }
+                } else {
+                    definitions.push(definition);
                 }
             }
         }
-        Ok(definitions.into_values().collect())
+        definitions.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| format!("{:?}", left.scope).cmp(&format!("{:?}", right.scope)))
+        });
+        Ok(definitions)
     }
 
     pub fn parse_settings(&self, assignments: &[String]) -> Result<SettingsPatch, EngineError> {

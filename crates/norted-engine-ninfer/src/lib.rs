@@ -190,6 +190,16 @@ fn apply_ninfer_runtime_contract(
     help: &str,
     capabilities: NinferRuntimeCapabilities,
 ) {
+    if !capabilities.protocol_semantics {
+        for definition in definitions {
+            definition.supported = false;
+            definition.unsupported_reason = Some(
+                "the exact NInfer runtime lacks a reviewed concrete settings/defaults contract"
+                    .to_owned(),
+            );
+        }
+        return;
+    }
     for definition in definitions.iter_mut() {
         let id = definition.id.as_str();
         if matches!(
@@ -2684,7 +2694,7 @@ mod tests {
         ResolvedSettings {
             engine_id: ENGINE_ID.to_owned(),
             model_profile_id: None,
-            effective: values
+            configured: values
                 .iter()
                 .map(|(id, value)| {
                     (
@@ -2696,6 +2706,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            effective: BTreeMap::new(),
         }
     }
 

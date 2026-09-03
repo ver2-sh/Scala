@@ -10,7 +10,7 @@ use norted_engine::{EngineError, common_setting_definitions};
 const MAX_NINFER_CLI_INTEGER: u64 = i32::MAX as u64;
 
 pub(crate) fn definitions() -> Vec<SettingDefinition> {
-    let mut definitions = common_setting_definitions();
+    let mut definitions = common_setting_definitions(crate::ENGINE_ID);
     definitions.extend([
         definition(
             "ninfer.kv_dtype",
@@ -217,73 +217,18 @@ pub(crate) fn apply_reviewed_runtime_defaults(
     settings: Option<&ResolvedSettings>,
 ) {
     for (id, value) in [
-        ("context_length", "runtime default: 8192"),
-        ("parallel_requests", "runtime default: 1"),
-        ("temperature", "model/thinking-mode default"),
-        ("top_p", "model/thinking-mode default"),
-        ("top_k", "model/thinking-mode default"),
-        ("min_p", "model/thinking-mode default"),
-        ("seed", "runtime-selected random seed"),
-        ("presence_penalty", "model/thinking-mode default"),
-        ("frequency_penalty", "model/thinking-mode default"),
-        ("max_output_tokens", "runtime default: 8192"),
-        ("ninfer.kv_dtype", "runtime default: BF16"),
-        ("ninfer.kv_capacity", "runtime default: 8192"),
-        ("ninfer.prefill_chunk", "runtime default: 1024"),
-        ("ninfer.speculation", "runtime default: off"),
-        ("ninfer.speculative_backend", "runtime default: off"),
-        ("ninfer.draft_tokens", "runtime default: unused"),
-        ("ninfer.lm_head_draft", "runtime default: off"),
-        ("ninfer.vision", "runtime default: off"),
-        ("ninfer.greedy", "runtime default: off"),
-        ("ninfer.cuda_graph", "runtime default: enabled"),
-        ("ninfer.prefix_reuse", "runtime default: enabled"),
-        ("ninfer.thinking", "runtime default: enabled"),
-        ("ninfer.preserve_thinking", "runtime default: disabled"),
-        (
-            "ninfer.device_state_slots",
-            "runtime automatic: concurrency",
-        ),
-        ("ninfer.host_state_slots", "runtime default: 8"),
-        ("ninfer.host_kv_mib", "runtime default: 8192 MiB"),
-        (
-            "ninfer.max_private_continuations",
-            "runtime automatic: 2 × concurrency",
-        ),
-        (
-            "ninfer.max_shared_prefixes",
-            "runtime automatic: concurrency",
-        ),
-        (
-            "ninfer.max_long_anchors_per_continuation",
-            "runtime default: 2",
-        ),
-        ("ninfer.max_pending_requests", "runtime default: 16"),
-        ("ninfer.pending_timeout_ms", "runtime default: 30000 ms"),
-        ("ninfer.log_stats_interval_ms", "runtime default: 5000 ms"),
-        ("ninfer.max_request_mib", "runtime default: 384 MiB"),
-        ("ninfer.media_cache_mib", "runtime default: 1024 MiB"),
-        ("ninfer.media_live_mib", "runtime default: 2048 MiB"),
-        (
-            "ninfer.media_preprocess_threads",
-            "runtime-selected from host concurrency",
-        ),
-        ("ninfer.response_store_max_records", "runtime default: 1024"),
-        ("ninfer.response_store_max_mib", "runtime default: 256 MiB"),
-    ] {
-        if let Some(definition) = definitions
-            .iter_mut()
-            .find(|definition| definition.id.as_str() == id)
-        {
-            definition.upstream_default = Some(value.to_owned());
-        }
-    }
-
-    for (id, value) in [
         ("context_length", "8192"),
         ("parallel_requests", "1"),
+        ("temperature", "1.0"),
+        ("top_p", "0.95"),
+        ("top_k", "20"),
+        ("min_p", "0.0"),
+        ("repeat_penalty", "1.0"),
+        ("presence_penalty", "0.0"),
+        ("frequency_penalty", "0.0"),
         ("max_output_tokens", "8192"),
         ("reasoning", "on"),
+        ("reasoning_effort", "none"),
         ("reasoning_budget", "None"),
         ("ninfer.kv_dtype", "BF16"),
         ("ninfer.kv_capacity", "8192"),
@@ -319,7 +264,7 @@ pub(crate) fn apply_reviewed_runtime_defaults(
     set_default(
         definitions,
         "seed",
-        SettingDefaultPreview::new("random per request", SettingDefaultSource::StartupDynamic)
+        SettingDefaultPreview::new("random", SettingDefaultSource::StartupDynamic)
             .with_detail("NInfer creates a fresh random seed for each request when none is set"),
     );
 
@@ -544,21 +489,20 @@ fn definition(
     label: &str,
     description: &str,
     kind: SettingKind,
-    upstream_default: Option<&str>,
+    _runtime_note: Option<&str>,
 ) -> SettingDefinition {
     SettingDefinition {
         id: SettingId::new(id).expect("static NInfer setting ID"),
         label: label.to_owned(),
         description: description.to_owned(),
         kind,
-        scope: SettingScope::Engine {
+        scope: SettingScope::Runtime {
             engine_id: crate::ENGINE_ID.to_owned(),
         },
         category: category(id),
         supported: true,
         unsupported_reason: None,
         unit: None,
-        upstream_default: upstream_default.map(str::to_owned),
         default_preview: None,
     }
 }
@@ -657,7 +601,7 @@ pub(crate) fn translate(
     model: &ModelArtifact,
     native_arguments: &[String],
 ) -> Result<Vec<OsString>, EngineError> {
-    for id in settings.effective.keys() {
+    for id in settings.configured.keys() {
         if matches!(
             id.as_str(),
             "ninfer.speculation"
@@ -789,7 +733,7 @@ pub(crate) fn translate(
         ));
     }
     if toggle_value(settings, "ninfer.prefix_reuse")? == Some(false)
-        && settings.effective.keys().any(|id| {
+        && settings.configured.keys().any(|id| {
             matches!(
                 id.as_str(),
                 "ninfer.device_state_slots"
@@ -808,7 +752,7 @@ pub(crate) fn translate(
     }
 
     let mut arguments = Vec::new();
-    for (id, resolved) in &settings.effective {
+    for (id, resolved) in &settings.configured {
         if matches!(
             id.as_str(),
             "ninfer.speculation"
@@ -979,7 +923,7 @@ mod tests {
         ResolvedSettings {
             engine_id: crate::ENGINE_ID.to_owned(),
             model_profile_id: None,
-            effective: values
+            configured: values
                 .iter()
                 .map(|(id, value)| {
                     (
@@ -991,6 +935,7 @@ mod tests {
                     )
                 })
                 .collect::<BTreeMap<_, _>>(),
+            effective: BTreeMap::new(),
         }
     }
 
@@ -1049,7 +994,7 @@ mod tests {
     #[test]
     fn advertised_common_definitions_remain_engine_neutral() {
         let definitions = definitions();
-        for common in common_setting_definitions() {
+        for common in common_setting_definitions(crate::ENGINE_ID) {
             assert_eq!(
                 definitions
                     .iter()

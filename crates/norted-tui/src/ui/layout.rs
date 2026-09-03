@@ -757,8 +757,8 @@ impl UiLayout {
                 app.settings_scopes()
                     .into_iter()
                     .map(|scope| match scope {
-                        crate::app::SettingsScope::Global => "Global".to_owned(),
-                        crate::app::SettingsScope::Engine(engine) => engine,
+                        crate::app::SettingsScope::Server => "Server".to_owned(),
+                        crate::app::SettingsScope::Runtime(engine) => engine,
                         crate::app::SettingsScope::ModelProfile(profile) => profile.to_string(),
                     })
                     .collect::<Vec<_>>()
