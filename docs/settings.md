@@ -63,9 +63,10 @@ metadata, an exact immutable reviewed contract, or a Norted-owned value that Nor
 Common but unversioned upstream defaults are not treated as authoritative; when exact evidence cannot
 establish an omitted default, schema resolution reports that absence instead of inventing a value.
 
-Unsupported is distinct from unknown. A setting may be shown as `Unsupported` with an exact reason
-when the selected runtime/model does not implement it. A supported setting may not use an ambiguous
-placeholder.
+Each runtime/model schema contains only settings configurable for that exact combination. Shared
+semantic definitions are reusable metadata, not automatic membership in every engine. A stale or
+incompatible stored override is reported as unavailable for the selected schema, but it is not shown
+as an ordinary editable `Unsupported` row. An exposed setting may not use an ambiguous placeholder.
 
 ## Future bulk editing
 

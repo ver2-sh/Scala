@@ -32,11 +32,11 @@ use norted_engine::{
     InferenceStream, InferenceToolCall, InferenceToolChoice, InferenceUsage, InstallationState,
     LaunchRequest, LaunchSpec, LoadProgressReporter, NativeOption, OptionValueKind, OutputFormat,
     PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
-    StartupObservation, UpdateState, capture_command, common_setting_definitions,
-    compatibility_for, compatibility_for_nvidia_device, isolated_cuda_environment,
-    prepare_norted_package_input, prepare_norted_package_input_with_progress,
-    revalidate_norted_package_before_launch, revalidate_norted_package_before_launch_with_progress,
-    visible_nvidia_devices,
+    StartupObservation, UpdateState, capture_command, common_setting_definitions_for,
+    compatibility_for, compatibility_for_nvidia_device, configurable_setting_definitions,
+    isolated_cuda_environment, prepare_norted_package_input,
+    prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
+    revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
 };
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -2816,6 +2816,7 @@ impl EngineAdapter for Q27Adapter {
         let facts = inspect_q27_model(&model.path).map_err(EngineError::InvalidConfiguration)?;
         apply_q27_model_capabilities(&mut schema.definitions, &facts);
         apply_q27_context_defaults(&mut schema.definitions, runtime, model, host, settings);
+        schema.definitions = configurable_setting_definitions(schema.definitions);
         Ok(schema)
     }
 
@@ -4630,12 +4631,25 @@ fn q27_settings_schema_from_usage(
     SettingsSchema {
         engine_id: ENGINE_ID.to_owned(),
         runtime_id,
-        definitions,
+        definitions: configurable_setting_definitions(definitions),
     }
 }
 
 fn q27_setting_definitions() -> Vec<SettingDefinition> {
-    let mut definitions = common_setting_definitions(ENGINE_ID);
+    const COMMON_SETTINGS: &[&str] = &[
+        "context_length",
+        "parallel_requests",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "seed",
+        "max_output_tokens",
+        "system_prompt",
+        "reasoning",
+        "reasoning_budget",
+    ];
+    let mut definitions = common_setting_definitions_for(ENGINE_ID, COMMON_SETTINGS);
     definitions.extend([
         q27_definition(
             "q27.slot1_context_length",
@@ -5667,6 +5681,21 @@ mod tests {
             "q27.response_filter",
         ] {
             assert!(ids.contains(expected), "missing q27 setting {expected}");
+        }
+        for absent in [
+            "frequency_penalty",
+            "presence_penalty",
+            "repeat_penalty",
+            "structured_output_schema",
+            "reasoning_budget_message",
+            "reasoning_effort",
+            "stop_strings",
+            "context_overflow",
+        ] {
+            assert!(
+                !ids.contains(absent),
+                "{absent} must not belong to the reviewed q27 settings surface"
+            );
         }
     }
 

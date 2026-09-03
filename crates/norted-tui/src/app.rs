@@ -222,7 +222,6 @@ pub enum SettingsScope {
 pub enum SettingPresentationState {
     Override,
     Default,
-    Unsupported,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -290,6 +289,7 @@ pub struct SettingsLoad {
     pub profiles: ModelProfilesState,
     pub runtime_schemas: BTreeMap<String, SettingsSchema>,
     pub runtime_schema_warnings: Vec<String>,
+    pub save_notice: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1143,7 +1143,9 @@ impl App {
                     self.model_profiles = Some(loaded.profiles);
                     self.runtime_settings_schemas = loaded.runtime_schemas;
                     self.settings_error = None;
-                    self.notice = Some(if loaded.runtime_schema_warnings.is_empty() {
+                    self.notice = Some(if let Some(notice) = loaded.save_notice {
+                        notice
+                    } else if loaded.runtime_schema_warnings.is_empty() {
                         "Settings saved; operational changes apply now and model settings on the next load"
                             .to_owned()
                     } else {
@@ -1278,18 +1280,6 @@ impl App {
                 can_clear: false,
             };
         };
-        let definition = self
-            .settings_definitions()
-            .into_iter()
-            .find(|definition| &definition.id == id);
-        if definition.is_some_and(|definition| !definition.supported) {
-            return SettingValueDisplay {
-                value: "Unsupported".to_owned(),
-                source: "unsupported".to_owned(),
-                state: SettingPresentationState::Unsupported,
-                can_clear: self.current_layer_value(id).is_some(),
-            };
-        }
         if self.screen == Screen::ModelProfiles {
             let Some(profile) = self.selected_model_profile_value() else {
                 return SettingValueDisplay {
@@ -1413,22 +1403,6 @@ impl App {
             .into_iter()
             .find(|definition| &definition.id == id);
         let current = self.settings_value_display(id);
-        if let Some(definition) = definition
-            && !definition.supported
-        {
-            let reason = definition
-                .unsupported_reason
-                .clone()
-                .unwrap_or_else(|| "The exact runtime does not support this setting".to_owned());
-            let mut lines = vec![
-                "Current: Unsupported".to_owned(),
-                format!("Reason: {reason}"),
-            ];
-            if self.current_layer_value(id).is_some() {
-                lines.push("An existing override is set; use Inherit to remove it.".to_owned());
-            }
-            return lines.join("\n");
-        }
         let preview = definition.and_then(|definition| definition.default_preview.as_ref());
         let mut lines = vec![format!("Current: {} · {}", current.value, current.source)];
         if self.screen == Screen::ModelProfiles {
@@ -2957,13 +2931,6 @@ impl App {
         let Some(definition) = definition else {
             return Update::None;
         };
-        if !definition.supported {
-            self.notice =
-                Some(definition.unsupported_reason.unwrap_or_else(|| {
-                    "The exact runtime does not support this setting".to_owned()
-                }));
-            return Update::Render;
-        }
         let current = self.current_layer_value(&definition.id);
         match &definition.kind {
             norted_core::SettingKind::Toggle => {
@@ -3603,11 +3570,7 @@ impl App {
             Some(HoverTarget::SettingValue(index)) => {
                 self.focus = FocusArea::Content;
                 self.settings_setting_index = index;
-                let supported = self
-                    .settings_definitions()
-                    .get(index)
-                    .is_some_and(|definition| definition.supported);
-                if self.settings_busy || !supported {
+                if self.settings_busy {
                     Update::Render
                 } else {
                     self.edit_selected_setting()

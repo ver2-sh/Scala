@@ -611,6 +611,22 @@ async fn handle_model_profiles(
             let model = require_model(&core, &existing.model_id).await?;
             let registry = composition::engine_registry(&core)?;
             require_compatible_engine(&registry, &model, engine_id.as_str())?;
+            let source_schema =
+                model_schema_for_engine(&registry, &model, existing.engine_id.as_str())?;
+            let target_schema = model_schema_for_engine(&registry, &model, engine_id.as_str())?;
+            let retained = source_schema
+                .definitions
+                .iter()
+                .filter(|definition| target_schema.definition(&definition.id).is_some())
+                .map(|definition| definition.id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            let removed = existing
+                .overrides
+                .0
+                .keys()
+                .filter(|id| !retained.contains(*id))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
             let selected = profile_id.clone();
             let state = store
                 .update(move |state| {
@@ -619,13 +635,16 @@ async fn handle_model_profiles(
                         .get_mut(&profile_id)
                         .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
                     profile.engine_id = engine_id;
-                    profile
-                        .overrides
-                        .0
-                        .retain(|id, _| id.applies_to_engine(profile.engine_id.as_str()));
+                    profile.overrides.0.retain(|id, _| retained.contains(id));
                     Ok(state.clone())
                 })
                 .await?;
+            if !removed.is_empty() {
+                eprintln!(
+                    "Notice: removed incompatible Model Profile overrides: {}",
+                    removed.join(", ")
+                );
+            }
             output_model_profile_mutation(&core, "set-engine", &state, &selected, json_output)
                 .await?;
         }
@@ -906,14 +925,52 @@ async fn mutate_defaults(
     record_llama_local_file_identities(core, &mut patch).await?;
     let scope = defaults_scope(args.server, args.runtime);
     validate_default_scope(&registry, &scope, &patch)?;
+    let store = SettingsStore::new(&core.paths);
+    let current = store.read().await?;
+    if let DefaultsScope::Runtime(engine) = &scope {
+        validate_runtime_default_candidate(core, &current, engine, &patch).await?;
+    }
     let update_scope = scope.clone();
-    let state = SettingsStore::new(&core.paths)
+    let state = store
         .update(move |state| {
             default_patch_mut(state, &update_scope).0.extend(patch.0);
             Ok(state.clone())
         })
         .await?;
     output_settings_scope(core, "set", &scope, &state, json_output).await?;
+    Ok(())
+}
+
+async fn validate_runtime_default_candidate(
+    core: &Arc<ApplicationCore>,
+    state: &norted_core::SettingsState,
+    engine: &str,
+    patch: &SettingsPatch,
+) -> Result<()> {
+    let registry = composition::engine_registry(core)?;
+    let packs = composition::runtime_pack_manager(core, registry)?;
+    let (mut schemas, warnings) = packs
+        .selected_runtime_settings_schemas(state, &core.paths.data_dir)
+        .await?;
+    let schema = schemas.remove(engine).ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "selected runtime schema for `{engine}` is unavailable{}",
+            if warnings.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", warnings.join("; "))
+            }
+        )
+    })?;
+    let mut candidate = state.clone();
+    candidate
+        .runtime_defaults
+        .entry(engine.to_owned())
+        .or_default()
+        .0
+        .extend(patch.0.clone());
+    let resolved = candidate.resolve_runtime_defaults(engine, &core.paths.data_dir)?;
+    schema.validate(&resolved)?;
     Ok(())
 }
 
@@ -1085,14 +1142,7 @@ fn validate_patch_for_model(
     engine: &str,
     patch: &SettingsPatch,
 ) -> Result<()> {
-    let adapter = registry
-        .get(engine)
-        .ok_or_else(|| color_eyre::eyre::eyre!("unknown engine `{engine}`"))?;
-    let schema = norted_core::SettingsSchema {
-        engine_id: engine.to_owned(),
-        runtime_id: None,
-        definitions: adapter.model_setting_definitions(model)?,
-    };
+    let schema = model_schema_for_engine(registry, model, engine)?;
     let resolved = norted_core::ResolvedSettings {
         engine_id: engine.to_owned(),
         model_profile_id: None,
@@ -1116,6 +1166,23 @@ fn validate_patch_for_model(
     };
     schema.validate(&resolved)?;
     Ok(())
+}
+
+fn model_schema_for_engine(
+    registry: &EngineRegistry,
+    model: &norted_core::ModelArtifact,
+    engine: &str,
+) -> Result<norted_core::SettingsSchema> {
+    let adapter = registry
+        .get(engine)
+        .ok_or_else(|| color_eyre::eyre::eyre!("unknown engine `{engine}`"))?;
+    Ok(norted_core::SettingsSchema {
+        engine_id: engine.to_owned(),
+        runtime_id: None,
+        definitions: norted_engine::configurable_setting_definitions(
+            adapter.model_setting_definitions(model)?,
+        ),
+    })
 }
 
 fn parse_known_setting_ids(registry: &EngineRegistry, values: &[String]) -> Result<Vec<SettingId>> {

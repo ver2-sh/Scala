@@ -598,6 +598,7 @@ async fn load_tui_settings(
         profiles,
         runtime_schemas,
         runtime_schema_warnings,
+        save_notice: None,
     })
 }
 
@@ -736,6 +737,44 @@ async fn execute_settings_action(
                     &profile.id,
                     &candidate,
                 )) {
+                    return SettingsTaskResult::Stored(Err(error.to_string()));
+                }
+            }
+            if let SettingsScope::Runtime(engine_id) = &scope {
+                let state = match settings_store.read().await {
+                    Ok(state) => state,
+                    Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
+                };
+                let (mut schemas, warnings) = match runtime_packs
+                    .selected_runtime_settings_schemas(&state, &paths.data_dir)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
+                };
+                let Some(schema) = schemas.remove(engine_id) else {
+                    return SettingsTaskResult::Stored(Err(format!(
+                        "Selected runtime schema for `{engine_id}` is unavailable{}",
+                        if warnings.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", warnings.join("; "))
+                        }
+                    )));
+                };
+                let mut candidate = state;
+                candidate
+                    .runtime_defaults
+                    .entry(engine_id.clone())
+                    .or_default()
+                    .0
+                    .extend(patch.0.clone());
+                let resolved = match candidate.resolve_runtime_defaults(engine_id, &paths.data_dir)
+                {
+                    Ok(resolved) => resolved,
+                    Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
+                };
+                if let Err(error) = schema.validate(&resolved) {
                     return SettingsTaskResult::Stored(Err(error.to_string()));
                 }
             }
@@ -1024,40 +1063,84 @@ async fn execute_settings_action(
         }
         SettingsAction::CycleProfileEngine { profile_id, model } => {
             let compatible = runtime_packs.compatible_engine_ids(&model);
+            let current = match profiles_store.read().await {
+                Ok(profiles) => profiles,
+                Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
+            };
+            let Some(existing) = current.profiles.get(&profile_id) else {
+                return SettingsTaskResult::Stored(Err(SettingsError::ModelProfileNotFound(
+                    profile_id,
+                )
+                .to_string()));
+            };
+            let next = compatible
+                .iter()
+                .position(|engine| engine == existing.engine_id.as_str())
+                .map(|index| (index + 1) % compatible.len())
+                .unwrap_or(0);
+            let Some(engine) = compatible.get(next) else {
+                return SettingsTaskResult::Stored(Err(SettingsError::InvalidModelProfile(
+                    format!(
+                        "no registered engine is compatible with model `{}`",
+                        model.id
+                    ),
+                )
+                .to_string()));
+            };
+            let source_schema = match runtime_packs
+                .model_settings_schema_for_engine(&model, existing.engine_id.as_str())
+            {
+                Ok(schema) => schema,
+                Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
+            };
+            let target_schema = match runtime_packs.model_settings_schema_for_engine(&model, engine)
+            {
+                Ok(schema) => schema,
+                Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
+            };
+            let retained = source_schema
+                .definitions
+                .iter()
+                .filter(|definition| target_schema.definition(&definition.id).is_some())
+                .map(|definition| definition.id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            let removed = existing
+                .overrides
+                .0
+                .keys()
+                .filter(|id| !retained.contains(*id))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let engine = engine.clone();
             let result = profiles_store
                 .update(move |state| {
                     let profile = state
                         .profiles
                         .get_mut(&profile_id)
                         .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
-                    let next = compatible
-                        .iter()
-                        .position(|engine| engine == profile.engine_id.as_str())
-                        .map(|index| (index + 1) % compatible.len())
-                        .unwrap_or(0);
-                    let engine = compatible.get(next).ok_or_else(|| {
-                        SettingsError::InvalidModelProfile(format!(
-                            "no registered engine is compatible with model `{}`",
-                            model.id
-                        ))
-                    })?;
-                    profile.engine_id = EngineId::new(engine.clone())?;
-                    profile
-                        .overrides
-                        .0
-                        .retain(|id, _| id.applies_to_engine(profile.engine_id.as_str()));
+                    profile.engine_id = EngineId::new(engine)?;
+                    profile.overrides.0.retain(|id, _| retained.contains(id));
                     Ok(())
                 })
                 .await
                 .map_err(|error| error.to_string());
-            finish_settings_write(
+            let mut stored = finish_settings_write(
                 &runtime_packs,
                 paths,
                 &settings_store,
                 &profiles_store,
                 result,
             )
-            .await
+            .await;
+            if let SettingsTaskResult::Stored(Ok(loaded)) = &mut stored
+                && !removed.is_empty()
+            {
+                loaded.save_notice = Some(format!(
+                    "Engine changed; removed incompatible overrides: {}",
+                    removed.join(", ")
+                ));
+            }
+            stored
         }
         SettingsAction::CycleProfileRole { profile_id } => {
             let result = profiles_store
