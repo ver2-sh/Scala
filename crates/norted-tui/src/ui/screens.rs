@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, ModelLibraryView, Screen};
+use crate::app::{App, FocusArea, ModelLibraryView, Screen};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{
     ActionState, action_style, content_layout, format_bytes, key_value, key_value_width,
@@ -17,7 +17,8 @@ use crate::ui::components::{
     render_load_progress, section_title, truncate_middle,
 };
 use crate::ui::layout::{
-    HoverTarget, InstalledModelAction, ModelProfileAction, SelectedRuntimeAction, UiLayout,
+    DownloadJobAction, HoverTarget, InstalledModelAction, ModelProfileAction,
+    SelectedRuntimeAction, UiLayout,
 };
 use crate::ui::runtime_search::progress_text;
 
@@ -399,7 +400,7 @@ fn render_models(
     render_model_header(frame, app, theme, glyphs, ui_layout, layout[0]);
     if app.model_library_view == ModelLibraryView::Discover {
         render_model_discover(frame, app, theme, glyphs, ui_layout);
-        render_model_downloads(frame, app, theme, glyphs, ui_layout.model_downloads);
+        render_model_downloads(frame, app, theme, glyphs, ui_layout);
         return;
     }
     if matches!(app.snapshot.registry_state, RegistryState::NotScanned) {
@@ -554,7 +555,7 @@ fn render_models(
             glyphs,
         );
     }
-    render_model_downloads(frame, app, theme, glyphs, ui_layout.model_downloads);
+    render_model_downloads(frame, app, theme, glyphs, ui_layout);
 }
 
 fn render_installed_model_actions(
@@ -783,8 +784,9 @@ fn render_model_downloads(
     app: &App,
     theme: &Theme,
     glyphs: &Glyphs,
-    area: Rect,
+    ui_layout: &UiLayout,
 ) {
+    let area = ui_layout.model_downloads;
     if area.height == 0 || app.model_download_jobs.is_empty() {
         return;
     }
@@ -792,7 +794,12 @@ fn render_model_downloads(
         .model_download_jobs
         .iter()
         .filter(|job| {
-            !job.is_terminal() && job.phase != norted_model_library::ModelOperationPhase::Queued
+            !job.is_terminal()
+                && !matches!(
+                    job.phase,
+                    norted_model_library::ModelOperationPhase::Queued
+                        | norted_model_library::ModelOperationPhase::Paused
+                )
         })
         .count();
     let queued = app
@@ -813,123 +820,249 @@ fn render_model_downloads(
         Rect::new(area.x, area.y, area.width, 1),
     );
 
-    let mut jobs = app
-        .model_download_jobs
+    for (index, card) in &ui_layout.download_job_rows {
+        let Some(job) = app.model_download_jobs.get(*index) else {
+            continue;
+        };
+        render_model_download_card(frame, app, theme, glyphs, (*index, job, *card), ui_layout);
+    }
+}
+
+fn render_model_download_card(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: &Theme,
+    glyphs: &Glyphs,
+    card: (usize, &norted_model_library::ModelDownloadJob, Rect),
+    ui_layout: &UiLayout,
+) {
+    let (index, job, area) = card;
+    let selected = app.selected_model_download_job.as_ref() == Some(&job.id);
+    let controls = download_job_controls(job);
+    let action_width = controls
         .iter()
-        .filter(|job| !job.is_terminal())
-        .collect::<Vec<_>>();
-    jobs.extend(
-        app.model_download_jobs
-            .iter()
-            .rev()
-            .filter(|job| job.is_terminal()),
-    );
-    let lines = jobs
-        .into_iter()
-        .take(area.height.saturating_sub(1) as usize)
-        .map(|job| {
-            let phase = match job.phase {
-                norted_model_library::ModelOperationPhase::Queued => {
-                    job.queue_position.map_or_else(
-                        || "Queued".to_owned(),
-                        |position| format!("Queued #{position}"),
-                    )
-                }
-                norted_model_library::ModelOperationPhase::Resolving => "Resolving".to_owned(),
-                norted_model_library::ModelOperationPhase::Downloading => "Downloading".to_owned(),
-                norted_model_library::ModelOperationPhase::Verifying => "Verifying".to_owned(),
-                norted_model_library::ModelOperationPhase::Validating => "Validating".to_owned(),
-                norted_model_library::ModelOperationPhase::Installing => "Installing".to_owned(),
-                norted_model_library::ModelOperationPhase::Installed => "Installed".to_owned(),
-                norted_model_library::ModelOperationPhase::Failed => "Failed".to_owned(),
-                norted_model_library::ModelOperationPhase::Cancelled => "Cancelled".to_owned(),
-            };
-            let identity = job
-                .filename
-                .as_deref()
-                .or(job.repository.as_deref())
-                .unwrap_or(&job.model_ref);
-            let mut metrics = Vec::new();
-            if job.phase != norted_model_library::ModelOperationPhase::Queued {
-                metrics.push(job.total_bytes.map_or_else(
-                    || format_bytes(job.downloaded_bytes),
-                    |total| {
-                        format!(
-                            "{} / {}",
-                            format_bytes(job.downloaded_bytes),
-                            format_bytes(total)
-                        )
-                    },
-                ));
-            }
-            if let Some(percent) = job.progress_percent {
-                metrics.push(format!("{percent:.1}%"));
-            }
-            if let Some(rate) = job.transfer_bytes_per_second {
-                metrics.push(format!("{}/s", format_bytes(rate as u64)));
-            }
-            if let Some(eta) = job.estimated_remaining {
-                metrics.push(format!("~{}", compact_duration(eta)));
-            }
-            if matches!(
-                job.phase,
-                norted_model_library::ModelOperationPhase::Verifying
-                    | norted_model_library::ModelOperationPhase::Validating
-                    | norted_model_library::ModelOperationPhase::Installing
-                    | norted_model_library::ModelOperationPhase::Installed
-                    | norted_model_library::ModelOperationPhase::Failed
-            ) {
-                metrics.push(job.message.clone());
-            }
-            let progress_bar = job.progress_percent.map_or_else(String::new, |percent| {
-                let width = if area.width >= 90 { 12 } else { 8 };
-                let filled = ((percent / 100.0) * f64::from(width)).round() as usize;
-                format!(
-                    "[{}{}] ",
-                    "=".repeat(filled.min(width as usize)),
-                    ".".repeat(width as usize - filled.min(width as usize))
-                )
-            });
-            let text = format!(
-                "{phase:<11} {progress_bar}{identity}{}",
-                if metrics.is_empty() {
-                    String::new()
-                } else {
-                    format!("  {}", metrics.join("  "))
-                }
-            );
-            let style = match job.phase {
-                norted_model_library::ModelOperationPhase::Installed => theme.success,
-                norted_model_library::ModelOperationPhase::Failed
-                | norted_model_library::ModelOperationPhase::Cancelled => theme.error,
-                norted_model_library::ModelOperationPhase::Queued => theme.muted,
-                _ => theme.text,
-            };
-            Line::from(Span::styled(
-                truncate_middle(&text, area.width as usize, glyphs.ellipsis),
-                style,
-            ))
-        })
-        .collect::<Vec<_>>();
+        .map(|action| download_action_label(*action, glyphs, ui_layout.compact).width() + 1)
+        .sum::<usize>();
+    let prefix = format!("{}  ", glyphs.download);
+    let identity_width = (area.width as usize)
+        .saturating_sub(prefix.width())
+        .saturating_sub(action_width);
+    let identity = download_identity(job);
+    let identity = marquee_text(&identity, identity_width, app.marquee_animation_frame / 3);
+    let identity_style = if selected && app.focus == FocusArea::Content {
+        theme.text.patch(theme.focused)
+    } else {
+        theme.text
+    };
     frame.render_widget(
-        Paragraph::new(lines),
-        Rect::new(
-            area.x,
-            area.y.saturating_add(1),
-            area.width,
-            area.height.saturating_sub(1),
-        ),
+        Paragraph::new(Line::from(vec![
+            Span::styled(prefix, download_phase_style(job.phase, theme)),
+            Span::styled(identity, identity_style),
+        ])),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+
+    for action in controls {
+        let Some((_, _, action_area)) = ui_layout
+            .download_job_actions
+            .iter()
+            .find(|(action_index, candidate, _)| *action_index == index && *candidate == action)
+        else {
+            continue;
+        };
+        let hovered = app.hover == Some(HoverTarget::DownloadJobAction(index, action));
+        let state = if action == DownloadJobAction::Cancel {
+            ActionState::Destructive
+        } else {
+            ActionState::Primary
+        };
+        let mut style = action_style(theme, state, hovered);
+        if selected && app.focus == FocusArea::Content {
+            style = style.patch(theme.focused);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                download_action_label(action, glyphs, ui_layout.compact),
+                style,
+            ))),
+            *action_area,
+        );
+    }
+
+    let bar_area = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
+    frame.render_widget(
+        Paragraph::new(download_progress_bar(
+            job,
+            bar_area.width,
+            app.marquee_animation_frame,
+            theme,
+            glyphs,
+        )),
+        bar_area,
+    );
+    let status = download_status(job, glyphs);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_middle(&status, area.width as usize, glyphs.ellipsis),
+            download_phase_style(job.phase, theme),
+        ))),
+        Rect::new(area.x, area.y.saturating_add(2), area.width, 1),
     );
 }
 
-fn compact_duration(duration: std::time::Duration) -> String {
+pub(crate) fn download_identity(job: &norted_model_library::ModelDownloadJob) -> String {
+    match (job.repository.as_deref(), job.filename.as_deref()) {
+        (Some(repository), Some(filename)) => format!("{repository}  {filename}"),
+        (Some(repository), None) => repository.to_owned(),
+        (None, Some(filename)) => filename.to_owned(),
+        (None, None) => job.model_ref.clone(),
+    }
+}
+
+fn download_job_controls(job: &norted_model_library::ModelDownloadJob) -> Vec<DownloadJobAction> {
+    use norted_model_library::ModelOperationPhase;
+    match job.phase {
+        ModelOperationPhase::Queued
+        | ModelOperationPhase::Resolving
+        | ModelOperationPhase::Downloading => {
+            vec![DownloadJobAction::Cancel, DownloadJobAction::Pause]
+        }
+        ModelOperationPhase::Paused => {
+            vec![DownloadJobAction::Cancel, DownloadJobAction::Resume]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn download_action_label(action: DownloadJobAction, glyphs: &Glyphs, compact: bool) -> String {
+    let glyph = match action {
+        DownloadJobAction::Pause => glyphs.pause,
+        DownloadJobAction::Resume => glyphs.resume,
+        DownloadJobAction::Cancel => glyphs.cancel,
+    };
+    if compact {
+        format!("[{glyph}]")
+    } else {
+        format!("[ {glyph} ]")
+    }
+}
+
+fn download_progress_bar(
+    job: &norted_model_library::ModelDownloadJob,
+    width: u16,
+    animation_frame: u32,
+    theme: &Theme,
+    glyphs: &Glyphs,
+) -> Line<'static> {
+    let width = width as usize;
+    let determinate = job.progress_percent.map(|percent| percent / 100.0);
+    let filled = if let Some(fraction) = determinate {
+        (fraction.clamp(0.0, 1.0) * width as f64).round() as usize
+    } else if matches!(
+        job.phase,
+        norted_model_library::ModelOperationPhase::Resolving
+            | norted_model_library::ModelOperationPhase::Downloading
+    ) && width > 0
+    {
+        let pulse = (width / 5).max(1);
+        ((animation_frame as usize) % (width + pulse)).saturating_sub(pulse)
+    } else {
+        0
+    };
+    let pulse_width = if determinate.is_none()
+        && matches!(
+            job.phase,
+            norted_model_library::ModelOperationPhase::Resolving
+                | norted_model_library::ModelOperationPhase::Downloading
+        ) {
+        (width / 5).max(1).min(width.saturating_sub(filled))
+    } else {
+        filled.min(width)
+    };
+    let leading = if determinate.is_some() {
+        0
+    } else {
+        filled.min(width)
+    };
+    let empty = width.saturating_sub(leading + pulse_width);
+    if determinate.is_some() {
+        Line::from(vec![
+            Span::styled(glyphs.progress_full.repeat(pulse_width), theme.accent),
+            Span::styled(glyphs.progress_empty.repeat(empty), theme.border),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(glyphs.progress_empty.repeat(leading), theme.border),
+            Span::styled(glyphs.progress_full.repeat(pulse_width), theme.accent),
+            Span::styled(glyphs.progress_empty.repeat(empty), theme.border),
+        ])
+    }
+}
+
+fn download_status(job: &norted_model_library::ModelDownloadJob, glyphs: &Glyphs) -> String {
+    use norted_model_library::ModelOperationPhase;
+    let separator = if glyphs.unicode { " · " } else { " | " };
+    let transferred = job.total_bytes.map_or_else(
+        || format_bytes(job.downloaded_bytes),
+        |total| {
+            format!(
+                "{} of {}",
+                format_bytes(job.downloaded_bytes),
+                format_bytes(total)
+            )
+        },
+    );
+    match job.phase {
+        ModelOperationPhase::Queued => job.queue_position.map_or_else(
+            || "Queued".to_owned(),
+            |position| format!("Queued{separator}position {position}"),
+        ),
+        ModelOperationPhase::Resolving => format!("Resolving{separator}{}", job.message),
+        ModelOperationPhase::Downloading => {
+            let mut details = vec![transferred];
+            if let Some(rate) = job.transfer_bytes_per_second {
+                details.push(format!("{}/s", format_bytes(rate as u64)));
+            }
+            if let Some(remaining) = job.estimated_remaining {
+                details.push(friendly_remaining(remaining));
+            }
+            details.join(separator)
+        }
+        ModelOperationPhase::Paused => format!("{transferred}{separator}Paused"),
+        ModelOperationPhase::Verifying => format!("Verifying{separator}{}", job.message),
+        ModelOperationPhase::Validating => format!("Validating{separator}{}", job.message),
+        ModelOperationPhase::Installing => format!("Installing{separator}{}", job.message),
+        ModelOperationPhase::Installed => format!("Installed{separator}{}", job.message),
+        ModelOperationPhase::Failed => format!("Failed{separator}{}", job.message),
+        ModelOperationPhase::Cancelled => "Cancelled".to_owned(),
+    }
+}
+
+fn friendly_remaining(duration: std::time::Duration) -> String {
     let seconds = duration.as_secs();
     if seconds >= 3600 {
-        format!("{}h{}m", seconds / 3600, (seconds % 3600) / 60)
+        format!("{} hr {} min left", seconds / 3600, (seconds % 3600) / 60)
     } else if seconds >= 60 {
-        format!("{}m{}s", seconds / 60, seconds % 60)
+        format!("{} min left", (seconds + 30) / 60)
     } else {
-        format!("{seconds}s")
+        format!("{} sec left", seconds.max(1))
+    }
+}
+
+fn download_phase_style(
+    phase: norted_model_library::ModelOperationPhase,
+    theme: &Theme,
+) -> ratatui::style::Style {
+    use norted_model_library::ModelOperationPhase;
+    match phase {
+        ModelOperationPhase::Installed => theme.success,
+        ModelOperationPhase::Failed | ModelOperationPhase::Cancelled => theme.error,
+        ModelOperationPhase::Queued | ModelOperationPhase::Paused => theme.muted,
+        ModelOperationPhase::Resolving
+        | ModelOperationPhase::Verifying
+        | ModelOperationPhase::Validating
+        | ModelOperationPhase::Installing => theme.warning,
+        ModelOperationPhase::Downloading => theme.text,
     }
 }
 
@@ -2269,6 +2402,7 @@ fn concise_help_columns<'a>(theme: &Theme, glyphs: &Glyphs) -> (Vec<Line<'a>>, V
         key_value("Models", "Installed / Discover", theme),
         key_value("Left / Right", "change library view", theme),
         key_value("e / f / d", "search, filter, download", theme),
+        key_value("p / x", "pause/resume or cancel download", theme),
         key_value("Model Profiles", "serving targets", theme),
         key_value("l/u/e/Delete", "load, unload, bind, inherit", theme),
     ];
@@ -2297,6 +2431,7 @@ fn compact_help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         key_value("Tab / arrows", "move focus and selection", theme),
         key_value("Enter", "open or activate", theme),
         key_value("Models", "e search, f format, d download", theme),
+        key_value("p / x", "pause/resume or cancel download", theme),
         key_value("Runtimes", "s search, g/Q/N default", theme),
         key_value("Settings", "Enter edit, Delete inherit", theme),
         key_value("/", "commands", theme),
@@ -2332,6 +2467,8 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
             "edit, search, filter, or download",
             theme,
         ),
+        key_value("Shift+Up/Down", "select a visible download card", theme),
+        key_value("p / x", "pause/resume or cancel that download", theme),
         key_value(
             "Model Profiles",
             "normal load and per-profile override screen",
