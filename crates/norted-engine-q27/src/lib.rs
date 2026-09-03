@@ -1549,7 +1549,7 @@ fn setting_unsigned_with_source<'a>(
     settings: &'a norted_core::ResolvedSettings,
     id: &str,
 ) -> Option<(u64, &'a norted_core::SettingSource)> {
-    settings.effective.iter().find_map(|(candidate, setting)| {
+    settings.configured.iter().find_map(|(candidate, setting)| {
         if candidate.as_str() != id {
             return None;
         }
@@ -1562,15 +1562,14 @@ fn setting_unsigned_with_source<'a>(
 
 fn setting_source_label(source: &norted_core::SettingSource) -> &'static str {
     match source {
-        norted_core::SettingSource::GlobalDefault => "Global Default",
-        norted_core::SettingSource::EngineDefault { .. } => "Engine Default",
+        norted_core::SettingSource::RuntimeDefault => "Runtime Default",
         norted_core::SettingSource::ModelProfile { .. } => "Model Profile",
         norted_core::SettingSource::Invocation => "invocation",
     }
 }
 
 fn q27_has_configured_execution(settings: &norted_core::ResolvedSettings) -> bool {
-    settings.effective.keys().any(|id| {
+    settings.configured.keys().any(|id| {
         matches!(
             id.as_str(),
             "context_length"
@@ -1694,7 +1693,7 @@ fn q27_configured_launch(
         }
     }
     let mut normalized_settings = BTreeMap::new();
-    for (id, setting) in &settings.effective {
+    for (id, setting) in &settings.configured {
         normalized_settings.insert(
             id.to_string(),
             serde_json::to_value(&setting.value).map_err(|error| {
@@ -4533,6 +4532,17 @@ fn q27_settings_schema_from_usage(
     apply_q27_runtime_bounds(&mut definitions, managed, version);
     if capabilities.stable_serving_environment {
         apply_q27_reviewed_runtime_defaults(&mut definitions);
+        if let Some(compiled_w_max) = capabilities.compiled_w_max {
+            set_q27_default(
+                &mut definitions,
+                "q27.suffix_width_mode",
+                SettingDefaultPreview::new(
+                    compiled_w_max.to_string(),
+                    SettingDefaultSource::Derived,
+                )
+                .with_detail("The exact reviewed runtime identity proves its compiled W_MAX"),
+            );
+        }
     }
     if capabilities.request_seed
         && let Some(seed) = definitions
@@ -4547,7 +4557,6 @@ fn q27_settings_schema_from_usage(
             maximum: Some(u64::from(u32::MAX)),
             choices: Vec::new(),
         };
-        seed.upstream_default = Some("runtime default: 0".to_owned());
         seed.default_preview = Some(SettingDefaultPreview::new(
             "0",
             SettingDefaultSource::Runtime,
@@ -4608,6 +4617,15 @@ fn q27_settings_schema_from_usage(
             });
         }
     }
+    if !capabilities.stable_serving_environment {
+        for definition in &mut definitions {
+            definition.supported = false;
+            definition.unsupported_reason = Some(
+                "the exact q27 runtime lacks a reviewed concrete settings/defaults contract"
+                    .to_owned(),
+            );
+        }
+    }
     SettingsSchema {
         engine_id: ENGINE_ID.to_owned(),
         runtime_id,
@@ -4616,7 +4634,7 @@ fn q27_settings_schema_from_usage(
 }
 
 fn q27_setting_definitions() -> Vec<SettingDefinition> {
-    let mut definitions = common_setting_definitions();
+    let mut definitions = common_setting_definitions(ENGINE_ID);
     definitions.extend([
         q27_definition(
             "q27.slot1_context_length",
@@ -4865,67 +4883,17 @@ fn q27_model_setting_definitions(
 
 fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
     for (id, value) in [
-        (
-            "context_length",
-            "runtime automatic: VRAM-sized; max 262144 compact KV / 131072 FP16",
-        ),
-        ("parallel_requests", "runtime default: 1"),
-        ("temperature", "runtime default: 0.0"),
-        ("top_p", "runtime default: 1.0"),
-        ("top_k", "runtime default: 0"),
-        ("min_p", "runtime default: 0.0"),
-        ("max_output_tokens", "runtime default: 8192"),
-        (
-            "q27.slot1_context_length",
-            "runtime automatic: same as slot 0",
-        ),
-        ("q27.kv_mode", "runtime-selected by architecture"),
-        ("q27.fast_head", "runtime profile default: enabled"),
-        ("q27.thinking", "runtime profile default: disabled"),
-        (
-            "q27.thinking_budget",
-            "runtime automatic for prompt-seeded thinking",
-        ),
-        ("q27.request_thinking", "runtime default: off"),
-        ("q27.constrain_tools", "runtime default: off"),
-        (
-            "q27.continuous_batching",
-            "runtime profile default: enabled; compatibility may auto-disable",
-        ),
-        ("q27.sampled_graphs", "runtime default: enabled"),
-        ("q27.mtp", "runtime profile default: enabled"),
-        ("q27.mtp_max_depth", "runtime profile default: auto, max 7"),
-        ("q27.mtp_min_probability", "runtime profile default: 0.5"),
-        ("q27.suffix_drafting", "runtime profile default: enabled"),
-        (
-            "q27.suffix_width_mode",
-            "runtime profile default: compiled W_MAX",
-        ),
-        (
-            "q27.prefix_cache_path",
-            "runtime default: disabled unless a path is supplied",
-        ),
-        ("q27.prefix_cache_max_gb", "runtime default: 20 GB"),
-        ("q27.prefix_cache_min_tokens", "runtime default: 4096"),
-        ("q27.prefix_cache_max_tokens", "runtime default: 32768"),
-        ("q27.prefix_cache_step_tokens", "runtime default: 8192"),
-        ("q27.prefix_cache_ram_gb", "runtime default: disabled"),
-    ] {
-        if let Some(definition) = definitions
-            .iter_mut()
-            .find(|definition| definition.id.as_str() == id)
-        {
-            definition.upstream_default = Some(value.to_owned());
-        }
-    }
-
-    for (id, value) in [
+        ("context_length", "auto"),
         ("parallel_requests", "1"),
         ("temperature", "0.0"),
         ("top_p", "1.0"),
         ("top_k", "0"),
         ("min_p", "0.0"),
         ("max_output_tokens", "8192"),
+        ("reasoning", "off"),
+        ("reasoning_budget", "auto"),
+        ("q27.slot1_context_length", "auto"),
+        ("q27.kv_mode", "auto"),
         ("q27.fast_head", "enabled"),
         ("q27.thinking", "disabled"),
         ("q27.request_thinking", "disabled"),
@@ -4933,6 +4901,7 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
         ("q27.continuous_batching", "enabled"),
         ("q27.sampled_graphs", "enabled"),
         ("q27.mtp", "enabled"),
+        ("q27.mtp_max_depth", "auto"),
         ("q27.mtp_min_probability", "0.5"),
         ("q27.suffix_drafting", "enabled"),
         ("q27.prefix_cache_path", "disabled"),
@@ -4950,6 +4919,26 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
     }
     set_q27_default(
         definitions,
+        "context_length",
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+            "q27 sizes context from live free VRAM and startup reservations after model weights load; compact KV is capped at 262144 and FP16 at 131072",
+        ),
+    );
+    set_q27_default(
+        definitions,
+        "q27.slot1_context_length",
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+            "When context is automatic, q27 sizes later slots to the live-VRAM-derived slot-0 window",
+        ),
+    );
+    set_q27_default(
+        definitions,
+        "q27.kv_mode",
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+            .with_detail("The exact runtime selects KV format from the accelerator architecture"),
+    );
+    set_q27_default(
+        definitions,
         "q27.continuous_batching",
         SettingDefaultPreview::new("enabled", SettingDefaultSource::Runtime).with_detail(
             "Enabled by the reviewed runtime profile; q27 may auto-disable it when runtime compatibility requires the solo path",
@@ -4958,17 +4947,23 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
     set_q27_default(
         definitions,
         "q27.mtp_max_depth",
-        SettingDefaultPreview::new("automatic · ≤7", SettingDefaultSource::Runtime).with_detail(
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
             "The reviewed runtime chooses proposal depth automatically with a maximum of 7",
         ),
     );
     set_q27_default(
         definitions,
         "q27.thinking_budget",
-        SettingDefaultPreview::new("request-sized", SettingDefaultSource::StartupDynamic)
-            .with_detail(
-                "For prompt-seeded thinking, q27 derives the budget from the request's maximum output at request time",
-            ),
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+            "For prompt-seeded thinking, q27 derives the budget from the request's maximum output at request time",
+        ),
+    );
+    set_q27_default(
+        definitions,
+        "reasoning_budget",
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+            "When request thinking is enabled, an omitted request budget remains request-derived",
+        ),
     );
 }
 
@@ -5034,12 +5029,8 @@ fn apply_q27_context_defaults(
         set_q27_default(
             definitions,
             "q27.kv_mode",
-            SettingDefaultPreview::new(
-                "architecture-selected",
-                SettingDefaultSource::StartupDynamic,
-            )
-            .with_detail(
-                "The reviewed runtime selects KV format from numeric GPU architecture, but the selected accelerator's compute capability is not known",
+            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+                "The exact runtime selects KV format from accelerator architecture; no authoritative compute capability is available before launch",
             ),
         );
     }
@@ -5061,19 +5052,17 @@ fn apply_q27_context_defaults(
     } else {
         262_144
     };
-    let context = SettingDefaultPreview::new(
-        format!("launch-sized · ≤{context_cap}"),
-        SettingDefaultSource::StartupDynamic,
-    )
-    .with_detail(
-        "q27 calculates the final context from live free VRAM and startup reservations after loading model weights",
+    let context = SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+        format!(
+            "q27 sizes context from live free VRAM and startup reservations after model weights load; the selected KV policy caps it at {context_cap}"
+        ),
     );
     set_q27_default(definitions, "context_length", context.clone());
     set_q27_default(
         definitions,
         "q27.slot1_context_length",
-        context.with_detail(
-            "When context is automatic, the reviewed runtime sizes later slots to the same live-VRAM-derived window as slot 0",
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+            "When context is automatic, the reviewed runtime sizes later slots to the live-VRAM-derived slot-0 window",
         ),
     );
     if let Some(compiled_w_max) = capabilities.compiled_w_max {
@@ -5131,7 +5120,7 @@ fn validate_q27_model_settings(
         return Ok(());
     }
     let contradicted = settings
-        .effective
+        .configured
         .keys()
         .find(|id| id.as_str().starts_with("q27.mtp") || id.as_str().starts_with("q27.suffix"));
     match contradicted {
@@ -5147,28 +5136,27 @@ fn q27_definition(
     label: &str,
     description: &str,
     kind: SettingKind,
-    upstream_default: Option<&str>,
+    _runtime_note: Option<&str>,
 ) -> SettingDefinition {
     SettingDefinition {
         id: SettingId::new(id).expect("static q27 setting ID"),
         label: label.to_owned(),
         description: description.to_owned(),
         kind,
-        scope: SettingScope::Engine {
+        scope: SettingScope::Runtime {
             engine_id: ENGINE_ID.to_owned(),
         },
         category: q27_setting_category(id),
         supported: true,
         unsupported_reason: None,
         unit: None,
-        upstream_default: upstream_default.map(str::to_owned),
         default_preview: match id {
             "q27.prompt_mode" => Some(SettingDefaultPreview::new(
-                "runtime template",
+                "runtime_default",
                 SettingDefaultSource::Norted,
             )),
             "q27.prompt_delivery" => Some(SettingDefaultPreview::new(
-                "runtime chat",
+                "runtime_chat",
                 SettingDefaultSource::Norted,
             )),
             "q27.template_path" | "q27.template_sha256" => Some(SettingDefaultPreview::new(
@@ -5273,7 +5261,7 @@ fn translate_q27_settings(
 ) -> Result<Q27StructuredArguments, EngineError> {
     let has_prefix_path = settings.value("q27.prefix_cache_path").is_some();
     if !has_prefix_path
-        && settings.effective.keys().any(|id| {
+        && settings.configured.keys().any(|id| {
             id.as_str().starts_with("q27.prefix_cache_") && id.as_str() != "q27.prefix_cache_path"
         })
     {
@@ -5285,7 +5273,7 @@ fn translate_q27_settings(
 
     let mut arguments = Vec::new();
     let environment_remove = Vec::new();
-    for (id, resolved) in &settings.effective {
+    for (id, resolved) in &settings.configured {
         if matches!(
             id.as_str(),
             "temperature"
@@ -5604,7 +5592,7 @@ mod tests {
         ResolvedSettings {
             engine_id: ENGINE_ID.to_owned(),
             model_profile_id: None,
-            effective: values
+            configured: values
                 .iter()
                 .map(|(id, value)| {
                     (
@@ -5616,6 +5604,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            effective: BTreeMap::new(),
         }
     }
 

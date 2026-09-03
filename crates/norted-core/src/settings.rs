@@ -9,7 +9,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::{AppPaths, ModelProfileId, RuntimeId};
 
-pub const SETTINGS_STATE_VERSION: u32 = 1;
+pub const SETTINGS_STATE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -408,9 +408,8 @@ impl std::fmt::Display for SettingCategory {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "scope")]
 pub enum SettingScope {
-    Global,
-    Common,
-    Engine { engine_id: String },
+    Server,
+    Runtime { engine_id: String },
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -426,20 +425,18 @@ pub enum SettingDefaultSource {
 impl std::fmt::Display for SettingDefaultSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Norted => "Norted default",
-            Self::Runtime => "runtime default",
-            Self::Model => "model default",
-            Self::Derived => "derived default",
-            Self::StartupDynamic => "startup dynamic",
+            Self::Norted | Self::Runtime | Self::Model | Self::Derived | Self::StartupDynamic => {
+                "runtime default"
+            }
         })
     }
 }
 
-/// A presentation-only effective default proved by the owning adapter.
+/// An authoritative runtime-base value or genuine runtime policy proved or
+/// deliberately owned by the adapter.
 ///
-/// This is deliberately separate from `upstream_default`: the latter remains
-/// human documentation, while this value is safe for clients to render without
-/// interpreting prose. It never changes persisted settings or launch behavior.
+/// The value is safe for clients to render without interpreting prose. A
+/// Norted-owned scalar may also be materialized into the launch contract.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SettingDefaultPreview {
     pub value: String,
@@ -478,8 +475,6 @@ pub struct SettingDefinition {
     pub unsupported_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_default: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_preview: Option<SettingDefaultPreview>,
 }
@@ -524,16 +519,16 @@ impl SettingsPatch {
 #[serde(default, deny_unknown_fields)]
 pub struct SettingsState {
     pub version: u32,
-    pub global_defaults: SettingsPatch,
-    pub engine_defaults: BTreeMap<String, SettingsPatch>,
+    pub server_settings: SettingsPatch,
+    pub runtime_defaults: BTreeMap<String, SettingsPatch>,
 }
 
 impl Default for SettingsState {
     fn default() -> Self {
         Self {
             version: SETTINGS_STATE_VERSION,
-            global_defaults: SettingsPatch::default(),
-            engine_defaults: BTreeMap::new(),
+            server_settings: SettingsPatch::default(),
+            runtime_defaults: BTreeMap::new(),
         }
     }
 }
@@ -546,15 +541,12 @@ impl SettingsState {
                 supported: SETTINGS_STATE_VERSION,
             });
         }
-        for id in self.global_defaults.0.keys() {
-            if id
-                .namespace()
-                .is_some_and(|namespace| namespace != "server")
-            {
-                return Err(SettingsError::InvalidGlobalSetting(id.clone()));
+        for id in self.server_settings.0.keys() {
+            if id.namespace() != Some("server") {
+                return Err(SettingsError::InvalidServerSetting(id.clone()));
             }
         }
-        for (engine_id, patch) in &self.engine_defaults {
+        for (engine_id, patch) in &self.runtime_defaults {
             crate::validate_engine_id(engine_id)?;
             for id in patch.0.keys() {
                 if !id.applies_to_engine(engine_id) {
@@ -576,9 +568,11 @@ impl SettingsState {
         invocation: &SettingsPatch,
         structured_path_base: &Path,
     ) -> Result<ResolvedSettings, SettingsError> {
-        let mut effective = self.resolve_engine_layers(engine_id);
+        let mut configured = self
+            .resolve_runtime_defaults(engine_id, structured_path_base)?
+            .configured;
         apply_layer(
-            &mut effective,
+            &mut configured,
             profile_overrides,
             engine_id,
             SettingSource::ModelProfile {
@@ -586,57 +580,42 @@ impl SettingsState {
             },
         );
         apply_layer(
-            &mut effective,
+            &mut configured,
             invocation,
             engine_id,
             SettingSource::Invocation,
         );
-        resolve_structured_paths(&mut effective, structured_path_base)?;
+        resolve_structured_paths(&mut configured, structured_path_base)?;
         Ok(ResolvedSettings {
             engine_id: engine_id.to_owned(),
             model_profile_id: Some(profile_id.clone()),
-            effective,
+            configured,
+            effective: BTreeMap::new(),
         })
     }
 
-    /// Resolves the model-independent settings visible to one engine.
-    ///
-    /// This uses the same global/engine layering, semantic-alternative
-    /// suppression, setting sources, and structured-path behavior as full
-    /// model-profile resolution without inventing a model-profile identity.
-    pub fn resolve_engine_defaults(
+    /// Resolves the persisted customization of one runtime's default layer.
+    pub fn resolve_runtime_defaults(
         &self,
         engine_id: &str,
         structured_path_base: &Path,
     ) -> Result<ResolvedSettings, SettingsError> {
-        let mut effective = self.resolve_engine_layers(engine_id);
-        resolve_structured_paths(&mut effective, structured_path_base)?;
-        Ok(ResolvedSettings {
-            engine_id: engine_id.to_owned(),
-            model_profile_id: None,
-            effective,
-        })
-    }
-
-    fn resolve_engine_layers(&self, engine_id: &str) -> BTreeMap<SettingId, ResolvedSetting> {
         let mut effective = BTreeMap::new();
-        apply_layer(
-            &mut effective,
-            &self.global_defaults,
-            engine_id,
-            SettingSource::GlobalDefault,
-        );
-        if let Some(defaults) = self.engine_defaults.get(engine_id) {
+        if let Some(defaults) = self.runtime_defaults.get(engine_id) {
             apply_layer(
                 &mut effective,
                 defaults,
                 engine_id,
-                SettingSource::EngineDefault {
-                    engine_id: engine_id.to_owned(),
-                },
+                SettingSource::RuntimeDefault,
             );
         }
-        effective
+        resolve_structured_paths(&mut effective, structured_path_base)?;
+        Ok(ResolvedSettings {
+            engine_id: engine_id.to_owned(),
+            model_profile_id: None,
+            configured: effective,
+            effective: BTreeMap::new(),
+        })
     }
 }
 
@@ -828,8 +807,7 @@ pub async fn bounded_setting_file_sha256(
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "source")]
 pub enum SettingSource {
-    GlobalDefault,
-    EngineDefault { engine_id: String },
+    RuntimeDefault,
     ModelProfile { model_profile_id: ModelProfileId },
     Invocation,
 }
@@ -837,11 +815,8 @@ pub enum SettingSource {
 impl std::fmt::Display for SettingSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::GlobalDefault => formatter.write_str("global-default"),
-            Self::EngineDefault { engine_id } => write!(formatter, "engine-default:{engine_id}"),
-            Self::ModelProfile { model_profile_id } => {
-                write!(formatter, "model-profile:{model_profile_id}")
-            }
+            Self::RuntimeDefault => formatter.write_str("runtime default"),
+            Self::ModelProfile { .. } => formatter.write_str("model profile"),
             Self::Invocation => formatter.write_str("invocation"),
         }
     }
@@ -858,20 +833,39 @@ pub struct ResolvedSettings {
     pub engine_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_profile_id: Option<ModelProfileId>,
+    /// Explicit values after Runtime customization, Model Profile, and
+    /// invocation precedence. Runtime adapters consume only this map.
     #[serde(default)]
-    pub effective: BTreeMap<SettingId, ResolvedSetting>,
+    pub configured: BTreeMap<SettingId, ResolvedSetting>,
+    /// Complete authoritative values or genuine unresolved runtime policies
+    /// for presentation and provenance.
+    #[serde(default)]
+    pub effective: BTreeMap<SettingId, EffectiveSetting>,
 }
 
 impl ResolvedSettings {
     pub fn is_empty(&self) -> bool {
-        self.effective.is_empty()
+        self.configured.is_empty()
     }
 
     pub fn value(&self, id: &str) -> Option<&SettingValue> {
-        self.effective
+        self.configured
             .iter()
             .find_map(|(candidate, setting)| (candidate.as_str() == id).then_some(&setting.value))
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EffectiveSetting {
+    pub value: String,
+    pub source: SettingSource,
+    /// Pre-start policy or value when authoritative runtime observation
+    /// changed the effective value. Absence means startup did not change the
+    /// configured effective value, or the runtime reported a new setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -890,7 +884,7 @@ impl SettingsSchema {
     }
 
     pub fn validate(&self, settings: &ResolvedSettings) -> Result<(), SettingsError> {
-        for (id, setting) in &settings.effective {
+        for (id, setting) in &settings.configured {
             let definition = self
                 .definition(id)
                 .ok_or_else(|| SettingsError::UnknownSetting(id.clone()))?;
@@ -906,6 +900,123 @@ impl SettingsSchema {
         }
         Ok(())
     }
+
+    /// Materializes adapter-owned scalar defaults into the launch contract.
+    /// Optional text/path/schema defaults remain absent so `none` is never
+    /// mistaken for a literal user value.
+    pub fn materialize_runtime_configuration(
+        &self,
+        settings: &mut ResolvedSettings,
+    ) -> Result<(), SettingsError> {
+        for definition in self
+            .definitions
+            .iter()
+            .filter(|definition| definition.supported)
+        {
+            if settings.configured.contains_key(&definition.id)
+                || matches!(
+                    definition.kind,
+                    SettingKind::String
+                        | SettingKind::StringList
+                        | SettingKind::JsonObject
+                        | SettingKind::Path
+                )
+            {
+                continue;
+            }
+            let Some(runtime_default) = definition.default_preview.as_ref() else {
+                continue;
+            };
+            if runtime_default.source != SettingDefaultSource::Norted {
+                continue;
+            }
+            let value = definition.parse(&runtime_default.value)?;
+            settings.configured.insert(
+                definition.id.clone(),
+                ResolvedSetting {
+                    value,
+                    source: SettingSource::RuntimeDefault,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Builds the single authoritative effective-value view used by clients
+    /// and provenance. Genuine runtime policies such as `auto` remain values;
+    /// derivation information is secondary metadata and never replaces them.
+    pub fn materialize_effective(
+        &self,
+        settings: &mut ResolvedSettings,
+    ) -> Result<(), SettingsError> {
+        let mut effective = BTreeMap::new();
+        for definition in self
+            .definitions
+            .iter()
+            .filter(|definition| definition.supported)
+        {
+            let runtime_default = definition
+                .default_preview
+                .as_ref()
+                .ok_or_else(|| SettingsError::MissingRuntimeDefault(definition.id.clone()))?;
+            if is_ambiguous_effective_value(&runtime_default.value) {
+                return Err(SettingsError::AmbiguousRuntimeDefault {
+                    setting_id: definition.id.clone(),
+                    value: runtime_default.value.clone(),
+                });
+            }
+            effective.insert(
+                definition.id.clone(),
+                EffectiveSetting {
+                    value: runtime_default.value.clone(),
+                    source: SettingSource::RuntimeDefault,
+                    requested_value: None,
+                    detail: runtime_default.detail.clone(),
+                },
+            );
+        }
+        for (id, setting) in &settings.configured {
+            let detail = if setting.source == SettingSource::RuntimeDefault {
+                effective.get(id).and_then(|setting| setting.detail.clone())
+            } else {
+                None
+            };
+            effective.insert(
+                id.clone(),
+                EffectiveSetting {
+                    value: setting.value.to_string(),
+                    source: setting.source.clone(),
+                    requested_value: None,
+                    detail,
+                },
+            );
+        }
+        settings.effective = effective;
+        Ok(())
+    }
+}
+
+fn is_ambiguous_effective_value(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.is_empty()
+        || matches!(
+            normalized.as_str(),
+            "default"
+                | "inherited"
+                | "automatic"
+                | "automatic slots"
+                | "automatic offload"
+                | "host-selected"
+                | "runtime fallback"
+                | "runtime-selected load mode"
+                | "template-detected"
+                | "template-defined"
+                | "architecture-selected"
+                | "request-sized"
+        )
+        || normalized.starts_with("launch-sized")
+        || normalized.starts_with("runtime/model")
+        || normalized.starts_with("model/thinking-mode")
 }
 
 #[derive(Debug, Clone)]
@@ -1073,8 +1184,15 @@ pub enum SettingsError {
         setting_id: SettingId,
         reason: String,
     },
-    #[error("global defaults cannot contain engine-specific setting `{0}`")]
-    InvalidGlobalSetting(SettingId),
+    #[error("supported setting `{0}` has no concrete runtime default")]
+    MissingRuntimeDefault(SettingId),
+    #[error("supported setting `{setting_id}` has ambiguous runtime default `{value}`")]
+    AmbiguousRuntimeDefault {
+        setting_id: SettingId,
+        value: String,
+    },
+    #[error("server settings cannot contain inference setting `{0}`")]
+    InvalidServerSetting(SettingId),
     #[error("setting `{setting_id}` does not belong to engine `{engine_id}`")]
     WrongEngineScope {
         setting_id: SettingId,
@@ -1125,14 +1243,11 @@ mod tests {
     }
 
     #[test]
-    fn resolution_has_exact_four_layer_precedence() {
+    fn resolution_has_exact_three_layer_precedence() {
         let profile_id = ModelProfileId::new("quality").expect("profile ID");
         let mut state = SettingsState::default();
         state
-            .global_defaults
-            .insert(id("temperature"), SettingValue::Float(0.1));
-        state
-            .engine_defaults
+            .runtime_defaults
             .entry("q27".to_owned())
             .or_default()
             .insert(id("temperature"), SettingValue::Float(0.2));
@@ -1158,7 +1273,7 @@ mod tests {
             Some(&SettingValue::Float(0.4))
         );
         assert_eq!(
-            resolved.effective[&id("temperature")].source,
+            resolved.configured[&id("temperature")].source,
             SettingSource::Invocation
         );
     }

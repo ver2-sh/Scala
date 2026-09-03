@@ -609,7 +609,7 @@ fn resolved_patch(
     norted_core::ResolvedSettings {
         engine_id: engine_id.to_owned(),
         model_profile_id: Some(profile_id.clone()),
-        effective: patch
+        configured: patch
             .0
             .iter()
             .map(|(id, value)| {
@@ -624,6 +624,7 @@ fn resolved_patch(
                 )
             })
             .collect(),
+        effective: Default::default(),
     }
 }
 
@@ -726,19 +727,18 @@ async fn execute_settings_action(
                 }
             }
             let result = match scope {
-                SettingsScope::Global | SettingsScope::Engine(_) => settings_store
+                SettingsScope::Server | SettingsScope::Runtime(_) => settings_store
                     .update(move |state| {
                         match scope {
-                            SettingsScope::Global => {
-                                if let Some(id) = patch.0.keys().find(|id| {
-                                    id.namespace()
-                                        .is_some_and(|namespace| namespace != "server")
-                                }) {
-                                    return Err(SettingsError::InvalidGlobalSetting(id.clone()));
+                            SettingsScope::Server => {
+                                if let Some(id) =
+                                    patch.0.keys().find(|id| id.namespace() != Some("server"))
+                                {
+                                    return Err(SettingsError::InvalidServerSetting(id.clone()));
                                 }
-                                state.global_defaults.0.extend(patch.0);
+                                state.server_settings.0.extend(patch.0);
                             }
-                            SettingsScope::Engine(engine_id) => {
+                            SettingsScope::Runtime(engine_id) => {
                                 if let Some(id) =
                                     patch.0.keys().find(|id| !id.applies_to_engine(&engine_id))
                                 {
@@ -748,7 +748,7 @@ async fn execute_settings_action(
                                     });
                                 }
                                 state
-                                    .engine_defaults
+                                    .runtime_defaults
                                     .entry(engine_id)
                                     .or_default()
                                     .0
@@ -809,21 +809,21 @@ async fn execute_settings_action(
                 }
             }
             let result = match scope {
-                SettingsScope::Global | SettingsScope::Engine(_) => settings_store
+                SettingsScope::Server | SettingsScope::Runtime(_) => settings_store
                     .update(move |state| {
                         match scope {
-                            SettingsScope::Global => {
+                            SettingsScope::Server => {
                                 for id in &ids {
-                                    state.global_defaults.remove(id);
+                                    state.server_settings.remove(id);
                                 }
                             }
-                            SettingsScope::Engine(engine_id) => {
-                                if let Some(patch) = state.engine_defaults.get_mut(&engine_id) {
+                            SettingsScope::Runtime(engine_id) => {
+                                if let Some(patch) = state.runtime_defaults.get_mut(&engine_id) {
                                     for id in &ids {
                                         patch.remove(id);
                                     }
                                     if patch.is_empty() {
-                                        state.engine_defaults.remove(&engine_id);
+                                        state.runtime_defaults.remove(&engine_id);
                                     }
                                 }
                             }
@@ -1074,7 +1074,7 @@ async fn execute_settings_action(
             let model_id = model.id.clone();
             let result = async {
                 let (state, profiles) = read_tui_settings(&settings_store, &profiles_store).await?;
-                let resolved = state
+                let mut resolved = state
                     .resolve(
                         &profile.id,
                         profile.engine_id.as_str(),
@@ -1114,7 +1114,9 @@ async fn execute_settings_action(
                     {
                         Ok((selection, schema)) => {
                             let validation_error = schema
-                                .validate(&resolved)
+                                .materialize_runtime_configuration(&mut resolved)
+                                .and_then(|()| schema.validate(&resolved))
+                                .and_then(|()| schema.materialize_effective(&mut resolved))
                                 .err()
                                 .map(|error| error.to_string());
                             (
