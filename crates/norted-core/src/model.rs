@@ -63,6 +63,12 @@ pub struct GgufArtifactIdentity {
     pub context_length: Option<u64>,
     pub expert_count: Option<u64>,
     pub expert_used_count: Option<u64>,
+    #[serde(default)]
+    pub rope_frequency_base: Option<String>,
+    #[serde(default)]
+    pub rope_frequency_scale: Option<String>,
+    #[serde(default)]
+    pub chat_template_sha256: Option<String>,
     pub tokenizer_metadata_sha256: Option<String>,
 }
 
@@ -457,6 +463,8 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
 
     let mut architecture = None;
     let mut architecture_numbers = HashMap::<String, u64>::new();
+    let mut architecture_decimals = HashMap::<String, String>::new();
+    let mut chat_template_sha256 = None;
     let mut tokenizer = Sha256::new();
     let mut tokenizer_fields = 0_u64;
 
@@ -474,10 +482,22 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
         let capture = key == "general.architecture"
             || key.ends_with(".context_length")
             || key.ends_with(".expert_count")
-            || key.ends_with(".expert_used_count");
+            || key.ends_with(".expert_used_count")
+            || key.ends_with(".rope.freq_base")
+            || key.ends_with(".rope.scaling.factor")
+            || key == "tokenizer.chat_template";
         let value = reader.value(value_type, capture.then_some(&key), None)?;
         if key == "general.architecture" {
             architecture = value.and_then(GgufScalar::into_string);
+        } else if key == "tokenizer.chat_template" {
+            chat_template_sha256 = value.and_then(GgufScalar::into_string).map(|template| {
+                let digest = Sha256::digest(template.as_bytes());
+                format!("{digest:x}")
+            });
+        } else if key.ends_with(".rope.freq_base") || key.ends_with(".rope.scaling.factor") {
+            if let Some(value) = value.and_then(GgufScalar::into_decimal_string) {
+                architecture_decimals.insert(key, value);
+            }
         } else if let Some(value) = value.and_then(GgufScalar::into_u64) {
             if key.ends_with(".context_length")
                 || key.ends_with(".expert_count")
@@ -499,12 +519,21 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
     let expert_used_count = architecture_numbers
         .get(&format!("{architecture}.expert_used_count"))
         .copied();
+    let rope_frequency_base = architecture_decimals
+        .get(&format!("{architecture}.rope.freq_base"))
+        .cloned();
+    let rope_frequency_scale = architecture_decimals
+        .get(&format!("{architecture}.rope.scaling.factor"))
+        .cloned();
     Ok(GgufArtifactIdentity {
         version,
         architecture,
         context_length,
         expert_count,
         expert_used_count,
+        rope_frequency_base,
+        rope_frequency_scale,
+        chat_template_sha256,
         tokenizer_metadata_sha256: (tokenizer_fields > 0)
             .then(|| format!("{:x}", tokenizer.finalize())),
     })
@@ -513,6 +542,7 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
 enum GgufScalar {
     Unsigned(u64),
     Signed(i64),
+    Decimal(String),
     String(String),
 }
 
@@ -521,6 +551,15 @@ impl GgufScalar {
         match self {
             Self::Unsigned(value) => Some(value),
             Self::Signed(value) => u64::try_from(value).ok(),
+            Self::Decimal(_) | Self::String(_) => None,
+        }
+    }
+
+    fn into_decimal_string(self) -> Option<String> {
+        match self {
+            Self::Unsigned(value) => Some(value.to_string()),
+            Self::Signed(value) => Some(value.to_string()),
+            Self::Decimal(value) => Some(value),
             Self::String(_) => None,
         }
     }
@@ -528,7 +567,7 @@ impl GgufScalar {
     fn into_string(self) -> Option<String> {
         match self {
             Self::String(value) => Some(value),
-            Self::Unsigned(_) | Self::Signed(_) => None,
+            Self::Unsigned(_) | Self::Signed(_) | Self::Decimal(_) => None,
         }
     }
 }
@@ -617,8 +656,8 @@ impl<R: Read> GgufReader<R> {
                 self.bytes(digest.as_deref_mut())?,
             ))),
             6 => {
-                let _ = self.bytes::<4>(digest.as_deref_mut())?;
-                return Ok(None);
+                let value = f32::from_le_bytes(self.bytes::<4>(digest.as_deref_mut())?);
+                GgufScalar::Decimal(value.to_string())
             }
             7 => GgufScalar::Unsigned(u64::from(self.bytes::<1>(digest.as_deref_mut())?[0])),
             8 => GgufScalar::String(self.string(digest.as_deref_mut())?),
@@ -638,8 +677,8 @@ impl<R: Read> GgufReader<R> {
             10 => GgufScalar::Unsigned(self.u64(digest.as_deref_mut())?),
             11 => GgufScalar::Signed(i64::from_le_bytes(self.bytes(digest.as_deref_mut())?)),
             12 => {
-                let _ = self.bytes::<8>(digest)?;
-                return Ok(None);
+                let value = f64::from_le_bytes(self.bytes::<8>(digest)?);
+                GgufScalar::Decimal(value.to_string())
             }
             other => {
                 return Err(GgufMetadataError::Malformed(format!(

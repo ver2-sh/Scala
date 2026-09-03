@@ -22,8 +22,9 @@ use norted_core::{
     AcquisitionMethod, ArtifactFormat, ArtifactNativeIdentity, AvailableRuntime, EngineConfig,
     EngineInstallation, EngineRevision, GpuOffload, HostCapabilities, InstalledRuntime,
     ModelArtifact, RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId, RuntimeIdentity,
-    RuntimeProbeObservation, SettingDefinition, SettingId, SettingKind, SettingScope, SettingValue,
-    SettingsSchema, UnsignedIntegerOrChoiceValue,
+    RuntimeProbeObservation, SettingDefaultPreview, SettingDefaultSource, SettingDefinition,
+    SettingId, SettingKind, SettingScope, SettingValue, SettingsSchema,
+    UnsignedIntegerOrChoiceValue,
 };
 use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CompatibilityDecision,
@@ -854,6 +855,7 @@ impl EngineAdapter for LlamaCppAdapter {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         _host: &HostCapabilities,
+        _settings: Option<&norted_core::ResolvedSettings>,
     ) -> Result<SettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
         let help = self.cached_runtime_help(runtime).await?;
@@ -1758,6 +1760,29 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
 
 fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<SettingDefinition> {
     let mut definitions = llama_setting_definitions();
+    if model.is_some() {
+        for id in [
+            "context_length",
+            "llama.cpp.rope_frequency_base",
+            "llama.cpp.rope_frequency_scale",
+            "llama.cpp.chat_template",
+        ] {
+            if let Some(definition) = definitions
+                .iter_mut()
+                .find(|definition| definition.id.as_str() == id)
+            {
+                definition.default_preview = Some(
+                    SettingDefaultPreview::new(
+                        "runtime fallback",
+                        SettingDefaultSource::StartupDynamic,
+                    )
+                    .with_detail(
+                        "The selected GGUF does not contain this inspected metadata value; the exact runtime fallback remains authoritative",
+                    ),
+                );
+            }
+        }
+    }
     if let Some(temperature) = definitions
         .iter_mut()
         .find(|definition| definition.id.as_str() == "temperature")
@@ -1782,6 +1807,19 @@ fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<Setting
                     minimum: Some(1),
                     maximum: identity.expert_count,
                 };
+                experts.default_preview = Some(
+                    SettingDefaultPreview::new(
+                        identity
+                            .expert_used_count
+                            .expect("checked expert_used_count")
+                            .to_string(),
+                        SettingDefaultSource::Model,
+                    )
+                    .with_detail(format!(
+                        "GGUF metadata {}.expert_used_count",
+                        identity.architecture
+                    )),
+                );
             }
             _ => {
                 experts.supported = false;
@@ -1790,6 +1828,53 @@ fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<Setting
                         .to_owned(),
                 );
             }
+        }
+    }
+    if let Some(ArtifactNativeIdentity::Gguf(identity)) =
+        model.and_then(|model| model.native_identity.as_ref())
+    {
+        for (id, value, metadata_key) in [
+            (
+                "context_length",
+                identity.context_length.map(|value| value.to_string()),
+                format!("{}.context_length", identity.architecture),
+            ),
+            (
+                "llama.cpp.rope_frequency_base",
+                identity.rope_frequency_base.clone(),
+                format!("{}.rope.freq_base", identity.architecture),
+            ),
+            (
+                "llama.cpp.rope_frequency_scale",
+                identity.rope_frequency_scale.clone(),
+                format!("{}.rope.scaling.factor", identity.architecture),
+            ),
+        ] {
+            if let Some(value) = value
+                && let Some(definition) = definitions
+                    .iter_mut()
+                    .find(|definition| definition.id.as_str() == id)
+            {
+                definition.default_preview = Some(
+                    SettingDefaultPreview::new(value, SettingDefaultSource::Model)
+                        .with_detail(format!("Selected GGUF metadata `{metadata_key}`")),
+                );
+            }
+        }
+        if let Some(digest) = identity.chat_template_sha256.as_deref()
+            && let Some(definition) = definitions
+                .iter_mut()
+                .find(|definition| definition.id.as_str() == "llama.cpp.chat_template")
+        {
+            definition.default_preview = Some(
+                SettingDefaultPreview::new(
+                    format!("embedded · sha256:{}", &digest[..digest.len().min(12)]),
+                    SettingDefaultSource::Model,
+                )
+                .with_detail(
+                    "The selected GGUF contains tokenizer.chat_template; its exact content digest is shown",
+                ),
+            );
         }
     }
     definitions
@@ -1830,6 +1915,15 @@ fn llama_definition(
         unsupported_reason: None,
         unit: None,
         upstream_default: upstream_default.map(str::to_owned),
+        default_preview: match id {
+            "llama.cpp.chat_template_file"
+            | "llama.cpp.chat_template_sha256"
+            | "llama.cpp.speculative_draft_sha256" => Some(SettingDefaultPreview::new(
+                "None",
+                SettingDefaultSource::Norted,
+            )),
+            _ => None,
+        },
     }
 }
 
@@ -2077,7 +2171,132 @@ fn apply_llama_exact_help_contract(definitions: &mut [SettingDefinition], help: 
             }
             _ => {}
         }
+        if definition.supported
+            && let Some(option) = requirements.first()
+        {
+            apply_llama_reported_default(definition, &help_option_block(help, option));
+        }
     }
+}
+
+fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &str) {
+    if definition.default_preview.as_ref().is_some_and(|preview| {
+        matches!(
+            preview.source,
+            SettingDefaultSource::Norted | SettingDefaultSource::Model
+        )
+    }) {
+        return;
+    }
+    let Some(reported) = llama_help_reported_default(contract) else {
+        return;
+    };
+    let id = definition.id.as_str();
+    let lower = reported.to_ascii_lowercase();
+    let preview = match id {
+        "parallel_requests" if lower == "-1" => SettingDefaultPreview::new(
+            "automatic slots",
+            SettingDefaultSource::StartupDynamic,
+        )
+        .with_detail(
+            "The exact runtime reports `-1 = auto` and finalizes its server slot count during startup",
+        ),
+        "llama.cpp.threads" if matches!(lower.as_str(), "-1" | "0" | "auto") => {
+            SettingDefaultPreview::new("host-selected", SettingDefaultSource::StartupDynamic)
+                .with_detail(format!(
+                    "The exact runtime reports `{reported}` and resolves the worker count from the launch host"
+                ))
+        }
+        "llama.cpp.gpu_offload" if matches!(lower.as_str(), "-1" | "auto") => {
+            SettingDefaultPreview::new(
+                "automatic offload",
+                SettingDefaultSource::StartupDynamic,
+            )
+            .with_detail(format!(
+                "The exact runtime reports `{reported}` and resolves offload from model and accelerator capacity"
+            ))
+        }
+        "llama.cpp.flash_attention" if lower == "auto" => SettingDefaultPreview::new(
+            "automatic",
+            SettingDefaultSource::StartupDynamic,
+        )
+        .with_detail("The exact runtime selects Flash Attention after inspecting model/backend support"),
+        "llama.cpp.load_mode" if lower == "auto" => SettingDefaultPreview::new(
+            "runtime-selected load mode",
+            SettingDefaultSource::StartupDynamic,
+        )
+        .with_detail(
+            "The exact runtime reports `auto` and selects its model loading strategy during startup",
+        ),
+        "context_length" if matches!(lower.as_str(), "0" | "auto") => {
+            SettingDefaultPreview::new("runtime fallback", SettingDefaultSource::StartupDynamic)
+                .with_detail("The exact runtime reports a model/runtime fallback and the selected GGUF has no inspected context metadata")
+        }
+        "llama.cpp.rope_frequency_base" | "llama.cpp.rope_frequency_scale"
+            if matches!(lower.as_str(), "0" | "auto") =>
+        {
+            SettingDefaultPreview::new("runtime fallback", SettingDefaultSource::StartupDynamic)
+                .with_detail("The exact runtime defers to model metadata, which is absent from the selected GGUF inspection")
+        }
+        "seed" if matches!(lower.as_str(), "-1" | "random") => {
+            SettingDefaultPreview::new("random per request", SettingDefaultSource::StartupDynamic)
+        }
+        "max_output_tokens" if lower == "-1" => {
+            SettingDefaultPreview::new("unlimited", SettingDefaultSource::Runtime)
+        }
+        "reasoning" if lower == "auto" => SettingDefaultPreview::new(
+            "template-detected",
+            SettingDefaultSource::StartupDynamic,
+        )
+        .with_detail(
+            "The exact runtime detects the reasoning mode from the selected chat template",
+        ),
+        "reasoning_effort" if lower == "default" => SettingDefaultPreview::new(
+            "template-defined",
+            SettingDefaultSource::StartupDynamic,
+        )
+        .with_detail("The exact runtime preserves the selected chat template's reasoning default"),
+        "llama.cpp.speculative_mode" if lower == "none" => {
+            SettingDefaultPreview::new("off", SettingDefaultSource::Runtime)
+        }
+        "llama.cpp.chat_template" if matches!(lower.as_str(), "model" | "auto" | "none") => {
+            SettingDefaultPreview::new("runtime fallback", SettingDefaultSource::StartupDynamic)
+                .with_detail("The exact runtime defers to selected-model template metadata")
+        }
+        _ if matches!(definition.kind, SettingKind::Toggle | SettingKind::OneWayFlag) => {
+            let value = match lower.as_str() {
+                "1" | "true" | "on" | "yes" | "enabled" => "enabled",
+                "0" | "false" | "off" | "no" | "disabled" | "none" => "disabled",
+                _ => reported.as_str(),
+            };
+            SettingDefaultPreview::new(value, SettingDefaultSource::Runtime)
+        }
+        _ => SettingDefaultPreview::new(reported, SettingDefaultSource::Runtime),
+    };
+    definition.default_preview = Some(if preview.detail.is_some() {
+        preview
+    } else {
+        preview.with_detail("Reported by this exact llama-server help contract")
+    });
+}
+
+fn llama_help_reported_default(contract: &str) -> Option<String> {
+    let lower = contract.to_ascii_lowercase();
+    let (index, marker_len) = ["default:", "default =", "default="]
+        .into_iter()
+        .filter_map(|marker| lower.find(marker).map(|index| (index, marker.len())))
+        .min_by_key(|(index, _)| *index)?;
+    let tail = contract[index + marker_len..].trim_start_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '(' | '[' | '{' | '`' | '\'' | '"')
+    });
+    let value = tail
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(character, ')' | ']' | '}' | ',' | ';' | '`' | '\'' | '"')
+        })
+        .next()?
+        .trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn llama_configured_runtime_compatibility(

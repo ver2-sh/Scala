@@ -1176,14 +1176,7 @@ impl App {
                 );
             };
             if let Some(value) = profile.overrides.0.get(id) {
-                return (
-                    value.to_string(),
-                    format!("model-profile:{}", profile.id),
-                    true,
-                );
-            }
-            if let Some(value) = self.settings_runtime_resolved_value(id) {
-                return (value, "runtime resolved".to_owned(), false);
+                return (value.to_string(), "profile override".to_owned(), true);
             }
             if let Some(setting) = self
                 .settings_resolved
@@ -1195,21 +1188,20 @@ impl App {
                     norted_core::SettingSource::EngineDefault { .. } => {
                         "inherited from engine".to_owned()
                     }
-                    norted_core::SettingSource::ModelProfile { model_profile_id } => {
-                        format!("model-profile:{model_profile_id}")
+                    norted_core::SettingSource::ModelProfile { .. } => {
+                        "profile override".to_owned()
                     }
                     norted_core::SettingSource::Invocation => "invocation".to_owned(),
                 };
                 return (setting.value.to_string(), source, false);
             }
+            if let Some(value) = self.settings_runtime_resolved_value(id) {
+                return (value, "runtime resolved".to_owned(), false);
+            }
             return self.settings_default_display(id);
         }
         let Some(scope) = self.selected_settings_scope() else {
-            return (
-                "varies by runtime".to_owned(),
-                "runtime/model dependent".to_owned(),
-                false,
-            );
+            return ("Default".to_owned(), "configured state".to_owned(), false);
         };
         let current = match &scope {
             SettingsScope::Global => state.global_defaults.0.get(id),
@@ -1249,11 +1241,19 @@ impl App {
             .settings_definitions()
             .into_iter()
             .find(|definition| &definition.id == id);
-        let declared = definition.and_then(|definition| definition.upstream_default.as_deref());
-        let model_profile = self.screen == Screen::ModelProfiles;
-        let exact_runtime = model_profile && self.settings_runtime_id.is_some();
-        let (value, source) = declared_default_display(declared, model_profile, exact_runtime);
-        (value, source.to_owned(), false)
+        if let Some(preview) = definition.and_then(|definition| definition.default_preview.as_ref())
+        {
+            return (preview.value.clone(), preview.source.to_string(), false);
+        }
+        if self.screen == Screen::ModelProfiles {
+            (
+                "runtime fallback".to_owned(),
+                "runtime dependent".to_owned(),
+                false,
+            )
+        } else {
+            ("Default".to_owned(), "configured state".to_owned(), false)
+        }
     }
 
     pub fn settings_default_detail(&self, id: &SettingId) -> String {
@@ -1273,11 +1273,25 @@ impl App {
             }
             return detail;
         }
-        let declared = definition.and_then(|definition| definition.upstream_default.as_deref());
-        let mut detail = format!(
-            "If unset: {}",
-            declared.unwrap_or("unknown runtime default")
-        );
+        let mut detail = definition
+            .and_then(|definition| definition.default_preview.as_ref())
+            .map(|preview| {
+                let summary = format!("If unset: {} ({})", preview.value, preview.source);
+                preview
+                    .detail
+                    .as_deref()
+                    .map_or(summary.clone(), |explanation| {
+                        format!("{summary} · {explanation}")
+                    })
+            })
+            .unwrap_or_else(|| {
+                if self.screen == Screen::ModelProfiles {
+                    "If unset: the selected runtime/model does not expose a pre-launch literal; runtime fallback remains authoritative".to_owned()
+                } else {
+                    "Unset: no model-specific preview is available in this configuration scope"
+                        .to_owned()
+                }
+            });
         if let Some(resolved) = self.settings_runtime_resolved_value(id) {
             detail.push_str(&format!(" · Running backend resolved: {resolved}"));
         }
@@ -4361,55 +4375,6 @@ fn byte_index(value: &str, character_index: usize) -> usize {
         .map_or(value.len(), |(index, _)| index)
 }
 
-fn declared_default_display(
-    declared: Option<&str>,
-    model_profile: bool,
-    exact_runtime: bool,
-) -> (String, &'static str) {
-    if let Some(value) = declared.and_then(|value| value.strip_prefix("Norted default: ")) {
-        return (concise_default_detail(value).to_owned(), "Norted default");
-    }
-    for prefix in ["model default: ", "model metadata: "] {
-        if let Some(value) = declared.and_then(|declared| declared.strip_prefix(prefix)) {
-            return (concise_default_detail(value).to_owned(), "model default");
-        }
-    }
-    if !exact_runtime {
-        if model_profile {
-            let source = if declared.is_some_and(|value| value.starts_with("model")) {
-                "model dependent"
-            } else {
-                "runtime dependent"
-            };
-            return ("unresolved".to_owned(), source);
-        }
-        return ("varies by runtime".to_owned(), "runtime/model dependent");
-    }
-    let Some(declared) = declared else {
-        return ("unresolved".to_owned(), "runtime dependent");
-    };
-    for prefix in ["runtime default: ", "runtime profile default: "] {
-        if let Some(value) = declared.strip_prefix(prefix) {
-            return (concise_default_detail(value).to_owned(), "runtime default");
-        }
-    }
-    match declared {
-        "auto in current runtimes" => ("auto".to_owned(), "runtime default"),
-        "enabled in current runtimes" => ("enabled".to_owned(), "runtime default"),
-        value if value.starts_with("model") || value.contains("model metadata") => {
-            ("unresolved".to_owned(), "model dependent")
-        }
-        _ => ("unresolved".to_owned(), "runtime dependent"),
-    }
-}
-
-fn concise_default_detail(value: &str) -> &str {
-    let value = value.split_once(';').map_or(value, |(concise, _)| concise);
-    value
-        .split_once(" unless ")
-        .map_or(value, |(concise, _)| concise)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -4444,6 +4409,7 @@ mod tests {
             unsupported_reason: None,
             unit: None,
             upstream_default: None,
+            default_preview: None,
         }
     }
 
