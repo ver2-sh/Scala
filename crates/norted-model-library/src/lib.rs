@@ -379,14 +379,16 @@ impl ModelLibrary {
         }
         let library = Arc::clone(self);
         tokio::spawn(async move {
+            let mut cleanup_complete = true;
             for path in cleanup {
                 if let Err(error) = tokio::fs::remove_file(&path).await
                     && error.kind() != std::io::ErrorKind::NotFound
                 {
+                    cleanup_complete = false;
                     tracing::warn!(path = %path.display(), %error, "could not clean model download partial");
                 }
             }
-            if let Some(job_id) = cancellation_cleanup {
+            if cleanup_complete && let Some(job_id) = cancellation_cleanup {
                 library.downloads.acknowledge_cancellation_cleanup(&job_id);
             }
         });
