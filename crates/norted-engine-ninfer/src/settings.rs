@@ -219,23 +219,21 @@ pub(crate) fn apply_reviewed_runtime_defaults(
     for (id, value) in [
         ("context_length", "8192"),
         ("parallel_requests", "1"),
-        ("temperature", "1.0"),
-        ("top_p", "0.95"),
-        ("top_k", "20"),
-        ("min_p", "0.0"),
-        ("repeat_penalty", "1.0"),
-        ("presence_penalty", "0.0"),
-        ("frequency_penalty", "0.0"),
+        ("temperature", "auto"),
+        ("top_p", "auto"),
+        ("top_k", "auto"),
+        ("min_p", "auto"),
+        ("presence_penalty", "auto"),
+        ("frequency_penalty", "auto"),
         ("max_output_tokens", "8192"),
         ("reasoning", "on"),
-        ("reasoning_effort", "none"),
-        ("reasoning_budget", "None"),
+        ("reasoning_effort", "auto"),
+        ("reasoning_budget", "unlimited"),
         ("ninfer.kv_dtype", "BF16"),
-        ("ninfer.kv_capacity", "8192"),
         ("ninfer.prefill_chunk", "1024"),
         ("ninfer.speculation", "disabled"),
         ("ninfer.speculative_backend", "off"),
-        ("ninfer.draft_tokens", "unused"),
+        ("ninfer.draft_tokens", "0"),
         ("ninfer.lm_head_draft", "disabled"),
         ("ninfer.vision", "disabled"),
         ("ninfer.greedy", "disabled"),
@@ -275,6 +273,21 @@ pub(crate) fn apply_reviewed_runtime_defaults(
             _ => None,
         })
         .unwrap_or(1);
+    let context = settings
+        .and_then(|settings| settings.value("context_length"))
+        .and_then(|value| match value {
+            SettingValue::UnsignedInteger(value) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(8192);
+    set_default(
+        definitions,
+        "ninfer.kv_capacity",
+        SettingDefaultPreview::new(context.to_string(), SettingDefaultSource::Derived)
+            .with_detail(
+                "When omitted, the reviewed runtime sets explicit KV capacity to effective context length",
+            ),
+    );
     for (id, value, formula) in [
         (
             "ninfer.device_state_slots",
@@ -288,8 +301,8 @@ pub(crate) fn apply_reviewed_runtime_defaults(
         ),
         (
             "ninfer.max_shared_prefixes",
-            concurrency,
-            "The reviewed runtime defaults shared prefixes to effective concurrency",
+            concurrency.max(4),
+            "The reviewed runtime defaults shared prefixes to max(effective concurrency, 4)",
         ),
     ] {
         set_default(
@@ -299,17 +312,12 @@ pub(crate) fn apply_reviewed_runtime_defaults(
                 .with_detail(formula),
         );
     }
-    let media_threads = std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get())
-        .unwrap_or(1)
-        .min(16);
     set_default(
         definitions,
         "ninfer.media_preprocess_threads",
-        SettingDefaultPreview::new(media_threads.to_string(), SettingDefaultSource::Derived)
-            .with_detail(
-                "Derived from detected host concurrency using the reviewed runtime's maximum of 16 workers",
-            ),
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+            "The reviewed runtime selects up to 16 media preprocessing workers from host concurrency",
+        ),
     );
 }
 
@@ -337,6 +345,19 @@ pub(crate) fn apply_model_sampler_defaults(
             SettingValue::Choice(value) if value == "off" => Some(false),
             SettingValue::Choice(value) if value == "auto" => None,
             _ => None,
+        })
+        .or_else(|| {
+            settings
+                .and_then(|settings| settings.value("reasoning_effort"))
+                .and_then(|value| match value {
+                    SettingValue::Choice(value) if value == "none" => Some(false),
+                    SettingValue::Choice(value)
+                        if matches!(value.as_str(), "low" | "medium" | "xhigh") =>
+                    {
+                        Some(true)
+                    }
+                    _ => None,
+                })
         });
     let process_thinking = settings
         .and_then(|settings| settings.value("ninfer.thinking"))
@@ -436,6 +457,13 @@ pub(crate) fn apply_runtime_bounds(definitions: &mut [SettingDefinition]) {
         budget.description =
             "Positive process-default thinking budget; explicit request effort/toggle controls remain separate"
                 .to_owned();
+    }
+    if let Some(effort) = definitions
+        .iter_mut()
+        .find(|definition| definition.id.as_str() == "reasoning_effort")
+        && let SettingKind::Choice { choices } = &mut effort.kind
+    {
+        choices.retain(|choice| matches!(choice.as_str(), "none" | "low" | "medium" | "xhigh"));
     }
 }
 
@@ -631,6 +659,19 @@ pub(crate) fn translate(
     {
         return Err(EngineError::InvalidConfiguration(
             "parallel_requests must be in 1..=8 for NInfer".to_owned(),
+        ));
+    }
+
+    let reasoning = choice_value(settings, "reasoning")?;
+    let effort = choice_value(settings, "reasoning_effort")?;
+    if matches!((reasoning, effort), (Some("on"), Some("none")))
+        || matches!(
+            (reasoning, effort),
+            (Some("off"), Some("low" | "medium" | "xhigh"))
+        )
+    {
+        return Err(EngineError::InvalidConfiguration(
+            "reasoning and reasoning_effort configure conflicting NInfer thinking modes".to_owned(),
         ));
     }
 
