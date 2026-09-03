@@ -869,7 +869,6 @@ impl EngineAdapter for LlamaCppAdapter {
                 "active experts requires a bound model with inspected expert metadata".to_owned(),
             );
         }
-        ensure_llama_runtime_defaults(&mut definitions);
         Ok(SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -888,7 +887,6 @@ impl EngineAdapter for LlamaCppAdapter {
         let help = self.cached_runtime_help(runtime).await?;
         let mut definitions = self.model_setting_definitions(model)?;
         apply_llama_exact_help_contract(&mut definitions, &help);
-        ensure_llama_runtime_defaults(&mut definitions);
         Ok(SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -2326,120 +2324,6 @@ fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &s
     } else {
         preview.with_detail("Reported by this exact llama-server help contract")
     });
-}
-
-fn ensure_llama_runtime_defaults(definitions: &mut [SettingDefinition]) {
-    for (id, value, detail) in [
-        ("context_length", "auto", "model/runtime context policy"),
-        ("parallel_requests", "auto", "runtime slot policy"),
-        ("temperature", "0.8", "llama.cpp runtime baseline"),
-        ("top_p", "0.95", "llama.cpp runtime baseline"),
-        ("top_k", "40", "llama.cpp runtime baseline"),
-        ("min_p", "0.05", "llama.cpp runtime baseline"),
-        ("seed", "random", "fresh randomness for each request"),
-        ("repeat_penalty", "1.0", "neutral repetition penalty"),
-        ("presence_penalty", "0.0", "neutral presence penalty"),
-        ("frequency_penalty", "0.0", "neutral frequency penalty"),
-        ("max_output_tokens", "unlimited", "no runtime response cap"),
-        ("reasoning", "auto", "chat-template reasoning policy"),
-        ("reasoning_budget", "-1", "unrestricted reasoning budget"),
-        ("llama.cpp.batch_size", "2048", "llama.cpp runtime baseline"),
-        (
-            "llama.cpp.micro_batch_size",
-            "512",
-            "llama.cpp runtime baseline",
-        ),
-        (
-            "llama.cpp.gpu_offload",
-            "auto",
-            "model and accelerator aware policy",
-        ),
-        (
-            "llama.cpp.flash_attention",
-            "auto",
-            "model and backend aware policy",
-        ),
-        ("llama.cpp.kv_cache_k", "f16", "llama.cpp cache baseline"),
-        ("llama.cpp.kv_cache_v", "f16", "llama.cpp cache baseline"),
-        ("llama.cpp.load_mode", "auto", "llama.cpp load policy"),
-        (
-            "llama.cpp.rope_frequency_base",
-            "auto",
-            "model/runtime RoPE policy",
-        ),
-        (
-            "llama.cpp.rope_frequency_scale",
-            "auto",
-            "model/runtime RoPE policy",
-        ),
-        (
-            "llama.cpp.unified_kv_cache",
-            "disabled",
-            "separate sequence caches",
-        ),
-        (
-            "llama.cpp.kv_cache_gpu_offload",
-            "enabled",
-            "GPU KV cache baseline",
-        ),
-        (
-            "llama.cpp.context_checkpoints",
-            "0",
-            "no context checkpoints",
-        ),
-        (
-            "llama.cpp.cpu_moe_layers",
-            "0",
-            "no forced CPU expert layers",
-        ),
-        (
-            "llama.cpp.cpu_moe_all",
-            "disabled",
-            "no forced CPU expert placement",
-        ),
-        (
-            "llama.cpp.chat_template",
-            "auto",
-            "model/runtime template policy",
-        ),
-        ("llama.cpp.speculative_mode", "off", "speculation disabled"),
-        (
-            "llama.cpp.speculative_draft_model",
-            "none",
-            "no draft model",
-        ),
-    ] {
-        if let Some(definition) = definitions.iter_mut().find(|definition| {
-            definition.id.as_str() == id
-                && definition.supported
-                && definition.default_preview.is_none()
-        }) {
-            definition.default_preview = Some(
-                SettingDefaultPreview::new(value, SettingDefaultSource::Runtime)
-                    .with_detail(detail),
-            );
-        }
-    }
-    if let Some(definition) = definitions.iter_mut().find(|definition| {
-        definition.id.as_str() == "reasoning_effort"
-            && definition.supported
-            && definition.default_preview.is_none()
-    }) {
-        definition.default_preview = Some(
-            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
-                .with_detail("The exact runtime preserves model/template reasoning policy"),
-        );
-    }
-    if let Some(definition) = definitions.iter_mut().find(|definition| {
-        definition.id.as_str() == "llama.cpp.threads"
-            && definition.supported
-            && definition.default_preview.is_none()
-    }) {
-        definition.default_preview = Some(
-            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
-                .with_detail("The exact runtime resolves worker count from the launch host"),
-        );
-    }
 }
 
 fn llama_help_reported_default(contract: &str) -> Option<String> {

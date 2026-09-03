@@ -2623,6 +2623,9 @@ fn reconcile_effective_settings_from_runtime(provenance: &mut RuntimeProvenance)
                 let previous = setting.value.clone();
                 setting.value = display;
                 if previous != setting.value {
+                    if setting.requested_value.is_none() {
+                        setting.requested_value = Some(previous.clone());
+                    }
                     let resolution = format!(
                         "The launched runtime resolved the pre-startup `{previous}` policy/value"
                     );
@@ -2640,6 +2643,7 @@ fn reconcile_effective_settings_from_runtime(provenance: &mut RuntimeProvenance)
                     norted_core::EffectiveSetting {
                         value: display,
                         source: norted_core::SettingSource::RuntimeDefault,
+                        requested_value: None,
                         detail: Some("Reported by the launched runtime".to_owned()),
                     },
                 );
