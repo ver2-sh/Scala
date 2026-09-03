@@ -18,12 +18,12 @@ pub(crate) fn backend_request(
     request: &InferenceRequest,
     streaming: bool,
     request_protocol_semantics: bool,
-    sampler_controls: bool,
+    request_sampler_semantics: bool,
     tool_calling: bool,
     vision: bool,
     greedy: bool,
 ) -> Result<Value, EngineError> {
-    if !sampler_controls
+    if !request_sampler_semantics
         && (request.generation_settings.temperature.is_some()
             || request.generation_settings.top_p.is_some()
             || request.generation_settings.top_k.is_some()
@@ -34,7 +34,7 @@ pub(crate) fn backend_request(
             || request.max_output_tokens.is_some())
     {
         return Err(EngineError::InvalidGenerationSettings(
-            "this NInfer executable has no reviewed sampler-control contract".to_owned(),
+            "this NInfer executable has no reviewed request-sampler semantic contract".to_owned(),
         ));
     }
     if !request_protocol_semantics
