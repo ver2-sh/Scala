@@ -1221,12 +1221,11 @@ pub fn setting_definition() -> norted_core::SettingDefinition {
             minimum: Some(1),
             maximum: None,
         },
-        scope: norted_core::SettingScope::Global,
+        scope: norted_core::SettingScope::Server,
         category: norted_core::SettingCategory::Downloads,
         supported: true,
         unsupported_reason: None,
         unit: Some("downloads".to_owned()),
-        upstream_default: Some(DEFAULT_MAX_PARALLEL_DOWNLOADS.to_string()),
         default_preview: Some(norted_core::SettingDefaultPreview::new(
             DEFAULT_MAX_PARALLEL_DOWNLOADS.to_string(),
             norted_core::SettingDefaultSource::Norted,
@@ -1236,7 +1235,7 @@ pub fn setting_definition() -> norted_core::SettingDefinition {
 
 pub fn max_parallel_downloads_from_settings(settings: &norted_core::SettingsState) -> usize {
     settings
-        .global_defaults
+        .server_settings
         .iter()
         .find_map(|(id, value)| (id.as_str() == MAX_PARALLEL_DOWNLOADS_SETTING_ID).then_some(value))
         .and_then(|value| match value {

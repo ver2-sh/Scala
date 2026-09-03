@@ -871,7 +871,7 @@ impl RuntimeManager {
             self.fail_loading(generation, error.to_string(), None).await;
             return Err(error);
         }
-        let resolved_settings = match settings_state.resolve(
+        let mut resolved_settings = match settings_state.resolve(
             &profile_id,
             &engine_id,
             &model_profile.overrides,
@@ -915,6 +915,14 @@ impl RuntimeManager {
                 return Err(RuntimeError::StartupFailed(error.to_string()));
             }
         };
+        if let Err(error) = settings_schema
+            .materialize_runtime_configuration(&mut resolved_settings)
+            .and_then(|()| settings_schema.validate(&resolved_settings))
+            .and_then(|()| settings_schema.materialize_effective(&mut resolved_settings))
+        {
+            self.fail_loading(generation, error.to_string(), None).await;
+            return Err(RuntimeError::StartupFailed(error.to_string()));
+        }
         let selected_runtime_id = selection.runtime.manifest.runtime_id.clone();
         self.set_load_progress(
             generation,
@@ -1391,6 +1399,7 @@ impl RuntimeManager {
                     "top_p".to_owned(),
                     serde_json::json!(effective_generation_settings.top_p),
                 );
+                reconcile_effective_settings_from_runtime(provenance);
             }
             let runtime_lease = backend
                 .loading_runtime_lease
@@ -2592,6 +2601,55 @@ fn merge_effective_generation_settings(
     );
     resolved_settings.insert("top_p".to_owned(), serde_json::json!(effective.top_p));
     Ok(())
+}
+
+fn reconcile_effective_settings_from_runtime(provenance: &mut RuntimeProvenance) {
+    let Some(resolved) = provenance
+        .normalized_settings
+        .get("resolved_settings")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    for (raw_id, value) in resolved {
+        let Ok(id) = norted_core::SettingId::new(raw_id.clone()) else {
+            continue;
+        };
+        let display = value
+            .as_str()
+            .map_or_else(|| value.to_string(), ToOwned::to_owned);
+        match provenance.settings.effective.get_mut(&id) {
+            Some(setting) => {
+                let previous = setting.value.clone();
+                setting.value = display;
+                if previous != setting.value {
+                    if setting.requested_value.is_none() {
+                        setting.requested_value = Some(previous.clone());
+                    }
+                    let resolution = format!(
+                        "The launched runtime resolved the pre-startup `{previous}` policy/value"
+                    );
+                    setting.detail = Some(setting.detail.as_ref().map_or_else(
+                        || resolution.clone(),
+                        |detail| format!("{detail}; {resolution}"),
+                    ));
+                } else if setting.detail.is_none() {
+                    setting.detail = Some("Confirmed by the launched runtime".to_owned());
+                }
+            }
+            None => {
+                provenance.settings.effective.insert(
+                    id,
+                    norted_core::EffectiveSetting {
+                        value: display,
+                        source: norted_core::SettingSource::RuntimeDefault,
+                        requested_value: None,
+                        detail: Some("Reported by the launched runtime".to_owned()),
+                    },
+                );
+            }
+        }
+    }
 }
 
 fn native_argument_provenance(arguments: Vec<String>) -> Vec<NativeArgumentProvenance> {

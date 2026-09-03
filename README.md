@@ -8,7 +8,7 @@ The central distinction is:
 model artifact = one discovered physical GGUF, q27, or NInfer file
 engine         = adapter, compatibility rules, launch semantics, health, protocol translation
 runtime        = one concrete executable package and version
-settings       = Global and per-engine defaults
+settings       = Server Settings plus independent per-runtime inference defaults
 Model Profile  = a user-owned serving target binding one artifact, one engine, role, and overrides
 ```
 
@@ -21,7 +21,7 @@ ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 ## Models, Settings, Model Profiles, and Runtimes
 
 - Models is artifact inventory: format, path, size, technical capability, and provenance.
-- Settings contains defaults at exactly Global, llama.cpp, NInfer, and q27 scopes.
+- Settings contains Server Settings plus llama.cpp, NInfer, and q27 runtime defaults.
 - Model Profiles are user-created mutable serving targets and the normal load unit.
 - Runtimes are installed executable implementations selected for the profile's bound engine.
 
@@ -33,16 +33,15 @@ the `model` value accepted by inference requests.
 Effective settings use one typed system with this complete precedence:
 
 ```text
-Global defaults
-  → selected-engine defaults
+selected-runtime defaults
   → Model Profile overrides
   → ephemeral invocation overrides
 ```
 
+Only the selected runtime participates; one runtime never inherits another runtime's settings.
 Request generation fields may override configured generation defaults when the exact adapter and
-runtime support them. There is no model-default layer and no post-resolution hidden policy. An
-omitted value emits no corresponding control when omission is the upstream/runtime default.
-For llama.cpp semantic alternatives, a higher layer also suppresses inherited siblings: built-in
+runtime support them. There is no Global inference layer, model-default layer, or hidden policy.
+For llama.cpp semantic alternatives, a higher layer also suppresses lower-layer siblings: built-in
 versus bound-file chat templates, all-versus-exact CPU MoE placement, and draft artifacts made
 inapplicable by `off`, n-gram, or `draft-mtp` speculation. Contradictory alternatives in the same
 winning layer remain invalid.
@@ -50,12 +49,13 @@ winning layer remain invalid.
 Persistent state is deliberately split:
 
 ```text
-<data>/settings.json         schema 1: Global and engine defaults
+<data>/settings.json         schema 2: Server Settings and independent runtime defaults
 <data>/model-profiles.json   schema 1: user-owned Model Profiles
 ```
 
 Each has its own inter-process lock and atomic replacement. Older combined state is not consumed or
-deleted; recreate current settings and profiles explicitly.
+deleted; settings schema 1 and obsolete Global fields are rejected rather than migrated. Recreate
+current settings and profiles explicitly.
 
 ### Model Library
 
@@ -68,7 +68,7 @@ receipt-backed acquisitions below the managed root can be removed by the library
 
 Discover includes an in-process model download manager. Separate acquisitions run concurrently
 (four by default), overflow requests wait in FIFO order, and a completed or failed job immediately
-releases its slot to the next queued request. Settings > Global > Downloads exposes the typed
+releases its slot to the next queued request. Settings > Server > Downloads exposes the typed
 `server.max_parallel_model_downloads` value with a minimum of 1; raising it starts more queued jobs
 immediately, while lowering it lets current transfers finish and limits subsequent starts. Exact
 duplicate references are suppressed while queued, resolving or downloading, paused, or completing
@@ -154,11 +154,21 @@ observed technical capabilities match.
 
 ## Typed serving settings
 
-Common and engine-specific settings share `SettingId`, `SettingValue`, `SettingDefinition`,
+Common semantic definitions and runtime-specific settings share `SettingId`, `SettingValue`, `SettingDefinition`,
 `SettingsPatch`, `ResolvedSettings`, and setting-source attribution. Presentation categories are
 General, Downloads, Load, Generation, Reasoning, Prompt, KV / Memory, Speculation, Cache, and
-Advanced. Server-operational definitions appear only in Global; an engine or Model Profile editor
-shows common controls plus only that engine's namespace.
+Advanced. Server-operational definitions appear only in Server Settings. Common inference semantics
+are defined once in code, then bound independently into each runtime's categories; a Runtime or
+Model Profile editor shows only the selected runtime's supported schema.
+
+Every supported effective setting is presented as a concrete value followed by its winning source,
+for example `1.0 (runtime default)`, `0.7 (model profile)`, or `200000 (boot inference)`.
+Source text supplements the value and never replaces it. Dynamic runtime/model/host derivations
+remain part of the runtime-default layer and carry optional secondary detail. A genuine `auto`
+policy remains automatic before startup; presenting it never causes Norted to materialize an
+invented launch value. Authoritative startup results replace that policy in the running effective
+view without changing its winning source. See
+[Settings and defaults](docs/settings.md).
 
 llama.cpp exposes load/runtime controls for context and slots; CPU threads and logical/physical
 batches; weight and KV offload; unified KV, checkpointing, Flash Attention, and K/V cache types;
@@ -230,12 +240,12 @@ norted-server model-profiles load <PROFILE> [--runtime <RUNTIME_ID>] [--set <SET
 norted-server model-profiles compatibility <PROFILE> [--runtime <RUNTIME_ID>]
 norted-server load <PROFILE> [--runtime <RUNTIME_ID>] [--set <SETTING=VALUE>...]
 norted-server unload <PROFILE>
-norted-server settings show --global
-norted-server settings set --global <SETTING=VALUE>...
-norted-server settings unset --global <SETTING>...
-norted-server settings show --engine q27
-norted-server settings set --engine q27 <SETTING=VALUE>...
-norted-server settings unset --engine q27 <SETTING>...
+norted-server settings show --server
+norted-server settings set --server <SETTING=VALUE>...
+norted-server settings unset --server <SETTING>...
+norted-server settings show --runtime q27
+norted-server settings set --runtime q27 <SETTING=VALUE>...
+norted-server settings unset --runtime q27 <SETTING>...
 ```
 
 ## Runtime packs
@@ -478,7 +488,7 @@ cargo run -p norted-server -- model-profiles set coding-large-context context_le
 cargo run -p norted-server -- model-profiles compatibility coding-large-context
 cargo run -p norted-server -- load coding-large-context
 cargo run -p norted-server -- load coding-large-context --set parallel_requests=2
-cargo run -p norted-server -- settings show --engine llama.cpp
+cargo run -p norted-server -- settings show --runtime llama.cpp
 cargo run -p norted-server -- status
 cargo run -p norted-server -- unload coding-large-context
 ```
@@ -502,7 +512,7 @@ cargo run -p norted-server -- tui
 
 At startup the TUI safely chooses one of two modes: it attaches to a healthy instance discovered through the existing runtime descriptor, public identity probe, and authenticated private control `status`, or it starts and owns the same serving composition used by headless `serve`. In owned mode the configured OpenAI-compatible endpoint is live while the TUI runs. Exiting shuts down the owned listeners and all managed backends and removes the owned descriptor; exiting an attached TUI leaves the external server running.
 
-Its top-level pages are Overview, Models, Model Profiles, Runtimes, Server, Logs, Settings, and Help. Models is an integrated Model Library: Installed preserves the local artifact/profile/runtime workflow, while Discover provides Hugging Face query editing, format filtering, repository-qualified artifact details, compact revision and size, known companion/package-manifest status, live download bytes, and explicit managed removal. Identical filenames from different repositories remain visibly distinct and retain their exact repository-qualified download reference. Remote rows say compatibility is unverified; the existing runtime picker continues to provide proven engine/runtime/host compatibility after acquisition. Model Profiles lists, creates, duplicates, deletes, rebinds, edits, validates, and loads user serving targets; it displays missing/incompatible state, active identity, and inherited versus overridden values. Settings shows only Global and engine defaults. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Incompatible candidates are hidden by default and can be revealed with the keyboard- and mouse-accessible `Show incompatible` checkbox; Recommended, Compatible, and Needs Attention results remain visible. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Installed source-runtime details include short commit/tree, recipe, Make or CMake, and CUDA provenance.
+Its top-level pages are Overview, Models, Model Profiles, Runtimes, Server, Logs, Settings, and Help. Models is an integrated Model Library: Installed preserves the local artifact/profile/runtime workflow, while Discover provides Hugging Face query editing, format filtering, repository-qualified artifact details, compact revision and size, known companion/package-manifest status, live download bytes, and explicit managed removal. Identical filenames from different repositories remain visibly distinct and retain their exact repository-qualified download reference. Remote rows say compatibility is unverified; the existing runtime picker continues to provide proven engine/runtime/host compatibility after acquisition. Model Profiles lists, creates, duplicates, deletes, rebinds, edits, validates, and loads user serving targets; it displays missing/incompatible state, active identity, and concrete effective values with source annotations. Settings shows Server, llama.cpp, q27, and NInfer scopes; there is no Global or Common inference page. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Incompatible candidates are hidden by default and can be revealed with the keyboard- and mouse-accessible `Show incompatible` checkbox; Recommended, Compatible, and Needs Attention results remain visible. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Installed source-runtime details include short commit/tree, recipe, Make or CMake, and CUDA provenance.
 
 The Models download panel presents active, queued, completed, and failed acquisitions independently
 with phase, progress bar, bytes, percentage, measured rate, ETA, and FIFO position whenever those
@@ -512,7 +522,7 @@ lives only for the current TUI process and does not survive an application resta
 through the normal verified path. The CLI `models download` command remains synchronous and waits
 for its requested acquisition.
 
-Owned startup establishes the serving and authenticated control stack without waiting for complete local model discovery. The TUI promptly draws its pending first frame, then starts model discovery asynchronously; the existing NotScanned, Scanning, Ready/Ready with warnings, and Failed registry states report real progress. A Model Profile cannot load until its exact bound artifact is discovered. Headless `serve` continues to complete discovery before announcing that it is listening. Neither interactive path performs catalog network I/O merely to start. The editor shows only common settings plus the bound engine namespace, and clearing an override restores inheritance. Runtime help/usage probing runs in the background. Keyboard, mouse/wheel navigation, narrow layout, `NO_COLOR`, and configured ASCII mode remain supported. Edits never hot-mutate a running backend and apply on its next load.
+Owned startup establishes the serving and authenticated control stack without waiting for complete local model discovery. The TUI promptly draws its pending first frame, then starts model discovery asynchronously; the existing NotScanned, Scanning, Ready/Ready with warnings, and Failed registry states report real progress. A Model Profile cannot load until its exact bound artifact is discovered. Headless `serve` continues to complete discovery before announcing that it is listening. Neither interactive path performs catalog network I/O merely to start. The editor shows the bound runtime's complete supported schema, and clearing an override immediately reveals the concrete runtime-default value. Runtime help/usage probing runs in the background. Keyboard, mouse/wheel navigation, narrow layout, `NO_COLOR`, and configured ASCII mode remain supported. Edits never hot-mutate a running backend and apply on its next load.
 
 When a model is loading, the TUI shows a polished model-loading progress bar on the Models, Server, and Overview screens. Progress is engine-neutral and flows through the same private control status used by both owned and attached TUI modes. Percentages are shown only when the exact runtime exposes trustworthy measurable progress; otherwise the TUI shows an animated indeterminate bar with meaningful phase text (for example, selecting runtime, revalidating a package, spawning the backend, or verifying startup). Engine-specific log parsing stays inside each adapter; the generic manager owns the progress state. While loading, the TUI polls control status at approximately 200 ms and runs a lightweight render tick for animation; its local admission intent remains fast until the accepted generation is authoritatively observed, then Loading itself keeps the fast cadence. Once loading finishes it returns to the existing slower, event-driven cadence.
 
@@ -712,7 +722,7 @@ Public `/v1/models` remains the minimal OpenAI list (`id`, `object`, `created`, 
 
 The common runtime manager resolves a concrete runtime before asking its engine adapter for a launch specification. The common supervisor owns process creation, stdout/stderr draining, crash observation, cancellation, bounded shutdown, and cleanup. Load still transitions through Stopped, Loading, Running, Stopping, and Failed; unloading during startup cancels and cleans up the child.
 
-Private control status identifies the model, engine, exact runtime ID/version/variant, executable SHA-256, process, and private endpoint. Launch provenance additionally snapshots the selected profile and every explicitly resolved structured load value with its global/engine/model/profile/invocation source. Absent upstream-default settings are not recorded as configured. This is separate from existing adapter/generation `normalized_settings` and redacted native argument provenance. Provenance also retains the immutable runtime manifest, selection source, accelerator UUID and observations, typed model native identity, auxiliary facts, release digests or source commit/tree/recipe/toolchain facts as appropriate, environment names/value hashes, process identity, endpoint, and launch time. External, official-binary, and managed-source acquisition are never blurred. Public `/v1/models` and Responses objects receive no profile, runtime, source, hardware, or NInfer native-identity metadata; `models info` exposes the latter locally.
+Private control status identifies the model, engine, exact runtime ID/version/variant, executable SHA-256, process, and private endpoint. Launch provenance additionally snapshots the selected profile and the complete concrete effective settings map with runtime-default, Model Profile, or invocation source attribution and optional derivation detail. Startup-confirmed runtime values replace pre-launch calculations without changing the winning layer; when startup changes a value, structured `requested_value` preserves the pre-start policy/value. This is separate from adapter/generation `normalized_settings` and redacted native argument provenance. Provenance also retains the immutable runtime manifest, selection source, accelerator UUID and observations, typed model native identity, auxiliary facts, release digests or source commit/tree/recipe/toolchain facts as appropriate, environment names/value hashes, process identity, endpoint, and launch time. External, official-binary, and managed-source acquisition are never blurred. Public `/v1/models` and Responses objects receive no profile, runtime, source, hardware, or NInfer native-identity metadata; `models info` exposes the latter locally.
 
 ## Development
 

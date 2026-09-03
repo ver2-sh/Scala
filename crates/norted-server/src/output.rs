@@ -496,6 +496,19 @@ pub fn control_operation(operation: &str, status: &ControlStatus, json_output: b
             if let Some(runtime) = &backend.runtime_id {
                 println!("    Runtime: {runtime}");
             }
+            if operation == "load"
+                && let Some(provenance) = &backend.provenance
+            {
+                println!("    Effective settings:");
+                for (id, setting) in &provenance.settings.effective {
+                    let source = match &setting.source {
+                        norted_core::SettingSource::RuntimeDefault => "runtime default",
+                        norted_core::SettingSource::ModelProfile { .. } => "model profile",
+                        norted_core::SettingSource::Invocation => "boot inference",
+                    };
+                    println!("      {id:<36} {:<18} ({source})", setting.value);
+                }
+            }
         }
         for event in status.recent_events.iter().filter(|event| {
             matches!(
@@ -911,7 +924,7 @@ pub fn model_profile(
     println!("  Role:           {:?}", profile.role);
     println!("  Content SHA:    {}", profile.content_hash());
     if profile.overrides.is_empty() {
-        println!("  Overrides:      none (Global + engine defaults only)");
+        println!("  Overrides:      none (runtime defaults apply)");
     } else {
         println!("  Overrides:");
         for (id, value) in profile.overrides.iter() {
@@ -984,8 +997,38 @@ pub fn settings_defaults(
     operation: &str,
     scope: &str,
     state: &norted_core::SettingsState,
+    definitions: &[norted_core::SettingDefinition],
     json_output: bool,
 ) -> Result<()> {
+    let patch = if scope == "server" {
+        Some(&state.server_settings)
+    } else {
+        scope
+            .strip_prefix("runtime:")
+            .and_then(|engine| state.runtime_defaults.get(engine))
+    };
+    let effective = definitions
+        .iter()
+        .map(|definition| {
+            let configured = patch.and_then(|patch| patch.0.get(&definition.id));
+            let value = configured.map(ToString::to_string).or_else(|| {
+                definition
+                    .default_preview
+                    .as_ref()
+                    .map(|default| default.value.clone())
+            });
+            let source = if scope == "server" {
+                if configured.is_some() {
+                    "server setting"
+                } else {
+                    "server default"
+                }
+            } else {
+                "runtime default"
+            };
+            (definition, value, source)
+        })
+        .collect::<Vec<_>>();
     if json_output {
         println!(
             "{}",
@@ -993,25 +1036,27 @@ pub fn settings_defaults(
                 "operation": operation,
                 "scope": scope,
                 "state": state,
+                "effective_settings": effective.iter().map(|(definition, value, source)| json!({
+                    "id": definition.id,
+                    "value": value,
+                    "source": source,
+                    "supported": definition.supported,
+                    "detail": definition.default_preview.as_ref().and_then(|default| default.detail.as_deref()),
+                    "unsupported_reason": definition.unsupported_reason,
+                })).collect::<Vec<_>>(),
             }))?
         );
         return Ok(());
     }
     println!("Settings {operation}: {scope}");
-    let patch = if scope == "global" {
-        Some(&state.global_defaults)
-    } else {
-        scope
-            .strip_prefix("engine:")
-            .and_then(|engine| state.engine_defaults.get(engine))
-    };
-    match patch {
-        Some(patch) if !patch.is_empty() => {
-            for (id, value) in patch.iter() {
-                println!("  {id:<38} {value}");
-            }
+    for (definition, value, source) in effective {
+        if !definition.supported {
+            println!("  {:<38} Unsupported", definition.id);
+        } else if let Some(value) = value {
+            println!("  {:<38} {:<18} ({source})", definition.id, value);
+        } else {
+            println!("  {:<38} Unavailable (resolution error)", definition.id);
         }
-        _ => println!("  No configured defaults; values inherit the runtime/upstream default."),
     }
     println!(
         "Server operational settings apply to the running TUI; model settings apply on the next Model Profile load."

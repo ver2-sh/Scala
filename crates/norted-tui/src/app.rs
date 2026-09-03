@@ -213,30 +213,16 @@ pub enum RuntimeTaskResult {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum SettingsScope {
-    Global,
-    Engine(String),
+    Server,
+    Runtime(String),
     ModelProfile(ModelProfileId),
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SettingPresentationState {
     Override,
-    Inherited,
     Default,
-    Resolved,
     Unsupported,
-}
-
-impl SettingPresentationState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Override => "override",
-            Self::Inherited => "inherited",
-            Self::Default => "default",
-            Self::Resolved => "resolved",
-            Self::Unsupported => "unsupported",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1207,16 +1193,16 @@ impl App {
     }
 
     pub fn settings_scopes(&self) -> Vec<SettingsScope> {
-        let mut scopes = vec![SettingsScope::Global];
+        let mut scopes = vec![SettingsScope::Server];
         let engines = self
             .setting_definitions
             .iter()
             .filter_map(|definition| match &definition.scope {
-                SettingScope::Global | SettingScope::Common => None,
-                SettingScope::Engine { engine_id } => Some(engine_id.clone()),
+                SettingScope::Server => None,
+                SettingScope::Runtime { engine_id } => Some(engine_id.clone()),
             })
             .collect::<BTreeSet<_>>();
-        scopes.extend(engines.into_iter().map(SettingsScope::Engine));
+        scopes.extend(engines.into_iter().map(SettingsScope::Runtime));
         scopes
     }
 
@@ -1233,11 +1219,11 @@ impl App {
                 .as_ref()
                 .map(|schema| schema.definitions.as_slice())
                 .unwrap_or_default()
-        } else if let Some(SettingsScope::Engine(engine_id)) = scope.as_ref() {
+        } else if let Some(SettingsScope::Runtime(engine_id)) = scope.as_ref() {
             self.runtime_settings_schemas
                 .get(engine_id)
                 .map(|schema| schema.definitions.as_slice())
-                .unwrap_or(self.setting_definitions.as_slice())
+                .unwrap_or_default()
         } else {
             self.setting_definitions.as_slice()
         };
@@ -1247,20 +1233,15 @@ impl App {
                 _ if self.screen == Screen::ModelProfiles => self
                     .selected_model_profile_value()
                     .is_some_and(|profile| match &definition.scope {
-                        SettingScope::Global => false,
-                        SettingScope::Common => true,
-                        SettingScope::Engine { engine_id } => {
+                        SettingScope::Server => false,
+                        SettingScope::Runtime { engine_id } => {
                             engine_id == profile.engine_id.as_str()
                         }
                     }),
-                Some(SettingsScope::Global) => matches!(
-                    definition.scope,
-                    SettingScope::Global | SettingScope::Common
-                ),
-                Some(SettingsScope::Engine(selected)) => match &definition.scope {
-                    SettingScope::Global => false,
-                    SettingScope::Common => true,
-                    SettingScope::Engine { engine_id } => engine_id == selected,
+                Some(SettingsScope::Server) => definition.scope == SettingScope::Server,
+                Some(SettingsScope::Runtime(selected)) => match &definition.scope {
+                    SettingScope::Server => false,
+                    SettingScope::Runtime { engine_id } => engine_id == selected,
                 },
                 Some(SettingsScope::ModelProfile(_)) => true,
                 None => false,
@@ -1304,67 +1285,54 @@ impl App {
                     can_clear: false,
                 };
             };
-            if let Some(value) = profile.overrides.0.get(id) {
-                return SettingValueDisplay {
-                    value: value.to_string(),
-                    source: "profile override".to_owned(),
-                    state: SettingPresentationState::Override,
-                    can_clear: true,
-                };
-            }
-            if let Some(value) = self.settings_runtime_resolved_value(id) {
-                return SettingValueDisplay {
-                    value,
-                    source: "runtime resolved".to_owned(),
-                    state: SettingPresentationState::Resolved,
-                    can_clear: false,
-                };
-            }
             if let Some(setting) = self
                 .settings_resolved
                 .as_ref()
                 .and_then(|resolved| resolved.effective.get(id))
             {
-                let source = match &setting.source {
-                    norted_core::SettingSource::GlobalDefault => "inherited from global".to_owned(),
-                    norted_core::SettingSource::EngineDefault { .. } => {
-                        "inherited from engine".to_owned()
-                    }
-                    norted_core::SettingSource::ModelProfile { .. } => {
-                        "profile override".to_owned()
-                    }
-                    norted_core::SettingSource::Invocation => "invocation".to_owned(),
-                };
                 return SettingValueDisplay {
-                    value: setting.value.to_string(),
-                    source,
+                    value: setting.value.clone(),
+                    source: match &setting.source {
+                        norted_core::SettingSource::RuntimeDefault => "runtime default".to_owned(),
+                        norted_core::SettingSource::ModelProfile { .. } => {
+                            "model profile".to_owned()
+                        }
+                        norted_core::SettingSource::Invocation => "boot inference".to_owned(),
+                    },
                     state: match setting.source {
-                        norted_core::SettingSource::GlobalDefault
-                        | norted_core::SettingSource::EngineDefault { .. } => {
-                            SettingPresentationState::Inherited
+                        norted_core::SettingSource::RuntimeDefault => {
+                            SettingPresentationState::Default
                         }
                         norted_core::SettingSource::ModelProfile { .. }
                         | norted_core::SettingSource::Invocation => {
                             SettingPresentationState::Override
                         }
                     },
-                    can_clear: false,
+                    can_clear: profile.overrides.0.contains_key(id),
+                };
+            }
+            if let Some(value) = profile.overrides.0.get(id) {
+                return SettingValueDisplay {
+                    value: value.to_string(),
+                    source: "model profile".to_owned(),
+                    state: SettingPresentationState::Override,
+                    can_clear: true,
                 };
             }
             return self.settings_default_display(id);
         }
         let Some(scope) = self.selected_settings_scope() else {
             return SettingValueDisplay {
-                value: "Default".to_owned(),
-                source: "configured state".to_owned(),
+                value: "Unavailable".to_owned(),
+                source: "unresolved scope".to_owned(),
                 state: SettingPresentationState::Default,
                 can_clear: false,
             };
         };
         let current = match &scope {
-            SettingsScope::Global => state.global_defaults.0.get(id),
-            SettingsScope::Engine(engine) => state
-                .engine_defaults
+            SettingsScope::Server => state.server_settings.0.get(id),
+            SettingsScope::Runtime(engine) => state
+                .runtime_defaults
                 .get(engine)
                 .and_then(|patch| patch.0.get(id)),
             SettingsScope::ModelProfile(profile_id) => self
@@ -1377,31 +1345,15 @@ impl App {
             return SettingValueDisplay {
                 value: value.to_string(),
                 source: match scope {
-                    SettingsScope::Global => "global override".to_owned(),
-                    SettingsScope::Engine(_) => "engine override".to_owned(),
-                    SettingsScope::ModelProfile(_) => "profile override".to_owned(),
+                    SettingsScope::Server => "server setting".to_owned(),
+                    SettingsScope::Runtime(_) => "runtime default".to_owned(),
+                    SettingsScope::ModelProfile(_) => "model profile".to_owned(),
                 },
                 state: SettingPresentationState::Override,
                 can_clear: true,
             };
         }
-        let inherited = match (&scope, id.namespace()) {
-            (SettingsScope::Engine(_), None) => state
-                .global_defaults
-                .0
-                .get(id)
-                .map(|value| (value, "inherited from global".to_owned())),
-            _ => None,
-        };
-        inherited.map_or_else(
-            || self.settings_default_display(id),
-            |(value, source)| SettingValueDisplay {
-                value: value.to_string(),
-                source,
-                state: SettingPresentationState::Inherited,
-                can_clear: false,
-            },
-        )
+        self.settings_default_display(id)
     }
 
     fn settings_default_display(&self, id: &SettingId) -> SettingValueDisplay {
@@ -1413,22 +1365,28 @@ impl App {
         {
             return SettingValueDisplay {
                 value: preview.value.clone(),
-                source: preview.source.to_string(),
+                source: if definition
+                    .is_some_and(|definition| definition.scope == SettingScope::Server)
+                {
+                    "server default".to_owned()
+                } else {
+                    "runtime default".to_owned()
+                },
                 state: SettingPresentationState::Default,
                 can_clear: false,
             };
         }
         if self.screen == Screen::ModelProfiles {
             SettingValueDisplay {
-                value: "runtime fallback".to_owned(),
-                source: "runtime dependent".to_owned(),
+                value: "Unavailable".to_owned(),
+                source: "resolution error".to_owned(),
                 state: SettingPresentationState::Default,
                 can_clear: false,
             }
         } else {
             SettingValueDisplay {
-                value: "Default".to_owned(),
-                source: "configured state".to_owned(),
+                value: "Unavailable".to_owned(),
+                source: "exact runtime unresolved".to_owned(),
                 state: SettingPresentationState::Default,
                 can_clear: false,
             }
@@ -1452,9 +1410,6 @@ impl App {
                 "Current: Unsupported".to_owned(),
                 format!("Reason: {reason}"),
             ];
-            if let Some(upstream) = definition.upstream_default.as_deref() {
-                lines.push(format!("Upstream: {upstream}"));
-            }
             if self.current_layer_value(id).is_some() {
                 lines.push("An existing override is set; use Inherit to remove it.".to_owned());
             }
@@ -1462,13 +1417,31 @@ impl App {
         }
         let preview = definition.and_then(|definition| definition.default_preview.as_ref());
         let mut lines = vec![format!("Current: {} · {}", current.value, current.source)];
-        if let Some(preview) = preview {
-            let preview_source = preview.source.to_string();
+        if self.screen == Screen::ModelProfiles {
+            if self.current_layer_value(id).is_some() {
+                lines.push(
+                    "Clear the profile override to use the runtime-default layer.".to_owned(),
+                );
+            }
+        } else if let Some(preview) = preview {
+            let preview_source =
+                if definition.is_some_and(|definition| definition.scope == SettingScope::Server) {
+                    "server default".to_owned()
+                } else {
+                    "runtime default".to_owned()
+                };
             let current_is_same_default = current.state == SettingPresentationState::Default
                 && current.value == preview.value
                 && current.source == preview_source;
             if !current_is_same_default {
-                lines.push(format!("Default: {} · {}", preview.value, preview_source));
+                let label = if definition
+                    .is_some_and(|definition| definition.scope == SettingScope::Server)
+                {
+                    "Server baseline"
+                } else {
+                    "Runtime baseline"
+                };
+                lines.push(format!("{label}: {}", preview.value));
             }
             if let Some(detail) = preview.detail.as_deref() {
                 lines.push(format!("Detail: {detail}"));
@@ -1478,33 +1451,38 @@ impl App {
             lines.push(format!("Default: {} · {}", fallback.value, fallback.source));
         } else {
             lines.push(if self.screen == Screen::ModelProfiles {
-                "Detail: If unset, runtime fallback remains authoritative; no pre-launch literal is available"
+                "Detail: The selected adapter did not produce a required concrete runtime value"
                     .to_owned()
             } else {
                 "Detail: If unset, no model-specific preview is available in this configuration scope"
                     .to_owned()
             });
         }
-        if let Some(upstream) =
-            definition.and_then(|definition| definition.upstream_default.as_deref())
-        {
-            lines.push(format!("Upstream: {upstream}"));
-        }
-        if let Some(resolved) = self.settings_runtime_resolved_value(id)
-            && (current.state != SettingPresentationState::Resolved || current.value != resolved)
-        {
-            lines.push(format!("Running: {resolved} · runtime resolved"));
+        if let Some(running) = self.settings_running_effective_setting(id) {
+            let running_source = match &running.source {
+                norted_core::SettingSource::RuntimeDefault => "runtime default",
+                norted_core::SettingSource::ModelProfile { .. } => "model profile",
+                norted_core::SettingSource::Invocation => "boot inference",
+            };
+            if running.value != current.value || running_source != current.source {
+                lines.push(format!("Running: {} · {}", running.value, running_source));
+                if let Some(detail) = running.detail.as_deref() {
+                    lines.push(format!("Running detail: {detail}"));
+                }
+            }
         }
         lines.join("\n")
     }
 
-    fn settings_runtime_resolved_value(&self, id: &SettingId) -> Option<String> {
+    fn settings_running_effective_setting(
+        &self,
+        id: &SettingId,
+    ) -> Option<&norted_core::EffectiveSetting> {
         if self.screen != Screen::ModelProfiles {
             return None;
         }
         let profile = self.selected_model_profile_value()?;
         let runtime_id = self.settings_runtime_id.as_ref()?;
-        let settings_resolved = self.settings_resolved.as_ref()?;
         let backend = self.control.as_ref()?.backend(&profile.id)?;
         if backend.lifecycle != BackendLifecycle::Running
             || backend.model_id != profile.model_id
@@ -1514,21 +1492,10 @@ impl App {
             return None;
         }
         let provenance = backend.provenance.as_ref()?;
-        if provenance.model_profile.content_sha256 != profile.content_hash()
-            || provenance.settings.effective != settings_resolved.effective
-        {
+        if provenance.model_profile.content_sha256 != profile.content_hash() {
             return None;
         }
-        let value = provenance
-            .normalized_settings
-            .get("resolved_settings")?
-            .as_object()?
-            .get(id.as_str())?;
-        Some(
-            value
-                .as_str()
-                .map_or_else(|| value.to_string(), ToOwned::to_owned),
-        )
+        provenance.settings.effective.get(id)
     }
 
     pub fn model_profile_values(&self) -> Vec<&ModelProfile> {
@@ -3074,8 +3041,10 @@ impl App {
             return Update::None;
         };
         if self.current_layer_value(&id).is_none() {
-            self.notice =
-                Some("This layer has no override; the value is already inherited".to_owned());
+            self.notice = Some(
+                "This layer has no override; the concrete lower-layer value already applies"
+                    .to_owned(),
+            );
             return Update::Render;
         }
         self.queue_settings_action(SettingsAction::Unset { scope, id })
@@ -3092,8 +3061,10 @@ impl App {
         }
         let state = self.settings_state.as_ref()?;
         match self.selected_settings_scope()? {
-            SettingsScope::Global => state.global_defaults.0.get(id).cloned(),
-            SettingsScope::Engine(engine) => state.engine_defaults.get(&engine)?.0.get(id).cloned(),
+            SettingsScope::Server => state.server_settings.0.get(id).cloned(),
+            SettingsScope::Runtime(engine) => {
+                state.runtime_defaults.get(&engine)?.0.get(id).cloned()
+            }
             SettingsScope::ModelProfile(profile_id) => self
                 .model_profiles
                 .as_ref()?
@@ -4736,7 +4707,6 @@ mod tests {
             supported: true,
             unsupported_reason: None,
             unit: None,
-            upstream_default: None,
             default_preview: None,
         }
     }
@@ -4765,18 +4735,24 @@ mod tests {
     }
 
     #[test]
-    fn settings_has_only_global_and_engine_default_scopes() {
+    fn settings_has_server_and_runtime_default_scopes() {
         let app = test_app(vec![
-            definition("temperature", SettingScope::Common),
+            definition("server.max_parallel_downloads", SettingScope::Server),
+            definition(
+                "temperature",
+                SettingScope::Runtime {
+                    engine_id: "q27".to_owned(),
+                },
+            ),
             definition(
                 "q27.mtp",
-                SettingScope::Engine {
+                SettingScope::Runtime {
                     engine_id: "q27".to_owned(),
                 },
             ),
             definition(
                 "ninfer.speculation",
-                SettingScope::Engine {
+                SettingScope::Runtime {
                     engine_id: "ninfer".to_owned(),
                 },
             ),
@@ -4784,32 +4760,37 @@ mod tests {
         assert_eq!(
             app.settings_scopes(),
             vec![
-                SettingsScope::Global,
-                SettingsScope::Engine("ninfer".to_owned()),
-                SettingsScope::Engine("q27".to_owned()),
+                SettingsScope::Server,
+                SettingsScope::Runtime("ninfer".to_owned()),
+                SettingsScope::Runtime("q27".to_owned()),
             ]
         );
     }
 
     #[test]
-    fn model_profile_editor_shows_common_and_bound_engine_only() {
+    fn model_profile_editor_shows_bound_runtime_only() {
         let definitions = vec![
-            definition("temperature", SettingScope::Common),
+            definition(
+                "temperature",
+                SettingScope::Runtime {
+                    engine_id: "q27".to_owned(),
+                },
+            ),
             definition(
                 "q27.mtp",
-                SettingScope::Engine {
+                SettingScope::Runtime {
                     engine_id: "q27".to_owned(),
                 },
             ),
             definition(
                 "ninfer.speculation",
-                SettingScope::Engine {
+                SettingScope::Runtime {
                     engine_id: "ninfer".to_owned(),
                 },
             ),
             definition(
                 "llama.cpp.flash_attention",
-                SettingScope::Engine {
+                SettingScope::Runtime {
                     engine_id: "llama.cpp".to_owned(),
                 },
             ),

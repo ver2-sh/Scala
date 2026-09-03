@@ -95,7 +95,7 @@ same core selector used by local discovery, including the upstream `MODEL.q27` +
 authoritative record containing exact reference, resolved provider/repository/artifact identity,
 phase, bytes, optional total/percentage, measured rate, elapsed time, optional ETA, queue position,
 and status. Up to `server.max_parallel_model_downloads` acquisitions run at once (default 4,
-minimum 1); the rest remain in a FIFO queue. Raising the Global setting fills newly available slots
+minimum 1); the rest remain in a FIFO queue. Raising the Server Setting fills newly available slots
 immediately. Lowering it never cancels work already running and suppresses starts until active work
 falls below the new limit. Completion and failure both release a slot. Exact active/queued
 references are deduplicated, and a per-reference cache key plus per-job staging directory prevents
@@ -167,22 +167,41 @@ artifact ID, bound engine ID, and typed overrides. It is always user-owned and m
 compatibility comes from the bound artifact, registered engine, exact runtime, and resulting
 settings—not from profile-authored applicability declarations.
 
-`SettingsState` schema 1 lives at `<data>/settings.json` and stores Global (including Global-only
-server operational values) and per-engine defaults. `ModelProfilesState` schema 1 lives at
+`SettingsState` schema 2 lives at `<data>/settings.json` and stores Server Settings separately from
+independent per-runtime defaults. `ModelProfilesState` schema 1 lives at
 `<data>/model-profiles.json`. Both stores have
-independent locks and atomic replacement. No older combined state is read or migrated.
+independent locks and atomic replacement. Settings schema 1 and obsolete Global fields are rejected;
+no compatibility reader or migration path exists.
 
-One resolver applies Global defaults, the bound engine defaults, Model Profile overrides, then
-ephemeral invocation overrides. It filters unrelated engine namespaces, records the winning source
-as `global-default`, `engine-default:<engine>`, `model-profile:<id>`, or `invocation`, and produces
-no entry for an upstream default. There is no model-default or hidden policy layer. Relative typed
-paths resolve beneath the data directory before all downstream consumers receive the same absolute
-value.
+One resolver applies the selected runtime's defaults, Model Profile overrides, then ephemeral
+invocation overrides. It filters unrelated runtime namespaces and records the winning inference
+source as runtime default, Model Profile, or invocation. In boot-loading presentation, invocation
+is labeled `boot inference`. There is no Global inference parent, model-default layer, or hidden
+policy. Relative typed paths resolve beneath the data directory before downstream consumers receive
+the same absolute value.
+
+Server Settings are application/control-plane configuration and never enter model inference
+resolution or inference provenance. Shared inference semantics are defined once in the engine-neutral
+schema builder, but each adapter binds those definitions into its own runtime scope and supplies its
+own concrete baseline. A future apply-to-all-runtimes action must copy a value independently into
+each applicable runtime; it must not create a shared parent layer.
+
+`ResolvedSettings` carries explicit launch configuration separately from the complete effective map.
+The exact adapter schema materializes every supported effective row as a concrete value, winning
+source, and optional derivation detail. Runtime/model/host calculations remain part of the runtime-
+default layer. A genuine unresolved runtime policy is represented canonically (for example `auto`),
+not replaced with a presentation-only scalar. Only deliberately Norted-owned execution defaults are
+materialized into launch configuration. Startup-confirmed results supersede automatic policies in
+the running effective map without creating a new source layer; when the value changes, structured
+`requested_value` retains the pre-start policy/value. The Model Profile editor consumes current
+resolution for its primary rows and presents a matching backend's effective map only as secondary
+running state. Server/status/control surfaces continue to consume the running map. No consumer
+reconstructs a value from descriptive default prose.
 
 Runtime selection receives the profile's explicit engine and cannot switch engines. Existing
 resolution order remains explicit runtime, persisted model/runtime choice when applicable,
 engine/format default, then best compatible installed runtime. Adapters expose a typed category-aware
-schema for common plus their own namespace, gate it first with facts proved by the bound model, and
+schema for centrally defined common semantics plus their own namespace, gate it first with facts proved by the bound model, and
 then gate it with the exact runtime contract before validating effective settings. Capability
 requirements are consequences of selected settings. q27 retains exact source fingerprints and
 bounded context/KV/W_MAX startup proof; NInfer retains native-container and exact-current-revision
@@ -192,7 +211,9 @@ system-prompt/context management separate from native launch flags.
 
 `RuntimeProvenance.model_profile` records the ID, display name, deterministic content hash, bound
 artifact ID, and engine ID. Artifact lineage and hashes remain separately recorded. Settings
-provenance contains the complete effective map and source attribution. No artifact package metadata
+provenance contains the complete concrete effective map and source attribution. Values confirmed by
+startup observations replace pre-launch calculations without changing the winning layer, while a
+changed requested policy/value remains available as structured provenance. No artifact package metadata
 selects settings, prompt templates, runtime defaults, or UI controls.
 
 ## Runtime identity and store

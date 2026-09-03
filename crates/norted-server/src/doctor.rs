@@ -7,8 +7,7 @@ use std::time::Duration;
 use norted_core::{
     ApiKeyStore, AppConfig, AppPaths, ConfigSource, LoadedConfig, ModelArtifact,
     ModelProfilesState, ModelProfilesStore, ModelRegistry, RuntimeCompatibility,
-    RuntimeSelectionSource, SettingDefinition, SettingId, SettingsPatch, SettingsState,
-    SettingsStore,
+    RuntimeSelectionSource, SettingDefinition, SettingsPatch, SettingsState, SettingsStore,
 };
 use norted_engine::{
     BackendLifecycle, ControlClient, ControlClientError, EngineRegistry, InstallationState,
@@ -572,9 +571,6 @@ fn inspect_setting_values(
         Ok(mut definitions) => {
             definitions.push(norted_model_library::setting_definition());
             definitions
-                .into_iter()
-                .map(|definition| (definition.id.clone(), definition))
-                .collect::<BTreeMap<_, _>>()
         }
         Err(error) => {
             checks.push(finding(
@@ -590,11 +586,11 @@ fn inspect_setting_values(
     };
 
     let mut errors = Vec::new();
-    validate_patch(&state.global_defaults, None, &definitions, &mut errors);
-    for (engine_id, patch) in &state.engine_defaults {
+    validate_patch(&state.server_settings, None, &definitions, &mut errors);
+    for (engine_id, patch) in &state.runtime_defaults {
         if registry.get(engine_id).is_none() {
             errors.push(format!(
-                "engine defaults reference unregistered engine `{engine_id}`"
+                "runtime defaults reference unregistered engine `{engine_id}`"
             ));
             continue;
         }
@@ -615,7 +611,7 @@ fn inspect_setting_values(
                 DoctorStatus::Fail,
                 "A persisted setting is invalid for the current engine definitions.",
                 Some(error),
-                &["Use `norted-server settings show` to review current Global and engine defaults."],
+                &["Use `norted-server settings show` to review current Server Settings and runtime defaults."],
             ));
         }
     }
@@ -624,16 +620,25 @@ fn inspect_setting_values(
 fn validate_patch(
     patch: &SettingsPatch,
     engine_id: Option<&str>,
-    definitions: &BTreeMap<SettingId, SettingDefinition>,
+    definitions: &[SettingDefinition],
     errors: &mut Vec<String>,
 ) {
     for (id, value) in patch.iter() {
-        let Some(definition) = definitions.get(id) else {
+        let Some(definition) = definitions.iter().find(|definition| {
+            &definition.id == id
+                && match (&definition.scope, engine_id) {
+                    (norted_core::SettingScope::Server, None) => true,
+                    (norted_core::SettingScope::Runtime { engine_id: owner }, Some(engine_id)) => {
+                        owner == engine_id
+                    }
+                    _ => false,
+                }
+        }) else {
             errors.push(format!("unknown setting `{id}`"));
             continue;
         };
         if let Some(engine_id) = engine_id
-            && (definition.scope == norted_core::SettingScope::Global
+            && (!matches!(definition.scope, norted_core::SettingScope::Runtime { .. })
                 || !id.applies_to_engine(engine_id))
         {
             errors.push(format!(
@@ -1024,7 +1029,7 @@ fn inspect_model_runtime_selections(
                 "runtime_selections",
                 DoctorStatus::Warning,
                 format!(
-                    "Model `{}` requires automatic runtime fallback.",
+                    "Model `{}` uses fallback runtime selection.",
                     model.id
                 ),
                 Some(bounded_detail(selection.notices.join("; "))),
@@ -1206,7 +1211,7 @@ async fn inspect_model_profiles(
                         "model_profiles",
                         DoctorStatus::Warning,
                         format!(
-                            "Model Profile '{}' requires automatic runtime fallback.",
+                            "Model Profile '{}' uses fallback runtime selection.",
                             profile.id
                         ),
                         Some(bounded_detail(selection.notices.join("; "))),

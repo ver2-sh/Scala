@@ -1815,7 +1815,7 @@ fn render_settings(
     frame.render_widget(
         section_title(
             "Settings",
-            "Global and engine defaults; Model Profiles are edited on their own screen",
+            "Server Settings and runtime defaults; Model Profiles are edited on their own screen",
             theme,
         ),
         layout[0],
@@ -1826,8 +1826,8 @@ fn render_settings(
             continue;
         };
         let label = match scope {
-            crate::app::SettingsScope::Global => "Global".to_owned(),
-            crate::app::SettingsScope::Engine(engine) => match engine.as_str() {
+            crate::app::SettingsScope::Server => "Server".to_owned(),
+            crate::app::SettingsScope::Runtime(engine) => match engine.as_str() {
                 "ninfer" => "NInfer".to_owned(),
                 _ => engine.clone(),
             },
@@ -2227,8 +2227,20 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
     }
     let definitions = app.settings_definitions();
     if definitions.is_empty() {
+        let message = match app.selected_settings_scope() {
+            Some(crate::app::SettingsScope::Runtime(engine))
+                if !app.runtime_settings_schemas.contains_key(&engine) =>
+            {
+                format!(
+                    "Exact runtime settings for `{engine}` are unavailable. Select or install a compatible exact runtime, then refresh Settings."
+                )
+            }
+            _ => "No settings are available in this scope.".to_owned(),
+        };
         frame.render_widget(
-            Paragraph::new("No settings are available in this scope.").style(theme.muted),
+            Paragraph::new(message)
+                .style(theme.warning)
+                .wrap(Wrap { trim: true }),
             ui_layout.settings_list,
         );
         return;
@@ -2260,7 +2272,7 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
                 .get(index.saturating_sub(1))
                 .is_none_or(|previous| previous.category != definition.category);
         let status = if definition.supported {
-            format!("{label} · {} · {}", display.source, display.state.as_str())
+            format!("{label} · {}", display.source)
         } else {
             format!("{label} · unsupported")
         };
@@ -2408,7 +2420,7 @@ fn concise_help_columns<'a>(theme: &Theme, glyphs: &Glyphs) -> (Vec<Line<'a>>, V
     ];
     let right = vec![
         Line::from(Span::styled("SETTINGS AND RUNTIMES", theme.hint)),
-        key_value("Settings", "Global and engine defaults", theme),
+        key_value("Settings", "Server Settings and runtime defaults", theme),
         key_value(glyphs.up_down, "select or scroll", theme),
         key_value("s", "search available runtimes", theme),
         key_value("g / Q / N", "set format default", theme),
@@ -2481,7 +2493,7 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         ),
         Line::default(),
         Line::from(Span::styled("SETTINGS AND RUNTIMES", theme.hint)),
-        key_value("Settings", "Global and per-engine defaults", theme),
+        key_value("Settings", "Server Settings and runtime defaults", theme),
         key_value("Up/Down or j/k", "select or scroll the current page", theme),
         key_value("s", "search available runtimes from Runtimes", theme),
         key_value("g / Q / N", "select runtime for GGUF / Q27 / NInfer", theme),
