@@ -432,7 +432,8 @@ impl std::fmt::Display for SettingDefaultSource {
     }
 }
 
-/// A concrete runtime-base value proved or deliberately owned by the adapter.
+/// An authoritative runtime-base value or genuine runtime policy proved or
+/// deliberately owned by the adapter.
 ///
 /// The value is safe for clients to render without interpreting prose. A
 /// Norted-owned scalar may also be materialized into the launch contract.
@@ -836,7 +837,8 @@ pub struct ResolvedSettings {
     /// invocation precedence. Runtime adapters consume only this map.
     #[serde(default)]
     pub configured: BTreeMap<SettingId, ResolvedSetting>,
-    /// Complete concrete values for presentation and provenance.
+    /// Complete authoritative values or genuine unresolved runtime policies
+    /// for presentation and provenance.
     #[serde(default)]
     pub effective: BTreeMap<SettingId, EffectiveSetting>,
 }
@@ -936,8 +938,8 @@ impl SettingsSchema {
     }
 
     /// Builds the single authoritative effective-value view used by clients
-    /// and provenance. Adapter-owned defaults are concrete values; derivation
-    /// information is secondary metadata and never replaces the value.
+    /// and provenance. Genuine runtime policies such as `auto` remain values;
+    /// derivation information is secondary metadata and never replaces them.
     pub fn materialize_effective(
         &self,
         settings: &mut ResolvedSettings,

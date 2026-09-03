@@ -2094,8 +2094,20 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
     }
     let definitions = app.settings_definitions();
     if definitions.is_empty() {
+        let message = match app.selected_settings_scope() {
+            Some(crate::app::SettingsScope::Runtime(engine))
+                if !app.runtime_settings_schemas.contains_key(&engine) =>
+            {
+                format!(
+                    "Exact runtime settings for `{engine}` are unavailable. Select or install a compatible exact runtime, then refresh Settings."
+                )
+            }
+            _ => "No settings are available in this scope.".to_owned(),
+        };
         frame.render_widget(
-            Paragraph::new("No settings are available in this scope.").style(theme.muted),
+            Paragraph::new(message)
+                .style(theme.warning)
+                .wrap(Wrap { trim: true }),
             ui_layout.settings_list,
         );
         return;

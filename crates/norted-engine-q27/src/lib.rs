@@ -4883,7 +4883,7 @@ fn q27_model_setting_definitions(
 
 fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
     for (id, value) in [
-        ("context_length", "8192"),
+        ("context_length", "auto"),
         ("parallel_requests", "1"),
         ("temperature", "0.0"),
         ("top_p", "1.0"),
@@ -4891,9 +4891,9 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
         ("min_p", "0.0"),
         ("max_output_tokens", "8192"),
         ("reasoning", "off"),
-        ("reasoning_budget", "8192"),
-        ("q27.slot1_context_length", "8192"),
-        ("q27.kv_mode", "fp16"),
+        ("reasoning_budget", "auto"),
+        ("q27.slot1_context_length", "auto"),
+        ("q27.kv_mode", "auto"),
         ("q27.fast_head", "enabled"),
         ("q27.thinking", "disabled"),
         ("q27.request_thinking", "disabled"),
@@ -4901,7 +4901,7 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
         ("q27.continuous_batching", "enabled"),
         ("q27.sampled_graphs", "enabled"),
         ("q27.mtp", "enabled"),
-        ("q27.mtp_max_depth", "7"),
+        ("q27.mtp_max_depth", "auto"),
         ("q27.mtp_min_probability", "0.5"),
         ("q27.suffix_drafting", "enabled"),
         ("q27.prefix_cache_path", "disabled"),
@@ -4920,9 +4920,22 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
     set_q27_default(
         definitions,
         "context_length",
-        SettingDefaultPreview::new("8192", SettingDefaultSource::Norted).with_detail(
-            "Norted owns a deterministic q27 context baseline instead of live-VRAM sizing",
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+            "q27 sizes context from live free VRAM and startup reservations after model weights load; compact KV is capped at 262144 and FP16 at 131072",
         ),
+    );
+    set_q27_default(
+        definitions,
+        "q27.slot1_context_length",
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+            "When context is automatic, q27 sizes later slots to the live-VRAM-derived slot-0 window",
+        ),
+    );
+    set_q27_default(
+        definitions,
+        "q27.kv_mode",
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+            .with_detail("The exact runtime selects KV format from the accelerator architecture"),
     );
     set_q27_default(
         definitions,
@@ -4934,15 +4947,22 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
     set_q27_default(
         definitions,
         "q27.mtp_max_depth",
-        SettingDefaultPreview::new("7", SettingDefaultSource::Norted).with_detail(
-            "Norted owns the deterministic proposal-depth baseline within the reviewed runtime maximum",
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+            "The reviewed runtime chooses proposal depth automatically with a maximum of 7",
         ),
     );
     set_q27_default(
         definitions,
         "q27.thinking_budget",
-        SettingDefaultPreview::new("8192", SettingDefaultSource::Norted).with_detail(
-            "Norted owns a deterministic runtime baseline equal to the default maximum output",
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+            "For prompt-seeded thinking, q27 derives the budget from the request's maximum output at request time",
+        ),
+    );
+    set_q27_default(
+        definitions,
+        "reasoning_budget",
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+            "When request thinking is enabled, an omitted request budget remains request-derived",
         ),
     );
 }
@@ -5009,12 +5029,8 @@ fn apply_q27_context_defaults(
         set_q27_default(
             definitions,
             "q27.kv_mode",
-            SettingDefaultPreview::new(
-                "fp16",
-                SettingDefaultSource::Norted,
-            )
-            .with_detail(
-                "Norted uses the portable reviewed q27 KV baseline when accelerator compute capability is unavailable",
+            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+                "The exact runtime selects KV format from accelerator architecture; no authoritative compute capability is available before launch",
             ),
         );
     }
@@ -5036,21 +5052,18 @@ fn apply_q27_context_defaults(
     } else {
         262_144
     };
-    let context_value = settings
-        .and_then(|settings| setting_unsigned(settings, "context_length"))
-        .unwrap_or(8192)
-        .min(context_cap);
-    let context = SettingDefaultPreview::new(
-        context_value.to_string(),
-        SettingDefaultSource::Norted,
-    )
-    .with_detail("Norted owns the deterministic q27 context baseline; the selected KV mode's reviewed cap is enforced");
+    let context = SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+        format!(
+            "q27 sizes context from live free VRAM and startup reservations after model weights load; the selected KV policy caps it at {context_cap}"
+        ),
+    );
     set_q27_default(definitions, "context_length", context.clone());
     set_q27_default(
         definitions,
         "q27.slot1_context_length",
-        SettingDefaultPreview::new(context_value.to_string(), SettingDefaultSource::Runtime)
-            .with_detail("The reviewed runtime uses the effective slot-0 context for later slots"),
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+            "When context is automatic, the reviewed runtime sizes later slots to the live-VRAM-derived slot-0 window",
+        ),
     );
     if let Some(compiled_w_max) = capabilities.compiled_w_max {
         set_q27_default(
@@ -5139,11 +5152,11 @@ fn q27_definition(
         unit: None,
         default_preview: match id {
             "q27.prompt_mode" => Some(SettingDefaultPreview::new(
-                "runtime template",
+                "runtime_default",
                 SettingDefaultSource::Norted,
             )),
             "q27.prompt_delivery" => Some(SettingDefaultPreview::new(
-                "runtime chat",
+                "runtime_chat",
                 SettingDefaultSource::Norted,
             )),
             "q27.template_path" | "q27.template_sha256" => Some(SettingDefaultPreview::new(

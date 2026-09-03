@@ -1778,9 +1778,9 @@ fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<Setting
                 .find(|definition| definition.id.as_str() == id)
             {
                 definition.default_preview = Some(
-                    SettingDefaultPreview::new("none", SettingDefaultSource::Runtime)
+                    SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
                     .with_detail(
-                        "The selected GGUF does not contain this metadata value, so Norted applies no model-derived customization",
+                        "The selected GGUF does not expose this inspected value, so the exact runtime remains authoritative",
                     ),
                 );
             }
@@ -2239,23 +2239,16 @@ fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &s
     let lower = reported.to_ascii_lowercase();
     let preview = match id {
         "parallel_requests" if lower == "-1" => SettingDefaultPreview::new(
-            "1",
-            SettingDefaultSource::Norted,
+            "auto",
+            SettingDefaultSource::Runtime,
         )
         .with_detail(
-            "Norted owns a deterministic single-slot baseline instead of the runtime's dynamic -1 policy",
+            "The exact runtime reports `-1 = auto` and finalizes its server slot count during startup",
         ),
         "llama.cpp.threads" if matches!(lower.as_str(), "-1" | "0" | "auto") => {
-            SettingDefaultPreview::new(
-                std::thread::available_parallelism()
-                    .map(|value| value.get())
-                    .unwrap_or(1)
-                    .to_string(),
-                SettingDefaultSource::Derived,
-            )
-                .with_detail(format!(
-                    "The exact runtime reports `{reported}` and resolves the worker count from the launch host"
-                ))
+            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(format!(
+                "The exact runtime reports `{reported}` and resolves the worker count from the launch host"
+            ))
         }
         "llama.cpp.gpu_offload" if matches!(lower.as_str(), "-1" | "auto") => {
             SettingDefaultPreview::new(
@@ -2279,14 +2272,14 @@ fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &s
             "The exact runtime reports `auto` and selects its model loading strategy during startup",
         ),
         "context_length" if matches!(lower.as_str(), "0" | "auto") => {
-            SettingDefaultPreview::new("4096", SettingDefaultSource::Norted)
-                .with_detail("Norted owns a deterministic fallback when GGUF context metadata is unavailable")
+            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+                .with_detail("The exact runtime defers context selection to model metadata and its runtime fallback")
         }
         "llama.cpp.rope_frequency_base" | "llama.cpp.rope_frequency_scale"
             if matches!(lower.as_str(), "0" | "auto") =>
         {
-            SettingDefaultPreview::new("1.0", SettingDefaultSource::Norted)
-                .with_detail("Norted owns the neutral RoPE fallback when model metadata is unavailable")
+            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+                .with_detail("The exact runtime defers RoPE selection to model metadata and its runtime fallback")
         }
         "seed" if matches!(lower.as_str(), "-1" | "random") => {
             SettingDefaultPreview::new("random", SettingDefaultSource::Runtime)
@@ -2301,24 +2294,23 @@ fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &s
         .with_detail(
             "The exact runtime detects the reasoning mode from the selected chat template",
         ),
-        "reasoning_effort" if lower == "default" => {
-            let value = match &definition.kind {
-                SettingKind::Choice { choices } if choices.iter().any(|choice| choice == "medium") => {
-                    "medium".to_owned()
-                }
-                SettingKind::Choice { choices } => choices.first().cloned().unwrap_or_else(|| "none".to_owned()),
-                _ => "none".to_owned(),
-            };
-            SettingDefaultPreview::new(value, SettingDefaultSource::Norted)
-                .with_detail("Norted selects a concrete effort from the exact runtime's advertised choices")
-        }
+        "reasoning_effort" if lower == "default" => SettingDefaultPreview::new(
+            "auto",
+            SettingDefaultSource::Runtime,
+        )
+        .with_detail("The exact runtime preserves the selected chat template's reasoning policy"),
         "llama.cpp.speculative_mode" if lower == "none" => {
             SettingDefaultPreview::new("off", SettingDefaultSource::Runtime)
         }
         "llama.cpp.chat_template" if matches!(lower.as_str(), "model" | "auto" | "none") => {
-            SettingDefaultPreview::new("none", SettingDefaultSource::Runtime)
-                .with_detail("No runtime-scope chat-template override is applied; a bound model may provide a concrete embedded template")
+            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+                .with_detail("The exact runtime selects the model-provided template when available")
         }
+        _ if lower == "default" => SettingDefaultPreview::new(
+            "auto",
+            SettingDefaultSource::Runtime,
+        )
+        .with_detail("The exact runtime retains its internal policy for this setting"),
         _ if matches!(definition.kind, SettingKind::Toggle | SettingKind::OneWayFlag) => {
             let value = match lower.as_str() {
                 "1" | "true" | "on" | "yes" | "enabled" => "enabled",
@@ -2337,13 +2329,9 @@ fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &s
 }
 
 fn ensure_llama_runtime_defaults(definitions: &mut [SettingDefinition]) {
-    let host_threads = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(1)
-        .to_string();
     for (id, value, detail) in [
-        ("context_length", "4096", "Norted deterministic fallback"),
-        ("parallel_requests", "1", "Norted deterministic baseline"),
+        ("context_length", "auto", "model/runtime context policy"),
+        ("parallel_requests", "auto", "runtime slot policy"),
         ("temperature", "0.8", "llama.cpp runtime baseline"),
         ("top_p", "0.95", "llama.cpp runtime baseline"),
         ("top_k", "40", "llama.cpp runtime baseline"),
@@ -2376,13 +2364,13 @@ fn ensure_llama_runtime_defaults(definitions: &mut [SettingDefinition]) {
         ("llama.cpp.load_mode", "auto", "llama.cpp load policy"),
         (
             "llama.cpp.rope_frequency_base",
-            "1.0",
-            "neutral RoPE fallback",
+            "auto",
+            "model/runtime RoPE policy",
         ),
         (
             "llama.cpp.rope_frequency_scale",
-            "1.0",
-            "neutral RoPE fallback",
+            "auto",
+            "model/runtime RoPE policy",
         ),
         (
             "llama.cpp.unified_kv_cache",
@@ -2411,8 +2399,8 @@ fn ensure_llama_runtime_defaults(definitions: &mut [SettingDefinition]) {
         ),
         (
             "llama.cpp.chat_template",
-            "none",
-            "no runtime-scope template override",
+            "auto",
+            "model/runtime template policy",
         ),
         ("llama.cpp.speculative_mode", "off", "speculation disabled"),
         (
@@ -2426,13 +2414,10 @@ fn ensure_llama_runtime_defaults(definitions: &mut [SettingDefinition]) {
                 && definition.supported
                 && definition.default_preview.is_none()
         }) {
-            let source = if value == "unlimited" || id == "llama.cpp.chat_template" {
-                SettingDefaultSource::Runtime
-            } else {
-                SettingDefaultSource::Norted
-            };
-            definition.default_preview =
-                Some(SettingDefaultPreview::new(value, source).with_detail(detail));
+            definition.default_preview = Some(
+                SettingDefaultPreview::new(value, SettingDefaultSource::Runtime)
+                    .with_detail(detail),
+            );
         }
     }
     if let Some(definition) = definitions.iter_mut().find(|definition| {
@@ -2440,19 +2425,9 @@ fn ensure_llama_runtime_defaults(definitions: &mut [SettingDefinition]) {
             && definition.supported
             && definition.default_preview.is_none()
     }) {
-        let value = match &definition.kind {
-            SettingKind::Choice { choices } if choices.iter().any(|choice| choice == "medium") => {
-                "medium".to_owned()
-            }
-            SettingKind::Choice { choices } => choices
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "none".to_owned()),
-            _ => "none".to_owned(),
-        };
         definition.default_preview = Some(
-            SettingDefaultPreview::new(value, SettingDefaultSource::Norted)
-                .with_detail("Norted selects a concrete advertised effort baseline"),
+            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+                .with_detail("The exact runtime preserves model/template reasoning policy"),
         );
     }
     if let Some(definition) = definitions.iter_mut().find(|definition| {
@@ -2461,8 +2436,8 @@ fn ensure_llama_runtime_defaults(definitions: &mut [SettingDefinition]) {
             && definition.default_preview.is_none()
     }) {
         definition.default_preview = Some(
-            SettingDefaultPreview::new(host_threads, SettingDefaultSource::Derived)
-                .with_detail("Derived from detected host concurrency"),
+            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+                .with_detail("The exact runtime resolves worker count from the launch host"),
         );
     }
 }

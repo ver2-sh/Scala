@@ -189,8 +189,11 @@ each applicable runtime; it must not create a shared parent layer.
 `ResolvedSettings` carries explicit launch configuration separately from the complete effective map.
 The exact adapter schema materializes every supported effective row as a concrete value, winning
 source, and optional derivation detail. Runtime/model/host calculations remain part of the runtime-
-default layer. The TUI, CLI, status data, and provenance consume that same map; none reconstruct a
-value from descriptive default prose.
+default layer. A genuine unresolved runtime policy is represented canonically (for example `auto`),
+not replaced with a presentation-only scalar. Only deliberately Norted-owned execution defaults are
+materialized into launch configuration. Startup-confirmed results supersede automatic policies in
+the running effective map without creating a new source layer. The TUI, CLI, status data, and
+provenance consume that same map; none reconstruct a value from descriptive default prose.
 
 Runtime selection receives the profile's explicit engine and cannot switch engines. Existing
 resolution order remains explicit runtime, persisted model/runtime choice when applicable,
