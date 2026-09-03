@@ -2,7 +2,10 @@ use norted_core::{
     ArtifactFormat, RegistryState, RuntimeCompatibility, RuntimeSourceBuildSystem,
     RuntimeUpdateState,
 };
-use norted_engine::InstalledRuntimeStatus;
+use norted_engine::{
+    BackendLifecycle, BackendParallelism, BackendStatus, InferenceActivity, InferenceActivityPhase,
+    InstalledRuntimeStatus,
+};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -67,97 +70,330 @@ fn render_overview(
         glyphs,
         ui_layout.compact,
     );
-    if let Some(progress) = app.load_progress() {
-        let compact_line = load_progress_compact(
-            progress,
-            app.load_animation_frame,
-            ui_layout.overview_progress.width,
-            glyphs,
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(compact_line, theme.accent))),
-            ui_layout.overview_progress,
-        );
-    }
-    let body = match &app.snapshot.registry_state {
-        RegistryState::NotScanned => vec![
-            Line::from(Span::styled(
-                format!("{}  Preparing model discovery", glyphs.transitional),
-                theme.text,
-            )),
-            Line::default(),
-            Line::from(Span::styled(
-                "The interface is ready; configured directories have not been scanned yet.",
-                theme.muted,
-            )),
-            Line::from(Span::styled(
-                "Discovery will start in the background after this first frame.",
-                theme.hint,
-            )),
-        ],
-        RegistryState::Scanning => vec![
-            Line::from(Span::styled(
-                format!("{}  Discovering local models", glyphs.transitional),
-                theme.text,
-            )),
-            Line::default(),
-            Line::from(Span::styled(
-                "The interface is ready while configured directories are scanned in the background.",
-                theme.muted,
-            )),
-            Line::from(Span::styled(
-                "Models will appear automatically when discovery completes.",
-                theme.hint,
-            )),
-        ],
-        RegistryState::Failed { message } => vec![
-            Line::from(Span::styled("Model discovery failed", theme.error)),
-            Line::default(),
-            Line::from(Span::styled(message, theme.muted)),
-            Line::from(Span::styled("Open Logs for details.", theme.hint)),
-        ],
-        RegistryState::Ready | RegistryState::ReadyWithWarnings { .. }
-            if app.snapshot.models.is_empty() =>
-        {
-            vec![
-                Line::from(Span::styled(
-                    "No model artifacts discovered yet",
-                    theme.text,
-                )),
-                Line::default(),
-                Line::from(Span::styled(
-                    if glyphs.unicode {
-                        "Open Models → Discover to download from Hugging Face."
-                    } else {
-                        "Open Models, then Discover, to download from Hugging Face."
-                    },
-                    theme.accent,
-                )),
-                Line::from(Span::styled(
-                    "Alternatively, configure external model paths for existing artifacts.",
-                    theme.muted,
-                )),
-                Line::default(),
-                Line::from(vec![
-                    Span::styled("/models", theme.accent),
-                    Span::styled("  inspect the registry    ", theme.muted),
-                    Span::styled("?", theme.accent),
-                    Span::styled("  open help", theme.muted),
-                ]),
-            ]
-        }
-        RegistryState::Ready | RegistryState::ReadyWithWarnings { .. } => vec![
-            Line::from(Span::styled("Ready to explore", theme.text)),
-            Line::from(Span::styled(
-                "Open Models to inspect discovered local artifacts.",
-                theme.muted,
-            )),
-        ],
+    render_loaded_models(frame, app, theme, ui_layout);
+}
+
+fn render_loaded_models(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layout: &UiLayout) {
+    let backends = app.resident_backends();
+    let header = if backends.is_empty() {
+        "Loaded Models".to_owned()
+    } else {
+        format!("Loaded Models  {}", backends.len())
     };
     frame.render_widget(
-        Paragraph::new(body).wrap(Wrap { trim: true }),
-        ui_layout.overview_body,
+        Paragraph::new(Line::from(Span::styled(header, theme.accent))),
+        Rect::new(
+            ui_layout.overview_resident.x,
+            ui_layout.overview_resident.y,
+            ui_layout.overview_resident.width,
+            1,
+        ),
     );
+
+    if backends.is_empty() {
+        let (title, detail) = match &app.snapshot.registry_state {
+            RegistryState::NotScanned | RegistryState::Scanning => (
+                "No models loaded",
+                "Model discovery is running; loaded backends will appear here automatically.",
+            ),
+            RegistryState::Failed { .. } => (
+                "No models loaded",
+                "Model discovery failed. Open Logs for details.",
+            ),
+            RegistryState::Ready | RegistryState::ReadyWithWarnings { .. }
+                if app.snapshot.models.is_empty() =>
+            {
+                (
+                    "No models loaded",
+                    "Open Models > Discover to add an artifact, then load a Model Profile.",
+                )
+            }
+            RegistryState::Ready | RegistryState::ReadyWithWarnings { .. } => (
+                "No models loaded",
+                "Open Model Profiles to load a model backend.",
+            ),
+        };
+        render_empty(
+            frame,
+            Rect::new(
+                ui_layout.overview_resident.x,
+                ui_layout.overview_resident.y.saturating_add(1),
+                ui_layout.overview_resident.width,
+                ui_layout.overview_resident.height.saturating_sub(1),
+            ),
+            title,
+            detail,
+            theme,
+        );
+        return;
+    }
+
+    for (index, area) in &ui_layout.overview_backend_rows {
+        let Some(backend) = backends.get(*index) else {
+            continue;
+        };
+        render_backend_card(frame, *area, *index, backend, app, theme, ui_layout);
+    }
+
+    let shown = ui_layout.overview_backend_rows.len();
+    if shown < backends.len() && ui_layout.overview_resident.width >= 12 {
+        let first = app.overview_scroll.saturating_add(1);
+        let last = app
+            .overview_scroll
+            .saturating_add(shown)
+            .min(backends.len());
+        let text = format!("{first}-{last} / {}", backends.len());
+        let width = text.len().min(ui_layout.overview_resident.width as usize) as u16;
+        frame.render_widget(
+            Paragraph::new(Span::styled(text, theme.hint)),
+            Rect::new(
+                ui_layout.overview_resident.right().saturating_sub(width),
+                ui_layout.overview_resident.y,
+                width,
+                1,
+            ),
+        );
+    }
+}
+
+fn render_backend_card(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    index: usize,
+    backend: &BackendStatus,
+    app: &App,
+    theme: &Theme,
+    ui_layout: &UiLayout,
+) {
+    let glyphs = Glyphs::current(app.unicode);
+    let selected = app.focus == FocusArea::Content && app.overview_selected == Some(index);
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_set(glyphs.border)
+        .border_style(if selected { theme.accent } else { theme.border })
+        .style(if selected {
+            theme.selected
+        } else {
+            theme.panel
+        })
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let status = backend_activity_label(backend, app.load_animation_frame, inner.width, &glyphs);
+    let status_style = match backend.lifecycle {
+        BackendLifecycle::Failed => theme.error,
+        BackendLifecycle::Stopping => theme.warning,
+        BackendLifecycle::Loading => theme.accent,
+        BackendLifecycle::Running if backend.active_request_count > 0 => theme.success,
+        BackendLifecycle::Running | BackendLifecycle::Stopped => theme.muted,
+    };
+    let mut lines = vec![Line::from(Span::styled(status, status_style))];
+
+    let profile = app
+        .model_profiles
+        .as_ref()
+        .and_then(|profiles| profiles.profiles.get(&backend.model_profile_id));
+    let model = app
+        .snapshot
+        .models
+        .iter()
+        .find(|model| model.id == backend.model_id);
+    let profile_name = profile.map_or_else(
+        || {
+            backend.provenance.as_ref().map_or_else(
+                || backend.model_profile_id.to_string(),
+                |provenance| provenance.model_profile.display_name.clone(),
+            )
+        },
+        |profile| profile.display_name.clone(),
+    );
+    let model_name = model.map_or_else(
+        || backend.model_id.to_string(),
+        |model| model.display_name.clone(),
+    );
+    let identity = if profile_name == backend.model_profile_id.as_str() {
+        format!("{profile_name} / {model_name}")
+    } else {
+        format!(
+            "{profile_name} [{}] / {model_name}",
+            backend.model_profile_id
+        )
+    };
+    let identity = if ui_layout.compact {
+        format!("{identity}  /  {}", backend_runtime_label(backend))
+    } else {
+        identity
+    };
+    lines.push(Line::from(Span::styled(
+        marquee_text(&identity, inner.width as usize, app.marquee_animation_frame),
+        theme.text,
+    )));
+
+    if !ui_layout.compact {
+        let runtime = backend_runtime_label(backend);
+        lines.push(Line::from(Span::styled(
+            marquee_text(&runtime, inner.width as usize, app.marquee_animation_frame),
+            theme.muted,
+        )));
+    }
+
+    let mut metadata = model
+        .map(|model| format!("Size {}", format_bytes(model.size_bytes)))
+        .unwrap_or_else(|| "Size unknown".to_owned());
+    if let Some(parallel) = &backend.parallel_requests {
+        match parallel {
+            BackendParallelism::Exact(value) => {
+                metadata.push_str(&format!("   Parallel {value}"));
+            }
+            BackendParallelism::Auto => metadata.push_str("   Parallel auto"),
+        }
+    }
+    let action = match backend.lifecycle {
+        BackendLifecycle::Loading => Some("[ Cancel ]"),
+        BackendLifecycle::Running | BackendLifecycle::Failed => Some("[ Unload ]"),
+        BackendLifecycle::Stopped | BackendLifecycle::Stopping => None,
+    };
+    if let Some(action) = action {
+        let available = (inner.width as usize).saturating_sub(action.len() + 1);
+        let metadata = truncate_middle(&metadata, available, glyphs.ellipsis);
+        let gap = (inner.width as usize)
+            .saturating_sub(UnicodeWidthStr::width(metadata.as_str()) + action.len());
+        let hovered = app.hover == Some(HoverTarget::OverviewBackendAction(index));
+        lines.push(Line::from(vec![
+            Span::styled(metadata, theme.hint),
+            Span::raw(" ".repeat(gap)),
+            Span::styled(
+                action,
+                action_style(theme, ActionState::Destructive, hovered),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            truncate_middle(&metadata, inner.width as usize, glyphs.ellipsis),
+            theme.hint,
+        )));
+    }
+
+    if !ui_layout.compact {
+        let request_capacity = inner.height.saturating_sub(lines.len() as u16) as usize;
+        let needs_summary =
+            backend.active_request_count > backend.activities.len().min(request_capacity);
+        let activity_capacity = if needs_summary {
+            request_capacity.saturating_sub(1)
+        } else {
+            request_capacity
+        };
+        let shown_requests = backend.activities.len().min(activity_capacity);
+        for activity in backend.activities.iter().take(shown_requests) {
+            lines.push(Line::from(Span::styled(
+                format_activity(activity),
+                theme.text,
+            )));
+        }
+        let hidden = backend.active_request_count.saturating_sub(shown_requests);
+        if hidden > 0 && request_capacity > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("+{hidden} more requests"),
+                theme.hint,
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn backend_activity_label(
+    backend: &BackendStatus,
+    animation_frame: u32,
+    width: u16,
+    glyphs: &Glyphs,
+) -> String {
+    match backend.lifecycle {
+        BackendLifecycle::Loading => backend.load_progress.as_ref().map_or_else(
+            || "LOADING".to_owned(),
+            |progress| {
+                format!(
+                    "LOADING  {}",
+                    load_progress_compact(
+                        progress,
+                        animation_frame,
+                        width.saturating_sub(9),
+                        glyphs
+                    )
+                )
+            },
+        ),
+        BackendLifecycle::Running if backend.active_request_count == 0 => "IDLE".to_owned(),
+        BackendLifecycle::Running => {
+            let phase = if backend.activities.len() == 1 {
+                match backend.activities[0].phase {
+                    InferenceActivityPhase::ProcessingPrompt => "PROCESSING PROMPT",
+                    InferenceActivityPhase::Generating => "GENERATING",
+                    InferenceActivityPhase::Active => "ACTIVE",
+                }
+            } else {
+                "ACTIVE"
+            };
+            format!("{phase}  {} request(s)", backend.active_request_count)
+        }
+        BackendLifecycle::Stopping => "STOPPING".to_owned(),
+        BackendLifecycle::Failed => backend.failure.as_ref().map_or_else(
+            || "FAILED".to_owned(),
+            |failure| format!("FAILED  {failure}"),
+        ),
+        BackendLifecycle::Stopped => "STOPPED".to_owned(),
+    }
+}
+
+pub(super) fn backend_runtime_label(backend: &BackendStatus) -> String {
+    let mut parts = Vec::new();
+    if let Some(engine) = &backend.engine_id {
+        parts.push(engine.clone());
+    }
+    if let Some(runtime) = backend.runtime_id.as_ref().or_else(|| {
+        backend
+            .provenance
+            .as_ref()
+            .map(|provenance| &provenance.runtime.runtime_id)
+    }) {
+        parts.push(runtime.to_string());
+    }
+    if let Some(version) = &backend.runtime_version {
+        parts.push(format!("v{version}"));
+    }
+    if let Some(variant) = &backend.runtime_variant {
+        parts.push(variant.clone());
+    }
+    if parts.is_empty() {
+        "Runtime resolving".to_owned()
+    } else {
+        parts.join("  /  ")
+    }
+}
+
+fn format_activity(activity: &InferenceActivity) -> String {
+    let state = match activity.phase {
+        InferenceActivityPhase::Active => "ACTIVE".to_owned(),
+        InferenceActivityPhase::ProcessingPrompt => {
+            if let Some(fraction) = activity.prompt_fraction {
+                format!("PROCESSING PROMPT {:.1}%", fraction.clamp(0.0, 1.0) * 100.0)
+            } else if let (Some(current), Some(total)) =
+                (activity.prompt_current, activity.prompt_total)
+            {
+                format!("PROCESSING PROMPT {current}/{total}")
+            } else {
+                "PROCESSING PROMPT".to_owned()
+            }
+        }
+        InferenceActivityPhase::Generating => activity.generated_tokens.map_or_else(
+            || "GENERATING".to_owned(),
+            |tokens| format!("GEN {tokens} tok"),
+        ),
+    };
+    format!("req {}  {state}", activity.id)
 }
 
 fn render_metrics(

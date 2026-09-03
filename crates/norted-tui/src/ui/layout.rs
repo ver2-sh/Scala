@@ -11,6 +11,8 @@ const MODEL_ROW_HEIGHT_COMPACT: u16 = 3;
 const MODEL_ROW_HEIGHT_COMFORTABLE: u16 = 4;
 const TWO_LINE_ROW_HEIGHT_COMPACT: u16 = 2;
 const TWO_LINE_ROW_HEIGHT_COMFORTABLE: u16 = 3;
+const OVERVIEW_CARD_HEIGHT_COMPACT: u16 = 3;
+const OVERVIEW_CARD_HEIGHT_COMFORTABLE: u16 = 6;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InstalledModelAction {
@@ -96,6 +98,8 @@ pub enum HoverTarget {
     FollowLatest,
     CommandSuggestion(usize),
     CommandBar,
+    OverviewBackend(usize),
+    OverviewBackendAction(usize),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -109,8 +113,9 @@ pub struct UiLayout {
     pub nav_items: Vec<(Screen, Rect)>,
     pub content: Rect,
     pub overview_metrics: Rect,
-    pub overview_body: Rect,
-    pub overview_progress: Rect,
+    pub overview_resident: Rect,
+    pub overview_backend_rows: Vec<(usize, Rect)>,
+    pub overview_backend_actions: Vec<(usize, Rect)>,
     pub model_installed_tab: Rect,
     pub model_discover_tab: Rect,
     pub model_search_field: Rect,
@@ -212,22 +217,64 @@ impl UiLayout {
         let nav_items = nav_rects(regions[0], compact);
 
         let mut overview_metrics = Rect::default();
-        let mut overview_body = Rect::default();
-        let mut overview_progress = Rect::default();
+        let mut overview_resident = Rect::default();
+        let mut overview_backend_rows = Vec::new();
+        let mut overview_backend_actions = Vec::new();
         if app.screen == Screen::Overview {
-            let progress_height = if app.load_progress().is_some() { 1 } else { 0 };
             let overview = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(if compact { 3 } else { 4 }),
-                    Constraint::Length(if compact { 6 } else { 5 }),
-                    Constraint::Length(progress_height),
-                    Constraint::Min(5),
+                    Constraint::Length(if compact { 4 } else { 5 }),
+                    Constraint::Min(2),
                 ])
                 .split(content);
             overview_metrics = overview[1];
-            overview_progress = overview[2];
-            overview_body = overview[3];
+            overview_resident = overview[2];
+            let mut card_height = if compact {
+                OVERVIEW_CARD_HEIGHT_COMPACT
+            } else {
+                OVERVIEW_CARD_HEIGHT_COMFORTABLE
+            };
+            let cards = Rect::new(
+                overview_resident.x,
+                overview_resident.y.saturating_add(1),
+                overview_resident.width,
+                overview_resident.height.saturating_sub(1),
+            );
+            if cards.height < card_height {
+                card_height = cards.height.max(1);
+            }
+            let capacity = (cards.height / card_height.max(1)) as usize;
+            let visible_count = capacity.min(
+                app.resident_backends()
+                    .len()
+                    .saturating_sub(app.overview_scroll),
+            );
+            for (visible, index) in (app.overview_scroll..).take(visible_count).enumerate() {
+                let area = Rect::new(
+                    cards.x,
+                    cards.y + visible as u16 * card_height,
+                    cards.width,
+                    card_height,
+                );
+                overview_backend_rows.push((index, area));
+                let label_width = if compact { 8 } else { 10 };
+                overview_backend_actions.push((
+                    index,
+                    Rect::new(
+                        area.right().saturating_sub(label_width),
+                        area.y
+                            + if compact {
+                                area.height.saturating_sub(1)
+                            } else {
+                                3.min(area.height.saturating_sub(1))
+                            },
+                        label_width.min(area.width),
+                        1,
+                    ),
+                ));
+            }
         }
 
         let mut model_installed_tab = Rect::default();
@@ -1053,8 +1100,9 @@ impl UiLayout {
             nav_items,
             content,
             overview_metrics,
-            overview_body,
-            overview_progress,
+            overview_resident,
+            overview_backend_rows,
+            overview_backend_actions,
             model_installed_tab,
             model_discover_tab,
             model_search_field,
@@ -1170,6 +1218,20 @@ impl UiLayout {
                 });
             }
             return None;
+        }
+        if let Some((index, _)) = self
+            .overview_backend_actions
+            .iter()
+            .find(|(_, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::OverviewBackendAction(*index));
+        }
+        if let Some((index, _)) = self
+            .overview_backend_rows
+            .iter()
+            .find(|(_, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::OverviewBackend(*index));
         }
         if let Some((index, _)) = self
             .suggestion_rows
@@ -1311,6 +1373,10 @@ impl UiLayout {
 
     pub fn model_capacity(&self) -> usize {
         (self.model_list.height / self.model_row_height.max(1)) as usize
+    }
+
+    pub fn overview_capacity(&self) -> usize {
+        self.overview_backend_rows.len()
     }
 
     pub fn log_capacity(&self) -> usize {
@@ -1508,6 +1574,57 @@ impl UiLayout {
             }
             Some(Overlay::Help) => {}
             None => match app.screen {
+                Screen::Overview => {
+                    let backends = app.resident_backends();
+                    for (index, row) in &self.overview_backend_rows {
+                        let Some(backend) = backends.get(*index) else {
+                            continue;
+                        };
+                        let profile = app
+                            .model_profiles
+                            .as_ref()
+                            .and_then(|profiles| profiles.profiles.get(&backend.model_profile_id));
+                        let model = app
+                            .snapshot
+                            .models
+                            .iter()
+                            .find(|model| model.id == backend.model_id);
+                        let profile_name = profile.map_or_else(
+                            || {
+                                backend.provenance.as_ref().map_or_else(
+                                    || backend.model_profile_id.to_string(),
+                                    |provenance| provenance.model_profile.display_name.clone(),
+                                )
+                            },
+                            |profile| profile.display_name.clone(),
+                        );
+                        let model_name = model.map_or_else(
+                            || backend.model_id.to_string(),
+                            |model| model.display_name.clone(),
+                        );
+                        let mut identity = if profile_name == backend.model_profile_id.as_str() {
+                            format!("{profile_name} / {model_name}")
+                        } else {
+                            format!(
+                                "{profile_name} [{}] / {model_name}",
+                                backend.model_profile_id
+                            )
+                        };
+                        if self.compact {
+                            identity.push_str("  /  ");
+                            identity.push_str(&super::screens::backend_runtime_label(backend));
+                        }
+                        let width = row.width.saturating_sub(3) as usize;
+                        track(&format!("overview-identity:{index}"), &identity, width);
+                        if !self.compact {
+                            track(
+                                &format!("overview-runtime:{index}"),
+                                &super::screens::backend_runtime_label(backend),
+                                width,
+                            );
+                        }
+                    }
+                }
                 Screen::Models => {
                     for (index, row) in &self.download_job_rows {
                         let Some(job) = app.model_download_jobs.get(*index) else {
@@ -1772,7 +1889,7 @@ impl UiLayout {
                         }
                     }
                 }
-                Screen::Overview | Screen::Logs | Screen::Help => {}
+                Screen::Logs | Screen::Help => {}
             },
         }
 

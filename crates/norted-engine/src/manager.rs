@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::Stream;
@@ -25,6 +25,7 @@ use crate::{
 };
 
 const NOTICE_LIMIT: usize = 64;
+const STATUS_ACTIVITY_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,10 +186,44 @@ pub struct BackendStatus {
     pub load_progress: Option<BackendLoadProgress>,
     pub failure: Option<String>,
     pub provenance: Option<RuntimeProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_requests: Option<BackendParallelism>,
+    pub activities: Vec<InferenceActivity>,
     pub active_request_count: usize,
     pub primary_lease_count: usize,
     pub last_used_unix: i64,
     pub retiring: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "mode", content = "value")]
+pub enum BackendParallelism {
+    Exact(u64),
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceActivityPhase {
+    Active,
+    ProcessingPrompt,
+    Generating,
+}
+
+/// A bounded, payload-free observation of one request currently using a backend.
+/// Numeric fields are present only when an adapter has exact runtime evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InferenceActivity {
+    pub id: String,
+    pub phase: InferenceActivityPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_fraction: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_current: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -344,6 +379,7 @@ struct RunningBackend {
 struct BackendActivity {
     active_requests: AtomicUsize,
     last_used_unix: AtomicI64,
+    requests: StdMutex<BTreeMap<u64, InferenceActivity>>,
     drained: Notify,
 }
 
@@ -352,6 +388,7 @@ impl BackendActivity {
         Arc::new(Self {
             active_requests: AtomicUsize::new(0),
             last_used_unix: AtomicI64::new(unix_timestamp()),
+            requests: StdMutex::new(BTreeMap::new()),
             drained: Notify::new(),
         })
     }
@@ -359,6 +396,7 @@ impl BackendActivity {
 
 struct InferenceLease {
     activity: Arc<BackendActivity>,
+    request_sequence: u64,
 }
 
 struct InferenceTarget {
@@ -371,17 +409,52 @@ struct InferenceTarget {
 }
 
 impl InferenceLease {
-    fn acquire(activity: Arc<BackendActivity>) -> Self {
+    fn acquire(activity: Arc<BackendActivity>, request_sequence: u64) -> Self {
         activity.active_requests.fetch_add(1, Ordering::AcqRel);
         activity
             .last_used_unix
             .store(unix_timestamp(), Ordering::Release);
-        Self { activity }
+        activity
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                request_sequence,
+                InferenceActivity {
+                    id: format!("req-{request_sequence:08x}"),
+                    phase: InferenceActivityPhase::Active,
+                    prompt_fraction: None,
+                    prompt_current: None,
+                    prompt_total: None,
+                    generated_tokens: None,
+                },
+            );
+        Self {
+            activity,
+            request_sequence,
+        }
+    }
+
+    fn mark_generating(&self) {
+        if let Some(request) = self
+            .activity
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&self.request_sequence)
+        {
+            request.phase = InferenceActivityPhase::Generating;
+        }
     }
 }
 
 impl Drop for InferenceLease {
     fn drop(&mut self) {
+        self.activity
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.request_sequence);
         self.activity
             .last_used_unix
             .store(unix_timestamp(), Ordering::Release);
@@ -405,7 +478,24 @@ impl Stream for LeasedInferenceStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let result = this.inner.as_mut().poll_next(cx);
-        if matches!(&result, std::task::Poll::Ready(None | Some(Err(_)))) {
+        let generated_output = match &result {
+            std::task::Poll::Ready(Some(Ok(crate::InferenceEvent::TextDelta { delta }))) => {
+                !delta.is_empty()
+            }
+            std::task::Poll::Ready(Some(Ok(crate::InferenceEvent::ToolCallDelta { .. }))) => true,
+            _ => false,
+        };
+        if generated_output {
+            if let Some(lease) = &this.lease {
+                lease.mark_generating();
+            }
+        }
+        if matches!(
+            &result,
+            std::task::Poll::Ready(
+                None | Some(Err(_)) | Some(Ok(crate::InferenceEvent::Completed { .. }))
+            )
+        ) {
             this.lease.take();
         }
         result
@@ -484,6 +574,7 @@ pub struct RuntimeManager {
     state: RwLock<ManagerState>,
     operation: Arc<Mutex<()>>,
     cancellation_epoch: AtomicU64,
+    next_activity_sequence: AtomicU64,
     shutting_down: AtomicBool,
     reaper: Mutex<Option<tokio::task::JoinHandle<()>>>,
     settings: SettingsStore,
@@ -518,6 +609,7 @@ impl RuntimeManager {
             }),
             operation: Arc::new(Mutex::new(())),
             cancellation_epoch: AtomicU64::new(0),
+            next_activity_sequence: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
             reaper: Mutex::new(None),
             settings,
@@ -2091,7 +2183,10 @@ impl RuntimeManager {
             .as_ref()
             .filter(|_| backend.lifecycle == BackendLifecycle::Running && !backend.retiring)
             .ok_or_else(|| RuntimeError::ModelProfileNotLoaded(requested.clone()))?;
-        let lease = InferenceLease::acquire(Arc::clone(&backend.activity));
+        let lease = InferenceLease::acquire(
+            Arc::clone(&backend.activity),
+            self.next_activity_sequence.fetch_add(1, Ordering::Relaxed),
+        );
         Ok(InferenceTarget {
             adapter: Arc::clone(&active.adapter),
             endpoint: active.endpoint.clone(),
@@ -2137,7 +2232,10 @@ impl RuntimeManager {
             .running
             .as_ref()
             .expect("running backend has process state");
-        let lease = InferenceLease::acquire(Arc::clone(&backend.activity));
+        let lease = InferenceLease::acquire(
+            Arc::clone(&backend.activity),
+            self.next_activity_sequence.fetch_add(1, Ordering::Relaxed),
+        );
         Some(InferenceTarget {
             adapter: Arc::clone(&active.adapter),
             endpoint: active.endpoint.clone(),
@@ -2277,6 +2375,12 @@ impl RuntimeManager {
         backend.running = None;
         backend.runtime_id = None;
         backend.load_progress = None;
+        backend
+            .activity
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         push_notice(
             &mut state,
             RuntimeNoticeLevel::Error,
@@ -2348,6 +2452,16 @@ impl RuntimeManager {
                     load_progress: backend.load_progress.clone(),
                     failure: backend.failure.clone(),
                     provenance: backend.provenance.clone(),
+                    parallel_requests: backend_parallelism(backend),
+                    activities: backend
+                        .activity
+                        .requests
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .values()
+                        .take(STATUS_ACTIVITY_LIMIT)
+                        .cloned()
+                        .collect(),
                     active_request_count: backend.activity.active_requests.load(Ordering::Acquire),
                     primary_lease_count,
                     last_used_unix: backend.activity.last_used_unix.load(Ordering::Acquire),
@@ -2367,6 +2481,46 @@ impl RuntimeManager {
             backends,
             recent_events: state.notices.iter().cloned().collect(),
         }
+    }
+}
+
+fn backend_parallelism(backend: &ManagedBackend) -> Option<BackendParallelism> {
+    if let Some(value) = backend
+        .provenance
+        .as_ref()
+        .and_then(|provenance| provenance.normalized_settings.get("resolved_settings"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|settings| settings.get("parallel_requests"))
+        .and_then(serde_json::Value::as_u64)
+    {
+        return Some(BackendParallelism::Exact(value));
+    }
+
+    let running = backend.running.as_ref()?;
+    match running.settings.value("parallel_requests") {
+        Some(norted_core::SettingValue::UnsignedInteger(value)) => {
+            Some(BackendParallelism::Exact(*value))
+        }
+        Some(norted_core::SettingValue::UnsignedIntegerOrChoice(
+            norted_core::UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
+        )) => Some(BackendParallelism::Exact(*value)),
+        Some(norted_core::SettingValue::UnsignedIntegerOrChoice(
+            norted_core::UnsignedIntegerOrChoiceValue::Choice(value),
+        )) if value.eq_ignore_ascii_case("auto") => Some(BackendParallelism::Auto),
+        Some(norted_core::SettingValue::Choice(value)) if value.eq_ignore_ascii_case("auto") => {
+            Some(BackendParallelism::Auto)
+        }
+        None if running
+            .settings_schema
+            .definitions
+            .iter()
+            .any(|definition| {
+                definition.id.as_str() == "parallel_requests" && definition.supported
+            }) =>
+        {
+            Some(BackendParallelism::Auto)
+        }
+        _ => None,
     }
 }
 

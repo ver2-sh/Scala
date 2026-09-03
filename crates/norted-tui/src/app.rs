@@ -11,7 +11,7 @@ use norted_core::{
     SettingId, SettingScope, SettingValue, SettingsSchema, SettingsState,
 };
 use norted_engine::{
-    BackendLifecycle, BackendLoadProgress, ControlStatus, RuntimeListSnapshot,
+    BackendLifecycle, BackendLoadProgress, BackendStatus, ControlStatus, RuntimeListSnapshot,
     RuntimeModelCandidate, RuntimeNoticeLevel, RuntimeSearchResult, RuntimeSearchSnapshot,
     RuntimeUpdateCheck,
 };
@@ -354,6 +354,8 @@ pub struct App {
     pub focus: FocusArea,
     pub nav_focus: Screen,
     pub hover: Option<HoverTarget>,
+    pub overview_selected: Option<usize>,
+    pub overview_scroll: usize,
     pub selected_model: Option<usize>,
     pub model_scroll: usize,
     pub model_library_view: ModelLibraryView,
@@ -473,6 +475,8 @@ impl App {
             focus: FocusArea::Navigation,
             nav_focus: Screen::Overview,
             hover: None,
+            overview_selected: None,
+            overview_scroll: 0,
             selected_model: None,
             model_scroll: 0,
             model_library_view: ModelLibraryView::Installed,
@@ -841,6 +845,16 @@ impl App {
             .loading_backend()?
             .load_progress
             .as_ref()
+    }
+
+    pub fn resident_backends(&self) -> Vec<&BackendStatus> {
+        let mut backends = self
+            .control
+            .as_ref()
+            .map(|control| control.backends.iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        backends.sort_by_key(|backend| backend.generation);
+        backends
     }
 
     pub fn selected_model_load_progress(&self) -> Option<&BackendLoadProgress> {
@@ -1954,6 +1968,10 @@ impl App {
     }
 
     fn apply_control_status(&mut self, source: ControlStatusSource, status: ControlStatus) -> bool {
+        let selected_generation = self
+            .resident_backends()
+            .get(self.overview_selected.unwrap_or_default())
+            .map(|backend| backend.generation);
         let target = match source {
             ControlStatusSource::ControlResult => self
                 .active_control_action
@@ -1978,6 +1996,27 @@ impl App {
             self.reconcile_lifecycle_notice(target.as_ref(), previous, &status);
         }
         self.control = Some(status);
+        let (backend_count, selected) = {
+            let backends = self.resident_backends();
+            let selected = if backends.is_empty() {
+                None
+            } else {
+                selected_generation
+                    .and_then(|generation| {
+                        backends
+                            .iter()
+                            .position(|backend| backend.generation == generation)
+                    })
+                    .or(Some(
+                        self.overview_selected
+                            .unwrap_or_default()
+                            .min(backends.len() - 1),
+                    ))
+            };
+            (backends.len(), selected)
+        };
+        self.overview_selected = selected;
+        self.overview_scroll = self.overview_scroll.min(backend_count.saturating_sub(1));
         true
     }
 
@@ -2356,6 +2395,22 @@ impl App {
             }
         }
         match self.screen {
+            Screen::Overview => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => self.move_overview_selection(-1, layout),
+                KeyCode::Down | KeyCode::Char('j') => self.move_overview_selection(1, layout),
+                KeyCode::PageUp => {
+                    self.move_overview_selection(-(layout.overview_capacity() as isize), layout)
+                }
+                KeyCode::PageDown => {
+                    self.move_overview_selection(layout.overview_capacity() as isize, layout)
+                }
+                KeyCode::Home => self.select_overview_backend(0, layout),
+                KeyCode::End if !self.resident_backends().is_empty() => {
+                    self.select_overview_backend(self.resident_backends().len() - 1, layout)
+                }
+                KeyCode::Enter | KeyCode::Char('u') => self.request_overview_unload(),
+                _ => Update::None,
+            },
             Screen::Models if self.model_library_view == ModelLibraryView::Discover => {
                 self.handle_model_discover_key(key)
             }
@@ -3370,6 +3425,18 @@ impl App {
                 self.notice = None;
                 self.activate_screen(screen)
             }
+            Some(HoverTarget::OverviewBackend(index)) => {
+                self.focus = FocusArea::Content;
+                self.overview_selected =
+                    Some(index.min(self.resident_backends().len().saturating_sub(1)));
+                Update::Render
+            }
+            Some(HoverTarget::OverviewBackendAction(index)) => {
+                self.focus = FocusArea::Content;
+                self.overview_selected =
+                    Some(index.min(self.resident_backends().len().saturating_sub(1)));
+                self.request_overview_unload()
+            }
             Some(HoverTarget::ModelLibraryTab(view)) => {
                 if self.command_active {
                     self.close_command();
@@ -3676,6 +3743,7 @@ impl App {
                 self.move_model_search_selection(direction * 3)
             }
             Screen::Models => self.scroll_models(direction * 3, layout),
+            Screen::Overview => self.move_overview_selection(direction, layout),
             Screen::ModelProfiles => self.scroll_settings(direction * 3, layout),
             Screen::Logs => self.scroll_logs(direction * -3, layout),
             Screen::Runtimes => self.scroll_runtimes(direction * 3, layout),
@@ -4653,6 +4721,69 @@ impl App {
         self.pending_control_action = Some(ControlAction::Unload(profile_id));
         self.control_busy = true;
         self.notice = Some("Unloading the selected Model Profile…".to_owned());
+        Update::Render
+    }
+
+    fn move_overview_selection(&mut self, amount: isize, layout: &UiLayout) -> Update {
+        let len = self.resident_backends().len();
+        if len == 0 {
+            self.overview_selected = None;
+            self.overview_scroll = 0;
+            return Update::None;
+        }
+        let current = self.overview_selected.unwrap_or_default();
+        let next = if amount < 0 {
+            current.saturating_sub(amount.unsigned_abs())
+        } else {
+            current.saturating_add(amount as usize).min(len - 1)
+        };
+        self.select_overview_backend(next, layout)
+    }
+
+    fn select_overview_backend(&mut self, index: usize, layout: &UiLayout) -> Update {
+        let len = self.resident_backends().len();
+        if len == 0 {
+            return Update::None;
+        }
+        let index = index.min(len - 1);
+        self.overview_selected = Some(index);
+        let capacity = layout.overview_capacity().max(1);
+        if index < self.overview_scroll {
+            self.overview_scroll = index;
+        } else if index >= self.overview_scroll + capacity {
+            self.overview_scroll = index + 1 - capacity;
+        }
+        Update::Render
+    }
+
+    fn request_overview_unload(&mut self) -> Update {
+        if self.control_busy {
+            self.notice = Some("A control operation is already in progress".to_owned());
+            return Update::Render;
+        }
+        let Some(backend) = self
+            .resident_backends()
+            .get(self.overview_selected.unwrap_or_default())
+            .copied()
+        else {
+            self.notice = Some("No Model Profile is currently loaded".to_owned());
+            return Update::Render;
+        };
+        if !matches!(
+            backend.lifecycle,
+            BackendLifecycle::Loading | BackendLifecycle::Running | BackendLifecycle::Failed
+        ) {
+            return Update::None;
+        }
+        let loading = backend.lifecycle == BackendLifecycle::Loading;
+        let profile_id = backend.model_profile_id.clone();
+        self.pending_control_action = Some(ControlAction::Unload(profile_id));
+        self.control_busy = true;
+        self.notice = Some(if loading {
+            "Cancelling the selected Model Profile load…".to_owned()
+        } else {
+            "Unloading the selected Model Profile…".to_owned()
+        });
         Update::Render
     }
 }

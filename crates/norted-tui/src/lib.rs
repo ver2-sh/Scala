@@ -48,6 +48,7 @@ struct ControlPollState {
     initial_observation_pending: bool,
     local_load_intent: LocalLoadIntent,
     observed_loading: bool,
+    observed_activity: bool,
 }
 
 impl ControlPollState {
@@ -80,8 +81,15 @@ impl ControlPollState {
         }
     }
 
+    fn record_activity(&mut self, active: bool) {
+        self.observed_activity = active;
+    }
+
     fn cadence(&self) -> Duration {
-        if self.local_load_intent != LocalLoadIntent::Idle || self.observed_loading {
+        if self.local_load_intent != LocalLoadIntent::Idle
+            || self.observed_loading
+            || self.observed_activity
+        {
             CONTROL_LOADING_CADENCE
         } else {
             CONTROL_IDLE_CADENCE
@@ -185,6 +193,11 @@ pub async fn run(
                     })
                     .map(|backend| (backend.generation, backend.lifecycle)),
             );
+            poll_state.record_activity(observation.status.as_ref().is_some_and(|status| {
+                status.backends.iter().any(|backend| {
+                    backend.active_request_count > 0 || !backend.activities.is_empty()
+                })
+            }));
             if control_updates.send(observation).await.is_err() {
                 break;
             }
