@@ -1,5 +1,6 @@
 use norted_core::{ArtifactFormat, RegistryState, RuntimeAcquisitionMethod};
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
+use ratatui::widgets::{Block, Borders, Padding};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, ModelLibraryView, Overlay, Screen};
@@ -13,6 +14,13 @@ const TWO_LINE_ROW_HEIGHT_COMPACT: u16 = 2;
 const TWO_LINE_ROW_HEIGHT_COMFORTABLE: u16 = 3;
 const OVERVIEW_CARD_HEIGHT_COMPACT: u16 = 3;
 const OVERVIEW_CARD_HEIGHT_COMFORTABLE: u16 = 6;
+
+pub(super) fn overview_backend_card_inner(area: Rect) -> Rect {
+    Block::default()
+        .borders(Borders::LEFT)
+        .padding(Padding::horizontal(1))
+        .inner(area)
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InstalledModelAction {
@@ -259,18 +267,19 @@ impl UiLayout {
                     card_height,
                 );
                 overview_backend_rows.push((index, area));
-                let label_width = if compact { 8 } else { 10 };
+                let inner = overview_backend_card_inner(area);
+                let label_width = 10.min(inner.width);
                 overview_backend_actions.push((
                     index,
                     Rect::new(
-                        area.right().saturating_sub(label_width),
-                        area.y
+                        inner.right().saturating_sub(label_width),
+                        inner.y
                             + if compact {
-                                area.height.saturating_sub(1)
+                                inner.height.saturating_sub(1)
                             } else {
-                                3.min(area.height.saturating_sub(1))
+                                3.min(inner.height.saturating_sub(1))
                             },
-                        label_width.min(area.width),
+                        label_width,
                         1,
                     ),
                 ));

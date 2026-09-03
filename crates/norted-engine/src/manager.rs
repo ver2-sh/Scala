@@ -217,8 +217,6 @@ pub struct InferenceActivity {
     pub id: String,
     pub phase: InferenceActivityPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_fraction: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_current: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_total: Option<u64>,
@@ -423,7 +421,6 @@ impl InferenceLease {
                 InferenceActivity {
                     id: format!("req-{request_sequence:08x}"),
                     phase: InferenceActivityPhase::Active,
-                    prompt_fraction: None,
                     prompt_current: None,
                     prompt_total: None,
                     generated_tokens: None,
@@ -433,6 +430,49 @@ impl InferenceLease {
             activity,
             request_sequence,
         }
+    }
+
+    fn mark_processing_prompt(&self) {
+        if let Some(request) = self
+            .activity
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&self.request_sequence)
+            && request.phase == InferenceActivityPhase::Active
+        {
+            request.phase = InferenceActivityPhase::ProcessingPrompt;
+        }
+    }
+
+    fn activity_reporter(&self) -> crate::InferenceActivityReporter {
+        let activity = Arc::clone(&self.activity);
+        let request_sequence = self.request_sequence;
+        Arc::new(move |update| {
+            let mut requests = activity
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(request) = requests.get_mut(&request_sequence) else {
+                return;
+            };
+            match update {
+                crate::InferenceActivityUpdate::PromptProgress { current, total }
+                    if total > 0 && current <= total =>
+                {
+                    request.prompt_current = Some(current);
+                    request.prompt_total = Some(total);
+                }
+                crate::InferenceActivityUpdate::GeneratedTokens(tokens) => {
+                    request.generated_tokens = Some(
+                        request
+                            .generated_tokens
+                            .map_or(tokens, |previous| previous.max(tokens)),
+                    );
+                }
+                crate::InferenceActivityUpdate::PromptProgress { .. } => {}
+            }
+        })
     }
 
     fn mark_generating(&self) {
@@ -1727,9 +1767,11 @@ impl RuntimeManager {
             .generation_settings
             .merged(&request.generation_settings);
         let effective_output_format = request.output_format.clone();
+        target.lease.mark_processing_prompt();
+        let activity = target.lease.activity_reporter();
         let stream = target
             .adapter
-            .infer_stream(&target.endpoint, request)
+            .infer_stream(&target.endpoint, request, activity)
             .await
             .map_err(map_inference_error)?;
         let stream = Box::pin(LeasedInferenceStream {

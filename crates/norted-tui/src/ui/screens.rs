@@ -21,7 +21,7 @@ use crate::ui::components::{
 };
 use crate::ui::layout::{
     DownloadJobAction, HoverTarget, InstalledModelAction, ModelProfileAction,
-    SelectedRuntimeAction, UiLayout,
+    SelectedRuntimeAction, UiLayout, overview_backend_card_inner,
 };
 use crate::ui::runtime_search::progress_text;
 
@@ -177,7 +177,7 @@ fn render_backend_card(
             theme.panel
         })
         .padding(Padding::horizontal(1));
-    let inner = block.inner(area);
+    let inner = overview_backend_card_inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -378,12 +378,13 @@ fn format_activity(activity: &InferenceActivity) -> String {
     let state = match activity.phase {
         InferenceActivityPhase::Active => "ACTIVE".to_owned(),
         InferenceActivityPhase::ProcessingPrompt => {
-            if let Some(fraction) = activity.prompt_fraction {
-                format!("PROCESSING PROMPT {:.1}%", fraction.clamp(0.0, 1.0) * 100.0)
-            } else if let (Some(current), Some(total)) =
-                (activity.prompt_current, activity.prompt_total)
+            if let (Some(current), Some(total)) = (activity.prompt_current, activity.prompt_total)
+                && total > 0
+                && current <= total
             {
-                format!("PROCESSING PROMPT {current}/{total}")
+                #[allow(clippy::cast_precision_loss)]
+                let percent = current as f64 / total as f64 * 100.0;
+                format!("PROCESSING PROMPT {percent:.1}%")
             } else {
                 "PROCESSING PROMPT".to_owned()
             }
@@ -393,7 +394,7 @@ fn format_activity(activity: &InferenceActivity) -> String {
             |tokens| format!("GEN {tokens} tok"),
         ),
     };
-    format!("req {}  {state}", activity.id)
+    format!("{}  {state}", activity.id)
 }
 
 fn render_metrics(

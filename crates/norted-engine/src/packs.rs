@@ -2362,6 +2362,7 @@ mod tests {
             &self,
             _endpoint: &str,
             _request: InferenceRequest,
+            _activity: crate::InferenceActivityReporter,
         ) -> Result<InferenceStream, EngineError> {
             unreachable!()
         }

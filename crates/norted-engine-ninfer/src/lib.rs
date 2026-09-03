@@ -17,11 +17,11 @@ use norted_core::{
 use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CompatibilityDecision,
     EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError, EngineFeature,
-    EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceOutput, InferenceRequest,
-    InferenceStream, InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter,
-    NativeOption, OptionValueKind, OutputFormat, PreparedModelInput, ProcessDescriptor,
-    RuntimeVariantUpdateIdentity, UpdateState, capture_command, compatibility_for,
-    isolated_cuda_environment, prepare_norted_package_input,
+    EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceActivityReporter,
+    InferenceOutput, InferenceRequest, InferenceStream, InstallationState, LaunchRequest,
+    LaunchSpec, LoadProgressReporter, NativeOption, OptionValueKind, OutputFormat,
+    PreparedModelInput, ProcessDescriptor, RuntimeVariantUpdateIdentity, UpdateState,
+    capture_command, compatibility_for, isolated_cuda_environment, prepare_norted_package_input,
     prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
     revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
 };
@@ -1765,6 +1765,7 @@ impl EngineAdapter for NinferAdapter {
         &self,
         endpoint: &str,
         request: InferenceRequest,
+        _activity: InferenceActivityReporter,
     ) -> Result<InferenceStream, EngineError> {
         let execution = self
             .active_executions

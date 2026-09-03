@@ -29,10 +29,11 @@ use norted_core::{
 use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CompatibilityDecision,
     EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError, EngineFeature,
-    EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceEvent, InferenceFinishReason,
-    InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
-    InferenceUsage, InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter,
-    NativeOption, OptionValueKind, OutputFormat, PreparedModelInput, ProcessDescriptor,
+    EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceActivityReporter,
+    InferenceActivityUpdate, InferenceEvent, InferenceFinishReason, InferenceMessage,
+    InferenceOutput, InferenceRequest, InferenceRole, InferenceStream, InferenceUsage,
+    InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter, NativeOption,
+    OptionValueKind, OutputFormat, PreparedModelInput, ProcessDescriptor,
     RuntimeVariantUpdateIdentity, StartupObservation, UpdateState, capture_command,
     common_setting_definitions, prepare_norted_package_input,
     prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
@@ -508,6 +509,8 @@ impl LlamaCppAdapter {
         }
         if stream {
             body["stream_options"] = json!({ "include_usage": true });
+            body["return_progress"] = json!(true);
+            body["timings_per_token"] = json!(true);
         }
         body
     }
@@ -1270,6 +1273,7 @@ impl EngineAdapter for LlamaCppAdapter {
         &self,
         endpoint: &str,
         request: InferenceRequest,
+        activity: InferenceActivityReporter,
     ) -> Result<InferenceStream, EngineError> {
         let response = self
             .client
@@ -1287,7 +1291,7 @@ impl EngineAdapter for LlamaCppAdapter {
                 .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
             return Err(backend_http_error(status, &body));
         }
-        Ok(llama_sse_stream(response.bytes_stream().boxed()))
+        Ok(llama_sse_stream(response.bytes_stream().boxed(), activity))
     }
 }
 
@@ -1393,16 +1397,21 @@ struct SseState {
     queued: VecDeque<Result<InferenceEvent, EngineError>>,
     usage: Option<InferenceUsage>,
     finish_reason: Option<InferenceFinishReason>,
+    activity: InferenceActivityReporter,
     finished: bool,
 }
 
-fn llama_sse_stream(source: BoxStream<'static, Result<Bytes, reqwest::Error>>) -> InferenceStream {
+fn llama_sse_stream(
+    source: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    activity: InferenceActivityReporter,
+) -> InferenceStream {
     let state = SseState {
         source,
         buffer: Vec::new(),
         queued: VecDeque::new(),
         usage: None,
         finish_reason: None,
+        activity,
         finished: false,
     };
     Box::pin(stream::unfold(state, |mut state| async move {
@@ -1489,6 +1498,25 @@ fn parse_sse_frames(state: &mut SseState) {
             ))));
             state.finished = true;
             return;
+        }
+        if let Some(progress) = value.get("prompt_progress")
+            && let (Some(total), Some(current), Some(cache)) = (
+                progress.get("total").and_then(Value::as_u64),
+                progress.get("processed").and_then(Value::as_u64),
+                progress.get("cache").and_then(Value::as_u64),
+            )
+            && total > 0
+            && cache <= current
+            && current <= total
+        {
+            (state.activity)(InferenceActivityUpdate::PromptProgress { current, total });
+        }
+        if let Some(tokens) = value
+            .get("timings")
+            .and_then(|timings| timings.get("predicted_n"))
+            .and_then(Value::as_u64)
+        {
+            (state.activity)(InferenceActivityUpdate::GeneratedTokens(tokens));
         }
         if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
             match serde_json::from_value::<ChatUsage>(usage.clone()) {
