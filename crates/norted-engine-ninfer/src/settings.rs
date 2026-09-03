@@ -226,7 +226,6 @@ pub(crate) fn apply_reviewed_runtime_defaults(
         ("presence_penalty", "auto"),
         ("frequency_penalty", "auto"),
         ("max_output_tokens", "8192"),
-        ("reasoning", "on"),
         ("reasoning_effort", "auto"),
         ("reasoning_budget", "unlimited"),
         ("ninfer.kv_dtype", "BF16"),
@@ -241,9 +240,6 @@ pub(crate) fn apply_reviewed_runtime_defaults(
         ("ninfer.prefix_reuse", "enabled"),
         ("ninfer.thinking", "enabled"),
         ("ninfer.preserve_thinking", "disabled"),
-        ("ninfer.host_state_slots", "8"),
-        ("ninfer.host_kv_mib", "8192 MiB"),
-        ("ninfer.max_long_anchors_per_continuation", "2"),
         ("ninfer.max_pending_requests", "16"),
         ("ninfer.pending_timeout_ms", "30000 ms"),
         ("ninfer.log_stats_interval_ms", "5000 ms"),
@@ -266,6 +262,28 @@ pub(crate) fn apply_reviewed_runtime_defaults(
             .with_detail("NInfer creates a fresh random seed for each request when none is set"),
     );
 
+    let thinking = reviewed_effective_thinking(settings);
+    let thinking_is_derived = settings.is_some_and(|settings| {
+        settings.value("ninfer.thinking").is_some() || settings.value("reasoning_effort").is_some()
+    });
+    set_default(
+        definitions,
+        "reasoning",
+        SettingDefaultPreview::new(
+            if thinking { "on" } else { "off" },
+            if thinking_is_derived {
+                SettingDefaultSource::Derived
+            } else {
+                SettingDefaultSource::Runtime
+            },
+        )
+        .with_detail(if thinking_is_derived {
+            "Inherited from the effective NInfer process thinking mode or reasoning-effort request default"
+        } else {
+            "The reviewed NInfer server enables thinking by default"
+        }),
+    );
+
     let concurrency = settings
         .and_then(|settings| settings.value("parallel_requests"))
         .and_then(|value| match value {
@@ -280,6 +298,13 @@ pub(crate) fn apply_reviewed_runtime_defaults(
             _ => None,
         })
         .unwrap_or(8192);
+    let prefix_reuse = settings
+        .and_then(|settings| settings.value("ninfer.prefix_reuse"))
+        .and_then(|value| match value {
+            SettingValue::Toggle(value) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(true);
     set_default(
         definitions,
         "ninfer.kv_capacity",
@@ -288,28 +313,86 @@ pub(crate) fn apply_reviewed_runtime_defaults(
                 "When omitted, the reviewed runtime sets explicit KV capacity to effective context length",
             ),
     );
-    for (id, value, formula) in [
-        (
-            "ninfer.device_state_slots",
-            concurrency,
-            "The reviewed runtime defaults extra device checkpoint slots to effective concurrency",
-        ),
-        (
-            "ninfer.max_private_continuations",
-            concurrency.saturating_mul(2),
-            "The reviewed runtime defaults private continuations to twice effective concurrency",
-        ),
-        (
-            "ninfer.max_shared_prefixes",
-            concurrency.max(4),
-            "The reviewed runtime defaults shared prefixes to max(effective concurrency, 4)",
-        ),
-    ] {
+    let cache_defaults = if prefix_reuse {
+        [
+            (
+                "ninfer.device_state_slots",
+                concurrency,
+                "With prefix reuse enabled, the reviewed runtime defaults extra device checkpoint slots to effective concurrency",
+            ),
+            (
+                "ninfer.host_state_slots",
+                8,
+                "With prefix reuse enabled, the reviewed runtime defaults Host state capacity to 8 slots",
+            ),
+            (
+                "ninfer.host_kv_mib",
+                8192,
+                "With prefix reuse enabled, the reviewed runtime defaults Host KV capacity to 8192 MiB",
+            ),
+            (
+                "ninfer.max_private_continuations",
+                concurrency.saturating_mul(2),
+                "With prefix reuse enabled, the reviewed runtime defaults private continuations to twice effective concurrency",
+            ),
+            (
+                "ninfer.max_shared_prefixes",
+                concurrency.max(4),
+                "With prefix reuse enabled, the reviewed runtime defaults shared prefixes to max(effective concurrency, 4)",
+            ),
+            (
+                "ninfer.max_long_anchors_per_continuation",
+                2,
+                "With prefix reuse enabled, the reviewed runtime defaults long anchors per continuation to 2",
+            ),
+        ]
+    } else {
+        [
+            (
+                "ninfer.device_state_slots",
+                0,
+                "Disabling prefix reuse makes the reviewed runtime use no extra device checkpoint slots",
+            ),
+            (
+                "ninfer.host_state_slots",
+                0,
+                "Disabling prefix reuse makes the reviewed runtime use no Host state slots",
+            ),
+            (
+                "ninfer.host_kv_mib",
+                0,
+                "Disabling prefix reuse makes the reviewed runtime use no Host KV capacity",
+            ),
+            (
+                "ninfer.max_private_continuations",
+                concurrency,
+                "Disabling prefix reuse retains only the reviewed runtime's active root continuations",
+            ),
+            (
+                "ninfer.max_shared_prefixes",
+                0,
+                "Disabling prefix reuse makes the reviewed runtime retain no shared prefixes",
+            ),
+            (
+                "ninfer.max_long_anchors_per_continuation",
+                0,
+                "Disabling prefix reuse makes the reviewed runtime retain no long anchors",
+            ),
+        ]
+    };
+    for (id, value, formula) in cache_defaults {
         set_default(
             definitions,
             id,
-            SettingDefaultPreview::new(value.to_string(), SettingDefaultSource::Derived)
-                .with_detail(formula),
+            SettingDefaultPreview::new(
+                if id == "ninfer.host_kv_mib" {
+                    format!("{value} MiB")
+                } else {
+                    value.to_string()
+                },
+                SettingDefaultSource::Derived,
+            )
+            .with_detail(formula),
         );
     }
     set_default(
@@ -319,6 +402,44 @@ pub(crate) fn apply_reviewed_runtime_defaults(
             "The reviewed runtime selects up to 16 media preprocessing workers from host concurrency",
         ),
     );
+}
+
+pub(crate) fn reviewed_request_thinking_override(
+    settings: Option<&ResolvedSettings>,
+) -> Option<bool> {
+    settings
+        .and_then(|settings| settings.value("reasoning"))
+        .and_then(|value| match value {
+            SettingValue::Choice(value) if value == "on" => Some(true),
+            SettingValue::Choice(value) if value == "off" => Some(false),
+            _ => None,
+        })
+        .or_else(|| {
+            settings
+                .and_then(|settings| settings.value("reasoning_effort"))
+                .and_then(|value| match value {
+                    SettingValue::Choice(value) if value == "none" => Some(false),
+                    SettingValue::Choice(value)
+                        if matches!(value.as_str(), "low" | "medium" | "xhigh") =>
+                    {
+                        Some(true)
+                    }
+                    _ => None,
+                })
+        })
+}
+
+fn reviewed_effective_thinking(settings: Option<&ResolvedSettings>) -> bool {
+    reviewed_request_thinking_override(settings)
+        .or_else(|| {
+            settings
+                .and_then(|settings| settings.value("ninfer.thinking"))
+                .and_then(|value| match value {
+                    SettingValue::Toggle(value) => Some(*value),
+                    _ => None,
+                })
+        })
+        .unwrap_or(true)
 }
 
 fn set_default(definitions: &mut [SettingDefinition], id: &str, preview: SettingDefaultPreview) {
@@ -338,35 +459,7 @@ pub(crate) fn apply_model_sampler_defaults(
     let Some(ArtifactNativeIdentity::Ninfer(identity)) = model.native_identity.as_ref() else {
         return;
     };
-    let request_thinking = settings
-        .and_then(|settings| settings.value("reasoning"))
-        .and_then(|value| match value {
-            SettingValue::Choice(value) if value == "on" => Some(true),
-            SettingValue::Choice(value) if value == "off" => Some(false),
-            SettingValue::Choice(value) if value == "auto" => None,
-            _ => None,
-        })
-        .or_else(|| {
-            settings
-                .and_then(|settings| settings.value("reasoning_effort"))
-                .and_then(|value| match value {
-                    SettingValue::Choice(value) if value == "none" => Some(false),
-                    SettingValue::Choice(value)
-                        if matches!(value.as_str(), "low" | "medium" | "xhigh") =>
-                    {
-                        Some(true)
-                    }
-                    _ => None,
-                })
-        });
-    let process_thinking = settings
-        .and_then(|settings| settings.value("ninfer.thinking"))
-        .and_then(|value| match value {
-            SettingValue::Toggle(value) => Some(*value),
-            _ => None,
-        })
-        .unwrap_or(true);
-    let thinking = request_thinking.unwrap_or(process_thinking);
+    let thinking = reviewed_effective_thinking(settings);
     let (mut temperature, top_p, top_k, min_p, presence_penalty, frequency_penalty) =
         match (identity.model_id.as_str(), thinking) {
             ("qwen3.6-27b" | "qwen3.8-27b", true) => ("1.0", "0.95", "20", "0.0", "0.0", "0.0"),
