@@ -469,6 +469,9 @@ impl InferenceLease {
                             .generated_tokens
                             .map_or(tokens, |previous| previous.max(tokens)),
                     );
+                    if tokens > 0 && request.phase != InferenceActivityPhase::Generating {
+                        request.phase = InferenceActivityPhase::Generating;
+                    }
                 }
                 crate::InferenceActivityUpdate::PromptProgress { .. } => {}
             }

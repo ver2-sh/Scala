@@ -328,16 +328,13 @@ fn backend_activity_label(
         ),
         BackendLifecycle::Running if backend.active_request_count == 0 => "IDLE".to_owned(),
         BackendLifecycle::Running => {
-            let phase = if backend.activities.len() == 1 {
-                match backend.activities[0].phase {
-                    InferenceActivityPhase::ProcessingPrompt => "PROCESSING PROMPT",
-                    InferenceActivityPhase::Generating => "GENERATING",
-                    InferenceActivityPhase::Active => "ACTIVE",
-                }
+            if backend.active_request_count == 1 && backend.activities.len() == 1 {
+                format_activity_state(&backend.activities[0])
+            } else if backend.active_request_count == 1 {
+                "ACTIVE".to_owned()
             } else {
-                "ACTIVE"
-            };
-            format!("{phase}  {} request(s)", backend.active_request_count)
+                format!("ACTIVE {} requests", backend.active_request_count)
+            }
         }
         BackendLifecycle::Stopping => "STOPPING".to_owned(),
         BackendLifecycle::Failed => backend.failure.as_ref().map_or_else(
@@ -375,7 +372,11 @@ pub(super) fn backend_runtime_label(backend: &BackendStatus) -> String {
 }
 
 fn format_activity(activity: &InferenceActivity) -> String {
-    let state = match activity.phase {
+    format!("{}  {}", activity.id, format_activity_state(activity))
+}
+
+fn format_activity_state(activity: &InferenceActivity) -> String {
+    match activity.phase {
         InferenceActivityPhase::Active => "ACTIVE".to_owned(),
         InferenceActivityPhase::ProcessingPrompt => {
             if let (Some(current), Some(total)) = (activity.prompt_current, activity.prompt_total)
@@ -393,8 +394,7 @@ fn format_activity(activity: &InferenceActivity) -> String {
             || "GENERATING".to_owned(),
             |tokens| format!("GEN {tokens} tok"),
         ),
-    };
-    format!("{}  {state}", activity.id)
+    }
 }
 
 fn render_metrics(

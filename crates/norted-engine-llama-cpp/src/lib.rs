@@ -514,6 +514,36 @@ impl LlamaCppAdapter {
         }
         body
     }
+
+    async fn startup_properties(
+        &self,
+        endpoint: &str,
+    ) -> Result<LlamaStartupProperties, EngineError> {
+        let response = self
+            .client
+            .get(format!("{endpoint}/props"))
+            .timeout(PROPS_TIMEOUT)
+            .send()
+            .await
+            .map_err(map_transport_error)?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
+        if !status.is_success() {
+            return Err(backend_http_error(status, &body));
+        }
+        let props: PropsResponse = serde_json::from_slice(&body).map_err(|error| {
+            EngineError::Operation(format!(
+                "invalid llama.cpp /props context contract: {error}"
+            ))
+        })?;
+        Ok(LlamaStartupProperties {
+            context_length: props.default_generation_settings.n_ctx,
+            parallel_requests: props.total_slots.filter(|slots| *slots > 0),
+        })
+    }
 }
 
 #[async_trait]
@@ -657,27 +687,9 @@ impl EngineAdapter for LlamaCppAdapter {
     }
 
     async fn context_capacity(&self, endpoint: &str) -> Result<Option<u64>, EngineError> {
-        let response = self
-            .client
-            .get(format!("{endpoint}/props"))
-            .timeout(PROPS_TIMEOUT)
-            .send()
-            .await
-            .map_err(map_transport_error)?;
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
-        if !status.is_success() {
-            return Err(backend_http_error(status, &body));
-        }
-        let props: PropsResponse = serde_json::from_slice(&body).map_err(|error| {
-            EngineError::Operation(format!(
-                "invalid llama.cpp /props context contract: {error}"
-            ))
-        })?;
-        Ok(Some(props.default_generation_settings.n_ctx))
+        Ok(Some(
+            self.startup_properties(endpoint).await?.context_length,
+        ))
     }
 
     async fn count_input_tokens(
@@ -1174,12 +1186,17 @@ impl EngineAdapter for LlamaCppAdapter {
         let endpoint = process.endpoint.as_deref().ok_or_else(|| {
             EngineError::Operation("llama.cpp process has no backend endpoint".to_owned())
         })?;
-        let Some(context) = self.context_capacity(endpoint).await? else {
-            return Ok(StartupObservation::Ready(BTreeMap::new()));
-        };
+        let properties = self.startup_properties(endpoint).await?;
+        let mut resolved_settings = serde_json::Map::from_iter([(
+            "context_length".to_owned(),
+            json!(properties.context_length),
+        )]);
+        if let Some(parallel_requests) = properties.parallel_requests {
+            resolved_settings.insert("parallel_requests".to_owned(), json!(parallel_requests));
+        }
         Ok(StartupObservation::Ready(BTreeMap::from([(
             "resolved_settings".to_owned(),
-            json!({"context_length": context}),
+            Value::Object(resolved_settings),
         )])))
     }
 
@@ -1332,6 +1349,12 @@ struct HealthResponse {
 #[derive(Deserialize)]
 struct PropsResponse {
     default_generation_settings: DefaultGenerationSettings,
+    total_slots: Option<u64>,
+}
+
+struct LlamaStartupProperties {
+    context_length: u64,
+    parallel_requests: Option<u64>,
 }
 
 #[derive(Deserialize)]
