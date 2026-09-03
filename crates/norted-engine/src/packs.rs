@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use norted_core::{
     AppPaths, ArtifactFormat, AvailableRuntime, EngineInstallation, HostCapabilities,
-    InstalledRuntime, ModelArtifact, ModelId, RUNTIME_MANIFEST_SCHEMA_VERSION,
-    RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId, RuntimeIdentity, RuntimeManifest,
-    RuntimeOperationProgress, RuntimePackageIdentity, RuntimeProbeObservation,
+    InstalledRuntime, ModelArtifact, ModelId, ModelProfile, RUNTIME_MANIFEST_SCHEMA_VERSION,
+    ResolvedSettings, RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId, RuntimeIdentity,
+    RuntimeManifest, RuntimeOperationProgress, RuntimePackageIdentity, RuntimeProbeObservation,
     RuntimeReleaseChannel, RuntimeSelection, RuntimeSelectionSource, RuntimeSelections,
-    RuntimeUpdatePreference, RuntimeUpdateState, effective_cmake_configuration_arguments,
+    RuntimeUpdatePreference, RuntimeUpdateState, SettingId, SettingsError, SettingsPatch,
+    SettingsState, effective_cmake_configuration_arguments,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -57,6 +58,15 @@ pub enum RuntimePackError {
     Selection(String),
     #[error("engine adapter failed: {0}")]
     Adapter(#[from] EngineError),
+    #[error(transparent)]
+    Settings(#[from] SettingsError),
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelProfileEngineSwitchCandidate {
+    pub overrides: SettingsPatch,
+    pub removed: Vec<SettingId>,
+    pub resolved: ResolvedSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +340,83 @@ impl RuntimePackManager {
             .await
             .map_err(RuntimePackError::Adapter)?;
         Ok((selection, schema))
+    }
+
+    /// Preflights a Model Profile engine change against the selected target
+    /// runtime. Stored overrides are retained only when the exact target
+    /// definition accepts both their ID and value.
+    pub async fn model_profile_engine_switch_candidate(
+        &self,
+        settings_state: &SettingsState,
+        profile: &ModelProfile,
+        model: &ModelArtifact,
+        target_engine_id: &str,
+        structured_path_base: &Path,
+    ) -> Result<ModelProfileEngineSwitchCandidate, RuntimePackError> {
+        let runtime_defaults =
+            settings_state.resolve_runtime_defaults(target_engine_id, structured_path_base)?;
+        let (_, mut schema) = self
+            .settings_schema_for_model_for_engine_with_settings(
+                model,
+                target_engine_id,
+                None,
+                Some(&runtime_defaults),
+            )
+            .await?;
+        let mut overrides = profile.overrides.clone();
+        let mut removed = BTreeSet::new();
+
+        loop {
+            overrides.0.retain(|id, value| {
+                let compatible = schema
+                    .definition(id)
+                    .is_some_and(|definition| definition.validate_value(value).is_ok());
+                if !compatible {
+                    removed.insert(id.clone());
+                }
+                compatible
+            });
+
+            let mut resolved = settings_state.resolve(
+                &profile.id,
+                target_engine_id,
+                &overrides,
+                &SettingsPatch::default(),
+                structured_path_base,
+            )?;
+            let (_, exact_schema) = self
+                .settings_schema_for_model_for_engine_with_settings(
+                    model,
+                    target_engine_id,
+                    None,
+                    Some(&resolved),
+                )
+                .await?;
+
+            let before = overrides.0.len();
+            overrides.0.retain(|id, value| {
+                let compatible = exact_schema
+                    .definition(id)
+                    .is_some_and(|definition| definition.validate_value(value).is_ok());
+                if !compatible {
+                    removed.insert(id.clone());
+                }
+                compatible
+            });
+            if overrides.0.len() != before {
+                schema = exact_schema;
+                continue;
+            }
+
+            exact_schema.materialize_runtime_configuration(&mut resolved)?;
+            exact_schema.validate(&resolved)?;
+            exact_schema.materialize_effective(&mut resolved)?;
+            return Ok(ModelProfileEngineSwitchCandidate {
+                overrides,
+                removed: removed.into_iter().collect(),
+                resolved,
+            });
+        }
     }
 
     pub async fn list(&self) -> Result<RuntimeListSnapshot, RuntimePackError> {

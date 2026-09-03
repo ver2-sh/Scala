@@ -50,9 +50,9 @@ pub use manager::{
     RuntimeNoticeLevel,
 };
 pub use packs::{
-    InstalledRuntimeStatus, RuntimeListSnapshot, RuntimeLocalInspection, RuntimeModelCandidate,
-    RuntimePackError, RuntimePackManager, RuntimeSearchResult, RuntimeSearchSnapshot,
-    RuntimeUpdateCheck,
+    InstalledRuntimeStatus, ModelProfileEngineSwitchCandidate, RuntimeListSnapshot,
+    RuntimeLocalInspection, RuntimeModelCandidate, RuntimePackError, RuntimePackManager,
+    RuntimeSearchResult, RuntimeSearchSnapshot, RuntimeUpdateCheck,
 };
 pub use store::{
     RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreIssue, RuntimeStoreIssueKind,
