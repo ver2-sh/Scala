@@ -2508,11 +2508,7 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
             || definitions
                 .get(index.saturating_sub(1))
                 .is_none_or(|previous| previous.category != definition.category);
-        let status = if definition.supported {
-            format!("{label} · {}", display.source)
-        } else {
-            format!("{label} · unsupported")
-        };
+        let status = format!("{label} · {}", display.source);
         let heading = if starts_category {
             format!("{}  ──  {status}", definition.category)
         } else {
@@ -2545,7 +2541,7 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
             Line::from(vec![Span::styled(format!("  {id_text}"), theme.text)]),
         ];
         frame.render_widget(Paragraph::new(lines).style(style), *rect);
-        let value_enabled = definition.supported && !app.settings_busy();
+        let value_enabled = !app.settings_busy();
         let value_label = format!("[ {} ]", display.value);
         let value_text = if active_row || app.hover == Some(HoverTarget::SettingValue(*index)) {
             marquee_text(

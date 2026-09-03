@@ -5,12 +5,29 @@ use norted_core::{
     SettingDefaultPreview, SettingDefaultSource, SettingDefinition, SettingId, SettingKind,
     SettingScope, SettingValue, UnsignedIntegerOrChoiceValue,
 };
-use norted_engine::{EngineError, common_setting_definitions};
+use norted_engine::{EngineError, common_setting_definitions_for};
 
 const MAX_NINFER_CLI_INTEGER: u64 = i32::MAX as u64;
+const NINFER_COMMON_SETTINGS: &[&str] = &[
+    "context_length",
+    "parallel_requests",
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "seed",
+    "presence_penalty",
+    "frequency_penalty",
+    "max_output_tokens",
+    "stop_strings",
+    "system_prompt",
+    "reasoning",
+    "reasoning_effort",
+    "reasoning_budget",
+];
 
 pub(crate) fn definitions() -> Vec<SettingDefinition> {
-    let mut definitions = common_setting_definitions(crate::ENGINE_ID);
+    let mut definitions = common_setting_definitions_for(crate::ENGINE_ID, NINFER_COMMON_SETTINGS);
     definitions.extend([
         definition(
             "ninfer.kv_dtype",
@@ -219,23 +236,20 @@ pub(crate) fn apply_reviewed_runtime_defaults(
     for (id, value) in [
         ("context_length", "8192"),
         ("parallel_requests", "1"),
-        ("temperature", "1.0"),
-        ("top_p", "0.95"),
-        ("top_k", "20"),
-        ("min_p", "0.0"),
-        ("repeat_penalty", "1.0"),
-        ("presence_penalty", "0.0"),
-        ("frequency_penalty", "0.0"),
+        ("temperature", "auto"),
+        ("top_p", "auto"),
+        ("top_k", "auto"),
+        ("min_p", "auto"),
+        ("presence_penalty", "auto"),
+        ("frequency_penalty", "auto"),
         ("max_output_tokens", "8192"),
-        ("reasoning", "on"),
-        ("reasoning_effort", "none"),
-        ("reasoning_budget", "None"),
+        ("reasoning_effort", "auto"),
+        ("reasoning_budget", "unlimited"),
         ("ninfer.kv_dtype", "BF16"),
-        ("ninfer.kv_capacity", "8192"),
         ("ninfer.prefill_chunk", "1024"),
         ("ninfer.speculation", "disabled"),
         ("ninfer.speculative_backend", "off"),
-        ("ninfer.draft_tokens", "unused"),
+        ("ninfer.draft_tokens", "0"),
         ("ninfer.lm_head_draft", "disabled"),
         ("ninfer.vision", "disabled"),
         ("ninfer.greedy", "disabled"),
@@ -243,9 +257,6 @@ pub(crate) fn apply_reviewed_runtime_defaults(
         ("ninfer.prefix_reuse", "enabled"),
         ("ninfer.thinking", "enabled"),
         ("ninfer.preserve_thinking", "disabled"),
-        ("ninfer.host_state_slots", "8"),
-        ("ninfer.host_kv_mib", "8192 MiB"),
-        ("ninfer.max_long_anchors_per_continuation", "2"),
         ("ninfer.max_pending_requests", "16"),
         ("ninfer.pending_timeout_ms", "30000 ms"),
         ("ninfer.log_stats_interval_ms", "5000 ms"),
@@ -268,6 +279,28 @@ pub(crate) fn apply_reviewed_runtime_defaults(
             .with_detail("NInfer creates a fresh random seed for each request when none is set"),
     );
 
+    let thinking = reviewed_effective_thinking(settings);
+    let thinking_is_derived = settings.is_some_and(|settings| {
+        settings.value("ninfer.thinking").is_some() || settings.value("reasoning_effort").is_some()
+    });
+    set_default(
+        definitions,
+        "reasoning",
+        SettingDefaultPreview::new(
+            if thinking { "on" } else { "off" },
+            if thinking_is_derived {
+                SettingDefaultSource::Derived
+            } else {
+                SettingDefaultSource::Runtime
+            },
+        )
+        .with_detail(if thinking_is_derived {
+            "Inherited from the effective NInfer process thinking mode or reasoning-effort request default"
+        } else {
+            "The reviewed NInfer server enables thinking by default"
+        }),
+    );
+
     let concurrency = settings
         .and_then(|settings| settings.value("parallel_requests"))
         .and_then(|value| match value {
@@ -275,42 +308,155 @@ pub(crate) fn apply_reviewed_runtime_defaults(
             _ => None,
         })
         .unwrap_or(1);
-    for (id, value, formula) in [
-        (
-            "ninfer.device_state_slots",
-            concurrency,
-            "The reviewed runtime defaults extra device checkpoint slots to effective concurrency",
-        ),
-        (
-            "ninfer.max_private_continuations",
-            concurrency.saturating_mul(2),
-            "The reviewed runtime defaults private continuations to twice effective concurrency",
-        ),
-        (
-            "ninfer.max_shared_prefixes",
-            concurrency,
-            "The reviewed runtime defaults shared prefixes to effective concurrency",
-        ),
-    ] {
+    let context = settings
+        .and_then(|settings| settings.value("context_length"))
+        .and_then(|value| match value {
+            SettingValue::UnsignedInteger(value) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(8192);
+    let prefix_reuse = settings
+        .and_then(|settings| settings.value("ninfer.prefix_reuse"))
+        .and_then(|value| match value {
+            SettingValue::Toggle(value) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(true);
+    set_default(
+        definitions,
+        "ninfer.kv_capacity",
+        SettingDefaultPreview::new(context.to_string(), SettingDefaultSource::Derived)
+            .with_detail(
+                "When omitted, the reviewed runtime sets explicit KV capacity to effective context length",
+            ),
+    );
+    let cache_defaults = if prefix_reuse {
+        [
+            (
+                "ninfer.device_state_slots",
+                concurrency,
+                "With prefix reuse enabled, the reviewed runtime defaults extra device checkpoint slots to effective concurrency",
+            ),
+            (
+                "ninfer.host_state_slots",
+                8,
+                "With prefix reuse enabled, the reviewed runtime defaults Host state capacity to 8 slots",
+            ),
+            (
+                "ninfer.host_kv_mib",
+                8192,
+                "With prefix reuse enabled, the reviewed runtime defaults Host KV capacity to 8192 MiB",
+            ),
+            (
+                "ninfer.max_private_continuations",
+                concurrency.saturating_mul(2),
+                "With prefix reuse enabled, the reviewed runtime defaults private continuations to twice effective concurrency",
+            ),
+            (
+                "ninfer.max_shared_prefixes",
+                concurrency.max(4),
+                "With prefix reuse enabled, the reviewed runtime defaults shared prefixes to max(effective concurrency, 4)",
+            ),
+            (
+                "ninfer.max_long_anchors_per_continuation",
+                2,
+                "With prefix reuse enabled, the reviewed runtime defaults long anchors per continuation to 2",
+            ),
+        ]
+    } else {
+        [
+            (
+                "ninfer.device_state_slots",
+                0,
+                "Disabling prefix reuse makes the reviewed runtime use no extra device checkpoint slots",
+            ),
+            (
+                "ninfer.host_state_slots",
+                0,
+                "Disabling prefix reuse makes the reviewed runtime use no Host state slots",
+            ),
+            (
+                "ninfer.host_kv_mib",
+                0,
+                "Disabling prefix reuse makes the reviewed runtime use no Host KV capacity",
+            ),
+            (
+                "ninfer.max_private_continuations",
+                concurrency,
+                "Disabling prefix reuse retains only the reviewed runtime's active root continuations",
+            ),
+            (
+                "ninfer.max_shared_prefixes",
+                0,
+                "Disabling prefix reuse makes the reviewed runtime retain no shared prefixes",
+            ),
+            (
+                "ninfer.max_long_anchors_per_continuation",
+                0,
+                "Disabling prefix reuse makes the reviewed runtime retain no long anchors",
+            ),
+        ]
+    };
+    for (id, value, formula) in cache_defaults {
         set_default(
             definitions,
             id,
-            SettingDefaultPreview::new(value.to_string(), SettingDefaultSource::Derived)
-                .with_detail(formula),
+            SettingDefaultPreview::new(
+                if id == "ninfer.host_kv_mib" {
+                    format!("{value} MiB")
+                } else {
+                    value.to_string()
+                },
+                SettingDefaultSource::Derived,
+            )
+            .with_detail(formula),
         );
     }
-    let media_threads = std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get())
-        .unwrap_or(1)
-        .min(16);
     set_default(
         definitions,
         "ninfer.media_preprocess_threads",
-        SettingDefaultPreview::new(media_threads.to_string(), SettingDefaultSource::Derived)
-            .with_detail(
-                "Derived from detected host concurrency using the reviewed runtime's maximum of 16 workers",
-            ),
+        SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
+            "The reviewed runtime selects up to 16 media preprocessing workers from host concurrency",
+        ),
     );
+}
+
+pub(crate) fn reviewed_request_thinking_override(
+    settings: Option<&ResolvedSettings>,
+) -> Option<bool> {
+    settings
+        .and_then(|settings| settings.value("reasoning"))
+        .and_then(|value| match value {
+            SettingValue::Choice(value) if value == "on" => Some(true),
+            SettingValue::Choice(value) if value == "off" => Some(false),
+            _ => None,
+        })
+        .or_else(|| {
+            settings
+                .and_then(|settings| settings.value("reasoning_effort"))
+                .and_then(|value| match value {
+                    SettingValue::Choice(value) if value == "none" => Some(false),
+                    SettingValue::Choice(value)
+                        if matches!(value.as_str(), "low" | "medium" | "xhigh") =>
+                    {
+                        Some(true)
+                    }
+                    _ => None,
+                })
+        })
+}
+
+fn reviewed_effective_thinking(settings: Option<&ResolvedSettings>) -> bool {
+    reviewed_request_thinking_override(settings)
+        .or_else(|| {
+            settings
+                .and_then(|settings| settings.value("ninfer.thinking"))
+                .and_then(|value| match value {
+                    SettingValue::Toggle(value) => Some(*value),
+                    _ => None,
+                })
+        })
+        .unwrap_or(true)
 }
 
 fn set_default(definitions: &mut [SettingDefinition], id: &str, preview: SettingDefaultPreview) {
@@ -330,22 +476,7 @@ pub(crate) fn apply_model_sampler_defaults(
     let Some(ArtifactNativeIdentity::Ninfer(identity)) = model.native_identity.as_ref() else {
         return;
     };
-    let request_thinking = settings
-        .and_then(|settings| settings.value("reasoning"))
-        .and_then(|value| match value {
-            SettingValue::Choice(value) if value == "on" => Some(true),
-            SettingValue::Choice(value) if value == "off" => Some(false),
-            SettingValue::Choice(value) if value == "auto" => None,
-            _ => None,
-        });
-    let process_thinking = settings
-        .and_then(|settings| settings.value("ninfer.thinking"))
-        .and_then(|value| match value {
-            SettingValue::Toggle(value) => Some(*value),
-            _ => None,
-        })
-        .unwrap_or(true);
-    let thinking = request_thinking.unwrap_or(process_thinking);
+    let thinking = reviewed_effective_thinking(settings);
     let (mut temperature, top_p, top_k, min_p, presence_penalty, frequency_penalty) =
         match (identity.model_id.as_str(), thinking) {
             ("qwen3.6-27b" | "qwen3.8-27b", true) => ("1.0", "0.95", "20", "0.0", "0.0", "0.0"),
@@ -436,6 +567,13 @@ pub(crate) fn apply_runtime_bounds(definitions: &mut [SettingDefinition]) {
         budget.description =
             "Positive process-default thinking budget; explicit request effort/toggle controls remain separate"
                 .to_owned();
+    }
+    if let Some(effort) = definitions
+        .iter_mut()
+        .find(|definition| definition.id.as_str() == "reasoning_effort")
+        && let SettingKind::Choice { choices } = &mut effort.kind
+    {
+        choices.retain(|choice| matches!(choice.as_str(), "none" | "low" | "medium" | "xhigh"));
     }
 }
 
@@ -550,49 +688,63 @@ fn unsigned(
     )
 }
 
-pub(crate) fn option_for_setting(id: &str) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingExecutionPath {
+    LaunchOption(&'static str),
+    NortedRequestDefault,
+    VirtualLaunchControl(&'static str),
+    Unsupported,
+}
+
+pub(crate) fn execution_path_for_setting(id: &str) -> SettingExecutionPath {
+    use SettingExecutionPath::{
+        LaunchOption, NortedRequestDefault, Unsupported, VirtualLaunchControl,
+    };
+
     match id {
-        "context_length" => "--max-context",
-        "parallel_requests" => "--max-concurrency",
-        "temperature" => "--temperature",
-        "top_p" => "--top-p",
-        "top_k" => "--top-k",
-        "min_p" => "--min-p",
-        "seed" => "--seed",
-        "presence_penalty" => "--presence-penalty",
-        "frequency_penalty" => "--frequency-penalty",
-        "max_output_tokens" => "--default-max-tokens",
-        "reasoning_budget" => "--default-thinking-budget",
-        "reasoning_effort" | "reasoning" | "stop_strings" | "system_prompt" => "",
-        "ninfer.kv_dtype" => "--kv-dtype",
-        "ninfer.kv_capacity" => "--kv-capacity",
-        "ninfer.prefill_chunk" => "--prefill-chunk",
-        "ninfer.speculation" => "",
-        "ninfer.speculative_backend" => "--spec",
-        "ninfer.draft_tokens" => "--draft-tokens",
-        "ninfer.lm_head_draft" => "--lm-head-draft",
-        "ninfer.vision" => "--vision",
-        "ninfer.greedy" => "--greedy",
-        "ninfer.cuda_graph" => "--no-cuda-graph",
-        "ninfer.prefix_reuse" => "--no-prefix-reuse",
-        "ninfer.thinking" => "--no-thinking",
-        "ninfer.preserve_thinking" => "--preserve-thinking",
-        "ninfer.device_state_slots" => "--device-state-slots",
-        "ninfer.host_state_slots" => "--host-state-slots",
-        "ninfer.host_kv_mib" => "--host-kv-mib",
-        "ninfer.max_private_continuations" => "--max-private-continuations",
-        "ninfer.max_shared_prefixes" => "--max-shared-prefixes",
-        "ninfer.max_long_anchors_per_continuation" => "--max-long-anchors-per-continuation",
-        "ninfer.max_pending_requests" => "--max-pending-requests",
-        "ninfer.pending_timeout_ms" => "--pending-timeout-ms",
-        "ninfer.log_stats_interval_ms" => "--log-stats-interval-ms",
-        "ninfer.max_request_mib" => "--max-request-mib",
-        "ninfer.media_cache_mib" => "--media-cache-mib",
-        "ninfer.media_live_mib" => "--media-live-mib",
-        "ninfer.media_preprocess_threads" => "--media-preprocess-threads",
-        "ninfer.response_store_max_records" => "--response-store-max-records",
-        "ninfer.response_store_max_mib" => "--response-store-max-mib",
-        _ => "",
+        "context_length" => LaunchOption("--max-context"),
+        "parallel_requests" => LaunchOption("--max-concurrency"),
+        "temperature" => LaunchOption("--temperature"),
+        "top_p" => LaunchOption("--top-p"),
+        "top_k" => LaunchOption("--top-k"),
+        "min_p" => LaunchOption("--min-p"),
+        "seed" => LaunchOption("--seed"),
+        "presence_penalty" => LaunchOption("--presence-penalty"),
+        "frequency_penalty" => LaunchOption("--frequency-penalty"),
+        "max_output_tokens" => LaunchOption("--default-max-tokens"),
+        "reasoning_budget" => LaunchOption("--default-thinking-budget"),
+        "reasoning_effort" | "reasoning" | "stop_strings" | "system_prompt" => NortedRequestDefault,
+        "ninfer.kv_dtype" => LaunchOption("--kv-dtype"),
+        "ninfer.kv_capacity" => LaunchOption("--kv-capacity"),
+        "ninfer.prefill_chunk" => LaunchOption("--prefill-chunk"),
+        "ninfer.speculation" => VirtualLaunchControl("--spec"),
+        "ninfer.speculative_backend" => LaunchOption("--spec"),
+        "ninfer.draft_tokens" => LaunchOption("--draft-tokens"),
+        "ninfer.lm_head_draft" => LaunchOption("--lm-head-draft"),
+        "ninfer.vision" => LaunchOption("--vision"),
+        "ninfer.greedy" => LaunchOption("--greedy"),
+        "ninfer.cuda_graph" => LaunchOption("--no-cuda-graph"),
+        "ninfer.prefix_reuse" => LaunchOption("--no-prefix-reuse"),
+        "ninfer.thinking" => LaunchOption("--no-thinking"),
+        "ninfer.preserve_thinking" => LaunchOption("--preserve-thinking"),
+        "ninfer.device_state_slots" => LaunchOption("--device-state-slots"),
+        "ninfer.host_state_slots" => LaunchOption("--host-state-slots"),
+        "ninfer.host_kv_mib" => LaunchOption("--host-kv-mib"),
+        "ninfer.max_private_continuations" => LaunchOption("--max-private-continuations"),
+        "ninfer.max_shared_prefixes" => LaunchOption("--max-shared-prefixes"),
+        "ninfer.max_long_anchors_per_continuation" => {
+            LaunchOption("--max-long-anchors-per-continuation")
+        }
+        "ninfer.max_pending_requests" => LaunchOption("--max-pending-requests"),
+        "ninfer.pending_timeout_ms" => LaunchOption("--pending-timeout-ms"),
+        "ninfer.log_stats_interval_ms" => LaunchOption("--log-stats-interval-ms"),
+        "ninfer.max_request_mib" => LaunchOption("--max-request-mib"),
+        "ninfer.media_cache_mib" => LaunchOption("--media-cache-mib"),
+        "ninfer.media_live_mib" => LaunchOption("--media-live-mib"),
+        "ninfer.media_preprocess_threads" => LaunchOption("--media-preprocess-threads"),
+        "ninfer.response_store_max_records" => LaunchOption("--response-store-max-records"),
+        "ninfer.response_store_max_mib" => LaunchOption("--response-store-max-mib"),
+        _ => Unsupported,
     }
 }
 
@@ -602,17 +754,16 @@ pub(crate) fn translate(
     native_arguments: &[String],
 ) -> Result<Vec<OsString>, EngineError> {
     for id in settings.configured.keys() {
-        if matches!(
-            id.as_str(),
-            "ninfer.speculation"
-                | "reasoning_effort"
-                | "reasoning"
-                | "stop_strings"
-                | "system_prompt"
-        ) {
-            continue;
-        }
-        let option = option_for_setting(id.as_str());
+        let option = match execution_path_for_setting(id.as_str()) {
+            SettingExecutionPath::LaunchOption(option) => option,
+            SettingExecutionPath::NortedRequestDefault
+            | SettingExecutionPath::VirtualLaunchControl(_) => continue,
+            SettingExecutionPath::Unsupported => {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "setting `{id}` has no NInfer execution path"
+                )));
+            }
+        };
         if let Some(argument) = find_native_option(native_arguments, option) {
             return Err(EngineError::InvalidConfiguration(format!(
                 "structured setting `{id}` conflicts with native NInfer argument `{argument}`"
@@ -631,6 +782,19 @@ pub(crate) fn translate(
     {
         return Err(EngineError::InvalidConfiguration(
             "parallel_requests must be in 1..=8 for NInfer".to_owned(),
+        ));
+    }
+
+    let reasoning = choice_value(settings, "reasoning")?;
+    let effort = choice_value(settings, "reasoning_effort")?;
+    if matches!((reasoning, effort), (Some("on"), Some("none")))
+        || matches!(
+            (reasoning, effort),
+            (Some("off"), Some("low" | "medium" | "xhigh"))
+        )
+    {
+        return Err(EngineError::InvalidConfiguration(
+            "reasoning and reasoning_effort configure conflicting NInfer thinking modes".to_owned(),
         ));
     }
 
@@ -753,16 +917,16 @@ pub(crate) fn translate(
 
     let mut arguments = Vec::new();
     for (id, resolved) in &settings.configured {
-        if matches!(
-            id.as_str(),
-            "ninfer.speculation"
-                | "reasoning_effort"
-                | "reasoning"
-                | "stop_strings"
-                | "system_prompt"
-        ) {
-            continue;
-        }
+        let option = match execution_path_for_setting(id.as_str()) {
+            SettingExecutionPath::LaunchOption(option) => option,
+            SettingExecutionPath::NortedRequestDefault
+            | SettingExecutionPath::VirtualLaunchControl(_) => continue,
+            SettingExecutionPath::Unsupported => {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "setting `{id}` has no NInfer execution path"
+                )));
+            }
+        };
         if !speculation_enabled
             && matches!(
                 id.as_str(),
@@ -771,7 +935,6 @@ pub(crate) fn translate(
         {
             continue;
         }
-        let option = option_for_setting(id.as_str());
         match &resolved.value {
             SettingValue::FlagEnabled => arguments.push(OsString::from(option)),
             SettingValue::Toggle(value) => match id.as_str() {
@@ -992,14 +1155,27 @@ mod tests {
     }
 
     #[test]
-    fn advertised_common_definitions_remain_engine_neutral() {
+    fn common_definitions_match_the_explicit_ninfer_surface() {
         let definitions = definitions();
-        for common in common_setting_definitions(crate::ENGINE_ID) {
+        for common in common_setting_definitions_for(crate::ENGINE_ID, NINFER_COMMON_SETTINGS) {
             assert_eq!(
                 definitions
                     .iter()
                     .find(|definition| definition.id == common.id),
                 Some(&common)
+            );
+        }
+        for absent in [
+            "repeat_penalty",
+            "reasoning_budget_message",
+            "structured_output_schema",
+            "context_overflow",
+        ] {
+            assert!(
+                definitions
+                    .iter()
+                    .all(|definition| definition.id.as_str() != absent),
+                "{absent} must not belong to the NInfer settings surface"
             );
         }
     }

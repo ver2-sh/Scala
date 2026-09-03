@@ -1040,9 +1040,7 @@ pub fn settings_defaults(
                     "id": definition.id,
                     "value": value,
                     "source": source,
-                    "supported": definition.supported,
                     "detail": definition.default_preview.as_ref().and_then(|default| default.detail.as_deref()),
-                    "unsupported_reason": definition.unsupported_reason,
                 })).collect::<Vec<_>>(),
             }))?
         );
@@ -1050,9 +1048,7 @@ pub fn settings_defaults(
     }
     println!("Settings {operation}: {scope}");
     for (definition, value, source) in effective {
-        if !definition.supported {
-            println!("  {:<38} Unsupported", definition.id);
-        } else if let Some(value) = value {
+        if let Some(value) = value {
             println!("  {:<38} {:<18} ({source})", definition.id, value);
         } else {
             println!("  {:<38} Unavailable (resolution error)", definition.id);

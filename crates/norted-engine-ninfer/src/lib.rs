@@ -21,7 +21,8 @@ use norted_engine::{
     InferenceOutput, InferenceRequest, InferenceStream, InstallationState, LaunchRequest,
     LaunchSpec, LoadProgressReporter, NativeOption, OptionValueKind, OutputFormat,
     PreparedModelInput, ProcessDescriptor, RuntimeVariantUpdateIdentity, UpdateState,
-    capture_command, compatibility_for, isolated_cuda_environment, prepare_norted_package_input,
+    capture_command, compatibility_for, configurable_setting_definitions,
+    isolated_cuda_environment, prepare_norted_package_input,
     prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
     revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
 };
@@ -42,10 +43,280 @@ pub const ENGINE_ID: &str = "ninfer";
 pub const UPSTREAM_REPOSITORY: &str = "https://github.com/Neroued/ninfer";
 pub const GITHUB_REPOSITORY: &str = "Neroued/ninfer";
 pub const PROVIDER_ID: &str = "ninfer-official-source";
-const CURRENT_PACKAGE_CAPABILITY_REVISION: &str = "21a0e85f8819edc644a3bc036fca6d05cf52ac6e";
-const CURRENT_PACKAGE_CAPABILITY_TREE: &str = "09eda8f77d17d140f57baac89a0259772e51a5f7";
-const CURRENT_REQUEST_LOG_SCHEMA: u32 = 19;
+const CURRENT_PACKAGE_CAPABILITY_REVISION: &str = "a140e7ae82a11ed2f370a4d8f2cc16268a3790b8";
+const CURRENT_PACKAGE_CAPABILITY_TREE: &str = "1474697c790de8df18ed07a469f560bb33e8f324";
+const CURRENT_REQUEST_LOG_SCHEMA: u32 = 20;
 const MANAGED_NINFER_FUNCTIONAL_VARIANT: &str = "managed-linux-x86_64-cuda-sm120a";
+
+// These are Git blob identities, not whole-repository identities. A later
+// upstream commit therefore retains a reviewed capability when the source
+// files that own that capability are byte-for-byte unchanged.
+#[rustfmt::skip]
+const REVIEWED_SOURCE_BLOBS: &[(&str, &str)] = &[
+    ("include/ninfer/types.h", "d8398774a89c25126a0aae830340d946911c4df3"),
+    ("src/product/media_acquire/acquire.cpp", "24644492e21122f225abcd7e2fc19718d1827d2c"),
+    ("src/product/media_acquire/acquire.h", "91be5a244a0ff45e92acf498ce35afc404a07c89"),
+    ("src/product/media_acquire/source.h", "8f9ed1c4ccb13b33a75bf7825f1002c61e4dcfb2"),
+    ("src/product/speculative_options.h", "a50ea5fc8263e0f65f96861148a5276514cd4564"),
+    ("src/runtime/contract/sampling.cpp", "495963c88468f215f63132ae901a7cbf455c1164"),
+    ("src/runtime/contract/sampling.h", "8770f7f39208bf26da731ecd6e60b33ba8fe8a1e"),
+    ("src/runtime/engine/engine.cpp", "ee15cf8ab8c961677bc8f8e27f0fab559f5b2f22"),
+    ("src/runtime/engine/engine_core.h", "d4d9b2d678f21b0033009b873d2448e7c9d0b365"),
+    ("src/runtime/engine/resource_manager.h", "f14837e23ea29ecb89541e1ebd916f1b60f788b2"),
+    ("src/serve/generation_service.cpp", "686992f1017c73cc52a0043980ea4d52bea05d3e"),
+    ("src/serve/generation_service.h", "8540d6ddc0b65b556d8c674167c10a63cf784e04"),
+    ("src/serve/http_server.cpp", "e1c12dcd32881149656a894ef11319d4bc011d5e"),
+    ("src/serve/http_server.h", "24314949fa23576a031550fba4c6e28e6f81e702"),
+    ("src/serve/http_transport.cpp", "2840814b6dcd6c71e600d5ade553e14ce3dede77"),
+    ("src/serve/http_transport.h", "22b68d45e208bcf52e14798516e9e949e76d4737"),
+    ("src/serve/openai_chat.h", "c581acd7439cfee19acd39a5004b02d6f8f43747"),
+    ("src/serve/openai_chat_http.cpp", "15ab4e6dbb52cf9d8f310cd2d05d729c5493776c"),
+    ("src/serve/openai_chat_request.cpp", "2a7611c1e7178925d714fcadf591c9067caaef29"),
+    ("src/serve/openai_chat_response.cpp", "5841d4b51b204307eca2fe4fb73edcd1dde8d73c"),
+    ("src/serve/openai_common.cpp", "f16a90f61b984dd586b9bad1d63902d1baa23c31"),
+    ("src/serve/openai_common.h", "1935327676b74a1716958f157bc9101376f93c11"),
+    ("src/serve/openai_responses_store.cpp", "6fa1605b838cc5909902f3bb6a9d172f59b97595"),
+    ("src/serve/openai_responses_store.h", "d8f68c3453b6b2e00b0dcddf45a591f379773469"),
+    ("src/serve/request.h", "cf87d3621f573876cd47610ee4aceb8645785d0b"),
+    ("src/serve/request_log.cpp", "b0dba5f2840e7cebc70cd868f57b66a89eaf38fa"),
+    ("src/serve/request_log.h", "8e0f062394a3cb7a5d26097bcfcadc8128d11d41"),
+    ("src/serve/request_json.h", "c61d5a1b1c8def6bac2a4f63a67febd451703121"),
+    ("src/serve/request_validation.cpp", "9401ec3f136ce22e2c054ed16619703587ccd669"),
+    ("src/serve/request_validation.h", "a5daabdaa99961573801fdeb8dd3cd58d91e496f"),
+    ("src/serve/serve_options.cpp", "b28a73453b9b24fbd01a3c5b061293c1619faea5"),
+    ("src/serve/serve_options.h", "e147539590041b064cb1161e16c21e59749c1e76"),
+    ("src/serve/translate.cpp", "c2effe323b25b5c1f8538ad43f4bc744984fcddc"),
+    ("src/serve/translate.h", "5d56431f2d271a5a9beb69a87ab5141868b9dfb4"),
+    ("src/targets/qwen3_6/impl/frontend/chat_template.cpp", "9fba17ab444808b45c2900fe9aeb7cda3b43fe16"),
+    ("src/targets/qwen3_6/impl/frontend/chat_template.h", "a3be5d9881ca5820a5dabfc8cbf490a3173b0698"),
+    ("src/targets/qwen3_6/impl/frontend/digest.cpp", "093051f81354e8d67e75d371e8669c5d4857deed"),
+    ("src/targets/qwen3_6/impl/frontend/digest.h", "06a35ba0b0b3a261cfc10eb7a23a36a5315b8d78"),
+    ("src/targets/qwen3_6/impl/frontend/frontend.cpp", "75c7138318a4571006b474ab3b189b0a189a0d16"),
+    ("src/targets/qwen3_6/impl/frontend/media_cache.cpp", "1c3f383849ac97fa147f6c8f04f2a42934fa677e"),
+    ("src/targets/qwen3_6/impl/frontend/media_cache.h", "37684cbce8ae066d2b0898bfd0603fa711bf3c85"),
+    ("src/targets/qwen3_6/impl/frontend/processor.cpp", "e9823ee7465d222959425f700b0662bfaa72dfef"),
+    ("src/targets/qwen3_6/impl/frontend/processor.h", "d96bb43a2e26422217851ef228a152e7db759eb4"),
+    ("src/targets/qwen3_6/impl/frontend/resources.cpp", "460e30ec01f9e65bef7d5542cb48af536ce160eb"),
+    ("src/targets/qwen3_6/impl/frontend/tool_call_parser.cpp", "38102c4a9c507d5b1b3296d940989138aa15408a"),
+    ("src/targets/qwen3_6/impl/frontend/tool_call_parser.h", "4f7733ecdcbb63ec9347f6ecc52c55b10349e879"),
+    ("src/targets/qwen3_6_27b/impl/package.cpp", "c844d21eda2d5e93649247291491ac5deb32c4c8"),
+    ("src/targets/qwen3_6_35b_a3b/impl/package.cpp", "15e55730e0296a1158e78db243ff94d1960040ef"),
+];
+
+const CORE_PROCESS_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/runtime/engine/engine.cpp",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/serve_options.cpp",
+    "src/serve/serve_options.h",
+];
+const CONTEXT_CACHE_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/runtime/engine/engine.cpp",
+    "src/runtime/engine/engine_core.h",
+    "src/runtime/engine/resource_manager.h",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/serve_options.cpp",
+    "src/serve/serve_options.h",
+];
+const SPECULATION_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/product/speculative_options.h",
+    "src/runtime/engine/engine.cpp",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/serve_options.cpp",
+    "src/serve/serve_options.h",
+];
+const SERVING_LIMIT_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/runtime/engine/engine_core.h",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/http_server.cpp",
+    "src/serve/http_server.h",
+    "src/serve/serve_options.cpp",
+    "src/serve/serve_options.h",
+];
+const RESPONSES_STORE_FILES: &[&str] = &[
+    "src/serve/http_server.cpp",
+    "src/serve/http_server.h",
+    "src/serve/openai_responses_store.cpp",
+    "src/serve/openai_responses_store.h",
+    "src/serve/request.h",
+    "src/serve/serve_options.cpp",
+    "src/serve/serve_options.h",
+];
+const REQUEST_DEFAULT_FILES: &[&str] = &[
+    "src/serve/openai_chat.h",
+    "src/serve/openai_chat_http.cpp",
+    "src/serve/openai_chat_request.cpp",
+    "src/serve/request.h",
+    "src/serve/request_json.h",
+    "src/serve/request_validation.cpp",
+    "src/serve/request_validation.h",
+    "src/serve/serve_options.cpp",
+    "src/serve/serve_options.h",
+];
+const PROCESS_SAMPLER_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/runtime/contract/sampling.cpp",
+    "src/runtime/contract/sampling.h",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/request.h",
+    "src/serve/serve_options.cpp",
+    "src/serve/serve_options.h",
+    "src/serve/translate.cpp",
+    "src/serve/translate.h",
+];
+const MODEL_SAMPLER_DEFAULT_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/runtime/contract/sampling.cpp",
+    "src/runtime/contract/sampling.h",
+    "src/runtime/engine/engine.cpp",
+    "src/targets/qwen3_6_27b/impl/package.cpp",
+    "src/targets/qwen3_6_35b_a3b/impl/package.cpp",
+];
+const REQUEST_SAMPLER_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/runtime/contract/sampling.cpp",
+    "src/runtime/contract/sampling.h",
+    "src/runtime/engine/engine.cpp",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/openai_chat.h",
+    "src/serve/openai_chat_http.cpp",
+    "src/serve/openai_chat_request.cpp",
+    "src/serve/request.h",
+    "src/serve/request_json.h",
+    "src/serve/request_validation.cpp",
+    "src/serve/request_validation.h",
+    "src/serve/translate.cpp",
+    "src/serve/translate.h",
+];
+const REQUEST_PROTOCOL_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/http_transport.cpp",
+    "src/serve/http_transport.h",
+    "src/serve/openai_chat.h",
+    "src/serve/openai_chat_http.cpp",
+    "src/serve/openai_chat_request.cpp",
+    "src/serve/openai_chat_response.cpp",
+    "src/serve/openai_common.cpp",
+    "src/serve/openai_common.h",
+    "src/serve/request.h",
+    "src/serve/request_json.h",
+    "src/serve/request_validation.cpp",
+    "src/serve/request_validation.h",
+    "src/serve/translate.cpp",
+    "src/serve/translate.h",
+    "src/targets/qwen3_6/impl/frontend/chat_template.cpp",
+    "src/targets/qwen3_6/impl/frontend/chat_template.h",
+    "src/targets/qwen3_6/impl/frontend/digest.cpp",
+    "src/targets/qwen3_6/impl/frontend/digest.h",
+    "src/targets/qwen3_6/impl/frontend/frontend.cpp",
+];
+const REQUEST_LOG_FILES: &[&str] = &["src/serve/request_log.cpp", "src/serve/request_log.h"];
+const THINKING_PROCESS_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/request.h",
+    "src/serve/serve_options.cpp",
+    "src/serve/serve_options.h",
+    "src/serve/translate.cpp",
+    "src/serve/translate.h",
+    "src/targets/qwen3_6/impl/frontend/chat_template.cpp",
+    "src/targets/qwen3_6/impl/frontend/chat_template.h",
+    "src/targets/qwen3_6/impl/frontend/digest.cpp",
+    "src/targets/qwen3_6/impl/frontend/digest.h",
+    "src/targets/qwen3_6/impl/frontend/frontend.cpp",
+];
+const THINKING_REQUEST_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/openai_chat.h",
+    "src/serve/openai_chat_http.cpp",
+    "src/serve/openai_chat_request.cpp",
+    "src/serve/openai_chat_response.cpp",
+    "src/serve/request.h",
+    "src/serve/request_json.h",
+    "src/serve/request_validation.cpp",
+    "src/serve/request_validation.h",
+    "src/serve/translate.cpp",
+    "src/serve/translate.h",
+    "src/targets/qwen3_6/impl/frontend/chat_template.cpp",
+    "src/targets/qwen3_6/impl/frontend/chat_template.h",
+    "src/targets/qwen3_6/impl/frontend/digest.cpp",
+    "src/targets/qwen3_6/impl/frontend/digest.h",
+    "src/targets/qwen3_6/impl/frontend/frontend.cpp",
+];
+const TOOL_CALLING_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/openai_chat.h",
+    "src/serve/openai_chat_http.cpp",
+    "src/serve/openai_chat_request.cpp",
+    "src/serve/openai_chat_response.cpp",
+    "src/serve/request.h",
+    "src/serve/request_json.h",
+    "src/serve/request_validation.cpp",
+    "src/serve/request_validation.h",
+    "src/serve/translate.cpp",
+    "src/serve/translate.h",
+    "src/targets/qwen3_6/impl/frontend/chat_template.cpp",
+    "src/targets/qwen3_6/impl/frontend/chat_template.h",
+    "src/targets/qwen3_6/impl/frontend/frontend.cpp",
+    "src/targets/qwen3_6/impl/frontend/tool_call_parser.cpp",
+    "src/targets/qwen3_6/impl/frontend/tool_call_parser.h",
+];
+const VISION_PROCESS_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/runtime/engine/engine.cpp",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/serve_options.cpp",
+    "src/serve/serve_options.h",
+    "src/targets/qwen3_6/impl/frontend/frontend.cpp",
+    "src/targets/qwen3_6/impl/frontend/media_cache.cpp",
+    "src/targets/qwen3_6/impl/frontend/media_cache.h",
+    "src/targets/qwen3_6/impl/frontend/processor.cpp",
+    "src/targets/qwen3_6/impl/frontend/processor.h",
+    "src/targets/qwen3_6_27b/impl/package.cpp",
+    "src/targets/qwen3_6_35b_a3b/impl/package.cpp",
+];
+const MEDIA_REQUEST_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/product/media_acquire/acquire.cpp",
+    "src/product/media_acquire/acquire.h",
+    "src/product/media_acquire/source.h",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/openai_chat.h",
+    "src/serve/openai_chat_http.cpp",
+    "src/serve/openai_chat_request.cpp",
+    "src/serve/request.h",
+    "src/serve/request_json.h",
+    "src/serve/request_validation.cpp",
+    "src/serve/request_validation.h",
+    "src/serve/translate.cpp",
+    "src/serve/translate.h",
+    "src/targets/qwen3_6/impl/frontend/chat_template.cpp",
+    "src/targets/qwen3_6/impl/frontend/chat_template.h",
+    "src/targets/qwen3_6/impl/frontend/frontend.cpp",
+    "src/targets/qwen3_6/impl/frontend/media_cache.cpp",
+    "src/targets/qwen3_6/impl/frontend/media_cache.h",
+    "src/targets/qwen3_6/impl/frontend/processor.cpp",
+    "src/targets/qwen3_6/impl/frontend/processor.h",
+    "src/targets/qwen3_6/impl/frontend/resources.cpp",
+];
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
@@ -146,13 +417,25 @@ struct PendingStartup {
 #[derive(Debug, Clone, PartialEq)]
 struct NinferStartupRequirements {
     minimum_context_tokens: Option<u64>,
+    max_concurrency: Option<u64>,
+    kv_capacity_mode: Option<String>,
+    kv_capacity: Option<u64>,
     kv_dtype: Option<String>,
+    prefill_chunk: Option<u64>,
     cuda_graph: Option<bool>,
     prefix_reuse: Option<bool>,
+    device_state_slots: Option<u64>,
+    host_state_slots: Option<u64>,
+    host_kv_bytes: Option<u64>,
+    max_private_continuations: Option<u64>,
+    max_shared_prefixes: Option<u64>,
+    max_long_anchors_per_continuation: Option<u64>,
     speculative_backend: Option<String>,
     speculative_draft_window: Option<u64>,
     proposal_head: Option<String>,
     expected_thinking: Option<bool>,
+    reconcile_reasoning_from_startup: bool,
+    preserve_thinking: Option<bool>,
     temperature: Option<f64>,
     top_p: Option<f64>,
     top_k: Option<u64>,
@@ -176,13 +459,112 @@ struct NinferStartupRequirements {
 #[derive(Debug, Clone, Copy, Default)]
 struct NinferRuntimeCapabilities {
     trustworthy_identity: bool,
-    thinking_control: bool,
-    process_sampler_overrides: bool,
-    bounded_server_start: bool,
-    protocol_semantics: bool,
-    tool_calling: bool,
-    vision: bool,
+    core_process_controls: bool,
+    context_cache_controls: bool,
+    speculation_controls: bool,
+    serving_limit_controls: bool,
+    responses_store_controls: bool,
+    request_default_controls: bool,
+    process_sampler_controls: bool,
+    model_sampler_defaults: bool,
+    request_sampler_semantics: bool,
+    request_protocol_semantics: bool,
     request_log_schema: Option<u32>,
+    thinking_process_controls: bool,
+    thinking_request_semantics: bool,
+    tool_calling: bool,
+    vision_process_controls: bool,
+    media_request_semantics: bool,
+    startup_proof: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct NinferReviewedDomains {
+    core_process_controls: bool,
+    context_cache_controls: bool,
+    speculation_controls: bool,
+    serving_limit_controls: bool,
+    responses_store_controls: bool,
+    request_default_controls: bool,
+    process_sampler_controls: bool,
+    model_sampler_defaults: bool,
+    request_sampler_semantics: bool,
+    request_protocol_semantics: bool,
+    request_log: bool,
+    thinking_process_controls: bool,
+    thinking_request_semantics: bool,
+    tool_calling: bool,
+    vision_process_controls: bool,
+    media_request_semantics: bool,
+}
+
+impl NinferReviewedDomains {
+    fn all(reviewed: bool) -> Self {
+        Self {
+            core_process_controls: reviewed,
+            context_cache_controls: reviewed,
+            speculation_controls: reviewed,
+            serving_limit_controls: reviewed,
+            responses_store_controls: reviewed,
+            request_default_controls: reviewed,
+            process_sampler_controls: reviewed,
+            model_sampler_defaults: reviewed,
+            request_sampler_semantics: reviewed,
+            request_protocol_semantics: reviewed,
+            request_log: reviewed,
+            thinking_process_controls: reviewed,
+            thinking_request_semantics: reviewed,
+            tool_calling: reviewed,
+            vision_process_controls: reviewed,
+            media_request_semantics: reviewed,
+        }
+    }
+}
+
+fn setting_capability_is_reviewed(id: &str, capabilities: NinferRuntimeCapabilities) -> bool {
+    match id {
+        "stop_strings" | "system_prompt" => capabilities.request_protocol_semantics,
+        "reasoning" | "reasoning_effort" => {
+            capabilities.request_protocol_semantics
+                && capabilities.thinking_process_controls
+                && capabilities.thinking_request_semantics
+        }
+        "temperature" | "top_p" | "top_k" | "min_p" | "seed" | "presence_penalty"
+        | "frequency_penalty" | "ninfer.greedy" => capabilities.process_sampler_controls,
+        "max_output_tokens" => capabilities.request_default_controls,
+        "reasoning_budget" | "ninfer.thinking" | "ninfer.preserve_thinking" => {
+            capabilities.thinking_process_controls
+        }
+        "context_length"
+        | "ninfer.kv_dtype"
+        | "ninfer.kv_capacity"
+        | "ninfer.prefill_chunk"
+        | "ninfer.prefix_reuse"
+        | "ninfer.device_state_slots"
+        | "ninfer.host_state_slots"
+        | "ninfer.host_kv_mib"
+        | "ninfer.max_private_continuations"
+        | "ninfer.max_shared_prefixes"
+        | "ninfer.max_long_anchors_per_continuation" => capabilities.context_cache_controls,
+        "ninfer.cuda_graph" => capabilities.core_process_controls,
+        "ninfer.speculation"
+        | "ninfer.speculative_backend"
+        | "ninfer.draft_tokens"
+        | "ninfer.lm_head_draft" => capabilities.speculation_controls,
+        "parallel_requests"
+        | "ninfer.max_pending_requests"
+        | "ninfer.pending_timeout_ms"
+        | "ninfer.log_stats_interval_ms"
+        | "ninfer.max_request_mib" => capabilities.serving_limit_controls,
+        "ninfer.response_store_max_records" | "ninfer.response_store_max_mib" => {
+            capabilities.responses_store_controls
+        }
+        "ninfer.vision"
+        | "ninfer.media_cache_mib"
+        | "ninfer.media_live_mib"
+        | "ninfer.media_preprocess_threads" => capabilities.vision_process_controls,
+        _ => false,
+    }
 }
 
 fn apply_ninfer_runtime_contract(
@@ -190,47 +572,51 @@ fn apply_ninfer_runtime_contract(
     help: &str,
     capabilities: NinferRuntimeCapabilities,
 ) {
-    if !capabilities.protocol_semantics {
-        for definition in definitions {
-            definition.supported = false;
-            definition.unsupported_reason = Some(
-                "the exact NInfer runtime lacks a reviewed concrete settings/defaults contract"
-                    .to_owned(),
-            );
-        }
-        return;
-    }
     for definition in definitions.iter_mut() {
         let id = definition.id.as_str();
+        let unsupported = |definition: &mut norted_core::SettingDefinition, reason: &str| {
+            definition.supported = false;
+            definition.unsupported_reason = Some(reason.to_owned());
+        };
         if matches!(
             id,
-            "reasoning" | "reasoning_effort" | "stop_strings" | "system_prompt"
+            "repeat_penalty"
+                | "reasoning_budget_message"
+                | "structured_output_schema"
+                | "context_overflow"
         ) {
-            if !capabilities.protocol_semantics {
-                definition.supported = false;
-                definition.unsupported_reason = Some(
-                    "the exact NInfer source revision has no reviewed request-protocol contract"
-                        .to_owned(),
+            unsupported(
+                definition,
+                "NInfer does not implement this generation semantic",
+            );
+            continue;
+        }
+        if !setting_capability_is_reviewed(id, capabilities) {
+            unsupported(
+                definition,
+                "this NInfer source runtime's capability contract for the setting is outdated or unreviewed; install or select the current reviewed runtime",
+            );
+            continue;
+        }
+        match settings::execution_path_for_setting(id) {
+            settings::SettingExecutionPath::LaunchOption(option)
+            | settings::SettingExecutionPath::VirtualLaunchControl(option)
+                if !usage_has_token(help, option) =>
+            {
+                unsupported(
+                    definition,
+                    &format!("the exact ninfer-serve help contract does not advertise `{option}`"),
                 );
             }
-            continue;
-        }
-        if id == "repeat_penalty" || id == "structured_output_schema" {
-            definition.supported = false;
-            definition.unsupported_reason =
-                Some("NInfer does not implement this generation semantic".to_owned());
-            continue;
-        }
-        let option = if id == "ninfer.speculation" {
-            "--spec"
-        } else {
-            settings::option_for_setting(id)
-        };
-        if option.is_empty() || !usage_has_token(help, option) {
-            definition.supported = false;
-            definition.unsupported_reason = Some(format!(
-                "the exact ninfer-serve help contract does not advertise `{option}`"
-            ));
+            settings::SettingExecutionPath::Unsupported => {
+                unsupported(
+                    definition,
+                    "NInfer has no reviewed execution path for this setting",
+                );
+            }
+            settings::SettingExecutionPath::LaunchOption(_)
+            | settings::SettingExecutionPath::VirtualLaunchControl(_)
+            | settings::SettingExecutionPath::NortedRequestDefault => {}
         }
     }
     if let Some(definition) = definitions
@@ -255,54 +641,15 @@ fn validate_ninfer_settings_prelaunch(
                 .to_owned(),
         );
     }
-    let configured = |ids: &[&str]| ids.iter().any(|id| settings.value(id).is_some());
-    if configured(&[
-        "ninfer.thinking",
-        "ninfer.preserve_thinking",
-        "reasoning_effort",
-        "reasoning",
-    ]) && !capabilities.thinking_control
+    if let Some(id) = settings
+        .configured
+        .keys()
+        .map(|id| id.as_str())
+        .find(|id| !setting_capability_is_reviewed(id, capabilities))
     {
-        return Err("NInfer thinking control is unsupported or unproven".to_owned());
-    }
-    if configured(&[
-        "temperature",
-        "top_p",
-        "top_k",
-        "min_p",
-        "seed",
-        "presence_penalty",
-        "frequency_penalty",
-        "max_output_tokens",
-        "reasoning_budget",
-        "ninfer.greedy",
-    ]) && !capabilities.process_sampler_overrides
-    {
-        return Err("NInfer process sampler controls are unsupported or unproven".to_owned());
-    }
-    if configured(&[
-        "context_length",
-        "ninfer.kv_dtype",
-        "ninfer.kv_capacity",
-        "ninfer.cuda_graph",
-        "ninfer.prefix_reuse",
-        "ninfer.speculation",
-        "ninfer.speculative_backend",
-        "ninfer.draft_tokens",
-        "ninfer.lm_head_draft",
-        "ninfer.vision",
-        "ninfer.max_pending_requests",
-        "ninfer.pending_timeout_ms",
-        "ninfer.log_stats_interval_ms",
-        "ninfer.max_request_mib",
-        "ninfer.media_cache_mib",
-        "ninfer.media_live_mib",
-        "ninfer.media_preprocess_threads",
-        "ninfer.response_store_max_records",
-        "ninfer.response_store_max_mib",
-    ]) && !capabilities.bounded_server_start
-    {
-        return Err("NInfer server_start capability observation is unproven".to_owned());
+        return Err(format!(
+            "NInfer capability contract for configured setting `{id}` is unsupported or unproven"
+        ));
     }
     Ok(())
 }
@@ -314,15 +661,39 @@ fn ninfer_runtime_capabilities_for_installed(
         == RuntimeAcquisitionMethod::SourceBuild
         && runtime.manifest.identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
         && runtime.manifest.identity.variant == format!("{}-sm120a", catalog::RECIPE_VERSION);
-    let revision = runtime.manifest.identity.upstream_revision.as_deref();
-    let current = managed_source
-        && revision == Some(CURRENT_PACKAGE_CAPABILITY_REVISION)
+    let exact_current = managed_source
+        && runtime.manifest.identity.upstream_revision.as_deref()
+            == Some(CURRENT_PACKAGE_CAPABILITY_REVISION)
         && runtime.manifest.source_build.as_ref().is_some_and(|build| {
             build.source.commit_sha == CURRENT_PACKAGE_CAPABILITY_REVISION
                 && build.source.tree_sha == CURRENT_PACKAGE_CAPABILITY_TREE
                 && build.recipe_version == catalog::RECIPE_VERSION
         });
-    ninfer_reviewed_capabilities(current)
+    let blobs = managed_source
+        .then(|| installed_source_blobs(runtime))
+        .flatten();
+    let reviewed = |files| exact_current || source_domain_matches(blobs.as_ref(), files);
+    ninfer_reviewed_capabilities(
+        managed_source,
+        NinferReviewedDomains {
+            core_process_controls: reviewed(CORE_PROCESS_FILES),
+            context_cache_controls: reviewed(CONTEXT_CACHE_FILES),
+            speculation_controls: reviewed(SPECULATION_FILES),
+            serving_limit_controls: reviewed(SERVING_LIMIT_FILES),
+            responses_store_controls: reviewed(RESPONSES_STORE_FILES),
+            request_default_controls: reviewed(REQUEST_DEFAULT_FILES),
+            process_sampler_controls: reviewed(PROCESS_SAMPLER_FILES),
+            model_sampler_defaults: reviewed(MODEL_SAMPLER_DEFAULT_FILES),
+            request_sampler_semantics: reviewed(REQUEST_SAMPLER_FILES),
+            request_protocol_semantics: reviewed(REQUEST_PROTOCOL_FILES),
+            request_log: reviewed(REQUEST_LOG_FILES),
+            thinking_process_controls: reviewed(THINKING_PROCESS_FILES),
+            thinking_request_semantics: reviewed(THINKING_REQUEST_FILES),
+            tool_calling: reviewed(TOOL_CALLING_FILES),
+            vision_process_controls: reviewed(VISION_PROCESS_FILES),
+            media_request_semantics: reviewed(MEDIA_REQUEST_FILES),
+        },
+    )
 }
 
 fn ninfer_runtime_capabilities_for_available(
@@ -342,20 +713,86 @@ fn ninfer_runtime_capabilities_for_available(
             source.commit_sha == CURRENT_PACKAGE_CAPABILITY_REVISION
                 && source.tree_sha == CURRENT_PACKAGE_CAPABILITY_TREE
         });
-    ninfer_reviewed_capabilities(current)
+    ninfer_reviewed_capabilities(managed_source, NinferReviewedDomains::all(current))
 }
 
-fn ninfer_reviewed_capabilities(current: bool) -> NinferRuntimeCapabilities {
+fn ninfer_reviewed_capabilities(
+    trustworthy_identity: bool,
+    reviewed: NinferReviewedDomains,
+) -> NinferRuntimeCapabilities {
     NinferRuntimeCapabilities {
-        trustworthy_identity: current,
-        thinking_control: current,
-        process_sampler_overrides: current,
-        bounded_server_start: current,
-        protocol_semantics: current,
-        tool_calling: current,
-        vision: current,
-        request_log_schema: current.then_some(CURRENT_REQUEST_LOG_SCHEMA),
+        trustworthy_identity,
+        core_process_controls: trustworthy_identity && reviewed.core_process_controls,
+        context_cache_controls: trustworthy_identity && reviewed.context_cache_controls,
+        speculation_controls: trustworthy_identity && reviewed.speculation_controls,
+        serving_limit_controls: trustworthy_identity && reviewed.serving_limit_controls,
+        responses_store_controls: trustworthy_identity && reviewed.responses_store_controls,
+        request_default_controls: trustworthy_identity && reviewed.request_default_controls,
+        process_sampler_controls: trustworthy_identity && reviewed.process_sampler_controls,
+        model_sampler_defaults: trustworthy_identity && reviewed.model_sampler_defaults,
+        request_sampler_semantics: trustworthy_identity && reviewed.request_sampler_semantics,
+        request_protocol_semantics: trustworthy_identity && reviewed.request_protocol_semantics,
+        request_log_schema: (trustworthy_identity && reviewed.request_log)
+            .then_some(CURRENT_REQUEST_LOG_SCHEMA),
+        thinking_process_controls: trustworthy_identity && reviewed.thinking_process_controls,
+        thinking_request_semantics: trustworthy_identity && reviewed.thinking_request_semantics,
+        tool_calling: trustworthy_identity && reviewed.tool_calling,
+        vision_process_controls: trustworthy_identity && reviewed.vision_process_controls,
+        media_request_semantics: trustworthy_identity && reviewed.media_request_semantics,
+        startup_proof: trustworthy_identity && reviewed.request_log,
     }
+}
+
+fn installed_source_blobs(runtime: &InstalledRuntime) -> Option<BTreeMap<String, String>> {
+    let source = runtime.manifest.source_build.as_ref()?;
+    if source.recipe_version != catalog::RECIPE_VERSION {
+        return None;
+    }
+    let source_root = runtime.installation_root.join("source");
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(source_root)
+        .arg("ls-tree")
+        .arg("-r")
+        .arg(&source.source.commit_sha)
+        .arg("--");
+    for (path, _) in REVIEWED_SOURCE_BLOBS {
+        command.arg(path);
+    }
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let output = String::from_utf8(output.stdout).ok()?;
+    let mut blobs = BTreeMap::new();
+    for line in output.lines() {
+        let (metadata, path) = line.split_once('\t')?;
+        let mut fields = metadata.split_whitespace();
+        let _mode = fields.next()?;
+        if fields.next()? != "blob" {
+            return None;
+        }
+        let object = fields.next()?;
+        if fields.next().is_some() {
+            return None;
+        }
+        blobs.insert(path.to_owned(), object.to_owned());
+    }
+    Some(blobs)
+}
+
+fn source_domain_matches(observed: Option<&BTreeMap<String, String>>, required: &[&str]) -> bool {
+    let Some(observed) = observed else {
+        return false;
+    };
+    required.iter().all(|path| {
+        let expected = REVIEWED_SOURCE_BLOBS
+            .iter()
+            .find_map(|(candidate, object)| (*candidate == *path).then_some(*object));
+        expected
+            .is_some_and(|expected| observed.get(*path).is_some_and(|actual| actual == expected))
+    })
 }
 
 fn ninfer_startup_requirements(
@@ -431,11 +868,35 @@ fn ninfer_startup_requirements(
             })
         })
         .transpose()?;
+    let (kv_capacity_mode, kv_capacity) = match settings.value("ninfer.kv_capacity") {
+        Some(SettingValue::UnsignedIntegerOrChoice(
+            norted_core::UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
+        )) => (Some("explicit".to_owned()), Some(*value)),
+        Some(SettingValue::UnsignedIntegerOrChoice(
+            norted_core::UnsignedIntegerOrChoiceValue::Choice(value),
+        )) if value == "auto" => (Some("auto".to_owned()), None),
+        None => (None, None),
+        Some(_) => {
+            return Err(EngineError::InvalidConfiguration(
+                "setting `ninfer.kv_capacity` must be an unsigned integer or `auto`".to_owned(),
+            ));
+        }
+    };
     Ok(NinferStartupRequirements {
         minimum_context_tokens: unsigned("context_length")?,
+        max_concurrency: unsigned("parallel_requests")?,
+        kv_capacity_mode,
+        kv_capacity,
         kv_dtype: choice("ninfer.kv_dtype")?,
+        prefill_chunk: unsigned("ninfer.prefill_chunk")?,
         cuda_graph: toggle("ninfer.cuda_graph")?,
         prefix_reuse: toggle("ninfer.prefix_reuse")?,
+        device_state_slots: unsigned("ninfer.device_state_slots")?,
+        host_state_slots: unsigned("ninfer.host_state_slots")?,
+        host_kv_bytes: mib_bytes("ninfer.host_kv_mib")?,
+        max_private_continuations: unsigned("ninfer.max_private_continuations")?,
+        max_shared_prefixes: unsigned("ninfer.max_shared_prefixes")?,
+        max_long_anchors_per_continuation: unsigned("ninfer.max_long_anchors_per_continuation")?,
         speculative_backend: if speculation_enabled {
             backend
         } else {
@@ -449,6 +910,11 @@ fn ninfer_startup_requirements(
         proposal_head: toggle("ninfer.lm_head_draft")?
             .map(|enabled| if enabled { "optimized" } else { "full" }.to_owned()),
         expected_thinking: toggle("ninfer.thinking")?,
+        reconcile_reasoning_from_startup: settings::reviewed_request_thinking_override(Some(
+            settings,
+        ))
+        .is_none(),
+        preserve_thinking: toggle("ninfer.preserve_thinking")?,
         temperature: float("temperature")?,
         top_p: float("top_p")?,
         top_k: unsigned("top_k")?,
@@ -757,7 +1223,8 @@ impl EngineAdapter for NinferAdapter {
         if capabilities.tool_calling {
             features.push(EngineFeature::ToolCalling);
         }
-        if capabilities.vision
+        if capabilities.vision_process_controls
+            && capabilities.media_request_semantics
             && matches!(
                 model.native_identity,
                 Some(ArtifactNativeIdentity::Ninfer(_))
@@ -908,12 +1375,15 @@ impl EngineAdapter for NinferAdapter {
         let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
         let base = combine_compatibility(native, device);
         let base = if runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::SourceBuild
-            && !capabilities.trustworthy_identity
+            && (!capabilities.trustworthy_identity
+                || !capabilities.request_protocol_semantics
+                || !capabilities.request_sampler_semantics
+                || !capabilities.startup_proof)
         {
             combine_compatibility(
                 base,
                 RuntimeCompatibility::NeedsAttention(
-                    "this exact NInfer source snapshot has not received a reviewed startup/request capability contract"
+                    "this NInfer source runtime has outdated or unreviewed request/request-sampler/startup capability contracts; install or select the current reviewed runtime"
                         .to_owned(),
                 ),
             )
@@ -975,12 +1445,15 @@ impl EngineAdapter for NinferAdapter {
         let base = if matches!(
             &runtime.acquisition,
             norted_core::RuntimeAcquisitionPlan::SourceBuild(_)
-        ) && !capabilities.trustworthy_identity
+        ) && (!capabilities.trustworthy_identity
+            || !capabilities.request_protocol_semantics
+            || !capabilities.request_sampler_semantics
+            || !capabilities.startup_proof)
         {
             combine_compatibility(
                 base,
                 RuntimeCompatibility::NeedsAttention(
-                    "this exact NInfer source snapshot has not received a reviewed startup/request capability contract"
+                    "this NInfer source runtime has outdated or unreviewed request/request-sampler/startup capability contracts; install or select the current reviewed runtime"
                         .to_owned(),
                 ),
             )
@@ -1128,7 +1601,7 @@ impl EngineAdapter for NinferAdapter {
     ) -> Result<Vec<norted_core::SettingDefinition>, EngineError> {
         let mut definitions = settings::definitions();
         settings::apply_model_capabilities(&mut definitions, model);
-        Ok(definitions)
+        Ok(configurable_setting_definitions(definitions))
     }
 
     async fn runtime_settings_schema(
@@ -1150,10 +1623,11 @@ impl EngineAdapter for NinferAdapter {
         let mut definitions = settings::definitions();
         settings::apply_runtime_bounds(&mut definitions);
         let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
-        if capabilities.protocol_semantics {
+        if capabilities.trustworthy_identity {
             settings::apply_reviewed_runtime_defaults(&mut definitions, settings);
         }
         apply_ninfer_runtime_contract(&mut definitions, &help, capabilities);
+        let definitions = configurable_setting_definitions(definitions);
         Ok(norted_core::SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -1181,11 +1655,14 @@ impl EngineAdapter for NinferAdapter {
         let mut definitions = self.model_setting_definitions(model)?;
         settings::apply_runtime_bounds(&mut definitions);
         let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
-        if capabilities.protocol_semantics {
+        if capabilities.trustworthy_identity {
             settings::apply_reviewed_runtime_defaults(&mut definitions, settings);
+        }
+        if capabilities.model_sampler_defaults {
             settings::apply_model_sampler_defaults(&mut definitions, model, settings);
         }
         apply_ninfer_runtime_contract(&mut definitions, &help, capabilities);
+        let definitions = configurable_setting_definitions(definitions);
         Ok(norted_core::SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -1263,11 +1740,15 @@ impl EngineAdapter for NinferAdapter {
                 "NInfer backend address must be loopback".to_owned(),
             ));
         }
-        validate_ninfer_settings_prelaunch(
-            &request.settings,
-            ninfer_runtime_capabilities_for_installed(&request.runtime),
-        )
-        .map_err(EngineError::InvalidConfiguration)?;
+        let runtime_capabilities = ninfer_runtime_capabilities_for_installed(&request.runtime);
+        if !runtime_capabilities.startup_proof {
+            return Err(EngineError::InvalidConfiguration(
+                "this NInfer source runtime's request-log/startup-proof capability contract is outdated or unreviewed; install or select the current reviewed runtime"
+                    .to_owned(),
+            ));
+        }
+        validate_ninfer_settings_prelaunch(&request.settings, runtime_capabilities)
+            .map_err(EngineError::InvalidConfiguration)?;
         request
             .settings_schema
             .validate(&request.settings)
@@ -1280,7 +1761,6 @@ impl EngineAdapter for NinferAdapter {
         let settings_requirements = (!request.settings.is_empty())
             .then(|| ninfer_startup_requirements(&request.settings))
             .transpose()?;
-        let runtime_capabilities = ninfer_runtime_capabilities_for_installed(&request.runtime);
         let model_path =
             canonical_regular_file(&request.model.primary.path, "NInfer model").await?;
         if model_path != request.model.primary.path {
@@ -1745,10 +2225,15 @@ impl EngineAdapter for NinferAdapter {
         let body = protocol::backend_request(
             &request,
             false,
-            execution.capabilities.protocol_semantics,
-            execution.capabilities.tool_calling,
-            execution.vision,
-            execution.greedy,
+            protocol::RequestAdmission {
+                protocol_semantics: execution.capabilities.request_protocol_semantics,
+                sampler_semantics: execution.capabilities.request_sampler_semantics,
+                thinking_semantics: execution.capabilities.thinking_request_semantics,
+                tool_calling: execution.capabilities.tool_calling,
+                media_semantics: execution.capabilities.media_request_semantics,
+                vision: execution.vision,
+                greedy: execution.greedy,
+            },
         )?;
         let response = self
             .client
@@ -1781,10 +2266,15 @@ impl EngineAdapter for NinferAdapter {
         let body = protocol::backend_request(
             &request,
             true,
-            execution.capabilities.protocol_semantics,
-            execution.capabilities.tool_calling,
-            execution.vision,
-            execution.greedy,
+            protocol::RequestAdmission {
+                protocol_semantics: execution.capabilities.request_protocol_semantics,
+                sampler_semantics: execution.capabilities.request_sampler_semantics,
+                thinking_semantics: execution.capabilities.thinking_request_semantics,
+                tool_calling: execution.capabilities.tool_calling,
+                media_semantics: execution.capabilities.media_request_semantics,
+                vision: execution.vision,
+                greedy: execution.greedy,
+            },
         )?;
         let response = self
             .client
@@ -1939,17 +2429,12 @@ struct StartupRecord {
 struct StartupServer {
     public_model_id: String,
     default_thinking: bool,
-    #[serde(default)]
-    max_request_bytes: Option<u64>,
-    #[serde(default)]
-    media_cache_bytes: Option<u64>,
-    #[serde(default)]
-    media_live_bytes: Option<u64>,
-    #[serde(default)]
-    media_preprocess_threads: Option<u64>,
-    #[serde(default)]
-    default_output_tokens: Option<u64>,
-    #[serde(default)]
+    default_preserve_thinking: bool,
+    max_request_bytes: u64,
+    media_cache_bytes: u64,
+    media_live_bytes: u64,
+    media_preprocess_threads: u64,
+    default_output_tokens: u64,
     default_thinking_budget: Option<u64>,
 }
 
@@ -1966,20 +2451,29 @@ struct StartupEngine {
     kv_capacity: u64,
     kv_cache: String,
     max_concurrency: u64,
-    #[serde(default)]
     vision: bool,
     cuda_graph: bool,
     prefix_reuse: bool,
     speculative_backend: String,
     speculative_draft_window: u64,
     proposal_head: String,
-    #[serde(default)]
-    max_pending_requests: Option<u64>,
-    #[serde(default)]
-    pending_timeout_ms: Option<u64>,
-    #[serde(default)]
-    log_stats_interval_ms: Option<u64>,
+    max_pending_requests: u64,
+    pending_timeout_ms: u64,
+    prefill_chunk: u64,
+    log_stats_interval_ms: u64,
     context_cost: StartupContextCost,
+    context_cache: StartupContextCache,
+}
+
+#[derive(Deserialize)]
+struct StartupContextCache {
+    enabled: bool,
+    device_state_slots: u64,
+    host_state_slots: u64,
+    host_kv_capacity_bytes: u64,
+    max_private_continuations: u64,
+    max_shared_prefixes: u64,
+    max_long_anchors_per_continuation: u64,
 }
 
 #[derive(Clone)]
@@ -2008,6 +2502,8 @@ struct StartupPreset {
     top_p: f64,
     top_k: u64,
     min_p: f64,
+    presence_penalty: f64,
+    frequency_penalty: f64,
 }
 
 #[derive(Deserialize)]
@@ -2120,11 +2616,10 @@ async fn read_and_validate_startup_log(
     let Some(startup) = startup else {
         return Ok(None);
     };
-    let schema_supported = startup.schema_version
-        == pending
-            .capabilities
-            .request_log_schema
-            .unwrap_or(CURRENT_REQUEST_LOG_SCHEMA);
+    let expected_schema = pending.capabilities.request_log_schema.ok_or_else(|| {
+        EngineError::Operation("NInfer startup proof has no reviewed request-log schema".to_owned())
+    })?;
+    let schema_supported = startup.schema_version == expected_schema;
     if startup.artifact_type != "ninfer_serve_request_log"
         || !schema_supported
         || startup.event != "server_start"
@@ -2201,6 +2696,16 @@ async fn read_and_validate_startup_log(
         .server_overrides
         .min_p
         .unwrap_or(preset.min_p);
+    let effective_presence_penalty = startup
+        .sampling_defaults
+        .server_overrides
+        .presence_penalty
+        .unwrap_or(preset.presence_penalty);
+    let effective_frequency_penalty = startup
+        .sampling_defaults
+        .server_overrides
+        .frequency_penalty
+        .unwrap_or(preset.frequency_penalty);
     if !defaults.temperature.is_finite()
         || !(0.0..=2.0).contains(&defaults.temperature)
         || !defaults.top_p.is_finite()
@@ -2226,6 +2731,15 @@ async fn read_and_validate_startup_log(
             )));
         }
         if requirements
+            .preserve_thinking
+            .is_some_and(|expected| startup.server.default_preserve_thinking != expected)
+        {
+            return Err(EngineError::Operation(
+                "NInfer startup preserve-thinking behavior disagrees with the configured value"
+                    .to_owned(),
+            ));
+        }
+        if requirements
             .vision
             .is_some_and(|expected| startup.engine.vision != expected)
         {
@@ -2235,7 +2749,7 @@ async fn read_and_validate_startup_log(
         }
         if requirements
             .default_output_tokens
-            .is_some_and(|expected| startup.server.default_output_tokens != Some(expected))
+            .is_some_and(|expected| startup.server.default_output_tokens != expected)
             || requirements
                 .default_thinking_budget
                 .is_some_and(|expected| startup.server.default_thinking_budget != Some(expected))
@@ -2247,13 +2761,13 @@ async fn read_and_validate_startup_log(
         }
         if requirements
             .max_pending_requests
-            .is_some_and(|expected| startup.engine.max_pending_requests != Some(expected))
+            .is_some_and(|expected| startup.engine.max_pending_requests != expected)
             || requirements
                 .pending_timeout_ms
-                .is_some_and(|expected| startup.engine.pending_timeout_ms != Some(expected))
+                .is_some_and(|expected| startup.engine.pending_timeout_ms != expected)
             || requirements
                 .log_stats_interval_ms
-                .is_some_and(|expected| startup.engine.log_stats_interval_ms != Some(expected))
+                .is_some_and(|expected| startup.engine.log_stats_interval_ms != expected)
         {
             return Err(EngineError::Operation(
                 "NInfer startup queue/statistics controls disagree with configured values"
@@ -2262,16 +2776,16 @@ async fn read_and_validate_startup_log(
         }
         if requirements
             .max_request_bytes
-            .is_some_and(|expected| startup.server.max_request_bytes != Some(expected))
+            .is_some_and(|expected| startup.server.max_request_bytes != expected)
             || requirements
                 .media_cache_bytes
-                .is_some_and(|expected| startup.server.media_cache_bytes != Some(expected))
+                .is_some_and(|expected| startup.server.media_cache_bytes != expected)
             || requirements
                 .media_live_bytes
-                .is_some_and(|expected| startup.server.media_live_bytes != Some(expected))
+                .is_some_and(|expected| startup.server.media_live_bytes != expected)
             || requirements
                 .media_preprocess_threads
-                .is_some_and(|expected| startup.server.media_preprocess_threads != Some(expected))
+                .is_some_and(|expected| startup.server.media_preprocess_threads != expected)
         {
             return Err(EngineError::Operation(
                 "NInfer startup request/media resource controls disagree with configured values"
@@ -2285,6 +2799,30 @@ async fn read_and_validate_startup_log(
                 "NInfer startup served only {} context tokens; the configured value requires at least {}",
                 startup.engine.max_context, minimum_context
             )));
+        }
+        if requirements
+            .max_concurrency
+            .is_some_and(|expected| startup.engine.max_concurrency != expected)
+            || requirements
+                .prefill_chunk
+                .is_some_and(|expected| startup.engine.prefill_chunk != expected)
+        {
+            return Err(EngineError::Operation(
+                "NInfer startup concurrency/prefill controls disagree with configured values"
+                    .to_owned(),
+            ));
+        }
+        if requirements
+            .kv_capacity_mode
+            .as_ref()
+            .is_some_and(|expected| startup.engine.kv_capacity_mode != *expected)
+            || requirements
+                .kv_capacity
+                .is_some_and(|expected| startup.engine.kv_capacity != expected)
+        {
+            return Err(EngineError::Operation(
+                "NInfer startup KV-capacity policy disagrees with the configured value".to_owned(),
+            ));
         }
         if !matches!(
             startup.engine.kv_capacity_mode.as_str(),
@@ -2315,6 +2853,33 @@ async fn read_and_validate_startup_log(
             return Err(EngineError::Operation(
                 "NInfer startup did not prove the configured KV/CUDA-graph/prefix-reuse behavior"
                     .to_owned(),
+            ));
+        }
+        let cache = &startup.engine.context_cache;
+        if requirements
+            .prefix_reuse
+            .is_some_and(|expected| cache.enabled != expected)
+            || requirements
+                .device_state_slots
+                .is_some_and(|expected| cache.device_state_slots != expected)
+            || requirements
+                .host_state_slots
+                .is_some_and(|expected| cache.host_state_slots != expected)
+            || requirements
+                .host_kv_bytes
+                .is_some_and(|expected| cache.host_kv_capacity_bytes != expected)
+            || requirements
+                .max_private_continuations
+                .is_some_and(|expected| cache.max_private_continuations != expected)
+            || requirements
+                .max_shared_prefixes
+                .is_some_and(|expected| cache.max_shared_prefixes != expected)
+            || requirements
+                .max_long_anchors_per_continuation
+                .is_some_and(|expected| cache.max_long_anchors_per_continuation != expected)
+        {
+            return Err(EngineError::Operation(
+                "NInfer startup context-cache controls disagree with configured values".to_owned(),
             ));
         }
         if requirements
@@ -2370,7 +2935,7 @@ async fn read_and_validate_startup_log(
             ));
         }
     }
-    let resolved_settings = BTreeMap::from([
+    let mut resolved_settings = BTreeMap::from([
         (
             "context_length".to_owned(),
             json!(startup.engine.max_context),
@@ -2384,7 +2949,106 @@ async fn read_and_validate_startup_log(
             "ninfer.kv_capacity".to_owned(),
             json!(startup.engine.kv_capacity),
         ),
+        (
+            "ninfer.prefill_chunk".to_owned(),
+            json!(startup.engine.prefill_chunk),
+        ),
+        (
+            "ninfer.cuda_graph".to_owned(),
+            json!(startup.engine.cuda_graph),
+        ),
+        (
+            "ninfer.prefix_reuse".to_owned(),
+            json!(startup.engine.prefix_reuse),
+        ),
+        ("ninfer.vision".to_owned(), json!(startup.engine.vision)),
+        (
+            "ninfer.device_state_slots".to_owned(),
+            json!(startup.engine.context_cache.device_state_slots),
+        ),
+        (
+            "ninfer.host_state_slots".to_owned(),
+            json!(startup.engine.context_cache.host_state_slots),
+        ),
+        (
+            "ninfer.host_kv_mib".to_owned(),
+            json!(startup.engine.context_cache.host_kv_capacity_bytes / (1_u64 << 20)),
+        ),
+        (
+            "ninfer.max_private_continuations".to_owned(),
+            json!(startup.engine.context_cache.max_private_continuations),
+        ),
+        (
+            "ninfer.max_shared_prefixes".to_owned(),
+            json!(startup.engine.context_cache.max_shared_prefixes),
+        ),
+        (
+            "ninfer.max_long_anchors_per_continuation".to_owned(),
+            json!(
+                startup
+                    .engine
+                    .context_cache
+                    .max_long_anchors_per_continuation
+            ),
+        ),
+        (
+            "ninfer.max_pending_requests".to_owned(),
+            json!(startup.engine.max_pending_requests),
+        ),
+        (
+            "ninfer.pending_timeout_ms".to_owned(),
+            json!(startup.engine.pending_timeout_ms),
+        ),
+        (
+            "ninfer.log_stats_interval_ms".to_owned(),
+            json!(startup.engine.log_stats_interval_ms),
+        ),
+        (
+            "max_output_tokens".to_owned(),
+            json!(startup.server.default_output_tokens),
+        ),
+        (
+            "reasoning_budget".to_owned(),
+            startup
+                .server
+                .default_thinking_budget
+                .map_or_else(|| json!("unlimited"), serde_json::Value::from),
+        ),
+        ("temperature".to_owned(), json!(defaults.temperature)),
+        ("top_p".to_owned(), json!(defaults.top_p)),
+        ("top_k".to_owned(), json!(effective_top_k)),
+        ("min_p".to_owned(), json!(effective_min_p)),
+        (
+            "presence_penalty".to_owned(),
+            json!(effective_presence_penalty),
+        ),
+        (
+            "frequency_penalty".to_owned(),
+            json!(effective_frequency_penalty),
+        ),
+        (
+            "seed".to_owned(),
+            startup
+                .sampling_defaults
+                .server_overrides
+                .seed
+                .map_or_else(|| json!("random"), serde_json::Value::from),
+        ),
     ]);
+    if pending
+        .settings_requirements
+        .as_ref()
+        .is_none_or(|requirements| requirements.reconcile_reasoning_from_startup)
+    {
+        resolved_settings.insert(
+            "reasoning".to_owned(),
+            json!(if startup.server.default_thinking {
+                "on"
+            } else {
+                "off"
+            }),
+        );
+    }
     Ok(Some(ObservedNinferStartup {
         generation_settings: defaults,
         resolved_settings,
@@ -2794,7 +3458,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_features_require_exact_runtime_evidence() {
+    fn configured_features_require_their_capability_domain_evidence() {
         let settings = resolved(&[
             ("ninfer.thinking", SettingValue::Toggle(true)),
             ("temperature", SettingValue::Float(0.8)),
@@ -2802,16 +3466,7 @@ mod tests {
         ]);
         let no_evidence = NinferRuntimeCapabilities::default();
         assert!(validate_ninfer_settings_prelaunch(&settings, no_evidence).is_err());
-        let exact = NinferRuntimeCapabilities {
-            trustworthy_identity: true,
-            thinking_control: true,
-            process_sampler_overrides: true,
-            bounded_server_start: true,
-            protocol_semantics: true,
-            tool_calling: true,
-            vision: true,
-            request_log_schema: Some(19),
-        };
+        let exact = ninfer_reviewed_capabilities(true, NinferReviewedDomains::all(true));
         assert!(validate_ninfer_settings_prelaunch(&settings, exact).is_ok());
     }
 

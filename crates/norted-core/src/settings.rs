@@ -885,9 +885,12 @@ impl SettingsSchema {
 
     pub fn validate(&self, settings: &ResolvedSettings) -> Result<(), SettingsError> {
         for (id, setting) in &settings.configured {
-            let definition = self
-                .definition(id)
-                .ok_or_else(|| SettingsError::UnknownSetting(id.clone()))?;
+            let definition =
+                self.definition(id)
+                    .ok_or_else(|| SettingsError::UnavailableSetting {
+                        setting_id: id.clone(),
+                        engine_id: self.engine_id.clone(),
+                    })?;
             if !definition.supported {
                 return Err(SettingsError::UnsupportedSetting {
                     setting_id: id.clone(),
@@ -1179,6 +1182,13 @@ pub enum SettingsError {
     },
     #[error("unknown setting `{0}`")]
     UnknownSetting(SettingId),
+    #[error(
+        "setting `{setting_id}` is unavailable in the selected `{engine_id}` runtime/model schema"
+    )]
+    UnavailableSetting {
+        setting_id: SettingId,
+        engine_id: String,
+    },
     #[error("setting `{setting_id}` is unsupported: {reason}")]
     UnsupportedSetting {
         setting_id: SettingId,

@@ -50,9 +50,9 @@ pub use manager::{
     RuntimeNoticeLevel,
 };
 pub use packs::{
-    InstalledRuntimeStatus, RuntimeListSnapshot, RuntimeLocalInspection, RuntimeModelCandidate,
-    RuntimePackError, RuntimePackManager, RuntimeSearchResult, RuntimeSearchSnapshot,
-    RuntimeUpdateCheck,
+    InstalledRuntimeStatus, ModelProfileEngineSwitchCandidate, RuntimeListSnapshot,
+    RuntimeLocalInspection, RuntimeModelCandidate, RuntimePackError, RuntimePackManager,
+    RuntimeSearchResult, RuntimeSearchSnapshot, RuntimeUpdateCheck,
 };
 pub use store::{
     RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreIssue, RuntimeStoreIssueKind,
@@ -157,7 +157,36 @@ pub enum OptionValueKind {
     Path,
 }
 
-pub fn common_setting_definitions(engine_id: &str) -> Vec<SettingDefinition> {
+/// Returns the centrally defined common semantics explicitly selected by one
+/// adapter. Common IDs are reusable across engines; they do not imply engine
+/// membership on their own.
+pub fn common_setting_definitions_for(
+    engine_id: &str,
+    setting_ids: &[&str],
+) -> Vec<SettingDefinition> {
+    let library = common_setting_definition_library(engine_id);
+    setting_ids
+        .iter()
+        .map(|id| {
+            library
+                .iter()
+                .find(|definition| definition.id.as_str() == *id)
+                .unwrap_or_else(|| panic!("unknown common setting definition `{id}`"))
+                .clone()
+        })
+        .collect()
+}
+
+/// Removes capability-diagnostic definitions before a schema is exposed to
+/// ordinary settings clients.
+pub fn configurable_setting_definitions(
+    mut definitions: Vec<SettingDefinition>,
+) -> Vec<SettingDefinition> {
+    definitions.retain(|definition| definition.supported);
+    definitions
+}
+
+fn common_setting_definition_library(engine_id: &str) -> Vec<SettingDefinition> {
     vec![
         SettingDefinition {
             id: SettingId::new("context_length").expect("static setting ID"),
@@ -1499,7 +1528,7 @@ pub trait EngineAdapter: Send + Sync {
         Ok(SettingsSchema {
             engine_id: self.identity().id,
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
-            definitions: self.setting_definitions(),
+            definitions: configurable_setting_definitions(self.setting_definitions()),
         })
     }
     /// Gates the curated semantic settings against one exact runtime contract.
@@ -1513,7 +1542,7 @@ pub trait EngineAdapter: Send + Sync {
         Ok(SettingsSchema {
             engine_id: self.identity().id,
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
-            definitions: self.model_setting_definitions(model)?,
+            definitions: configurable_setting_definitions(self.model_setting_definitions(model)?),
         })
     }
     /// Reports the legacy/flexible-entry runtime configured directly for this
