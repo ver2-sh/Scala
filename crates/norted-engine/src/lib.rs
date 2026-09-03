@@ -44,9 +44,10 @@ pub use control::{
     ControlErrorResponse, ControlLoadRequest, ControlUnloadRequest,
 };
 pub use manager::{
-    BackendLifecycle, BackendLoadPhase, BackendLoadProgress, BackendResidency, BackendStatus,
-    ControlStatus, EngineStatus, InferenceRoutingContext, RuntimeError, RuntimeManager,
-    RuntimeManagerOptions, RuntimeNotice, RuntimeNoticeLevel,
+    BackendLifecycle, BackendLoadPhase, BackendLoadProgress, BackendParallelism, BackendResidency,
+    BackendStatus, ControlStatus, EngineStatus, InferenceActivity, InferenceActivityPhase,
+    InferenceRoutingContext, RuntimeError, RuntimeManager, RuntimeManagerOptions, RuntimeNotice,
+    RuntimeNoticeLevel,
 };
 pub use packs::{
     InstalledRuntimeStatus, RuntimeListSnapshot, RuntimeLocalInspection, RuntimeModelCandidate,
@@ -2453,6 +2454,8 @@ mod tests {
             }),
             failure: None,
             provenance: None,
+            parallel_requests: None,
+            activities: Vec::new(),
             active_request_count: 0,
             primary_lease_count: 0,
             last_used_unix: 0,

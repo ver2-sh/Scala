@@ -410,6 +410,8 @@ mod tests {
                 load_progress: None,
                 failure: failure.map(str::to_owned),
                 provenance: None,
+                parallel_requests: None,
+                activities: Vec::new(),
                 active_request_count: 0,
                 primary_lease_count: 0,
                 last_used_unix: 0,
