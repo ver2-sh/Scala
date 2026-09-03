@@ -10,6 +10,8 @@
 - Never substitute `runtime/model default`, `runtime-selected`, `model/thinking-mode default`, `inherited`, `default`, `automatic`, or similar prose for an effective value.
 - A genuine runtime policy such as `auto`, `random`, `off`, or `unlimited` is a value; presentation must never replace automatic runtime behavior with an invented or forced scalar.
 - Authoritative startup observations replace a pre-startup automatic policy in effective presentation without changing its winning source layer.
+- Configuration editors show current/next-load configuration. Running observations are separate running-state facts and must not silently replace edited configuration.
+- When startup changes a requested policy/value, preserve both values structurally in provenance; explanatory prose is supplementary only.
 - Model Profile inheritance displays `VALUE (runtime default)`; boot overrides display `VALUE (boot inference)`.
 - Derived values remain in the runtime-default layer and show the result plus optional derivation detail.
 - `SettingDefaultSource::Norted` is reserved for execution behavior Norted intentionally owns, never for satisfying presentation requirements.

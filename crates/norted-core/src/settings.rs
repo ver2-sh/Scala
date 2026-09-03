@@ -859,6 +859,11 @@ impl ResolvedSettings {
 pub struct EffectiveSetting {
     pub value: String,
     pub source: SettingSource,
+    /// Pre-start policy or value when authoritative runtime observation
+    /// changed the effective value. Absence means startup did not change the
+    /// configured effective value, or the runtime reported a new setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -965,6 +970,7 @@ impl SettingsSchema {
                 EffectiveSetting {
                     value: runtime_default.value.clone(),
                     source: SettingSource::RuntimeDefault,
+                    requested_value: None,
                     detail: runtime_default.detail.clone(),
                 },
             );
@@ -980,6 +986,7 @@ impl SettingsSchema {
                 EffectiveSetting {
                     value: setting.value.to_string(),
                     source: setting.source.clone(),
+                    requested_value: None,
                     detail,
                 },
             );

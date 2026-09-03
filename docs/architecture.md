@@ -192,8 +192,11 @@ source, and optional derivation detail. Runtime/model/host calculations remain p
 default layer. A genuine unresolved runtime policy is represented canonically (for example `auto`),
 not replaced with a presentation-only scalar. Only deliberately Norted-owned execution defaults are
 materialized into launch configuration. Startup-confirmed results supersede automatic policies in
-the running effective map without creating a new source layer. The TUI, CLI, status data, and
-provenance consume that same map; none reconstruct a value from descriptive default prose.
+the running effective map without creating a new source layer; when the value changes, structured
+`requested_value` retains the pre-start policy/value. The Model Profile editor consumes current
+resolution for its primary rows and presents a matching backend's effective map only as secondary
+running state. Server/status/control surfaces continue to consume the running map. No consumer
+reconstructs a value from descriptive default prose.
 
 Runtime selection receives the profile's explicit engine and cannot switch engines. Existing
 resolution order remains explicit runtime, persisted model/runtime choice when applicable,
@@ -209,7 +212,8 @@ system-prompt/context management separate from native launch flags.
 `RuntimeProvenance.model_profile` records the ID, display name, deterministic content hash, bound
 artifact ID, and engine ID. Artifact lineage and hashes remain separately recorded. Settings
 provenance contains the complete concrete effective map and source attribution. Values confirmed by
-startup observations replace pre-launch calculations without changing the winning layer. No artifact package metadata
+startup observations replace pre-launch calculations without changing the winning layer, while a
+changed requested policy/value remains available as structured provenance. No artifact package metadata
 selects settings, prompt templates, runtime defaults, or UI controls.
 
 ## Runtime identity and store

@@ -1224,7 +1224,11 @@ impl App {
                     can_clear: false,
                 };
             };
-            if let Some(setting) = self.settings_running_effective_setting(id) {
+            if let Some(setting) = self
+                .settings_resolved
+                .as_ref()
+                .and_then(|resolved| resolved.effective.get(id))
+            {
                 return SettingValueDisplay {
                     value: setting.value.clone(),
                     source: match &setting.source {
@@ -1252,31 +1256,6 @@ impl App {
                     source: "model profile".to_owned(),
                     state: SettingPresentationState::Override,
                     can_clear: true,
-                };
-            }
-            if let Some(setting) = self
-                .settings_resolved
-                .as_ref()
-                .and_then(|resolved| resolved.effective.get(id))
-            {
-                let source = match &setting.source {
-                    norted_core::SettingSource::RuntimeDefault => "runtime default".to_owned(),
-                    norted_core::SettingSource::ModelProfile { .. } => "model profile".to_owned(),
-                    norted_core::SettingSource::Invocation => "boot inference".to_owned(),
-                };
-                return SettingValueDisplay {
-                    value: setting.value.to_string(),
-                    source,
-                    state: match setting.source {
-                        norted_core::SettingSource::RuntimeDefault => {
-                            SettingPresentationState::Default
-                        }
-                        norted_core::SettingSource::ModelProfile { .. }
-                        | norted_core::SettingSource::Invocation => {
-                            SettingPresentationState::Override
-                        }
-                    },
-                    can_clear: false,
                 };
             }
             return self.settings_default_display(id);
@@ -1377,7 +1356,13 @@ impl App {
         }
         let preview = definition.and_then(|definition| definition.default_preview.as_ref());
         let mut lines = vec![format!("Current: {} · {}", current.value, current.source)];
-        if let Some(preview) = preview {
+        if self.screen == Screen::ModelProfiles {
+            if self.current_layer_value(id).is_some() {
+                lines.push(
+                    "Clear the profile override to use the runtime-default layer.".to_owned(),
+                );
+            }
+        } else if let Some(preview) = preview {
             let preview_source =
                 if definition.is_some_and(|definition| definition.scope == SettingScope::Server) {
                     "server default".to_owned()
@@ -1388,7 +1373,14 @@ impl App {
                 && current.value == preview.value
                 && current.source == preview_source;
             if !current_is_same_default {
-                lines.push(format!("Default: {} · {}", preview.value, preview_source));
+                let label = if definition
+                    .is_some_and(|definition| definition.scope == SettingScope::Server)
+                {
+                    "Server baseline"
+                } else {
+                    "Runtime baseline"
+                };
+                lines.push(format!("{label}: {}", preview.value));
             }
             if let Some(detail) = preview.detail.as_deref() {
                 lines.push(format!("Detail: {detail}"));
@@ -1405,11 +1397,18 @@ impl App {
                     .to_owned()
             });
         }
-        if let Some(running) = self.settings_running_effective_setting(id)
-            && let Some(detail) = running.detail.as_deref()
-            && preview.and_then(|preview| preview.detail.as_deref()) != Some(detail)
-        {
-            lines.push(format!("Running detail: {detail}"));
+        if let Some(running) = self.settings_running_effective_setting(id) {
+            let running_source = match &running.source {
+                norted_core::SettingSource::RuntimeDefault => "runtime default",
+                norted_core::SettingSource::ModelProfile { .. } => "model profile",
+                norted_core::SettingSource::Invocation => "boot inference",
+            };
+            if running.value != current.value || running_source != current.source {
+                lines.push(format!("Running: {} · {}", running.value, running_source));
+                if let Some(detail) = running.detail.as_deref() {
+                    lines.push(format!("Running detail: {detail}"));
+                }
+            }
         }
         lines.join("\n")
     }
