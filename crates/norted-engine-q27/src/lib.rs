@@ -27,10 +27,10 @@ use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CatalogError, CompatibilityDecision,
     EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError, EngineFeature,
     EngineIdentity, EngineProbe, GenerationSettingsPatch, GitHubCommit, GitHubRelease,
-    GitHubReleaseAsset, GitHubReleaseClient, InferenceEvent, InferenceFinishReason,
-    InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole, InferenceStream,
-    InferenceToolCall, InferenceToolChoice, InferenceUsage, InstallationState, LaunchRequest,
-    LaunchSpec, LoadProgressReporter, NativeOption, OptionValueKind, OutputFormat,
+    GitHubReleaseAsset, GitHubReleaseClient, InferenceActivityReporter, InferenceEvent,
+    InferenceFinishReason, InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole,
+    InferenceStream, InferenceToolCall, InferenceToolChoice, InferenceUsage, InstallationState,
+    LaunchRequest, LaunchSpec, LoadProgressReporter, NativeOption, OptionValueKind, OutputFormat,
     PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
     StartupObservation, UpdateState, capture_command, common_setting_definitions,
     compatibility_for, compatibility_for_nvidia_device, isolated_cuda_environment,
@@ -3485,6 +3485,7 @@ impl EngineAdapter for Q27Adapter {
         &self,
         endpoint: &str,
         request: InferenceRequest,
+        _activity: InferenceActivityReporter,
     ) -> Result<InferenceStream, EngineError> {
         let configured = self
             .configured_executions

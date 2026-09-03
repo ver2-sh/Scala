@@ -2016,7 +2016,10 @@ impl App {
             (backends.len(), selected)
         };
         self.overview_selected = selected;
-        self.overview_scroll = self.overview_scroll.min(backend_count.saturating_sub(1));
+        self.overview_scroll = self
+            .overview_scroll
+            .min(backend_count.saturating_sub(1))
+            .min(selected.unwrap_or_default());
         true
     }
 

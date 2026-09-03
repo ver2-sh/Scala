@@ -511,6 +511,17 @@ pub struct PreparedFileIdentity {
 /// promptly; the runtime manager uses a coalescing channel behind this API.
 pub type LoadProgressReporter = Arc<dyn Fn(BackendLoadProgress) + Send + Sync>;
 
+/// Exact, engine-neutral progress for one streaming inference request.
+/// Adapters report only values directly observed from their runtime contract.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum InferenceActivityUpdate {
+    PromptProgress { current: u64, total: u64 },
+    GeneratedTokens(u64),
+}
+
+/// Non-blocking sink for exact per-request inference progress.
+pub type InferenceActivityReporter = Arc<dyn Fn(InferenceActivityUpdate) + Send + Sync>;
+
 const HASH_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const HASH_PROGRESS_BYTE_INTERVAL: u64 = 64 * 1024 * 1024;
 const HASH_PROGRESS_TIME_INTERVAL: Duration = Duration::from_millis(250);
@@ -1656,6 +1667,7 @@ pub trait EngineAdapter: Send + Sync {
         &self,
         endpoint: &str,
         request: InferenceRequest,
+        activity: InferenceActivityReporter,
     ) -> Result<InferenceStream, EngineError>;
 }
 
@@ -2055,6 +2067,7 @@ mod tests {
             &self,
             _endpoint: &str,
             _request: super::InferenceRequest,
+            _activity: super::InferenceActivityReporter,
         ) -> Result<super::InferenceStream, EngineError> {
             unreachable!()
         }
