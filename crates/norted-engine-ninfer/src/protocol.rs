@@ -14,16 +14,23 @@ use serde_json::{Value, json};
 const SSE_FRAME_LIMIT: usize = 1024 * 1024;
 const PRIVATE_BODY_LIMIT: usize = 32 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RequestAdmission {
+    pub(crate) protocol_semantics: bool,
+    pub(crate) sampler_semantics: bool,
+    pub(crate) thinking_semantics: bool,
+    pub(crate) tool_calling: bool,
+    pub(crate) media_semantics: bool,
+    pub(crate) vision: bool,
+    pub(crate) greedy: bool,
+}
+
 pub(crate) fn backend_request(
     request: &InferenceRequest,
     streaming: bool,
-    request_protocol_semantics: bool,
-    request_sampler_semantics: bool,
-    tool_calling: bool,
-    vision: bool,
-    greedy: bool,
+    admission: RequestAdmission,
 ) -> Result<Value, EngineError> {
-    if !request_sampler_semantics
+    if !admission.sampler_semantics
         && (request.generation_settings.temperature.is_some()
             || request.generation_settings.top_p.is_some()
             || request.generation_settings.top_k.is_some()
@@ -37,26 +44,32 @@ pub(crate) fn backend_request(
             "this NInfer executable has no reviewed request-sampler semantic contract".to_owned(),
         ));
     }
-    if !request_protocol_semantics
-        && (request.generation_settings.stop.is_some()
-            || request.generation_settings.reasoning_enabled.is_some()
-            || request.generation_settings.reasoning_effort.is_some())
-    {
+    if !admission.protocol_semantics {
         return Err(EngineError::InvalidGenerationSettings(
             "this NInfer executable has no reviewed source contract for request semantics"
                 .to_owned(),
+        ));
+    }
+    if !admission.thinking_semantics
+        && (request.generation_settings.reasoning_enabled.is_some()
+            || request.generation_settings.reasoning_effort.is_some())
+    {
+        return Err(EngineError::InvalidGenerationSettings(
+            "this NInfer executable has no reviewed thinking-request semantic contract".to_owned(),
         ));
     }
     let has_tool_history = request
         .messages
         .iter()
         .any(|message| !message.tool_calls.is_empty() || message.tool_call_id.is_some());
-    if (!request.tools.is_empty() || has_tool_history) && !tool_calling {
+    if (!request.tools.is_empty() || has_tool_history) && !admission.tool_calling {
         return Err(EngineError::InvalidGenerationSettings(
             "this exact NInfer source contract does not prove tool calling".to_owned(),
         ));
     }
-    if request.messages.iter().any(InferenceMessage::has_media) && !vision {
+    if request.messages.iter().any(InferenceMessage::has_media)
+        && (!admission.media_semantics || !admission.vision)
+    {
         return Err(EngineError::InvalidGenerationSettings(
             "NInfer media input requires exact reviewed runtime support and enabled vision residency"
                 .to_owned(),
@@ -85,7 +98,7 @@ pub(crate) fn backend_request(
                 .to_owned(),
         ));
     }
-    if greedy
+    if admission.greedy
         && (request
             .generation_settings
             .temperature
@@ -693,8 +706,16 @@ mod tests {
 
     #[test]
     fn message_order_and_sampler_omission_are_preserved() {
-        let body = backend_request(&request(), false, true, true, true, false, false)
-            .expect("request body");
+        let admission = RequestAdmission {
+            protocol_semantics: true,
+            sampler_semantics: true,
+            thinking_semantics: true,
+            tool_calling: true,
+            media_semantics: true,
+            vision: false,
+            greedy: false,
+        };
+        let body = backend_request(&request(), false, admission).expect("request body");
         let roles = body["messages"]
             .as_array()
             .expect("messages")
@@ -708,8 +729,7 @@ mod tests {
         let mut explicit = request();
         explicit.generation_settings.temperature = Some(0.4);
         explicit.generation_settings.top_p = Some(0.8);
-        let body = backend_request(&explicit, false, true, true, true, false, false)
-            .expect("request body");
+        let body = backend_request(&explicit, false, admission).expect("request body");
         assert_eq!(body["temperature"], 0.4);
         assert_eq!(body["top_p"], 0.8);
     }

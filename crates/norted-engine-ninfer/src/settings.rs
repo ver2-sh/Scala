@@ -671,49 +671,63 @@ fn unsigned(
     )
 }
 
-pub(crate) fn option_for_setting(id: &str) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingExecutionPath {
+    LaunchOption(&'static str),
+    NortedRequestDefault,
+    VirtualLaunchControl(&'static str),
+    Unsupported,
+}
+
+pub(crate) fn execution_path_for_setting(id: &str) -> SettingExecutionPath {
+    use SettingExecutionPath::{
+        LaunchOption, NortedRequestDefault, Unsupported, VirtualLaunchControl,
+    };
+
     match id {
-        "context_length" => "--max-context",
-        "parallel_requests" => "--max-concurrency",
-        "temperature" => "--temperature",
-        "top_p" => "--top-p",
-        "top_k" => "--top-k",
-        "min_p" => "--min-p",
-        "seed" => "--seed",
-        "presence_penalty" => "--presence-penalty",
-        "frequency_penalty" => "--frequency-penalty",
-        "max_output_tokens" => "--default-max-tokens",
-        "reasoning_budget" => "--default-thinking-budget",
-        "reasoning_effort" | "reasoning" | "stop_strings" | "system_prompt" => "",
-        "ninfer.kv_dtype" => "--kv-dtype",
-        "ninfer.kv_capacity" => "--kv-capacity",
-        "ninfer.prefill_chunk" => "--prefill-chunk",
-        "ninfer.speculation" => "",
-        "ninfer.speculative_backend" => "--spec",
-        "ninfer.draft_tokens" => "--draft-tokens",
-        "ninfer.lm_head_draft" => "--lm-head-draft",
-        "ninfer.vision" => "--vision",
-        "ninfer.greedy" => "--greedy",
-        "ninfer.cuda_graph" => "--no-cuda-graph",
-        "ninfer.prefix_reuse" => "--no-prefix-reuse",
-        "ninfer.thinking" => "--no-thinking",
-        "ninfer.preserve_thinking" => "--preserve-thinking",
-        "ninfer.device_state_slots" => "--device-state-slots",
-        "ninfer.host_state_slots" => "--host-state-slots",
-        "ninfer.host_kv_mib" => "--host-kv-mib",
-        "ninfer.max_private_continuations" => "--max-private-continuations",
-        "ninfer.max_shared_prefixes" => "--max-shared-prefixes",
-        "ninfer.max_long_anchors_per_continuation" => "--max-long-anchors-per-continuation",
-        "ninfer.max_pending_requests" => "--max-pending-requests",
-        "ninfer.pending_timeout_ms" => "--pending-timeout-ms",
-        "ninfer.log_stats_interval_ms" => "--log-stats-interval-ms",
-        "ninfer.max_request_mib" => "--max-request-mib",
-        "ninfer.media_cache_mib" => "--media-cache-mib",
-        "ninfer.media_live_mib" => "--media-live-mib",
-        "ninfer.media_preprocess_threads" => "--media-preprocess-threads",
-        "ninfer.response_store_max_records" => "--response-store-max-records",
-        "ninfer.response_store_max_mib" => "--response-store-max-mib",
-        _ => "",
+        "context_length" => LaunchOption("--max-context"),
+        "parallel_requests" => LaunchOption("--max-concurrency"),
+        "temperature" => LaunchOption("--temperature"),
+        "top_p" => LaunchOption("--top-p"),
+        "top_k" => LaunchOption("--top-k"),
+        "min_p" => LaunchOption("--min-p"),
+        "seed" => LaunchOption("--seed"),
+        "presence_penalty" => LaunchOption("--presence-penalty"),
+        "frequency_penalty" => LaunchOption("--frequency-penalty"),
+        "max_output_tokens" => LaunchOption("--default-max-tokens"),
+        "reasoning_budget" => LaunchOption("--default-thinking-budget"),
+        "reasoning_effort" | "reasoning" | "stop_strings" | "system_prompt" => NortedRequestDefault,
+        "ninfer.kv_dtype" => LaunchOption("--kv-dtype"),
+        "ninfer.kv_capacity" => LaunchOption("--kv-capacity"),
+        "ninfer.prefill_chunk" => LaunchOption("--prefill-chunk"),
+        "ninfer.speculation" => VirtualLaunchControl("--spec"),
+        "ninfer.speculative_backend" => LaunchOption("--spec"),
+        "ninfer.draft_tokens" => LaunchOption("--draft-tokens"),
+        "ninfer.lm_head_draft" => LaunchOption("--lm-head-draft"),
+        "ninfer.vision" => LaunchOption("--vision"),
+        "ninfer.greedy" => LaunchOption("--greedy"),
+        "ninfer.cuda_graph" => LaunchOption("--no-cuda-graph"),
+        "ninfer.prefix_reuse" => LaunchOption("--no-prefix-reuse"),
+        "ninfer.thinking" => LaunchOption("--no-thinking"),
+        "ninfer.preserve_thinking" => LaunchOption("--preserve-thinking"),
+        "ninfer.device_state_slots" => LaunchOption("--device-state-slots"),
+        "ninfer.host_state_slots" => LaunchOption("--host-state-slots"),
+        "ninfer.host_kv_mib" => LaunchOption("--host-kv-mib"),
+        "ninfer.max_private_continuations" => LaunchOption("--max-private-continuations"),
+        "ninfer.max_shared_prefixes" => LaunchOption("--max-shared-prefixes"),
+        "ninfer.max_long_anchors_per_continuation" => {
+            LaunchOption("--max-long-anchors-per-continuation")
+        }
+        "ninfer.max_pending_requests" => LaunchOption("--max-pending-requests"),
+        "ninfer.pending_timeout_ms" => LaunchOption("--pending-timeout-ms"),
+        "ninfer.log_stats_interval_ms" => LaunchOption("--log-stats-interval-ms"),
+        "ninfer.max_request_mib" => LaunchOption("--max-request-mib"),
+        "ninfer.media_cache_mib" => LaunchOption("--media-cache-mib"),
+        "ninfer.media_live_mib" => LaunchOption("--media-live-mib"),
+        "ninfer.media_preprocess_threads" => LaunchOption("--media-preprocess-threads"),
+        "ninfer.response_store_max_records" => LaunchOption("--response-store-max-records"),
+        "ninfer.response_store_max_mib" => LaunchOption("--response-store-max-mib"),
+        _ => Unsupported,
     }
 }
 
@@ -723,17 +737,16 @@ pub(crate) fn translate(
     native_arguments: &[String],
 ) -> Result<Vec<OsString>, EngineError> {
     for id in settings.configured.keys() {
-        if matches!(
-            id.as_str(),
-            "ninfer.speculation"
-                | "reasoning_effort"
-                | "reasoning"
-                | "stop_strings"
-                | "system_prompt"
-        ) {
-            continue;
-        }
-        let option = option_for_setting(id.as_str());
+        let option = match execution_path_for_setting(id.as_str()) {
+            SettingExecutionPath::LaunchOption(option) => option,
+            SettingExecutionPath::NortedRequestDefault
+            | SettingExecutionPath::VirtualLaunchControl(_) => continue,
+            SettingExecutionPath::Unsupported => {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "setting `{id}` has no NInfer execution path"
+                )));
+            }
+        };
         if let Some(argument) = find_native_option(native_arguments, option) {
             return Err(EngineError::InvalidConfiguration(format!(
                 "structured setting `{id}` conflicts with native NInfer argument `{argument}`"
@@ -887,16 +900,16 @@ pub(crate) fn translate(
 
     let mut arguments = Vec::new();
     for (id, resolved) in &settings.configured {
-        if matches!(
-            id.as_str(),
-            "ninfer.speculation"
-                | "reasoning_effort"
-                | "reasoning"
-                | "stop_strings"
-                | "system_prompt"
-        ) {
-            continue;
-        }
+        let option = match execution_path_for_setting(id.as_str()) {
+            SettingExecutionPath::LaunchOption(option) => option,
+            SettingExecutionPath::NortedRequestDefault
+            | SettingExecutionPath::VirtualLaunchControl(_) => continue,
+            SettingExecutionPath::Unsupported => {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "setting `{id}` has no NInfer execution path"
+                )));
+            }
+        };
         if !speculation_enabled
             && matches!(
                 id.as_str(),
@@ -905,7 +918,6 @@ pub(crate) fn translate(
         {
             continue;
         }
-        let option = option_for_setting(id.as_str());
         match &resolved.value {
             SettingValue::FlagEnabled => arguments.push(OsString::from(option)),
             SettingValue::Toggle(value) => match id.as_str() {
