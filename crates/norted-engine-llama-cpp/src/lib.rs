@@ -35,7 +35,7 @@ use norted_engine::{
     InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter, NativeOption,
     OptionValueKind, OutputFormat, PreparedModelInput, ProcessDescriptor,
     RuntimeVariantUpdateIdentity, StartupObservation, UpdateState, capture_command,
-    common_setting_definitions, prepare_norted_package_input,
+    common_setting_definitions_for, configurable_setting_definitions, prepare_norted_package_input,
     prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
     revalidate_norted_package_before_launch_with_progress,
 };
@@ -850,7 +850,9 @@ impl EngineAdapter for LlamaCppAdapter {
         &self,
         model: &ModelArtifact,
     ) -> Result<Vec<SettingDefinition>, EngineError> {
-        Ok(llama_model_setting_definitions(Some(model)))
+        Ok(configurable_setting_definitions(
+            llama_model_setting_definitions(Some(model)),
+        ))
     }
 
     async fn runtime_settings_schema(
@@ -872,6 +874,7 @@ impl EngineAdapter for LlamaCppAdapter {
                 "active experts requires a bound model with inspected expert metadata".to_owned(),
             );
         }
+        let definitions = configurable_setting_definitions(definitions);
         Ok(SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -890,6 +893,7 @@ impl EngineAdapter for LlamaCppAdapter {
         let help = self.cached_runtime_help(runtime).await?;
         let mut definitions = self.model_setting_definitions(model)?;
         apply_llama_exact_help_contract(&mut definitions, &help);
+        let definitions = configurable_setting_definitions(definitions);
         Ok(SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -1635,7 +1639,28 @@ fn invalid_probe(reason: String) -> EngineProbe {
 }
 
 fn llama_setting_definitions() -> Vec<SettingDefinition> {
-    let mut definitions = common_setting_definitions(ENGINE_ID);
+    const COMMON_SETTINGS: &[&str] = &[
+        "context_length",
+        "parallel_requests",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "seed",
+        "repeat_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "max_output_tokens",
+        "stop_strings",
+        "system_prompt",
+        "reasoning",
+        "reasoning_effort",
+        "reasoning_budget",
+        "reasoning_budget_message",
+        "structured_output_schema",
+        "context_overflow",
+    ];
+    let mut definitions = common_setting_definitions_for(ENGINE_ID, COMMON_SETTINGS);
     definitions.extend([
         llama_definition(
             "llama.cpp.threads",
@@ -2419,6 +2444,7 @@ fn llama_configured_runtime_compatibility(
     };
     let mut definitions = llama_model_setting_definitions(model);
     apply_llama_exact_help_contract(&mut definitions, help);
+    let definitions = configurable_setting_definitions(definitions);
     let schema = SettingsSchema {
         engine_id: ENGINE_ID.to_owned(),
         runtime_id: None,

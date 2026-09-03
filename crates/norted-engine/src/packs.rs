@@ -306,7 +306,7 @@ impl RuntimePackManager {
         Ok(norted_core::SettingsSchema {
             engine_id: engine_id.to_owned(),
             runtime_id: None,
-            definitions,
+            definitions: crate::configurable_setting_definitions(definitions),
         })
     }
 

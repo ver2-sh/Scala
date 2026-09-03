@@ -21,7 +21,8 @@ use norted_engine::{
     InferenceOutput, InferenceRequest, InferenceStream, InstallationState, LaunchRequest,
     LaunchSpec, LoadProgressReporter, NativeOption, OptionValueKind, OutputFormat,
     PreparedModelInput, ProcessDescriptor, RuntimeVariantUpdateIdentity, UpdateState,
-    capture_command, compatibility_for, isolated_cuda_environment, prepare_norted_package_input,
+    capture_command, compatibility_for, configurable_setting_definitions,
+    isolated_cuda_environment, prepare_norted_package_input,
     prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
     revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
 };
@@ -1600,7 +1601,7 @@ impl EngineAdapter for NinferAdapter {
     ) -> Result<Vec<norted_core::SettingDefinition>, EngineError> {
         let mut definitions = settings::definitions();
         settings::apply_model_capabilities(&mut definitions, model);
-        Ok(definitions)
+        Ok(configurable_setting_definitions(definitions))
     }
 
     async fn runtime_settings_schema(
@@ -1626,6 +1627,7 @@ impl EngineAdapter for NinferAdapter {
             settings::apply_reviewed_runtime_defaults(&mut definitions, settings);
         }
         apply_ninfer_runtime_contract(&mut definitions, &help, capabilities);
+        let definitions = configurable_setting_definitions(definitions);
         Ok(norted_core::SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -1660,6 +1662,7 @@ impl EngineAdapter for NinferAdapter {
             settings::apply_model_sampler_defaults(&mut definitions, model, settings);
         }
         apply_ninfer_runtime_contract(&mut definitions, &help, capabilities);
+        let definitions = configurable_setting_definitions(definitions);
         Ok(norted_core::SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),

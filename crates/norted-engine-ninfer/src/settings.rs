@@ -5,12 +5,29 @@ use norted_core::{
     SettingDefaultPreview, SettingDefaultSource, SettingDefinition, SettingId, SettingKind,
     SettingScope, SettingValue, UnsignedIntegerOrChoiceValue,
 };
-use norted_engine::{EngineError, common_setting_definitions};
+use norted_engine::{EngineError, common_setting_definitions_for};
 
 const MAX_NINFER_CLI_INTEGER: u64 = i32::MAX as u64;
+const NINFER_COMMON_SETTINGS: &[&str] = &[
+    "context_length",
+    "parallel_requests",
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "seed",
+    "presence_penalty",
+    "frequency_penalty",
+    "max_output_tokens",
+    "stop_strings",
+    "system_prompt",
+    "reasoning",
+    "reasoning_effort",
+    "reasoning_budget",
+];
 
 pub(crate) fn definitions() -> Vec<SettingDefinition> {
-    let mut definitions = common_setting_definitions(crate::ENGINE_ID);
+    let mut definitions = common_setting_definitions_for(crate::ENGINE_ID, NINFER_COMMON_SETTINGS);
     definitions.extend([
         definition(
             "ninfer.kv_dtype",
@@ -1138,14 +1155,27 @@ mod tests {
     }
 
     #[test]
-    fn advertised_common_definitions_remain_engine_neutral() {
+    fn common_definitions_match_the_explicit_ninfer_surface() {
         let definitions = definitions();
-        for common in common_setting_definitions(crate::ENGINE_ID) {
+        for common in common_setting_definitions_for(crate::ENGINE_ID, NINFER_COMMON_SETTINGS) {
             assert_eq!(
                 definitions
                     .iter()
                     .find(|definition| definition.id == common.id),
                 Some(&common)
+            );
+        }
+        for absent in [
+            "repeat_penalty",
+            "reasoning_budget_message",
+            "structured_output_schema",
+            "context_overflow",
+        ] {
+            assert!(
+                definitions
+                    .iter()
+                    .all(|definition| definition.id.as_str() != absent),
+                "{absent} must not belong to the NInfer settings surface"
             );
         }
     }
