@@ -71,11 +71,18 @@ Discover includes an in-process model download manager. Separate acquisitions ru
 releases its slot to the next queued request. Settings > Global > Downloads exposes the typed
 `server.max_parallel_model_downloads` value with a minimum of 1; raising it starts more queued jobs
 immediately, while lowering it lets current transfers finish and limits subsequent starts. Exact
-duplicate references are admitted only once while queued or active. References that resolve to the
-same package acquisition wait for its owner and settle as already installed. The download panel
-retains a bounded recent history and shows each job's artifact, phase, real bytes/total and
-percentage when known, measured transfer rate, calculated ETA when meaningful, or queue position.
-Search and TUI navigation remain independent of downloads.
+duplicate references are suppressed while queued, resolving or downloading, paused, or completing
+cancellation cleanup. Active downloads can be paused; pausing retains resumable partial data and
+releases the scheduler slot so queued work can run. Resume continues through the existing HTTP
+Range partial-file mechanism.
+
+Queued, paused, resolving, and downloading jobs can be cancelled where safe. Cancellation removes
+partial transfer data before the same model reference becomes eligible again; verifying,
+validating, and installing are intentionally atomic and non-cancellable. References that resolve
+to the same package acquisition wait for its owner and settle as already installed. The TUI
+download cards retain a bounded recent history and expose progress, bytes/total, transfer rate,
+ETA, queue state, and Pause, Resume, or Cancel controls as applicable. Search and TUI navigation
+remain independent of downloads.
 
 Managed models use the platform-native Norted data directory shown by `config show`:
 
