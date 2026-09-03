@@ -329,7 +329,7 @@ fn models_footer<'a>(
                 line.push(hint("d", "remove", theme));
             }
         }
-        if app.selected_model_download_job.is_some() {
+        if app.selected_model_download_job_is_controllable() {
             line.push(hint("p", "pause/resume", theme));
             line.push(hint("x", "cancel download", theme));
             if !compact {
@@ -348,7 +348,7 @@ fn models_footer<'a>(
             hint("Up/Down", "select", theme),
             hint("d", "download", theme),
         ];
-        if app.selected_model_download_job.is_some() {
+        if app.selected_model_download_job_is_controllable() {
             line.push(hint("p", "pause/resume", theme));
             line.push(hint("x", "cancel", theme));
             line.push(hint("Shift+Up/Down", "select download", theme));
@@ -371,7 +371,7 @@ fn models_footer<'a>(
     if has_selection {
         line.push(hint("d", "download", theme));
     }
-    if app.selected_model_download_job.is_some() {
+    if app.selected_model_download_job_is_controllable() {
         line.push(hint("p", "pause/resume", theme));
         line.push(hint("x", "cancel", theme));
     }

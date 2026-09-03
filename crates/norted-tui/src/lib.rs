@@ -312,7 +312,7 @@ pub async fn run(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => Update::None,
             },
             _ = render_tick.tick() => {
-                let has_live_downloads = reconcile_model_download_jobs(
+                let (has_live_downloads, download_jobs_changed) = reconcile_model_download_jobs(
                     &mut app,
                     &model_library,
                     &core,
@@ -321,7 +321,7 @@ pub async fn run(
                 );
                 let animation_changed =
                     app.advance_ui_animation(layout.active_marquee_target(&app));
-                if has_live_downloads || animation_changed {
+                if has_live_downloads || download_jobs_changed || animation_changed {
                     Update::Render
                 } else {
                     Update::None
@@ -380,8 +380,10 @@ fn reconcile_model_download_jobs(
     core: &Arc<ApplicationCore>,
     results: &tokio::sync::mpsc::Sender<ModelLibraryTaskResult>,
     refreshed_installed_jobs: &mut HashSet<ModelDownloadJobId>,
-) -> bool {
+) -> (bool, bool) {
     let jobs = library.download_jobs();
+    let jobs_changed = download_job_snapshots_changed(&app.model_download_jobs, &jobs);
+    let previous_selection = app.selected_model_download_job.clone();
     let current_ids = jobs
         .iter()
         .map(|job| job.id.clone())
@@ -418,7 +420,32 @@ fn reconcile_model_download_jobs(
         )
     });
     app.replace_model_download_jobs(jobs);
-    has_live_downloads
+    (
+        has_live_downloads,
+        jobs_changed || app.selected_model_download_job != previous_selection,
+    )
+}
+
+fn download_job_snapshots_changed(
+    previous: &[norted_model_library::ModelDownloadJob],
+    current: &[norted_model_library::ModelDownloadJob],
+) -> bool {
+    previous.len() != current.len()
+        || previous.iter().zip(current).any(|(previous, current)| {
+            previous.id != current.id
+                || previous.model_ref != current.model_ref
+                || previous.provider != current.provider
+                || previous.repository != current.repository
+                || previous.filename != current.filename
+                || previous.phase != current.phase
+                || previous.downloaded_bytes != current.downloaded_bytes
+                || previous.total_bytes != current.total_bytes
+                || previous.progress_percent != current.progress_percent
+                || previous.transfer_bytes_per_second != current.transfer_bytes_per_second
+                || previous.estimated_remaining != current.estimated_remaining
+                || previous.queue_position != current.queue_position
+                || previous.message != current.message
+        })
 }
 
 fn spawn_model_library_action(

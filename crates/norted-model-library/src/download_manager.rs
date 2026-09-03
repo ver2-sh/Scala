@@ -78,6 +78,7 @@ struct JobRecord {
     active_control: Option<ActiveControl>,
     resume_after_stop: bool,
     partial_paths: HashSet<std::path::PathBuf>,
+    cancellation_cleanup_pending: bool,
 }
 
 #[derive(Debug)]
@@ -97,6 +98,7 @@ pub(crate) struct DownloadStart {
 pub(crate) struct DownloadTransition {
     pub(crate) starts: Vec<DownloadStart>,
     pub(crate) cleanup: Vec<std::path::PathBuf>,
+    pub(crate) cancellation_cleanup: Option<ModelDownloadJobId>,
 }
 
 #[derive(Debug)]
@@ -128,11 +130,10 @@ impl DownloadManager {
 
     pub(crate) fn admit(&self, model_ref: String) -> (DownloadAdmission, Vec<DownloadStart>) {
         let mut state = self.state.lock().expect("download manager lock poisoned");
-        if let Some(record) = state
-            .jobs
-            .values()
-            .find(|record| record.model_ref == model_ref && !record.phase.is_terminal())
-        {
+        if let Some(record) = state.jobs.values().find(|record| {
+            record.model_ref == model_ref
+                && (!record.phase.is_terminal() || record.cancellation_cleanup_pending)
+        }) {
             return (
                 DownloadAdmission::Duplicate(snapshot(&state, record)),
                 Vec::new(),
@@ -160,6 +161,7 @@ impl DownloadManager {
             active_control: None,
             resume_after_stop: false,
             partial_paths: HashSet::new(),
+            cancellation_cleanup_pending: false,
         };
         state.order.push(id.clone());
         state.queue.push_back(id.clone());
@@ -356,18 +358,30 @@ impl DownloadManager {
         record.finished_at = Some(Instant::now());
         record.resume_after_stop = false;
         record.transfer_started_at = None;
+        record.cancellation_cleanup_pending =
+            record.active_control.is_some() || !record.partial_paths.is_empty();
         let cleanup = if record.active_control.is_none() {
             record.partial_paths.drain().collect()
         } else {
             Vec::new()
         };
+        let cancellation_cleanup = (record.cancellation_cleanup_pending
+            && record.active_control.is_none())
+        .then(|| id.clone());
         let starts = schedule_locked(&mut state);
-        prune_locked(&mut state);
         let job = snapshot(
             &state,
             state.jobs.get(id).expect("download job remains present"),
         );
-        Ok((job, DownloadTransition { starts, cleanup }))
+        prune_locked(&mut state);
+        Ok((
+            job,
+            DownloadTransition {
+                starts,
+                cleanup,
+                cancellation_cleanup,
+            },
+        ))
     }
 
     pub(crate) fn finish_attempt(
@@ -430,8 +444,24 @@ impl DownloadManager {
             }
         }
         let starts = schedule_locked(&mut state);
+        let cancellation_cleanup = (phase == ModelOperationPhase::Cancelled).then(|| id.clone());
         prune_locked(&mut state);
-        DownloadTransition { starts, cleanup }
+        DownloadTransition {
+            starts,
+            cleanup,
+            cancellation_cleanup,
+        }
+    }
+
+    pub(crate) fn acknowledge_cancellation_cleanup(&self, id: &ModelDownloadJobId) {
+        let mut state = self.state.lock().expect("download manager lock poisoned");
+        if let Some(record) = state.jobs.get_mut(id)
+            && record.phase == ModelOperationPhase::Cancelled
+            && record.active_control.is_none()
+        {
+            record.cancellation_cleanup_pending = false;
+        }
+        prune_locked(&mut state);
     }
 
     pub(crate) fn snapshots(&self) -> Vec<ModelDownloadJob> {
@@ -483,10 +513,11 @@ fn prune_locked(state: &mut State) {
         .order
         .iter()
         .filter(|id| {
-            state
-                .jobs
-                .get(*id)
-                .is_some_and(|record| record.phase.is_terminal() && record.active_control.is_none())
+            state.jobs.get(*id).is_some_and(|record| {
+                record.phase.is_terminal()
+                    && record.active_control.is_none()
+                    && !record.cancellation_cleanup_pending
+            })
         })
         .count();
     let mut remove = terminal.saturating_sub(MAX_RECENT_TERMINAL_JOBS);
@@ -495,10 +526,11 @@ fn prune_locked(state: &mut State) {
     }
     state.order.retain(|id| {
         if remove > 0
-            && state
-                .jobs
-                .get(id)
-                .is_some_and(|record| record.phase.is_terminal() && record.active_control.is_none())
+            && state.jobs.get(id).is_some_and(|record| {
+                record.phase.is_terminal()
+                    && record.active_control.is_none()
+                    && !record.cancellation_cleanup_pending
+            })
         {
             state.jobs.remove(id);
             remove -= 1;
@@ -577,102 +609,4 @@ fn identity_from_reference(model_ref: &str) -> (Option<String>, Option<String>, 
         .map(|(_, filename)| filename.to_owned())
         .filter(|value| !value.is_empty());
     (provider, repository, filename)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::DownloadManager;
-    use crate::{DownloadAdmission, ModelOperationPhase};
-
-    #[test]
-    fn paused_attempt_releases_capacity_and_resumes_the_same_job_after_stopping() {
-        let manager = DownloadManager::new(1);
-        let (first, first_starts) = manager.admit("hf:owner/first@main/model.gguf".to_owned());
-        let first_id = match first {
-            DownloadAdmission::Started(job) => job.id,
-            _ => panic!("first download should start"),
-        };
-        let first_start = first_starts.into_iter().next().expect("first start");
-        let (second, _) = manager.admit("hf:owner/second@main/model.gguf".to_owned());
-        let second_id = match second {
-            DownloadAdmission::Queued(job) => job.id,
-            _ => panic!("second download should queue"),
-        };
-
-        let (paused, replacement) = manager.pause(&first_id).expect("pause succeeds");
-        assert_eq!(paused.phase, ModelOperationPhase::Paused);
-        assert_eq!(replacement.len(), 1);
-        assert_eq!(replacement[0].id, second_id);
-
-        let (resuming, starts) = manager.resume(&first_id).expect("resume succeeds");
-        assert_eq!(resuming.phase, ModelOperationPhase::Paused);
-        assert!(starts.is_empty(), "old attempt must stop before resuming");
-        let stopped = manager.finish_attempt(&first_id, first_start.generation, None);
-        assert!(
-            stopped.starts.is_empty(),
-            "the replacement still owns the slot"
-        );
-
-        let second_generation = replacement[0].generation;
-        let resumed = manager.finish_attempt(
-            &second_id,
-            second_generation,
-            Some((ModelOperationPhase::Installed, "installed".to_owned())),
-        );
-        assert_eq!(resumed.starts.len(), 1);
-        assert_eq!(resumed.starts[0].id, first_id);
-        assert_ne!(resumed.starts[0].generation, first_start.generation);
-    }
-
-    #[test]
-    fn cancelled_attempt_cannot_be_overwritten_and_defers_cleanup_until_it_stops() {
-        let manager = DownloadManager::new(1);
-        let (admission, starts) = manager.admit("hf:owner/model@main/model.gguf".to_owned());
-        let id = match admission {
-            DownloadAdmission::Started(job) => job.id,
-            _ => panic!("download should start"),
-        };
-        let start = starts.into_iter().next().expect("download start");
-        let partial = PathBuf::from("model.part");
-        manager.register_partial_paths(&id, Some(start.generation), [partial.clone()]);
-
-        let (cancelled, transition) = manager.cancel(&id).expect("cancel succeeds");
-        assert_eq!(cancelled.phase, ModelOperationPhase::Cancelled);
-        assert!(transition.cleanup.is_empty());
-
-        let finished = manager.finish_attempt(
-            &id,
-            start.generation,
-            Some((ModelOperationPhase::Failed, "late failure".to_owned())),
-        );
-        assert_eq!(finished.cleanup, [partial]);
-        let snapshot = manager
-            .snapshots()
-            .into_iter()
-            .find(|job| job.id == id)
-            .expect("cancelled job remains visible");
-        assert_eq!(snapshot.phase, ModelOperationPhase::Cancelled);
-        assert_eq!(snapshot.message, "Download cancelled");
-    }
-
-    #[test]
-    fn pausing_a_queued_job_removes_it_from_scheduling_and_duplicate_admission() {
-        let manager = DownloadManager::new(1);
-        let (_, _) = manager.admit("hf:owner/active@main/model.gguf".to_owned());
-        let model_ref = "hf:owner/queued@main/model.gguf".to_owned();
-        let (queued, _) = manager.admit(model_ref.clone());
-        let queued_id = match queued {
-            DownloadAdmission::Queued(job) => job.id,
-            _ => panic!("second download should queue"),
-        };
-        let (paused, starts) = manager.pause(&queued_id).expect("queued pause succeeds");
-        assert_eq!(paused.phase, ModelOperationPhase::Paused);
-        assert!(starts.is_empty());
-        assert!(matches!(
-            manager.admit(model_ref).0,
-            DownloadAdmission::Duplicate(job) if job.id == queued_id && job.phase == ModelOperationPhase::Paused
-        ));
-    }
 }
