@@ -157,7 +157,10 @@ Model Profile editor shows only the selected runtime's supported schema.
 Every supported effective setting is presented as a concrete value followed by its winning source,
 for example `1.0 (runtime default)`, `0.7 (model profile)`, or `200000 (boot inference)`.
 Source text supplements the value and never replaces it. Dynamic runtime/model/host derivations
-remain part of the runtime-default layer and carry optional secondary detail. See
+remain part of the runtime-default layer and carry optional secondary detail. A genuine `auto`
+policy remains automatic before startup; presenting it never causes Norted to materialize an
+invented launch value. Authoritative startup results replace that policy in the running effective
+view without changing its winning source. See
 [Settings and defaults](docs/settings.md).
 
 llama.cpp exposes load/runtime controls for context and slots; CPU threads and logical/physical

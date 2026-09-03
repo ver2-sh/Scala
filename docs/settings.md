@@ -39,7 +39,12 @@ Derivation may appear as secondary detail, for example `derived from host concur
 derivation supplement the value; they never replace it. `runtime/model default`, `runtime-selected`,
 `model/thinking-mode default`, `inherited`, `default`, `automatic`, and similar prose must not stand
 in for an unknown effective result. A genuine typed policy such as seed `random` or an editable
-`auto` mode remains a real value, but a resolvable automatic result must be displayed concretely.
+`auto` mode remains a real value. Showing a value never authorizes inventing or forcing a scalar:
+when the runtime intentionally defers a result until model/host/startup facts exist, the pre-startup
+effective value is `auto (runtime default)` with constraints in secondary detail. Once authoritative
+startup observation resolves that policy, the running effective value becomes the observed result
+while retaining the original winning source. `SettingDefaultSource::Norted` is reserved for
+execution behavior Norted intentionally owns for a product/runtime reason, not presentation needs.
 
 Clearing a Model Profile override immediately reveals `VALUE (runtime default)`. Boot overrides are
 ephemeral and display as `VALUE (boot inference)`; they are not persisted unless the user explicitly

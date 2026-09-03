@@ -1162,7 +1162,7 @@ impl App {
             self.runtime_settings_schemas
                 .get(engine_id)
                 .map(|schema| schema.definitions.as_slice())
-                .unwrap_or(self.setting_definitions.as_slice())
+                .unwrap_or_default()
         } else {
             self.setting_definitions.as_slice()
         };
@@ -1224,6 +1224,28 @@ impl App {
                     can_clear: false,
                 };
             };
+            if let Some(setting) = self.settings_running_effective_setting(id) {
+                return SettingValueDisplay {
+                    value: setting.value.clone(),
+                    source: match &setting.source {
+                        norted_core::SettingSource::RuntimeDefault => "runtime default".to_owned(),
+                        norted_core::SettingSource::ModelProfile { .. } => {
+                            "model profile".to_owned()
+                        }
+                        norted_core::SettingSource::Invocation => "boot inference".to_owned(),
+                    },
+                    state: match setting.source {
+                        norted_core::SettingSource::RuntimeDefault => {
+                            SettingPresentationState::Default
+                        }
+                        norted_core::SettingSource::ModelProfile { .. }
+                        | norted_core::SettingSource::Invocation => {
+                            SettingPresentationState::Override
+                        }
+                    },
+                    can_clear: profile.overrides.0.contains_key(id),
+                };
+            }
             if let Some(value) = profile.overrides.0.get(id) {
                 return SettingValueDisplay {
                     value: value.to_string(),
@@ -1240,7 +1262,7 @@ impl App {
                 let source = match &setting.source {
                     norted_core::SettingSource::RuntimeDefault => "runtime default".to_owned(),
                     norted_core::SettingSource::ModelProfile { .. } => "model profile".to_owned(),
-                    norted_core::SettingSource::Invocation => "invocation".to_owned(),
+                    norted_core::SettingSource::Invocation => "boot inference".to_owned(),
                 };
                 return SettingValueDisplay {
                     value: setting.value.to_string(),
@@ -1261,8 +1283,8 @@ impl App {
         }
         let Some(scope) = self.selected_settings_scope() else {
             return SettingValueDisplay {
-                value: "Default".to_owned(),
-                source: "configured state".to_owned(),
+                value: "Unavailable".to_owned(),
+                source: "unresolved scope".to_owned(),
                 state: SettingPresentationState::Default,
                 can_clear: false,
             };
@@ -1323,8 +1345,8 @@ impl App {
             }
         } else {
             SettingValueDisplay {
-                value: "Default".to_owned(),
-                source: "configured state".to_owned(),
+                value: "Unavailable".to_owned(),
+                source: "exact runtime unresolved".to_owned(),
                 state: SettingPresentationState::Default,
                 can_clear: false,
             }
@@ -1383,21 +1405,24 @@ impl App {
                     .to_owned()
             });
         }
-        if let Some(resolved) = self.settings_runtime_resolved_value(id)
-            && current.value != resolved
+        if let Some(running) = self.settings_running_effective_setting(id)
+            && let Some(detail) = running.detail.as_deref()
+            && preview.and_then(|preview| preview.detail.as_deref()) != Some(detail)
         {
-            lines.push(format!("Running: {resolved} · runtime resolved"));
+            lines.push(format!("Running detail: {detail}"));
         }
         lines.join("\n")
     }
 
-    fn settings_runtime_resolved_value(&self, id: &SettingId) -> Option<String> {
+    fn settings_running_effective_setting(
+        &self,
+        id: &SettingId,
+    ) -> Option<&norted_core::EffectiveSetting> {
         if self.screen != Screen::ModelProfiles {
             return None;
         }
         let profile = self.selected_model_profile_value()?;
         let runtime_id = self.settings_runtime_id.as_ref()?;
-        let settings_resolved = self.settings_resolved.as_ref()?;
         let backend = self.control.as_ref()?.backend(&profile.id)?;
         if backend.lifecycle != BackendLifecycle::Running
             || backend.model_id != profile.model_id
@@ -1407,21 +1432,10 @@ impl App {
             return None;
         }
         let provenance = backend.provenance.as_ref()?;
-        if provenance.model_profile.content_sha256 != profile.content_hash()
-            || provenance.settings.effective != settings_resolved.effective
-        {
+        if provenance.model_profile.content_sha256 != profile.content_hash() {
             return None;
         }
-        let value = provenance
-            .normalized_settings
-            .get("resolved_settings")?
-            .as_object()?
-            .get(id.as_str())?;
-        Some(
-            value
-                .as_str()
-                .map_or_else(|| value.to_string(), ToOwned::to_owned),
-        )
+        provenance.settings.effective.get(id)
     }
 
     pub fn model_profile_values(&self) -> Vec<&ModelProfile> {

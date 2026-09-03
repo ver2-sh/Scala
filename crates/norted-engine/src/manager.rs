@@ -2620,8 +2620,17 @@ fn reconcile_effective_settings_from_runtime(provenance: &mut RuntimeProvenance)
             .map_or_else(|| value.to_string(), ToOwned::to_owned);
         match provenance.settings.effective.get_mut(&id) {
             Some(setting) => {
+                let previous = setting.value.clone();
                 setting.value = display;
-                if setting.detail.is_none() {
+                if previous != setting.value {
+                    let resolution = format!(
+                        "The launched runtime resolved the pre-startup `{previous}` policy/value"
+                    );
+                    setting.detail = Some(setting.detail.as_ref().map_or_else(
+                        || resolution.clone(),
+                        |detail| format!("{detail}; {resolution}"),
+                    ));
+                } else if setting.detail.is_none() {
                     setting.detail = Some("Confirmed by the launched runtime".to_owned());
                 }
             }
