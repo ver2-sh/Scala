@@ -407,7 +407,16 @@ fn reconcile_model_download_jobs(
                 .await;
         });
     }
-    let has_live_downloads = jobs.iter().any(|job| !job.is_terminal());
+    let has_live_downloads = jobs.iter().any(|job| {
+        matches!(
+            job.phase,
+            ModelOperationPhase::Resolving
+                | ModelOperationPhase::Downloading
+                | ModelOperationPhase::Verifying
+                | ModelOperationPhase::Validating
+                | ModelOperationPhase::Installing
+        )
+    });
     app.replace_model_download_jobs(jobs);
     has_live_downloads
 }
@@ -429,6 +438,17 @@ fn spawn_model_library_action(
             ModelLibraryAction::Download(model_ref) => ModelLibraryTaskResult::DownloadAdmitted(
                 Box::new(library.enqueue_download(model_ref)),
             ),
+            ModelLibraryAction::DownloadJob { id, action } => {
+                let result = match action {
+                    crate::ui::layout::DownloadJobAction::Pause => library.pause_download(&id),
+                    crate::ui::layout::DownloadJobAction::Resume => library.resume_download(&id),
+                    crate::ui::layout::DownloadJobAction::Cancel => library.cancel_download(&id),
+                };
+                ModelLibraryTaskResult::DownloadJobControlled {
+                    action,
+                    result: Box::new(result),
+                }
+            }
             ModelLibraryAction::Remove(model_id) => {
                 let result = match core.model(&model_id).await {
                     Some(model) => match library.plan_removal(&model) {

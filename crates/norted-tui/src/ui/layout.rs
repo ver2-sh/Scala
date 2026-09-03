@@ -40,6 +40,23 @@ pub enum SelectedRuntimeAction {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DownloadJobAction {
+    Pause,
+    Resume,
+    Cancel,
+}
+
+impl DownloadJobAction {
+    pub fn completed_label(self) -> &'static str {
+        match self {
+            Self::Pause => "Paused",
+            Self::Resume => "Resumed",
+            Self::Cancel => "Cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum HoverTarget {
     Navigation(Screen),
     ModelLibraryTab(ModelLibraryView),
@@ -47,6 +64,8 @@ pub enum HoverTarget {
     ModelSearchSubmit,
     ModelFormatFilter(Option<ArtifactFormat>),
     ModelDownloadAction(usize),
+    DownloadJob(usize),
+    DownloadJobAction(usize, DownloadJobAction),
     Model(usize),
     InstalledModelAction(InstalledModelAction),
     Runtime(usize),
@@ -103,6 +122,8 @@ pub struct UiLayout {
     pub model_downloads: Rect,
     pub model_rows: Vec<(usize, Rect)>,
     pub model_download_actions: Vec<(usize, Rect)>,
+    pub download_job_rows: Vec<(usize, Rect)>,
+    pub download_job_actions: Vec<(usize, DownloadJobAction, Rect)>,
     pub installed_model_actions: Vec<(InstalledModelAction, Rect)>,
     pub server_details: Rect,
     pub server_progress: Rect,
@@ -303,14 +324,27 @@ impl UiLayout {
                 .filter(|job| job.is_terminal())
                 .count()
                 .min(if pending_downloads == 0 { 3 } else { 1 });
-            let download_height = (pending_downloads + recent_downloads + 1) as u16;
-            let download_height =
-                download_height.min(model_body.height.saturating_sub(model_row_height).max(3));
-            let (model_body, downloads) = reserve_bottom(
-                model_body,
-                !app.model_download_jobs.is_empty(),
-                download_height,
-            );
+            let download_count = pending_downloads + recent_downloads;
+            let card_stride = if compact { 3 } else { 4 };
+            let desired_download_height = if download_count == 0 {
+                0
+            } else {
+                1 + (download_count as u16).saturating_mul(card_stride) - u16::from(!compact)
+            };
+            let preserved_rows = if model_body.height >= model_row_height.saturating_mul(4) {
+                model_row_height.saturating_mul(2)
+            } else {
+                model_row_height
+            };
+            let available_after_models = model_body.height.saturating_sub(preserved_rows);
+            let proportional_cap = model_body.height.saturating_mul(3) / 5;
+            let mut download_height =
+                desired_download_height.min(available_after_models.min(proportional_cap.max(4)));
+            if download_count > 0 && model_body.height >= 4 && download_height < 4 {
+                download_height = 4;
+            }
+            let (model_body, downloads) =
+                reserve_bottom(model_body, download_height > 0, download_height);
             model_downloads = downloads;
             let (mut list, progress) =
                 reserve_bottom(model_body, app.selected_model_load_progress().is_some(), 3);
@@ -361,6 +395,8 @@ impl UiLayout {
 
         let mut model_rows = Vec::new();
         let mut model_download_actions = Vec::new();
+        let mut download_job_rows = Vec::new();
+        let mut download_job_actions = Vec::new();
         let model_count = if app.model_library_view == ModelLibraryView::Discover {
             app.model_search_artifacts().len()
         } else {
@@ -403,6 +439,61 @@ impl UiLayout {
                         ),
                     ));
                 }
+            }
+        }
+
+        if app.screen == Screen::Models && model_downloads.height > 1 {
+            let glyphs = crate::theme::Glyphs::current(app.unicode);
+            let stride = if compact { 3 } else { 4 };
+            let mut y = model_downloads.y.saturating_add(1);
+            for index in app.model_download_display_indices() {
+                if y.saturating_add(3) > model_downloads.bottom() {
+                    break;
+                }
+                let row = Rect::new(model_downloads.x, y, model_downloads.width, 3);
+                download_job_rows.push((index, row));
+                let Some(job) = app.model_download_jobs.get(index) else {
+                    continue;
+                };
+                let secondary = match job.phase {
+                    norted_model_library::ModelOperationPhase::Queued
+                    | norted_model_library::ModelOperationPhase::Resolving
+                    | norted_model_library::ModelOperationPhase::Downloading => {
+                        Some(DownloadJobAction::Pause)
+                    }
+                    norted_model_library::ModelOperationPhase::Paused => {
+                        Some(DownloadJobAction::Resume)
+                    }
+                    _ => None,
+                };
+                if let Some(secondary) = secondary {
+                    let secondary_glyph = match secondary {
+                        DownloadJobAction::Pause => glyphs.pause,
+                        DownloadJobAction::Resume => glyphs.resume,
+                        DownloadJobAction::Cancel => glyphs.cancel,
+                    };
+                    let secondary_width = UnicodeWidthStr::width(secondary_glyph) as u16
+                        + if compact { 2 } else { 4 };
+                    let cancel_width =
+                        UnicodeWidthStr::width(glyphs.cancel) as u16 + if compact { 2 } else { 4 };
+                    let secondary_area = Rect::new(
+                        row.right().saturating_sub(secondary_width),
+                        row.y,
+                        secondary_width.min(row.width),
+                        1,
+                    );
+                    let cancel_area = Rect::new(
+                        secondary_area
+                            .x
+                            .saturating_sub(cancel_width.saturating_add(1)),
+                        row.y,
+                        cancel_width.min(row.width),
+                        1,
+                    );
+                    download_job_actions.push((index, DownloadJobAction::Cancel, cancel_area));
+                    download_job_actions.push((index, secondary, secondary_area));
+                }
+                y = y.saturating_add(stride);
             }
         }
 
@@ -975,6 +1066,8 @@ impl UiLayout {
             model_downloads,
             model_rows,
             model_download_actions,
+            download_job_rows,
+            download_job_actions,
             installed_model_actions,
             server_details,
             server_progress,
@@ -1117,6 +1210,20 @@ impl UiLayout {
             .find(|(_, area)| contains(*area, position))
         {
             return Some(HoverTarget::ModelDownloadAction(*index));
+        }
+        if let Some((index, action, _)) = self
+            .download_job_actions
+            .iter()
+            .find(|(_, _, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::DownloadJobAction(*index, *action));
+        }
+        if let Some((index, _)) = self
+            .download_job_rows
+            .iter()
+            .find(|(_, area)| contains(*area, position))
+        {
+            return Some(HoverTarget::DownloadJob(*index));
         }
         if let Some((action, _)) = self
             .installed_model_actions
@@ -1402,6 +1509,42 @@ impl UiLayout {
             Some(Overlay::Help) => {}
             None => match app.screen {
                 Screen::Models => {
+                    for (index, row) in &self.download_job_rows {
+                        let Some(job) = app.model_download_jobs.get(*index) else {
+                            continue;
+                        };
+                        let active_job = app.selected_model_download_job.as_ref() == Some(&job.id)
+                            || app.hover == Some(HoverTarget::DownloadJob(*index))
+                            || self
+                                .download_job_actions
+                                .iter()
+                                .any(|(action_index, action, _)| {
+                                    *action_index == *index
+                                        && app.hover
+                                            == Some(HoverTarget::DownloadJobAction(*index, *action))
+                                });
+                        if !active_job {
+                            continue;
+                        }
+                        let actions_start = self
+                            .download_job_actions
+                            .iter()
+                            .filter(|(action_index, _, _)| action_index == index)
+                            .map(|(_, _, area)| area.x)
+                            .min()
+                            .unwrap_or_else(|| row.right());
+                        let prefix_width = UnicodeWidthStr::width(glyphs.download) + 2;
+                        let identity_width = actions_start
+                            .saturating_sub(row.x)
+                            .saturating_sub(prefix_width as u16)
+                            .saturating_sub(u16::from(actions_start < row.right()))
+                            as usize;
+                        track(
+                            &format!("model-download:{index}"),
+                            &super::screens::download_identity(job),
+                            identity_width,
+                        );
+                    }
                     for (index, row) in &self.model_rows {
                         if app.selected_model != Some(*index)
                             && app.hover != Some(HoverTarget::Model(*index))

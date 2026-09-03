@@ -17,12 +17,14 @@ use norted_engine::{
 };
 use norted_model_library::{
     CatalogFile, CatalogRepository, CatalogSearch, DownloadAdmission, ModelDownloadJob,
+    ModelDownloadJobId, ModelOperationPhase,
 };
 use ratatui::layout::Position;
 
 use crate::commands::{self, CommandAction};
 use crate::ui::layout::{
-    HoverTarget, InstalledModelAction, ModelProfileAction, SelectedRuntimeAction, UiLayout,
+    DownloadJobAction, HoverTarget, InstalledModelAction, ModelProfileAction,
+    SelectedRuntimeAction, UiLayout,
 };
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -155,6 +157,10 @@ pub enum ModelLibraryAction {
         format: Option<ArtifactFormat>,
     },
     Download(String),
+    DownloadJob {
+        id: ModelDownloadJobId,
+        action: DownloadJobAction,
+    },
     Remove(ModelId),
 }
 
@@ -162,6 +168,10 @@ pub enum ModelLibraryAction {
 pub enum ModelLibraryTaskResult {
     Searched(Result<CatalogSearch, String>),
     DownloadAdmitted(Box<DownloadAdmission>),
+    DownloadJobControlled {
+        action: DownloadJobAction,
+        result: Box<Result<ModelDownloadJob, String>>,
+    },
     ModelsRefreshed(Result<(), String>),
     Removed(Result<ModelId, String>),
 }
@@ -369,6 +379,7 @@ pub struct App {
     pub model_search_loading: bool,
     pub selected_model_search_result: Option<usize>,
     pub model_download_jobs: Vec<ModelDownloadJob>,
+    pub selected_model_download_job: Option<ModelDownloadJobId>,
     pub selected_model_profile: Option<usize>,
     pub log_scroll: usize,
     pub runtime_list: Option<RuntimeListSnapshot>,
@@ -487,6 +498,7 @@ impl App {
             model_search_loading: false,
             selected_model_search_result: None,
             model_download_jobs: Vec::new(),
+            selected_model_download_job: None,
             selected_model_profile: None,
             log_scroll: 0,
             runtime_list: None,
@@ -940,9 +952,19 @@ impl App {
                 }
                 DownloadAdmission::Duplicate(job) => {
                     self.notice = Some(format!(
-                        "Already queued or downloading: {} ({:?})",
+                        "Already queued, paused, or downloading: {} ({:?})",
                         job.model_ref, job.phase
                     ));
+                }
+            },
+            ModelLibraryTaskResult::DownloadJobControlled { action, result } => match *result {
+                Ok(job) => {
+                    self.selected_model_download_job = Some(job.id);
+                    self.notice = Some(format!("{}: {}", action.completed_label(), job.model_ref));
+                }
+                Err(error) => {
+                    self.notice = Some(error.clone());
+                    self.push_log(LogLevel::Error, error);
                 }
             },
             ModelLibraryTaskResult::ModelsRefreshed(result) => {
@@ -984,6 +1006,37 @@ impl App {
             }
         }
         self.model_download_jobs = jobs;
+        let selected_is_present = self.selected_model_download_job.as_ref().is_some_and(|id| {
+            self.model_download_jobs
+                .iter()
+                .any(|job| &job.id == id && download_job_is_controllable(job))
+        });
+        if !selected_is_present {
+            self.selected_model_download_job = self
+                .model_download_jobs
+                .iter()
+                .find(|job| download_job_is_controllable(job))
+                .map(|job| job.id.clone());
+        }
+    }
+
+    pub fn model_download_display_indices(&self) -> Vec<usize> {
+        let mut jobs = self
+            .model_download_jobs
+            .iter()
+            .enumerate()
+            .filter(|(_, job)| !job.is_terminal())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        jobs.extend(
+            self.model_download_jobs
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, job)| job.is_terminal())
+                .map(|(index, _)| index),
+        );
+        jobs
     }
 
     pub fn model_search_artifacts(&self) -> Vec<(&CatalogRepository, &CatalogFile)> {
@@ -2312,6 +2365,21 @@ impl App {
     }
 
     fn handle_content_key(&mut self, key: KeyEvent, layout: &UiLayout) -> Update {
+        if self.screen == Screen::Models {
+            match key.code {
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    return self.move_model_download_selection(-1, layout);
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    return self.move_model_download_selection(1, layout);
+                }
+                KeyCode::Char('p') => return self.toggle_selected_model_download(),
+                KeyCode::Char('x') => {
+                    return self.request_selected_model_download_action(DownloadJobAction::Cancel);
+                }
+                _ => {}
+            }
+        }
         match self.screen {
             Screen::Models if self.model_library_view == ModelLibraryView::Discover => {
                 self.handle_model_discover_key(key)
@@ -2532,6 +2600,81 @@ impl App {
         };
         self.pending_model_library_actions
             .push_back(ModelLibraryAction::Download(model_ref));
+        Update::Render
+    }
+
+    fn move_model_download_selection(&mut self, direction: isize, layout: &UiLayout) -> Update {
+        let jobs = layout
+            .download_job_rows
+            .iter()
+            .filter_map(|(index, _)| self.model_download_jobs.get(*index))
+            .filter(|job| download_job_is_controllable(job))
+            .map(|job| job.id.clone())
+            .collect::<Vec<_>>();
+        if jobs.is_empty() {
+            return Update::None;
+        }
+        let current = self
+            .selected_model_download_job
+            .as_ref()
+            .and_then(|id| jobs.iter().position(|candidate| candidate == id))
+            .unwrap_or(0) as isize;
+        let index = (current + direction).rem_euclid(jobs.len() as isize) as usize;
+        self.selected_model_download_job = Some(jobs[index].clone());
+        Update::Render
+    }
+
+    fn toggle_selected_model_download(&mut self) -> Update {
+        let Some(job) = self
+            .selected_model_download_job
+            .as_ref()
+            .and_then(|id| self.model_download_jobs.iter().find(|job| &job.id == id))
+        else {
+            self.notice = Some("No controllable download is selected".to_owned());
+            return Update::Render;
+        };
+        let action = if job.phase == ModelOperationPhase::Paused {
+            DownloadJobAction::Resume
+        } else {
+            DownloadJobAction::Pause
+        };
+        self.request_selected_model_download_action(action)
+    }
+
+    fn request_selected_model_download_action(&mut self, action: DownloadJobAction) -> Update {
+        let Some(id) = self.selected_model_download_job.clone() else {
+            self.notice = Some("No controllable download is selected".to_owned());
+            return Update::Render;
+        };
+        self.request_model_download_action(id, action)
+    }
+
+    fn request_model_download_action(
+        &mut self,
+        id: ModelDownloadJobId,
+        action: DownloadJobAction,
+    ) -> Update {
+        let Some(job) = self.model_download_jobs.iter().find(|job| job.id == id) else {
+            self.notice = Some("Download job no longer exists".to_owned());
+            return Update::Render;
+        };
+        let valid = match action {
+            DownloadJobAction::Pause => matches!(
+                job.phase,
+                ModelOperationPhase::Queued
+                    | ModelOperationPhase::Resolving
+                    | ModelOperationPhase::Downloading
+            ),
+            DownloadJobAction::Resume => job.phase == ModelOperationPhase::Paused,
+            DownloadJobAction::Cancel => download_job_is_controllable(job),
+        };
+        if !valid {
+            self.notice = Some("That download control is no longer available".to_owned());
+            return Update::Render;
+        }
+        self.selected_model_download_job = Some(id.clone());
+        self.pending_model_library_actions
+            .push_back(ModelLibraryAction::DownloadJob { id, action });
         Update::Render
     }
 
@@ -3283,6 +3426,24 @@ impl App {
                 self.model_search_editing = false;
                 self.selected_model_search_result = Some(index);
                 self.request_model_download()
+            }
+            Some(HoverTarget::DownloadJobAction(index, action)) => {
+                self.focus = FocusArea::Content;
+                let Some(job) = self.model_download_jobs.get(index) else {
+                    return Update::None;
+                };
+                let id = job.id.clone();
+                self.selected_model_download_job = Some(id.clone());
+                self.request_model_download_action(id, action)
+            }
+            Some(HoverTarget::DownloadJob(index)) => {
+                self.focus = FocusArea::Content;
+                if let Some(job) = self.model_download_jobs.get(index) {
+                    self.selected_model_download_job = Some(job.id.clone());
+                    Update::Render
+                } else {
+                    Update::None
+                }
             }
             Some(HoverTarget::Model(index)) => {
                 if self.command_active {
@@ -4511,6 +4672,16 @@ impl App {
         self.notice = Some("Unloading the selected Model Profile…".to_owned());
         Update::Render
     }
+}
+
+fn download_job_is_controllable(job: &ModelDownloadJob) -> bool {
+    matches!(
+        job.phase,
+        ModelOperationPhase::Queued
+            | ModelOperationPhase::Resolving
+            | ModelOperationPhase::Downloading
+            | ModelOperationPhase::Paused
+    )
 }
 
 fn byte_index(value: &str, character_index: usize) -> usize {

@@ -157,6 +157,7 @@ pub enum ModelOperationPhase {
     Queued,
     Resolving,
     Downloading,
+    Paused,
     Verifying,
     Validating,
     Installing,
@@ -243,6 +244,33 @@ impl ModelLibrary {
         admission
     }
 
+    pub fn pause_download(
+        self: &Arc<Self>,
+        job_id: &ModelDownloadJobId,
+    ) -> std::result::Result<ModelDownloadJob, String> {
+        let (job, starts) = self.downloads.pause(job_id)?;
+        self.spawn_download_jobs(starts);
+        Ok(job)
+    }
+
+    pub fn resume_download(
+        self: &Arc<Self>,
+        job_id: &ModelDownloadJobId,
+    ) -> std::result::Result<ModelDownloadJob, String> {
+        let (job, starts) = self.downloads.resume(job_id)?;
+        self.spawn_download_jobs(starts);
+        Ok(job)
+    }
+
+    pub fn cancel_download(
+        self: &Arc<Self>,
+        job_id: &ModelDownloadJobId,
+    ) -> std::result::Result<ModelDownloadJob, String> {
+        let (job, transition) = self.downloads.cancel(job_id)?;
+        self.apply_download_transition(transition);
+        Ok(job)
+    }
+
     pub async fn search(
         &self,
         query: &str,
@@ -266,7 +294,7 @@ impl ModelLibrary {
 
     pub async fn download_with_status(&self, model_ref: &str) -> Result<ModelDownloadResult> {
         let job_id = ModelDownloadJobId::new();
-        self.download_with_job(&job_id, model_ref)
+        self.download_with_job(&job_id, model_ref, None)
             .await
             .map(DownloadOutcome::into_result)
     }
@@ -275,12 +303,14 @@ impl ModelLibrary {
         &self,
         job_id: &ModelDownloadJobId,
         model_ref: &str,
+        generation: Option<u64>,
     ) -> Result<DownloadOutcome> {
         let resolving = DownloadProgressContext {
             job_id,
             model_ref,
             provider: None,
             repository: None,
+            generation,
         };
         self.emit(
             &resolving,
@@ -292,32 +322,62 @@ impl ModelLibrary {
         );
         let provider = self.provider_for(model_ref)?;
         let resolved = provider.resolve(model_ref).await?;
-        self.download_resolved(job_id, model_ref, &resolved).await
+        self.download_resolved(job_id, model_ref, &resolved, generation)
+            .await
     }
 
-    fn spawn_download_jobs(self: &Arc<Self>, starts: Vec<ModelDownloadJobId>) {
-        for job_id in starts {
+    fn spawn_download_jobs(self: &Arc<Self>, starts: Vec<download_manager::DownloadStart>) {
+        for start in starts {
             let library = Arc::clone(self);
             tokio::spawn(async move {
+                let job_id = start.id;
+                let generation = start.generation;
+                let mut stop = start.stop;
                 let Some(model_ref) = library.downloads.model_ref(&job_id) else {
                     return;
                 };
-                let result = library.download_with_job(&job_id, &model_ref).await;
-                let (phase, message) = match &result {
-                    Ok(DownloadOutcome::Installed(model)) => (
-                        ModelOperationPhase::Installed,
-                        format!("Model installed as {}", model.id),
-                    ),
-                    Ok(DownloadOutcome::AlreadyInstalled(model)) => (
-                        ModelOperationPhase::Installed,
-                        format!("Already installed as {}", model.id),
-                    ),
-                    Err(error) => (ModelOperationPhase::Failed, error.to_string()),
+                let completion = tokio::select! {
+                    biased;
+                    changed = stop.changed() => {
+                        let _ = changed;
+                        None
+                    }
+                    result = library.download_with_job(&job_id, &model_ref, Some(generation)) => {
+                        Some(match &result {
+                            Ok(DownloadOutcome::Installed(model)) => (
+                                ModelOperationPhase::Installed,
+                                format!("Model installed as {}", model.id),
+                            ),
+                            Ok(DownloadOutcome::AlreadyInstalled(model)) => (
+                                ModelOperationPhase::Installed,
+                                format!("Already installed as {}", model.id),
+                            ),
+                            Err(error) => (ModelOperationPhase::Failed, error.to_string()),
+                        })
+                    }
                 };
-                let starts = library.downloads.finish(&job_id, phase, message);
-                library.spawn_download_jobs(starts);
+                let transition = library
+                    .downloads
+                    .finish_attempt(&job_id, generation, completion);
+                library.apply_download_transition(transition);
             });
         }
+    }
+
+    fn apply_download_transition(
+        self: &Arc<Self>,
+        transition: download_manager::DownloadTransition,
+    ) {
+        for path in transition.cleanup {
+            tokio::spawn(async move {
+                if let Err(error) = tokio::fs::remove_file(&path).await
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(path = %path.display(), %error, "could not clean model download partial");
+                }
+            });
+        }
+        self.spawn_download_jobs(transition.starts);
     }
 
     pub async fn import(&self, source: &Path) -> Result<ModelArtifact> {
@@ -668,6 +728,7 @@ impl ModelLibrary {
         job_id: &ModelDownloadJobId,
         model_ref: &str,
         resolved: &ResolvedArtifact,
+        generation: Option<u64>,
     ) -> Result<DownloadOutcome> {
         tokio::fs::create_dir_all(&self.download_cache)
             .await
@@ -681,7 +742,15 @@ impl ModelLibrary {
             model_ref,
             provider: Some(&resolved.provider),
             repository: Some(&resolved.repository),
+            generation,
         };
+        self.downloads.register_partial_paths(
+            job_id,
+            generation,
+            std::iter::once(&resolved.primary)
+                .chain(resolved.companions.iter())
+                .map(|file| download_partial_path(&self.download_cache, model_ref, file)),
+        );
         let acquisition_id = remote_acquisition_id(resolved);
         let _acquisition_lock = self.acquisition_lock(&acquisition_id).await?;
         let primary_name = safe_remote_path(&resolved.primary.filename)?;
@@ -903,10 +972,7 @@ impl ModelLibrary {
         completed_before: u64,
         total: Option<u64>,
     ) -> Result<u64> {
-        let partial = self.download_cache.join(format!(
-            "{}.part",
-            sha256_text(&format!("{}\0{}", context.model_ref, file.url))
-        ));
+        let partial = download_partial_path(&self.download_cache, context.model_ref, file);
         let mut existing = tokio::fs::metadata(&partial)
             .await
             .map(|metadata| metadata.len())
@@ -940,12 +1006,7 @@ impl ModelLibrary {
                     });
                 }
             }
-            tokio::fs::rename(&partial, destination)
-                .await
-                .map_err(|source| ModelLibraryError::Io {
-                    path: destination.to_path_buf(),
-                    source,
-                })?;
+            stage_download_partial(&partial, destination, context.generation.is_some()).await?;
             return Ok(existing);
         }
         let mut request = Client::new().get(file.url.clone());
@@ -1026,12 +1087,7 @@ impl ModelLibrary {
                 });
             }
         }
-        tokio::fs::rename(&partial, destination)
-            .await
-            .map_err(|source| ModelLibraryError::Io {
-                path: destination.to_path_buf(),
-                source,
-            })?;
+        stage_download_partial(&partial, destination, context.generation.is_some()).await?;
         Ok(downloaded)
     }
 
@@ -1072,9 +1128,28 @@ impl ModelLibrary {
             total_bytes,
             message: message.to_owned(),
         };
-        self.downloads.update(&progress);
+        self.downloads.update(&progress, context.generation);
         let _ = self.progress.send(progress);
     }
+}
+
+fn download_partial_path(cache: &Path, model_ref: &str, file: &ResolvedFile) -> PathBuf {
+    cache.join(format!(
+        "{}.part",
+        sha256_text(&format!("{model_ref}\0{}", file.url))
+    ))
+}
+
+async fn stage_download_partial(partial: &Path, destination: &Path, preserve: bool) -> Result<()> {
+    let result = if preserve {
+        tokio::fs::copy(partial, destination).await.map(|_| ())
+    } else {
+        tokio::fs::rename(partial, destination).await
+    };
+    result.map_err(|source| ModelLibraryError::Io {
+        path: destination.to_path_buf(),
+        source,
+    })
 }
 
 pub fn setting_definition() -> norted_core::SettingDefinition {
@@ -1118,6 +1193,7 @@ struct DownloadProgressContext<'a> {
     model_ref: &'a str,
     provider: Option<&'a str>,
     repository: Option<&'a str>,
+    generation: Option<u64>,
 }
 
 enum DownloadOutcome {
