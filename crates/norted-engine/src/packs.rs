@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use norted_core::{
@@ -217,10 +217,15 @@ impl RuntimePackManager {
     /// default can be represented truthfully and that engine is omitted.
     pub async fn selected_runtime_settings_schemas(
         &self,
-    ) -> Result<BTreeMap<String, norted_core::SettingsSchema>, RuntimePackError> {
+        settings_state: &norted_core::SettingsState,
+        structured_path_base: &Path,
+    ) -> Result<(BTreeMap<String, norted_core::SettingsSchema>, Vec<String>), RuntimePackError>
+    {
         let host = self.refresh_host_capabilities().await;
         let list = self.list().await?;
         let mut schemas = BTreeMap::<String, norted_core::SettingsSchema>::new();
+        let mut warnings = Vec::new();
+        let mut attempted = BTreeMap::<String, RuntimeId>::new();
         let mut ambiguous = BTreeSet::new();
         for runtime_id in list.selections.format_defaults.values() {
             let Some(status) = list
@@ -234,26 +239,45 @@ impl RuntimePackManager {
             if ambiguous.contains(&engine_id) {
                 continue;
             }
-            if schemas
+            if attempted
                 .get(&engine_id)
-                .is_some_and(|schema| schema.runtime_id.as_ref() != Some(runtime_id))
+                .is_some_and(|attempted_runtime| attempted_runtime != runtime_id)
             {
                 schemas.remove(&engine_id);
                 ambiguous.insert(engine_id);
                 continue;
             }
-            let adapter = self.registry.get(&engine_id).ok_or_else(|| {
-                RuntimePackError::Selection(format!(
-                    "selected runtime uses unregistered engine `{engine_id}`"
-                ))
-            })?;
-            let schema = adapter
-                .runtime_settings_schema(&status.runtime, &host)
+            if attempted
+                .insert(engine_id.clone(), runtime_id.clone())
+                .is_some()
+            {
+                continue;
+            }
+            let Some(adapter) = self.registry.get(&engine_id) else {
+                warnings.push(format!(
+                    "{engine_id}: selected runtime uses an unregistered engine"
+                ));
+                continue;
+            };
+            let settings =
+                match settings_state.resolve_engine_defaults(&engine_id, structured_path_base) {
+                    Ok(settings) => settings,
+                    Err(error) => {
+                        warnings.push(format!("{engine_id}: {error}"));
+                        continue;
+                    }
+                };
+            match adapter
+                .runtime_settings_schema(&status.runtime, &host, Some(&settings))
                 .await
-                .map_err(RuntimePackError::Adapter)?;
-            schemas.insert(engine_id, schema);
+            {
+                Ok(schema) => {
+                    schemas.insert(engine_id, schema);
+                }
+                Err(error) => warnings.push(format!("{engine_id}: {error}")),
+            }
         }
-        Ok(schemas)
+        Ok((schemas, warnings))
     }
 
     pub fn model_settings_schema_for_engine(

@@ -1474,6 +1474,7 @@ pub trait EngineAdapter: Send + Sync {
         &self,
         runtime: &InstalledRuntime,
         _host: &HostCapabilities,
+        _settings: Option<&ResolvedSettings>,
     ) -> Result<SettingsSchema, EngineError> {
         Ok(SettingsSchema {
             engine_id: self.identity().id,

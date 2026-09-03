@@ -228,7 +228,7 @@ pub(crate) fn apply_reviewed_runtime_defaults(
         ("frequency_penalty", "model/thinking-mode default"),
         ("max_output_tokens", "runtime default: 8192"),
         ("ninfer.kv_dtype", "runtime default: BF16"),
-        ("ninfer.kv_capacity", "runtime default: matches context"),
+        ("ninfer.kv_capacity", "runtime default: 8192"),
         ("ninfer.prefill_chunk", "runtime default: 1024"),
         ("ninfer.speculation", "runtime default: off"),
         ("ninfer.speculative_backend", "runtime default: off"),
@@ -286,6 +286,7 @@ pub(crate) fn apply_reviewed_runtime_defaults(
         ("reasoning", "on"),
         ("reasoning_budget", "None"),
         ("ninfer.kv_dtype", "BF16"),
+        ("ninfer.kv_capacity", "8192"),
         ("ninfer.prefill_chunk", "1024"),
         ("ninfer.speculation", "disabled"),
         ("ninfer.speculative_backend", "off"),
@@ -329,19 +330,7 @@ pub(crate) fn apply_reviewed_runtime_defaults(
             _ => None,
         })
         .unwrap_or(1);
-    let context = settings
-        .and_then(|settings| settings.value("context_length"))
-        .and_then(|value| match value {
-            SettingValue::UnsignedInteger(value) => Some(*value),
-            _ => None,
-        })
-        .unwrap_or(8192);
     for (id, value, formula) in [
-        (
-            "ninfer.kv_capacity",
-            context,
-            "The reviewed runtime defaults KV capacity to the effective context length",
-        ),
         (
             "ninfer.device_state_slots",
             concurrency,
