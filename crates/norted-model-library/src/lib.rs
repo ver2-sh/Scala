@@ -368,16 +368,28 @@ impl ModelLibrary {
         self: &Arc<Self>,
         transition: download_manager::DownloadTransition,
     ) {
-        for path in transition.cleanup {
-            tokio::spawn(async move {
+        let download_manager::DownloadTransition {
+            starts,
+            cleanup,
+            cancellation_cleanup,
+        } = transition;
+        self.spawn_download_jobs(starts);
+        if cleanup.is_empty() && cancellation_cleanup.is_none() {
+            return;
+        }
+        let library = Arc::clone(self);
+        tokio::spawn(async move {
+            for path in cleanup {
                 if let Err(error) = tokio::fs::remove_file(&path).await
                     && error.kind() != std::io::ErrorKind::NotFound
                 {
                     tracing::warn!(path = %path.display(), %error, "could not clean model download partial");
                 }
-            });
-        }
-        self.spawn_download_jobs(transition.starts);
+            }
+            if let Some(job_id) = cancellation_cleanup {
+                library.downloads.acknowledge_cancellation_cleanup(&job_id);
+            }
+        });
     }
 
     pub async fn import(&self, source: &Path) -> Result<ModelArtifact> {

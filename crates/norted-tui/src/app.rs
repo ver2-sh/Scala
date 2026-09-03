@@ -1020,6 +1020,14 @@ impl App {
         }
     }
 
+    pub fn selected_model_download_job_is_controllable(&self) -> bool {
+        self.selected_model_download_job.as_ref().is_some_and(|id| {
+            self.model_download_jobs
+                .iter()
+                .any(|job| &job.id == id && download_job_is_controllable(job))
+        })
+    }
+
     pub fn model_download_display_indices(&self) -> Vec<usize> {
         let mut jobs = self
             .model_download_jobs
@@ -3438,7 +3446,11 @@ impl App {
             }
             Some(HoverTarget::DownloadJob(index)) => {
                 self.focus = FocusArea::Content;
-                if let Some(job) = self.model_download_jobs.get(index) {
+                if let Some(job) = self
+                    .model_download_jobs
+                    .get(index)
+                    .filter(|job| download_job_is_controllable(job))
+                {
                     self.selected_model_download_job = Some(job.id.clone());
                     Update::Render
                 } else {
