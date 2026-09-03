@@ -611,42 +611,60 @@ async fn handle_model_profiles(
             let model = require_model(&core, &existing.model_id).await?;
             let registry = composition::engine_registry(&core)?;
             require_compatible_engine(&registry, &model, engine_id.as_str())?;
-            let source_schema =
-                model_schema_for_engine(&registry, &model, existing.engine_id.as_str())?;
-            let target_schema = model_schema_for_engine(&registry, &model, engine_id.as_str())?;
-            let retained = source_schema
-                .definitions
-                .iter()
-                .filter(|definition| target_schema.definition(&definition.id).is_some())
-                .map(|definition| definition.id.clone())
-                .collect::<std::collections::BTreeSet<_>>();
-            let removed = existing
-                .overrides
-                .0
-                .keys()
-                .filter(|id| !retained.contains(*id))
-                .map(ToString::to_string)
-                .collect::<Vec<_>>();
-            let selected = profile_id.clone();
+            let settings = SettingsStore::new(&core.paths).read().await?;
+            let packs = composition::runtime_pack_manager(&core, registry)?;
+            let candidate = packs
+                .model_profile_engine_switch_candidate(
+                    &settings,
+                    existing,
+                    &model,
+                    engine_id.as_str(),
+                    &core.paths.data_dir,
+                )
+                .await?;
+            let original_hash = existing.content_hash();
+            let overrides = candidate.overrides.clone();
+            let update_profile_id = profile_id.clone();
             let state = store
                 .update(move |state| {
                     let profile = state
                         .profiles
-                        .get_mut(&profile_id)
-                        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+                        .get_mut(&update_profile_id)
+                        .ok_or_else(|| {
+                            SettingsError::ModelProfileNotFound(update_profile_id.clone())
+                        })?;
+                    if profile.content_hash() != original_hash {
+                        return Err(SettingsError::InvalidModelProfile(format!(
+                            "Model Profile `{update_profile_id}` changed during engine-switch preflight"
+                        )));
+                    }
                     profile.engine_id = engine_id;
-                    profile.overrides.0.retain(|id, _| retained.contains(id));
+                    profile.overrides = overrides;
                     Ok(state.clone())
                 })
                 .await?;
-            if !removed.is_empty() {
+            if !candidate.removed.is_empty() {
                 eprintln!(
                     "Notice: removed incompatible Model Profile overrides: {}",
-                    removed.join(", ")
+                    candidate
+                        .removed
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
-            output_model_profile_mutation(&core, "set-engine", &state, &selected, json_output)
-                .await?;
+            let profile = state
+                .profiles
+                .get(&profile_id)
+                .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+            output::model_profile(
+                "set-engine",
+                profile,
+                Some(&model),
+                &candidate.resolved,
+                json_output,
+            )?;
         }
         ModelProfilesCommand::SetRole { profile, role } => {
             let profile_id = ModelProfileId::new(profile)?;

@@ -1063,10 +1063,11 @@ async fn execute_settings_action(
         }
         SettingsAction::CycleProfileEngine { profile_id, model } => {
             let compatible = runtime_packs.compatible_engine_ids(&model);
-            let current = match profiles_store.read().await {
-                Ok(profiles) => profiles,
-                Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
-            };
+            let (settings, current) =
+                match read_tui_settings(&settings_store, &profiles_store).await {
+                    Ok(state) => state,
+                    Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
+                };
             let Some(existing) = current.profiles.get(&profile_id) else {
                 return SettingsTaskResult::Stored(Err(SettingsError::ModelProfileNotFound(
                     profile_id,
@@ -1087,39 +1088,43 @@ async fn execute_settings_action(
                 )
                 .to_string()));
             };
-            let source_schema = match runtime_packs
-                .model_settings_schema_for_engine(&model, existing.engine_id.as_str())
-            {
-                Ok(schema) => schema,
+            let engine = match EngineId::new(engine.clone()) {
+                Ok(engine) => engine,
                 Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
             };
-            let target_schema = match runtime_packs.model_settings_schema_for_engine(&model, engine)
+            let candidate = match runtime_packs
+                .model_profile_engine_switch_candidate(
+                    &settings,
+                    existing,
+                    &model,
+                    engine.as_str(),
+                    &paths.data_dir,
+                )
+                .await
             {
-                Ok(schema) => schema,
+                Ok(candidate) => candidate,
                 Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
             };
-            let retained = source_schema
-                .definitions
-                .iter()
-                .filter(|definition| target_schema.definition(&definition.id).is_some())
-                .map(|definition| definition.id.clone())
-                .collect::<std::collections::BTreeSet<_>>();
-            let removed = existing
-                .overrides
-                .0
-                .keys()
-                .filter(|id| !retained.contains(*id))
-                .map(ToString::to_string)
+            let original_hash = existing.content_hash();
+            let overrides = candidate.overrides;
+            let removed = candidate
+                .removed
+                .into_iter()
+                .map(|id| id.to_string())
                 .collect::<Vec<_>>();
-            let engine = engine.clone();
             let result = profiles_store
                 .update(move |state| {
                     let profile = state
                         .profiles
                         .get_mut(&profile_id)
                         .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
-                    profile.engine_id = EngineId::new(engine)?;
-                    profile.overrides.0.retain(|id, _| retained.contains(id));
+                    if profile.content_hash() != original_hash {
+                        return Err(SettingsError::InvalidModelProfile(format!(
+                            "Model Profile `{profile_id}` changed during engine-switch preflight"
+                        )));
+                    }
+                    profile.engine_id = engine;
+                    profile.overrides = overrides;
                     Ok(())
                 })
                 .await
