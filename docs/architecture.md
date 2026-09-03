@@ -204,8 +204,8 @@ engine/format default, then best compatible installed runtime. Adapters expose a
 schema for centrally defined common semantics plus their own namespace, gate it first with facts proved by the bound model, and
 then gate it with the exact runtime contract before validating effective settings. Capability
 requirements are consequences of selected settings. q27 retains exact source fingerprints and
-bounded context/KV/W_MAX startup proof; NInfer retains native-container and exact-current-revision
-schema-19 startup proof;
+bounded context/KV/W_MAX startup proof; NInfer retains native-container identity, capability-domain
+source fingerprints, and schema-20 startup proof;
 llama.cpp uses exact help evidence for every structured launch control and keeps Norted-owned
 system-prompt/context management separate from native launch flags.
 
@@ -441,12 +441,11 @@ ninfer-serve <canonical-model.ninfer>
 
 The positional artifact, binding, alias, device, auth/CORS surface, typed load/cache/media/store
 controls, sampler/greedy controls, and startup log are reserved. `/health` alone is insufficient for
-readiness. Norted selects the bounded schema-19 `server_start` record for reviewed exact source
-commit `21a0e85f...`, validates public
-alias, artifact target/weights and context-cost identity, selected GPU identity, KV/CUDA/prefix/spec
-state, Vision residency, greedy state, and configured sampler defaults, then derives effective
-temperature/top-p. The file is unlinked before requests are served; failure and cancellation paths
-remove it as well.
+readiness. Norted selects the bounded schema-20 `server_start` record reviewed at source commit
+`a140e7ae...`, validates public alias, artifact target/weights and context-cost identity, selected GPU
+identity, context/KV/cache/CUDA/speculation state, queue and media limits, thinking state, greedy
+state, and configured sampler defaults, then records the runtime-resolved effective values. The file
+is unlinked before requests are served; failure and cancellation paths remove it as well.
 
 Public Responses and Chat messages both become one ordered canonical `InferenceRequest`, then
 private NInfer Chat JSON. The reviewed source contract forwards seed, top-k/min-p,
@@ -457,8 +456,8 @@ single-call guarantees fail rather than weaken. Assistant tool calls and tool-re
 preserved, and tool deltas become Responses and Chat events. Exact registered artifacts expose user
 image/video and tool-result image content only when startup proves `--vision`; HTTP(S)/data URLs are
 accepted, local paths and unsupported roles/modalities are not. Structured output, raw/stateful
-upstream Responses, and Anthropic remain outside this bridge. Unknown future revisions can use
-help-proven launch facts but do not inherit these reviewed protocol capabilities.
+upstream Responses, and Anthropic remain outside this bridge. Later revisions can retain
+help- and source-blob-proven launch facts without inheriting changed, unreviewed protocol domains.
 
 ## Process, control, and provenance
 

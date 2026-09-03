@@ -17,23 +17,33 @@ const PRIVATE_BODY_LIMIT: usize = 32 * 1024 * 1024;
 pub(crate) fn backend_request(
     request: &InferenceRequest,
     streaming: bool,
-    protocol_semantics: bool,
+    request_protocol_semantics: bool,
+    sampler_controls: bool,
     tool_calling: bool,
     vision: bool,
     greedy: bool,
 ) -> Result<Value, EngineError> {
-    if !protocol_semantics
-        && (request.generation_settings.top_k.is_some()
+    if !sampler_controls
+        && (request.generation_settings.temperature.is_some()
+            || request.generation_settings.top_p.is_some()
+            || request.generation_settings.top_k.is_some()
             || request.generation_settings.min_p.is_some()
             || request.generation_settings.seed.is_some()
             || request.generation_settings.presence_penalty.is_some()
             || request.generation_settings.frequency_penalty.is_some()
-            || request.generation_settings.stop.is_some()
+            || request.max_output_tokens.is_some())
+    {
+        return Err(EngineError::InvalidGenerationSettings(
+            "this NInfer executable has no reviewed sampler-control contract".to_owned(),
+        ));
+    }
+    if !request_protocol_semantics
+        && (request.generation_settings.stop.is_some()
             || request.generation_settings.reasoning_enabled.is_some()
             || request.generation_settings.reasoning_effort.is_some())
     {
         return Err(EngineError::InvalidGenerationSettings(
-            "this NInfer executable has no reviewed source contract for extended request controls"
+            "this NInfer executable has no reviewed source contract for request semantics"
                 .to_owned(),
         ));
     }
@@ -683,8 +693,8 @@ mod tests {
 
     #[test]
     fn message_order_and_sampler_omission_are_preserved() {
-        let body =
-            backend_request(&request(), false, true, true, false, false).expect("request body");
+        let body = backend_request(&request(), false, true, true, true, false, false)
+            .expect("request body");
         let roles = body["messages"]
             .as_array()
             .expect("messages")
@@ -698,8 +708,8 @@ mod tests {
         let mut explicit = request();
         explicit.generation_settings.temperature = Some(0.4);
         explicit.generation_settings.top_p = Some(0.8);
-        let body =
-            backend_request(&explicit, false, true, true, false, false).expect("request body");
+        let body = backend_request(&explicit, false, true, true, true, false, false)
+            .expect("request body");
         assert_eq!(body["temperature"], 0.4);
         assert_eq!(body["top_p"], 0.8);
     }

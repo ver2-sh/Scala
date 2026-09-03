@@ -298,11 +298,14 @@ For a q27 source build, discovery resolves the release tag to a full Git commit/
 NInfer publishes source rather than an installable release binary. Its provider resolves the canonical `Neroued/ninfer` default-branch HEAD into one `Latest` source snapshot containing the full commit and Git-tree SHAs. It deliberately exposes no `Stable` channel and no fake release asset. Revalidation targets the selected commit itself, so a normal later HEAD does not substitute new source; bounded historical source descriptors retained from explicit searches keep that exact selection addressable after a refresh. Update checks use Git ancestry: identical is current, a descendant is an available update, and backward or diverged history is a provider warning rather than an implicit downgrade. Installed snapshots and selections remain side by side and unchanged until explicitly updated/selected.
 
 The currently reviewed NInfer request/startup authority is commit
-`21a0e85f8819edc644a3bc036fca6d05cf52ac6e`, tree
-`09eda8f77d17d140f57baac89a0259772e51a5f7`, with request-log schema 19.
-Executable help can prove an exact launch option without changing request semantics; an unknown
-future source snapshot does not inherit reviewed tools/media/request capabilities and remains
-NeedsAttention until its protocol/startup changes are audited.
+`a140e7ae82a11ed2f370a4d8f2cc16268a3790b8`, tree
+`1474697c790de8df18ed07a469f560bb33e8f324`, with request-log schema 20.
+NInfer admission is capability-domain based: exact process/launch and sampler controls use the
+observed executable help plus reviewed default-owning source blobs, while request semantics,
+request-log/startup proof, thinking, tools, and Vision/media use their own reviewed source-blob
+sets. The full commit/tree remains provenance. A later source snapshot retains any domain whose
+contract-owning blobs are unchanged; an unreviewed semantic domain becomes NeedsAttention without
+erasing unrelated launch controls.
 
 The current official NInfer build contract is Linux x86_64, NVIDIA GeForce RTX 5090, numeric compute capability 12.0 with `sm_120a`, CUDA Toolkit 13.1 or newer, CMake 3.28 or newer, Ninja, a C++20 compiler, pkg-config, FFmpeg development modules, and libcurl. Product name and compute capability are independent observed checks; missing facts are needs-attention and contradictory facts are incompatible. Norted never installs host packages automatically.
 
