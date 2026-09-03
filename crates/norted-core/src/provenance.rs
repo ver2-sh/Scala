@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceleratorDevice, ArtifactNativeIdentity, AuxiliaryArtifactRole, EngineId, ModelId,
-    ModelProfileId, ModelRole, ResolvedSetting, RuntimeManifest, RuntimeSelectionSource, SettingId,
+    AcceleratorDevice, ArtifactNativeIdentity, AuxiliaryArtifactRole, EffectiveSetting, EngineId,
+    ModelId, ModelProfileId, ModelRole, RuntimeManifest, RuntimeSelectionSource, SettingId,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,7 +118,7 @@ pub struct ProcessIdentity {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SettingsProvenance {
     #[serde(default)]
-    pub effective: BTreeMap<SettingId, ResolvedSetting>,
+    pub effective: BTreeMap<SettingId, EffectiveSetting>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

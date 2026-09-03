@@ -67,10 +67,10 @@ pub use runtime_pack::{
     is_safe_relative_path,
 };
 pub use settings::{
-    GpuOffload, ResolvedSetting, ResolvedSettings, SETTINGS_STATE_VERSION, SettingCategory,
-    SettingDefaultPreview, SettingDefaultSource, SettingDefinition, SettingId, SettingKind,
-    SettingScope, SettingSource, SettingValue, SettingsError, SettingsPatch, SettingsSchema,
-    SettingsState, SettingsStore, StateStoreError, UnsignedIntegerOrChoiceValue,
+    EffectiveSetting, GpuOffload, ResolvedSetting, ResolvedSettings, SETTINGS_STATE_VERSION,
+    SettingCategory, SettingDefaultPreview, SettingDefaultSource, SettingDefinition, SettingId,
+    SettingKind, SettingScope, SettingSource, SettingValue, SettingsError, SettingsPatch,
+    SettingsSchema, SettingsState, SettingsStore, StateStoreError, UnsignedIntegerOrChoiceValue,
     bounded_setting_file_sha256,
 };
 pub use state::{AppSnapshot, ApplicationCore, RegistryState, ServerState};

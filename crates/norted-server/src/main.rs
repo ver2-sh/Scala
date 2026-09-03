@@ -511,27 +511,9 @@ async fn handle_model_profiles(
         }
         ModelProfilesCommand::Show { profile } => {
             let profile_id = ModelProfileId::new(profile)?;
-            core.ensure_model_discovery().await?;
-            let profiles = store.read().await?;
-            let profile = profiles
-                .profiles
-                .get(&profile_id)
-                .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
-            let settings = SettingsStore::new(&core.paths).read().await?;
-            let resolved = settings.resolve(
-                &profile.id,
-                profile.engine_id.as_str(),
-                &profile.overrides,
-                &SettingsPatch::default(),
-                &core.paths.data_dir,
-            )?;
-            output::model_profile(
-                "show",
-                profile,
-                core.model(&profile.model_id).await.as_ref(),
-                &resolved,
-                json_output,
-            )?;
+            let (profile, model, _, _, resolved, _) =
+                exact_model_profile_context(&core, &profile_id, None).await?;
+            output::model_profile("show", &profile, Some(&model), &resolved, json_output)?;
         }
         ModelProfilesCommand::Create {
             profile,
@@ -558,15 +540,7 @@ async fn handle_model_profiles(
                     Ok(state.clone())
                 })
                 .await?;
-            let created = &state.profiles[&selected];
-            let resolved = SettingsStore::new(&core.paths).read().await?.resolve(
-                &created.id,
-                created.engine_id.as_str(),
-                &created.overrides,
-                &SettingsPatch::default(),
-                &core.paths.data_dir,
-            )?;
-            output::model_profile("create", created, Some(&model), &resolved, json_output)?;
+            output_model_profile_mutation(&core, "create", &state, &selected, json_output).await?;
         }
         ModelProfilesCommand::Duplicate { source, profile } => {
             let source = ModelProfileId::new(source)?;
@@ -578,21 +552,8 @@ async fn handle_model_profiles(
                     Ok(state.clone())
                 })
                 .await?;
-            let duplicated = &state.profiles[&selected];
-            let resolved = SettingsStore::new(&core.paths).read().await?.resolve(
-                &duplicated.id,
-                duplicated.engine_id.as_str(),
-                &duplicated.overrides,
-                &SettingsPatch::default(),
-                &core.paths.data_dir,
-            )?;
-            output::model_profile(
-                "duplicate",
-                duplicated,
-                core.model(&duplicated.model_id).await.as_ref(),
-                &resolved,
-                json_output,
-            )?;
+            output_model_profile_mutation(&core, "duplicate", &state, &selected, json_output)
+                .await?;
         }
         ModelProfilesCommand::Delete { profile } => {
             let profile_id = ModelProfileId::new(profile)?;
@@ -782,27 +743,15 @@ async fn handle_model_profiles(
 }
 
 async fn output_model_profile_mutation(
-    core: &ApplicationCore,
+    core: &Arc<ApplicationCore>,
     operation: &str,
-    state: &norted_core::ModelProfilesState,
+    _state: &norted_core::ModelProfilesState,
     selected: &ModelProfileId,
     json_output: bool,
 ) -> Result<()> {
-    let profile = &state.profiles[selected];
-    let resolved = SettingsStore::new(&core.paths).read().await?.resolve(
-        &profile.id,
-        profile.engine_id.as_str(),
-        &profile.overrides,
-        &SettingsPatch::default(),
-        &core.paths.data_dir,
-    )?;
-    output::model_profile(
-        operation,
-        profile,
-        core.model(&profile.model_id).await.as_ref(),
-        &resolved,
-        json_output,
-    )
+    let (profile, model, _, _, resolved, _) =
+        exact_model_profile_context(core, selected, None).await?;
+    output::model_profile(operation, &profile, Some(&model), &resolved, json_output)
 }
 
 async fn exact_model_profile_context(
@@ -835,7 +784,7 @@ async fn exact_model_profile_context(
     let registry = composition::engine_registry(core)?;
     require_compatible_engine(&registry, &model, profile.engine_id.as_str())?;
     let settings = SettingsStore::new(&core.paths).read().await?;
-    let resolved = settings.resolve(
+    let mut resolved = settings.resolve(
         &profile.id,
         profile.engine_id.as_str(),
         &profile.overrides,
@@ -856,7 +805,9 @@ async fn exact_model_profile_context(
     let adapter = registry.get(profile.engine_id.as_str()).ok_or_else(|| {
         color_eyre::eyre::eyre!("bound engine `{}` is not registered", profile.engine_id)
     })?;
+    schema.materialize_runtime_configuration(&mut resolved)?;
     schema.validate(&resolved)?;
+    schema.materialize_effective(&mut resolved)?;
     let compatibility =
         adapter.runtime_model_compatibility(&selection.runtime, &model, &host, Some(&resolved));
     Ok((profile, model, selection, schema, resolved, compatibility))
@@ -869,10 +820,10 @@ async fn handle_settings(
 ) -> Result<()> {
     let store = SettingsStore::new(&core.paths);
     match command {
-        SettingsCommand::Show { global, engine } => {
-            let scope = defaults_scope(global, engine);
+        SettingsCommand::Show { server, runtime } => {
+            let scope = defaults_scope(server, runtime);
             let state = store.read().await?;
-            output::settings_defaults("show", &scope.to_string(), &state, json_output)?;
+            output_settings_scope(&core, "show", &scope, &state, json_output).await?;
         }
         SettingsCommand::Set(args) => mutate_defaults(&core, args, json_output).await?,
         SettingsCommand::Unset(args) => unset_defaults(&core, args, json_output).await?,
@@ -880,17 +831,59 @@ async fn handle_settings(
     Ok(())
 }
 
+async fn output_settings_scope(
+    core: &Arc<ApplicationCore>,
+    operation: &str,
+    scope: &DefaultsScope,
+    state: &norted_core::SettingsState,
+    json_output: bool,
+) -> Result<()> {
+    let registry = composition::engine_registry(core)?;
+    let definitions = match scope {
+        DefaultsScope::Server => server_setting_definitions(&registry)?
+            .into_iter()
+            .filter(|definition| definition.scope == norted_core::SettingScope::Server)
+            .collect(),
+        DefaultsScope::Runtime(engine_id) => {
+            let packs = composition::runtime_pack_manager(core, registry)?;
+            let (mut schemas, warnings) = packs
+                .selected_runtime_settings_schemas(state, &core.paths.data_dir)
+                .await?;
+            schemas
+                .remove(engine_id)
+                .ok_or_else(|| {
+                    color_eyre::eyre::eyre!(
+                        "selected runtime defaults for `{engine_id}` are unavailable{}",
+                        if warnings.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", warnings.join("; "))
+                        }
+                    )
+                })?
+                .definitions
+        }
+    };
+    output::settings_defaults(
+        operation,
+        &scope.to_string(),
+        state,
+        &definitions,
+        json_output,
+    )
+}
+
 #[derive(Clone)]
 enum DefaultsScope {
-    Global,
-    Engine(String),
+    Server,
+    Runtime(String),
 }
 
 impl std::fmt::Display for DefaultsScope {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Global => formatter.write_str("global"),
-            Self::Engine(engine) => write!(formatter, "engine:{engine}"),
+            Self::Server => formatter.write_str("server"),
+            Self::Runtime(engine) => write!(formatter, "runtime:{engine}"),
         }
     }
 }
@@ -911,16 +904,16 @@ async fn mutate_defaults(
     )
     .await?;
     record_llama_local_file_identities(core, &mut patch).await?;
-    let scope = defaults_scope(args.global, args.engine);
+    let scope = defaults_scope(args.server, args.runtime);
     validate_default_scope(&registry, &scope, &patch)?;
-    let label = scope.to_string();
+    let update_scope = scope.clone();
     let state = SettingsStore::new(&core.paths)
         .update(move |state| {
-            default_patch_mut(state, &scope).0.extend(patch.0);
+            default_patch_mut(state, &update_scope).0.extend(patch.0);
             Ok(state.clone())
         })
         .await?;
-    output::settings_defaults("set", &label, &state, json_output)?;
+    output_settings_scope(core, "set", &scope, &state, json_output).await?;
     Ok(())
 }
 
@@ -991,7 +984,7 @@ async fn unset_defaults(
         ids.push(SettingId::new("q27.template_sha256")?);
     }
     add_llama_bound_identity_ids(&mut ids)?;
-    let scope = defaults_scope(args.global, args.engine);
+    let scope = defaults_scope(args.server, args.runtime);
     let patch = SettingsPatch(
         ids.iter()
             .cloned()
@@ -999,33 +992,33 @@ async fn unset_defaults(
             .collect(),
     );
     validate_default_scope(&registry, &scope, &patch)?;
-    let label = scope.to_string();
+    let update_scope = scope.clone();
     let state = SettingsStore::new(&core.paths)
         .update(move |state| {
-            let target = default_patch_mut(state, &scope);
+            let target = default_patch_mut(state, &update_scope);
             for id in &ids {
                 target.remove(id);
             }
-            if let DefaultsScope::Engine(engine) = &scope
+            if let DefaultsScope::Runtime(engine) = &update_scope
                 && state
-                    .engine_defaults
+                    .runtime_defaults
                     .get(engine)
                     .is_some_and(SettingsPatch::is_empty)
             {
-                state.engine_defaults.remove(engine);
+                state.runtime_defaults.remove(engine);
             }
             Ok(state.clone())
         })
         .await?;
-    output::settings_defaults("unset", &label, &state, json_output)?;
+    output_settings_scope(core, "unset", &scope, &state, json_output).await?;
     Ok(())
 }
 
-fn defaults_scope(global: bool, engine: Option<String>) -> DefaultsScope {
-    if global {
-        DefaultsScope::Global
+fn defaults_scope(server: bool, runtime: Option<String>) -> DefaultsScope {
+    if server {
+        DefaultsScope::Server
     } else {
-        DefaultsScope::Engine(engine.expect("clap requires one settings scope"))
+        DefaultsScope::Runtime(runtime.expect("clap requires one settings scope"))
     }
 }
 
@@ -1034,8 +1027,8 @@ fn default_patch_mut<'a>(
     scope: &DefaultsScope,
 ) -> &'a mut SettingsPatch {
     match scope {
-        DefaultsScope::Global => &mut state.global_defaults,
-        DefaultsScope::Engine(engine) => state.engine_defaults.entry(engine.clone()).or_default(),
+        DefaultsScope::Server => &mut state.server_settings,
+        DefaultsScope::Runtime(engine) => state.runtime_defaults.entry(engine.clone()).or_default(),
     }
 }
 
@@ -1045,15 +1038,12 @@ fn validate_default_scope(
     patch: &SettingsPatch,
 ) -> Result<()> {
     match scope {
-        DefaultsScope::Global => {
-            if let Some(id) = patch.0.keys().find(|id| {
-                id.namespace()
-                    .is_some_and(|namespace| namespace != "server")
-            }) {
-                return Err(SettingsError::InvalidGlobalSetting(id.clone()).into());
+        DefaultsScope::Server => {
+            if let Some(id) = patch.0.keys().find(|id| id.namespace() != Some("server")) {
+                return Err(SettingsError::InvalidServerSetting(id.clone()).into());
             }
         }
-        DefaultsScope::Engine(engine) => {
+        DefaultsScope::Runtime(engine) => {
             if registry.get(engine).is_none() {
                 return Err(color_eyre::eyre::eyre!("unknown engine `{engine}`"));
             }
@@ -1064,10 +1054,10 @@ fn validate_default_scope(
             if let Some(id) = patch.0.keys().find(|id| {
                 definitions
                     .get(*id)
-                    .is_some_and(|definition| definition.scope == norted_core::SettingScope::Global)
+                    .is_some_and(|definition| definition.scope == norted_core::SettingScope::Server)
             }) {
                 return Err(color_eyre::eyre::eyre!(
-                    "setting `{id}` is available only in Global settings"
+                    "setting `{id}` is available only in Server Settings"
                 ));
             }
             validate_patch_for_engine(patch, engine)?;
@@ -1106,7 +1096,7 @@ fn validate_patch_for_model(
     let resolved = norted_core::ResolvedSettings {
         engine_id: engine.to_owned(),
         model_profile_id: None,
-        effective: patch
+        configured: patch
             .0
             .iter()
             .map(|(id, value)| {
@@ -1122,6 +1112,7 @@ fn validate_patch_for_model(
                 )
             })
             .collect(),
+        effective: Default::default(),
     };
     schema.validate(&resolved)?;
     Ok(())

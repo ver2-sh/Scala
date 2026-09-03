@@ -65,7 +65,7 @@ pub enum Command {
     Runtimes(RuntimesArgs),
     /// Create, edit, load, and inspect user-owned Model Profiles
     ModelProfiles(ModelProfilesArgs),
-    /// Manage Global and engine serving defaults
+    /// Manage Server Settings and runtime inference defaults
     Settings(SettingsArgs),
     /// Inspect resolved application configuration
     Config(ConfigArgs),
@@ -253,7 +253,7 @@ pub enum ModelProfilesCommand {
         #[arg(required = true, value_name = "SETTING_ID=VALUE")]
         settings: Vec<String>,
     },
-    /// Clear overrides so values inherit Global/engine defaults again
+    /// Clear overrides so values use runtime defaults again
     Unset {
         profile: String,
         #[arg(required = true, value_name = "SETTING_ID")]
@@ -299,16 +299,16 @@ pub struct SettingsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SettingsCommand {
-    /// Show persisted Global or engine defaults
+    /// Show persisted Server Settings or runtime defaults
     Show {
-        #[arg(long, conflicts_with = "engine", required_unless_present = "engine")]
-        global: bool,
-        #[arg(long, conflicts_with = "global", required_unless_present = "global")]
-        engine: Option<String>,
+        #[arg(long, conflicts_with = "runtime", required_unless_present = "runtime")]
+        server: bool,
+        #[arg(long, conflicts_with = "server", required_unless_present = "server")]
+        runtime: Option<String>,
     },
     /// Set one or more persisted defaults
     Set(SettingsMutationArgs),
-    /// Remove persisted defaults so lower layers inherit again
+    /// Remove persisted values so the runtime baseline applies again
     Unset(SettingsUnsetArgs),
 }
 
@@ -317,13 +317,13 @@ pub enum SettingsCommand {
     ArgGroup::new("scope")
         .required(true)
         .multiple(false)
-        .args(["global", "engine"])
+        .args(["server", "runtime"])
 ))]
 pub struct SettingsMutationArgs {
     #[arg(long)]
-    pub global: bool,
+    pub server: bool,
     #[arg(long)]
-    pub engine: Option<String>,
+    pub runtime: Option<String>,
     #[arg(long)]
     #[arg(required = true, value_name = "SETTING_ID=VALUE")]
     pub settings: Vec<String>,
@@ -334,13 +334,13 @@ pub struct SettingsMutationArgs {
     ArgGroup::new("scope")
         .required(true)
         .multiple(false)
-        .args(["global", "engine"])
+        .args(["server", "runtime"])
 ))]
 pub struct SettingsUnsetArgs {
     #[arg(long)]
-    pub global: bool,
+    pub server: bool,
     #[arg(long)]
-    pub engine: Option<String>,
+    pub runtime: Option<String>,
     #[arg(long)]
     #[arg(required = true, value_name = "SETTING_ID")]
     pub settings: Vec<String>,

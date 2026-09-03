@@ -260,7 +260,7 @@ impl RuntimePackManager {
                 continue;
             };
             let settings =
-                match settings_state.resolve_engine_defaults(&engine_id, structured_path_base) {
+                match settings_state.resolve_runtime_defaults(&engine_id, structured_path_base) {
                     Ok(settings) => settings,
                     Err(error) => {
                         warnings.push(format!("{engine_id}: {error}"));
@@ -272,7 +272,16 @@ impl RuntimePackManager {
                 .await
             {
                 Ok(schema) => {
-                    schemas.insert(engine_id, schema);
+                    let mut resolved = settings.clone();
+                    if let Err(error) = schema
+                        .materialize_runtime_configuration(&mut resolved)
+                        .and_then(|()| schema.validate(&resolved))
+                        .and_then(|()| schema.materialize_effective(&mut resolved))
+                    {
+                        warnings.push(format!("{engine_id}: {error}"));
+                    } else {
+                        schemas.insert(engine_id, schema);
+                    }
                 }
                 Err(error) => warnings.push(format!("{engine_id}: {error}")),
             }
@@ -2277,14 +2286,13 @@ mod tests {
                     label: self.id.to_owned(),
                     description: self.id.to_owned(),
                     kind: SettingKind::Toggle,
-                    scope: SettingScope::Engine {
+                    scope: SettingScope::Runtime {
                         engine_id: self.id.to_owned(),
                     },
                     category: norted_core::SettingCategory::Advanced,
                     supported: true,
                     unsupported_reason: None,
                     unit: None,
-                    upstream_default: None,
                     default_preview: None,
                 }],
             })
