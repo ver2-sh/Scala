@@ -67,6 +67,8 @@ const REVIEWED_SOURCE_BLOBS: &[(&str, &str)] = &[
     ("src/serve/openai_chat_response.cpp", "5841d4b51b204307eca2fe4fb73edcd1dde8d73c"),
     ("src/serve/openai_common.cpp", "f16a90f61b984dd586b9bad1d63902d1baa23c31"),
     ("src/serve/openai_common.h", "1935327676b74a1716958f157bc9101376f93c11"),
+    ("src/serve/openai_responses_store.cpp", "6fa1605b838cc5909902f3bb6a9d172f59b97595"),
+    ("src/serve/openai_responses_store.h", "d8f68c3453b6b2e00b0dcddf45a591f379773469"),
     ("src/serve/request.h", "cf87d3621f573876cd47610ee4aceb8645785d0b"),
     ("src/serve/request_events.cpp", "f2e4d90efdd71b0862a0791faac3133a2df6c54d"),
     ("src/serve/request_events.h", "b7e0353d144bf39749dcbbb3ba34ea101146f314"),
@@ -87,19 +89,38 @@ const RUNTIME_DEFAULT_FILES: &[&str] = &[
     "include/ninfer/types.h",
     "src/product/speculative_options.h",
     "src/runtime/engine/engine.cpp",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/http_server.cpp",
+    "src/serve/http_server.h",
+    "src/serve/openai_responses_store.cpp",
+    "src/serve/openai_responses_store.h",
     "src/serve/serve_options.cpp",
     "src/serve/serve_options.h",
+    "src/targets/qwen3_6_27b/impl/package.cpp",
+    "src/targets/qwen3_6_35b_a3b/impl/package.cpp",
 ];
 const SAMPLER_DEFAULT_FILES: &[&str] = &[
     "include/ninfer/types.h",
     "src/runtime/contract/sampling.cpp",
     "src/runtime/contract/sampling.h",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/http_server.cpp",
+    "src/serve/http_server.h",
+    "src/serve/openai_chat_request.cpp",
+    "src/serve/request.h",
+    "src/serve/translate.cpp",
+    "src/serve/translate.h",
     "src/targets/qwen3_6_27b/impl/package.cpp",
     "src/targets/qwen3_6_35b_a3b/impl/package.cpp",
 ];
 const REQUEST_PROTOCOL_FILES: &[&str] = &[
+    "include/ninfer/types.h",
     "src/serve/generation_service.cpp",
     "src/serve/generation_service.h",
+    "src/serve/http_server.cpp",
+    "src/serve/http_server.h",
     "src/serve/openai_chat_request.cpp",
     "src/serve/openai_chat_response.cpp",
     "src/serve/openai_common.cpp",
@@ -107,37 +128,70 @@ const REQUEST_PROTOCOL_FILES: &[&str] = &[
     "src/serve/request.h",
     "src/serve/translate.cpp",
     "src/serve/translate.h",
+    "src/targets/qwen3_6/impl/frontend/chat_template.cpp",
+    "src/targets/qwen3_6/impl/frontend/frontend.cpp",
+    "src/targets/qwen3_6_27b/impl/package.cpp",
+    "src/targets/qwen3_6_35b_a3b/impl/package.cpp",
 ];
 const REQUEST_LOG_FILES: &[&str] = &[
     "apps/serve/main.cpp",
+    "include/ninfer/types.h",
+    "src/product/speculative_options.h",
+    "src/runtime/engine/engine.cpp",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
     "src/serve/http_server.cpp",
     "src/serve/http_server.h",
     "src/serve/request_events.cpp",
     "src/serve/request_events.h",
     "src/serve/request_log.cpp",
     "src/serve/request_log.h",
+    "src/serve/serve_options.cpp",
+    "src/serve/serve_options.h",
 ];
 const THINKING_PROTOCOL_FILES: &[&str] = &[
-    "src/serve/openai_chat_request.cpp",
-    "src/serve/request.h",
-    "src/serve/translate.cpp",
-    "src/serve/translate.h",
-    "src/targets/qwen3_6/impl/frontend/chat_template.cpp",
-];
-const TOOL_CALLING_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/http_server.cpp",
+    "src/serve/http_server.h",
     "src/serve/openai_chat_request.cpp",
     "src/serve/openai_chat_response.cpp",
     "src/serve/request.h",
     "src/serve/translate.cpp",
+    "src/serve/translate.h",
     "src/targets/qwen3_6/impl/frontend/chat_template.cpp",
+    "src/targets/qwen3_6/impl/frontend/frontend.cpp",
+];
+const TOOL_CALLING_FILES: &[&str] = &[
+    "include/ninfer/types.h",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/http_server.cpp",
+    "src/serve/http_server.h",
+    "src/serve/openai_chat_request.cpp",
+    "src/serve/openai_chat_response.cpp",
+    "src/serve/request.h",
+    "src/serve/translate.cpp",
+    "src/serve/translate.h",
+    "src/targets/qwen3_6/impl/frontend/chat_template.cpp",
+    "src/targets/qwen3_6/impl/frontend/frontend.cpp",
     "src/targets/qwen3_6/impl/frontend/tool_call_parser.cpp",
 ];
 const VISION_MEDIA_FILES: &[&str] = &[
+    "include/ninfer/types.h",
     "src/product/media_acquire/acquire.cpp",
     "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/http_server.cpp",
+    "src/serve/http_server.h",
     "src/serve/openai_chat_request.cpp",
+    "src/serve/request.h",
     "src/serve/translate.cpp",
+    "src/serve/translate.h",
     "src/targets/qwen3_6/impl/frontend/frontend.cpp",
+    "src/targets/qwen3_6_27b/impl/package.cpp",
+    "src/targets/qwen3_6_35b_a3b/impl/package.cpp",
 ];
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -256,6 +310,7 @@ struct NinferStartupRequirements {
     speculative_draft_window: Option<u64>,
     proposal_head: Option<String>,
     expected_thinking: Option<bool>,
+    request_default_thinking: Option<bool>,
     preserve_thinking: Option<bool>,
     temperature: Option<f64>,
     top_p: Option<f64>,
@@ -318,7 +373,7 @@ fn apply_ninfer_runtime_contract(
             if !capabilities.request_protocol_semantics {
                 unsupported(
                     definition,
-                    "the NInfer request-protocol source contract is not reviewed",
+                    "this NInfer source runtime's request-protocol capability contract is outdated or unreviewed; install or select the current reviewed runtime",
                 );
             }
             continue;
@@ -327,7 +382,7 @@ fn apply_ninfer_runtime_contract(
             if !capabilities.request_protocol_semantics || !capabilities.thinking_protocol {
                 unsupported(
                     definition,
-                    "the NInfer request/thinking protocol source contract is not reviewed",
+                    "this NInfer source runtime's request/thinking capability contract is outdated or unreviewed; install or select the current reviewed runtime",
                 );
             }
             continue;
@@ -364,7 +419,7 @@ fn apply_ninfer_runtime_contract(
         if !required_domain {
             unsupported(
                 definition,
-                "the capability domain that owns this NInfer setting is not reviewed",
+                "this NInfer source runtime's capability contract for the setting is outdated or unreviewed; install or select the current reviewed runtime",
             );
             continue;
         }
@@ -722,6 +777,7 @@ fn ninfer_startup_requirements(
         proposal_head: toggle("ninfer.lm_head_draft")?
             .map(|enabled| if enabled { "optimized" } else { "full" }.to_owned()),
         expected_thinking: toggle("ninfer.thinking")?,
+        request_default_thinking: settings::reviewed_request_thinking_override(Some(settings)),
         preserve_thinking: toggle("ninfer.preserve_thinking")?,
         temperature: float("temperature")?,
         top_p: float("top_p")?,
@@ -1189,7 +1245,7 @@ impl EngineAdapter for NinferAdapter {
             combine_compatibility(
                 base,
                 RuntimeCompatibility::NeedsAttention(
-                    "one or more NInfer request-protocol/startup capability domains are not reviewed"
+                    "this NInfer source runtime has outdated or unreviewed request-protocol/startup capability contracts; install or select the current reviewed runtime"
                         .to_owned(),
                 ),
             )
@@ -1258,7 +1314,7 @@ impl EngineAdapter for NinferAdapter {
             combine_compatibility(
                 base,
                 RuntimeCompatibility::NeedsAttention(
-                    "one or more NInfer request-protocol/startup capability domains are not reviewed"
+                    "this NInfer source runtime has outdated or unreviewed request-protocol/startup capability contracts; install or select the current reviewed runtime"
                         .to_owned(),
                 ),
             )
@@ -1546,7 +1602,8 @@ impl EngineAdapter for NinferAdapter {
         let runtime_capabilities = ninfer_runtime_capabilities_for_installed(&request.runtime);
         if !runtime_capabilities.startup_proof {
             return Err(EngineError::InvalidConfiguration(
-                "the NInfer request-log/startup-proof source contract is not reviewed".to_owned(),
+                "this NInfer source runtime's request-log/startup-proof capability contract is outdated or unreviewed; install or select the current reviewed runtime"
+                    .to_owned(),
             ));
         }
         validate_ninfer_settings_prelaunch(&request.settings, runtime_capabilities)
@@ -2729,6 +2786,11 @@ async fn read_and_validate_startup_log(
             ));
         }
     }
+    let resolved_reasoning = pending
+        .settings_requirements
+        .as_ref()
+        .and_then(|requirements| requirements.request_default_thinking)
+        .unwrap_or(startup.server.default_thinking);
     let resolved_settings = BTreeMap::from([
         (
             "context_length".to_owned(),
@@ -2765,6 +2827,10 @@ async fn read_and_validate_startup_log(
             json!(startup.engine.context_cache.host_state_slots),
         ),
         (
+            "ninfer.host_kv_mib".to_owned(),
+            json!(startup.engine.context_cache.host_kv_capacity_bytes / (1_u64 << 20)),
+        ),
+        (
             "ninfer.max_private_continuations".to_owned(),
             json!(startup.engine.context_cache.max_private_continuations),
         ),
@@ -2799,11 +2865,7 @@ async fn read_and_validate_startup_log(
         ),
         (
             "reasoning".to_owned(),
-            json!(if startup.server.default_thinking {
-                "on"
-            } else {
-                "off"
-            }),
+            json!(if resolved_reasoning { "on" } else { "off" }),
         ),
         (
             "reasoning_budget".to_owned(),
