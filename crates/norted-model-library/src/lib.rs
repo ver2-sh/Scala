@@ -1093,6 +1093,10 @@ pub fn setting_definition() -> norted_core::SettingDefinition {
         unsupported_reason: None,
         unit: Some("downloads".to_owned()),
         upstream_default: Some(DEFAULT_MAX_PARALLEL_DOWNLOADS.to_string()),
+        default_preview: Some(norted_core::SettingDefaultPreview::new(
+            DEFAULT_MAX_PARALLEL_DOWNLOADS.to_string(),
+            norted_core::SettingDefaultSource::Norted,
+        )),
     }
 }
 

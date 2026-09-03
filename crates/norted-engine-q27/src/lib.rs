@@ -20,8 +20,8 @@ use norted_core::{
     RuntimeIdentity, RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel,
     RuntimeRequirements, RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites,
     RuntimeSourceBuildProvenance, RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem,
-    RuntimeSourceSnapshot, SettingCategory, SettingDefinition, SettingId, SettingKind,
-    SettingScope, SettingValue, SettingsSchema,
+    RuntimeSourceSnapshot, SettingCategory, SettingDefaultPreview, SettingDefaultSource,
+    SettingDefinition, SettingId, SettingKind, SettingScope, SettingValue, SettingsSchema,
 };
 use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CatalogError, CompatibilityDecision,
@@ -2761,7 +2761,8 @@ impl EngineAdapter for Q27Adapter {
         &self,
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
-        _host: &HostCapabilities,
+        host: &HostCapabilities,
+        settings: Option<&norted_core::ResolvedSettings>,
     ) -> Result<SettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
         let usage = self
@@ -2786,6 +2787,7 @@ impl EngineAdapter for Q27Adapter {
         );
         let facts = inspect_q27_model(&model.path).map_err(EngineError::InvalidConfiguration)?;
         apply_q27_model_capabilities(&mut schema.definitions, &facts);
+        apply_q27_context_defaults(&mut schema.definitions, runtime, model, host, settings);
         Ok(schema)
     }
 
@@ -4517,6 +4519,10 @@ fn q27_settings_schema_from_usage(
             choices: Vec::new(),
         };
         seed.upstream_default = Some("runtime default: 0".to_owned());
+        seed.default_preview = Some(SettingDefaultPreview::new(
+            "0",
+            SettingDefaultSource::Runtime,
+        ));
     }
     for definition in &mut definitions {
         let option = q27_setting_option(definition.id.as_str());
@@ -4883,6 +4889,190 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
             definition.upstream_default = Some(value.to_owned());
         }
     }
+
+    for (id, value) in [
+        ("parallel_requests", "1"),
+        ("temperature", "0.0"),
+        ("top_p", "1.0"),
+        ("top_k", "0"),
+        ("min_p", "0.0"),
+        ("max_output_tokens", "8192"),
+        ("q27.fast_head", "enabled"),
+        ("q27.thinking", "disabled"),
+        ("q27.request_thinking", "off"),
+        ("q27.constrain_tools", "off"),
+        ("q27.continuous_batching", "enabled"),
+        ("q27.sampled_graphs", "enabled"),
+        ("q27.mtp", "enabled"),
+        ("q27.mtp_min_probability", "0.5"),
+        ("q27.suffix_drafting", "enabled"),
+        ("q27.prefix_cache_path", "disabled"),
+        ("q27.prefix_cache_max_gb", "20 GB"),
+        ("q27.prefix_cache_min_tokens", "4096"),
+        ("q27.prefix_cache_max_tokens", "32768"),
+        ("q27.prefix_cache_step_tokens", "8192"),
+        ("q27.prefix_cache_ram_gb", "disabled"),
+    ] {
+        set_q27_default(
+            definitions,
+            id,
+            SettingDefaultPreview::new(value, SettingDefaultSource::Runtime),
+        );
+    }
+    set_q27_default(
+        definitions,
+        "q27.continuous_batching",
+        SettingDefaultPreview::new("enabled", SettingDefaultSource::Runtime).with_detail(
+            "Enabled by the reviewed runtime profile; q27 may auto-disable it when runtime compatibility requires the solo path",
+        ),
+    );
+    set_q27_default(
+        definitions,
+        "q27.mtp_max_depth",
+        SettingDefaultPreview::new("automatic · ≤7", SettingDefaultSource::Runtime).with_detail(
+            "The reviewed runtime chooses proposal depth automatically with a maximum of 7",
+        ),
+    );
+    set_q27_default(
+        definitions,
+        "q27.thinking_budget",
+        SettingDefaultPreview::new("request-sized", SettingDefaultSource::StartupDynamic)
+            .with_detail(
+                "For prompt-seeded thinking, q27 derives the budget from the request's maximum output at request time",
+            ),
+    );
+}
+
+fn set_q27_default(
+    definitions: &mut [SettingDefinition],
+    id: &str,
+    preview: SettingDefaultPreview,
+) {
+    if let Some(definition) = definitions
+        .iter_mut()
+        .find(|definition| definition.id.as_str() == id)
+    {
+        definition.default_preview = Some(preview);
+    }
+}
+
+fn apply_q27_context_defaults(
+    definitions: &mut [SettingDefinition],
+    runtime: &InstalledRuntime,
+    model: &ModelArtifact,
+    host: &HostCapabilities,
+    settings: Option<&norted_core::ResolvedSettings>,
+) {
+    let capabilities = q27_runtime_capabilities(
+        &runtime.manifest.identity,
+        &runtime.manifest.acquisition_method,
+        runtime
+            .manifest
+            .source_build
+            .as_ref()
+            .map(Q27SourceBuildEvidence::Provenance),
+    );
+    if !capabilities.stable_serving_environment {
+        return;
+    }
+
+    let configured_mode = settings.and_then(|settings| setting_choice(settings, "q27.kv_mode"));
+    let default_mode = if matches!(configured_mode, Some(mode) if mode != "runtime_default") {
+        None
+    } else {
+        self_selected_q27_accelerator(runtime, model, host)
+            .and_then(|accelerator| accelerator.compute_capability)
+            .map(|capability| {
+                let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
+                if architecture >= 89 {
+                    Q27KvMode::Fp8
+                } else if architecture >= 80 {
+                    Q27KvMode::Turbo5k
+                } else {
+                    Q27KvMode::Fp16
+                }
+            })
+    };
+    if let Some(mode) = default_mode {
+        set_q27_default(
+            definitions,
+            "q27.kv_mode",
+            SettingDefaultPreview::new(mode.as_str(), SettingDefaultSource::Derived).with_detail(
+                "Derived before launch from the reviewed q27 architecture contract and the selected accelerator's numeric compute capability",
+            ),
+        );
+    } else if configured_mode.is_none() || configured_mode == Some("runtime_default") {
+        set_q27_default(
+            definitions,
+            "q27.kv_mode",
+            SettingDefaultPreview::new(
+                "architecture-selected",
+                SettingDefaultSource::StartupDynamic,
+            )
+            .with_detail(
+                "The reviewed runtime selects KV format from numeric GPU architecture, but the selected accelerator's compute capability is not known",
+            ),
+        );
+    }
+
+    let effective_mode = configured_mode
+        .and_then(|mode| {
+            [
+                Q27KvMode::Fp8,
+                Q27KvMode::Turbo5k,
+                Q27KvMode::Turbo3,
+                Q27KvMode::Fp16,
+            ]
+            .into_iter()
+            .find(|known| known.as_str() == mode)
+        })
+        .or(default_mode);
+    let context_cap = if effective_mode == Some(Q27KvMode::Fp16) {
+        131_072
+    } else {
+        262_144
+    };
+    let context = SettingDefaultPreview::new(
+        format!("launch-sized · ≤{context_cap}"),
+        SettingDefaultSource::StartupDynamic,
+    )
+    .with_detail(
+        "q27 calculates the final context from live free VRAM and startup reservations after loading model weights",
+    );
+    set_q27_default(definitions, "context_length", context.clone());
+    set_q27_default(
+        definitions,
+        "q27.slot1_context_length",
+        context.with_detail(
+            "When context is automatic, the reviewed runtime sizes later slots to the same live-VRAM-derived window as slot 0",
+        ),
+    );
+    if let Some(compiled_w_max) = capabilities.compiled_w_max {
+        set_q27_default(
+            definitions,
+            "q27.suffix_width_mode",
+            SettingDefaultPreview::new(compiled_w_max.to_string(), SettingDefaultSource::Derived)
+                .with_detail("The exact reviewed runtime identity proves its compiled W_MAX"),
+        );
+    }
+}
+
+fn self_selected_q27_accelerator(
+    runtime: &InstalledRuntime,
+    model: &ModelArtifact,
+    host: &HostCapabilities,
+) -> Option<AcceleratorDevice> {
+    inspect_q27_model(&model.path).ok().and_then(|facts| {
+        q27_device_evaluation(
+            &runtime.manifest.identity.platform,
+            &runtime.manifest.identity.architecture,
+            &runtime.manifest.requirements,
+            facts.tier,
+            host,
+            runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
+        )
+        .accelerator
+    })
 }
 
 fn apply_q27_model_capabilities(
@@ -4943,6 +5133,33 @@ fn q27_definition(
         unsupported_reason: None,
         unit: None,
         upstream_default: upstream_default.map(str::to_owned),
+        default_preview: match id {
+            "q27.prompt_mode" => Some(SettingDefaultPreview::new(
+                "runtime template",
+                SettingDefaultSource::Norted,
+            )),
+            "q27.prompt_delivery" => Some(SettingDefaultPreview::new(
+                "runtime chat",
+                SettingDefaultSource::Norted,
+            )),
+            "q27.template_path" | "q27.template_sha256" => Some(SettingDefaultPreview::new(
+                "None",
+                SettingDefaultSource::Norted,
+            )),
+            "q27.render_generation_prompt" => Some(SettingDefaultPreview::new(
+                "enabled",
+                SettingDefaultSource::Norted,
+            )),
+            "q27.template_thinking" => Some(SettingDefaultPreview::new(
+                "disabled",
+                SettingDefaultSource::Norted,
+            )),
+            "q27.response_filter" => Some(SettingDefaultPreview::new(
+                "none",
+                SettingDefaultSource::Norted,
+            )),
+            _ => None,
+        },
     }
 }
 

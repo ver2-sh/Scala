@@ -1,8 +1,9 @@
 use std::ffi::OsString;
 
 use norted_core::{
-    ArtifactNativeIdentity, ModelArtifact, ResolvedSettings, SettingCategory, SettingDefinition,
-    SettingId, SettingKind, SettingScope, SettingValue, UnsignedIntegerOrChoiceValue,
+    ArtifactNativeIdentity, ModelArtifact, ResolvedSettings, SettingCategory,
+    SettingDefaultPreview, SettingDefaultSource, SettingDefinition, SettingId, SettingKind,
+    SettingScope, SettingValue, UnsignedIntegerOrChoiceValue,
 };
 use norted_engine::{EngineError, common_setting_definitions};
 
@@ -211,7 +212,11 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
     definitions
 }
 
-pub(crate) fn apply_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
+pub(crate) fn apply_reviewed_runtime_defaults(
+    definitions: &mut [SettingDefinition],
+    model: &ModelArtifact,
+    settings: Option<&ResolvedSettings>,
+) {
     for (id, value) in [
         ("context_length", "runtime default: 8192"),
         ("parallel_requests", "runtime default: 1"),
@@ -273,6 +278,179 @@ pub(crate) fn apply_reviewed_runtime_defaults(definitions: &mut [SettingDefiniti
         {
             definition.upstream_default = Some(value.to_owned());
         }
+    }
+
+    for (id, value) in [
+        ("context_length", "8192"),
+        ("parallel_requests", "1"),
+        ("max_output_tokens", "8192"),
+        ("reasoning", "on"),
+        ("reasoning_budget", "None"),
+        ("ninfer.kv_dtype", "BF16"),
+        ("ninfer.prefill_chunk", "1024"),
+        ("ninfer.speculation", "disabled"),
+        ("ninfer.speculative_backend", "off"),
+        ("ninfer.draft_tokens", "unused"),
+        ("ninfer.lm_head_draft", "disabled"),
+        ("ninfer.vision", "disabled"),
+        ("ninfer.greedy", "disabled"),
+        ("ninfer.cuda_graph", "enabled"),
+        ("ninfer.prefix_reuse", "enabled"),
+        ("ninfer.thinking", "enabled"),
+        ("ninfer.preserve_thinking", "disabled"),
+        ("ninfer.host_state_slots", "8"),
+        ("ninfer.host_kv_mib", "8192 MiB"),
+        ("ninfer.max_long_anchors_per_continuation", "2"),
+        ("ninfer.max_pending_requests", "16"),
+        ("ninfer.pending_timeout_ms", "30000 ms"),
+        ("ninfer.log_stats_interval_ms", "5000 ms"),
+        ("ninfer.max_request_mib", "384 MiB"),
+        ("ninfer.media_cache_mib", "1024 MiB"),
+        ("ninfer.media_live_mib", "2048 MiB"),
+        ("ninfer.response_store_max_records", "1024"),
+        ("ninfer.response_store_max_mib", "256 MiB"),
+    ] {
+        set_default(
+            definitions,
+            id,
+            SettingDefaultPreview::new(value, SettingDefaultSource::Runtime),
+        );
+    }
+    set_default(
+        definitions,
+        "seed",
+        SettingDefaultPreview::new("random per request", SettingDefaultSource::StartupDynamic)
+            .with_detail("NInfer creates a fresh random seed for each request when none is set"),
+    );
+
+    let concurrency = settings
+        .and_then(|settings| settings.value("parallel_requests"))
+        .and_then(|value| match value {
+            SettingValue::UnsignedInteger(value) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(1);
+    let context = settings
+        .and_then(|settings| settings.value("context_length"))
+        .and_then(|value| match value {
+            SettingValue::UnsignedInteger(value) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(8192);
+    for (id, value, formula) in [
+        (
+            "ninfer.kv_capacity",
+            context,
+            "The reviewed runtime defaults KV capacity to the effective context length",
+        ),
+        (
+            "ninfer.device_state_slots",
+            concurrency,
+            "The reviewed runtime defaults extra device checkpoint slots to effective concurrency",
+        ),
+        (
+            "ninfer.max_private_continuations",
+            concurrency.saturating_mul(2),
+            "The reviewed runtime defaults private continuations to twice effective concurrency",
+        ),
+        (
+            "ninfer.max_shared_prefixes",
+            concurrency,
+            "The reviewed runtime defaults shared prefixes to effective concurrency",
+        ),
+    ] {
+        set_default(
+            definitions,
+            id,
+            SettingDefaultPreview::new(value.to_string(), SettingDefaultSource::Derived)
+                .with_detail(formula),
+        );
+    }
+    let media_threads = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+        .min(16);
+    set_default(
+        definitions,
+        "ninfer.media_preprocess_threads",
+        SettingDefaultPreview::new(media_threads.to_string(), SettingDefaultSource::Derived)
+            .with_detail(
+                "Derived from detected host concurrency using the reviewed runtime's maximum of 16 workers",
+            ),
+    );
+    apply_model_sampler_defaults(definitions, model, settings);
+}
+
+fn set_default(definitions: &mut [SettingDefinition], id: &str, preview: SettingDefaultPreview) {
+    if let Some(definition) = definitions
+        .iter_mut()
+        .find(|definition| definition.id.as_str() == id)
+    {
+        definition.default_preview = Some(preview);
+    }
+}
+
+fn apply_model_sampler_defaults(
+    definitions: &mut [SettingDefinition],
+    model: &ModelArtifact,
+    settings: Option<&ResolvedSettings>,
+) {
+    let Some(ArtifactNativeIdentity::Ninfer(identity)) = model.native_identity.as_ref() else {
+        return;
+    };
+    let thinking = settings
+        .and_then(|settings| settings.value("ninfer.thinking"))
+        .and_then(|value| match value {
+            SettingValue::Toggle(value) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(true);
+    let (mut temperature, top_p, top_k, min_p, presence_penalty, frequency_penalty) =
+        match (identity.model_id.as_str(), thinking) {
+            ("qwen3.6-27b" | "qwen3.8-27b", true) => ("1.0", "0.95", "20", "0.0", "0.0", "0.0"),
+            ("qwen3.6-27b" | "qwen3.8-27b", false) => ("0.7", "0.8", "20", "0.0", "1.5", "0.0"),
+            ("qwen3.6-35b-a3b", true) => ("1.0", "0.95", "20", "0.0", "1.5", "0.0"),
+            ("qwen3.6-35b-a3b", false) => ("0.7", "0.8", "20", "0.0", "1.5", "0.0"),
+            _ => return,
+        };
+    let greedy = settings.is_some_and(|settings| {
+        matches!(
+            settings.value("ninfer.greedy"),
+            Some(SettingValue::Toggle(true))
+        )
+    });
+    if greedy {
+        temperature = "0.0";
+    }
+    for (id, value) in [
+        ("temperature", temperature),
+        ("top_p", top_p),
+        ("top_k", top_k),
+        ("min_p", min_p),
+        ("presence_penalty", presence_penalty),
+        ("frequency_penalty", frequency_penalty),
+    ] {
+        set_default(
+            definitions,
+            id,
+            SettingDefaultPreview::new(
+                value,
+                if id == "temperature" && greedy {
+                    SettingDefaultSource::Derived
+                } else {
+                    SettingDefaultSource::Model
+                },
+            )
+            .with_detail(if id == "temperature" && greedy {
+                "The reviewed runtime's configured greedy mode forces exact argmax".to_owned()
+            } else {
+                format!(
+                    "Reviewed NInfer preset for model {} in {} mode",
+                    identity.model_id,
+                    if thinking { "thinking" } else { "non-thinking" }
+                )
+            }),
+        );
     }
 }
 
@@ -385,6 +563,7 @@ fn definition(
         unsupported_reason: None,
         unit: None,
         upstream_default: upstream_default.map(str::to_owned),
+        default_preview: None,
     }
 }
 

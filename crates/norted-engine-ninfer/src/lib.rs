@@ -1079,6 +1079,7 @@ impl EngineAdapter for NinferAdapter {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         _host: &HostCapabilities,
+        settings: Option<&ResolvedSettings>,
     ) -> Result<norted_core::SettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
         let help = self
@@ -1094,7 +1095,7 @@ impl EngineAdapter for NinferAdapter {
         settings::apply_runtime_bounds(&mut definitions);
         let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
         if capabilities.protocol_semantics {
-            settings::apply_reviewed_runtime_defaults(&mut definitions);
+            settings::apply_reviewed_runtime_defaults(&mut definitions, model, settings);
         }
         for definition in &mut definitions {
             let id = definition.id.as_str();

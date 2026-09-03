@@ -205,7 +205,7 @@ impl RuntimePackManager {
         })?;
         let host = self.host_capabilities().await;
         let schema = adapter
-            .settings_schema(&selection.runtime, model, &host)
+            .settings_schema(&selection.runtime, model, &host, settings)
             .await
             .map_err(RuntimePackError::Adapter)?;
         Ok((selection, schema))
@@ -248,7 +248,7 @@ impl RuntimePackManager {
         })?;
         let host = self.host_capabilities().await;
         let schema = adapter
-            .settings_schema(&selection.runtime, model, &host)
+            .settings_schema(&selection.runtime, model, &host, settings)
             .await
             .map_err(RuntimePackError::Adapter)?;
         Ok((selection, schema))
@@ -857,7 +857,7 @@ impl RuntimePackManager {
             RuntimePackError::Selection(format!("bound engine `{engine_id}` is not registered"))
         })?;
         let schema = adapter
-            .settings_schema(&selection.runtime, model, &inspection.host)
+            .settings_schema(&selection.runtime, model, &inspection.host, settings)
             .await
             .map_err(RuntimePackError::Adapter)?;
         Ok((selection, schema))
@@ -1102,7 +1102,7 @@ impl RuntimePackManager {
             && let Some(adapter) = selected_adapter.as_ref()
         {
             adapter
-                .settings_schema(&selection.runtime, model, &list.host)
+                .settings_schema(&selection.runtime, model, &list.host, settings)
                 .await
                 .ok()
                 .and_then(|schema| {
@@ -2198,6 +2198,7 @@ mod tests {
             runtime: &InstalledRuntime,
             _model: &ModelArtifact,
             _host: &norted_core::HostCapabilities,
+            _settings: Option<&norted_core::ResolvedSettings>,
         ) -> Result<SettingsSchema, EngineError> {
             Ok(SettingsSchema {
                 engine_id: self.id.to_owned(),
@@ -2215,6 +2216,7 @@ mod tests {
                     unsupported_reason: None,
                     unit: None,
                     upstream_default: None,
+                    default_preview: None,
                 }],
             })
         }

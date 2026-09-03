@@ -906,7 +906,7 @@ impl RuntimeManager {
         };
         let host = self.packs.host_capabilities().await;
         let settings_schema = match adapter
-            .settings_schema(&selection.runtime, &model, &host)
+            .settings_schema(&selection.runtime, &model, &host, Some(&resolved_settings))
             .await
         {
             Ok(schema) => schema,

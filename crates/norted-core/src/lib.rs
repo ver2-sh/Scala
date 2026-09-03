@@ -68,8 +68,9 @@ pub use runtime_pack::{
 };
 pub use settings::{
     GpuOffload, ResolvedSetting, ResolvedSettings, SETTINGS_STATE_VERSION, SettingCategory,
-    SettingDefinition, SettingId, SettingKind, SettingScope, SettingSource, SettingValue,
-    SettingsError, SettingsPatch, SettingsSchema, SettingsState, SettingsStore, StateStoreError,
-    UnsignedIntegerOrChoiceValue, bounded_setting_file_sha256,
+    SettingDefaultPreview, SettingDefaultSource, SettingDefinition, SettingId, SettingKind,
+    SettingScope, SettingSource, SettingValue, SettingsError, SettingsPatch, SettingsSchema,
+    SettingsState, SettingsStore, StateStoreError, UnsignedIntegerOrChoiceValue,
+    bounded_setting_file_sha256,
 };
 pub use state::{AppSnapshot, ApplicationCore, RegistryState, ServerState};

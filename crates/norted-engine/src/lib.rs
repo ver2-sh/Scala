@@ -15,8 +15,9 @@ use norted_core::{
     AcceleratorDevice, ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifactRole,
     AvailableRuntime, EngineInstallation, EngineRevision, HostCapabilities, InstalledRuntime,
     ModelArtifact, ModelId, ModelRuntimeIdentity, ResolvedSettings, RuntimeCompatibility,
-    RuntimeId, RuntimeIdentity, RuntimeProbeObservation, SettingDefinition, SettingId,
-    SettingsError, SettingsPatch, SettingsSchema,
+    RuntimeId, RuntimeIdentity, RuntimeProbeObservation, SettingDefaultPreview,
+    SettingDefaultSource, SettingDefinition, SettingId, SettingsError, SettingsPatch,
+    SettingsSchema,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -171,6 +172,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             unsupported_reason: None,
             unit: Some("tokens".to_owned()),
             upstream_default: Some("runtime/model automatic".to_owned()),
+            default_preview: None,
         },
         SettingDefinition {
             id: SettingId::new("parallel_requests").expect("static setting ID"),
@@ -186,6 +188,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             unsupported_reason: None,
             unit: Some("slots".to_owned()),
             upstream_default: Some("runtime-selected".to_owned()),
+            default_preview: None,
         },
         SettingDefinition {
             id: SettingId::new("temperature").expect("static setting ID"),
@@ -202,6 +205,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             unsupported_reason: None,
             unit: None,
             upstream_default: Some("runtime/model default".to_owned()),
+            default_preview: None,
         },
         SettingDefinition {
             id: SettingId::new("top_p").expect("static setting ID"),
@@ -217,6 +221,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             unsupported_reason: None,
             unit: None,
             upstream_default: Some("runtime/model default".to_owned()),
+            default_preview: None,
         },
         SettingDefinition {
             id: SettingId::new("top_k").expect("static setting ID"),
@@ -232,6 +237,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             unsupported_reason: None,
             unit: None,
             upstream_default: Some("runtime/model default".to_owned()),
+            default_preview: None,
         },
         SettingDefinition {
             id: SettingId::new("min_p").expect("static setting ID"),
@@ -247,6 +253,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             unsupported_reason: None,
             unit: None,
             upstream_default: Some("runtime/model default".to_owned()),
+            default_preview: None,
         },
         SettingDefinition {
             id: SettingId::new("reasoning_effort").expect("static setting ID"),
@@ -264,6 +271,7 @@ pub fn common_setting_definitions() -> Vec<SettingDefinition> {
             unsupported_reason: None,
             unit: None,
             upstream_default: Some("runtime/model default".to_owned()),
+            default_preview: None,
         },
         common_definition(
             "seed",
@@ -412,6 +420,20 @@ fn common_definition(
         unsupported_reason: None,
         unit: None,
         upstream_default: upstream_default.map(str::to_owned),
+        default_preview: match id {
+            "stop_strings" | "system_prompt" | "reasoning_budget_message" => Some(
+                SettingDefaultPreview::new("None", SettingDefaultSource::Norted),
+            ),
+            "structured_output_schema" => Some(SettingDefaultPreview::new(
+                "plain text",
+                SettingDefaultSource::Norted,
+            )),
+            "context_overflow" => Some(SettingDefaultPreview::new(
+                "error",
+                SettingDefaultSource::Norted,
+            )),
+            _ => None,
+        },
     }
 }
 
@@ -1451,6 +1473,7 @@ pub trait EngineAdapter: Send + Sync {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         _host: &HostCapabilities,
+        _settings: Option<&ResolvedSettings>,
     ) -> Result<SettingsSchema, EngineError> {
         Ok(SettingsSchema {
             engine_id: self.identity().id,
