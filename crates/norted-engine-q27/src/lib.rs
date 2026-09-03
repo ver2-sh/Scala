@@ -2761,6 +2761,7 @@ impl EngineAdapter for Q27Adapter {
         &self,
         runtime: &InstalledRuntime,
         _host: &HostCapabilities,
+        _settings: Option<&norted_core::ResolvedSettings>,
     ) -> Result<SettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
         let usage = self

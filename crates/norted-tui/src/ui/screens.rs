@@ -1722,13 +1722,14 @@ fn render_settings(
             "Rows select. Click a value to edit or change it; Inherit clears this layer's override.\n{description}\n{default}"
         )
     };
+    let info_y = ui_layout.settings_scopes.y.saturating_add(1);
     frame.render_widget(
         Paragraph::new(info).style(theme.hint),
         Rect::new(
             ui_layout.settings_scopes.x,
-            ui_layout.settings_scopes.y.saturating_add(1),
+            info_y,
             ui_layout.settings_scopes.width,
-            4,
+            ui_layout.settings_list.y.saturating_sub(info_y),
         ),
     );
     render_settings_input(frame, app, theme, ui_layout);

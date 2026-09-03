@@ -854,6 +854,7 @@ impl EngineAdapter for LlamaCppAdapter {
         &self,
         runtime: &InstalledRuntime,
         _host: &HostCapabilities,
+        _settings: Option<&norted_core::ResolvedSettings>,
     ) -> Result<SettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
         let help = self.cached_runtime_help(runtime).await?;

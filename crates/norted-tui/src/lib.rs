@@ -522,6 +522,38 @@ async fn read_tui_settings(
     ))
 }
 
+async fn load_tui_settings(
+    runtime_packs: &RuntimePackManager,
+    settings: &SettingsStore,
+    profiles: &ModelProfilesStore,
+    structured_path_base: &std::path::Path,
+) -> std::result::Result<SettingsLoad, String> {
+    let (state, profiles) = read_tui_settings(settings, profiles).await?;
+    let (runtime_schemas, runtime_schema_warnings) = runtime_packs
+        .selected_runtime_settings_schemas(&state, structured_path_base)
+        .await
+        .unwrap_or_else(|error| (Default::default(), vec![error.to_string()]));
+    Ok(SettingsLoad {
+        state,
+        profiles,
+        runtime_schemas,
+        runtime_schema_warnings,
+    })
+}
+
+async fn finish_settings_write(
+    runtime_packs: &RuntimePackManager,
+    paths: &AppPaths,
+    settings: &SettingsStore,
+    profiles: &ModelProfilesStore,
+    result: std::result::Result<(), String>,
+) -> SettingsTaskResult {
+    SettingsTaskResult::Stored(match result {
+        Ok(()) => load_tui_settings(runtime_packs, settings, profiles, &paths.data_dir).await,
+        Err(error) => Err(error),
+    })
+}
+
 fn resolved_patch(
     engine_id: &str,
     profile_id: &norted_core::ModelProfileId,
@@ -556,25 +588,15 @@ async fn execute_settings_action(
     let settings_store = SettingsStore::new(paths);
     let profiles_store = ModelProfilesStore::new(paths);
     match action {
-        SettingsAction::Refresh => {
-            let (settings, runtime_schemas) = tokio::join!(
-                read_tui_settings(&settings_store, &profiles_store),
-                runtime_packs.selected_runtime_settings_schemas()
-            );
-            let (runtime_schemas, runtime_schema_error) = match runtime_schemas {
-                Ok(schemas) => (schemas, None),
-                Err(error) => (Default::default(), Some(error.to_string())),
-            };
-            SettingsTaskResult::Loaded(match settings {
-                Ok((state, profiles)) => Ok(SettingsLoad {
-                    state,
-                    profiles,
-                    runtime_schemas,
-                    runtime_schema_error,
-                }),
-                Err(error) => Err(error),
-            })
-        }
+        SettingsAction::Refresh => SettingsTaskResult::Loaded(
+            load_tui_settings(
+                &runtime_packs,
+                &settings_store,
+                &profiles_store,
+                &paths.data_dir,
+            )
+            .await,
+        ),
         SettingsAction::Set {
             scope,
             id,
@@ -711,10 +733,14 @@ async fn execute_settings_action(
                     .await
                     .map_err(|error| error.to_string()),
             };
-            SettingsTaskResult::Stored(match result {
-                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
-                Err(error) => Err(error),
-            })
+            finish_settings_write(
+                &runtime_packs,
+                paths,
+                &settings_store,
+                &profiles_store,
+                result,
+            )
+            .await
         }
         SettingsAction::Unset { scope, id } => {
             let mut ids = vec![id];
@@ -773,10 +799,14 @@ async fn execute_settings_action(
                     .await
                     .map_err(|error| error.to_string()),
             };
-            SettingsTaskResult::Stored(match result {
-                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
-                Err(error) => Err(error),
-            })
+            finish_settings_write(
+                &runtime_packs,
+                paths,
+                &settings_store,
+                &profiles_store,
+                result,
+            )
+            .await
         }
         SettingsAction::CreateProfile {
             id,
@@ -822,10 +852,14 @@ async fn execute_settings_action(
                 .update(move |state| state.create(id, display_name, model.id, engine_id))
                 .await
                 .map_err(|error| error.to_string());
-            SettingsTaskResult::Stored(match result {
-                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
-                Err(error) => Err(error),
-            })
+            finish_settings_write(
+                &runtime_packs,
+                paths,
+                &settings_store,
+                &profiles_store,
+                result,
+            )
+            .await
         }
         SettingsAction::DuplicateProfile {
             source,
@@ -836,10 +870,14 @@ async fn execute_settings_action(
                 .update(move |state| state.duplicate(&source, destination, display_name))
                 .await
                 .map_err(|error| error.to_string());
-            SettingsTaskResult::Stored(match result {
-                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
-                Err(error) => Err(error),
-            })
+            finish_settings_write(
+                &runtime_packs,
+                paths,
+                &settings_store,
+                &profiles_store,
+                result,
+            )
+            .await
         }
         SettingsAction::DeleteProfile(profile_id) => {
             let active = match ControlClient::discover(paths).await {
@@ -861,10 +899,14 @@ async fn execute_settings_action(
                     .await
                     .map_err(|error| error.to_string())
             };
-            SettingsTaskResult::Stored(match result {
-                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
-                Err(error) => Err(error),
-            })
+            finish_settings_write(
+                &runtime_packs,
+                paths,
+                &settings_store,
+                &profiles_store,
+                result,
+            )
+            .await
         }
         SettingsAction::SetProfileModel { profile_id, model } => {
             let compatible = runtime_packs.compatible_engine_ids(&model);
@@ -911,10 +953,14 @@ async fn execute_settings_action(
                 })
                 .await
                 .map_err(|error| error.to_string());
-            SettingsTaskResult::Stored(match result {
-                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
-                Err(error) => Err(error),
-            })
+            finish_settings_write(
+                &runtime_packs,
+                paths,
+                &settings_store,
+                &profiles_store,
+                result,
+            )
+            .await
         }
         SettingsAction::CycleProfileEngine { profile_id, model } => {
             let compatible = runtime_packs.compatible_engine_ids(&model);
@@ -944,10 +990,14 @@ async fn execute_settings_action(
                 })
                 .await
                 .map_err(|error| error.to_string());
-            SettingsTaskResult::Stored(match result {
-                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
-                Err(error) => Err(error),
-            })
+            finish_settings_write(
+                &runtime_packs,
+                paths,
+                &settings_store,
+                &profiles_store,
+                result,
+            )
+            .await
         }
         SettingsAction::CycleProfileRole { profile_id } => {
             let result = profiles_store
@@ -964,10 +1014,14 @@ async fn execute_settings_action(
                 })
                 .await
                 .map_err(|error| error.to_string());
-            SettingsTaskResult::Stored(match result {
-                Ok(()) => read_tui_settings(&settings_store, &profiles_store).await,
-                Err(error) => Err(error),
-            })
+            finish_settings_write(
+                &runtime_packs,
+                paths,
+                &settings_store,
+                &profiles_store,
+                result,
+            )
+            .await
         }
         SettingsAction::InspectProfile { profile, model } => {
             let model_id = model.id.clone();

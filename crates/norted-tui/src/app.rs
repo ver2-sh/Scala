@@ -293,7 +293,7 @@ pub struct SettingsLoad {
     pub state: SettingsState,
     pub profiles: ModelProfilesState,
     pub runtime_schemas: BTreeMap<String, SettingsSchema>,
-    pub runtime_schema_error: Option<String>,
+    pub runtime_schema_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -308,7 +308,7 @@ pub struct ProfileEngineSelection {
 #[derive(Debug)]
 pub enum SettingsTaskResult {
     Loaded(Result<SettingsLoad, String>),
-    Stored(Result<(SettingsState, ModelProfilesState), String>),
+    Stored(Result<SettingsLoad, String>),
     ChooseProfileEngine(ProfileEngineSelection),
     Inspected {
         model_id: ModelId,
@@ -1056,9 +1056,10 @@ impl App {
                     self.model_profiles = Some(loaded.profiles);
                     self.runtime_settings_schemas = loaded.runtime_schemas;
                     self.settings_error = None;
-                    if let Some(error) = loaded.runtime_schema_error {
+                    if !loaded.runtime_schema_warnings.is_empty() {
                         self.notice = Some(format!(
-                            "Selected-runtime defaults are unavailable: {error}"
+                            "Some selected-runtime defaults are unavailable: {}",
+                            loaded.runtime_schema_warnings.join("; ")
                         ));
                     } else if self.notice.as_deref()
                         == Some("Refreshing selected-runtime defaults…")
@@ -1076,14 +1077,20 @@ impl App {
                 }
             },
             SettingsTaskResult::Stored(result) => match result {
-                Ok((state, profiles)) => {
-                    self.settings_state = Some(state);
-                    self.model_profiles = Some(profiles);
+                Ok(loaded) => {
+                    self.settings_state = Some(loaded.state);
+                    self.model_profiles = Some(loaded.profiles);
+                    self.runtime_settings_schemas = loaded.runtime_schemas;
                     self.settings_error = None;
-                    self.notice = Some(
+                    self.notice = Some(if loaded.runtime_schema_warnings.is_empty() {
                         "Settings saved; operational changes apply now and model settings on the next load"
-                            .to_owned(),
-                    );
+                            .to_owned()
+                    } else {
+                        format!(
+                            "Settings saved. Some selected-runtime defaults are unavailable: {}",
+                            loaded.runtime_schema_warnings.join("; ")
+                        )
+                    });
                     self.reconcile_settings_selection();
                     if self.screen == Screen::ModelProfiles {
                         let _ = self.refresh_selected_model_profile();
@@ -1372,63 +1379,62 @@ impl App {
             .settings_definitions()
             .into_iter()
             .find(|definition| &definition.id == id);
+        let current = self.settings_value_display(id);
         if let Some(definition) = definition
             && !definition.supported
         {
-            let mut detail = definition
+            let reason = definition
                 .unsupported_reason
                 .clone()
                 .unwrap_or_else(|| "The exact runtime does not support this setting".to_owned());
-            if let Some(upstream) = definition.upstream_default.as_deref()
-                && !detail_covers_upstream(&detail, upstream)
-            {
-                detail.push_str(&format!(" · Upstream: {upstream}"));
+            let mut lines = vec![
+                "Current: Unsupported".to_owned(),
+                format!("Reason: {reason}"),
+            ];
+            if let Some(upstream) = definition.upstream_default.as_deref() {
+                lines.push(format!("Upstream: {upstream}"));
             }
             if self.current_layer_value(id).is_some() {
-                detail.push_str(" · An existing override is set; use Inherit to remove it.");
+                lines.push("An existing override is set; use Inherit to remove it.".to_owned());
             }
-            return format!("Value: Unsupported\nDetail: {detail}");
+            return lines.join("\n");
         }
         let preview = definition.and_then(|definition| definition.default_preview.as_ref());
-        let value = preview.map_or_else(
-            || {
-                if self.screen == Screen::ModelProfiles {
-                    "runtime fallback".to_owned()
-                } else {
-                    "Default".to_owned()
-                }
-            },
-            |preview| preview.value.clone(),
-        );
-        let mut detail = preview.map_or_else(
-            || {
-                if self.screen == Screen::ModelProfiles {
-                    "If unset: the selected runtime/model does not expose a pre-launch literal; runtime fallback remains authoritative".to_owned()
-                } else {
-                    "If unset: no model-specific preview is available in this configuration scope"
-                        .to_owned()
-                }
-            },
-            |preview| {
-                let mut detail = format!("If unset: {} ({})", preview.value, preview.source);
-                if let Some(explanation) = preview.detail.as_deref() {
-                    detail.push_str(&format!(" · {explanation}"));
-                }
-                detail
-            },
-        );
+        let mut lines = vec![format!("Current: {} · {}", current.value, current.source)];
+        if let Some(preview) = preview {
+            let preview_source = preview.source.to_string();
+            let current_is_same_default = current.state == SettingPresentationState::Default
+                && current.value == preview.value
+                && current.source == preview_source;
+            if !current_is_same_default {
+                lines.push(format!("Default: {} · {}", preview.value, preview_source));
+            }
+            if let Some(detail) = preview.detail.as_deref() {
+                lines.push(format!("Detail: {detail}"));
+            }
+        } else if current.state != SettingPresentationState::Default {
+            let fallback = self.settings_default_display(id);
+            lines.push(format!("Default: {} · {}", fallback.value, fallback.source));
+        } else {
+            lines.push(if self.screen == Screen::ModelProfiles {
+                "Detail: If unset, runtime fallback remains authoritative; no pre-launch literal is available"
+                    .to_owned()
+            } else {
+                "Detail: If unset, no model-specific preview is available in this configuration scope"
+                    .to_owned()
+            });
+        }
         if let Some(upstream) =
             definition.and_then(|definition| definition.upstream_default.as_deref())
-            && !preview
-                .and_then(|preview| preview.detail.as_deref())
-                .is_some_and(|preview_detail| detail_covers_upstream(preview_detail, upstream))
         {
-            detail.push_str(&format!(" · Upstream: {upstream}"));
+            lines.push(format!("Upstream: {upstream}"));
         }
-        if let Some(resolved) = self.settings_runtime_resolved_value(id) {
-            detail.push_str(&format!(" · Running backend resolved: {resolved}"));
+        if let Some(resolved) = self.settings_runtime_resolved_value(id)
+            && (current.state != SettingPresentationState::Resolved || current.value != resolved)
+        {
+            lines.push(format!("Running: {resolved} · runtime resolved"));
         }
-        format!("Value: {value}\nDetail: {detail}")
+        lines.join("\n")
     }
 
     fn settings_runtime_resolved_value(&self, id: &SettingId) -> Option<String> {
@@ -4512,19 +4518,6 @@ fn byte_index(value: &str, character_index: usize) -> usize {
         .char_indices()
         .nth(character_index)
         .map_or(value.len(), |(index, _)| index)
-}
-
-fn detail_covers_upstream(preview_detail: &str, upstream: &str) -> bool {
-    let normalize = |value: &str| {
-        value
-            .chars()
-            .filter(|character| character.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
-    };
-    let preview_detail = normalize(preview_detail);
-    let upstream = normalize(upstream);
-    !upstream.is_empty() && preview_detail.contains(&upstream)
 }
 
 #[cfg(test)]

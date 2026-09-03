@@ -576,23 +576,7 @@ impl SettingsState {
         invocation: &SettingsPatch,
         structured_path_base: &Path,
     ) -> Result<ResolvedSettings, SettingsError> {
-        let mut effective = BTreeMap::new();
-        apply_layer(
-            &mut effective,
-            &self.global_defaults,
-            engine_id,
-            SettingSource::GlobalDefault,
-        );
-        if let Some(defaults) = self.engine_defaults.get(engine_id) {
-            apply_layer(
-                &mut effective,
-                defaults,
-                engine_id,
-                SettingSource::EngineDefault {
-                    engine_id: engine_id.to_owned(),
-                },
-            );
-        }
+        let mut effective = self.resolve_engine_layers(engine_id);
         apply_layer(
             &mut effective,
             profile_overrides,
@@ -613,6 +597,46 @@ impl SettingsState {
             model_profile_id: Some(profile_id.clone()),
             effective,
         })
+    }
+
+    /// Resolves the model-independent settings visible to one engine.
+    ///
+    /// This uses the same global/engine layering, semantic-alternative
+    /// suppression, setting sources, and structured-path behavior as full
+    /// model-profile resolution without inventing a model-profile identity.
+    pub fn resolve_engine_defaults(
+        &self,
+        engine_id: &str,
+        structured_path_base: &Path,
+    ) -> Result<ResolvedSettings, SettingsError> {
+        let mut effective = self.resolve_engine_layers(engine_id);
+        resolve_structured_paths(&mut effective, structured_path_base)?;
+        Ok(ResolvedSettings {
+            engine_id: engine_id.to_owned(),
+            model_profile_id: None,
+            effective,
+        })
+    }
+
+    fn resolve_engine_layers(&self, engine_id: &str) -> BTreeMap<SettingId, ResolvedSetting> {
+        let mut effective = BTreeMap::new();
+        apply_layer(
+            &mut effective,
+            &self.global_defaults,
+            engine_id,
+            SettingSource::GlobalDefault,
+        );
+        if let Some(defaults) = self.engine_defaults.get(engine_id) {
+            apply_layer(
+                &mut effective,
+                defaults,
+                engine_id,
+                SettingSource::EngineDefault {
+                    engine_id: engine_id.to_owned(),
+                },
+            );
+        }
+        effective
     }
 }
 
