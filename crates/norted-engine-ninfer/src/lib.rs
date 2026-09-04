@@ -43,8 +43,10 @@ pub const ENGINE_ID: &str = "ninfer";
 pub const UPSTREAM_REPOSITORY: &str = "https://github.com/Neroued/ninfer";
 pub const GITHUB_REPOSITORY: &str = "Neroued/ninfer";
 pub const PROVIDER_ID: &str = "ninfer-official-source";
-const CURRENT_PACKAGE_CAPABILITY_REVISION: &str = "a140e7ae82a11ed2f370a4d8f2cc16268a3790b8";
-const CURRENT_PACKAGE_CAPABILITY_TREE: &str = "1474697c790de8df18ed07a469f560bb33e8f324";
+const CURRENT_PACKAGE_CAPABILITY_REVISION: &str = "863aa8a5f1e866db74f29f8999b83b4021398dee";
+const CURRENT_PACKAGE_CAPABILITY_TREE: &str = "5368f514bafbcab89ce1272df3a13d9d9af55820";
+const LEGACY_PACKAGE_CAPABILITY_REVISION: &str = "a140e7ae82a11ed2f370a4d8f2cc16268a3790b8";
+const LEGACY_PACKAGE_CAPABILITY_TREE: &str = "1474697c790de8df18ed07a469f560bb33e8f324";
 const CURRENT_REQUEST_LOG_SCHEMA: u32 = 20;
 const MANAGED_NINFER_FUNCTIONAL_VARIANT: &str = "managed-linux-x86_64-cuda-sm120a";
 
@@ -53,6 +55,7 @@ const MANAGED_NINFER_FUNCTIONAL_VARIANT: &str = "managed-linux-x86_64-cuda-sm120
 // files that own that capability are byte-for-byte unchanged.
 #[rustfmt::skip]
 const REVIEWED_SOURCE_BLOBS: &[(&str, &str)] = &[
+    ("apps/cli/options.cpp", "f1c134cbef222c5c949bae5a368c31f17fbf4614"),
     ("include/ninfer/types.h", "d8398774a89c25126a0aae830340d946911c4df3"),
     ("src/product/media_acquire/acquire.cpp", "24644492e21122f225abcd7e2fc19718d1827d2c"),
     ("src/product/media_acquire/acquire.h", "91be5a244a0ff45e92acf498ce35afc404a07c89"),
@@ -83,7 +86,7 @@ const REVIEWED_SOURCE_BLOBS: &[(&str, &str)] = &[
     ("src/serve/request_json.h", "c61d5a1b1c8def6bac2a4f63a67febd451703121"),
     ("src/serve/request_validation.cpp", "9401ec3f136ce22e2c054ed16619703587ccd669"),
     ("src/serve/request_validation.h", "a5daabdaa99961573801fdeb8dd3cd58d91e496f"),
-    ("src/serve/serve_options.cpp", "b28a73453b9b24fbd01a3c5b061293c1619faea5"),
+    ("src/serve/serve_options.cpp", "73c43a55a1102825d054c38730edcc2575489537"),
     ("src/serve/serve_options.h", "e147539590041b064cb1161e16c21e59749c1e76"),
     ("src/serve/translate.cpp", "c2effe323b25b5c1f8538ad43f4bc744984fcddc"),
     ("src/serve/translate.h", "5d56431f2d271a5a9beb69a87ab5141868b9dfb4"),
@@ -99,29 +102,107 @@ const REVIEWED_SOURCE_BLOBS: &[(&str, &str)] = &[
     ("src/targets/qwen3_6/impl/frontend/resources.cpp", "460e30ec01f9e65bef7d5542cb48af536ce160eb"),
     ("src/targets/qwen3_6/impl/frontend/tool_call_parser.cpp", "38102c4a9c507d5b1b3296d940989138aa15408a"),
     ("src/targets/qwen3_6/impl/frontend/tool_call_parser.h", "4f7733ecdcbb63ec9347f6ecc52c55b10349e879"),
+    ("src/runtime/engine/admission_policy.cpp", "36953259963bda808dd80b3d491cba5932260a8f"),
+    ("src/runtime/engine/admission_policy.h", "a6c1045432df35aa33dbb1b3ff575b605964a014"),
+    ("src/runtime/engine/context_cost.cpp", "fe0c885303b00945cc39add94bc0c32e99aded6d"),
+    ("src/runtime/engine/context_cost.h", "3ecd66c933ca2dd752c0a61b132942488d1d116b"),
+    ("src/runtime/engine/context_cost_defaults.cpp", "43ded5705a1af9f56035716c557e0ccba65ca172"),
+    ("src/runtime/engine/context_portfolio_value.h", "ddac06c7ce9e3a60f09c34906379b608da614973"),
+    ("src/runtime/engine/kv_capacity.cpp", "4870e77523bded9243f3624ed0b4eafddc76dcb6"),
+    ("src/runtime/engine/kv_capacity.h", "65c5be7b788e1bdc4f8356602544877251ac106d"),
+    ("src/runtime/engine/materialization_planner.h", "74e10a2a71c467371acb9222c74290d4779359fb"),
+    ("src/runtime/engine/request_record.h", "4def8a6733dfd34ca188a8bbc25719bd6e92c1dd"),
+    ("src/runtime/engine/resource_search.h", "08b14447dc9eebf1a5fbd3b2c3fe5737a5166938"),
+    ("src/runtime/engine/scheduler.h", "38f2ab99da6151f510f4e1952b481b6b39a5bcb9"),
+    ("src/runtime/engine/shared_capture_planner.h", "ade4f69d4e4df0f5b34bb7fed47af0a0809024dc"),
+    ("src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h", "c969ce32c6f41d28fd1f6982de6a4ecab72d0dbf"),
+    ("src/targets/qwen3_6/impl/runtime/dflash_context.h", "ecb1dd47ce69275fe36d785657511b984d85d9cf"),
+    ("src/targets/qwen3_6/impl/runtime/dflash_context_impl.h", "18b1935d4241227f2b706954ea5880c3244c8d7a"),
+    ("src/targets/qwen3_6/impl/runtime/dflash_impl.h", "bce35899c9ade3cd2a92fe72907ed1a52e5dc347"),
+    ("src/targets/qwen3_6/impl/runtime/host_kv_extent_store.h", "d3a90981d0ae959235da0887db231f6cff970c9b"),
+    ("src/targets/qwen3_6/impl/runtime/layouts.h", "d72dbebf531a18bac97a58fa09951e014ce00d6f"),
+    ("src/targets/qwen3_6/impl/runtime/layouts_impl.h", "b70437e3ec6d81a79beafa31707b53862b144d1c"),
+    ("src/targets/qwen3_6/impl/runtime/logical_kv_store.h", "bfba64a9aa71c8558853c28c72f6e3431b632337"),
+    ("src/targets/qwen3_6/impl/runtime/mtp_impl.h", "987e23ef828bb6078dd065ff9e2fe03792b3a035"),
+    ("src/targets/qwen3_6/impl/runtime/pressure_planner.h", "729c25aaf22001adc9f8cc59b3e9fcb68cc632fd"),
+    ("src/targets/qwen3_6/impl/runtime/program.h", "0ff969a3e4389994c7f7f6de0477597323e73387"),
+    ("src/targets/qwen3_6/impl/runtime/program_impl.h", "9ef417b283a40dc1317c763ddf645c4f3b6cfa68"),
+    ("src/targets/qwen3_6/impl/runtime/rebuild_work.h", "6f01b2e2f99e6a31ecde5954a90d6e0937a4a2b0"),
+    ("src/targets/qwen3_6/impl/runtime/request_plan_impl.h", "5b7fe83b080530dc787c957e55ceac0f3c43d2b8"),
+    ("src/targets/qwen3_6/impl/runtime/resource_projection.h", "86e3091ffe3d024ea0dd85b4088bccb608a20360"),
+    ("src/targets/qwen3_6/impl/runtime/schedule.h", "c9dc6eebecdc945dfece1a154539169ab4f5e602"),
+    ("src/targets/qwen3_6/impl/runtime/state_image_store.h", "a5b691307547b25dd50aa24240d3632158ca2109"),
+    ("src/targets/qwen3_6/impl/runtime/text_context.h", "3b4deda322438d29a76e6d039e761c05553ca138"),
+    ("src/targets/qwen3_6/impl/runtime/text_context_impl.h", "872c13531a95db62adf83e7047c821b5bd671ad3"),
+    ("src/targets/qwen3_6/impl/runtime/text_prefill_impl.h", "3716872fc6e30a4ad0093aadef38140a9cffbe05"),
+    ("src/targets/qwen3_6/impl/runtime/vision_context.h", "2e11abcfd96a2681b6f2bc2c52cf2b753a434fbf"),
+    ("src/targets/qwen3_6/impl/runtime/vision_context_impl.h", "fd8214efb0962ae79f362ccd08a8365aa4c06ec8"),
+    ("src/targets/qwen3_6/impl/runtime/vision_prefill.h", "3cb791af026b1a48d93b5eb06a87be835a76e65e"),
+    ("src/targets/qwen3_6/impl/runtime/workspace_recipe.h", "576d049439020f040ea85766b2af0e3ff8edf75a"),
+    ("src/targets/qwen3_6/impl/state/decoder_state.cpp", "cf9f9b3710caa78f5648176eb93922989f16d795"),
+    ("src/targets/qwen3_6/impl/state/round_state.cpp", "eae86cbef5326af83919f4ad8fac944b016aaa8a"),
+    ("src/targets/qwen3_6/impl/state/state_image.cpp", "91eabd0e102fc8dcd4eb5e352efae5ced8b0287d"),
     ("src/targets/qwen3_6_27b/impl/package.cpp", "c844d21eda2d5e93649247291491ac5deb32c4c8"),
     ("src/targets/qwen3_6_35b_a3b/impl/package.cpp", "15e55730e0296a1158e78db243ff94d1960040ef"),
 ];
 
 const CORE_PROCESS_FILES: &[&str] = &[
+    "apps/cli/options.cpp",
     "include/ninfer/types.h",
+    "src/runtime/engine/admission_policy.cpp",
+    "src/runtime/engine/admission_policy.h",
     "src/runtime/engine/engine.cpp",
+    "src/runtime/engine/engine_core.h",
+    "src/runtime/engine/scheduler.h",
     "src/serve/generation_service.cpp",
     "src/serve/generation_service.h",
     "src/serve/serve_options.cpp",
     "src/serve/serve_options.h",
+    "src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h",
+    "src/targets/qwen3_6/impl/runtime/layouts.h",
+    "src/targets/qwen3_6/impl/runtime/layouts_impl.h",
+    "src/targets/qwen3_6/impl/runtime/program.h",
+    "src/targets/qwen3_6/impl/runtime/program_impl.h",
 ];
 const CONTEXT_CACHE_FILES: &[&str] = &[
     "include/ninfer/types.h",
+    "src/runtime/engine/admission_policy.cpp",
+    "src/runtime/engine/admission_policy.h",
+    "src/runtime/engine/context_cost.cpp",
+    "src/runtime/engine/context_cost.h",
+    "src/runtime/engine/context_cost_defaults.cpp",
+    "src/runtime/engine/context_portfolio_value.h",
     "src/runtime/engine/engine.cpp",
     "src/runtime/engine/engine_core.h",
+    "src/runtime/engine/kv_capacity.cpp",
+    "src/runtime/engine/kv_capacity.h",
+    "src/runtime/engine/materialization_planner.h",
+    "src/runtime/engine/resource_search.h",
     "src/runtime/engine/resource_manager.h",
+    "src/runtime/engine/scheduler.h",
+    "src/runtime/engine/shared_capture_planner.h",
     "src/serve/generation_service.cpp",
     "src/serve/generation_service.h",
     "src/serve/serve_options.cpp",
     "src/serve/serve_options.h",
+    "src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h",
+    "src/targets/qwen3_6/impl/runtime/host_kv_extent_store.h",
+    "src/targets/qwen3_6/impl/runtime/layouts.h",
+    "src/targets/qwen3_6/impl/runtime/layouts_impl.h",
+    "src/targets/qwen3_6/impl/runtime/logical_kv_store.h",
+    "src/targets/qwen3_6/impl/runtime/pressure_planner.h",
+    "src/targets/qwen3_6/impl/runtime/program.h",
+    "src/targets/qwen3_6/impl/runtime/program_impl.h",
+    "src/targets/qwen3_6/impl/runtime/rebuild_work.h",
+    "src/targets/qwen3_6/impl/runtime/request_plan_impl.h",
+    "src/targets/qwen3_6/impl/runtime/resource_projection.h",
+    "src/targets/qwen3_6/impl/runtime/state_image_store.h",
+    "src/targets/qwen3_6/impl/state/decoder_state.cpp",
+    "src/targets/qwen3_6/impl/state/round_state.cpp",
+    "src/targets/qwen3_6/impl/state/state_image.cpp",
 ];
 const SPECULATION_FILES: &[&str] = &[
+    "apps/cli/options.cpp",
     "include/ninfer/types.h",
     "src/product/speculative_options.h",
     "src/runtime/engine/engine.cpp",
@@ -129,16 +210,41 @@ const SPECULATION_FILES: &[&str] = &[
     "src/serve/generation_service.h",
     "src/serve/serve_options.cpp",
     "src/serve/serve_options.h",
+    "src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h",
+    "src/targets/qwen3_6/impl/runtime/dflash_context.h",
+    "src/targets/qwen3_6/impl/runtime/dflash_context_impl.h",
+    "src/targets/qwen3_6/impl/runtime/dflash_impl.h",
+    "src/targets/qwen3_6/impl/runtime/layouts.h",
+    "src/targets/qwen3_6/impl/runtime/layouts_impl.h",
+    "src/targets/qwen3_6/impl/runtime/mtp_impl.h",
+    "src/targets/qwen3_6/impl/runtime/program.h",
+    "src/targets/qwen3_6/impl/runtime/program_impl.h",
+    "src/targets/qwen3_6/impl/runtime/request_plan_impl.h",
+    "src/targets/qwen3_6/impl/runtime/resource_projection.h",
+    "src/targets/qwen3_6/impl/runtime/schedule.h",
+    "src/targets/qwen3_6/impl/runtime/text_prefill_impl.h",
+    "src/targets/qwen3_6/impl/state/round_state.cpp",
+    "src/targets/qwen3_6_27b/impl/package.cpp",
+    "src/targets/qwen3_6_35b_a3b/impl/package.cpp",
 ];
 const SERVING_LIMIT_FILES: &[&str] = &[
     "include/ninfer/types.h",
+    "src/runtime/engine/admission_policy.cpp",
+    "src/runtime/engine/admission_policy.h",
     "src/runtime/engine/engine_core.h",
+    "src/runtime/engine/resource_manager.h",
+    "src/runtime/engine/resource_search.h",
+    "src/runtime/engine/scheduler.h",
     "src/serve/generation_service.cpp",
     "src/serve/generation_service.h",
     "src/serve/http_server.cpp",
     "src/serve/http_server.h",
     "src/serve/serve_options.cpp",
     "src/serve/serve_options.h",
+    "src/targets/qwen3_6/impl/runtime/program.h",
+    "src/targets/qwen3_6/impl/runtime/program_impl.h",
+    "src/targets/qwen3_6/impl/runtime/request_plan_impl.h",
+    "src/targets/qwen3_6/impl/runtime/resource_projection.h",
 ];
 const RESPONSES_STORE_FILES: &[&str] = &[
     "src/serve/http_server.cpp",
@@ -278,6 +384,7 @@ const TOOL_CALLING_FILES: &[&str] = &[
     "src/targets/qwen3_6/impl/frontend/tool_call_parser.h",
 ];
 const VISION_PROCESS_FILES: &[&str] = &[
+    "apps/cli/options.cpp",
     "include/ninfer/types.h",
     "src/runtime/engine/engine.cpp",
     "src/serve/generation_service.cpp",
@@ -289,7 +396,49 @@ const VISION_PROCESS_FILES: &[&str] = &[
     "src/targets/qwen3_6/impl/frontend/media_cache.h",
     "src/targets/qwen3_6/impl/frontend/processor.cpp",
     "src/targets/qwen3_6/impl/frontend/processor.h",
+    "src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h",
+    "src/targets/qwen3_6/impl/runtime/layouts.h",
+    "src/targets/qwen3_6/impl/runtime/layouts_impl.h",
+    "src/targets/qwen3_6/impl/runtime/program.h",
+    "src/targets/qwen3_6/impl/runtime/program_impl.h",
+    "src/targets/qwen3_6/impl/runtime/request_plan_impl.h",
+    "src/targets/qwen3_6/impl/runtime/resource_projection.h",
+    "src/targets/qwen3_6/impl/runtime/text_context.h",
+    "src/targets/qwen3_6/impl/runtime/text_context_impl.h",
+    "src/targets/qwen3_6/impl/runtime/text_prefill_impl.h",
+    "src/targets/qwen3_6/impl/runtime/vision_context.h",
+    "src/targets/qwen3_6/impl/runtime/vision_context_impl.h",
+    "src/targets/qwen3_6/impl/runtime/vision_prefill.h",
+    "src/targets/qwen3_6/impl/state/round_state.cpp",
     "src/targets/qwen3_6_27b/impl/package.cpp",
+    "src/targets/qwen3_6_35b_a3b/impl/package.cpp",
+];
+const DFLASH_VISION_FILES: &[&str] = &[
+    "apps/cli/options.cpp",
+    "include/ninfer/types.h",
+    "src/product/speculative_options.h",
+    "src/serve/generation_service.cpp",
+    "src/serve/generation_service.h",
+    "src/serve/serve_options.cpp",
+    "src/serve/serve_options.h",
+    "src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h",
+    "src/targets/qwen3_6/impl/runtime/dflash_context.h",
+    "src/targets/qwen3_6/impl/runtime/dflash_context_impl.h",
+    "src/targets/qwen3_6/impl/runtime/dflash_impl.h",
+    "src/targets/qwen3_6/impl/runtime/layouts.h",
+    "src/targets/qwen3_6/impl/runtime/layouts_impl.h",
+    "src/targets/qwen3_6/impl/runtime/program.h",
+    "src/targets/qwen3_6/impl/runtime/program_impl.h",
+    "src/targets/qwen3_6/impl/runtime/request_plan_impl.h",
+    "src/targets/qwen3_6/impl/runtime/resource_projection.h",
+    "src/targets/qwen3_6/impl/runtime/schedule.h",
+    "src/targets/qwen3_6/impl/runtime/text_context.h",
+    "src/targets/qwen3_6/impl/runtime/text_context_impl.h",
+    "src/targets/qwen3_6/impl/runtime/text_prefill_impl.h",
+    "src/targets/qwen3_6/impl/runtime/vision_context.h",
+    "src/targets/qwen3_6/impl/runtime/vision_context_impl.h",
+    "src/targets/qwen3_6/impl/runtime/vision_prefill.h",
+    "src/targets/qwen3_6/impl/state/round_state.cpp",
     "src/targets/qwen3_6_35b_a3b/impl/package.cpp",
 ];
 const MEDIA_REQUEST_FILES: &[&str] = &[
@@ -398,11 +547,12 @@ const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "--frequency-penalty",
     "--seed",
     "--greedy",
+    "--context-cost-presets",
 ];
 
-// These operational tuning options do not change model identity, private
-// binding, device isolation, or request-generation semantics.
-const ALLOWED_VALUE_NATIVE_ARGUMENTS: &[&str] = &["--context-cost-presets"];
+// NInfer currently has no raw native option whose ownership is both safe and
+// outside the structured runtime-setting contract.
+const ALLOWED_VALUE_NATIVE_ARGUMENTS: &[&str] = &[];
 
 #[derive(Debug, Clone)]
 struct PendingStartup {
@@ -474,6 +624,7 @@ struct NinferRuntimeCapabilities {
     thinking_request_semantics: bool,
     tool_calling: bool,
     vision_process_controls: bool,
+    dflash_vision: bool,
     media_request_semantics: bool,
     startup_proof: bool,
 }
@@ -495,6 +646,7 @@ struct NinferReviewedDomains {
     thinking_request_semantics: bool,
     tool_calling: bool,
     vision_process_controls: bool,
+    dflash_vision: bool,
     media_request_semantics: bool,
 }
 
@@ -516,6 +668,7 @@ impl NinferReviewedDomains {
             thinking_request_semantics: reviewed,
             tool_calling: reviewed,
             vision_process_controls: reviewed,
+            dflash_vision: reviewed,
             media_request_semantics: reviewed,
         }
     }
@@ -677,29 +830,39 @@ fn ninfer_runtime_capabilities_for_installed(
                 && build.source.tree_sha == CURRENT_PACKAGE_CAPABILITY_TREE
                 && build.recipe_version == catalog::RECIPE_VERSION
         });
+    let exact_legacy = managed_source
+        && runtime.manifest.identity.upstream_revision.as_deref()
+            == Some(LEGACY_PACKAGE_CAPABILITY_REVISION)
+        && runtime.manifest.source_build.as_ref().is_some_and(|build| {
+            build.source.commit_sha == LEGACY_PACKAGE_CAPABILITY_REVISION
+                && build.source.tree_sha == LEGACY_PACKAGE_CAPABILITY_TREE
+                && build.recipe_version == catalog::RECIPE_VERSION
+        });
     let blobs = managed_source
         .then(|| installed_source_blobs(runtime))
         .flatten();
     let reviewed = |files| exact_current || source_domain_matches(blobs.as_ref(), files);
+    let legacy_or_reviewed = |files| exact_legacy || reviewed(files);
     ninfer_reviewed_capabilities(
         managed_source,
         NinferReviewedDomains {
-            core_process_controls: reviewed(CORE_PROCESS_FILES),
-            context_cache_controls: reviewed(CONTEXT_CACHE_FILES),
-            speculation_controls: reviewed(SPECULATION_FILES),
-            serving_limit_controls: reviewed(SERVING_LIMIT_FILES),
-            responses_store_controls: reviewed(RESPONSES_STORE_FILES),
-            request_default_controls: reviewed(REQUEST_DEFAULT_FILES),
-            process_sampler_controls: reviewed(PROCESS_SAMPLER_FILES),
-            model_sampler_defaults: reviewed(MODEL_SAMPLER_DEFAULT_FILES),
-            request_sampler_semantics: reviewed(REQUEST_SAMPLER_FILES),
-            request_protocol_semantics: reviewed(REQUEST_PROTOCOL_FILES),
-            request_log: reviewed(REQUEST_LOG_FILES),
-            thinking_process_controls: reviewed(THINKING_PROCESS_FILES),
-            thinking_request_semantics: reviewed(THINKING_REQUEST_FILES),
-            tool_calling: reviewed(TOOL_CALLING_FILES),
-            vision_process_controls: reviewed(VISION_PROCESS_FILES),
-            media_request_semantics: reviewed(MEDIA_REQUEST_FILES),
+            core_process_controls: legacy_or_reviewed(CORE_PROCESS_FILES),
+            context_cache_controls: legacy_or_reviewed(CONTEXT_CACHE_FILES),
+            speculation_controls: legacy_or_reviewed(SPECULATION_FILES),
+            serving_limit_controls: legacy_or_reviewed(SERVING_LIMIT_FILES),
+            responses_store_controls: legacy_or_reviewed(RESPONSES_STORE_FILES),
+            request_default_controls: legacy_or_reviewed(REQUEST_DEFAULT_FILES),
+            process_sampler_controls: legacy_or_reviewed(PROCESS_SAMPLER_FILES),
+            model_sampler_defaults: legacy_or_reviewed(MODEL_SAMPLER_DEFAULT_FILES),
+            request_sampler_semantics: legacy_or_reviewed(REQUEST_SAMPLER_FILES),
+            request_protocol_semantics: legacy_or_reviewed(REQUEST_PROTOCOL_FILES),
+            request_log: legacy_or_reviewed(REQUEST_LOG_FILES),
+            thinking_process_controls: legacy_or_reviewed(THINKING_PROCESS_FILES),
+            thinking_request_semantics: legacy_or_reviewed(THINKING_REQUEST_FILES),
+            tool_calling: legacy_or_reviewed(TOOL_CALLING_FILES),
+            vision_process_controls: legacy_or_reviewed(VISION_PROCESS_FILES),
+            dflash_vision: reviewed(DFLASH_VISION_FILES),
+            media_request_semantics: legacy_or_reviewed(MEDIA_REQUEST_FILES),
         },
     )
 }
@@ -746,6 +909,7 @@ fn ninfer_reviewed_capabilities(
         thinking_request_semantics: trustworthy_identity && reviewed.thinking_request_semantics,
         tool_calling: trustworthy_identity && reviewed.tool_calling,
         vision_process_controls: trustworthy_identity && reviewed.vision_process_controls,
+        dflash_vision: trustworthy_identity && reviewed.dflash_vision,
         media_request_semantics: trustworthy_identity && reviewed.media_request_semantics,
         startup_proof: trustworthy_identity && reviewed.request_log,
     }
@@ -1360,8 +1524,10 @@ impl EngineAdapter for NinferAdapter {
         if let CompatibilityDecision::Unsupported { reason } = self.runtime_compatibility(runtime) {
             return RuntimeCompatibility::Incompatible(reason);
         }
+        let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
         if let Some(settings) = settings
-            && let Err(reason) = settings::validate_model_settings(settings, model)
+            && let Err(reason) =
+                settings::validate_model_settings(settings, model, capabilities.dflash_vision)
         {
             return RuntimeCompatibility::Incompatible(reason);
         }
@@ -1380,7 +1546,6 @@ impl EngineAdapter for NinferAdapter {
             runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
         )
         .compatibility;
-        let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
         let base = combine_compatibility(native, device);
         let base = if runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::SourceBuild
             && (!capabilities.trustworthy_identity
@@ -1428,8 +1593,10 @@ impl EngineAdapter for NinferAdapter {
         {
             return RuntimeCompatibility::Incompatible(reason);
         }
+        let capabilities = ninfer_runtime_capabilities_for_available(runtime);
         if let Some(settings) = settings
-            && let Err(reason) = settings::validate_model_settings(settings, model)
+            && let Err(reason) =
+                settings::validate_model_settings(settings, model, capabilities.dflash_vision)
         {
             return RuntimeCompatibility::Incompatible(reason);
         }
@@ -1448,7 +1615,6 @@ impl EngineAdapter for NinferAdapter {
             false,
         )
         .compatibility;
-        let capabilities = ninfer_runtime_capabilities_for_available(runtime);
         let base = combine_compatibility(native, device);
         let base = if matches!(
             &runtime.acquisition,
@@ -1591,9 +1757,8 @@ impl EngineAdapter for NinferAdapter {
     fn native_options(&self) -> Vec<NativeOption> {
         vec![NativeOption {
             name: "arguments".to_owned(),
-            description:
-                "Strictly allowlisted non-semantic ninfer-serve operational tuning options"
-                    .to_owned(),
+            description: "Reserved NInfer native arguments; no raw options are currently allowed"
+                .to_owned(),
             value_kind: OptionValueKind::String,
             repeatable: true,
         }]
@@ -1608,7 +1773,7 @@ impl EngineAdapter for NinferAdapter {
         model: &ModelArtifact,
     ) -> Result<Vec<norted_core::SettingDefinition>, EngineError> {
         let mut definitions = settings::definitions();
-        settings::apply_model_capabilities(&mut definitions, model);
+        settings::apply_model_capabilities(&mut definitions, model, None, false);
         Ok(configurable_setting_definitions(definitions))
     }
 
@@ -1660,9 +1825,15 @@ impl EngineAdapter for NinferAdapter {
             .ok_or_else(|| {
                 EngineError::Operation("NInfer help observation was not cached".to_owned())
             })?;
-        let mut definitions = self.model_setting_definitions(model)?;
+        let mut definitions = settings::definitions();
         settings::apply_runtime_bounds(&mut definitions);
         let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
+        settings::apply_model_capabilities(
+            &mut definitions,
+            model,
+            settings,
+            capabilities.dflash_vision,
+        );
         if capabilities.trustworthy_identity {
             settings::apply_reviewed_runtime_defaults(&mut definitions, settings);
         }
@@ -1742,7 +1913,10 @@ impl EngineAdapter for NinferAdapter {
         Ok(inspect_source_native_identities(source_root))
     }
 
-    async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError> {
+    async fn build_launch_spec(
+        &self,
+        mut request: LaunchRequest,
+    ) -> Result<LaunchSpec, EngineError> {
         if !request.backend_address.ip().is_loopback() {
             return Err(EngineError::InvalidConfiguration(
                 "NInfer backend address must be loopback".to_owned(),
@@ -1761,10 +1935,18 @@ impl EngineAdapter for NinferAdapter {
             .settings_schema
             .validate(&request.settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
+        settings::validate_model_settings(
+            &request.settings,
+            &request.model.primary,
+            runtime_capabilities.dflash_vision,
+        )
+        .map_err(EngineError::InvalidConfiguration)?;
+        let bound_context_cost = bind_ninfer_context_cost_presets(&mut request.settings).await?;
         let structured = settings::translate(
             &request.settings,
             &request.model.primary,
             &self.native_arguments,
+            runtime_capabilities.dflash_vision,
         )?;
         let settings_requirements = (!request.settings.is_empty())
             .then(|| ninfer_startup_requirements(&request.settings))
@@ -1889,6 +2071,12 @@ impl EngineAdapter for NinferAdapter {
                 json!(runtime_capabilities.request_log_schema),
             ),
         ]);
+        if let Some(identity) = bound_context_cost {
+            normalized_settings.insert(
+                "bound_files.ninfer.context_cost_presets".to_owned(),
+                identity,
+            );
+        }
         if let Some(requirements) = settings_requirements.as_ref() {
             normalized_settings.extend([
                 (
@@ -3234,6 +3422,37 @@ async fn canonical_regular_file(path: &Path, description: &str) -> Result<PathBu
     Ok(canonical)
 }
 
+async fn bind_ninfer_context_cost_presets(
+    settings: &mut ResolvedSettings,
+) -> Result<Option<serde_json::Value>, EngineError> {
+    const MAXIMUM_CONTEXT_COST_PRESET_BYTES: u64 = 16 * 1024 * 1024;
+    const SETTING_ID: &str = "ninfer.context_cost_presets";
+
+    let Some(SettingValue::Path(configured)) = settings.value(SETTING_ID).cloned() else {
+        return Ok(None);
+    };
+    let canonical = canonical_regular_file(&configured, "NInfer context-cost preset").await?;
+    let id = norted_core::SettingId::new(SETTING_ID).expect("static NInfer setting ID");
+    let digest = norted_core::bounded_setting_file_sha256(
+        &id,
+        &canonical,
+        Path::new("/"),
+        MAXIMUM_CONTEXT_COST_PRESET_BYTES,
+    )
+    .await
+    .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
+    let resolved = settings.configured.get_mut(&id).ok_or_else(|| {
+        EngineError::InvalidConfiguration(
+            "resolved NInfer context-cost preset disappeared while binding the file".to_owned(),
+        )
+    })?;
+    resolved.value = SettingValue::Path(canonical.clone());
+    Ok(Some(json!({
+        "path": canonical,
+        "sha256": digest,
+    })))
+}
+
 async fn hash_file(path: &Path) -> std::io::Result<String> {
     let mut file = tokio::fs::File::open(path).await?;
     let mut hash = Sha256::new();
@@ -3438,6 +3657,7 @@ mod tests {
         assert!(invalid_native_argument(&["--unknown".to_owned()]).is_some());
         assert!(conflicts_with_managed_argument("--temperature=0.8"));
         assert!(conflicts_with_managed_argument("--no-thinking"));
+        assert!(conflicts_with_managed_argument("--context-cost-presets"));
     }
 
     #[test]
