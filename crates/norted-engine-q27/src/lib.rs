@@ -2270,12 +2270,17 @@ impl Q27Adapter {
             ));
         }
         if (request.generation_settings.reasoning_enabled.is_some()
-            || request.generation_settings.reasoning_budget.is_some())
+            || request.generation_settings.reasoning_budget.is_some()
+            || matches!(
+                request.generation_settings.reasoning_effort,
+                Some(norted_engine::ReasoningEffort::None)
+            ))
             && (!execution.capabilities.request_thinking
                 || setting_toggle(&execution.settings, "q27.request_thinking") != Some(true))
         {
             return Err(EngineError::InvalidGenerationSettings(
-                "q27 per-request thinking requires `q27.request_thinking` to be enabled".to_owned(),
+                "q27 per-request thinking enable, disable, and budget require `q27.request_thinking` to be enabled"
+                    .to_owned(),
             ));
         }
         if request.generation_settings.reasoning_effort.is_some()
@@ -6219,6 +6224,20 @@ mod tests {
             .collect()
     }
 
+    fn inference_request(generation_settings: GenerationSettingsPatch) -> InferenceRequest {
+        InferenceRequest {
+            model_profile_id: ModelProfileId::new("profile-alias").expect("profile ID"),
+            messages: Vec::new(),
+            generation_settings,
+            tools: Vec::new(),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            output_format: None,
+            max_output_tokens: None,
+            stream: false,
+        }
+    }
+
     #[test]
     fn ordinary_q27_settings_cover_formerly_hidden_execution_controls() {
         let ids = q27_setting_definitions()
@@ -6347,7 +6366,7 @@ mod tests {
             ("q27.thinking_budget", SettingValue::UnsignedInteger(0)),
             (
                 "q27.reasoning_effort",
-                SettingValue::Choice("medium".to_owned()),
+                SettingValue::Choice("xhigh".to_owned()),
             ),
             ("q27.mtp", SettingValue::Toggle(true)),
             ("q27.mtp_max_depth", SettingValue::UnsignedInteger(7)),
@@ -6364,7 +6383,7 @@ mod tests {
         assert!(arguments.iter().any(|argument| argument == "--think"));
         assert!(arguments.windows(2).any(|pair| pair == ["--top-k", "32"]));
         assert_eq!(launch.environment["Q27_KV"], "fp8");
-        assert_eq!(launch.environment["Q27_REASONING_EFFORT"], "medium");
+        assert_eq!(launch.environment["Q27_REASONING_EFFORT"], "xhigh");
         assert_eq!(launch.environment["Q27_MAXD"], "7");
         assert_eq!(launch.environment["Q27_SUFFIX_W"], "12");
 
@@ -6419,6 +6438,10 @@ mod tests {
             settings: resolved(&[
                 ("q27.temperature", SettingValue::Float(0.8)),
                 ("q27.top_p", SettingValue::Float(0.9)),
+                (
+                    "q27.reasoning_effort",
+                    SettingValue::Choice("xhigh".to_owned()),
+                ),
             ]),
             sharp_template: None,
             compiled_w_max: Some(12),
@@ -6427,29 +6450,31 @@ mod tests {
         };
         let (_, body) = Q27Adapter::configured_backend_request(
             &execution,
-            &InferenceRequest {
-                model_profile_id: ModelProfileId::new("profile-alias").expect("profile ID"),
-                messages: Vec::new(),
-                generation_settings: GenerationSettingsPatch {
-                    temperature: Some(0.4),
-                    top_p: Some(0.7),
-                    reasoning_effort: Some(norted_engine::ReasoningEffort::High),
-                    ..Default::default()
-                },
-                tools: Vec::new(),
-                tool_choice: None,
-                parallel_tool_calls: None,
-                output_format: None,
-                max_output_tokens: None,
-                stream: false,
-            },
+            &inference_request(GenerationSettingsPatch {
+                temperature: Some(0.4),
+                top_p: Some(0.7),
+                reasoning_effort: Some(norted_engine::ReasoningEffort::Low),
+                ..Default::default()
+            }),
             false,
         )
         .expect("request body");
         assert_eq!(body["temperature"], 0.4);
         assert_eq!(body["top_p"], 0.7);
-        assert_eq!(body["reasoning_effort"], "xhigh");
+        assert_eq!(body["reasoning_effort"], "low");
         assert_eq!(body["model"], "profile-alias");
+
+        let (_, later_body) = Q27Adapter::configured_backend_request(
+            &execution,
+            &inference_request(GenerationSettingsPatch::default()),
+            false,
+        )
+        .expect("later request body");
+        assert!(later_body.get("reasoning_effort").is_none());
+        assert_eq!(
+            setting_choice(&execution.settings, "q27.reasoning_effort"),
+            Some("xhigh")
+        );
     }
 
     #[test]
@@ -6467,6 +6492,34 @@ mod tests {
         }
 
         let execution = Q27ConfiguredExecution {
+            settings: resolved(&[
+                (
+                    "q27.reasoning_effort",
+                    SettingValue::Choice("xhigh".to_owned()),
+                ),
+                ("q27.request_thinking", SettingValue::Toggle(true)),
+            ]),
+            sharp_template: None,
+            compiled_w_max: Some(12),
+            selected_kv_mode: None,
+            capabilities: exact_capabilities(),
+        };
+        let (_, body) = Q27Adapter::configured_backend_request(
+            &execution,
+            &inference_request(GenerationSettingsPatch {
+                reasoning_effort: Some(norted_engine::ReasoningEffort::None),
+                ..Default::default()
+            }),
+            false,
+        )
+        .expect("request body");
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["enable_thinking"], false);
+    }
+
+    #[test]
+    fn request_reasoning_effort_none_requires_request_thinking() {
+        let execution = Q27ConfiguredExecution {
             settings: resolved(&[(
                 "q27.reasoning_effort",
                 SettingValue::Choice("xhigh".to_owned()),
@@ -6476,27 +6529,50 @@ mod tests {
             selected_kv_mode: None,
             capabilities: exact_capabilities(),
         };
-        let (_, body) = Q27Adapter::configured_backend_request(
+        let error = Q27Adapter::configured_backend_request(
             &execution,
-            &InferenceRequest {
-                model_profile_id: ModelProfileId::new("profile-alias").expect("profile ID"),
-                messages: Vec::new(),
-                generation_settings: GenerationSettingsPatch {
-                    reasoning_effort: Some(norted_engine::ReasoningEffort::None),
-                    ..Default::default()
-                },
-                tools: Vec::new(),
-                tool_choice: None,
-                parallel_tool_calls: None,
-                output_format: None,
-                max_output_tokens: None,
-                stream: false,
-            },
+            &inference_request(GenerationSettingsPatch {
+                reasoning_effort: Some(norted_engine::ReasoningEffort::None),
+                ..Default::default()
+            }),
             false,
         )
-        .expect("request body");
-        assert_eq!(body["reasoning_effort"], "none");
+        .expect_err("q27 would ignore the engine-level disable without --request-think");
+        assert!(matches!(error, EngineError::InvalidGenerationSettings(_)));
+        assert!(error.to_string().contains("q27.request_thinking"));
+    }
+
+    #[test]
+    fn configured_reasoning_off_does_not_synthesize_process_effort() {
+        let adapter = Q27Adapter::from_config(None, Path::new("."));
+        assert!(!adapter.uses_setting_as_request_default("reasoning_effort"));
+        assert!(adapter.uses_setting_as_request_default("reasoning_budget"));
+
+        let execution = Q27ConfiguredExecution {
+            settings: resolved(&[
+                ("q27.reasoning", SettingValue::Choice("off".to_owned())),
+                (
+                    "q27.reasoning_effort",
+                    SettingValue::Choice("xhigh".to_owned()),
+                ),
+                ("q27.request_thinking", SettingValue::Toggle(true)),
+            ]),
+            sharp_template: None,
+            compiled_w_max: Some(12),
+            selected_kv_mode: None,
+            capabilities: exact_capabilities(),
+        };
+        let (_, body) = Q27Adapter::configured_backend_request(
+            &execution,
+            &inference_request(GenerationSettingsPatch {
+                reasoning_enabled: Some(false),
+                ..Default::default()
+            }),
+            false,
+        )
+        .expect("request default body");
         assert_eq!(body["enable_thinking"], false);
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]

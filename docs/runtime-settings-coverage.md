@@ -100,8 +100,9 @@ row. The reviewed Qwen3.8 runtime default is `xhigh`; a persisted/Profile/invoca
 translated only by the adapter to `Q27_REASONING_EFFORT`. Persistent choices intentionally exclude q27's
 legacy `off` A/B arm and internal aliases. Explicit request `minimal`/`low` becomes q27 `low`, `medium`
 remains `medium`, and `high`/`xhigh`/`max` becomes q27 `xhigh`; request `none` retains q27's distinct
-disable-thinking behavior. Request overrides are ephemeral and never rewrite the process default or the
-separate `q27.thinking` setting.
+disable-thinking behavior only when `q27.request_thinking=true`, and is rejected otherwise because the
+upstream process would ignore it. Request overrides are ephemeral and never rewrite the process default
+or the separate `q27.thinking` setting.
 
 ### NORTED_MANAGED
 
