@@ -758,6 +758,24 @@ pub struct AcceleratorDevice {
     pub compute_capability: Option<ComputeCapability>,
 }
 
+/// Ordered physical accelerator ownership for one runtime process.
+///
+/// Device order is part of the launch contract: adapters may translate it to
+/// runtime-local indexes only after constraining the child process to these
+/// stable physical identities.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AcceleratorBinding {
+    pub devices: Vec<AcceleratorDevice>,
+}
+
+impl AcceleratorBinding {
+    pub fn single(device: AcceleratorDevice) -> Self {
+        Self {
+            devices: vec![device],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HostCapabilities {
     pub platform: String,
@@ -827,8 +845,8 @@ pub struct RuntimeSelection {
     pub runtime: InstalledRuntime,
     pub source: RuntimeSelectionSource,
     pub notices: Vec<String>,
-    /// Exact physical accelerator selected while evaluating this runtime.
-    pub accelerator: Option<AcceleratorDevice>,
+    /// Exact ordered physical accelerators selected while evaluating this runtime.
+    pub accelerator_binding: Option<AcceleratorBinding>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

@@ -1250,6 +1250,23 @@ pub fn visible_nvidia_devices<'a>(
     host: &'a HostCapabilities,
     consumer: &str,
 ) -> Result<Vec<&'a AcceleratorDevice>, RuntimeCompatibility> {
+    let devices = visible_nvidia_device_set(host, consumer)?;
+    if host.cuda_visible_devices.is_some() && devices.len() != 1 {
+        return Err(RuntimeCompatibility::Incompatible(format!(
+            "existing CUDA_VISIBLE_DEVICES is empty or selects multiple devices; {consumer} requires exactly one resolvable GPU UUID"
+        )));
+    }
+    Ok(devices)
+}
+
+/// Resolves the NVIDIA devices visible to an engine without assuming a
+/// numeric CUDA/NVML index mapping. An inherited UUID list is preserved in
+/// order and may contain more than one device; single-device adapters apply
+/// their stricter arity contract through `visible_nvidia_devices`.
+pub fn visible_nvidia_device_set<'a>(
+    host: &'a HostCapabilities,
+    consumer: &str,
+) -> Result<Vec<&'a AcceleratorDevice>, RuntimeCompatibility> {
     let devices = host
         .accelerators
         .iter()
@@ -1270,40 +1287,50 @@ pub fn visible_nvidia_devices<'a>(
             Ok(devices)
         };
     };
-    let identifiers = visibility
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    if identifiers.len() != 1 {
+    let identifiers = visibility.split(',').map(str::trim).collect::<Vec<_>>();
+    if identifiers.is_empty() || identifiers.iter().any(|value| value.is_empty()) {
         return Err(RuntimeCompatibility::Incompatible(format!(
-            "existing CUDA_VISIBLE_DEVICES is empty or selects multiple devices; {consumer} requires one resolvable GPU UUID"
+            "existing CUDA_VISIBLE_DEVICES is empty or contains an empty device; {consumer} requires resolvable GPU UUIDs"
         )));
     }
-    let identifier = identifiers[0];
-    if !identifier.starts_with("GPU-") {
-        return Err(RuntimeCompatibility::Incompatible(format!(
-            "existing CUDA_VISIBLE_DEVICES `{identifier}` is not a GPU UUID; Norted never assumes a CUDA/nvidia-smi numeric index mapping"
-        )));
+    let mut resolved = Vec::with_capacity(identifiers.len());
+    for identifier in identifiers {
+        if !identifier.starts_with("GPU-") {
+            return Err(RuntimeCompatibility::Incompatible(format!(
+                "existing CUDA_VISIBLE_DEVICES `{identifier}` is not a GPU UUID; Norted never assumes a CUDA/nvidia-smi numeric index mapping"
+            )));
+        }
+        let matching = devices
+            .iter()
+            .copied()
+            .filter(|device| {
+                device
+                    .stable_id
+                    .as_deref()
+                    .is_some_and(|stable_id| stable_id.starts_with(identifier))
+            })
+            .collect::<Vec<_>>();
+        let device = match matching.as_slice() {
+            [device] => *device,
+            [] => {
+                return Err(RuntimeCompatibility::Incompatible(format!(
+                    "existing CUDA_VISIBLE_DEVICES `{identifier}` does not resolve to an observed NVIDIA GPU UUID"
+                )));
+            }
+            _ => {
+                return Err(RuntimeCompatibility::Incompatible(format!(
+                    "existing CUDA_VISIBLE_DEVICES `{identifier}` is an ambiguous GPU UUID prefix"
+                )));
+            }
+        };
+        if resolved.contains(&device) {
+            return Err(RuntimeCompatibility::Incompatible(format!(
+                "existing CUDA_VISIBLE_DEVICES selects NVIDIA GPU `{identifier}` more than once"
+            )));
+        }
+        resolved.push(device);
     }
-    let matching = devices
-        .into_iter()
-        .filter(|device| {
-            device
-                .stable_id
-                .as_deref()
-                .is_some_and(|stable_id| stable_id.starts_with(identifier))
-        })
-        .collect::<Vec<_>>();
-    match matching.as_slice() {
-        [device] => Ok(vec![*device]),
-        [] => Err(RuntimeCompatibility::Incompatible(format!(
-            "existing CUDA_VISIBLE_DEVICES `{identifier}` does not resolve to an observed NVIDIA GPU UUID"
-        ))),
-        _ => Err(RuntimeCompatibility::Incompatible(format!(
-            "existing CUDA_VISIBLE_DEVICES `{identifier}` is an ambiguous GPU UUID prefix"
-        ))),
-    }
+    Ok(resolved)
 }
 
 pub fn is_exact_nvidia_gpu_uuid(value: &str) -> bool {
@@ -1341,6 +1368,47 @@ pub fn isolated_cuda_environment(
     }
     let mut environment = configured.clone();
     environment.insert("CUDA_VISIBLE_DEVICES".to_owned(), uuid.to_owned());
+    Ok(environment)
+}
+
+pub fn isolated_cuda_environment_for_binding(
+    configured: &BTreeMap<String, String>,
+    binding: &norted_core::AcceleratorBinding,
+    consumer: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    if binding.devices.is_empty() {
+        return Err(format!(
+            "{consumer} selected accelerator binding contains no devices"
+        ));
+    }
+    let mut uuids = Vec::with_capacity(binding.devices.len());
+    for accelerator in &binding.devices {
+        if !accelerator.accelerator.eq_ignore_ascii_case("cuda") {
+            return Err(format!(
+                "{consumer} selected accelerator is not a CUDA device"
+            ));
+        }
+        let uuid = accelerator
+            .stable_id
+            .as_deref()
+            .ok_or_else(|| format!("{consumer} selected CUDA device has no stable GPU UUID"))?;
+        if !is_exact_nvidia_gpu_uuid(uuid) {
+            return Err(format!(
+                "{consumer} selected CUDA device identity is not an exact NVIDIA GPU UUID"
+            ));
+        }
+        if uuids
+            .iter()
+            .any(|selected: &&str| selected.eq_ignore_ascii_case(uuid))
+        {
+            return Err(format!(
+                "{consumer} selected CUDA device `{uuid}` more than once"
+            ));
+        }
+        uuids.push(uuid);
+    }
+    let mut environment = configured.clone();
+    environment.insert("CUDA_VISIBLE_DEVICES".to_owned(), uuids.join(","));
     Ok(environment)
 }
 
@@ -1505,17 +1573,19 @@ mod tests {
     use std::collections::BTreeMap;
 
     use norted_core::{
-        AcceleratorDevice, ArtifactFormat, AvailableRuntime, ComputeCapability, HostCapabilities,
-        RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest,
-        RuntimeDownload, RuntimeIdentity, RuntimePackageIdentity, RuntimeReleaseChannel,
-        RuntimeRequirements, RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites,
-        RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem, RuntimeSourceSnapshot,
+        AcceleratorBinding, AcceleratorDevice, ArtifactFormat, AvailableRuntime, ComputeCapability,
+        HostCapabilities, RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeCompatibility,
+        RuntimeDigest, RuntimeDownload, RuntimeIdentity, RuntimePackageIdentity,
+        RuntimeReleaseChannel, RuntimeRequirements, RuntimeSourceBuildPlan,
+        RuntimeSourceBuildPrerequisites, RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem,
+        RuntimeSourceSnapshot,
     };
 
     use super::{
         ProviderCache, RuntimeProviderAuthority, compatibility_for,
         compute_cap_query_is_unsupported, historical_source_candidates, is_allowed_github_host,
-        parse_nvidia_smi_devices, same_install_candidate,
+        isolated_cuda_environment_for_binding, parse_nvidia_smi_devices, same_install_candidate,
+        visible_nvidia_device_set, visible_nvidia_devices,
     };
 
     #[test]
@@ -1541,6 +1611,61 @@ mod tests {
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].stable_id.as_deref(), Some("GPU-one"));
         assert_eq!(devices[0].compute_capability, None);
+    }
+
+    #[test]
+    fn ordered_uuid_visibility_is_preserved_and_single_device_consumers_stay_strict() {
+        let first_uuid = "GPU-11111111-1111-1111-1111-111111111111";
+        let second_uuid = "GPU-22222222-2222-2222-2222-222222222222";
+        let device = |uuid: &str, name: &str| AcceleratorDevice {
+            accelerator: "cuda".to_owned(),
+            stable_id: Some(uuid.to_owned()),
+            name: Some(name.to_owned()),
+            vram_bytes: Some(24 * 1024 * 1024 * 1024),
+            driver_version: Some("580.1".to_owned()),
+            compute_capability: Some(ComputeCapability::new(8, 9)),
+        };
+        let host = HostCapabilities {
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            accelerators: vec![device(first_uuid, "first"), device(second_uuid, "second")],
+            nvidia_gpu_absence_confirmed: false,
+            cuda_visible_devices: Some(format!("{second_uuid},{first_uuid}")),
+            observations: Vec::new(),
+        };
+
+        let visible = visible_nvidia_device_set(&host, "fixture").expect("ordered devices");
+        assert_eq!(visible[0].stable_id.as_deref(), Some(second_uuid));
+        assert_eq!(visible[1].stable_id.as_deref(), Some(first_uuid));
+        assert!(visible_nvidia_devices(&host, "single-device fixture").is_err());
+
+        let mut unconstrained = host.clone();
+        unconstrained.cuda_visible_devices = None;
+        assert_eq!(
+            visible_nvidia_devices(&unconstrained, "single-device fixture")
+                .expect("candidates for automatic single-device selection")
+                .len(),
+            2
+        );
+
+        let binding = AcceleratorBinding {
+            devices: visible.into_iter().cloned().collect(),
+        };
+        let environment = isolated_cuda_environment_for_binding(
+            &BTreeMap::from([("ORDINARY".to_owned(), "kept".to_owned())]),
+            &binding,
+            "fixture",
+        )
+        .expect("isolated environment");
+        assert_eq!(
+            environment["CUDA_VISIBLE_DEVICES"],
+            format!("{second_uuid},{first_uuid}")
+        );
+        assert_eq!(environment["ORDINARY"], "kept");
+
+        let mut duplicate = host;
+        duplicate.cuda_visible_devices = Some(format!("{first_uuid},{first_uuid}"));
+        assert!(visible_nvidia_device_set(&duplicate, "fixture").is_err());
     }
 
     #[test]

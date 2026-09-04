@@ -405,6 +405,7 @@ mod tests {
                 runtime_version: None,
                 runtime_variant: None,
                 runtime_executable_sha256: None,
+                accelerator_binding: None,
                 process_id: None,
                 private_endpoint: None,
                 load_progress: None,

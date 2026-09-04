@@ -180,6 +180,8 @@ pub struct BackendStatus {
     pub runtime_version: Option<String>,
     pub runtime_variant: Option<String>,
     pub runtime_executable_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accelerator_binding: Option<norted_core::AcceleratorBinding>,
     pub process_id: Option<u32>,
     pub private_endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -574,6 +576,7 @@ struct ManagedBackend {
     residency: BackendResidency,
     engine_id: Option<String>,
     runtime_id: Option<RuntimeId>,
+    accelerator_binding: Option<norted_core::AcceleratorBinding>,
     running: Option<RunningBackend>,
     loading_process: Option<ProcessDescriptor>,
     loading_runtime_lease: Option<RuntimeLease>,
@@ -896,6 +899,7 @@ impl RuntimeManager {
                 residency,
                 engine_id: None,
                 runtime_id: None,
+                accelerator_binding: None,
                 running: None,
                 loading_process: None,
                 loading_runtime_lease: None,
@@ -1089,6 +1093,7 @@ impl RuntimeManager {
                 let backend = backend.expect("checked above");
                 backend.engine_id = Some(engine_id.clone());
                 backend.runtime_id = Some(selected_runtime_id.clone());
+                backend.accelerator_binding = selection.accelerator_binding.clone();
                 backend.loading_runtime_lease = Some(runtime_lease);
                 for notice in &selection.notices {
                     push_notice(&mut state, RuntimeNoticeLevel::Warning, notice.clone());
@@ -1137,7 +1142,7 @@ impl RuntimeManager {
             .build_launch_attempts(LaunchRequest {
                 model: prepared_model,
                 runtime: selection.runtime.clone(),
-                accelerator: selection.accelerator.clone(),
+                accelerator_binding: selection.accelerator_binding.clone(),
                 backend_address,
                 settings: resolved_settings.clone(),
                 settings_schema: settings_schema.clone(),
@@ -1211,7 +1216,7 @@ impl RuntimeManager {
 
             let installation = launch_spec.installation.clone();
             let selected_runtime = launch_spec.runtime.clone();
-            let selected_accelerator = launch_spec.accelerator.clone();
+            let selected_accelerator_binding = launch_spec.accelerator_binding.clone();
             let model_identity = launch_spec.model.runtime_identity();
             let normalized_settings = launch_spec.normalized_settings.clone();
             let settings = launch_spec.settings.clone();
@@ -1286,7 +1291,7 @@ impl RuntimeManager {
                 runtime: selected_runtime.manifest.clone(),
                 runtime_entrypoint: selected_runtime.entrypoint_path(),
                 selection_source: selection.source,
-                accelerator: selected_accelerator,
+                accelerator_binding: selected_accelerator_binding,
                 installation,
                 model_profile: ModelProfileRuntimeIdentity {
                     model_profile_id: model_profile.id.clone(),
@@ -2493,6 +2498,7 @@ impl RuntimeManager {
                         .provenance
                         .as_ref()
                         .map(|p| p.runtime.entrypoint_sha256.clone()),
+                    accelerator_binding: backend.accelerator_binding.clone(),
                     process_id,
                     private_endpoint: active.map(|active| active.endpoint.clone()).or_else(|| {
                         backend
@@ -3117,6 +3123,7 @@ mod tests {
             residency: BackendResidency::Jit,
             engine_id: None,
             runtime_id: None,
+            accelerator_binding: None,
             running: None,
             loading_process: None,
             loading_runtime_lease: None,

@@ -8,11 +8,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use norted_core::{
-    AcceleratorDevice, AcquisitionMethod, ArtifactFormat, ArtifactNativeIdentity, AvailableRuntime,
-    EngineConfig, EngineInstallation, EngineRevision, HostCapabilities, InstalledRuntime,
-    ModelArtifact, ModelProfileId, NinferArtifactIdentity, ResolvedSettings,
-    RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId, RuntimeProbeObservation,
-    RuntimeRequirements, SettingValue, inspect_ninfer_container,
+    AcceleratorBinding, AcceleratorDevice, AcquisitionMethod, ArtifactFormat,
+    ArtifactNativeIdentity, AvailableRuntime, EngineConfig, EngineInstallation, EngineRevision,
+    HostCapabilities, InstalledRuntime, ModelArtifact, ModelProfileId, NinferArtifactIdentity,
+    ResolvedSettings, RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId,
+    RuntimeProbeObservation, RuntimeRequirements, SettingValue, inspect_ninfer_container,
 };
 use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CompatibilityDecision,
@@ -1649,12 +1649,13 @@ impl EngineAdapter for NinferAdapter {
         }
     }
 
-    fn runtime_model_accelerator(
+    fn runtime_model_accelerator_binding(
         &self,
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-    ) -> Option<AcceleratorDevice> {
+        _settings: Option<&norted_core::ResolvedSettings>,
+    ) -> Option<AcceleratorBinding> {
         matches!(self.compatibility(model), CompatibilityDecision::Supported).then(|| {
             ninfer_device_evaluation(
                 &runtime.manifest.identity.platform,
@@ -1664,6 +1665,7 @@ impl EngineAdapter for NinferAdapter {
                 runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
             )
             .accelerator
+            .map(AcceleratorBinding::single)
         })?
     }
 
@@ -1986,13 +1988,19 @@ impl EngineAdapter for NinferAdapter {
             ));
         }
         let observation = self.probe_runtime(&request.runtime).await?;
-        let accelerator = request.accelerator.clone().ok_or_else(|| {
+        let binding = request.accelerator_binding.clone().ok_or_else(|| {
             EngineError::InvalidConfiguration(
                 "NInfer launch has no exact NVIDIA GPU selected by compatibility evaluation"
                     .to_owned(),
             )
         })?;
-        let environment = isolated_cuda_environment(&self.environment, &accelerator, "NInfer")
+        let [accelerator] = binding.devices.as_slice() else {
+            return Err(EngineError::InvalidConfiguration(
+                "NInfer requires an accelerator binding containing exactly one NVIDIA GPU"
+                    .to_owned(),
+            ));
+        };
+        let environment = isolated_cuda_environment(&self.environment, accelerator, "NInfer")
             .map_err(EngineError::InvalidConfiguration)?;
         let request_log_path = create_private_request_log()?;
         let endpoint = http_endpoint(request.backend_address);
@@ -2145,7 +2153,7 @@ impl EngineAdapter for NinferAdapter {
             installation,
             runtime: request.runtime,
             model: request.model,
-            accelerator: Some(accelerator),
+            accelerator_binding: Some(binding),
         })
     }
 

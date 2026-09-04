@@ -84,6 +84,30 @@ scaled LoRA/control-vector identities also retain their numeric scale. This make
 configured path distinguishable. Mutable output/state destinations, including ordinary log and slot-save
 paths, are not hashed as if they were immutable inputs.
 
+## Ordered accelerator binding
+
+The common runtime-selection and launch contract carries an ordered accelerator binding, not one optional
+device. Each entry is the complete observed `AcceleratorDevice` fact, including its stable physical UUID,
+name, VRAM, driver, and compute capability when available; order is part of provenance.
+
+`llama.cpp.devices` is an ordered list of exact NVIDIA `GPU-...` UUIDs. An explicit list must be nonempty,
+duplicate-free, currently visible, and compatible with the selected CUDA runtime. Norted preserves the list
+order in `CUDA_VISIBLE_DEVICES`, then translates it to llama.cpp's post-isolation local names
+`CUDA0,CUDA1,...`. Host numeric GPU indexes are never persisted or correlated. If the setting is omitted,
+the effective policy is the concrete `auto` policy: CUDA retains the existing automatic selection of one
+compatible GPU, while non-CUDA runtimes retain their ordinary automatic device behavior. `main_gpu` is validated as an index into this ordered set; tensor-split and fit-target lists
+are checked against the selected arity while preserving upstream zero/default, broadcast, and partial-list
+behavior. `split_mode=none` remains the upstream policy rather than a Norted single-device rewrite.
+
+q27 and NInfer deliberately require bindings of exactly one device. A plural common representation does not
+grant either adapter multi-GPU behavior. Running status and launch provenance expose the complete binding,
+so load/unload and residency state retain the physical devices associated with each backend.
+
+Raw llama.cpp and q27 native arguments are disabled. Engine-owned ambient controls are fail-closed as well:
+llama.cpp dynamically removes inherited llama/MTMD/GGML/LLGuidance/AIP variables, and q27 removes every
+inherited `Q27_*` variable, before each adapter adds back only values produced by its typed settings and
+Norted-owned process contract. Unrelated process environment continues to be inherited.
+
 Each runtime/model schema contains only settings configurable for that exact combination. Reusable
 definition constructors do not create shared setting identity. A stale or
 incompatible stored override is reported as unavailable for the selected schema, but it is not shown

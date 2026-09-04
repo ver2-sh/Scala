@@ -1870,10 +1870,38 @@ impl UiLayout {
                                 .collect::<Vec<_>>()
                                 .join(", "),
                         );
+                        let accelerators = fallback(
+                            control
+                                .backends
+                                .iter()
+                                .filter_map(|backend| {
+                                    backend.accelerator_binding.as_ref().map(|binding| {
+                                        let devices = binding
+                                            .devices
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(index, device)| {
+                                                format!(
+                                                    "[{index}] {}",
+                                                    device
+                                                        .stable_id
+                                                        .as_deref()
+                                                        .unwrap_or("unknown-id")
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join(", ");
+                                        format!("{}: {devices}", backend.model_profile_id)
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
                         track("server-profiles", &profiles, width);
                         track("server-models", &models, width);
                         track("server-engines", &engines, width);
                         track("server-runtimes", &runtimes, width);
+                        track("server-accelerators", &accelerators, width);
                         if self.server_details.height >= 20 {
                             let private = fallback(
                                 control
@@ -1892,6 +1920,7 @@ impl UiLayout {
                         track("server-models", fallback, width);
                         track("server-engines", fallback, width);
                         track("server-runtimes", fallback, width);
+                        track("server-accelerators", fallback, width);
                         if self.server_details.height >= 20 {
                             track("server-bind", &app.public_auth_status.bind, width);
                             track("server-private", fallback, width);

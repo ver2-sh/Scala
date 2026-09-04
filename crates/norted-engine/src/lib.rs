@@ -12,12 +12,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures_util::Stream;
 use norted_core::{
-    AcceleratorDevice, ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifactRole,
-    AvailableRuntime, EngineInstallation, EngineRevision, HostCapabilities, InstalledRuntime,
-    ModelArtifact, ModelId, ModelRuntimeIdentity, ResolvedSettings, RuntimeCompatibility,
-    RuntimeId, RuntimeIdentity, RuntimeProbeObservation, SettingDefaultPreview,
-    SettingDefaultSource, SettingDefinition, SettingId, SettingScope, SettingsError, SettingsPatch,
-    SettingsSchema,
+    ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifactRole, AvailableRuntime,
+    EngineInstallation, EngineRevision, HostCapabilities, InstalledRuntime, ModelArtifact, ModelId,
+    ModelRuntimeIdentity, ResolvedSettings, RuntimeCompatibility, RuntimeId, RuntimeIdentity,
+    RuntimeProbeObservation, SettingDefaultPreview, SettingDefaultSource, SettingDefinition,
+    SettingId, SettingScope, SettingsError, SettingsPatch, SettingsSchema,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,7 +35,8 @@ pub use catalog::{
     GitHubReleaseAsset, GitHubReleaseClient, GitHubRepository, RuntimeCatalog, RuntimeCatalogEntry,
     RuntimeCatalogProvider, RuntimeCatalogSnapshot, RuntimeProviderAuthority, RuntimeProviderError,
     compatibility_for, compatibility_for_nvidia_device, detect_host_capabilities,
-    is_exact_nvidia_gpu_uuid, isolated_cuda_environment, visible_nvidia_devices,
+    is_exact_nvidia_gpu_uuid, isolated_cuda_environment, isolated_cuda_environment_for_binding,
+    visible_nvidia_device_set, visible_nvidia_devices,
 };
 
 pub use control::{
@@ -966,7 +966,7 @@ impl PreparedModelInput {
 pub struct LaunchRequest {
     pub model: PreparedModelInput,
     pub runtime: InstalledRuntime,
-    pub accelerator: Option<AcceleratorDevice>,
+    pub accelerator_binding: Option<norted_core::AcceleratorBinding>,
     pub backend_address: SocketAddr,
     pub settings: ResolvedSettings,
     pub settings_schema: SettingsSchema,
@@ -990,7 +990,7 @@ pub struct LaunchSpec {
     pub installation: EngineInstallation,
     pub runtime: InstalledRuntime,
     pub model: PreparedModelInput,
-    pub accelerator: Option<AcceleratorDevice>,
+    pub accelerator_binding: Option<norted_core::AcceleratorBinding>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1494,14 +1494,16 @@ pub trait EngineAdapter: Send + Sync {
     ) -> u16 {
         100
     }
-    /// Returns the exact accelerator selected by the same policy used for
-    /// model/runtime compatibility. `None` means the engine does not bind one.
-    fn runtime_model_accelerator(
+    /// Returns the exact ordered accelerator binding selected by the same
+    /// policy used for model/runtime compatibility. `None` means the engine
+    /// does not bind accelerators.
+    fn runtime_model_accelerator_binding(
         &self,
         _runtime: &InstalledRuntime,
         _model: &ModelArtifact,
         _host: &HostCapabilities,
-    ) -> Option<AcceleratorDevice> {
+        _settings: Option<&ResolvedSettings>,
+    ) -> Option<norted_core::AcceleratorBinding> {
         None
     }
     async fn prepare_model_input(
@@ -2520,6 +2522,7 @@ mod tests {
             runtime_version: Some("0.10.0".to_owned()),
             runtime_variant: Some("w12".to_owned()),
             runtime_executable_sha256: None,
+            accelerator_binding: None,
             process_id: Some(4321),
             private_endpoint: Some("http://127.0.0.1:4321".to_owned()),
             load_progress: Some(BackendLoadProgress {
