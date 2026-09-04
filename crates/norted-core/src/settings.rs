@@ -9,7 +9,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::{AppPaths, ModelProfileId, RuntimeId};
 
-pub const SETTINGS_STATE_VERSION: u32 = 2;
+pub const SETTINGS_STATE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -31,8 +31,14 @@ impl SettingId {
     }
 
     pub fn applies_to_engine(&self, engine_id: &str) -> bool {
-        self.namespace()
-            .is_none_or(|namespace| namespace == engine_id)
+        self.namespace() == Some(engine_id)
+    }
+
+    pub fn applies_to_scope(&self, scope: &SettingScope) -> bool {
+        match scope {
+            SettingScope::Server => self.namespace() == Some("server"),
+            SettingScope::Runtime { engine_id } => self.applies_to_engine(engine_id),
+        }
     }
 }
 
@@ -491,6 +497,17 @@ impl SettingDefinition {
     pub fn validate_value(&self, value: &SettingValue) -> Result<(), SettingsError> {
         self.kind.accepts(&self.id, value)
     }
+
+    pub fn validate_scope(&self) -> Result<(), SettingsError> {
+        if self.id.applies_to_scope(&self.scope) {
+            Ok(())
+        } else {
+            Err(SettingsError::DefinitionScopeMismatch {
+                setting_id: self.id.clone(),
+                scope: self.scope.clone(),
+            })
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -578,13 +595,13 @@ impl SettingsState {
             SettingSource::ModelProfile {
                 model_profile_id: profile_id.clone(),
             },
-        );
+        )?;
         apply_layer(
             &mut configured,
             invocation,
             engine_id,
             SettingSource::Invocation,
-        );
+        )?;
         resolve_structured_paths(&mut configured, structured_path_base)?;
         Ok(ResolvedSettings {
             engine_id: engine_id.to_owned(),
@@ -607,7 +624,7 @@ impl SettingsState {
                 defaults,
                 engine_id,
                 SettingSource::RuntimeDefault,
-            );
+            )?;
         }
         resolve_structured_paths(&mut effective, structured_path_base)?;
         Ok(ResolvedSettings {
@@ -624,71 +641,23 @@ fn apply_layer(
     patch: &SettingsPatch,
     engine_id: &str,
     source: SettingSource,
-) {
-    suppress_inherited_semantic_alternatives(effective, patch, engine_id);
+) -> Result<(), SettingsError> {
     for (id, value) in patch.iter() {
-        if id.applies_to_engine(engine_id) {
-            effective.insert(
-                id.clone(),
-                ResolvedSetting {
-                    value: value.clone(),
-                    source: source.clone(),
-                },
-            );
+        if !id.applies_to_engine(engine_id) {
+            return Err(SettingsError::WrongEngineScope {
+                setting_id: id.clone(),
+                engine_id: engine_id.to_owned(),
+            });
         }
+        effective.insert(
+            id.clone(),
+            ResolvedSetting {
+                value: value.clone(),
+                source: source.clone(),
+            },
+        );
     }
-}
-
-fn suppress_inherited_semantic_alternatives(
-    effective: &mut BTreeMap<SettingId, ResolvedSetting>,
-    patch: &SettingsPatch,
-    engine_id: &str,
-) {
-    if engine_id != "llama.cpp" {
-        return;
-    }
-    let contains = |id: &str| patch.0.keys().any(|candidate| candidate.as_str() == id);
-    let mut suppress = Vec::new();
-
-    if contains("llama.cpp.chat_template") {
-        suppress.extend([
-            "llama.cpp.chat_template_file",
-            "llama.cpp.chat_template_sha256",
-        ]);
-    }
-    if contains("llama.cpp.chat_template_file") {
-        suppress.extend(["llama.cpp.chat_template", "llama.cpp.chat_template_sha256"]);
-    }
-    if contains("llama.cpp.cpu_moe_all") {
-        suppress.push("llama.cpp.cpu_moe_layers");
-    }
-    if contains("llama.cpp.cpu_moe_layers") {
-        suppress.push("llama.cpp.cpu_moe_all");
-    }
-    if matches!(
-        patch
-            .0
-            .iter()
-            .find(|(id, _)| id.as_str() == "llama.cpp.speculative_mode")
-            .map(|(_, value)| value),
-        Some(SettingValue::Choice(mode))
-            if mode == "off" || mode == "draft-mtp" || mode.starts_with("ngram-")
-    ) {
-        suppress.extend([
-            "llama.cpp.speculative_draft_model",
-            "llama.cpp.speculative_draft_sha256",
-        ]);
-    }
-
-    for id in suppress {
-        if let Some(id) = effective
-            .keys()
-            .find(|candidate| candidate.as_str() == id)
-            .cloned()
-        {
-            effective.remove(&id);
-        }
-    }
+    Ok(())
 }
 
 fn resolve_structured_paths(
@@ -853,6 +822,13 @@ impl ResolvedSettings {
             .iter()
             .find_map(|(candidate, setting)| (candidate.as_str() == id).then_some(&setting.value))
     }
+
+    /// Looks up a protocol-level concept through this resolved runtime's own
+    /// namespace. This never falls back to an unqualified or foreign ID.
+    pub fn runtime_value(&self, suffix: &str) -> Option<&SettingValue> {
+        let id = format!("{}.{}", self.engine_id, suffix);
+        self.value(&id)
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -877,6 +853,33 @@ pub struct SettingsSchema {
 }
 
 impl SettingsSchema {
+    pub fn validate_contract(&self) -> Result<(), SettingsError> {
+        crate::validate_engine_id(&self.engine_id)?;
+        for definition in &self.definitions {
+            definition.validate_scope()?;
+            match (self.engine_id.as_str(), &definition.scope) {
+                ("server", SettingScope::Server) => {}
+                ("server", SettingScope::Runtime { .. }) => {
+                    return Err(SettingsError::InvalidServerSetting(definition.id.clone()));
+                }
+                (_, SettingScope::Server) => {
+                    return Err(SettingsError::WrongEngineScope {
+                        setting_id: definition.id.clone(),
+                        engine_id: self.engine_id.clone(),
+                    });
+                }
+                (_, SettingScope::Runtime { engine_id }) if engine_id == &self.engine_id => {}
+                (_, SettingScope::Runtime { .. }) => {
+                    return Err(SettingsError::WrongEngineScope {
+                        setting_id: definition.id.clone(),
+                        engine_id: self.engine_id.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn definition(&self, id: &SettingId) -> Option<&SettingDefinition> {
         self.definitions
             .iter()
@@ -884,7 +887,20 @@ impl SettingsSchema {
     }
 
     pub fn validate(&self, settings: &ResolvedSettings) -> Result<(), SettingsError> {
+        self.validate_contract()?;
+        if settings.engine_id != self.engine_id {
+            return Err(SettingsError::InvalidModelProfile(format!(
+                "resolved settings belong to engine `{}`, not `{}`",
+                settings.engine_id, self.engine_id
+            )));
+        }
         for (id, setting) in &settings.configured {
+            if !id.applies_to_engine(&self.engine_id) {
+                return Err(SettingsError::WrongEngineScope {
+                    setting_id: id.clone(),
+                    engine_id: self.engine_id.clone(),
+                });
+            }
             let definition =
                 self.definition(id)
                     .ok_or_else(|| SettingsError::UnavailableSetting {
@@ -911,6 +927,7 @@ impl SettingsSchema {
         &self,
         settings: &mut ResolvedSettings,
     ) -> Result<(), SettingsError> {
+        self.validate_contract()?;
         for definition in self
             .definitions
             .iter()
@@ -952,6 +969,7 @@ impl SettingsSchema {
         &self,
         settings: &mut ResolvedSettings,
     ) -> Result<(), SettingsError> {
+        self.validate_contract()?;
         let mut effective = BTreeMap::new();
         for definition in self
             .definitions
@@ -1203,6 +1221,11 @@ pub enum SettingsError {
     },
     #[error("server settings cannot contain inference setting `{0}`")]
     InvalidServerSetting(SettingId),
+    #[error("setting definition `{setting_id}` does not belong to its declared scope {scope:?}")]
+    DefinitionScopeMismatch {
+        setting_id: SettingId,
+        scope: SettingScope,
+    },
     #[error("setting `{setting_id}` does not belong to engine `{engine_id}`")]
     WrongEngineScope {
         setting_id: SettingId,
@@ -1260,13 +1283,13 @@ mod tests {
             .runtime_defaults
             .entry("q27".to_owned())
             .or_default()
-            .insert(id("temperature"), SettingValue::Float(0.2));
+            .insert(id("q27.temperature"), SettingValue::Float(0.2));
         let profile = SettingsPatch(BTreeMap::from([(
-            id("temperature"),
+            id("q27.temperature"),
             SettingValue::Float(0.3),
         )]));
         let invocation = SettingsPatch(BTreeMap::from([(
-            id("temperature"),
+            id("q27.temperature"),
             SettingValue::Float(0.4),
         )]));
         let resolved = state
@@ -1279,11 +1302,11 @@ mod tests {
             )
             .expect("resolve");
         assert_eq!(
-            resolved.value("temperature"),
+            resolved.value("q27.temperature"),
             Some(&SettingValue::Float(0.4))
         );
         assert_eq!(
-            resolved.configured[&id("temperature")].source,
+            resolved.configured[&id("q27.temperature")].source,
             SettingSource::Invocation
         );
     }

@@ -371,7 +371,7 @@ mod tests {
             .expect("quality")
             .overrides
             .insert(
-                SettingId::new("temperature").expect("setting ID"),
+                SettingId::new("q27.temperature").expect("setting ID"),
                 SettingValue::Float(0.8),
             );
         assert_eq!(state.profiles.len(), 2);

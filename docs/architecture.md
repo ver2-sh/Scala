@@ -165,25 +165,26 @@ remain separate systems.
 distinct domains. `ModelProfile` is deliberately small: typed ID, display name, concrete bound
 artifact ID, bound engine ID, and typed overrides. It is always user-owned and mutable. Technical
 compatibility comes from the bound artifact, registered engine, exact runtime, and resulting
-settings—not from profile-authored applicability declarations.
+settings—not from profile-authored applicability declarations. Runtime IDs must be qualified by the
+bound engine; unqualified or foreign namespaces are rejected at every layer.
 
-`SettingsState` schema 2 lives at `<data>/settings.json` and stores Server Settings separately from
+`SettingsState` schema 3 lives at `<data>/settings.json` and stores Server Settings separately from
 independent per-runtime defaults. `ModelProfilesState` schema 1 lives at
 `<data>/model-profiles.json`. Both stores have
-independent locks and atomic replacement. Settings schema 1 and obsolete Global fields are rejected;
-no compatibility reader or migration path exists.
+independent locks and atomic replacement. Settings schemas 1 and 2 and obsolete Global fields are
+rejected; no compatibility reader, alias, or migration path exists.
 
 One resolver applies the selected runtime's defaults, Model Profile overrides, then ephemeral
-invocation overrides. It filters unrelated runtime namespaces and records the winning inference
+invocation overrides. It rejects unrelated runtime namespaces and records the winning inference
 source as runtime default, Model Profile, or invocation. In boot-loading presentation, invocation
 is labeled `boot inference`. There is no Global inference parent, model-default layer, or hidden
 policy. Relative typed paths resolve beneath the data directory before downstream consumers receive
 the same absolute value.
 
-Server Settings are application/control-plane configuration and never enter model inference
-resolution or inference provenance. Shared inference semantics are defined once in the engine-neutral
-schema builder, but each adapter binds those definitions into its own runtime scope and supplies its
-own concrete baseline. A future apply-to-all-runtimes action must copy a value independently into
+Server Settings use only `server.*` and never enter inference resolution or provenance. Runtime
+definitions and values use only `llama.cpp.*`, `q27.*`, or `ninfer.*`. Generic code may construct
+repeated metadata shapes but owns no inference setting identity, runtime value, default, or
+adapter-specific conflict rule. A future apply-to-all-runtimes action must copy a value independently into
 each applicable runtime; it must not create a shared parent layer.
 
 `ResolvedSettings` carries explicit launch configuration separately from the complete effective map.
@@ -200,8 +201,8 @@ reconstructs a value from descriptive default prose.
 
 Runtime selection receives the profile's explicit engine and cannot switch engines. Existing
 resolution order remains explicit runtime, persisted model/runtime choice when applicable,
-engine/format default, then best compatible installed runtime. Adapters expose a typed category-aware
-schema for centrally defined common semantics plus their own namespace, gate it first with facts proved by the bound model, and
+engine/format default, then best compatible installed runtime. Adapters expose a typed,
+category-aware, wholly engine-qualified schema, gate it first with facts proved by the bound model, and
 then gate it with the exact runtime contract before validating effective settings. Capability
 requirements are consequences of selected settings. q27 retains exact source fingerprints and
 bounded context/KV/W_MAX startup proof; NInfer retains native-container identity, capability-domain

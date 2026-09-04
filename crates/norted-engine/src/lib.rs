@@ -16,7 +16,7 @@ use norted_core::{
     AvailableRuntime, EngineInstallation, EngineRevision, HostCapabilities, InstalledRuntime,
     ModelArtifact, ModelId, ModelRuntimeIdentity, ResolvedSettings, RuntimeCompatibility,
     RuntimeId, RuntimeIdentity, RuntimeProbeObservation, SettingDefaultPreview,
-    SettingDefaultSource, SettingDefinition, SettingId, SettingsError, SettingsPatch,
+    SettingDefaultSource, SettingDefinition, SettingId, SettingScope, SettingsError, SettingsPatch,
     SettingsSchema,
 };
 use serde::{Deserialize, Serialize};
@@ -157,9 +157,9 @@ pub enum OptionValueKind {
     Path,
 }
 
-/// Returns the centrally defined common semantics explicitly selected by one
-/// adapter. Common IDs are reusable across engines; they do not imply engine
-/// membership on their own.
+/// Returns shared setting shapes instantiated with identities owned exclusively
+/// by one adapter. The suffixes are reusable; every returned ID is qualified by
+/// `engine_id` and cannot participate in another runtime's state.
 pub fn common_setting_definitions_for(
     engine_id: &str,
     setting_ids: &[&str],
@@ -168,9 +168,14 @@ pub fn common_setting_definitions_for(
     setting_ids
         .iter()
         .map(|id| {
+            let suffix = id
+                .strip_prefix(engine_id)
+                .and_then(|value| value.strip_prefix('.'))
+                .unwrap_or(id);
+            let qualified = format!("{engine_id}.{suffix}");
             library
                 .iter()
-                .find(|definition| definition.id.as_str() == *id)
+                .find(|definition| definition.id.as_str() == qualified)
                 .unwrap_or_else(|| panic!("unknown common setting definition `{id}`"))
                 .clone()
         })
@@ -189,7 +194,7 @@ pub fn configurable_setting_definitions(
 fn common_setting_definition_library(engine_id: &str) -> Vec<SettingDefinition> {
     vec![
         SettingDefinition {
-            id: SettingId::new("context_length").expect("static setting ID"),
+            id: qualified_setting_id(engine_id, "context_length"),
             label: "Context length".to_owned(),
             description: "Explicit context window requested from the selected runtime".to_owned(),
             kind: norted_core::SettingKind::UnsignedInteger {
@@ -206,7 +211,7 @@ fn common_setting_definition_library(engine_id: &str) -> Vec<SettingDefinition> 
             default_preview: None,
         },
         SettingDefinition {
-            id: SettingId::new("parallel_requests").expect("static setting ID"),
+            id: qualified_setting_id(engine_id, "parallel_requests"),
             label: "Parallel requests".to_owned(),
             description: "Number of concurrent server slots".to_owned(),
             kind: norted_core::SettingKind::UnsignedInteger {
@@ -223,7 +228,7 @@ fn common_setting_definition_library(engine_id: &str) -> Vec<SettingDefinition> 
             default_preview: None,
         },
         SettingDefinition {
-            id: SettingId::new("temperature").expect("static setting ID"),
+            id: qualified_setting_id(engine_id, "temperature"),
             label: "Temperature".to_owned(),
             description: "Configured generation temperature; request values may override it"
                 .to_owned(),
@@ -241,7 +246,7 @@ fn common_setting_definition_library(engine_id: &str) -> Vec<SettingDefinition> 
             default_preview: None,
         },
         SettingDefinition {
-            id: SettingId::new("top_p").expect("static setting ID"),
+            id: qualified_setting_id(engine_id, "top_p"),
             label: "Top P".to_owned(),
             description: "Configured nucleus-sampling probability".to_owned(),
             kind: norted_core::SettingKind::Float {
@@ -258,7 +263,7 @@ fn common_setting_definition_library(engine_id: &str) -> Vec<SettingDefinition> 
             default_preview: None,
         },
         SettingDefinition {
-            id: SettingId::new("top_k").expect("static setting ID"),
+            id: qualified_setting_id(engine_id, "top_k"),
             label: "Top K".to_owned(),
             description: "Configured top-k sampler cutoff".to_owned(),
             kind: norted_core::SettingKind::UnsignedInteger {
@@ -275,7 +280,7 @@ fn common_setting_definition_library(engine_id: &str) -> Vec<SettingDefinition> 
             default_preview: None,
         },
         SettingDefinition {
-            id: SettingId::new("min_p").expect("static setting ID"),
+            id: qualified_setting_id(engine_id, "min_p"),
             label: "Min P".to_owned(),
             description: "Configured minimum-token probability threshold".to_owned(),
             kind: norted_core::SettingKind::Float {
@@ -292,7 +297,7 @@ fn common_setting_definition_library(engine_id: &str) -> Vec<SettingDefinition> 
             default_preview: None,
         },
         SettingDefinition {
-            id: SettingId::new("reasoning_effort").expect("static setting ID"),
+            id: qualified_setting_id(engine_id, "reasoning_effort"),
             label: "Reasoning effort".to_owned(),
             description: "Default reasoning effort when the selected engine supports it".to_owned(),
             kind: norted_core::SettingKind::Choice {
@@ -447,7 +452,7 @@ fn common_definition(
     engine_id: &str,
 ) -> SettingDefinition {
     SettingDefinition {
-        id: SettingId::new(id).expect("static common setting ID"),
+        id: qualified_setting_id(engine_id, id),
         label: label.to_owned(),
         description: description.to_owned(),
         kind,
@@ -473,6 +478,10 @@ fn common_definition(
             _ => None,
         },
     }
+}
+
+fn qualified_setting_id(engine_id: &str, suffix: &str) -> SettingId {
+    SettingId::new(format!("{engine_id}.{suffix}")).expect("static engine-qualified setting ID")
 }
 
 pub async fn record_local_file_setting_identity(
@@ -1437,6 +1446,19 @@ pub trait EngineAdapter: Send + Sync {
     fn uses_setting_as_request_default(&self, _id: &str) -> bool {
         true
     }
+    /// Applies adapter-owned cross-setting normalization after the generic
+    /// three-layer resolver has selected exact, engine-qualified values.
+    fn normalize_settings(&self, settings: &mut ResolvedSettings) -> Result<(), EngineError> {
+        if settings.engine_id == self.identity().id {
+            Ok(())
+        } else {
+            Err(EngineError::InvalidConfiguration(format!(
+                "resolved settings belong to `{}`, not `{}`",
+                settings.engine_id,
+                self.identity().id
+            )))
+        }
+    }
     /// Lower values are preferred after compatibility. Engines own the
     /// semantic ordering of their runtime variants.
     fn runtime_model_preference(
@@ -1757,7 +1779,20 @@ impl EngineRegistry {
     pub fn setting_definitions(&self) -> Result<Vec<SettingDefinition>, EngineError> {
         let mut definitions = Vec::<SettingDefinition>::new();
         for adapter in self.adapters.values() {
+            let engine_id = adapter.identity().id;
             for definition in adapter.setting_definitions() {
+                definition
+                    .validate_scope()
+                    .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
+                if !matches!(
+                    &definition.scope,
+                    SettingScope::Runtime { engine_id: owner } if owner == &engine_id
+                ) {
+                    return Err(EngineError::InvalidConfiguration(format!(
+                        "setting `{}` is not owned by adapter `{engine_id}`",
+                        definition.id
+                    )));
+                }
                 if let Some(existing) = definitions.iter().find(|existing| {
                     existing.id == definition.id && existing.scope == definition.scope
                 }) {

@@ -1019,6 +1019,10 @@ impl RuntimeManager {
                 return Err(RuntimeError::Operation(error.to_string()));
             }
         };
+        if let Err(error) = adapter.normalize_settings(&mut resolved_settings) {
+            self.fail_loading(generation, error.to_string(), None).await;
+            return Err(RuntimeError::Operation(error.to_string()));
+        }
         self.set_load_progress(
             generation,
             BackendLoadProgress::indeterminate(BackendLoadPhase::SelectingRuntime),
@@ -1398,9 +1402,11 @@ impl RuntimeManager {
                             return Err(RuntimeError::StartupFailed(detail));
                         }
                     };
-                    if let Err(error) =
-                        merge_effective_generation_settings(&mut observation, settings)
-                    {
+                    if let Err(error) = merge_effective_generation_settings(
+                        &mut observation,
+                        &resolved_settings.engine_id,
+                        settings,
+                    ) {
                         cleanup_pending_launch_files(&launch_attempts).await;
                         let detail = format!(
                             "could not record effective generation settings from the engine: {error}"
@@ -1527,11 +1533,11 @@ impl RuntimeManager {
             if let Some(provenance) = backend.provenance.as_mut() {
                 provenance.normalized_settings.extend(startup_observation);
                 provenance.normalized_settings.insert(
-                    "temperature".to_owned(),
+                    format!("{}.temperature", resolved_settings.engine_id),
                     serde_json::json!(effective_generation_settings.temperature),
                 );
                 provenance.normalized_settings.insert(
-                    "top_p".to_owned(),
+                    format!("{}.top_p", resolved_settings.engine_id),
                     serde_json::json!(effective_generation_settings.top_p),
                 );
                 reconcile_effective_settings_from_runtime(provenance);
@@ -2530,19 +2536,21 @@ impl RuntimeManager {
 }
 
 fn backend_parallelism(backend: &ManagedBackend) -> Option<BackendParallelism> {
+    let running = backend.running.as_ref()?;
     if let Some(value) = backend
         .provenance
         .as_ref()
         .and_then(|provenance| provenance.normalized_settings.get("resolved_settings"))
         .and_then(serde_json::Value::as_object)
-        .and_then(|settings| settings.get("parallel_requests"))
+        .and_then(|settings| {
+            settings.get(&format!("{}.parallel_requests", running.settings.engine_id))
+        })
         .and_then(serde_json::Value::as_u64)
     {
         return Some(BackendParallelism::Exact(value));
     }
 
-    let running = backend.running.as_ref()?;
-    match running.settings.value("parallel_requests") {
+    match running.settings.runtime_value("parallel_requests") {
         Some(norted_core::SettingValue::UnsignedInteger(value)) => {
             Some(BackendParallelism::Exact(*value))
         }
@@ -2560,7 +2568,9 @@ fn backend_parallelism(backend: &ManagedBackend) -> Option<BackendParallelism> {
             .definitions
             .iter()
             .any(|definition| {
-                definition.id.as_str() == "parallel_requests" && definition.supported
+                definition.id.as_str()
+                    == format!("{}.parallel_requests", running.settings.engine_id)
+                    && definition.supported
             }) =>
         {
             Some(BackendParallelism::Auto)
@@ -2592,44 +2602,49 @@ async fn prepare_inference_request(
     request: &mut InferenceRequest,
 ) -> Result<(), EngineError> {
     if request.generation_settings.top_k.is_none()
-        && let Some(norted_core::SettingValue::UnsignedInteger(value)) = settings.value("top_k")
+        && let Some(norted_core::SettingValue::UnsignedInteger(value)) =
+            settings.runtime_value("top_k")
     {
         request.generation_settings.top_k = Some(*value);
     }
     if request.generation_settings.min_p.is_none()
-        && let Some(norted_core::SettingValue::Float(value)) = settings.value("min_p")
+        && let Some(norted_core::SettingValue::Float(value)) = settings.runtime_value("min_p")
     {
         request.generation_settings.min_p = Some(*value);
     }
     if request.generation_settings.seed.is_none()
         && let Some(norted_core::SettingValue::UnsignedIntegerOrChoice(
             norted_core::UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
-        )) = settings.value("seed")
+        )) = settings.runtime_value("seed")
     {
         request.generation_settings.seed = Some(*value);
     }
     if request.generation_settings.repeat_penalty.is_none()
-        && let Some(norted_core::SettingValue::Float(value)) = settings.value("repeat_penalty")
+        && let Some(norted_core::SettingValue::Float(value)) =
+            settings.runtime_value("repeat_penalty")
     {
         request.generation_settings.repeat_penalty = Some(*value);
     }
     if request.generation_settings.presence_penalty.is_none()
-        && let Some(norted_core::SettingValue::Float(value)) = settings.value("presence_penalty")
+        && let Some(norted_core::SettingValue::Float(value)) =
+            settings.runtime_value("presence_penalty")
     {
         request.generation_settings.presence_penalty = Some(*value);
     }
     if request.generation_settings.frequency_penalty.is_none()
-        && let Some(norted_core::SettingValue::Float(value)) = settings.value("frequency_penalty")
+        && let Some(norted_core::SettingValue::Float(value)) =
+            settings.runtime_value("frequency_penalty")
     {
         request.generation_settings.frequency_penalty = Some(*value);
     }
     if request.generation_settings.stop.is_none()
-        && let Some(norted_core::SettingValue::StringList(value)) = settings.value("stop_strings")
+        && let Some(norted_core::SettingValue::StringList(value)) =
+            settings.runtime_value("stop_strings")
     {
         request.generation_settings.stop = Some(value.clone());
     }
     if request.generation_settings.reasoning_enabled.is_none()
-        && let Some(norted_core::SettingValue::Choice(value)) = settings.value("reasoning")
+        && let Some(norted_core::SettingValue::Choice(value)) = settings.runtime_value("reasoning")
     {
         request.generation_settings.reasoning_enabled = match value.as_str() {
             "on" => Some(true),
@@ -2640,12 +2655,14 @@ async fn prepare_inference_request(
     }
     if adapter.uses_setting_as_request_default("reasoning_budget")
         && request.generation_settings.reasoning_budget.is_none()
-        && let Some(norted_core::SettingValue::Integer(value)) = settings.value("reasoning_budget")
+        && let Some(norted_core::SettingValue::Integer(value)) =
+            settings.runtime_value("reasoning_budget")
     {
         request.generation_settings.reasoning_budget = Some(*value);
     }
     if request.generation_settings.reasoning_effort.is_none()
-        && let Some(norted_core::SettingValue::Choice(value)) = settings.value("reasoning_effort")
+        && let Some(norted_core::SettingValue::Choice(value)) =
+            settings.runtime_value("reasoning_effort")
     {
         request.generation_settings.reasoning_effort = match value.as_str() {
             "none" => Some(crate::ReasoningEffort::None),
@@ -2660,7 +2677,7 @@ async fn prepare_inference_request(
     }
     if request.max_output_tokens.is_none()
         && let Some(norted_core::SettingValue::UnsignedInteger(value)) =
-            settings.value("max_output_tokens")
+            settings.runtime_value("max_output_tokens")
     {
         request.max_output_tokens = u32::try_from(*value).ok();
     }
@@ -2669,7 +2686,8 @@ async fn prepare_inference_request(
             message.role,
             crate::InferenceRole::System | crate::InferenceRole::Developer
         )
-    }) && let Some(norted_core::SettingValue::String(prompt)) = settings.value("system_prompt")
+    }) && let Some(norted_core::SettingValue::String(prompt)) =
+        settings.runtime_value("system_prompt")
     {
         request.messages.insert(
             0,
@@ -2678,7 +2696,7 @@ async fn prepare_inference_request(
     }
     if request.output_format.is_none()
         && let Some(norted_core::SettingValue::Json(schema)) =
-            settings.value("structured_output_schema")
+            settings.runtime_value("structured_output_schema")
     {
         request.output_format = Some(crate::OutputFormat::JsonSchema {
             name: None,
@@ -2689,7 +2707,7 @@ async fn prepare_inference_request(
     }
 
     if !matches!(
-        settings.value("context_overflow"),
+        settings.runtime_value("context_overflow"),
         Some(norted_core::SettingValue::Choice(policy)) if policy == "truncate_middle"
     ) {
         return Ok(());
@@ -2783,6 +2801,7 @@ fn reserve_loopback_address() -> std::io::Result<SocketAddr> {
 
 fn merge_effective_generation_settings(
     normalized_settings: &mut BTreeMap<String, serde_json::Value>,
+    engine_id: &str,
     effective: EffectiveGenerationSettings,
 ) -> Result<(), EngineError> {
     let resolved_settings = normalized_settings
@@ -2795,10 +2814,13 @@ fn merge_effective_generation_settings(
             )
         })?;
     resolved_settings.insert(
-        "temperature".to_owned(),
+        format!("{engine_id}.temperature"),
         serde_json::json!(effective.temperature),
     );
-    resolved_settings.insert("top_p".to_owned(), serde_json::json!(effective.top_p));
+    resolved_settings.insert(
+        format!("{engine_id}.top_p"),
+        serde_json::json!(effective.top_p),
+    );
     Ok(())
 }
 

@@ -105,6 +105,41 @@ const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &[
     "Q27_PROFILE",
     "Q27_KV_POOL",
     "Q27_PF_ARENA",
+    "Q27_BATCH_GRAPH",
+    "Q27_BATCH_GRAPH_CAP",
+    "Q27_BATCH_GEMM",
+    "Q27_DEXIT",
+    "Q27_SAMPLE_PLAIN",
+    "Q27_TOOL_SPLIT",
+    "Q27_NO_INTERLEAVE",
+    "Q27_PHASE_STATS",
+    "Q27_READY_FLOOR_MB",
+    "Q27_THINK_BUDGET_FRAC",
+    "Q27_SUFFIX_L",
+    "Q27_PF_BATCH_MIN",
+    "Q27_GEMM_MIN",
+    "Q27_GEMM_SPLITK",
+    "Q27_PREFILL",
+    "Q27_PF_XG",
+    "Q27_PF_NT",
+    "Q27_FD",
+    "Q27_DS_MODE",
+    "Q27_DS_SPLIT",
+    "Q27_CKPT_INTERVAL",
+    "Q27_CKPT_SLOTS",
+    "Q27_MAXD_RESET",
+    "Q27_MAXD_EMA",
+    "Q27_MAXD_HI",
+    "Q27_MAXD_HI6",
+    "Q27_MAXD_HI7",
+    "Q27_MAXD_FLO6",
+    "Q27_MAXD_FLO7",
+    "Q27_MAXD_LO",
+    "Q27_TOOL_DIALECT",
+    "Q27_TOOL_STRICT",
+    "Q27_TOOL_ERROR_WARNINGS",
+    "Q27_MAX_TOOL_ARG_CHARS",
+    "Q27_MAX_TOOL_RESPONSE_CHARS",
     "CUDA_VISIBLE_DEVICES",
 ];
 
@@ -1149,7 +1184,7 @@ fn validate_q27_settings_prelaunch(
 ) -> Result<(), String> {
     if let Some(SettingValue::UnsignedIntegerOrChoice(
         norted_core::UnsignedIntegerOrChoiceValue::Choice(value),
-    )) = settings.value("seed")
+    )) = settings.value("q27.seed")
     {
         return Err(format!(
             "q27 does not implement `seed={value}`; configure an explicit numeric seed or leave it unset"
@@ -1191,28 +1226,29 @@ fn validate_q27_settings_prelaunch(
     if settings.value("q27.thinking_budget").is_some() && !capabilities.unlimited_think_budget {
         failures.push("thinking budget control is unproven");
     }
-    if (settings.value("temperature").is_some() || settings.value("top_p").is_some())
+    if (settings.value("q27.temperature").is_some() || settings.value("q27.top_p").is_some())
         && !capabilities.temperature_top_p
     {
         failures.push("temperature/top-p controls are unproven");
     }
-    if (settings.value("top_k").is_some() || settings.value("min_p").is_some())
+    if (settings.value("q27.top_k").is_some() || settings.value("q27.min_p").is_some())
         && !capabilities.top_k_min_p
     {
         failures.push("top-k/min-p controls are unproven");
     }
-    if settings.value("seed").is_some() && !capabilities.request_seed {
+    if settings.value("q27.seed").is_some() && !capabilities.request_seed {
         failures.push("request-default seed control is unproven");
     }
-    if (settings.value("seed").is_some()
-        || setting_unsigned(settings, "top_k").is_some_and(|value| value > 0)
-        || setting_float(settings, "min_p").is_some_and(|value| value > 0.0))
-        && setting_float(settings, "temperature").unwrap_or(0.0) <= 0.0
+    if (settings.value("q27.seed").is_some()
+        || setting_unsigned(settings, "q27.top_k").is_some_and(|value| value > 0)
+        || setting_float(settings, "q27.min_p").is_some_and(|value| value > 0.0))
+        && setting_float(settings, "q27.temperature").unwrap_or(0.0) <= 0.0
     {
         failures
             .push("q27 seed/top-k/min-p request defaults require a positive temperature default");
     }
-    if (settings.value("reasoning").is_some() || settings.value("reasoning_budget").is_some())
+    if (settings.value("q27.reasoning").is_some()
+        || settings.value("q27.reasoning_budget").is_some())
         && (!capabilities.request_thinking
             || setting_toggle(settings, "q27.request_thinking") != Some(true))
     {
@@ -1233,7 +1269,7 @@ fn validate_q27_settings_prelaunch(
         failures.push("stable batching/sampled-graph controls are unproven");
     }
     if setting_toggle(settings, "q27.sampled_graphs") == Some(false)
-        && setting_float(settings, "temperature").is_some_and(|temperature| temperature > 0.0)
+        && setting_float(settings, "q27.temperature").is_some_and(|temperature| temperature > 0.0)
     {
         failures.push("q27 sampled graphs cannot be disabled with a sampled temperature default");
     }
@@ -1262,7 +1298,7 @@ fn validate_q27_settings_prelaunch(
         failures.push("no configurable KV mode is proven for this executable");
     }
     if settings.value("q27.slot1_context_length").is_some()
-        && setting_unsigned(settings, "parallel_requests").unwrap_or(1) < 2
+        && setting_unsigned(settings, "q27.parallel_requests").unwrap_or(1) < 2
     {
         failures.push("q27 background-slot context requires at least two configured slots");
     }
@@ -1570,41 +1606,42 @@ fn setting_source_label(source: &norted_core::SettingSource) -> &'static str {
 
 fn q27_has_configured_execution(settings: &norted_core::ResolvedSettings) -> bool {
     settings.configured.keys().any(|id| {
-        matches!(
-            id.as_str(),
-            "context_length"
-                | "parallel_requests"
-                | "temperature"
-                | "top_p"
-                | "top_k"
-                | "min_p"
-                | "seed"
-                | "max_output_tokens"
-                | "system_prompt"
-                | "reasoning"
-                | "reasoning_budget"
-                | "q27.thinking"
-                | "q27.thinking_budget"
-                | "q27.request_thinking"
-                | "q27.constrain_tools"
-                | "q27.continuous_batching"
-                | "q27.sampled_graphs"
-                | "q27.slot1_context_length"
-                | "q27.fast_head"
-                | "q27.kv_mode"
-                | "q27.mtp"
-                | "q27.mtp_max_depth"
-                | "q27.mtp_min_probability"
-                | "q27.suffix_drafting"
-                | "q27.suffix_width_mode"
-                | "q27.prompt_mode"
-                | "q27.prompt_delivery"
-                | "q27.template_path"
-                | "q27.template_sha256"
-                | "q27.render_generation_prompt"
-                | "q27.template_thinking"
-                | "q27.response_filter"
-        )
+        q27_environment_name(id.as_str()).is_some()
+            || matches!(
+                id.as_str(),
+                "q27.context_length"
+                    | "q27.parallel_requests"
+                    | "q27.temperature"
+                    | "q27.top_p"
+                    | "q27.top_k"
+                    | "q27.min_p"
+                    | "q27.seed"
+                    | "q27.max_output_tokens"
+                    | "q27.system_prompt"
+                    | "q27.reasoning"
+                    | "q27.reasoning_budget"
+                    | "q27.thinking"
+                    | "q27.thinking_budget"
+                    | "q27.request_thinking"
+                    | "q27.constrain_tools"
+                    | "q27.continuous_batching"
+                    | "q27.sampled_graphs"
+                    | "q27.slot1_context_length"
+                    | "q27.fast_head"
+                    | "q27.kv_mode"
+                    | "q27.mtp"
+                    | "q27.mtp_max_depth"
+                    | "q27.mtp_min_probability"
+                    | "q27.suffix_drafting"
+                    | "q27.suffix_width_mode"
+                    | "q27.prompt_mode"
+                    | "q27.prompt_delivery"
+                    | "q27.template_path"
+                    | "q27.template_sha256"
+                    | "q27.render_generation_prompt"
+                    | "q27.template_thinking"
+                    | "q27.response_filter"
+            )
     })
 }
 
@@ -1640,19 +1677,19 @@ fn q27_configured_launch(
     for (option, value) in [
         (
             "--temp",
-            setting_float(settings, "temperature").map(|value| value.to_string()),
+            setting_float(settings, "q27.temperature").map(|value| value.to_string()),
         ),
         (
             "--top-p",
-            setting_float(settings, "top_p").map(|value| value.to_string()),
+            setting_float(settings, "q27.top_p").map(|value| value.to_string()),
         ),
         (
             "--top-k",
-            setting_unsigned(settings, "top_k").map(|value| value.to_string()),
+            setting_unsigned(settings, "q27.top_k").map(|value| value.to_string()),
         ),
         (
             "--min-p",
-            setting_float(settings, "min_p").map(|value| value.to_string()),
+            setting_float(settings, "q27.min_p").map(|value| value.to_string()),
         ),
     ] {
         if let Some(value) = value {
@@ -1692,6 +1729,48 @@ fn q27_configured_launch(
             environment.insert("Q27_SUFFIX_W".to_owned(), compiled_w_max.to_string());
         }
     }
+    for (id, setting) in &settings.configured {
+        let Some(name) = q27_environment_name(id.as_str()) else {
+            continue;
+        };
+        let value = match (id.as_str(), &setting.value) {
+            ("q27.serving_profile", SettingValue::Choice(value)) if value == "cc" => continue,
+            (
+                "q27.tool_dialect"
+                | "q27.decode_attention"
+                | "q27.prefill_token_tile"
+                | "q27.delta_scan_split",
+                SettingValue::Choice(value),
+            ) if value == "auto" => continue,
+            ("q27.batch_gemm", SettingValue::Choice(value))
+            | ("q27.prefill_split_k", SettingValue::Choice(value)) => match value.as_str() {
+                "auto" => "auto".to_owned(),
+                "on" => "1".to_owned(),
+                "off" => "0".to_owned(),
+                _ => {
+                    return Err(EngineError::InvalidConfiguration(format!(
+                        "setting `{id}` has an invalid q27 environment value"
+                    )));
+                }
+            },
+            ("q27.gpu_interleaving", SettingValue::Toggle(true)) => continue,
+            ("q27.gpu_interleaving", SettingValue::Toggle(false)) => "1".to_owned(),
+            (
+                "q27.plain_sampling" | "q27.tool_split" | "q27.bare_system_prompt",
+                SettingValue::Toggle(false),
+            ) => continue,
+            (_, SettingValue::Toggle(value)) => u8::from(*value).to_string(),
+            (_, SettingValue::UnsignedInteger(value)) => value.to_string(),
+            (_, SettingValue::Float(value)) => value.to_string(),
+            (_, SettingValue::Choice(value)) => value.clone(),
+            _ => {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "setting `{id}` has an invalid q27 environment value"
+                )));
+            }
+        };
+        environment.insert(name.to_owned(), value);
+    }
     let mut normalized_settings = BTreeMap::new();
     for (id, setting) in &settings.configured {
         normalized_settings.insert(
@@ -1715,8 +1794,8 @@ fn verify_q27_process_setting_arguments(
     arguments: &[OsString],
 ) -> Result<(), EngineError> {
     for (id, option) in [
-        ("context_length", "--ctx"),
-        ("parallel_requests", "--slots"),
+        ("q27.context_length", "--ctx"),
+        ("q27.parallel_requests", "--slots"),
         ("q27.slot1_context_length", "--slot1-ctx"),
     ] {
         let expected = setting_unsigned(settings, id).map(|value| value.to_string());
@@ -2200,7 +2279,7 @@ impl Q27Adapter {
         let effective_temperature = request
             .generation_settings
             .temperature
-            .or_else(|| setting_float(&execution.settings, "temperature"))
+            .or_else(|| setting_float(&execution.settings, "q27.temperature"))
             .unwrap_or(0.0);
         let requests_sampling_control = request.generation_settings.seed.is_some()
             || request
@@ -2238,7 +2317,7 @@ impl Q27Adapter {
                     .generation_settings
                     .reasoning_effort
                     .map(norted_engine::ReasoningEffort::as_str)
-                    .or_else(|| setting_choice(&execution.settings, "reasoning_effort")),
+                    .or_else(|| setting_choice(&execution.settings, "q27.reasoning_effort")),
             )?);
             "/v1/completions"
         } else {
@@ -2258,7 +2337,7 @@ impl Q27Adapter {
                     request
                         .generation_settings
                         .temperature
-                        .or_else(|| setting_float(&execution.settings, "temperature"))
+                        .or_else(|| setting_float(&execution.settings, "q27.temperature"))
                         .unwrap_or(0.0),
                 )),
             ),
@@ -2268,7 +2347,7 @@ impl Q27Adapter {
                     request
                         .generation_settings
                         .top_p
-                        .or_else(|| setting_float(&execution.settings, "top_p"))
+                        .or_else(|| setting_float(&execution.settings, "q27.top_p"))
                         .unwrap_or(1.0),
                 )),
             ),
@@ -2277,7 +2356,7 @@ impl Q27Adapter {
                 request
                     .generation_settings
                     .top_k
-                    .or_else(|| setting_unsigned(&execution.settings, "top_k"))
+                    .or_else(|| setting_unsigned(&execution.settings, "q27.top_k"))
                     .map(Value::from),
             ),
             (
@@ -2285,7 +2364,7 @@ impl Q27Adapter {
                 request
                     .generation_settings
                     .min_p
-                    .or_else(|| setting_float(&execution.settings, "min_p"))
+                    .or_else(|| setting_float(&execution.settings, "q27.min_p"))
                     .map(Value::from),
             ),
         ] {
@@ -2815,6 +2894,7 @@ impl EngineAdapter for Q27Adapter {
         );
         let facts = inspect_q27_model(&model.path).map_err(EngineError::InvalidConfiguration)?;
         apply_q27_model_capabilities(&mut schema.definitions, &facts);
+        apply_q27_profile_defaults(&mut schema.definitions, settings);
         apply_q27_context_defaults(&mut schema.definitions, runtime, model, host, settings);
         schema.definitions = configurable_setting_definitions(schema.definitions);
         Ok(schema)
@@ -3235,7 +3315,7 @@ impl EngineAdapter for Q27Adapter {
             ));
         }
         if let Some((requested_context, source)) =
-            setting_unsigned_with_source(&execution.settings, "context_length")
+            setting_unsigned_with_source(&execution.settings, "q27.context_length")
         {
             if observed.initial_auto_context.is_some() {
                 return Err(EngineError::Operation(
@@ -3258,7 +3338,7 @@ impl EngineAdapter for Q27Adapter {
         }
         let ready_slot_count = observed.slot_contexts.len() as u64;
         if let Some((requested_slots, source)) =
-            setting_unsigned_with_source(&execution.settings, "parallel_requests")
+            setting_unsigned_with_source(&execution.settings, "q27.parallel_requests")
             && ready_slot_count != requested_slots
         {
             let changed = if ready_slot_count < requested_slots {
@@ -3335,8 +3415,11 @@ impl EngineAdapter for Q27Adapter {
             proof.insert("auto_context_kv_mode".to_owned(), json!(auto_kv_mode));
         }
         let mut resolved_settings = serde_json::Map::from_iter([
-            ("context_length".to_owned(), json!(observed.served_context)),
-            ("parallel_requests".to_owned(), json!(ready_slot_count)),
+            (
+                "q27.context_length".to_owned(),
+                json!(observed.served_context),
+            ),
+            ("q27.parallel_requests".to_owned(), json!(ready_slot_count)),
             ("q27.kv_mode".to_owned(), json!(observed.kv_mode)),
             ("q27.fast_head".to_owned(), json!(observed.fast_head)),
             ("q27.thinking".to_owned(), json!(observed.thinking)),
@@ -3399,8 +3482,8 @@ impl EngineAdapter for Q27Adapter {
                 top_p: 1.0,
             },
             |execution| EffectiveGenerationSettings {
-                temperature: setting_float(&execution.settings, "temperature").unwrap_or(0.0),
-                top_p: setting_float(&execution.settings, "top_p").unwrap_or(1.0),
+                temperature: setting_float(&execution.settings, "q27.temperature").unwrap_or(0.0),
+                top_p: setting_float(&execution.settings, "q27.top_p").unwrap_or(1.0),
             },
         ))
     }
@@ -3632,7 +3715,7 @@ fn validate_configured_template(
         setting_toggle(settings, "q27.template_thinking")
             .or_else(|| setting_toggle(settings, "q27.thinking"))
             .unwrap_or(false),
-        setting_choice(settings, "reasoning_effort"),
+        setting_choice(settings, "q27.reasoning_effort"),
     )?;
     if rendered.is_empty() {
         return Err(EngineError::InvalidConfiguration(
@@ -4549,7 +4632,7 @@ fn q27_settings_schema_from_usage(
     if capabilities.request_seed
         && let Some(seed) = definitions
             .iter_mut()
-            .find(|definition| definition.id.as_str() == "seed")
+            .find(|definition| definition.id.as_str() == "q27.seed")
     {
         seed.description =
             "Configured numeric q27 request seed; q27 does not implement the `random` sentinel"
@@ -4580,12 +4663,12 @@ fn q27_settings_schema_from_usage(
             "q27.continuous_batching" | "q27.sampled_graphs" => {
                 capabilities.stable_serving_environment
             }
-            "temperature" | "top_p" => capabilities.temperature_top_p,
-            "top_k" | "min_p" => capabilities.top_k_min_p,
-            "seed" => capabilities.request_seed,
-            "max_output_tokens" | "system_prompt" => capabilities.trustworthy_identity,
-            "reasoning" | "reasoning_budget" => capabilities.request_thinking,
-            "reasoning_effort" => false,
+            "q27.temperature" | "q27.top_p" => capabilities.temperature_top_p,
+            "q27.top_k" | "q27.min_p" => capabilities.top_k_min_p,
+            "q27.seed" => capabilities.request_seed,
+            "q27.max_output_tokens" | "q27.system_prompt" => capabilities.trustworthy_identity,
+            "q27.reasoning" | "q27.reasoning_budget" => capabilities.request_thinking,
+            "q27.reasoning_effort" => false,
             "q27.kv_mode" => !capabilities.supported_kv_modes.is_empty(),
             "q27.mtp" | "q27.mtp_max_depth" | "q27.mtp_min_probability" | "q27.suffix_drafting" => {
                 capabilities.mtp_environment
@@ -4600,7 +4683,8 @@ fn q27_settings_schema_from_usage(
             | "q27.response_filter" => {
                 capabilities.raw_completions && capabilities.exact_sharp_renderer
             }
-            "parallel_requests" => {
+            id if q27_environment_name(id).is_some() => capabilities.stable_serving_environment,
+            "q27.parallel_requests" => {
                 capabilities.trustworthy_identity || usage_has_token(&usage, option)
             }
             _ => usage_has_token(&usage, option),
@@ -4637,17 +4721,17 @@ fn q27_settings_schema_from_usage(
 
 fn q27_setting_definitions() -> Vec<SettingDefinition> {
     const COMMON_SETTINGS: &[&str] = &[
-        "context_length",
-        "parallel_requests",
-        "temperature",
-        "top_p",
-        "top_k",
-        "min_p",
-        "seed",
-        "max_output_tokens",
-        "system_prompt",
-        "reasoning",
-        "reasoning_budget",
+        "q27.context_length",
+        "q27.parallel_requests",
+        "q27.temperature",
+        "q27.top_p",
+        "q27.top_k",
+        "q27.min_p",
+        "q27.seed",
+        "q27.max_output_tokens",
+        "q27.system_prompt",
+        "q27.reasoning",
+        "q27.reasoning_budget",
     ];
     let mut definitions = common_setting_definitions_for(ENGINE_ID, COMMON_SETTINGS);
     definitions.extend([
@@ -4884,7 +4968,334 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
             Some("exact runtime default"),
         ),
     ]);
+    definitions.extend(q27_reviewed_environment_definitions());
     definitions
+}
+
+fn q27_reviewed_environment_definitions() -> Vec<SettingDefinition> {
+    let toggle = |id, label, description| {
+        q27_definition(
+            id,
+            label,
+            description,
+            SettingKind::Toggle,
+            Some("reviewed q27 environment"),
+        )
+    };
+    let unsigned = |id, label, description, minimum| {
+        q27_definition(
+            id,
+            label,
+            description,
+            SettingKind::UnsignedInteger {
+                minimum: Some(minimum),
+                maximum: None,
+            },
+            Some("reviewed q27 environment"),
+        )
+    };
+    let float = |id, label, description, minimum, maximum| {
+        q27_definition(
+            id,
+            label,
+            description,
+            SettingKind::Float { minimum, maximum },
+            Some("reviewed q27 environment"),
+        )
+    };
+    vec![
+        q27_definition(
+            "q27.serving_profile",
+            "Serving profile",
+            "q27 serving defaults profile",
+            SettingKind::Choice {
+                choices: vec!["cc".to_owned(), "ref".to_owned()],
+            },
+            Some("reviewed q27 environment"),
+        ),
+        float(
+            "q27.force_temperature",
+            "Forced temperature",
+            "Force a temperature when a request omits it",
+            Some(0.0),
+            None,
+        ),
+        float(
+            "q27.force_top_p",
+            "Forced Top P",
+            "Force Top P when a request omits it",
+            Some(0.0),
+            Some(1.0),
+        ),
+        toggle(
+            "q27.batch_graphs",
+            "Batch graphs",
+            "Capture fused continuous-batching CUDA graphs",
+        ),
+        unsigned(
+            "q27.batch_graph_capacity",
+            "Batch graph capacity",
+            "Maximum fused graph executable cache entries before headroom shrinking",
+            1,
+        ),
+        q27_definition(
+            "q27.batch_gemm",
+            "Batch GEMM",
+            "Fused batch GEMM policy",
+            SettingKind::Choice {
+                choices: vec!["auto".to_owned(), "on".to_owned(), "off".to_owned()],
+            },
+            Some("reviewed q27 environment"),
+        ),
+        toggle(
+            "q27.kv_pooling",
+            "KV pooling",
+            "Use the process-wide paged KV pool",
+        ),
+        toggle(
+            "q27.shared_prefill_arena",
+            "Shared prefill arena",
+            "Use one process-wide prefill scratch arena",
+        ),
+        toggle(
+            "q27.draft_early_exit",
+            "Draft early exit",
+            "Stop confidence-gated drafting as soon as its margin gate trips",
+        ),
+        toggle(
+            "q27.plain_sampling",
+            "Plain sampling",
+            "Use the non-speculative sampler path for sampled requests",
+        ),
+        toggle(
+            "q27.tool_split",
+            "Tool split",
+            "Use the split constrained-tool decode path",
+        ),
+        toggle(
+            "q27.gpu_interleaving",
+            "GPU interleaving",
+            "Interleave multi-slot work at round granularity",
+        ),
+        toggle(
+            "q27.phase_stats",
+            "Phase statistics",
+            "Log per-request draft and verify phase statistics",
+        ),
+        unsigned(
+            "q27.readiness_floor_mib",
+            "Ready VRAM floor",
+            "Warn when free VRAM at readiness is below this threshold",
+            0,
+        ),
+        float(
+            "q27.thinking_budget_fraction",
+            "Thinking budget fraction",
+            "Fraction of request max tokens used for the automatic thinking budget",
+            Some(f64::MIN_POSITIVE),
+            Some(1.0 - f64::EPSILON),
+        ),
+        unsigned(
+            "q27.suffix_min_match",
+            "Suffix minimum match",
+            "Minimum matching suffix length required before suffix drafting",
+            1,
+        ),
+        unsigned(
+            "q27.prefill_batch_min",
+            "Prefill batch threshold",
+            "Minimum prompt length routed through chunked prefill",
+            2,
+        ),
+        unsigned(
+            "q27.gemm_min_width",
+            "GEMM minimum width",
+            "Verify width at which q27 changes from GEMV to GEMM",
+            1,
+        ),
+        q27_definition(
+            "q27.prefill_split_k",
+            "Prefill split-K",
+            "q27 split-K prefill GEMM policy",
+            SettingKind::Choice {
+                choices: vec!["auto".to_owned(), "on".to_owned(), "off".to_owned()],
+            },
+            Some("reviewed q27 environment"),
+        ),
+        q27_definition(
+            "q27.prefill_kernel",
+            "Prefill kernel",
+            "q27 prefill GEMM implementation",
+            SettingKind::Choice {
+                choices: vec!["mma".to_owned(), "dp4a".to_owned(), "fp4".to_owned()],
+            },
+            Some("reviewed q27 environment"),
+        ),
+        q27_definition(
+            "q27.prefill_activation_group",
+            "Prefill activation group",
+            "Activation regroup width for prefill",
+            SettingKind::Choice {
+                choices: vec!["32".to_owned(), "64".to_owned()],
+            },
+            Some("reviewed q27 environment"),
+        ),
+        q27_definition(
+            "q27.prefill_token_tile",
+            "Prefill token tile",
+            "Fixed prefill GEMM token tile; zero keeps automatic dispatch",
+            SettingKind::Choice {
+                choices: vec![
+                    "auto".to_owned(),
+                    "16".to_owned(),
+                    "32".to_owned(),
+                    "64".to_owned(),
+                    "128".to_owned(),
+                ],
+            },
+            Some("reviewed q27 environment"),
+        ),
+        q27_definition(
+            "q27.decode_attention",
+            "Decode attention",
+            "Speculative verify/decode attention implementation",
+            SettingKind::Choice {
+                choices: vec![
+                    "auto".to_owned(),
+                    "fd2".to_owned(),
+                    "v1".to_owned(),
+                    "mma".to_owned(),
+                ],
+            },
+            Some("reviewed q27 environment"),
+        ),
+        q27_definition(
+            "q27.delta_scan_mode",
+            "Delta scan mode",
+            "Recurrent delta-scan implementation",
+            SettingKind::Choice {
+                choices: vec!["wy".to_owned(), "seq".to_owned()],
+            },
+            Some("reviewed q27 environment"),
+        ),
+        q27_definition(
+            "q27.delta_scan_split",
+            "Delta scan split",
+            "Delta-scan split count; one restores the exact reference path",
+            SettingKind::Choice {
+                choices: vec![
+                    "auto".to_owned(),
+                    "1".to_owned(),
+                    "2".to_owned(),
+                    "4".to_owned(),
+                    "8".to_owned(),
+                ],
+            },
+            Some("reviewed q27 environment"),
+        ),
+        unsigned(
+            "q27.checkpoint_interval",
+            "Checkpoint interval",
+            "Token interval between q27 recurrent-state checkpoints",
+            1,
+        ),
+        unsigned(
+            "q27.checkpoint_slots",
+            "Checkpoint slots",
+            "Number of recurrent-state checkpoint slots",
+            1,
+        ),
+        toggle(
+            "q27.adaptive_depth_reset",
+            "Adaptive-depth reset",
+            "Reset the adaptive MTP-depth controller for every request",
+        ),
+        float(
+            "q27.adaptive_depth_ema",
+            "Adaptive-depth EMA",
+            "Adaptive MTP-depth controller EMA coefficient",
+            Some(0.0),
+            Some(1.0),
+        ),
+        float(
+            "q27.adaptive_depth_high",
+            "Adaptive-depth high",
+            "Adaptive MTP-depth high threshold",
+            None,
+            None,
+        ),
+        float(
+            "q27.adaptive_depth_high6",
+            "Adaptive-depth high 6",
+            "Adaptive MTP depth-6 high threshold",
+            None,
+            None,
+        ),
+        float(
+            "q27.adaptive_depth_high7",
+            "Adaptive-depth high 7",
+            "Adaptive MTP depth-7 high threshold",
+            None,
+            None,
+        ),
+        float(
+            "q27.adaptive_depth_floor6",
+            "Adaptive-depth floor 6",
+            "Adaptive MTP depth-6 floor threshold",
+            None,
+            None,
+        ),
+        float(
+            "q27.adaptive_depth_floor7",
+            "Adaptive-depth floor 7",
+            "Adaptive MTP depth-7 floor threshold",
+            None,
+            None,
+        ),
+        float(
+            "q27.adaptive_depth_low",
+            "Adaptive-depth low",
+            "Adaptive MTP-depth low threshold",
+            None,
+            None,
+        ),
+        q27_definition(
+            "q27.tool_dialect",
+            "Tool dialect",
+            "Use model-derived tool-call syntax or force JSON/XML",
+            SettingKind::Choice {
+                choices: vec!["auto".to_owned(), "json".to_owned(), "xml".to_owned()],
+            },
+            Some("reviewed q27 environment"),
+        ),
+        toggle(
+            "q27.strict_tool_parser",
+            "Strict tool parser",
+            "Disable tolerant tool-call parser recovery",
+        ),
+        toggle(
+            "q27.tool_error_warnings",
+            "Tool error warnings",
+            "Inject tool-error recovery warnings",
+        ),
+        unsigned(
+            "q27.max_tool_argument_chars",
+            "Tool argument limit",
+            "Maximum rendered tool-call argument characters; zero is unlimited",
+            0,
+        ),
+        unsigned(
+            "q27.max_tool_response_chars",
+            "Tool response limit",
+            "Maximum rendered XML tool-response characters; zero is unlimited",
+            0,
+        ),
+        toggle(
+            "q27.bare_system_prompt",
+            "Bare system prompt",
+            "Do not inject q27's fallback system prompt when the request omits one",
+        ),
+    ]
 }
 
 fn q27_model_setting_definitions(
@@ -4898,15 +5309,15 @@ fn q27_model_setting_definitions(
 
 fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
     for (id, value) in [
-        ("context_length", "auto"),
-        ("parallel_requests", "1"),
-        ("temperature", "0.0"),
-        ("top_p", "1.0"),
-        ("top_k", "0"),
-        ("min_p", "0.0"),
-        ("max_output_tokens", "8192"),
-        ("reasoning", "off"),
-        ("reasoning_budget", "auto"),
+        ("q27.context_length", "auto"),
+        ("q27.parallel_requests", "1"),
+        ("q27.temperature", "0.0"),
+        ("q27.top_p", "1.0"),
+        ("q27.top_k", "0"),
+        ("q27.min_p", "0.0"),
+        ("q27.max_output_tokens", "8192"),
+        ("q27.reasoning", "off"),
+        ("q27.reasoning_budget", "auto"),
         ("q27.slot1_context_length", "auto"),
         ("q27.kv_mode", "auto"),
         ("q27.fast_head", "enabled"),
@@ -4925,6 +5336,47 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
         ("q27.prefix_cache_max_tokens", "32768"),
         ("q27.prefix_cache_step_tokens", "8192"),
         ("q27.prefix_cache_ram_gb", "disabled"),
+        ("q27.serving_profile", "cc"),
+        ("q27.force_temperature", "0.0"),
+        ("q27.force_top_p", "1.0"),
+        ("q27.batch_graphs", "enabled"),
+        ("q27.batch_graph_capacity", "64"),
+        ("q27.batch_gemm", "auto"),
+        ("q27.kv_pooling", "enabled"),
+        ("q27.shared_prefill_arena", "enabled"),
+        ("q27.draft_early_exit", "enabled"),
+        ("q27.plain_sampling", "disabled"),
+        ("q27.tool_split", "disabled"),
+        ("q27.gpu_interleaving", "enabled"),
+        ("q27.phase_stats", "enabled"),
+        ("q27.readiness_floor_mib", "192 MiB"),
+        ("q27.thinking_budget_fraction", "0.5"),
+        ("q27.suffix_min_match", "12"),
+        ("q27.prefill_batch_min", "2"),
+        ("q27.gemm_min_width", "9"),
+        ("q27.prefill_split_k", "auto"),
+        ("q27.prefill_kernel", "mma"),
+        ("q27.prefill_activation_group", "64"),
+        ("q27.prefill_token_tile", "auto"),
+        ("q27.decode_attention", "auto"),
+        ("q27.delta_scan_mode", "wy"),
+        ("q27.delta_scan_split", "auto"),
+        ("q27.checkpoint_interval", "4096"),
+        ("q27.checkpoint_slots", "16"),
+        ("q27.adaptive_depth_reset", "disabled"),
+        ("q27.adaptive_depth_ema", "0.0625"),
+        ("q27.adaptive_depth_high", "0.5"),
+        ("q27.adaptive_depth_high6", "0.6"),
+        ("q27.adaptive_depth_high7", "0.6"),
+        ("q27.adaptive_depth_floor6", "0.45"),
+        ("q27.adaptive_depth_floor7", "0.45"),
+        ("q27.adaptive_depth_low", "0.35"),
+        ("q27.tool_dialect", "auto"),
+        ("q27.strict_tool_parser", "disabled"),
+        ("q27.tool_error_warnings", "disabled"),
+        ("q27.max_tool_argument_chars", "unlimited"),
+        ("q27.max_tool_response_chars", "unlimited"),
+        ("q27.bare_system_prompt", "disabled"),
     ] {
         set_q27_default(
             definitions,
@@ -4934,7 +5386,7 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
     }
     set_q27_default(
         definitions,
-        "context_length",
+        "q27.context_length",
         SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
             "q27 sizes context from live free VRAM and startup reservations after model weights load; compact KV is capped at 262144 and FP16 at 131072",
         ),
@@ -4975,11 +5427,37 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
     );
     set_q27_default(
         definitions,
-        "reasoning_budget",
+        "q27.reasoning_budget",
         SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime).with_detail(
             "When request thinking is enabled, an omitted request budget remains request-derived",
         ),
     );
+}
+
+fn apply_q27_profile_defaults(
+    definitions: &mut [SettingDefinition],
+    settings: Option<&norted_core::ResolvedSettings>,
+) {
+    if settings.and_then(|settings| setting_choice(settings, "q27.serving_profile")) != Some("ref")
+    {
+        return;
+    }
+    for (id, value) in [
+        ("q27.fast_head", "disabled"),
+        ("q27.thinking", "enabled"),
+        ("q27.continuous_batching", "disabled"),
+        ("q27.kv_mode", "fp16"),
+        ("q27.suffix_drafting", "disabled"),
+        ("q27.prefill_batch_min", "32"),
+        ("q27.decode_attention", "fd2"),
+    ] {
+        set_q27_default(
+            definitions,
+            id,
+            SettingDefaultPreview::new(value, SettingDefaultSource::Runtime)
+                .with_detail("Selected q27 reference serving profile"),
+        );
+    }
 }
 
 fn set_q27_default(
@@ -5015,7 +5493,13 @@ fn apply_q27_context_defaults(
         return;
     }
 
-    let configured_mode = settings.and_then(|settings| setting_choice(settings, "q27.kv_mode"));
+    let configured_mode = settings
+        .and_then(|settings| setting_choice(settings, "q27.kv_mode"))
+        .or_else(|| {
+            (settings.and_then(|settings| setting_choice(settings, "q27.serving_profile"))
+                == Some("ref"))
+            .then_some("fp16")
+        });
     let default_mode = if matches!(configured_mode, Some(mode) if mode != "runtime_default") {
         None
     } else {
@@ -5072,7 +5556,7 @@ fn apply_q27_context_defaults(
             "q27 sizes context from live free VRAM and startup reservations after model weights load; the selected KV policy caps it at {context_cap}"
         ),
     );
-    set_q27_default(definitions, "context_length", context.clone());
+    set_q27_default(definitions, "q27.context_length", context.clone());
     set_q27_default(
         definitions,
         "q27.slot1_context_length",
@@ -5202,7 +5686,7 @@ fn q27_setting_category(id: &str) -> SettingCategory {
         SettingCategory::Prompt
     } else if id.contains("mtp") || id.contains("suffix") {
         SettingCategory::Speculation
-    } else if id.contains("kv_") || id.contains("context_length") {
+    } else if id.contains("kv_") || id.contains("q27.context_length") {
         SettingCategory::KvMemory
     } else if id.contains("cache") {
         SettingCategory::Cache
@@ -5213,8 +5697,8 @@ fn q27_setting_category(id: &str) -> SettingCategory {
 
 fn q27_setting_option(id: &str) -> &'static str {
     match id {
-        "context_length" => "--ctx",
-        "parallel_requests" => "--slots",
+        "q27.context_length" => "--ctx",
+        "q27.parallel_requests" => "--slots",
         "q27.slot1_context_length" => "--slot1-ctx",
         "q27.fast_head" => "--fast-head",
         "q27.request_thinking" => "--request-think",
@@ -5227,6 +5711,53 @@ fn q27_setting_option(id: &str) -> &'static str {
         "q27.prefix_cache_ram_gb" => "--prefix-cache-ram-gb",
         _ => "",
     }
+}
+
+fn q27_environment_name(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "q27.serving_profile" => "Q27_PROFILE",
+        "q27.force_temperature" => "Q27_FORCE_TEMP",
+        "q27.force_top_p" => "Q27_FORCE_TOP_P",
+        "q27.batch_graphs" => "Q27_BATCH_GRAPH",
+        "q27.batch_graph_capacity" => "Q27_BATCH_GRAPH_CAP",
+        "q27.batch_gemm" => "Q27_BATCH_GEMM",
+        "q27.kv_pooling" => "Q27_KV_POOL",
+        "q27.shared_prefill_arena" => "Q27_PF_ARENA",
+        "q27.draft_early_exit" => "Q27_DEXIT",
+        "q27.plain_sampling" => "Q27_SAMPLE_PLAIN",
+        "q27.tool_split" => "Q27_TOOL_SPLIT",
+        "q27.gpu_interleaving" => "Q27_NO_INTERLEAVE",
+        "q27.phase_stats" => "Q27_PHASE_STATS",
+        "q27.readiness_floor_mib" => "Q27_READY_FLOOR_MB",
+        "q27.thinking_budget_fraction" => "Q27_THINK_BUDGET_FRAC",
+        "q27.suffix_min_match" => "Q27_SUFFIX_L",
+        "q27.prefill_batch_min" => "Q27_PF_BATCH_MIN",
+        "q27.gemm_min_width" => "Q27_GEMM_MIN",
+        "q27.prefill_split_k" => "Q27_GEMM_SPLITK",
+        "q27.prefill_kernel" => "Q27_PREFILL",
+        "q27.prefill_activation_group" => "Q27_PF_XG",
+        "q27.prefill_token_tile" => "Q27_PF_NT",
+        "q27.decode_attention" => "Q27_FD",
+        "q27.delta_scan_mode" => "Q27_DS_MODE",
+        "q27.delta_scan_split" => "Q27_DS_SPLIT",
+        "q27.checkpoint_interval" => "Q27_CKPT_INTERVAL",
+        "q27.checkpoint_slots" => "Q27_CKPT_SLOTS",
+        "q27.adaptive_depth_reset" => "Q27_MAXD_RESET",
+        "q27.adaptive_depth_ema" => "Q27_MAXD_EMA",
+        "q27.adaptive_depth_high" => "Q27_MAXD_HI",
+        "q27.adaptive_depth_high6" => "Q27_MAXD_HI6",
+        "q27.adaptive_depth_high7" => "Q27_MAXD_HI7",
+        "q27.adaptive_depth_floor6" => "Q27_MAXD_FLO6",
+        "q27.adaptive_depth_floor7" => "Q27_MAXD_FLO7",
+        "q27.adaptive_depth_low" => "Q27_MAXD_LO",
+        "q27.tool_dialect" => "Q27_TOOL_DIALECT",
+        "q27.strict_tool_parser" => "Q27_TOOL_STRICT",
+        "q27.tool_error_warnings" => "Q27_TOOL_ERROR_WARNINGS",
+        "q27.max_tool_argument_chars" => "Q27_MAX_TOOL_ARG_CHARS",
+        "q27.max_tool_response_chars" => "Q27_MAX_TOOL_RESPONSE_CHARS",
+        "q27.bare_system_prompt" => "Q27_BARE",
+        _ => return None,
+    })
 }
 
 fn q27_setting_unavailable_by_version(managed: bool, version: &str, option: &str) -> bool {
@@ -5245,7 +5776,7 @@ fn apply_q27_runtime_bounds(definitions: &mut [SettingDefinition], managed: bool
     });
     if let Some(definition) = definitions
         .iter_mut()
-        .find(|definition| definition.id.as_str() == "parallel_requests")
+        .find(|definition| definition.id.as_str() == "q27.parallel_requests")
     {
         definition.kind = SettingKind::UnsignedInteger {
             minimum: Some(1),
@@ -5254,7 +5785,7 @@ fn apply_q27_runtime_bounds(definitions: &mut [SettingDefinition], managed: bool
     }
     if let Some(definition) = definitions
         .iter_mut()
-        .find(|definition| definition.id.as_str() == "top_k")
+        .find(|definition| definition.id.as_str() == "q27.top_k")
     {
         definition.kind = SettingKind::UnsignedInteger {
             minimum: Some(0),
@@ -5291,16 +5822,16 @@ fn translate_q27_settings(
     for (id, resolved) in &settings.configured {
         if matches!(
             id.as_str(),
-            "temperature"
-                | "top_p"
-                | "top_k"
-                | "min_p"
-                | "seed"
-                | "max_output_tokens"
-                | "system_prompt"
-                | "reasoning"
-                | "reasoning_budget"
-                | "reasoning_effort"
+            "q27.temperature"
+                | "q27.top_p"
+                | "q27.top_k"
+                | "q27.min_p"
+                | "q27.seed"
+                | "q27.max_output_tokens"
+                | "q27.system_prompt"
+                | "q27.reasoning"
+                | "q27.reasoning_budget"
+                | "q27.reasoning_effort"
                 | "q27.thinking"
                 | "q27.thinking_budget"
                 | "q27.request_thinking"
@@ -5333,10 +5864,10 @@ fn translate_q27_settings(
             )));
         }
         match (id.as_str(), &resolved.value) {
-            ("context_length", SettingValue::UnsignedInteger(value)) => {
+            ("q27.context_length", SettingValue::UnsignedInteger(value)) => {
                 push_q27_value_argument(&mut arguments, "--ctx", value);
             }
-            ("parallel_requests", SettingValue::UnsignedInteger(value)) => {
+            ("q27.parallel_requests", SettingValue::UnsignedInteger(value)) => {
                 push_q27_value_argument(&mut arguments, "--slots", value);
             }
             ("q27.slot1_context_length", SettingValue::UnsignedInteger(value)) => {
@@ -5659,10 +6190,10 @@ mod tests {
             .map(|definition| definition.id.to_string())
             .collect::<std::collections::BTreeSet<_>>();
         for expected in [
-            "temperature",
-            "top_p",
-            "top_k",
-            "min_p",
+            "q27.temperature",
+            "q27.top_p",
+            "q27.top_k",
+            "q27.min_p",
             "q27.thinking",
             "q27.thinking_budget",
             "q27.fast_head",
@@ -5683,14 +6214,14 @@ mod tests {
             assert!(ids.contains(expected), "missing q27 setting {expected}");
         }
         for absent in [
-            "frequency_penalty",
-            "presence_penalty",
-            "repeat_penalty",
-            "structured_output_schema",
-            "reasoning_budget_message",
-            "reasoning_effort",
-            "stop_strings",
-            "context_overflow",
+            "q27.frequency_penalty",
+            "q27.presence_penalty",
+            "q27.repeat_penalty",
+            "q27.structured_output_schema",
+            "q27.reasoning_budget_message",
+            "q27.reasoning_effort",
+            "q27.stop_strings",
+            "q27.context_overflow",
         ] {
             assert!(
                 !ids.contains(absent),
@@ -5762,10 +6293,10 @@ mod tests {
     #[test]
     fn configured_q27_values_translate_without_provenance_checks() {
         let settings = resolved(&[
-            ("temperature", SettingValue::Float(0.8)),
-            ("top_p", SettingValue::Float(0.9)),
-            ("top_k", SettingValue::UnsignedInteger(32)),
-            ("min_p", SettingValue::Float(0.05)),
+            ("q27.temperature", SettingValue::Float(0.8)),
+            ("q27.top_p", SettingValue::Float(0.9)),
+            ("q27.top_k", SettingValue::UnsignedInteger(32)),
+            ("q27.min_p", SettingValue::Float(0.05)),
             ("q27.thinking", SettingValue::Toggle(true)),
             ("q27.thinking_budget", SettingValue::UnsignedInteger(0)),
             ("q27.mtp", SettingValue::Toggle(true)),
@@ -5835,8 +6366,8 @@ mod tests {
     fn request_generation_values_override_configured_defaults() {
         let execution = Q27ConfiguredExecution {
             settings: resolved(&[
-                ("temperature", SettingValue::Float(0.8)),
-                ("top_p", SettingValue::Float(0.9)),
+                ("q27.temperature", SettingValue::Float(0.8)),
+                ("q27.top_p", SettingValue::Float(0.9)),
             ]),
             sharp_template: None,
             compiled_w_max: Some(12),

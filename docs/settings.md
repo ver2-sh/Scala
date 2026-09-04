@@ -15,13 +15,24 @@ The selected exact runtime is the only base. llama.cpp, q27, and NInfer own inde
 one runtime cannot inherit values from another. A runtime's authoritative baseline and persisted
 runtime customization are one user-facing `runtime default` layer.
 
-Persisted settings use schema 2 with separate `server_settings` and `runtime_defaults` fields. The
-obsolete Global schema is rejected; Norted does not read or migrate it.
+Persisted settings use schema 3 with separate `server_settings` and `runtime_defaults` fields.
+Schema 2 is intentionally rejected rather than migrated because Norted is unreleased and its
+unqualified inference IDs had ambiguous ownership.
 
-Common semantics such as context length, temperature, sampling, reasoning, prompts, structured
-output, and overflow policy are defined once in engine-neutral code. Each adapter binds the shared
-definitions into its own categories and supplies exact-runtime, model-derived, host-derived, or
-deliberately Norted-owned concrete values. Shared definitions never imply shared persisted defaults.
+Every setting identity belongs to exactly one domain:
+
+```text
+Server Settings            server.*
+llama.cpp Runtime Settings llama.cpp.*
+q27 Runtime Settings       q27.*
+NInfer Runtime Settings    ninfer.*
+```
+
+Context length, temperature, sampling, reasoning, prompts, structured output, overflow policy, and
+other same-named human concepts are independent settings. Engine-neutral Rust constructors may
+share type/label shape, but no ID, persisted value, default, inheritance, or semantic ownership is
+shared. An unqualified runtime ID is invalid in runtime defaults, Model Profiles, and invocation
+patches.
 
 ## Concrete values are mandatory
 
@@ -63,8 +74,8 @@ metadata, an exact immutable reviewed contract, or a Norted-owned value that Nor
 Common but unversioned upstream defaults are not treated as authoritative; when exact evidence cannot
 establish an omitted default, schema resolution reports that absence instead of inventing a value.
 
-Each runtime/model schema contains only settings configurable for that exact combination. Shared
-semantic definitions are reusable metadata, not automatic membership in every engine. A stale or
+Each runtime/model schema contains only settings configurable for that exact combination. Reusable
+definition constructors do not create shared setting identity. A stale or
 incompatible stored override is reported as unavailable for the selected schema, but it is not shown
 as an ordinary editable `Unsupported` row. An exposed setting may not use an ambiguous placeholder.
 
@@ -73,3 +84,6 @@ as an ordinary editable `Unsupported` row. An exposed setting may not use an amb
 An `Apply to all runtimes` feature must be a bulk copy. For example, applying temperature `0.7`
 writes independent llama.cpp, q27, and NInfer runtime-default values. The runtimes remain independent;
 the feature must never recreate a Global or shared-parent inference layer.
+
+The exact upstream coverage audit and option classifications are maintained in
+[`runtime-settings-coverage.md`](runtime-settings-coverage.md).

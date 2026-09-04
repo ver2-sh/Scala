@@ -638,30 +638,33 @@ impl EngineAdapter for LlamaCppAdapter {
     ) -> Result<(), EngineError> {
         self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
         let required = [
-            (request.generation_settings.seed.is_some(), "seed"),
+            (request.generation_settings.seed.is_some(), "llama.cpp.seed"),
             (
                 request.generation_settings.repeat_penalty.is_some(),
-                "repeat_penalty",
+                "llama.cpp.repeat_penalty",
             ),
             (
                 request.generation_settings.presence_penalty.is_some(),
-                "presence_penalty",
+                "llama.cpp.presence_penalty",
             ),
             (
                 request.generation_settings.frequency_penalty.is_some(),
-                "frequency_penalty",
+                "llama.cpp.frequency_penalty",
             ),
-            (request.generation_settings.stop.is_some(), "stop_strings"),
+            (
+                request.generation_settings.stop.is_some(),
+                "llama.cpp.stop_strings",
+            ),
             (
                 request.generation_settings.reasoning_effort.is_some(),
-                "reasoning_effort",
+                "llama.cpp.reasoning_effort",
             ),
             (
                 matches!(
                     request.output_format.as_ref(),
                     Some(OutputFormat::JsonObject | OutputFormat::JsonSchema { .. })
                 ),
-                "structured_output_schema",
+                "llama.cpp.structured_output_schema",
             ),
         ];
         for (used, id) in required {
@@ -670,7 +673,7 @@ impl EngineAdapter for LlamaCppAdapter {
             }
         }
         if let Some(effort) = request.generation_settings.reasoning_effort {
-            let id = SettingId::new("reasoning_effort").expect("static setting ID");
+            let id = SettingId::new("llama.cpp.reasoning_effort").expect("static setting ID");
             let definition = settings_schema.definition(&id).expect("common definition");
             let SettingKind::Choice { choices } = &definition.kind else {
                 return Err(EngineError::InvalidGenerationSettings(
@@ -827,6 +830,20 @@ impl EngineAdapter for LlamaCppAdapter {
         host: &HostCapabilities,
     ) -> u16 {
         llama_runtime_preference(&runtime.identity.accelerator, host)
+    }
+
+    fn normalize_settings(
+        &self,
+        settings: &mut norted_core::ResolvedSettings,
+    ) -> Result<(), EngineError> {
+        if settings.engine_id != ENGINE_ID {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "resolved settings belong to `{}`, not `{ENGINE_ID}`",
+                settings.engine_id
+            )));
+        }
+        normalize_llama_semantic_alternatives(settings);
+        Ok(())
     }
 
     fn native_options(&self) -> Vec<NativeOption> {
@@ -1192,11 +1209,14 @@ impl EngineAdapter for LlamaCppAdapter {
         })?;
         let properties = self.startup_properties(endpoint).await?;
         let mut resolved_settings = serde_json::Map::from_iter([(
-            "context_length".to_owned(),
+            "llama.cpp.context_length".to_owned(),
             json!(properties.context_length),
         )]);
         if let Some(parallel_requests) = properties.parallel_requests {
-            resolved_settings.insert("parallel_requests".to_owned(), json!(parallel_requests));
+            resolved_settings.insert(
+                "llama.cpp.parallel_requests".to_owned(),
+                json!(parallel_requests),
+            );
         }
         Ok(StartupObservation::Ready(BTreeMap::from([(
             "resolved_settings".to_owned(),
@@ -1313,6 +1333,73 @@ impl EngineAdapter for LlamaCppAdapter {
             return Err(backend_http_error(status, &body));
         }
         Ok(llama_sse_stream(response.bytes_stream().boxed(), activity))
+    }
+}
+
+fn setting_source_rank(source: &norted_core::SettingSource) -> u8 {
+    match source {
+        norted_core::SettingSource::RuntimeDefault => 0,
+        norted_core::SettingSource::ModelProfile { .. } => 1,
+        norted_core::SettingSource::Invocation => 2,
+    }
+}
+
+fn remove_if_lower(
+    settings: &mut norted_core::ResolvedSettings,
+    winner: &str,
+    alternatives: &[&str],
+) {
+    let Some(winner_rank) = settings.configured.iter().find_map(|(id, value)| {
+        (id.as_str() == winner).then(|| setting_source_rank(&value.source))
+    }) else {
+        return;
+    };
+    settings.configured.retain(|id, value| {
+        !alternatives.contains(&id.as_str()) || setting_source_rank(&value.source) >= winner_rank
+    });
+}
+
+fn normalize_llama_semantic_alternatives(settings: &mut norted_core::ResolvedSettings) {
+    remove_if_lower(
+        settings,
+        "llama.cpp.chat_template",
+        &[
+            "llama.cpp.chat_template_file",
+            "llama.cpp.chat_template_sha256",
+        ],
+    );
+    remove_if_lower(
+        settings,
+        "llama.cpp.chat_template_file",
+        &["llama.cpp.chat_template", "llama.cpp.chat_template_sha256"],
+    );
+    remove_if_lower(
+        settings,
+        "llama.cpp.cpu_moe_all",
+        &["llama.cpp.cpu_moe_layers"],
+    );
+    remove_if_lower(
+        settings,
+        "llama.cpp.cpu_moe_layers",
+        &["llama.cpp.cpu_moe_all"],
+    );
+    let mode_disables_bound_draft = settings.configured.iter().any(|(id, setting)| {
+        id.as_str() == "llama.cpp.speculative_mode"
+            && matches!(
+                &setting.value,
+                SettingValue::Choice(mode)
+                    if mode == "off" || mode == "draft-mtp" || mode.starts_with("ngram-")
+            )
+    });
+    if mode_disables_bound_draft {
+        remove_if_lower(
+            settings,
+            "llama.cpp.speculative_mode",
+            &[
+                "llama.cpp.speculative_draft_model",
+                "llama.cpp.speculative_draft_sha256",
+            ],
+        );
     }
 }
 
@@ -1663,25 +1750,25 @@ fn invalid_probe(reason: String) -> EngineProbe {
 
 fn llama_setting_definitions() -> Vec<SettingDefinition> {
     const COMMON_SETTINGS: &[&str] = &[
-        "context_length",
-        "parallel_requests",
-        "temperature",
-        "top_p",
-        "top_k",
-        "min_p",
-        "seed",
-        "repeat_penalty",
-        "presence_penalty",
-        "frequency_penalty",
-        "max_output_tokens",
-        "stop_strings",
-        "system_prompt",
-        "reasoning",
-        "reasoning_effort",
-        "reasoning_budget",
-        "reasoning_budget_message",
-        "structured_output_schema",
-        "context_overflow",
+        "llama.cpp.context_length",
+        "llama.cpp.parallel_requests",
+        "llama.cpp.temperature",
+        "llama.cpp.top_p",
+        "llama.cpp.top_k",
+        "llama.cpp.min_p",
+        "llama.cpp.seed",
+        "llama.cpp.repeat_penalty",
+        "llama.cpp.presence_penalty",
+        "llama.cpp.frequency_penalty",
+        "llama.cpp.max_output_tokens",
+        "llama.cpp.stop_strings",
+        "llama.cpp.system_prompt",
+        "llama.cpp.reasoning",
+        "llama.cpp.reasoning_effort",
+        "llama.cpp.reasoning_budget",
+        "llama.cpp.reasoning_budget_message",
+        "llama.cpp.structured_output_schema",
+        "llama.cpp.context_overflow",
     ];
     let mut definitions = common_setting_definitions_for(ENGINE_ID, COMMON_SETTINGS);
     definitions.extend([
@@ -1835,14 +1922,941 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
             SettingKind::String,
         ),
     ]);
+    definitions.extend(llama_extended_setting_definitions());
     definitions
+}
+
+fn llama_extended_setting_definitions() -> Vec<SettingDefinition> {
+    let uint = |minimum| SettingKind::UnsignedInteger {
+        minimum: Some(minimum),
+        maximum: None,
+    };
+    let integer = SettingKind::Integer {
+        minimum: None,
+        maximum: None,
+    };
+    let float = |minimum, maximum| SettingKind::Float { minimum, maximum };
+    let choice = |values: &[&str]| SettingKind::Choice {
+        choices: values.iter().map(|value| (*value).to_owned()).collect(),
+    };
+    let specs = [
+        (
+            "threads_batch",
+            "Batch CPU threads",
+            "CPU threads used for prompt and batch processing",
+            uint(1),
+            "same as llama.cpp.threads",
+        ),
+        (
+            "cpu_mask",
+            "CPU affinity mask",
+            "Generation-thread CPU affinity hexadecimal mask",
+            SettingKind::String,
+            "empty",
+        ),
+        (
+            "cpu_range",
+            "CPU affinity range",
+            "Generation-thread CPU affinity range",
+            SettingKind::String,
+            "None",
+        ),
+        (
+            "cpu_strict",
+            "Strict CPU placement",
+            "Require strict generation-thread CPU placement",
+            SettingKind::Toggle,
+            "disabled",
+        ),
+        (
+            "priority",
+            "Thread priority",
+            "Generation thread priority",
+            choice(&["low", "normal", "medium", "high", "realtime"]),
+            "normal",
+        ),
+        (
+            "poll",
+            "Thread polling",
+            "Generation worker polling percentage",
+            float(Some(0.0), Some(100.0)),
+            "50",
+        ),
+        (
+            "cpu_mask_batch",
+            "Batch CPU affinity mask",
+            "Batch-thread CPU affinity hexadecimal mask",
+            SettingKind::String,
+            "same as llama.cpp.cpu_mask",
+        ),
+        (
+            "cpu_range_batch",
+            "Batch CPU affinity range",
+            "Batch-thread CPU affinity range",
+            SettingKind::String,
+            "None",
+        ),
+        (
+            "cpu_strict_batch",
+            "Strict batch CPU placement",
+            "Require strict batch-thread CPU placement",
+            SettingKind::Toggle,
+            "same as llama.cpp.cpu_strict",
+        ),
+        (
+            "priority_batch",
+            "Batch thread priority",
+            "Batch thread priority",
+            choice(&["normal", "medium", "high", "realtime"]),
+            "normal",
+        ),
+        (
+            "poll_batch",
+            "Batch thread polling",
+            "Batch worker polling policy",
+            SettingKind::Toggle,
+            "same as llama.cpp.poll",
+        ),
+        (
+            "keep_tokens",
+            "Prompt tokens to keep",
+            "Initial prompt tokens retained during context shifting",
+            integer.clone(),
+            "0",
+        ),
+        (
+            "swa_full",
+            "Full SWA cache",
+            "Allocate a full-size sliding-window-attention cache",
+            SettingKind::Toggle,
+            "disabled",
+        ),
+        (
+            "performance_timings",
+            "Performance timings",
+            "Enable internal libllama performance timings",
+            SettingKind::Toggle,
+            "disabled",
+        ),
+        (
+            "escape_sequences",
+            "Escape sequences",
+            "Process escaped control sequences in prompt strings",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "rope_scaling",
+            "RoPE scaling method",
+            "RoPE scaling algorithm",
+            choice(&["none", "linear", "yarn"]),
+            "auto",
+        ),
+        (
+            "rope_context_scale",
+            "RoPE context scale",
+            "Context expansion factor",
+            float(Some(f64::MIN_POSITIVE), None),
+            "auto",
+        ),
+        (
+            "yarn_original_context",
+            "YaRN original context",
+            "Original training context for YaRN",
+            uint(0),
+            "model training context",
+        ),
+        (
+            "yarn_extrapolation_factor",
+            "YaRN extrapolation factor",
+            "YaRN extrapolation/interpolation mix",
+            float(None, None),
+            "auto",
+        ),
+        (
+            "yarn_attention_factor",
+            "YaRN attention factor",
+            "YaRN attention magnitude scale",
+            float(None, None),
+            "auto",
+        ),
+        (
+            "yarn_beta_slow",
+            "YaRN beta slow",
+            "YaRN high correction dimension",
+            float(None, None),
+            "auto",
+        ),
+        (
+            "yarn_beta_fast",
+            "YaRN beta fast",
+            "YaRN low correction dimension",
+            float(None, None),
+            "auto",
+        ),
+        (
+            "weight_repacking",
+            "Weight repacking",
+            "Enable weight repacking",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "host_buffer",
+            "Host buffer",
+            "Allow host buffers for model tensors",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "lazy_mode",
+            "Lazy tensor loading",
+            "On-demand tensor row loading policy",
+            choice(&["auto", "on", "off"]),
+            "auto",
+        ),
+        (
+            "numa",
+            "NUMA policy",
+            "NUMA execution placement",
+            choice(&["distribute", "isolate", "numactl"]),
+            "disabled",
+        ),
+        (
+            "override_tensor",
+            "Tensor placement overrides",
+            "Tensor-pattern to buffer-type placement overrides",
+            SettingKind::StringList,
+            "None",
+        ),
+        (
+            "cpu_ffn_layers",
+            "Dense FFN layers on CPU",
+            "Keep dense FFN weights for the first N layers on CPU",
+            uint(0),
+            "0",
+        ),
+        (
+            "split_mode",
+            "Multi-GPU split mode",
+            "Model placement strategy across selected GPUs",
+            choice(&["none", "layer", "row", "tensor"]),
+            "layer",
+        ),
+        (
+            "tensor_split",
+            "Tensor split",
+            "Per-device model offload proportions",
+            SettingKind::StringList,
+            "auto",
+        ),
+        (
+            "main_gpu",
+            "Main GPU",
+            "Primary GPU index for single/row split operation",
+            uint(0),
+            "0",
+        ),
+        (
+            "fit",
+            "Fit to device memory",
+            "Adjust otherwise-unset settings to fit device memory",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "fit_target_mib",
+            "Fit target margins",
+            "Per-device free-memory margins in MiB",
+            SettingKind::StringList,
+            "1024 MiB per device",
+        ),
+        (
+            "fit_min_context",
+            "Fit minimum context",
+            "Minimum context allowed by automatic memory fitting",
+            uint(1),
+            "4096",
+        ),
+        (
+            "check_tensors",
+            "Check tensors",
+            "Validate loaded model tensors for invalid values",
+            SettingKind::Toggle,
+            "disabled",
+        ),
+        (
+            "operation_offload",
+            "Operation offload",
+            "Offload host tensor operations to an accelerator",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "lora_adapters",
+            "LoRA adapters",
+            "Local LoRA adapter paths",
+            SettingKind::StringList,
+            "None",
+        ),
+        (
+            "lora_scaled",
+            "Scaled LoRA adapters",
+            "Local LoRA path and scale specifications",
+            SettingKind::StringList,
+            "None",
+        ),
+        (
+            "control_vectors",
+            "Control vectors",
+            "Local control-vector paths",
+            SettingKind::StringList,
+            "None",
+        ),
+        (
+            "control_vectors_scaled",
+            "Scaled control vectors",
+            "Local control-vector path and scale specifications",
+            SettingKind::StringList,
+            "None",
+        ),
+        (
+            "control_vector_layer_range",
+            "Control-vector layer range",
+            "Inclusive start and end layers",
+            SettingKind::String,
+            "all layers",
+        ),
+        (
+            "log_disabled",
+            "Disable logging",
+            "Disable llama.cpp process logging",
+            SettingKind::OneWayFlag,
+            "disabled",
+        ),
+        (
+            "log_file",
+            "Log file",
+            "Write llama.cpp process logs to a file",
+            SettingKind::Path,
+            "None",
+        ),
+        (
+            "log_colors",
+            "Log colors",
+            "Colored log-output policy",
+            choice(&["auto", "on", "off"]),
+            "auto",
+        ),
+        (
+            "log_verbosity",
+            "Log verbosity",
+            "llama.cpp log threshold",
+            uint(0),
+            "3",
+        ),
+        (
+            "log_prefix",
+            "Log prefix",
+            "Prefix llama.cpp log messages",
+            SettingKind::Toggle,
+            "disabled",
+        ),
+        (
+            "log_timestamps",
+            "Log timestamps",
+            "Timestamp llama.cpp log messages",
+            SettingKind::Toggle,
+            "disabled",
+        ),
+        (
+            "offline",
+            "Offline mode",
+            "Prevent llama.cpp network access",
+            SettingKind::OneWayFlag,
+            "disabled",
+        ),
+        (
+            "samplers",
+            "Sampler chain",
+            "Ordered sampler names",
+            SettingKind::StringList,
+            "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature",
+        ),
+        (
+            "ignore_eos",
+            "Ignore EOS",
+            "Continue generation after EOS",
+            SettingKind::OneWayFlag,
+            "disabled",
+        ),
+        (
+            "top_n_sigma",
+            "Top-n-sigma",
+            "Top-n-sigma sampling threshold",
+            float(None, None),
+            "-1",
+        ),
+        (
+            "xtc_probability",
+            "XTC probability",
+            "XTC sampling probability",
+            float(Some(0.0), Some(1.0)),
+            "0",
+        ),
+        (
+            "xtc_threshold",
+            "XTC threshold",
+            "XTC sampling threshold",
+            float(Some(0.0), Some(1.0)),
+            "0.1",
+        ),
+        (
+            "typical_p",
+            "Typical P",
+            "Locally typical sampling probability",
+            float(Some(0.0), Some(1.0)),
+            "1",
+        ),
+        (
+            "repeat_last_n",
+            "Repeat window",
+            "Recent tokens considered by repetition penalties",
+            uint(0),
+            "64",
+        ),
+        (
+            "dry_multiplier",
+            "DRY multiplier",
+            "DRY repetition penalty multiplier",
+            float(Some(0.0), None),
+            "0",
+        ),
+        (
+            "dry_base",
+            "DRY base",
+            "DRY repetition penalty base",
+            float(Some(0.0), None),
+            "1.75",
+        ),
+        (
+            "dry_allowed_length",
+            "DRY allowed length",
+            "Allowed repeated sequence length",
+            uint(0),
+            "2",
+        ),
+        (
+            "dry_penalty_last_n",
+            "DRY window",
+            "Recent-token window for DRY",
+            uint(0),
+            "64",
+        ),
+        (
+            "dry_sequence_breakers",
+            "DRY sequence breakers",
+            "DRY sequence breaker strings",
+            SettingKind::StringList,
+            "runtime built-ins",
+        ),
+        (
+            "adaptive_target",
+            "Adaptive target",
+            "Adaptive-p target probability; negative disables",
+            float(Some(-1.0), Some(1.0)),
+            "-1",
+        ),
+        (
+            "adaptive_decay",
+            "Adaptive decay",
+            "Adaptive-p target decay rate",
+            float(Some(0.0), Some(0.99)),
+            "0.9",
+        ),
+        (
+            "dynatemp_range",
+            "Dynamic temperature range",
+            "Dynamic temperature range",
+            float(Some(0.0), None),
+            "0",
+        ),
+        (
+            "dynatemp_exponent",
+            "Dynamic temperature exponent",
+            "Dynamic temperature exponent",
+            float(Some(0.0), None),
+            "48",
+        ),
+        (
+            "mirostat",
+            "Mirostat mode",
+            "Mirostat sampling mode",
+            uint(0),
+            "0",
+        ),
+        (
+            "mirostat_learning_rate",
+            "Mirostat learning rate",
+            "Mirostat eta",
+            float(Some(0.0), None),
+            "0.1",
+        ),
+        (
+            "mirostat_entropy",
+            "Mirostat entropy",
+            "Mirostat target entropy",
+            float(Some(0.0), None),
+            "5",
+        ),
+        (
+            "backend_sampling",
+            "Backend sampling",
+            "Use experimental backend sampling",
+            SettingKind::OneWayFlag,
+            "disabled",
+        ),
+        (
+            "draft_kv_cache_k",
+            "Draft K-cache type",
+            "Draft-model key cache storage type",
+            choice(&[
+                "f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1",
+            ]),
+            "f16",
+        ),
+        (
+            "draft_kv_cache_v",
+            "Draft V-cache type",
+            "Draft-model value cache storage type",
+            choice(&[
+                "f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1",
+            ]),
+            "f16",
+        ),
+        (
+            "draft_tokens_max",
+            "Maximum draft tokens",
+            "Maximum speculative draft length",
+            uint(1),
+            "3",
+        ),
+        (
+            "draft_tokens_min",
+            "Minimum draft tokens",
+            "Minimum speculative draft length",
+            uint(0),
+            "0",
+        ),
+        (
+            "draft_probability_min",
+            "Minimum draft probability",
+            "Greedy speculative acceptance probability",
+            float(Some(0.0), Some(1.0)),
+            "0",
+        ),
+        (
+            "draft_probability_split",
+            "Draft split probability",
+            "Speculative candidate split probability",
+            float(Some(0.0), Some(1.0)),
+            "0.1",
+        ),
+        (
+            "draft_threads",
+            "Draft CPU threads",
+            "Draft generation CPU threads",
+            uint(1),
+            "auto",
+        ),
+        (
+            "draft_threads_batch",
+            "Draft batch CPU threads",
+            "Draft prompt-processing CPU threads",
+            uint(1),
+            "auto",
+        ),
+        (
+            "draft_cpu_mask",
+            "Draft CPU mask",
+            "Draft generation CPU affinity mask",
+            SettingKind::String,
+            "auto",
+        ),
+        (
+            "draft_cpu_range",
+            "Draft CPU range",
+            "Draft generation CPU affinity range",
+            SettingKind::String,
+            "None",
+        ),
+        (
+            "draft_cpu_strict",
+            "Strict draft CPU placement",
+            "Require strict draft CPU placement",
+            SettingKind::Toggle,
+            "auto",
+        ),
+        (
+            "draft_priority",
+            "Draft priority",
+            "Draft worker priority",
+            choice(&["normal", "medium", "high", "realtime"]),
+            "normal",
+        ),
+        (
+            "draft_poll",
+            "Draft polling",
+            "Draft worker polling policy",
+            SettingKind::Toggle,
+            "auto",
+        ),
+        (
+            "draft_cpu_mask_batch",
+            "Draft batch CPU mask",
+            "Draft batch-thread CPU affinity mask",
+            SettingKind::String,
+            "auto",
+        ),
+        (
+            "draft_cpu_strict_batch",
+            "Strict draft batch placement",
+            "Require strict draft batch CPU placement",
+            SettingKind::Toggle,
+            "auto",
+        ),
+        (
+            "draft_priority_batch",
+            "Draft batch priority",
+            "Draft batch-worker priority",
+            choice(&["normal", "medium", "high", "realtime"]),
+            "normal",
+        ),
+        (
+            "draft_poll_batch",
+            "Draft batch polling",
+            "Draft batch-worker polling policy",
+            SettingKind::Toggle,
+            "auto",
+        ),
+        (
+            "draft_override_tensor",
+            "Draft tensor overrides",
+            "Draft tensor-pattern buffer overrides",
+            SettingKind::StringList,
+            "None",
+        ),
+        (
+            "draft_cpu_moe",
+            "Draft MoE on CPU",
+            "Keep every draft-model expert weight on CPU",
+            SettingKind::OneWayFlag,
+            "disabled",
+        ),
+        (
+            "draft_cpu_moe_layers",
+            "Draft MoE CPU layers",
+            "Keep the first N draft MoE layers on CPU",
+            uint(0),
+            "0",
+        ),
+        (
+            "draft_gpu_offload",
+            "Draft GPU offload",
+            "Draft-model layers placed in VRAM",
+            SettingKind::GpuOffload,
+            "auto",
+        ),
+        (
+            "draft_backend_sampling",
+            "Draft backend sampling",
+            "Offload draft sampling to the backend",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "ngram_mod_min",
+            "N-gram modified minimum",
+            "Minimum N-gram modified draft length",
+            uint(1),
+            "1",
+        ),
+        (
+            "ngram_mod_max",
+            "N-gram modified maximum",
+            "Maximum N-gram modified draft length",
+            uint(1),
+            "64",
+        ),
+        (
+            "ngram_mod_match",
+            "N-gram modified match",
+            "N-gram modified lookup length",
+            uint(1),
+            "24",
+        ),
+        (
+            "ngram_simple_size_n",
+            "N-gram simple lookup",
+            "N-gram-simple lookup length",
+            uint(1),
+            "12",
+        ),
+        (
+            "ngram_simple_size_m",
+            "N-gram simple draft",
+            "N-gram-simple draft length",
+            uint(1),
+            "48",
+        ),
+        (
+            "ngram_simple_min_hits",
+            "N-gram simple hits",
+            "Minimum N-gram-simple hits",
+            uint(1),
+            "1",
+        ),
+        (
+            "ngram_map_size_n",
+            "N-gram map lookup",
+            "N-gram-map lookup length",
+            uint(1),
+            "12",
+        ),
+        (
+            "ngram_map_size_m",
+            "N-gram map draft",
+            "N-gram-map draft length",
+            uint(1),
+            "48",
+        ),
+        (
+            "ngram_map_min_hits",
+            "N-gram map hits",
+            "Minimum N-gram-map hits",
+            uint(1),
+            "1",
+        ),
+        (
+            "ngram_map4_size_n",
+            "N-gram map4 lookup",
+            "N-gram-map-k4v lookup length",
+            uint(1),
+            "12",
+        ),
+        (
+            "ngram_map4_size_m",
+            "N-gram map4 draft",
+            "N-gram-map-k4v draft length",
+            uint(1),
+            "48",
+        ),
+        (
+            "ngram_map4_min_hits",
+            "N-gram map4 hits",
+            "Minimum N-gram-map-k4v hits",
+            uint(1),
+            "1",
+        ),
+        (
+            "kv_per_slot",
+            "KV context per slot",
+            "Unified-KV context limit for each slot",
+            uint(1),
+            "unset",
+        ),
+        (
+            "checkpoint_min_step",
+            "Checkpoint minimum step",
+            "Minimum token spacing between context checkpoints",
+            uint(1),
+            "8192",
+        ),
+        (
+            "cache_ram_mib",
+            "Cache RAM",
+            "Maximum server cache size in MiB",
+            integer.clone(),
+            "8192",
+        ),
+        (
+            "cache_idle_slots",
+            "Cache idle slots",
+            "Allow idle slot KV data in the shared cache",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "context_shift",
+            "Context shifting",
+            "Shift context for unbounded generation",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "warmup",
+            "Warmup",
+            "Warm the model with an empty run",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "continuous_batching",
+            "Continuous batching",
+            "Enable continuous batching",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "timeout_seconds",
+            "Server timeout",
+            "Private backend read/write timeout in seconds",
+            uint(1),
+            "3600",
+        ),
+        (
+            "sse_ping_interval",
+            "SSE ping interval",
+            "Backend SSE keepalive interval; -1 disables",
+            integer.clone(),
+            "30",
+        ),
+        (
+            "http_threads",
+            "HTTP threads",
+            "Private backend HTTP worker threads",
+            integer.clone(),
+            "auto",
+        ),
+        (
+            "prompt_cache",
+            "Prompt cache",
+            "Enable prompt caching",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "cache_reuse",
+            "Cache reuse threshold",
+            "Minimum reusable cache chunk size",
+            uint(0),
+            "0",
+        ),
+        (
+            "metrics",
+            "Metrics endpoint",
+            "Enable the private backend metrics endpoint",
+            SettingKind::Toggle,
+            "disabled",
+        ),
+        (
+            "slots_endpoint",
+            "Slots endpoint",
+            "Enable private backend slot monitoring",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "slot_save_path",
+            "Slot save path",
+            "Directory for persisted slot KV caches",
+            SettingKind::Path,
+            "None",
+        ),
+        (
+            "jinja",
+            "Jinja templates",
+            "Enable the Jinja chat-template engine",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "reasoning_format",
+            "Reasoning format",
+            "Reasoning extraction format",
+            choice(&["auto", "none", "deepseek", "deepseek-legacy"]),
+            "auto",
+        ),
+        (
+            "reasoning_preserve",
+            "Preserve reasoning",
+            "Preserve reasoning traces in conversation history",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "chat_template_kwargs",
+            "Chat-template arguments",
+            "Additional JSON object passed to the chat template",
+            SettingKind::JsonObject,
+            "{}",
+        ),
+        (
+            "skip_chat_parsing",
+            "Skip chat parsing",
+            "Return reasoning/tool syntax as plain message content",
+            SettingKind::Toggle,
+            "disabled",
+        ),
+        (
+            "prefill_assistant",
+            "Prefill assistant",
+            "Prefill a trailing assistant message",
+            SettingKind::Toggle,
+            "enabled",
+        ),
+        (
+            "slot_prompt_similarity",
+            "Slot prompt similarity",
+            "Minimum prompt similarity for slot reuse",
+            float(Some(0.0), Some(1.0)),
+            "0.1",
+        ),
+        (
+            "lora_init_without_apply",
+            "Defer LoRA application",
+            "Load LoRA adapters without initially applying them",
+            SettingKind::OneWayFlag,
+            "disabled",
+        ),
+        (
+            "sleep_idle_seconds",
+            "Sleep after idle",
+            "Idle seconds before the backend sleeps; -1 disables",
+            integer,
+            "disabled",
+        ),
+        (
+            "log_prompts_dir",
+            "Prompt log directory",
+            "Directory for diagnostic prompt logs",
+            SettingKind::Path,
+            "None",
+        ),
+    ];
+    specs
+        .into_iter()
+        .map(|(suffix, label, description, kind, default)| {
+            let mut definition = llama_definition(
+                &format!("{ENGINE_ID}.{suffix}"),
+                label,
+                description,
+                kind,
+            );
+            definition.default_preview = Some(
+                SettingDefaultPreview::new(default, SettingDefaultSource::Runtime)
+                    .with_detail("Exact llama-server omitted/default policy; availability is checked against this binary's help"),
+            );
+            definition
+        })
+        .collect()
 }
 
 fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<SettingDefinition> {
     let mut definitions = llama_setting_definitions();
     if model.is_some() {
         for id in [
-            "context_length",
+            "llama.cpp.context_length",
             "llama.cpp.rope_frequency_base",
             "llama.cpp.rope_frequency_scale",
             "llama.cpp.chat_template",
@@ -1862,7 +2876,7 @@ fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<Setting
     }
     if let Some(temperature) = definitions
         .iter_mut()
-        .find(|definition| definition.id.as_str() == "temperature")
+        .find(|definition| definition.id.as_str() == "llama.cpp.temperature")
     {
         temperature.kind = SettingKind::Float {
             minimum: Some(0.0),
@@ -1912,7 +2926,7 @@ fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<Setting
     {
         for (id, value, metadata_key) in [
             (
-                "context_length",
+                "llama.cpp.context_length",
                 identity.context_length.map(|value| value.to_string()),
                 format!("{}.context_length", identity.architecture),
             ),
@@ -2014,16 +3028,43 @@ fn llama_definition(
         scope: SettingScope::Runtime {
             engine_id: ENGINE_ID.to_owned(),
         },
-        category: if id.contains("unified_kv")
+        category: if id.contains("sampler")
+            || id.contains("temperature")
+            || id.contains("sigma")
+            || id.contains("xtc")
+            || id.contains("typical")
+            || id.contains("repeat")
+            || id.contains("dry_")
+            || id.contains("mirostat")
+            || id.contains("dynatemp")
+            || id.contains("ignore_eos")
+        {
+            norted_core::SettingCategory::Generation
+        } else if id.contains("unified_kv")
             || id.contains("kv_cache")
             || id.contains("flash_attention")
+            || id.contains("cache_ram")
+            || id.contains("kv_per_slot")
         {
             norted_core::SettingCategory::KvMemory
-        } else if id.contains("speculative") {
+        } else if id.contains("speculative") || id.contains("draft_") || id.contains("ngram_") {
             norted_core::SettingCategory::Speculation
-        } else if id.contains("chat_template") {
+        } else if id.contains("chat_template")
+            || id.contains("reasoning")
+            || id.contains("jinja")
+            || id.contains("prefill_assistant")
+            || id.contains("skip_chat")
+        {
             norted_core::SettingCategory::Prompt
-        } else if id.contains("context_checkpoint") {
+        } else if id.contains("context_checkpoint")
+            || id.contains("checkpoint_")
+            || id.contains("log_")
+            || id.contains("metrics")
+            || id.contains("endpoint")
+            || id.contains("timeout")
+            || id.contains("http_")
+            || id.contains("sse_")
+        {
             norted_core::SettingCategory::Advanced
         } else if id.contains("cache") {
             norted_core::SettingCategory::Cache
@@ -2061,99 +3102,448 @@ fn llama_load_modes() -> Vec<String> {
         .collect()
 }
 
-fn llama_setting_contract(id: &str) -> &'static [&'static str] {
+#[derive(Clone, Copy)]
+enum LlamaDirectMode {
+    Value,
+    Toggle {
+        enabled: Option<&'static str>,
+        disabled: Option<&'static str>,
+    },
+    Flag,
+}
+
+#[derive(Clone, Copy)]
+struct LlamaDirectSetting {
+    required: &'static str,
+    aliases: &'static [&'static str],
+    environment: &'static [&'static str],
+    mode: LlamaDirectMode,
+    list_separator: &'static str,
+}
+
+fn llama_direct_setting(id: &str) -> Option<LlamaDirectSetting> {
+    macro_rules! value {
+        ($option:literal, $env:literal) => {
+            Some(LlamaDirectSetting {
+                required: $option,
+                aliases: &[$option],
+                environment: &[$env],
+                mode: LlamaDirectMode::Value,
+                list_separator: ",",
+            })
+        };
+        ($option:literal) => {
+            Some(LlamaDirectSetting {
+                required: $option,
+                aliases: &[$option],
+                environment: &[],
+                mode: LlamaDirectMode::Value,
+                list_separator: ",",
+            })
+        };
+    }
+    macro_rules! toggle {
+        ($required:literal, $on:expr, $off:expr, $env:literal) => {
+            Some(LlamaDirectSetting {
+                required: $required,
+                aliases: &[$required],
+                environment: &[$env],
+                mode: LlamaDirectMode::Toggle {
+                    enabled: $on,
+                    disabled: $off,
+                },
+                list_separator: ",",
+            })
+        };
+        ($required:literal, $on:expr, $off:expr) => {
+            Some(LlamaDirectSetting {
+                required: $required,
+                aliases: &[$required],
+                environment: &[],
+                mode: LlamaDirectMode::Toggle {
+                    enabled: $on,
+                    disabled: $off,
+                },
+                list_separator: ",",
+            })
+        };
+    }
+    macro_rules! flag {
+        ($option:literal, $env:literal) => {
+            Some(LlamaDirectSetting {
+                required: $option,
+                aliases: &[$option],
+                environment: &[$env],
+                mode: LlamaDirectMode::Flag,
+                list_separator: ",",
+            })
+        };
+        ($option:literal) => {
+            Some(LlamaDirectSetting {
+                required: $option,
+                aliases: &[$option],
+                environment: &[],
+                mode: LlamaDirectMode::Flag,
+                list_separator: ",",
+            })
+        };
+    }
     match id {
-        "context_length" => &["--ctx-size"],
-        "parallel_requests" => &["--parallel"],
-        "temperature" => &["--temp"],
-        "top_p" => &["--top-p"],
-        "top_k" => &["--top-k"],
-        "min_p" => &["--min-p"],
-        "seed" => &["--seed"],
-        "repeat_penalty" => &["--repeat-penalty"],
-        "presence_penalty" => &["--presence-penalty"],
-        "frequency_penalty" => &["--frequency-penalty"],
-        "max_output_tokens" => &["--predict"],
-        "stop_strings" => &["--reverse-prompt"],
-        "reasoning" => &["--reasoning"],
-        "reasoning_effort" => &["--reasoning-effort"],
-        "reasoning_budget" => &["--reasoning-budget"],
-        "reasoning_budget_message" => &["--reasoning-budget-message"],
-        "structured_output_schema" => &["--json-schema"],
-        "context_overflow" => &["--ctx-size"],
-        "llama.cpp.threads" => &["--threads"],
-        "llama.cpp.batch_size" => &["--batch-size"],
-        "llama.cpp.micro_batch_size" => &["--ubatch-size"],
-        "llama.cpp.gpu_offload" => &["--n-gpu-layers"],
-        "llama.cpp.flash_attention" => &["--flash-attn"],
-        "llama.cpp.kv_cache_k" => &["--cache-type-k"],
-        "llama.cpp.kv_cache_v" => &["--cache-type-v"],
-        "llama.cpp.load_mode" => &["--load-mode"],
-        "llama.cpp.rope_frequency_base" => &["--rope-freq-base"],
-        "llama.cpp.rope_frequency_scale" => &["--rope-freq-scale"],
-        "llama.cpp.unified_kv_cache" => &["--kv-unified", "--no-kv-unified"],
-        "llama.cpp.kv_cache_gpu_offload" => &["--kv-offload", "--no-kv-offload"],
-        "llama.cpp.context_checkpoints" => &["--ctx-checkpoints"],
-        "llama.cpp.cpu_moe_layers" => &["--n-cpu-moe"],
-        "llama.cpp.cpu_moe_all" => &["--cpu-moe"],
-        "llama.cpp.active_experts" => &["--override-kv"],
-        "llama.cpp.chat_template" => &["--chat-template"],
+        "llama.cpp.threads_batch" => value!("--threads-batch"),
+        "llama.cpp.cpu_mask" => value!("--cpu-mask"),
+        "llama.cpp.cpu_range" => value!("--cpu-range"),
+        "llama.cpp.cpu_strict" => value!("--cpu-strict"),
+        "llama.cpp.priority" => value!("--prio"),
+        "llama.cpp.poll" => value!("--poll"),
+        "llama.cpp.cpu_mask_batch" => value!("--cpu-mask-batch"),
+        "llama.cpp.cpu_range_batch" => value!("--cpu-range-batch"),
+        "llama.cpp.cpu_strict_batch" => value!("--cpu-strict-batch"),
+        "llama.cpp.priority_batch" => value!("--prio-batch"),
+        "llama.cpp.poll_batch" => value!("--poll-batch"),
+        "llama.cpp.keep_tokens" => value!("--keep"),
+        "llama.cpp.swa_full" => flag!("--swa-full", "LLAMA_ARG_SWA_FULL"),
+        "llama.cpp.performance_timings" => toggle!(
+            "--perf",
+            Some("--perf"),
+            Some("--no-perf"),
+            "LLAMA_ARG_PERF"
+        ),
+        "llama.cpp.escape_sequences" => toggle!("--escape", Some("--escape"), Some("--no-escape")),
+        "llama.cpp.rope_scaling" => value!("--rope-scaling", "LLAMA_ARG_ROPE_SCALING_TYPE"),
+        "llama.cpp.rope_context_scale" => value!("--rope-scale", "LLAMA_ARG_ROPE_SCALE"),
+        "llama.cpp.yarn_original_context" => value!("--yarn-orig-ctx", "LLAMA_ARG_YARN_ORIG_CTX"),
+        "llama.cpp.yarn_extrapolation_factor" => {
+            value!("--yarn-ext-factor", "LLAMA_ARG_YARN_EXT_FACTOR")
+        }
+        "llama.cpp.yarn_attention_factor" => {
+            value!("--yarn-attn-factor", "LLAMA_ARG_YARN_ATTN_FACTOR")
+        }
+        "llama.cpp.yarn_beta_slow" => value!("--yarn-beta-slow", "LLAMA_ARG_YARN_BETA_SLOW"),
+        "llama.cpp.yarn_beta_fast" => value!("--yarn-beta-fast", "LLAMA_ARG_YARN_BETA_FAST"),
+        "llama.cpp.weight_repacking" => toggle!(
+            "--repack",
+            Some("--repack"),
+            Some("--no-repack"),
+            "LLAMA_ARG_REPACK"
+        ),
+        "llama.cpp.host_buffer" => {
+            toggle!("--no-host", None, Some("--no-host"), "LLAMA_ARG_NO_HOST")
+        }
+        "llama.cpp.lazy_mode" => value!("--lazy-mode", "LLAMA_ARG_LAZY_MODE"),
+        "llama.cpp.numa" => value!("--numa", "LLAMA_ARG_NUMA"),
+        "llama.cpp.override_tensor" => value!("--override-tensor", "LLAMA_ARG_OVERRIDE_TENSOR"),
+        "llama.cpp.cpu_ffn_layers" => value!("--n-cpu-ffn", "LLAMA_ARG_N_CPU_FFN"),
+        "llama.cpp.split_mode" => value!("--split-mode", "LLAMA_ARG_SPLIT_MODE"),
+        "llama.cpp.tensor_split" => value!("--tensor-split", "LLAMA_ARG_TENSOR_SPLIT"),
+        "llama.cpp.main_gpu" => value!("--main-gpu", "LLAMA_ARG_MAIN_GPU"),
+        "llama.cpp.fit" => value!("--fit", "LLAMA_ARG_FIT"),
+        "llama.cpp.fit_target_mib" => value!("--fit-target", "LLAMA_ARG_FIT_TARGET"),
+        "llama.cpp.fit_min_context" => value!("--fit-ctx", "LLAMA_ARG_FIT_CTX"),
+        "llama.cpp.check_tensors" => flag!("--check-tensors"),
+        "llama.cpp.operation_offload" => toggle!(
+            "--op-offload",
+            Some("--op-offload"),
+            Some("--no-op-offload")
+        ),
+        "llama.cpp.lora_adapters" => value!("--lora"),
+        "llama.cpp.lora_scaled" => value!("--lora-scaled"),
+        "llama.cpp.control_vectors" => value!("--control-vector"),
+        "llama.cpp.control_vectors_scaled" => value!("--control-vector-scaled"),
+        "llama.cpp.control_vector_layer_range" => value!("--control-vector-layer-range"),
+        "llama.cpp.log_disabled" => flag!("--log-disable"),
+        "llama.cpp.log_file" => value!("--log-file", "LLAMA_ARG_LOG_FILE"),
+        "llama.cpp.log_colors" => value!("--log-colors", "LLAMA_ARG_LOG_COLORS"),
+        "llama.cpp.log_verbosity" => value!("--log-verbosity", "LLAMA_ARG_LOG_VERBOSITY"),
+        "llama.cpp.log_prefix" => toggle!(
+            "--log-prefix",
+            Some("--log-prefix"),
+            Some("--no-log-prefix"),
+            "LLAMA_ARG_LOG_PREFIX"
+        ),
+        "llama.cpp.log_timestamps" => toggle!(
+            "--log-timestamps",
+            Some("--log-timestamps"),
+            Some("--no-log-timestamps"),
+            "LLAMA_ARG_LOG_TIMESTAMPS"
+        ),
+        "llama.cpp.offline" => flag!("--offline", "LLAMA_ARG_OFFLINE"),
+        "llama.cpp.samplers" => {
+            let mut setting = value!("--samplers")?;
+            setting.list_separator = ";";
+            Some(setting)
+        }
+        "llama.cpp.ignore_eos" => flag!("--ignore-eos"),
+        "llama.cpp.top_n_sigma" => value!("--top-nsigma"),
+        "llama.cpp.xtc_probability" => value!("--xtc-probability"),
+        "llama.cpp.xtc_threshold" => value!("--xtc-threshold"),
+        "llama.cpp.typical_p" => value!("--typical"),
+        "llama.cpp.repeat_last_n" => value!("--repeat-last-n"),
+        "llama.cpp.dry_multiplier" => value!("--dry-multiplier"),
+        "llama.cpp.dry_base" => value!("--dry-base"),
+        "llama.cpp.dry_allowed_length" => value!("--dry-allowed-length"),
+        "llama.cpp.dry_penalty_last_n" => value!("--dry-penalty-last-n"),
+        "llama.cpp.dry_sequence_breakers" => value!("--dry-sequence-breaker"),
+        "llama.cpp.adaptive_target" => value!("--adaptive-target"),
+        "llama.cpp.adaptive_decay" => value!("--adaptive-decay"),
+        "llama.cpp.dynatemp_range" => value!("--dynatemp-range"),
+        "llama.cpp.dynatemp_exponent" => value!("--dynatemp-exp"),
+        "llama.cpp.mirostat" => value!("--mirostat"),
+        "llama.cpp.mirostat_learning_rate" => value!("--mirostat-lr"),
+        "llama.cpp.mirostat_entropy" => value!("--mirostat-ent"),
+        "llama.cpp.backend_sampling" => flag!("--backend-sampling"),
+        "llama.cpp.draft_kv_cache_k" => {
+            value!("--cache-type-k-draft", "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K")
+        }
+        "llama.cpp.draft_kv_cache_v" => {
+            value!("--cache-type-v-draft", "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V")
+        }
+        "llama.cpp.draft_tokens_max" => value!("--spec-draft-n-max"),
+        "llama.cpp.draft_tokens_min" => value!("--spec-draft-n-min"),
+        "llama.cpp.draft_probability_min" => value!("--spec-draft-p-min"),
+        "llama.cpp.draft_probability_split" => {
+            value!("--spec-draft-p-split", "LLAMA_ARG_SPEC_DRAFT_P_SPLIT")
+        }
+        "llama.cpp.draft_threads" => value!("--spec-draft-threads"),
+        "llama.cpp.draft_threads_batch" => value!("--spec-draft-threads-batch"),
+        "llama.cpp.draft_cpu_mask" => value!("--spec-draft-cpu-mask"),
+        "llama.cpp.draft_cpu_range" => value!("--spec-draft-cpu-range"),
+        "llama.cpp.draft_cpu_strict" => value!("--spec-draft-cpu-strict"),
+        "llama.cpp.draft_priority" => value!("--spec-draft-prio"),
+        "llama.cpp.draft_poll" => value!("--spec-draft-poll"),
+        "llama.cpp.draft_cpu_mask_batch" => value!("--spec-draft-cpu-mask-batch"),
+        "llama.cpp.draft_cpu_strict_batch" => value!("--spec-draft-cpu-strict-batch"),
+        "llama.cpp.draft_priority_batch" => value!("--spec-draft-prio-batch"),
+        "llama.cpp.draft_poll_batch" => value!("--spec-draft-poll-batch"),
+        "llama.cpp.draft_override_tensor" => value!("--spec-draft-override-tensor"),
+        "llama.cpp.draft_cpu_moe" => flag!("--spec-draft-cpu-moe", "LLAMA_ARG_SPEC_DRAFT_CPU_MOE"),
+        "llama.cpp.draft_cpu_moe_layers" => {
+            value!("--spec-draft-n-cpu-moe", "LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE")
+        }
+        "llama.cpp.draft_gpu_offload" => value!("--spec-draft-ngl", "LLAMA_ARG_N_GPU_LAYERS_DRAFT"),
+        "llama.cpp.draft_backend_sampling" => toggle!(
+            "--spec-draft-backend-sampling",
+            Some("--spec-draft-backend-sampling"),
+            Some("--no-spec-draft-backend-sampling"),
+            "LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"
+        ),
+        "llama.cpp.ngram_mod_min" => value!("--spec-ngram-mod-n-min"),
+        "llama.cpp.ngram_mod_max" => value!("--spec-ngram-mod-n-max"),
+        "llama.cpp.ngram_mod_match" => value!("--spec-ngram-mod-n-match"),
+        "llama.cpp.ngram_simple_size_n" => value!("--spec-ngram-simple-size-n"),
+        "llama.cpp.ngram_simple_size_m" => value!("--spec-ngram-simple-size-m"),
+        "llama.cpp.ngram_simple_min_hits" => value!("--spec-ngram-simple-min-hits"),
+        "llama.cpp.ngram_map_size_n" => value!("--spec-ngram-map-k-size-n"),
+        "llama.cpp.ngram_map_size_m" => value!("--spec-ngram-map-k-size-m"),
+        "llama.cpp.ngram_map_min_hits" => value!("--spec-ngram-map-k-min-hits"),
+        "llama.cpp.ngram_map4_size_n" => value!("--spec-ngram-map-k4v-size-n"),
+        "llama.cpp.ngram_map4_size_m" => value!("--spec-ngram-map-k4v-size-m"),
+        "llama.cpp.ngram_map4_min_hits" => value!("--spec-ngram-map-k4v-min-hits"),
+        "llama.cpp.kv_per_slot" => value!("--kv-unified-per-slot"),
+        "llama.cpp.checkpoint_min_step" => value!("--checkpoint-min-step"),
+        "llama.cpp.cache_ram_mib" => value!("--cache-ram"),
+        "llama.cpp.cache_idle_slots" => toggle!(
+            "--cache-idle-slots",
+            Some("--cache-idle-slots"),
+            Some("--no-cache-idle-slots")
+        ),
+        "llama.cpp.context_shift" => toggle!(
+            "--context-shift",
+            Some("--context-shift"),
+            Some("--no-context-shift")
+        ),
+        "llama.cpp.warmup" => toggle!("--warmup", Some("--warmup"), Some("--no-warmup")),
+        "llama.cpp.continuous_batching" => toggle!(
+            "--cont-batching",
+            Some("--cont-batching"),
+            Some("--no-cont-batching")
+        ),
+        "llama.cpp.timeout_seconds" => value!("--timeout", "LLAMA_ARG_TIMEOUT"),
+        "llama.cpp.sse_ping_interval" => {
+            value!("--sse-ping-interval", "LLAMA_ARG_SSE_PING_INTERVAL")
+        }
+        "llama.cpp.http_threads" => value!("--threads-http", "LLAMA_ARG_THREADS_HTTP"),
+        "llama.cpp.prompt_cache" => toggle!(
+            "--cache-prompt",
+            Some("--cache-prompt"),
+            Some("--no-cache-prompt"),
+            "LLAMA_ARG_CACHE_PROMPT"
+        ),
+        "llama.cpp.cache_reuse" => value!("--cache-reuse", "LLAMA_ARG_CACHE_REUSE"),
+        "llama.cpp.metrics" => flag!("--metrics", "LLAMA_ARG_ENDPOINT_METRICS"),
+        "llama.cpp.slots_endpoint" => toggle!(
+            "--slots",
+            Some("--slots"),
+            Some("--no-slots"),
+            "LLAMA_ARG_ENDPOINT_SLOTS"
+        ),
+        "llama.cpp.slot_save_path" => value!("--slot-save-path"),
+        "llama.cpp.jinja" => toggle!(
+            "--jinja",
+            Some("--jinja"),
+            Some("--no-jinja"),
+            "LLAMA_ARG_JINJA"
+        ),
+        "llama.cpp.reasoning_format" => value!("--reasoning-format", "LLAMA_ARG_THINK"),
+        "llama.cpp.reasoning_preserve" => toggle!(
+            "--reasoning-preserve",
+            Some("--reasoning-preserve"),
+            Some("--no-reasoning-preserve"),
+            "LLAMA_ARG_REASONING_PRESERVE"
+        ),
+        "llama.cpp.chat_template_kwargs" => {
+            value!("--chat-template-kwargs", "LLAMA_ARG_CHAT_TEMPLATE_KWARGS")
+        }
+        "llama.cpp.skip_chat_parsing" => toggle!(
+            "--skip-chat-parsing",
+            Some("--skip-chat-parsing"),
+            Some("--no-skip-chat-parsing"),
+            "LLAMA_ARG_SKIP_CHAT_PARSING"
+        ),
+        "llama.cpp.prefill_assistant" => toggle!(
+            "--prefill-assistant",
+            Some("--prefill-assistant"),
+            Some("--no-prefill-assistant"),
+            "LLAMA_ARG_PREFILL_ASSISTANT"
+        ),
+        "llama.cpp.slot_prompt_similarity" => value!("--slot-prompt-similarity"),
+        "llama.cpp.lora_init_without_apply" => flag!("--lora-init-without-apply"),
+        "llama.cpp.sleep_idle_seconds" => value!("--sleep-idle-seconds"),
+        "llama.cpp.log_prompts_dir" => value!("--log-prompts-dir"),
+        _ => None,
+    }
+}
+
+fn llama_direct_aliases(id: &str, required: &'static str) -> Vec<&'static str> {
+    let aliases: &'static [&'static str] = match id {
+        "llama.cpp.threads_batch" => &["-tb", "--threads-batch"],
+        "llama.cpp.cpu_mask" => &["-C", "--cpu-mask"],
+        "llama.cpp.cpu_range" => &["-Cr", "--cpu-range"],
+        "llama.cpp.cpu_mask_batch" => &["-Cb", "--cpu-mask-batch"],
+        "llama.cpp.cpu_range_batch" => &["-Crb", "--cpu-range-batch"],
+        "llama.cpp.lazy_mode" => &["-lzm", "--lazy-mode"],
+        "llama.cpp.override_tensor" => &["-ot", "--override-tensor"],
+        "llama.cpp.cpu_ffn_layers" => &["-ncffn", "--n-cpu-ffn"],
+        "llama.cpp.split_mode" => &["-sm", "--split-mode"],
+        "llama.cpp.tensor_split" => &["-ts", "--tensor-split"],
+        "llama.cpp.main_gpu" => &["-mg", "--main-gpu"],
+        "llama.cpp.fit" => &["-fit", "--fit"],
+        "llama.cpp.fit_target_mib" => &["-fitt", "--fit-target"],
+        "llama.cpp.fit_min_context" => &["-fitc", "--fit-ctx"],
+        "llama.cpp.log_verbosity" => &["-lv", "--verbosity", "--log-verbosity"],
+        "llama.cpp.top_n_sigma" => &["--top-nsigma", "--top-n-sigma"],
+        "llama.cpp.typical_p" => &["--typical", "--typical-p"],
+        "llama.cpp.backend_sampling" => &["-bs", "--backend-sampling"],
+        "llama.cpp.draft_kv_cache_k" => &["--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"],
+        "llama.cpp.draft_kv_cache_v" => &["--spec-draft-type-v", "-ctvd", "--cache-type-v-draft"],
+        "llama.cpp.draft_probability_min" => &["--spec-draft-p-min", "--draft-p-min"],
+        "llama.cpp.context_checkpoints" => &["-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"],
+        "llama.cpp.continuous_batching" => {
+            &["-cb", "--cont-batching", "-nocb", "--no-cont-batching"]
+        }
+        "llama.cpp.timeout_seconds" => &["-to", "--timeout"],
+        "llama.cpp.slot_prompt_similarity" => &["-sps", "--slot-prompt-similarity"],
+        _ => return vec![required],
+    };
+    aliases.to_vec()
+}
+
+fn llama_setting_contract(id: &str) -> Vec<&'static str> {
+    if let Some(setting) = llama_direct_setting(id) {
+        return vec![setting.required];
+    }
+    match id {
+        "llama.cpp.context_length" => vec!["--ctx-size"],
+        "llama.cpp.parallel_requests" => vec!["--parallel"],
+        "llama.cpp.temperature" => vec!["--temp"],
+        "llama.cpp.top_p" => vec!["--top-p"],
+        "llama.cpp.top_k" => vec!["--top-k"],
+        "llama.cpp.min_p" => vec!["--min-p"],
+        "llama.cpp.seed" => vec!["--seed"],
+        "llama.cpp.repeat_penalty" => vec!["--repeat-penalty"],
+        "llama.cpp.presence_penalty" => vec!["--presence-penalty"],
+        "llama.cpp.frequency_penalty" => vec!["--frequency-penalty"],
+        "llama.cpp.max_output_tokens" => vec!["--predict"],
+        "llama.cpp.stop_strings" => vec!["--reverse-prompt"],
+        "llama.cpp.reasoning" => vec!["--reasoning"],
+        "llama.cpp.reasoning_effort" => vec!["--reasoning-effort"],
+        "llama.cpp.reasoning_budget" => vec!["--reasoning-budget"],
+        "llama.cpp.reasoning_budget_message" => vec!["--reasoning-budget-message"],
+        "llama.cpp.structured_output_schema" => vec!["--json-schema"],
+        "llama.cpp.context_overflow" => vec!["--ctx-size"],
+        "llama.cpp.threads" => vec!["--threads"],
+        "llama.cpp.batch_size" => vec!["--batch-size"],
+        "llama.cpp.micro_batch_size" => vec!["--ubatch-size"],
+        "llama.cpp.gpu_offload" => vec!["--n-gpu-layers"],
+        "llama.cpp.flash_attention" => vec!["--flash-attn"],
+        "llama.cpp.kv_cache_k" => vec!["--cache-type-k"],
+        "llama.cpp.kv_cache_v" => vec!["--cache-type-v"],
+        "llama.cpp.load_mode" => vec!["--load-mode"],
+        "llama.cpp.rope_frequency_base" => vec!["--rope-freq-base"],
+        "llama.cpp.rope_frequency_scale" => vec!["--rope-freq-scale"],
+        "llama.cpp.unified_kv_cache" => vec!["--kv-unified", "--no-kv-unified"],
+        "llama.cpp.kv_cache_gpu_offload" => vec!["--kv-offload", "--no-kv-offload"],
+        "llama.cpp.context_checkpoints" => vec!["--ctx-checkpoints"],
+        "llama.cpp.cpu_moe_layers" => vec!["--n-cpu-moe"],
+        "llama.cpp.cpu_moe_all" => vec!["--cpu-moe"],
+        "llama.cpp.active_experts" => vec!["--override-kv"],
+        "llama.cpp.chat_template" => vec!["--chat-template"],
         "llama.cpp.chat_template_file" | "llama.cpp.chat_template_sha256" => {
-            &["--jinja", "--chat-template-file"]
+            vec!["--jinja", "--chat-template-file"]
         }
-        "llama.cpp.speculative_mode" => &["--spec-type"],
+        "llama.cpp.speculative_mode" => vec!["--spec-type"],
         "llama.cpp.speculative_draft_model" | "llama.cpp.speculative_draft_sha256" => {
-            &["--spec-draft-model"]
+            vec!["--spec-draft-model"]
         }
-        _ => &[],
+        _ => vec![],
     }
 }
 
 fn llama_setting_has_execution_path(id: &str) -> bool {
-    matches!(
-        id,
-        "context_length"
-            | "parallel_requests"
-            | "temperature"
-            | "top_p"
-            | "top_k"
-            | "min_p"
-            | "seed"
-            | "repeat_penalty"
-            | "presence_penalty"
-            | "frequency_penalty"
-            | "max_output_tokens"
-            | "stop_strings"
-            | "system_prompt"
-            | "reasoning"
-            | "reasoning_effort"
-            | "reasoning_budget"
-            | "reasoning_budget_message"
-            | "structured_output_schema"
-            | "context_overflow"
-            | "llama.cpp.threads"
-            | "llama.cpp.batch_size"
-            | "llama.cpp.micro_batch_size"
-            | "llama.cpp.gpu_offload"
-            | "llama.cpp.flash_attention"
-            | "llama.cpp.kv_cache_k"
-            | "llama.cpp.kv_cache_v"
-            | "llama.cpp.load_mode"
-            | "llama.cpp.rope_frequency_base"
-            | "llama.cpp.rope_frequency_scale"
-            | "llama.cpp.unified_kv_cache"
-            | "llama.cpp.kv_cache_gpu_offload"
-            | "llama.cpp.context_checkpoints"
-            | "llama.cpp.cpu_moe_layers"
-            | "llama.cpp.cpu_moe_all"
-            | "llama.cpp.active_experts"
-            | "llama.cpp.chat_template"
-            | "llama.cpp.chat_template_file"
-            | "llama.cpp.chat_template_sha256"
-            | "llama.cpp.speculative_mode"
-            | "llama.cpp.speculative_draft_model"
-            | "llama.cpp.speculative_draft_sha256"
-    )
+    llama_direct_setting(id).is_some()
+        || matches!(
+            id,
+            "llama.cpp.context_length"
+                | "llama.cpp.parallel_requests"
+                | "llama.cpp.temperature"
+                | "llama.cpp.top_p"
+                | "llama.cpp.top_k"
+                | "llama.cpp.min_p"
+                | "llama.cpp.seed"
+                | "llama.cpp.repeat_penalty"
+                | "llama.cpp.presence_penalty"
+                | "llama.cpp.frequency_penalty"
+                | "llama.cpp.max_output_tokens"
+                | "llama.cpp.stop_strings"
+                | "llama.cpp.system_prompt"
+                | "llama.cpp.reasoning"
+                | "llama.cpp.reasoning_effort"
+                | "llama.cpp.reasoning_budget"
+                | "llama.cpp.reasoning_budget_message"
+                | "llama.cpp.structured_output_schema"
+                | "llama.cpp.context_overflow"
+                | "llama.cpp.threads"
+                | "llama.cpp.batch_size"
+                | "llama.cpp.micro_batch_size"
+                | "llama.cpp.gpu_offload"
+                | "llama.cpp.flash_attention"
+                | "llama.cpp.kv_cache_k"
+                | "llama.cpp.kv_cache_v"
+                | "llama.cpp.load_mode"
+                | "llama.cpp.rope_frequency_base"
+                | "llama.cpp.rope_frequency_scale"
+                | "llama.cpp.unified_kv_cache"
+                | "llama.cpp.kv_cache_gpu_offload"
+                | "llama.cpp.context_checkpoints"
+                | "llama.cpp.cpu_moe_layers"
+                | "llama.cpp.cpu_moe_all"
+                | "llama.cpp.active_experts"
+                | "llama.cpp.chat_template"
+                | "llama.cpp.chat_template_file"
+                | "llama.cpp.chat_template_sha256"
+                | "llama.cpp.speculative_mode"
+                | "llama.cpp.speculative_draft_model"
+                | "llama.cpp.speculative_draft_sha256"
+        )
 }
 
 fn apply_llama_exact_help_contract(definitions: &mut [SettingDefinition], help: &str) {
@@ -2184,8 +3574,8 @@ fn apply_llama_exact_help_contract(definitions: &mut [SettingDefinition], help: 
             .map(|option| help_option_context(help, option))
             .unwrap_or_default();
         match definition.id.as_str() {
-            "system_prompt" => {}
-            "reasoning_effort" => {
+            "llama.cpp.system_prompt" => {}
+            "llama.cpp.reasoning_effort" => {
                 let choices = ["minimal", "low", "medium", "high", "xhigh", "max"]
                     .into_iter()
                     .filter(|choice| text_has_value(&contract, choice))
@@ -2326,7 +3716,28 @@ fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &s
     let id = definition.id.as_str();
     let lower = reported.to_ascii_lowercase();
     let preview = match id {
-        "parallel_requests" if lower == "-1" => SettingDefaultPreview::new(
+        _ if lower == "same" => SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+            .with_detail("The exact runtime derives this value from its related primary worker setting"),
+        _ if lower == "loaded" => SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+            .with_detail("The exact runtime loads this value from selected model metadata"),
+        "llama.cpp.yarn_original_context" if lower == "0" => {
+            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+                .with_detail("The exact runtime uses the model training context")
+        }
+        "llama.cpp.yarn_extrapolation_factor"
+        | "llama.cpp.yarn_attention_factor"
+        | "llama.cpp.yarn_beta_slow"
+        | "llama.cpp.yarn_beta_fast"
+            if lower == "-1.00" || lower == "-1" =>
+        {
+            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+                .with_detail("The exact runtime derives this YaRN parameter")
+        }
+        "llama.cpp.http_threads" if lower == "-1" => {
+            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+                .with_detail("The exact runtime selects its HTTP worker count")
+        }
+        "llama.cpp.parallel_requests" if lower == "-1" => SettingDefaultPreview::new(
             "auto",
             SettingDefaultSource::Runtime,
         )
@@ -2359,7 +3770,7 @@ fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &s
         .with_detail(
             "The exact runtime reports `auto` and selects its model loading strategy during startup",
         ),
-        "context_length" if matches!(lower.as_str(), "0" | "auto") => {
+        "llama.cpp.context_length" if matches!(lower.as_str(), "0" | "auto") => {
             SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
                 .with_detail("The exact runtime defers context selection to model metadata and its runtime fallback")
         }
@@ -2369,20 +3780,20 @@ fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &s
             SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
                 .with_detail("The exact runtime defers RoPE selection to model metadata and its runtime fallback")
         }
-        "seed" if matches!(lower.as_str(), "-1" | "random") => {
+        "llama.cpp.seed" if matches!(lower.as_str(), "-1" | "random") => {
             SettingDefaultPreview::new("random", SettingDefaultSource::Runtime)
         }
-        "max_output_tokens" if lower == "-1" => {
+        "llama.cpp.max_output_tokens" if lower == "-1" => {
             SettingDefaultPreview::new("unlimited", SettingDefaultSource::Runtime)
         }
-        "reasoning" if lower == "auto" => SettingDefaultPreview::new(
+        "llama.cpp.reasoning" if lower == "auto" => SettingDefaultPreview::new(
             "auto",
             SettingDefaultSource::Runtime,
         )
         .with_detail(
             "The exact runtime detects the reasoning mode from the selected chat template",
         ),
-        "reasoning_effort" if lower == "default" => SettingDefaultPreview::new(
+        "llama.cpp.reasoning_effort" if lower == "default" => SettingDefaultPreview::new(
             "auto",
             SettingDefaultSource::Runtime,
         )
@@ -2499,17 +3910,22 @@ fn llama_configured_runtime_compatibility(
 fn llama_normalized_generation_defaults(
     settings: &norted_core::ResolvedSettings,
 ) -> BTreeMap<String, Value> {
-    ["temperature", "top_p", "top_k", "min_p"]
-        .into_iter()
-        .filter_map(|id| {
-            let value = match settings.value(id)? {
-                SettingValue::Float(value) => json!(value),
-                SettingValue::UnsignedInteger(value) => json!(value),
-                _ => return None,
-            };
-            Some((format!("configured_{id}"), value))
-        })
-        .collect()
+    [
+        "llama.cpp.temperature",
+        "llama.cpp.top_p",
+        "llama.cpp.top_k",
+        "llama.cpp.min_p",
+    ]
+    .into_iter()
+    .filter_map(|id| {
+        let value = match settings.value(id)? {
+            SettingValue::Float(value) => json!(value),
+            SettingValue::UnsignedInteger(value) => json!(value),
+            _ => return None,
+        };
+        Some((format!("configured_{id}"), value))
+    })
+    .collect()
 }
 
 fn help_has_option(help: &str, option: &str) -> bool {
@@ -2812,6 +4228,34 @@ fn translate_llama_settings_for_model(
     let mut arguments = Vec::new();
     let mut environment_remove = Vec::new();
     for (id, resolved) in &settings.configured {
+        if let Some(direct) = llama_direct_setting(id.as_str()) {
+            let mut aliases = direct.aliases.to_vec();
+            aliases.extend(llama_direct_aliases(id.as_str(), direct.required));
+            if let LlamaDirectMode::Toggle { enabled, disabled } = direct.mode {
+                aliases.extend(enabled);
+                aliases.extend(disabled);
+            }
+            aliases.sort_unstable();
+            aliases.dedup();
+            if let Some(argument) = find_native_option(native_arguments, &aliases) {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "structured setting `{id}` conflicts with native llama.cpp argument `{argument}`"
+                )));
+            }
+            if let Some(name) = configured_environment.keys().find(|name| {
+                direct
+                    .environment
+                    .iter()
+                    .any(|owned| name.eq_ignore_ascii_case(owned))
+            }) {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "structured setting `{id}` conflicts with configured llama.cpp environment variable `{name}`"
+                )));
+            }
+            environment_remove.extend(direct.environment.iter().map(OsString::from));
+            push_llama_direct_argument(&mut arguments, id.as_str(), &resolved.value, direct)?;
+            continue;
+        }
         let (aliases, environment_names) = llama_setting_collision_contract(id.as_str());
         if let Some(argument) = find_native_option(native_arguments, aliases) {
             return Err(EngineError::InvalidConfiguration(format!(
@@ -2829,25 +4273,25 @@ fn translate_llama_settings_for_model(
         }
         environment_remove.extend(environment_names.iter().map(OsString::from));
         match (id.as_str(), &resolved.value) {
-            ("context_length", SettingValue::UnsignedInteger(value)) => {
+            ("llama.cpp.context_length", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--ctx-size", *value);
             }
-            ("parallel_requests", SettingValue::UnsignedInteger(value)) => {
+            ("llama.cpp.parallel_requests", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--parallel", *value);
             }
-            ("temperature", SettingValue::Float(value)) => {
+            ("llama.cpp.temperature", SettingValue::Float(value)) => {
                 push_value_argument(&mut arguments, "--temp", *value);
             }
-            ("top_p", SettingValue::Float(value)) => {
+            ("llama.cpp.top_p", SettingValue::Float(value)) => {
                 push_value_argument(&mut arguments, "--top-p", *value);
             }
-            ("top_k", SettingValue::UnsignedInteger(value)) => {
+            ("llama.cpp.top_k", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--top-k", *value);
             }
-            ("min_p", SettingValue::Float(value)) => {
+            ("llama.cpp.min_p", SettingValue::Float(value)) => {
                 push_value_argument(&mut arguments, "--min-p", *value);
             }
-            ("seed", SettingValue::UnsignedIntegerOrChoice(value)) => {
+            ("llama.cpp.seed", SettingValue::UnsignedIntegerOrChoice(value)) => {
                 let value = match value {
                     UnsignedIntegerOrChoiceValue::UnsignedInteger(value) => value.to_string(),
                     UnsignedIntegerOrChoiceValue::Choice(value) if value == "random" => {
@@ -2861,37 +4305,37 @@ fn translate_llama_settings_for_model(
                 };
                 push_value_argument(&mut arguments, "--seed", value);
             }
-            ("repeat_penalty", SettingValue::Float(value)) => {
+            ("llama.cpp.repeat_penalty", SettingValue::Float(value)) => {
                 push_value_argument(&mut arguments, "--repeat-penalty", *value);
             }
-            ("presence_penalty", SettingValue::Float(value)) => {
+            ("llama.cpp.presence_penalty", SettingValue::Float(value)) => {
                 push_value_argument(&mut arguments, "--presence-penalty", *value);
             }
-            ("frequency_penalty", SettingValue::Float(value)) => {
+            ("llama.cpp.frequency_penalty", SettingValue::Float(value)) => {
                 push_value_argument(&mut arguments, "--frequency-penalty", *value);
             }
-            ("max_output_tokens", SettingValue::UnsignedInteger(value)) => {
+            ("llama.cpp.max_output_tokens", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--predict", *value);
             }
-            ("stop_strings", SettingValue::StringList(values)) => {
+            ("llama.cpp.stop_strings", SettingValue::StringList(values)) => {
                 for value in values {
                     push_value_argument(&mut arguments, "--reverse-prompt", value);
                 }
             }
-            ("reasoning", SettingValue::Choice(value)) => {
+            ("llama.cpp.reasoning", SettingValue::Choice(value)) => {
                 push_value_argument(&mut arguments, "--reasoning", value);
             }
-            ("reasoning_effort", SettingValue::Choice(value)) => {
+            ("llama.cpp.reasoning_effort", SettingValue::Choice(value)) => {
                 push_value_argument(&mut arguments, "--reasoning-effort", value);
             }
-            ("reasoning_budget", SettingValue::Integer(value)) => {
+            ("llama.cpp.reasoning_budget", SettingValue::Integer(value)) => {
                 push_value_argument(&mut arguments, "--reasoning-budget", *value);
             }
-            ("reasoning_budget_message", SettingValue::String(value)) => {
+            ("llama.cpp.reasoning_budget_message", SettingValue::String(value)) => {
                 push_value_argument(&mut arguments, "--reasoning-budget-message", value);
             }
-            ("structured_output_schema", SettingValue::Json(_)) => {}
-            ("system_prompt" | "context_overflow", _) => {}
+            ("llama.cpp.structured_output_schema", SettingValue::Json(_)) => {}
+            ("llama.cpp.system_prompt" | "llama.cpp.context_overflow", _) => {}
             ("llama.cpp.threads", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--threads", *value);
             }
@@ -3009,6 +4453,100 @@ fn translate_llama_settings_for_model(
     })
 }
 
+fn push_llama_direct_argument(
+    arguments: &mut Vec<OsString>,
+    id: &str,
+    value: &SettingValue,
+    setting: LlamaDirectSetting,
+) -> Result<(), EngineError> {
+    match setting.mode {
+        LlamaDirectMode::Flag => {
+            if !matches!(value, SettingValue::FlagEnabled) {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "setting `{id}` must be enabled or unset"
+                )));
+            }
+            arguments.push(OsString::from(setting.required));
+            return Ok(());
+        }
+        LlamaDirectMode::Toggle { enabled, disabled } => {
+            let SettingValue::Toggle(value) = value else {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "setting `{id}` must be a toggle"
+                )));
+            };
+            if let Some(option) = if *value { enabled } else { disabled } {
+                arguments.push(OsString::from(option));
+            }
+            return Ok(());
+        }
+        LlamaDirectMode::Value => {}
+    }
+    let rendered = match value {
+        SettingValue::Toggle(value) => {
+            if id == "llama.cpp.fit" {
+                if *value {
+                    "on".to_owned()
+                } else {
+                    "off".to_owned()
+                }
+            } else if *value {
+                "1".to_owned()
+            } else {
+                "0".to_owned()
+            }
+        }
+        SettingValue::Integer(value) => value.to_string(),
+        SettingValue::UnsignedInteger(value) => value.to_string(),
+        SettingValue::Float(value) => value.to_string(),
+        SettingValue::String(value) | SettingValue::Choice(value) => match (id, value.as_str()) {
+            ("llama.cpp.priority", "low") => "-1".to_owned(),
+            (id, "normal") if id.contains("priority") => "0".to_owned(),
+            (id, "medium") if id.contains("priority") => "1".to_owned(),
+            (id, "high") if id.contains("priority") => "2".to_owned(),
+            (id, "realtime") if id.contains("priority") => "3".to_owned(),
+            _ => value.clone(),
+        },
+        SettingValue::Path(value) => value.display().to_string(),
+        SettingValue::GpuOffload(value) => match value {
+            GpuOffload::None => "0".to_owned(),
+            GpuOffload::Auto => "auto".to_owned(),
+            GpuOffload::All => "all".to_owned(),
+            GpuOffload::Layers(value) => value.to_string(),
+        },
+        SettingValue::Json(value) => serde_json::to_string(value).map_err(|error| {
+            EngineError::InvalidConfiguration(format!("could not serialize `{id}`: {error}"))
+        })?,
+        SettingValue::StringList(values) => values.join(setting.list_separator),
+        _ => {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "setting `{id}` has an invalid value for llama.cpp"
+            )));
+        }
+    };
+    arguments.push(OsString::from(setting.required));
+    if id == "llama.cpp.control_vector_layer_range" {
+        let values = rendered.split_whitespace().collect::<Vec<_>>();
+        if values.len() != 2 {
+            return Err(EngineError::InvalidConfiguration(
+                "llama.cpp.control_vector_layer_range requires `START END`".to_owned(),
+            ));
+        }
+        arguments.extend(values.into_iter().map(OsString::from));
+    } else if id == "llama.cpp.dry_sequence_breakers" {
+        arguments.pop();
+        let SettingValue::StringList(values) = value else {
+            unreachable!()
+        };
+        for value in values {
+            push_value_argument(arguments, setting.required, value);
+        }
+    } else {
+        arguments.push(OsString::from(rendered));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn translate_llama_settings(
     settings: &norted_core::ResolvedSettings,
@@ -3022,30 +4560,30 @@ fn llama_setting_collision_contract(
     id: &str,
 ) -> (&'static [&'static str], &'static [&'static str]) {
     match id {
-        "context_length" => (&["-c", "--ctx-size"], &["LLAMA_ARG_CTX_SIZE"]),
-        "parallel_requests" => (&["-np", "--parallel"], &["LLAMA_ARG_N_PARALLEL"]),
-        "temperature" => (&["--temp"], &["LLAMA_ARG_TEMP"]),
-        "top_p" => (&["--top-p"], &["LLAMA_ARG_TOP_P"]),
-        "top_k" => (&["--top-k"], &["LLAMA_ARG_TOP_K"]),
-        "min_p" => (&["--min-p"], &["LLAMA_ARG_MIN_P"]),
-        "seed" => (&["-s", "--seed"], &[]),
-        "repeat_penalty" => (&["--repeat-penalty"], &[]),
-        "presence_penalty" => (&["--presence-penalty"], &[]),
-        "frequency_penalty" => (&["--frequency-penalty"], &[]),
-        "max_output_tokens" => (
+        "llama.cpp.context_length" => (&["-c", "--ctx-size"], &["LLAMA_ARG_CTX_SIZE"]),
+        "llama.cpp.parallel_requests" => (&["-np", "--parallel"], &["LLAMA_ARG_N_PARALLEL"]),
+        "llama.cpp.temperature" => (&["--temp"], &["LLAMA_ARG_TEMP"]),
+        "llama.cpp.top_p" => (&["--top-p"], &["LLAMA_ARG_TOP_P"]),
+        "llama.cpp.top_k" => (&["--top-k"], &["LLAMA_ARG_TOP_K"]),
+        "llama.cpp.min_p" => (&["--min-p"], &["LLAMA_ARG_MIN_P"]),
+        "llama.cpp.seed" => (&["-s", "--seed"], &[]),
+        "llama.cpp.repeat_penalty" => (&["--repeat-penalty"], &[]),
+        "llama.cpp.presence_penalty" => (&["--presence-penalty"], &[]),
+        "llama.cpp.frequency_penalty" => (&["--frequency-penalty"], &[]),
+        "llama.cpp.max_output_tokens" => (
             &["-n", "--predict", "--n-predict"],
             &["LLAMA_ARG_N_PREDICT"],
         ),
-        "stop_strings" => (&["-r", "--reverse-prompt"], &[]),
-        "system_prompt" | "context_overflow" => (&[], &[]),
-        "reasoning" => (&["-rea", "--reasoning"], &["LLAMA_ARG_REASONING"]),
-        "reasoning_effort" => (&["--reasoning-effort"], &["LLAMA_ARG_REASONING_EFFORT"]),
-        "reasoning_budget" => (&["--reasoning-budget"], &["LLAMA_ARG_THINK_BUDGET"]),
-        "reasoning_budget_message" => (
+        "llama.cpp.stop_strings" => (&["-r", "--reverse-prompt"], &[]),
+        "llama.cpp.system_prompt" | "llama.cpp.context_overflow" => (&[], &[]),
+        "llama.cpp.reasoning" => (&["-rea", "--reasoning"], &["LLAMA_ARG_REASONING"]),
+        "llama.cpp.reasoning_effort" => (&["--reasoning-effort"], &["LLAMA_ARG_REASONING_EFFORT"]),
+        "llama.cpp.reasoning_budget" => (&["--reasoning-budget"], &["LLAMA_ARG_THINK_BUDGET"]),
+        "llama.cpp.reasoning_budget_message" => (
             &["--reasoning-budget-message"],
             &["LLAMA_ARG_THINK_BUDGET_MESSAGE"],
         ),
-        "structured_output_schema" => (
+        "llama.cpp.structured_output_schema" => (
             &[
                 "-j",
                 "--json-schema",
@@ -3165,14 +4703,34 @@ fn conflicts_with_managed_argument(argument: &str) -> bool {
 fn conflicts_with_managed_environment(name: &str) -> bool {
     MANAGED_ENVIRONMENT_VARIABLES
         .iter()
+        .copied()
+        .chain(structured_llama_environment_names())
         .any(|managed| name.eq_ignore_ascii_case(managed))
 }
 
 fn managed_environment_removals() -> Vec<OsString> {
-    MANAGED_ENVIRONMENT_VARIABLES
+    let mut names = MANAGED_ENVIRONMENT_VARIABLES
         .iter()
-        .map(OsString::from)
-        .collect()
+        .copied()
+        .chain(structured_llama_environment_names())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    names.into_iter().map(OsString::from).collect()
+}
+
+fn structured_llama_environment_names() -> impl Iterator<Item = &'static str> {
+    llama_setting_definitions()
+        .into_iter()
+        .flat_map(|definition| {
+            if let Some(setting) = llama_direct_setting(definition.id.as_str()) {
+                setting.environment.to_vec()
+            } else {
+                llama_setting_collision_contract(definition.id.as_str())
+                    .1
+                    .to_vec()
+            }
+        })
 }
 
 fn parse_version(output: &str) -> (Option<String>, Option<String>) {
@@ -3723,8 +5281,14 @@ mod settings_tests {
     fn common_and_kv_settings_translate_independently() {
         let translated = translate_llama_settings(
             &resolved(&[
-                ("context_length", SettingValue::UnsignedInteger(131_072)),
-                ("parallel_requests", SettingValue::UnsignedInteger(3)),
+                (
+                    "llama.cpp.context_length",
+                    SettingValue::UnsignedInteger(131_072),
+                ),
+                (
+                    "llama.cpp.parallel_requests",
+                    SettingValue::UnsignedInteger(3),
+                ),
                 (
                     "llama.cpp.kv_cache_k",
                     SettingValue::Choice("q8_0".to_owned()),
@@ -3750,10 +5314,10 @@ mod settings_tests {
     #[test]
     fn configured_generation_defaults_translate_to_exact_llama_controls() {
         let settings = resolved(&[
-            ("temperature", SettingValue::Float(0.7)),
-            ("top_p", SettingValue::Float(0.9)),
-            ("top_k", SettingValue::UnsignedInteger(40)),
-            ("min_p", SettingValue::Float(0.05)),
+            ("llama.cpp.temperature", SettingValue::Float(0.7)),
+            ("llama.cpp.top_p", SettingValue::Float(0.9)),
+            ("llama.cpp.top_k", SettingValue::UnsignedInteger(40)),
+            ("llama.cpp.min_p", SettingValue::Float(0.05)),
         ]);
         let translated = translate_llama_settings(&settings, &[], &BTreeMap::new())
             .expect("configured generation defaults");
@@ -3766,10 +5330,10 @@ mod settings_tests {
         assert_eq!(
             llama_normalized_generation_defaults(&settings),
             BTreeMap::from([
-                ("configured_min_p".to_owned(), json!(0.05)),
-                ("configured_temperature".to_owned(), json!(0.7)),
-                ("configured_top_k".to_owned(), json!(40)),
-                ("configured_top_p".to_owned(), json!(0.9)),
+                ("configured_llama.cpp.min_p".to_owned(), json!(0.05)),
+                ("configured_llama.cpp.temperature".to_owned(), json!(0.7)),
+                ("configured_llama.cpp.top_k".to_owned(), json!(40)),
+                ("configured_llama.cpp.top_p".to_owned(), json!(0.9)),
             ])
         );
     }
@@ -3777,7 +5341,7 @@ mod settings_tests {
     #[test]
     fn common_temperature_resolves_from_a_llama_model_profile_and_translates() {
         let profile_id = ModelProfileId::new("llama-quality").expect("profile ID");
-        let temperature_id = SettingId::new("temperature").expect("temperature ID");
+        let temperature_id = SettingId::new("llama.cpp.temperature").expect("temperature ID");
         let mut overrides = SettingsPatch::default();
         overrides.insert(temperature_id.clone(), SettingValue::Float(0.7));
         let resolved = SettingsState::default()
@@ -3817,7 +5381,7 @@ mod settings_tests {
 
     #[test]
     fn exact_generation_and_reasoning_controls_are_help_gated() {
-        let configured = resolved(&[("temperature", SettingValue::Float(0.7))]);
+        let configured = resolved(&[("llama.cpp.temperature", SettingValue::Float(0.7))]);
         assert!(matches!(
             llama_configured_runtime_compatibility(&configured, None, None),
             RuntimeCompatibility::NeedsAttention(_)
@@ -3836,10 +5400,10 @@ mod settings_tests {
         ));
 
         let all_generation = resolved(&[
-            ("temperature", SettingValue::Float(0.7)),
-            ("top_p", SettingValue::Float(0.9)),
-            ("top_k", SettingValue::UnsignedInteger(40)),
-            ("min_p", SettingValue::Float(0.05)),
+            ("llama.cpp.temperature", SettingValue::Float(0.7)),
+            ("llama.cpp.top_p", SettingValue::Float(0.9)),
+            ("llama.cpp.top_k", SettingValue::UnsignedInteger(40)),
+            ("llama.cpp.min_p", SettingValue::Float(0.05)),
         ]);
         let generation_help =
             "  --temp N  temperature\n  --top-p N  top p\n  --top-k N  top k\n  --min-p N  min p";
@@ -3849,7 +5413,7 @@ mod settings_tests {
         ));
         let mut definitions = llama_model_setting_definitions(None);
         apply_llama_exact_help_contract(&mut definitions, "  --temp N  temperature");
-        for id in ["top_p", "top_k", "min_p"] {
+        for id in ["llama.cpp.top_p", "llama.cpp.top_k", "llama.cpp.min_p"] {
             assert!(
                 !definitions
                     .iter()
@@ -3862,7 +5426,7 @@ mod settings_tests {
 
         let reasoning = definitions
             .iter()
-            .find(|definition| definition.id.as_str() == "reasoning_effort")
+            .find(|definition| definition.id.as_str() == "llama.cpp.reasoning_effort")
             .expect("reasoning definition");
         assert!(!reasoning.supported);
         assert!(
@@ -3883,7 +5447,7 @@ mod settings_tests {
                     definition.id
                 );
                 assert!(
-                    definition.id.as_str() == "system_prompt"
+                    definition.id.as_str() == "llama.cpp.system_prompt"
                         || !llama_setting_contract(definition.id.as_str()).is_empty(),
                     "supported llama.cpp setting {} has no exact-runtime contract",
                     definition.id
@@ -3986,7 +5550,10 @@ mod settings_tests {
 
     #[test]
     fn structured_llama_setting_rejects_both_native_argument_forms() {
-        let settings = resolved(&[("context_length", SettingValue::UnsignedInteger(8192))]);
+        let settings = resolved(&[(
+            "llama.cpp.context_length",
+            SettingValue::UnsignedInteger(8192),
+        )]);
         for native in [
             vec!["--ctx-size=4096".to_owned()],
             vec!["-c".to_owned(), "4096".to_owned()],
@@ -4001,7 +5568,7 @@ mod settings_tests {
     fn malformed_values_are_rejected_by_the_definition() {
         let definition = llama_setting_definitions()
             .into_iter()
-            .find(|definition| definition.id.as_str() == "context_length")
+            .find(|definition| definition.id.as_str() == "llama.cpp.context_length")
             .expect("context definition");
         assert!(definition.parse("0").is_err());
         assert!(definition.parse("many").is_err());

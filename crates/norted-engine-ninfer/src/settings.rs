@@ -9,21 +9,21 @@ use norted_engine::{EngineError, common_setting_definitions_for};
 
 const MAX_NINFER_CLI_INTEGER: u64 = i32::MAX as u64;
 const NINFER_COMMON_SETTINGS: &[&str] = &[
-    "context_length",
-    "parallel_requests",
-    "temperature",
-    "top_p",
-    "top_k",
-    "min_p",
-    "seed",
-    "presence_penalty",
-    "frequency_penalty",
-    "max_output_tokens",
-    "stop_strings",
-    "system_prompt",
-    "reasoning",
-    "reasoning_effort",
-    "reasoning_budget",
+    "ninfer.context_length",
+    "ninfer.parallel_requests",
+    "ninfer.temperature",
+    "ninfer.top_p",
+    "ninfer.top_k",
+    "ninfer.min_p",
+    "ninfer.seed",
+    "ninfer.presence_penalty",
+    "ninfer.frequency_penalty",
+    "ninfer.max_output_tokens",
+    "ninfer.stop_strings",
+    "ninfer.system_prompt",
+    "ninfer.reasoning",
+    "ninfer.reasoning_effort",
+    "ninfer.reasoning_budget",
 ];
 
 pub(crate) fn definitions() -> Vec<SettingDefinition> {
@@ -225,6 +225,29 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             1,
             Some(u64::MAX >> 20),
         ),
+        toggle(
+            "ninfer.cors",
+            "CORS",
+            "Emit NInfer's permissive CORS headers on its private loopback backend",
+        ),
+        definition(
+            "ninfer.log_level",
+            "Log level",
+            "NInfer process log verbosity",
+            SettingKind::Choice {
+                choices: choices(&[
+                    "trace", "debug", "info", "warning", "error", "critical", "off",
+                ]),
+            },
+            Some("exact runtime default"),
+        ),
+        definition(
+            "ninfer.context_cost_presets",
+            "Context-cost presets",
+            "Optional NInfer context-cost preset file",
+            SettingKind::Path,
+            Some("exact runtime default"),
+        ),
     ]);
     definitions
 }
@@ -234,17 +257,17 @@ pub(crate) fn apply_reviewed_runtime_defaults(
     settings: Option<&ResolvedSettings>,
 ) {
     for (id, value) in [
-        ("context_length", "8192"),
-        ("parallel_requests", "1"),
-        ("temperature", "auto"),
-        ("top_p", "auto"),
-        ("top_k", "auto"),
-        ("min_p", "auto"),
-        ("presence_penalty", "auto"),
-        ("frequency_penalty", "auto"),
-        ("max_output_tokens", "8192"),
-        ("reasoning_effort", "auto"),
-        ("reasoning_budget", "unlimited"),
+        ("ninfer.context_length", "8192"),
+        ("ninfer.parallel_requests", "1"),
+        ("ninfer.temperature", "auto"),
+        ("ninfer.top_p", "auto"),
+        ("ninfer.top_k", "auto"),
+        ("ninfer.min_p", "auto"),
+        ("ninfer.presence_penalty", "auto"),
+        ("ninfer.frequency_penalty", "auto"),
+        ("ninfer.max_output_tokens", "8192"),
+        ("ninfer.reasoning_effort", "auto"),
+        ("ninfer.reasoning_budget", "unlimited"),
         ("ninfer.kv_dtype", "BF16"),
         ("ninfer.prefill_chunk", "1024"),
         ("ninfer.speculation", "disabled"),
@@ -265,6 +288,9 @@ pub(crate) fn apply_reviewed_runtime_defaults(
         ("ninfer.media_live_mib", "2048 MiB"),
         ("ninfer.response_store_max_records", "1024"),
         ("ninfer.response_store_max_mib", "256 MiB"),
+        ("ninfer.cors", "disabled"),
+        ("ninfer.log_level", "info"),
+        ("ninfer.context_cost_presets", "None"),
     ] {
         set_default(
             definitions,
@@ -274,18 +300,19 @@ pub(crate) fn apply_reviewed_runtime_defaults(
     }
     set_default(
         definitions,
-        "seed",
+        "ninfer.seed",
         SettingDefaultPreview::new("random", SettingDefaultSource::StartupDynamic)
             .with_detail("NInfer creates a fresh random seed for each request when none is set"),
     );
 
     let thinking = reviewed_effective_thinking(settings);
     let thinking_is_derived = settings.is_some_and(|settings| {
-        settings.value("ninfer.thinking").is_some() || settings.value("reasoning_effort").is_some()
+        settings.value("ninfer.thinking").is_some()
+            || settings.value("ninfer.reasoning_effort").is_some()
     });
     set_default(
         definitions,
-        "reasoning",
+        "ninfer.reasoning",
         SettingDefaultPreview::new(
             if thinking { "on" } else { "off" },
             if thinking_is_derived {
@@ -302,14 +329,14 @@ pub(crate) fn apply_reviewed_runtime_defaults(
     );
 
     let concurrency = settings
-        .and_then(|settings| settings.value("parallel_requests"))
+        .and_then(|settings| settings.value("ninfer.parallel_requests"))
         .and_then(|value| match value {
             SettingValue::UnsignedInteger(value) => Some(*value),
             _ => None,
         })
         .unwrap_or(1);
     let context = settings
-        .and_then(|settings| settings.value("context_length"))
+        .and_then(|settings| settings.value("ninfer.context_length"))
         .and_then(|value| match value {
             SettingValue::UnsignedInteger(value) => Some(*value),
             _ => None,
@@ -425,7 +452,7 @@ pub(crate) fn reviewed_request_thinking_override(
     settings: Option<&ResolvedSettings>,
 ) -> Option<bool> {
     settings
-        .and_then(|settings| settings.value("reasoning"))
+        .and_then(|settings| settings.value("ninfer.reasoning"))
         .and_then(|value| match value {
             SettingValue::Choice(value) if value == "on" => Some(true),
             SettingValue::Choice(value) if value == "off" => Some(false),
@@ -433,7 +460,7 @@ pub(crate) fn reviewed_request_thinking_override(
         })
         .or_else(|| {
             settings
-                .and_then(|settings| settings.value("reasoning_effort"))
+                .and_then(|settings| settings.value("ninfer.reasoning_effort"))
                 .and_then(|value| match value {
                     SettingValue::Choice(value) if value == "none" => Some(false),
                     SettingValue::Choice(value)
@@ -495,25 +522,25 @@ pub(crate) fn apply_model_sampler_defaults(
         temperature = "0.0";
     }
     for (id, value) in [
-        ("temperature", temperature),
-        ("top_p", top_p),
-        ("top_k", top_k),
-        ("min_p", min_p),
-        ("presence_penalty", presence_penalty),
-        ("frequency_penalty", frequency_penalty),
+        ("ninfer.temperature", temperature),
+        ("ninfer.top_p", top_p),
+        ("ninfer.top_k", top_k),
+        ("ninfer.min_p", min_p),
+        ("ninfer.presence_penalty", presence_penalty),
+        ("ninfer.frequency_penalty", frequency_penalty),
     ] {
         set_default(
             definitions,
             id,
             SettingDefaultPreview::new(
                 value,
-                if id == "temperature" && greedy {
+                if id == "ninfer.temperature" && greedy {
                     SettingDefaultSource::Derived
                 } else {
                     SettingDefaultSource::Model
                 },
             )
-            .with_detail(if id == "temperature" && greedy {
+            .with_detail(if id == "ninfer.temperature" && greedy {
                 "The reviewed runtime's configured greedy mode forces exact argmax".to_owned()
             } else {
                 format!(
@@ -529,7 +556,7 @@ pub(crate) fn apply_model_sampler_defaults(
 pub(crate) fn apply_runtime_bounds(definitions: &mut [SettingDefinition]) {
     if let Some(context) = definitions
         .iter_mut()
-        .find(|definition| definition.id.as_str() == "context_length")
+        .find(|definition| definition.id.as_str() == "ninfer.context_length")
     {
         context.kind = SettingKind::UnsignedInteger {
             minimum: Some(1),
@@ -538,7 +565,7 @@ pub(crate) fn apply_runtime_bounds(definitions: &mut [SettingDefinition]) {
     }
     if let Some(parallel) = definitions
         .iter_mut()
-        .find(|definition| definition.id.as_str() == "parallel_requests")
+        .find(|definition| definition.id.as_str() == "ninfer.parallel_requests")
     {
         parallel.kind = SettingKind::UnsignedInteger {
             minimum: Some(1),
@@ -549,7 +576,7 @@ pub(crate) fn apply_runtime_bounds(definitions: &mut [SettingDefinition]) {
     }
     if let Some(top_k) = definitions
         .iter_mut()
-        .find(|definition| definition.id.as_str() == "top_k")
+        .find(|definition| definition.id.as_str() == "ninfer.top_k")
     {
         top_k.kind = SettingKind::UnsignedInteger {
             minimum: Some(0),
@@ -558,7 +585,7 @@ pub(crate) fn apply_runtime_bounds(definitions: &mut [SettingDefinition]) {
     }
     if let Some(budget) = definitions
         .iter_mut()
-        .find(|definition| definition.id.as_str() == "reasoning_budget")
+        .find(|definition| definition.id.as_str() == "ninfer.reasoning_budget")
     {
         budget.kind = SettingKind::Integer {
             minimum: Some(1),
@@ -570,7 +597,7 @@ pub(crate) fn apply_runtime_bounds(definitions: &mut [SettingDefinition]) {
     }
     if let Some(effort) = definitions
         .iter_mut()
-        .find(|definition| definition.id.as_str() == "reasoning_effort")
+        .find(|definition| definition.id.as_str() == "ninfer.reasoning_effort")
         && let SettingKind::Choice { choices } = &mut effort.kind
     {
         choices.retain(|choice| matches!(choice.as_str(), "none" | "low" | "medium" | "xhigh"));
@@ -702,18 +729,21 @@ pub(crate) fn execution_path_for_setting(id: &str) -> SettingExecutionPath {
     };
 
     match id {
-        "context_length" => LaunchOption("--max-context"),
-        "parallel_requests" => LaunchOption("--max-concurrency"),
-        "temperature" => LaunchOption("--temperature"),
-        "top_p" => LaunchOption("--top-p"),
-        "top_k" => LaunchOption("--top-k"),
-        "min_p" => LaunchOption("--min-p"),
-        "seed" => LaunchOption("--seed"),
-        "presence_penalty" => LaunchOption("--presence-penalty"),
-        "frequency_penalty" => LaunchOption("--frequency-penalty"),
-        "max_output_tokens" => LaunchOption("--default-max-tokens"),
-        "reasoning_budget" => LaunchOption("--default-thinking-budget"),
-        "reasoning_effort" | "reasoning" | "stop_strings" | "system_prompt" => NortedRequestDefault,
+        "ninfer.context_length" => LaunchOption("--max-context"),
+        "ninfer.parallel_requests" => LaunchOption("--max-concurrency"),
+        "ninfer.temperature" => LaunchOption("--temperature"),
+        "ninfer.top_p" => LaunchOption("--top-p"),
+        "ninfer.top_k" => LaunchOption("--top-k"),
+        "ninfer.min_p" => LaunchOption("--min-p"),
+        "ninfer.seed" => LaunchOption("--seed"),
+        "ninfer.presence_penalty" => LaunchOption("--presence-penalty"),
+        "ninfer.frequency_penalty" => LaunchOption("--frequency-penalty"),
+        "ninfer.max_output_tokens" => LaunchOption("--default-max-tokens"),
+        "ninfer.reasoning_budget" => LaunchOption("--default-thinking-budget"),
+        "ninfer.reasoning_effort"
+        | "ninfer.reasoning"
+        | "ninfer.stop_strings"
+        | "ninfer.system_prompt" => NortedRequestDefault,
         "ninfer.kv_dtype" => LaunchOption("--kv-dtype"),
         "ninfer.kv_capacity" => LaunchOption("--kv-capacity"),
         "ninfer.prefill_chunk" => LaunchOption("--prefill-chunk"),
@@ -744,6 +774,9 @@ pub(crate) fn execution_path_for_setting(id: &str) -> SettingExecutionPath {
         "ninfer.media_preprocess_threads" => LaunchOption("--media-preprocess-threads"),
         "ninfer.response_store_max_records" => LaunchOption("--response-store-max-records"),
         "ninfer.response_store_max_mib" => LaunchOption("--response-store-max-mib"),
+        "ninfer.cors" => LaunchOption("--cors"),
+        "ninfer.log_level" => LaunchOption("--log-level"),
+        "ninfer.context_cost_presets" => LaunchOption("--context-cost-presets"),
         _ => Unsupported,
     }
 }
@@ -771,22 +804,23 @@ pub(crate) fn translate(
         }
     }
 
-    if unsigned_value(settings, "context_length")?
+    if unsigned_value(settings, "ninfer.context_length")?
         .is_some_and(|value| value == 0 || value > MAX_NINFER_CLI_INTEGER)
     {
         return Err(EngineError::InvalidConfiguration(format!(
             "context_length must be in 1..={MAX_NINFER_CLI_INTEGER} for NInfer"
         )));
     }
-    if unsigned_value(settings, "parallel_requests")?.is_some_and(|value| !(1..=8).contains(&value))
+    if unsigned_value(settings, "ninfer.parallel_requests")?
+        .is_some_and(|value| !(1..=8).contains(&value))
     {
         return Err(EngineError::InvalidConfiguration(
             "parallel_requests must be in 1..=8 for NInfer".to_owned(),
         ));
     }
 
-    let reasoning = choice_value(settings, "reasoning")?;
-    let effort = choice_value(settings, "reasoning_effort")?;
+    let reasoning = choice_value(settings, "ninfer.reasoning")?;
+    let effort = choice_value(settings, "ninfer.reasoning_effort")?;
     if matches!((reasoning, effort), (Some("on"), Some("none")))
         || matches!(
             (reasoning, effort),
@@ -808,9 +842,15 @@ pub(crate) fn translate(
     }
     let speculation_enabled = speculation.unwrap_or(speculative.is_some());
     if toggle_value(settings, "ninfer.greedy")? == Some(true)
-        && ["temperature", "top_p", "top_k", "min_p", "seed"]
-            .into_iter()
-            .any(|id| settings.value(id).is_some())
+        && [
+            "ninfer.temperature",
+            "ninfer.top_p",
+            "ninfer.top_k",
+            "ninfer.min_p",
+            "ninfer.seed",
+        ]
+        .into_iter()
+        .any(|id| settings.value(id).is_some())
     {
         return Err(EngineError::InvalidConfiguration(
             "ninfer.greedy cannot be combined with sampler defaults that it would override"
@@ -835,7 +875,7 @@ pub(crate) fn translate(
             "NInfer media resource settings require `ninfer.vision=on`".to_owned(),
         ));
     }
-    if let Some(SettingValue::Integer(value)) = settings.value("reasoning_budget")
+    if let Some(SettingValue::Integer(value)) = settings.value("ninfer.reasoning_budget")
         && *value <= 0
     {
         return Err(EngineError::InvalidConfiguration(
@@ -888,7 +928,7 @@ pub(crate) fn translate(
         ));
     }
     if let (Some(context), Some(capacity)) = (
-        unsigned_value(settings, "context_length")?,
+        unsigned_value(settings, "ninfer.context_length")?,
         unsigned_integer_or_choice_value(settings, "ninfer.kv_capacity")?,
     ) && capacity < context
     {
@@ -944,7 +984,7 @@ pub(crate) fn translate(
                 "ninfer.lm_head_draft" | "ninfer.preserve_thinking" if *value => {
                     arguments.push(OsString::from(option));
                 }
-                "ninfer.vision" | "ninfer.greedy" if *value => {
+                "ninfer.vision" | "ninfer.greedy" | "ninfer.cors" if *value => {
                     arguments.push(OsString::from(option));
                 }
                 "ninfer.cuda_graph"
@@ -953,7 +993,8 @@ pub(crate) fn translate(
                 | "ninfer.lm_head_draft"
                 | "ninfer.preserve_thinking"
                 | "ninfer.vision"
-                | "ninfer.greedy" => {}
+                | "ninfer.greedy"
+                | "ninfer.cors" => {}
                 _ => {
                     return Err(EngineError::InvalidConfiguration(format!(
                         "setting `{id}` has an invalid toggle mapping for NInfer"
@@ -966,11 +1007,15 @@ pub(crate) fn translate(
             SettingValue::Float(value) => push_value(&mut arguments, option, value),
             SettingValue::Integer(value) => push_value(&mut arguments, option, value),
             SettingValue::Choice(value) => push_value(&mut arguments, option, value),
+            SettingValue::Path(value) => {
+                arguments.push(OsString::from(option));
+                arguments.push(value.as_os_str().to_owned());
+            }
             SettingValue::UnsignedIntegerOrChoice(
                 UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
             ) => push_value(&mut arguments, option, value),
             SettingValue::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(value))
-                if id.as_str() == "seed" && value == "random" => {}
+                if id.as_str() == "ninfer.seed" && value == "random" => {}
             SettingValue::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(value)) => {
                 push_value(&mut arguments, option, value)
             }
@@ -1123,8 +1168,11 @@ mod tests {
     fn common_and_typed_ninfer_settings_translate_exactly() {
         let arguments = translated(
             &[
-                ("context_length", SettingValue::UnsignedInteger(32_768)),
-                ("parallel_requests", SettingValue::UnsignedInteger(4)),
+                (
+                    "ninfer.context_length",
+                    SettingValue::UnsignedInteger(32_768),
+                ),
+                ("ninfer.parallel_requests", SettingValue::UnsignedInteger(4)),
                 ("ninfer.kv_dtype", SettingValue::Choice("fp8".to_owned())),
                 (
                     "ninfer.kv_capacity",
@@ -1166,10 +1214,10 @@ mod tests {
             );
         }
         for absent in [
-            "repeat_penalty",
-            "reasoning_budget_message",
-            "structured_output_schema",
-            "context_overflow",
+            "ninfer.repeat_penalty",
+            "ninfer.reasoning_budget_message",
+            "ninfer.structured_output_schema",
+            "ninfer.context_overflow",
         ] {
             assert!(
                 definitions
@@ -1186,7 +1234,7 @@ mod tests {
         apply_runtime_bounds(&mut definitions);
         let parallel = definitions
             .iter()
-            .find(|definition| definition.id.as_str() == "parallel_requests")
+            .find(|definition| definition.id.as_str() == "ninfer.parallel_requests")
             .expect("parallel definition");
         assert!(matches!(
             parallel.kind,
@@ -1299,7 +1347,7 @@ mod tests {
     #[test]
     fn explicit_kv_capacity_must_cover_explicit_context() {
         let undersized = settings(&[
-            ("context_length", SettingValue::UnsignedInteger(8192)),
+            ("ninfer.context_length", SettingValue::UnsignedInteger(8192)),
             (
                 "ninfer.kv_capacity",
                 SettingValue::UnsignedIntegerOrChoice(
@@ -1310,7 +1358,7 @@ mod tests {
         assert!(translate(&undersized, &model("qwen3.6-27b"), &[]).is_err());
 
         let automatic = settings(&[
-            ("context_length", SettingValue::UnsignedInteger(8192)),
+            ("ninfer.context_length", SettingValue::UnsignedInteger(8192)),
             (
                 "ninfer.kv_capacity",
                 SettingValue::UnsignedIntegerOrChoice(UnsignedIntegerOrChoiceValue::Choice(

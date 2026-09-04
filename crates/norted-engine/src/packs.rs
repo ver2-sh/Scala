@@ -139,6 +139,19 @@ pub struct RuntimePackManager {
 }
 
 impl RuntimePackManager {
+    pub fn normalize_settings(
+        &self,
+        engine_id: &str,
+        settings: &mut norted_core::ResolvedSettings,
+    ) -> Result<(), RuntimePackError> {
+        let adapter = self.registry.get(engine_id).ok_or_else(|| {
+            RuntimePackError::Selection(format!("bound engine `{engine_id}` is not registered"))
+        })?;
+        adapter
+            .normalize_settings(settings)
+            .map_err(RuntimePackError::Adapter)
+    }
+
     pub fn compatible_engine_ids(&self, model: &ModelArtifact) -> Vec<String> {
         self.registry
             .compatible_with(model)
@@ -384,6 +397,7 @@ impl RuntimePackManager {
                 &SettingsPatch::default(),
                 structured_path_base,
             )?;
+            self.normalize_settings(target_engine_id, &mut resolved)?;
             let (_, exact_schema) = self
                 .settings_schema_for_model_for_engine_with_settings(
                     model,
@@ -1271,7 +1285,11 @@ impl RuntimePackManager {
                 .await
                 .ok()
                 .and_then(|schema| {
-                    let id = norted_core::SettingId::new("structured_output_schema").ok()?;
+                    let id = norted_core::SettingId::new(format!(
+                        "{}.structured_output_schema",
+                        selection.runtime.manifest.identity.engine_id
+                    ))
+                    .ok()?;
                     schema
                         .definition(&id)
                         .map(|definition| definition.supported)

@@ -49,12 +49,12 @@ winning layer remain invalid.
 Persistent state is deliberately split:
 
 ```text
-<data>/settings.json         schema 2: Server Settings and independent runtime defaults
+<data>/settings.json         schema 3: Server Settings and strictly namespaced runtime defaults
 <data>/model-profiles.json   schema 1: user-owned Model Profiles
 ```
 
 Each has its own inter-process lock and atomic replacement. Older combined state is not consumed or
-deleted; settings schema 1 and obsolete Global fields are rejected rather than migrated. Recreate
+deleted; settings schemas 1 and 2 and obsolete Global/unqualified fields are rejected rather than migrated. Recreate
 current settings and profiles explicitly.
 
 ### Model Library
@@ -487,10 +487,10 @@ Scriptable management commands remain clients of a running instance. With headle
 
 ```console
 cargo run -p norted-server -- model-profiles create coding-large-context --model <MODEL_ID> --engine llama.cpp
-cargo run -p norted-server -- model-profiles set coding-large-context context_length=131072 llama.cpp.kv_cache_k=q8_0
+cargo run -p norted-server -- model-profiles set coding-large-context llama.cpp.context_length=131072 llama.cpp.kv_cache_k=q8_0
 cargo run -p norted-server -- model-profiles compatibility coding-large-context
 cargo run -p norted-server -- load coding-large-context
-cargo run -p norted-server -- load coding-large-context --set parallel_requests=2
+cargo run -p norted-server -- load coding-large-context --set llama.cpp.parallel_requests=2
 cargo run -p norted-server -- settings show --runtime llama.cpp
 cargo run -p norted-server -- status
 cargo run -p norted-server -- unload coding-large-context
