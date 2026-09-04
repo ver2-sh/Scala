@@ -53,6 +53,13 @@ impl Q27Tier {
             Self::Qwen36Q8 => 48,
         }
     }
+
+    pub(crate) fn is_qwen38(self) -> bool {
+        matches!(
+            self,
+            Self::Qwen38Default | Self::Qwen38Q4s | Self::Qwen38Q6 | Self::Qwen38Q6k
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -114,7 +121,26 @@ pub(crate) fn inspect_q27_model(path: &Path) -> Result<Q27ModelFacts, String> {
     {
         capabilities.insert("mtp_layer_1");
     }
+    // Exact q27 v0.10.0 selects the Qwen3.8 trained-template contract from
+    // normalized `general.name`. Require that same bounded metadata fact plus
+    // a recognized Qwen3.8 v2 quantization identity; neither filenames nor an
+    // unrecognized fine-tune recipe are sufficient capability evidence.
+    if tier.is_some_and(Q27Tier::is_qwen38)
+        && metadata
+            .get("general.name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| normalize_model_name(name).contains("qwen38"))
+    {
+        capabilities.insert("qwen38_trained_template");
+    }
     Ok(Q27ModelFacts { tier, capabilities })
+}
+
+fn normalize_model_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
 }
 
 fn validate_current_architecture(metadata: &Map<String, Value>) -> Result<(), String> {
@@ -363,6 +389,46 @@ mod tests {
             inspect_q27_model(write_model(&unsupported).path())
                 .unwrap_err()
                 .contains("at most one prediction layer")
+        );
+    }
+
+    #[test]
+    fn qwen38_template_capability_requires_exact_metadata_identity() {
+        let mut metadata = architecture_metadata();
+        metadata.as_object_mut().expect("object").extend([
+            ("general.name".to_owned(), json!("Qwen38 27b Hf")),
+            ("quant_policy".to_owned(), json!("v2.0")),
+            ("q8_extra".to_owned(), json!("(attn_output)\\.")),
+        ]);
+        let qwen38 = inspect_q27_model(write_model(&metadata).path()).expect("Qwen3.8 fixture");
+        assert!(qwen38.capabilities.contains("qwen38_trained_template"));
+
+        metadata
+            .as_object_mut()
+            .expect("object")
+            .insert("general.name".to_owned(), json!("Qwen36 27b Hf"));
+        let mismatched_name =
+            inspect_q27_model(write_model(&metadata).path()).expect("mismatched fixture");
+        assert!(
+            !mismatched_name
+                .capabilities
+                .contains("qwen38_trained_template")
+        );
+
+        metadata
+            .as_object_mut()
+            .expect("object")
+            .insert("general.name".to_owned(), json!("Qwen38 custom fine tune"));
+        metadata
+            .as_object_mut()
+            .expect("object")
+            .insert("quant_policy".to_owned(), json!("experimental-v2"));
+        let unknown_recipe =
+            inspect_q27_model(write_model(&metadata).path()).expect("fine-tune fixture");
+        assert!(
+            !unknown_recipe
+                .capabilities
+                .contains("qwen38_trained_template")
         );
     }
 }
