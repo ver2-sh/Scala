@@ -10,9 +10,10 @@ counted as first-class coverage.
 
 The adapter probes the installed executable's own `llama-server --help`; every definition is hidden unless
 that exact executable advertises its required option and a trustworthy omitted/default value. The
-2026-09-04 audit built and inspected upstream commit
-`64a155d242cb427766055ea9caea6f34df1ca94b`, tree
-`100e2797e2540b5f4a9a7b8dc6858e5acb09ceca`. Generic definitions carry no snapshot-derived runtime scalar;
+2026-09-04 audit ended at upstream commit `8b4b3558f1459c13e4aa38d5c94d306a00dc6acd`, tree
+`a53cf3e02dd97bd5c19a33abbed3c9797c8eb842`. The exact `llama-server --help` was built and inspected;
+the final advance during the audit changed CI only, so its option-bearing source and resulting help contract
+were unchanged. Generic definitions carry no snapshot-derived runtime scalar;
 new nightlies discovered by the provider receive only the settings and defaults their own help/model evidence
 proves.
 
@@ -25,7 +26,7 @@ proves.
   context shifting, continuous batching, prompt cache/reuse, and warmup.
 - RoPE/model loading: scaling method/context scale/frequency base/frequency scale, every current YaRN knob,
   load/lazy/NUMA modes, repacking/host buffers/tensor checks/op offload, GPU layer placement, CPU MoE/dense
-  FFN placement, split mode/tensor split/main GPU, fit policy/target/minimum context, tensor placement
+  FFN placement, ordered exact-UUID CUDA device set, split mode/tensor split/main GPU, fit policy/target/minimum context, tensor placement
   overrides, model metadata active-expert override, LoRA and control-vector modifiers.
 - Sampling/default generation: sampler chain, temperature, top-p/top-k/min-p/top-n-sigma, XTC, typical-p,
   seed, EOS behavior, repeat/presence/frequency penalties and window, DRY and adaptive-p controls, dynamic temperature,
@@ -41,9 +42,11 @@ proves.
 ### NORTED_MANAGED
 
 - Primary model/source selectors (`--model`, model URL, Docker/Hugging Face selectors and token), alias/public
-  model identity, bind host/port/reuse/API prefix, API keys/TLS, and `--device`/`LLAMA_ARG_DEVICE` are owned by
-  acquisition, routing, private transport, authentication, and selected-accelerator isolation. CUDA launch
-  selects one UUID-identified GPU, constrains `CUDA_VISIBLE_DEVICES` to that UUID, and passes `--device CUDA0`.
+  model identity, bind host/port/reuse/API prefix, and API keys/TLS are owned by acquisition, routing, private
+  transport, and authentication. Raw `--device`/`LLAMA_ARG_DEVICE` are process-contract controls: the typed
+  `llama.cpp.devices` setting selects ordered physical UUID identities, then launch constrains
+  `CUDA_VISIBLE_DEVICES` to that ordered UUID list and emits the corresponding runtime-local
+  `--device CUDA0,CUDA1,...`. With no explicit set, Norted preserves automatic single-compatible-GPU binding.
 - `--props` is kept off because mutable backend-global properties bypass resolved settings and provenance.
 - Help/version/list/completion/cache-list are probe or one-shot commands, not launch configuration.
 
@@ -56,19 +59,24 @@ proves.
 - Raw grammar/logit-bias and synthetic benchmark switches remain intentionally unavailable as persistent
   defaults: Norted's public request contract does not yet preserve their semantics or file/content identity.
 
-All aliases in the three classifications are enforced at the raw boundary. First-class CLI/environment
-aliases are reserved even when their structured setting is omitted; Norted-managed and unsupported aliases
-are rejected (and managed environment names are removed from launch inheritance). Thus `--rpc`, generic
+All aliases in the three classifications are enforced at the raw boundary, and llama.cpp raw native
+arguments are disabled entirely. At exact-runtime probe time, every ordinary option header advertised by
+that executable must occur in the structured or reviewed managed/unsupported inventories; a new upstream
+option makes the runtime inadmissible until this ledger and adapter are updated. First-class CLI/environment
+aliases are reserved even when their structured setting is omitted. All inherited `LLAMA_*`, `MTMD_*`,
+`GGML_*`, `LLGUIDANCE_*`, and `AIP_*` variables are scrubbed dynamically, after which the adapter supplies
+only its reviewed values; unrelated ordinary environment is still inherited. Thus `--rpc`, generic
 `--override-kv`, device/list-device, multimodal/media, router, UI/tools/MCP, one-shot, legacy-removed, raw
-grammar/logit-bias, and synthetic controls cannot change the private single-model process through
-`engine."llama.cpp".native`.
+grammar/logit-bias, synthetic controls, and future unclassified controls cannot change the private
+single-model process through `engine."llama.cpp".native` or ambient engine environment.
 
 ## q27
 
 The stable serving contract is only v0.10.0 commit
 `4770e053656af9aababdc49c81f280ad21b74986`, tree
 `ff712f78fd17b5fe12149679114b6def003f16a6`. The 2026-09-04 upstream audit found HEAD
-`da8a2bf698a2bf1a893fa0afbcd49979919f40b3` but no release newer than v0.10.0, so HEAD-only controls are not
+`da8a2bf698a2bf1a893fa0afbcd49979919f40b3`, tree
+`3ef39c28e549b3b1cc339e33e3f47e35751d1150`, but no release newer than v0.10.0, so HEAD-only controls are not
 claimed for installable runtimes. All controls below are source-contract gated; external or unreviewed
 binaries do not receive them.
 
@@ -95,11 +103,24 @@ binaries do not receive them.
 - q27 runtime catalog entries are Linux CUDA only; Metal-only controls are not shown.
 - Current unreleased q27 HEAD's `--enable-metrics` is not present in the installable/reviewed v0.10.0
   server and is not claimed until an installable revision receives a new source capability contract.
-- Kernel A/B, benchmark, corpus/evaluation, unit-gate, crash-injection, trace/dump and debug-only environment
-  variables (`*_DBG`, `Q27_TEST_*`, `Q27_BENCH*`, `Q27_DUMP*`, forced launch geometry/stage counts) are
-  diagnostics rather than normal serving configuration. Low-level cp.async/FP8-MMA/PV8/split-K/FD-MMA
-  stage overrides are likewise test/acceptance-gate controls; the typed serving/profile/kernel controls
-  select supported paths without exposing unsafe internal combinations.
+- After subtracting the typed and Norted-managed values above, the exact v0.10.0 CUDA serving runtime's
+  remaining environment inventory is deliberately unsupported:
+  `Q27_ATTN_PF`, `Q27_BATCH_DBG`, `Q27_DRAFT_CEIL`, `Q27_DRAFT_CEIL1`, `Q27_DRIFT_CORPUS`,
+  `Q27_DUMP_HIDDENS`, `Q27_FDMMA_NS`, `Q27_FDMMA_STAGES`, `Q27_GC_RECYCLE`,
+  `Q27_GEMM_SPLITK_DBG`, `Q27_KV_SCATTER`, `Q27_MPROBE`, `Q27_NJOINT`, `Q27_P0B_T`,
+  `Q27_PF4_INSTRUMENT`, `Q27_PF_ARENA_NODRAIN`, `Q27_PF_CPASYNC`, `Q27_PF_FP8MMA`,
+  `Q27_PF_NOSERIAL`, `Q27_PF_NTX`, `Q27_PF_NTX_DBG`, `Q27_PF_PV8`, `Q27_PF_SPLIT`,
+  `Q27_PRINT_WSUM`, `Q27_PROF_DECODE`, `Q27_REASONING_EFFORT`, `Q27_SUFFIX_DBG`, `Q27_SYSBLK`,
+  `Q27_TG_REENGAGE`, `Q27_TG_TRACE`, `Q27_VG_CTA_TARGET`, and `Q27_WSUM_LOCATE`. These are diagnostic,
+  A/B, corpus, trace/dump/instrumentation, unstable internal lifecycle, or low-level launch-geometry controls;
+  the exact q27 schema intentionally does not promote them into normal serving configuration.
+
+q27 raw native arguments are disabled, including the former alternate paths for fast-head, fp16 KV, and
+prefix caching. Configured `Q27_*` variables are rejected, every inherited `Q27_*` name is scrubbed
+dynamically (including future names), and only values generated from reviewed typed `q27.*` settings are
+added back. Norted's independently owned `CUDA_VISIBLE_DEVICES` binding is applied separately. This makes
+the complete pinned v0.10.0 runtime environment inventory enforceable without promoting diagnostics into
+ordinary settings.
 
 ## NInfer
 

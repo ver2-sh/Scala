@@ -1080,7 +1080,12 @@ impl RuntimePackManager {
                 runtime: status.runtime.clone(),
                 source: RuntimeSelectionSource::Invocation,
                 notices: Vec::new(),
-                accelerator: self.model_candidate_accelerator(&status.runtime, model, &host),
+                accelerator_binding: self.model_candidate_accelerator_binding(
+                    &status.runtime,
+                    model,
+                    &host,
+                    settings,
+                ),
             });
         }
         let mut notices = Vec::new();
@@ -1091,7 +1096,12 @@ impl RuntimePackManager {
                         runtime.manifest.identity.engine_id == required
                     }) => {
                     return Ok(RuntimeSelection {
-                        accelerator: self.model_candidate_accelerator(&runtime, model, &list.host),
+                        accelerator_binding: self.model_candidate_accelerator_binding(
+                            &runtime,
+                            model,
+                            &list.host,
+                            settings,
+                        ),
                         runtime,
                         source: RuntimeSelectionSource::ModelOverride,
                         notices,
@@ -1115,7 +1125,12 @@ impl RuntimePackManager {
                         runtime.manifest.identity.engine_id == required
                     }) => {
                     return Ok(RuntimeSelection {
-                        accelerator: self.model_candidate_accelerator(&runtime, model, &list.host),
+                        accelerator_binding: self.model_candidate_accelerator_binding(
+                            &runtime,
+                            model,
+                            &list.host,
+                            settings,
+                        ),
                         runtime,
                         source: RuntimeSelectionSource::FormatDefault,
                         notices,
@@ -1206,7 +1221,8 @@ impl RuntimePackManager {
                 ))
             })?;
         Ok(RuntimeSelection {
-            accelerator: self.model_candidate_accelerator(&runtime, model, &host),
+            accelerator_binding: self
+                .model_candidate_accelerator_binding(&runtime, model, &host, settings),
             runtime,
             source: RuntimeSelectionSource::Fallback,
             notices,
@@ -1799,15 +1815,18 @@ impl RuntimePackManager {
             })
     }
 
-    fn model_candidate_accelerator(
+    fn model_candidate_accelerator_binding(
         &self,
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-    ) -> Option<norted_core::AcceleratorDevice> {
+        settings: Option<&norted_core::ResolvedSettings>,
+    ) -> Option<norted_core::AcceleratorBinding> {
         self.registry
             .get(&runtime.manifest.identity.engine_id)
-            .and_then(|adapter| adapter.runtime_model_accelerator(runtime, model, host))
+            .and_then(|adapter| {
+                adapter.runtime_model_accelerator_binding(runtime, model, host, settings)
+            })
     }
 }
 

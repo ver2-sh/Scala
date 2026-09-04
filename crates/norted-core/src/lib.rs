@@ -52,8 +52,8 @@ pub use runtime::{
     observe_runtime_descriptor, observe_runtime_descriptor_read_only,
 };
 pub use runtime_pack::{
-    AcceleratorDevice, AvailableRuntime, ComputeCapability, HostCapabilities, InstalledRuntime,
-    MINIMUM_RUNTIME_MANIFEST_SCHEMA_VERSION, RUNTIME_MANIFEST_SCHEMA_VERSION,
+    AcceleratorBinding, AcceleratorDevice, AvailableRuntime, ComputeCapability, HostCapabilities,
+    InstalledRuntime, MINIMUM_RUNTIME_MANIFEST_SCHEMA_VERSION, RUNTIME_MANIFEST_SCHEMA_VERSION,
     RUNTIME_SELECTIONS_SCHEMA_VERSION, RuntimeAcquisitionMethod, RuntimeAcquisitionPlan,
     RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest, RuntimeDigestError, RuntimeDownload,
     RuntimeId, RuntimeIdentity, RuntimeIdentityError, RuntimeManifest, RuntimeManifestError,

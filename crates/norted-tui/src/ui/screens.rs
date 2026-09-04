@@ -1870,6 +1870,39 @@ fn render_server(
             }
         })
         .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
+    let accelerators = app
+        .control
+        .as_ref()
+        .map(|control| {
+            let value = control
+                .backends
+                .iter()
+                .filter_map(|backend| {
+                    backend.accelerator_binding.as_ref().map(|binding| {
+                        let devices = binding
+                            .devices
+                            .iter()
+                            .enumerate()
+                            .map(|(index, device)| {
+                                format!(
+                                    "[{index}] {}",
+                                    device.stable_id.as_deref().unwrap_or("unknown-id")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("{}: {devices}", backend.model_profile_id)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if value.is_empty() {
+                "None".to_owned()
+            } else {
+                value
+            }
+        })
+        .unwrap_or_else(|| if pending { "Unknown" } else { "None" }.to_owned());
     let private_backend = app
         .control
         .as_ref()
@@ -1919,6 +1952,7 @@ fn render_server(
         value_width,
         app.marquee_animation_frame / 3,
     );
+    let accelerators = marquee_text(&accelerators, value_width, app.marquee_animation_frame / 3);
     let private_backend = marquee_text(
         &private_backend,
         value_width,
@@ -1948,6 +1982,7 @@ fn render_server(
             key_value("MODELS", &active_model, theme),
             key_value("ENGINES", &active_engine, theme),
             key_value("RUNTIMES", &active_runtime, theme),
+            key_value("GPUS", &accelerators, theme),
             security,
             Line::from(Span::styled("Available now", theme.text)),
             Line::from(Span::styled(
@@ -1971,6 +2006,7 @@ fn render_server(
             key_value("MODELS", &active_model, theme),
             key_value("ENGINES", &active_engine, theme),
             key_value("RUNTIMES", &active_runtime, theme),
+            key_value("GPUS", &accelerators, theme),
             key_value("PRIVATE ENDPOINTS", &private_backend, theme),
             security,
             Line::default(),

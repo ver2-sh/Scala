@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceleratorDevice, ArtifactNativeIdentity, AuxiliaryArtifactRole, EffectiveSetting, EngineId,
+    AcceleratorBinding, ArtifactNativeIdentity, AuxiliaryArtifactRole, EffectiveSetting, EngineId,
     ModelId, ModelProfileId, ModelRole, RuntimeManifest, RuntimeSelectionSource, SettingId,
 };
 
@@ -127,7 +127,7 @@ pub struct RuntimeProvenance {
     pub runtime: RuntimeManifest,
     pub runtime_entrypoint: PathBuf,
     pub selection_source: RuntimeSelectionSource,
-    pub accelerator: Option<AcceleratorDevice>,
+    pub accelerator_binding: Option<AcceleratorBinding>,
     pub installation: EngineInstallation,
     pub model_profile: ModelProfileRuntimeIdentity,
     #[serde(default)]

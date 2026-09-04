@@ -13,15 +13,16 @@ use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use minijinja::{Environment, ErrorKind, context};
 use norted_core::{
-    AcceleratorDevice, AcquisitionMethod, ArtifactFormat, AuxiliaryArtifactRole, AvailableRuntime,
-    ComputeCapability, EngineConfig, EngineInstallation, EngineRevision, HostCapabilities,
-    InstalledRuntime, ModelArtifact, RuntimeAcquisitionMethod, RuntimeAcquisitionPlan,
-    RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest, RuntimeDownload, RuntimeId,
-    RuntimeIdentity, RuntimePackageIdentity, RuntimeProbeObservation, RuntimeReleaseChannel,
-    RuntimeRequirements, RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites,
-    RuntimeSourceBuildProvenance, RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem,
-    RuntimeSourceSnapshot, SettingCategory, SettingDefaultPreview, SettingDefaultSource,
-    SettingDefinition, SettingId, SettingKind, SettingScope, SettingValue, SettingsSchema,
+    AcceleratorBinding, AcceleratorDevice, AcquisitionMethod, ArtifactFormat,
+    AuxiliaryArtifactRole, AvailableRuntime, ComputeCapability, EngineConfig, EngineInstallation,
+    EngineRevision, HostCapabilities, InstalledRuntime, ModelArtifact, RuntimeAcquisitionMethod,
+    RuntimeAcquisitionPlan, RuntimeArchiveFormat, RuntimeCompatibility, RuntimeDigest,
+    RuntimeDownload, RuntimeId, RuntimeIdentity, RuntimePackageIdentity, RuntimeProbeObservation,
+    RuntimeReleaseChannel, RuntimeRequirements, RuntimeSourceBuildPlan,
+    RuntimeSourceBuildPrerequisites, RuntimeSourceBuildProvenance, RuntimeSourceBuildRecipe,
+    RuntimeSourceBuildSystem, RuntimeSourceSnapshot, SettingCategory, SettingDefaultPreview,
+    SettingDefaultSource, SettingDefinition, SettingId, SettingKind, SettingScope, SettingValue,
+    SettingsSchema,
 };
 use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CatalogError, CompatibilityDecision,
@@ -30,7 +31,7 @@ use norted_engine::{
     GitHubReleaseAsset, GitHubReleaseClient, InferenceActivityReporter, InferenceEvent,
     InferenceFinishReason, InferenceMessage, InferenceOutput, InferenceRequest, InferenceRole,
     InferenceStream, InferenceToolCall, InferenceToolChoice, InferenceUsage, InstallationState,
-    LaunchRequest, LaunchSpec, LoadProgressReporter, NativeOption, OptionValueKind, OutputFormat,
+    LaunchRequest, LaunchSpec, LoadProgressReporter, NativeOption, OutputFormat,
     PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
     StartupObservation, UpdateState, capture_command, common_setting_definitions_for,
     compatibility_for, compatibility_for_nvidia_device, configurable_setting_definitions,
@@ -164,19 +165,6 @@ const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "--slots",
     "--slot1-ctx",
 ];
-
-// q27 v0.6.2 parses options with a hand-written exact-match argv loop. Keep
-// this allowlist at that managed binary contract: unknown arguments are
-// silently ignored upstream, and boolean/value arity must not be guessed.
-const ALLOWED_VALUE_NATIVE_ARGUMENTS: &[&str] = &[
-    "--prefix-cache",
-    "--prefix-cache-max-gb",
-    "--prefix-cache-min",
-    "--prefix-cache-max-tokens",
-    "--prefix-cache-step",
-    "--prefix-cache-ram-gb",
-];
-const ALLOWED_BOOLEAN_NATIVE_ARGUMENTS: &[&str] = &["--fast-head", "--no-fast-head", "--kv-fp16"];
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Q27RuntimeCatalogProvider;
@@ -1529,7 +1517,6 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 pub struct Q27Adapter {
     enabled: bool,
     binary_path: Option<PathBuf>,
-    native_arguments: Vec<String>,
     environment: BTreeMap<String, String>,
     configuration_error: Option<String>,
     client: reqwest::Client,
@@ -1928,12 +1915,10 @@ impl Q27Adapter {
                     "native argument `{argument}` conflicts with the Norted-managed q27 backend contract"
                 ));
             }
-            if configuration_error.is_none()
-                && let Some(argument) = invalid_native_argument(&native_arguments)
-            {
-                configuration_error = Some(format!(
-                    "native argument `{argument}` is unsupported or has invalid arity; Norted accepts only known q27 v0.6.2 tuning options and owns the model/tokenizer positions"
-                ));
+            if configuration_error.is_none() && !native_arguments.is_empty() {
+                configuration_error = Some(
+                    "q27 native arguments are disabled; use typed `q27.*` settings".to_owned(),
+                );
             }
         }
 
@@ -1949,7 +1934,6 @@ impl Q27Adapter {
         Self {
             enabled,
             binary_path,
-            native_arguments,
             environment,
             configuration_error,
             client,
@@ -2060,7 +2044,7 @@ impl Q27Adapter {
         )
         .await?;
         let usage = command_detail(&usage_output.stdout, &usage_output.stderr);
-        let usage_contract_error = q27_usage_contract_error(&usage, &self.native_arguments);
+        let usage_contract_error = q27_usage_contract_error(&usage);
         if usage_output.success || usage_contract_error.is_some() {
             return Err(EngineError::InvalidConfiguration(format!(
                 "entrypoint does not satisfy the q27-server launch contract ({}): {usage}",
@@ -2577,33 +2561,12 @@ impl EngineAdapter for Q27Adapter {
         ) {
             return CompatibilityDecision::Supported;
         }
-        match unsupported_native_argument_for_version(
-            &self.native_arguments,
-            &runtime.manifest.identity.version,
-        ) {
-            Some(argument) => CompatibilityDecision::Unsupported {
-                reason: format!(
-                    "q27 runtime {} does not support configured native option `{argument}`",
-                    runtime.manifest.identity.version
-                ),
-            },
-            None => CompatibilityDecision::Supported,
-        }
+        CompatibilityDecision::Supported
     }
 
     fn available_runtime_compatibility(&self, runtime: &AvailableRuntime) -> CompatibilityDecision {
-        match unsupported_native_argument_for_version(
-            &self.native_arguments,
-            &runtime.identity.version,
-        ) {
-            Some(argument) => CompatibilityDecision::Unsupported {
-                reason: format!(
-                    "q27 runtime {} does not support configured native option `{argument}`",
-                    runtime.identity.version
-                ),
-            },
-            None => CompatibilityDecision::Supported,
-        }
+        let _ = runtime;
+        CompatibilityDecision::Supported
     }
 
     fn compatibility(&self, model: &ModelArtifact) -> CompatibilityDecision {
@@ -2780,12 +2743,13 @@ impl EngineAdapter for Q27Adapter {
         q27_runtime_preference(&runtime.identity.variant, accelerator.as_ref())
     }
 
-    fn runtime_model_accelerator(
+    fn runtime_model_accelerator_binding(
         &self,
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-    ) -> Option<AcceleratorDevice> {
+        _settings: Option<&norted_core::ResolvedSettings>,
+    ) -> Option<AcceleratorBinding> {
         inspect_q27_model(&model.path).ok().and_then(|facts| {
             q27_device_evaluation(
                 &runtime.manifest.identity.platform,
@@ -2796,6 +2760,7 @@ impl EngineAdapter for Q27Adapter {
                 runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
             )
             .accelerator
+            .map(AcceleratorBinding::single)
         })
     }
 
@@ -2815,13 +2780,7 @@ impl EngineAdapter for Q27Adapter {
     }
 
     fn native_options(&self) -> Vec<NativeOption> {
-        vec![NativeOption {
-            name: "arguments".to_owned(),
-            description: "Allowlisted q27 v0.6.2 tuning options appended after Norted's positional model/tokenizer and managed bind/thinking flags"
-                .to_owned(),
-            value_kind: OptionValueKind::String,
-            repeatable: true,
-        }]
+        Vec::new()
     }
 
     fn setting_definitions(&self) -> Vec<SettingDefinition> {
@@ -3009,22 +2968,7 @@ impl EngineAdapter for Q27Adapter {
             .settings_schema
             .validate(&request.settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
-        let structured =
-            translate_q27_settings(&request.settings, &self.native_arguments, &self.environment)?;
-        if !matches!(
-            request.runtime.manifest.acquisition_method,
-            RuntimeAcquisitionMethod::ExternalBinary
-        ) {
-            if let Some(argument) = unsupported_native_argument_for_version(
-                &self.native_arguments,
-                &request.runtime.manifest.identity.version,
-            ) {
-                return Err(EngineError::InvalidConfiguration(format!(
-                    "q27 runtime {} does not support configured native option `{argument}`",
-                    request.runtime.manifest.identity.version
-                )));
-            }
-        }
+        let structured = translate_q27_settings(&request.settings, &[], &self.environment)?;
         let model_path = canonical_regular_file(&request.model.primary.path, "q27 model").await?;
         if model_path != request.model.primary.path {
             return Err(EngineError::InvalidConfiguration(
@@ -3110,14 +3054,18 @@ impl EngineAdapter for Q27Adapter {
             arguments.extend(configured_launch.arguments.iter().cloned());
         }
         arguments.extend(structured.arguments);
-        arguments.extend(self.native_arguments.iter().map(OsString::from));
-        let accelerator = request.accelerator.ok_or_else(|| {
+        let binding = request.accelerator_binding.ok_or_else(|| {
             EngineError::InvalidConfiguration(
                 "q27 launch has no exact NVIDIA GPU selected by compatibility evaluation"
                     .to_owned(),
             )
         })?;
-        let mut environment = q27_launch_environment(&self.environment, &accelerator)?;
+        let [accelerator] = binding.devices.as_slice() else {
+            return Err(EngineError::InvalidConfiguration(
+                "q27 requires an accelerator binding containing exactly one NVIDIA GPU".to_owned(),
+            ));
+        };
+        let mut environment = q27_launch_environment(&self.environment, accelerator)?;
         if let Some(configured_launch) = configured_launch.as_ref() {
             environment.extend(configured_launch.environment.clone());
         }
@@ -3137,11 +3085,11 @@ impl EngineAdapter for Q27Adapter {
             endpoint: Some(endpoint),
             normalized_settings,
             settings: request.settings,
-            native_arguments: self.native_arguments.clone(),
+            native_arguments: Vec::new(),
             installation,
             runtime: request.runtime,
             model: request.model,
-            accelerator: Some(accelerator),
+            accelerator_binding: Some(binding),
         })
     }
 
@@ -5931,7 +5879,7 @@ fn push_q27_value_argument(arguments: &mut Vec<OsString>, option: &str, value: i
     arguments.push(OsString::from(value.to_string()));
 }
 
-fn q27_usage_contract_error(output: &str, native_arguments: &[String]) -> Option<String> {
+fn q27_usage_contract_error(output: &str) -> Option<String> {
     let output = output.to_ascii_lowercase();
     let positional_contract = output.contains("usage:")
         && output.contains("model.q27")
@@ -5946,11 +5894,7 @@ fn q27_usage_contract_error(output: &str, native_arguments: &[String]) -> Option
     if !usage_has_token(&output, "no-think") && !usage_has_token(&output, "--no-think") {
         return Some("the required no-think launch behavior was not advertised".to_owned());
     }
-    native_arguments
-        .iter()
-        .filter(|argument| argument.starts_with("--"))
-        .find(|argument| !usage_has_token(&output, argument))
-        .map(|argument| format!("configured native option `{argument}` was not advertised"))
+    None
 }
 
 fn usage_has_token(output: &str, expected: &str) -> bool {
@@ -5974,44 +5918,11 @@ fn conflicts_with_managed_argument(argument: &str) -> bool {
     })
 }
 
-fn invalid_native_argument(arguments: &[String]) -> Option<&str> {
-    let mut index = 0;
-    while let Some(argument) = arguments.get(index) {
-        if ALLOWED_BOOLEAN_NATIVE_ARGUMENTS.contains(&argument.as_str()) {
-            index += 1;
-            continue;
-        }
-        if ALLOWED_VALUE_NATIVE_ARGUMENTS.contains(&argument.as_str()) {
-            let Some(value) = arguments.get(index + 1) else {
-                return Some(argument);
-            };
-            if value.starts_with('-') {
-                return Some(value);
-            }
-            index += 2;
-            continue;
-        }
-        return Some(argument);
-    }
-    None
-}
-
-fn unsupported_native_argument_for_version<'a>(
-    arguments: &'a [String],
-    version: &str,
-) -> Option<&'a str> {
-    arguments.iter().find_map(|argument| {
-        let unavailable = (argument == "--prefix-cache-ram-gb"
-            && !version_at_least(version, 0, 6, 1))
-            || (argument.starts_with("--prefix-cache") && !version_at_least(version, 0, 6, 0));
-        unavailable.then_some(argument.as_str())
-    })
-}
-
 fn conflicts_with_managed_environment(name: &str) -> bool {
-    MANAGED_ENVIRONMENT_VARIABLES
-        .iter()
-        .any(|managed| name.eq_ignore_ascii_case(managed))
+    is_q27_engine_environment(name)
+        || MANAGED_ENVIRONMENT_VARIABLES
+            .iter()
+            .any(|managed| name.eq_ignore_ascii_case(managed))
 }
 
 fn q27_launch_environment(
@@ -6023,10 +5934,22 @@ fn q27_launch_environment(
 }
 
 fn managed_environment_removals() -> Vec<OsString> {
-    MANAGED_ENVIRONMENT_VARIABLES
+    let mut names = MANAGED_ENVIRONMENT_VARIABLES
         .iter()
         .map(OsString::from)
-        .collect()
+        .collect::<Vec<_>>();
+    names.extend(std::env::vars_os().filter_map(|(name, _)| {
+        name.to_str()
+            .is_some_and(is_q27_engine_environment)
+            .then_some(name)
+    }));
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+fn is_q27_engine_environment(name: &str) -> bool {
+    name.to_ascii_uppercase().starts_with("Q27_")
 }
 
 fn map_finish_reason(reason: Option<&str>) -> Result<InferenceFinishReason, EngineError> {
@@ -6430,5 +6353,39 @@ mod tests {
             .expect("empty translation");
         assert!(translated.arguments.is_empty());
         assert!(translated.environment_remove.is_empty());
+    }
+
+    #[test]
+    fn raw_q27_controls_are_disabled_and_future_q27_environment_is_reserved() {
+        let raw: EngineConfig = serde_json::from_value(json!({
+            "enabled": true,
+            "native": { "arguments": ["--unclassified"] }
+        }))
+        .expect("engine config");
+        let adapter = Q27Adapter::from_config(Some(&raw), Path::new("."));
+        assert!(
+            adapter
+                .configuration_error
+                .as_deref()
+                .is_some_and(|error| error.contains("native arguments are disabled"))
+        );
+        assert!(adapter.native_options().is_empty());
+
+        let mut diagnostic = EngineConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        diagnostic
+            .env
+            .insert("Q27_MPROBE".to_owned(), "1".to_owned());
+        let adapter = Q27Adapter::from_config(Some(&diagnostic), Path::new("."));
+        assert!(
+            adapter
+                .configuration_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Q27_MPROBE"))
+        );
+        assert!(is_q27_engine_environment("q27_future_control"));
+        assert!(!is_q27_engine_environment("ORDINARY_APPLICATION_VALUE"));
     }
 }

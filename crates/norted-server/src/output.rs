@@ -103,6 +103,9 @@ pub async fn status(core: Arc<ApplicationCore>, json_output: bool) -> Result<()>
                 if let Some(digest) = &backend.runtime_executable_sha256 {
                     println!("    SHA-256:       {digest}");
                 }
+                if let Some(binding) = backend.accelerator_binding.as_ref() {
+                    println!("    Accelerators:  {}", accelerator_binding_label(binding));
+                }
             }
         } else {
             println!("  Adapters:        unavailable (no private control observation)");
@@ -499,6 +502,9 @@ pub fn control_operation(operation: &str, status: &ControlStatus, json_output: b
             if operation == "load"
                 && let Some(provenance) = &backend.provenance
             {
+                if let Some(binding) = provenance.accelerator_binding.as_ref() {
+                    println!("    Accelerators: {}", accelerator_binding_label(binding));
+                }
                 println!("    Effective settings:");
                 for (id, setting) in &provenance.settings.effective {
                     let source = match &setting.source {
@@ -521,6 +527,20 @@ pub fn control_operation(operation: &str, status: &ControlStatus, json_output: b
         }
     }
     Ok(())
+}
+
+fn accelerator_binding_label(binding: &norted_core::AcceleratorBinding) -> String {
+    binding
+        .devices
+        .iter()
+        .enumerate()
+        .map(|(index, device)| {
+            let identity = device.stable_id.as_deref().unwrap_or("unknown-id");
+            let name = device.name.as_deref().unwrap_or("unknown device");
+            format!("[{index}] {identity} ({name})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub fn config(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {

@@ -8,7 +8,7 @@ pub use source_catalog::{
     LLAMA_CPP_SOURCE_RUNTIME_PROVIDER_ID, LlamaCppSourceRuntimeCatalogProvider,
 };
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -19,12 +19,12 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use norted_core::{
-    AcceleratorDevice, AcquisitionMethod, ArtifactFormat, ArtifactNativeIdentity, AvailableRuntime,
-    EngineConfig, EngineInstallation, EngineRevision, GpuOffload, HostCapabilities,
-    InstalledRuntime, ModelArtifact, RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId,
-    RuntimeIdentity, RuntimeProbeObservation, SettingDefaultPreview, SettingDefaultSource,
-    SettingDefinition, SettingId, SettingKind, SettingScope, SettingValue, SettingsSchema,
-    UnsignedIntegerOrChoiceValue,
+    AcceleratorBinding, AcceleratorDevice, AcquisitionMethod, ArtifactFormat,
+    ArtifactNativeIdentity, AvailableRuntime, EngineConfig, EngineInstallation, EngineRevision,
+    GpuOffload, HostCapabilities, InstalledRuntime, ModelArtifact, RuntimeAcquisitionMethod,
+    RuntimeCompatibility, RuntimeId, RuntimeIdentity, RuntimeProbeObservation,
+    SettingDefaultPreview, SettingDefaultSource, SettingDefinition, SettingId, SettingKind,
+    SettingScope, SettingValue, SettingsSchema, UnsignedIntegerOrChoiceValue,
 };
 use norted_engine::{
     ApiCapability, BackendLoadPhase, BackendLoadProgress, CompatibilityDecision,
@@ -32,13 +32,13 @@ use norted_engine::{
     EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceActivityReporter,
     InferenceActivityUpdate, InferenceEvent, InferenceFinishReason, InferenceMessage,
     InferenceOutput, InferenceRequest, InferenceRole, InferenceStream, InferenceUsage,
-    InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter, NativeOption,
-    OptionValueKind, OutputFormat, PreparedModelInput, ProcessDescriptor,
-    RuntimeVariantUpdateIdentity, StartupObservation, UpdateState, capture_command,
-    common_setting_definitions_for, compatibility_for, configurable_setting_definitions,
-    isolated_cuda_environment, prepare_norted_package_input,
-    prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
-    revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
+    InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter, NativeOption, OutputFormat,
+    PreparedModelInput, ProcessDescriptor, RuntimeVariantUpdateIdentity, StartupObservation,
+    UpdateState, capture_command, common_setting_definitions_for, compatibility_for,
+    configurable_setting_definitions, isolated_cuda_environment_for_binding,
+    prepare_norted_package_input, prepare_norted_package_input_with_progress,
+    revalidate_norted_package_before_launch, revalidate_norted_package_before_launch_with_progress,
+    visible_nvidia_device_set,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -409,6 +409,12 @@ impl LlamaCppAdapter {
                 configuration_error = Some(format!(
                     "native argument `{argument}` conflicts with the Norted-managed llama.cpp backend contract"
                 ));
+            }
+            if configuration_error.is_none() && !native_arguments.is_empty() {
+                configuration_error = Some(
+                    "llama.cpp native arguments are disabled; use typed `llama.cpp.*` settings"
+                        .to_owned(),
+                );
             }
         }
 
@@ -938,6 +944,7 @@ impl EngineAdapter for LlamaCppAdapter {
                 &runtime.manifest.identity.architecture,
                 &runtime.manifest.requirements,
                 host,
+                settings,
             )
             .compatibility,
         )
@@ -965,6 +972,7 @@ impl EngineAdapter for LlamaCppAdapter {
                 &runtime.identity.architecture,
                 &runtime.requirements,
                 host,
+                settings,
             )
             .compatibility,
         )
@@ -988,20 +996,22 @@ impl EngineAdapter for LlamaCppAdapter {
         llama_runtime_preference(&runtime.identity.accelerator, host)
     }
 
-    fn runtime_model_accelerator(
+    fn runtime_model_accelerator_binding(
         &self,
         runtime: &InstalledRuntime,
         _model: &ModelArtifact,
         host: &HostCapabilities,
-    ) -> Option<AcceleratorDevice> {
+        settings: Option<&norted_core::ResolvedSettings>,
+    ) -> Option<AcceleratorBinding> {
         llama_device_evaluation(
             &runtime.manifest.identity.accelerator,
             &runtime.manifest.identity.platform,
             &runtime.manifest.identity.architecture,
             &runtime.manifest.requirements,
             host,
+            settings,
         )
-        .accelerator
+        .binding
     }
 
     fn normalize_settings(
@@ -1019,13 +1029,7 @@ impl EngineAdapter for LlamaCppAdapter {
     }
 
     fn native_options(&self) -> Vec<NativeOption> {
-        vec![NativeOption {
-            name: "arguments".to_owned(),
-            description: "Arguments appended exactly as configured after managed bind/model flags"
-                .to_owned(),
-            value_kind: OptionValueKind::String,
-            repeatable: true,
-        }]
+        Vec::new()
     }
 
     async fn prepare_model_input(
@@ -1187,6 +1191,11 @@ impl EngineAdapter for LlamaCppAdapter {
             )));
         }
         let help = self.cached_runtime_help(runtime).await?;
+        if let Some(option) = unclassified_llama_help_option(&help) {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "exact llama-server advertises unclassified option `{option}`; this runtime requires an updated Norted adapter audit"
+            )));
+        }
         for required in ["--model", "--alias", "--host", "--port"] {
             if !help.contains(required) {
                 return Err(EngineError::InvalidConfiguration(format!(
@@ -1304,12 +1313,13 @@ impl EngineAdapter for LlamaCppAdapter {
         ];
         let mut environment = self.environment.clone();
         if manifest.identity.accelerator == "cuda" {
-            let accelerator = request.accelerator.as_ref().ok_or_else(|| {
+            let binding = request.accelerator_binding.as_ref().ok_or_else(|| {
                 EngineError::InvalidConfiguration(
-                    "llama.cpp CUDA launch has no exact NVIDIA GPU selected by compatibility evaluation"
+                    "llama.cpp CUDA launch has no exact NVIDIA GPU binding selected by compatibility evaluation"
                         .to_owned(),
                 )
             })?;
+            validate_llama_accelerator_settings(&request.settings, binding)?;
             let help = self.cached_runtime_help(&request.runtime).await?;
             if !help_has_option(&help, "--device") {
                 return Err(EngineError::InvalidConfiguration(
@@ -1317,9 +1327,13 @@ impl EngineAdapter for LlamaCppAdapter {
                         .to_owned(),
                 ));
             }
-            environment = isolated_cuda_environment(&environment, accelerator, "llama.cpp")
+            environment = isolated_cuda_environment_for_binding(&environment, binding, "llama.cpp")
                 .map_err(EngineError::InvalidConfiguration)?;
-            arguments.extend([OsString::from("--device"), OsString::from("CUDA0")]);
+            let visible_devices = (0..binding.devices.len())
+                .map(|index| format!("CUDA{index}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            arguments.extend([OsString::from("--device"), OsString::from(visible_devices)]);
         }
         arguments.extend(structured.arguments);
         arguments.extend(self.native_arguments.iter().map(OsString::from));
@@ -1342,7 +1356,7 @@ impl EngineAdapter for LlamaCppAdapter {
             installation: (*installation).clone(),
             runtime: request.runtime,
             model: request.model,
-            accelerator: request.accelerator,
+            accelerator_binding: request.accelerator_binding,
         })
     }
 
@@ -1614,7 +1628,7 @@ fn llama_runtime_preference(accelerator: &str, host: &HostCapabilities) -> u16 {
 #[derive(Debug)]
 struct LlamaDeviceEvaluation {
     compatibility: RuntimeCompatibility,
-    accelerator: Option<AcceleratorDevice>,
+    binding: Option<AcceleratorBinding>,
 }
 
 fn llama_device_evaluation(
@@ -1623,19 +1637,28 @@ fn llama_device_evaluation(
     architecture: &str,
     requirements: &norted_core::RuntimeRequirements,
     host: &HostCapabilities,
+    settings: Option<&norted_core::ResolvedSettings>,
 ) -> LlamaDeviceEvaluation {
     if accelerator != "cuda" {
+        if settings.is_some_and(|settings| settings.value("llama.cpp.devices").is_some()) {
+            return LlamaDeviceEvaluation {
+                compatibility: RuntimeCompatibility::Incompatible(
+                    "`llama.cpp.devices` requires a CUDA llama.cpp runtime".to_owned(),
+                ),
+                binding: None,
+            };
+        }
         return LlamaDeviceEvaluation {
             compatibility: RuntimeCompatibility::Compatible,
-            accelerator: None,
+            binding: None,
         };
     }
-    let devices = match visible_nvidia_devices(host, "llama.cpp") {
+    let devices = match visible_nvidia_device_set(host, "llama.cpp") {
         Ok(devices) => devices,
         Err(compatibility) => {
             return LlamaDeviceEvaluation {
                 compatibility,
-                accelerator: None,
+                binding: None,
             };
         }
     };
@@ -1662,6 +1685,82 @@ fn llama_device_evaluation(
             )
         })
         .collect::<Vec<_>>();
+    if let Some(configured) = settings.and_then(llama_configured_device_ids) {
+        let mut selected = Vec::with_capacity(configured.len());
+        for configured_uuid in configured {
+            if !norted_engine::is_exact_nvidia_gpu_uuid(configured_uuid) {
+                return LlamaDeviceEvaluation {
+                    compatibility: RuntimeCompatibility::Incompatible(format!(
+                        "`llama.cpp.devices` entry `{configured_uuid}` is not an exact NVIDIA GPU UUID"
+                    )),
+                    binding: None,
+                };
+            }
+            let matching = evaluated
+                .iter()
+                .filter(|(device, _)| {
+                    device
+                        .stable_id
+                        .as_deref()
+                        .is_some_and(|uuid| uuid.eq_ignore_ascii_case(configured_uuid))
+                })
+                .collect::<Vec<_>>();
+            let [(device, compatibility)] = matching.as_slice() else {
+                return LlamaDeviceEvaluation {
+                    compatibility: RuntimeCompatibility::Incompatible(format!(
+                        "`llama.cpp.devices` entry `{configured_uuid}` does not resolve exactly to one currently visible NVIDIA GPU"
+                    )),
+                    binding: None,
+                };
+            };
+            if selected.iter().any(|selected: &AcceleratorDevice| {
+                selected.stable_id.as_deref().is_some_and(|uuid| {
+                    device
+                        .stable_id
+                        .as_deref()
+                        .is_some_and(|candidate| uuid.eq_ignore_ascii_case(candidate))
+                })
+            }) {
+                return LlamaDeviceEvaluation {
+                    compatibility: RuntimeCompatibility::Incompatible(format!(
+                        "`llama.cpp.devices` selects NVIDIA GPU `{configured_uuid}` more than once"
+                    )),
+                    binding: None,
+                };
+            }
+            if let RuntimeCompatibility::Incompatible(reason) = compatibility {
+                return LlamaDeviceEvaluation {
+                    compatibility: RuntimeCompatibility::Incompatible(format!(
+                        "`llama.cpp.devices` GPU `{configured_uuid}` is incompatible: {reason}"
+                    )),
+                    binding: None,
+                };
+            }
+            selected.push(device.clone());
+        }
+        let binding = AcceleratorBinding { devices: selected };
+        if let Some(settings) = settings
+            && let Err(error) = validate_llama_accelerator_settings(settings, &binding)
+        {
+            return LlamaDeviceEvaluation {
+                compatibility: RuntimeCompatibility::Incompatible(error.to_string()),
+                binding: None,
+            };
+        }
+        let compatibility = evaluated
+            .iter()
+            .filter(|(device, _)| binding.devices.contains(device))
+            .map(|(_, compatibility)| compatibility.clone())
+            .fold(
+                RuntimeCompatibility::Recommended,
+                combine_llama_compatibility,
+            );
+        return LlamaDeviceEvaluation {
+            compatibility,
+            binding: Some(binding),
+        };
+    }
+
     evaluated.sort_by(|left, right| {
         left.1
             .preference_rank()
@@ -1678,15 +1777,22 @@ fn llama_device_evaluation(
     match evaluated.into_iter().next() {
         Some((accelerator, compatibility)) => LlamaDeviceEvaluation {
             compatibility,
-            accelerator: Some(accelerator),
+            binding: Some(AcceleratorBinding::single(accelerator)),
         },
         None => LlamaDeviceEvaluation {
             compatibility: RuntimeCompatibility::NeedsAttention(
                 "llama.cpp CUDA requires a stable NVIDIA GPU UUID, but none was observed"
                     .to_owned(),
             ),
-            accelerator: None,
+            binding: None,
         },
+    }
+}
+
+fn llama_configured_device_ids(settings: &norted_core::ResolvedSettings) -> Option<&[String]> {
+    match settings.value("llama.cpp.devices") {
+        Some(SettingValue::StringList(devices)) => Some(devices),
+        _ => None,
     }
 }
 
@@ -1702,12 +1808,12 @@ fn combine_llama_compatibility(
         left
     } else if matches!(right, RuntimeCompatibility::NeedsAttention(_)) {
         right
-    } else if matches!(left, RuntimeCompatibility::Recommended)
-        || matches!(right, RuntimeCompatibility::Recommended)
+    } else if matches!(left, RuntimeCompatibility::Compatible)
+        || matches!(right, RuntimeCompatibility::Compatible)
     {
-        RuntimeCompatibility::Recommended
-    } else {
         RuntimeCompatibility::Compatible
+    } else {
+        RuntimeCompatibility::Recommended
     }
 }
 
@@ -2430,6 +2536,13 @@ fn llama_extended_setting_definitions() -> Vec<SettingDefinition> {
             "Keep dense FFN weights for the first N layers on CPU",
             uint(0),
             "0",
+        ),
+        (
+            "devices",
+            "CUDA devices",
+            "Ordered exact NVIDIA GPU UUIDs; unset uses Norted's automatic single-compatible-GPU policy",
+            SettingKind::StringList,
+            "auto",
         ),
         (
             "split_mode",
@@ -3342,6 +3455,11 @@ fn llama_definition(
         unsupported_reason: None,
         unit: None,
         default_preview: match id {
+            "llama.cpp.devices" => Some(
+                SettingDefaultPreview::new("auto", SettingDefaultSource::Norted).with_detail(
+                    "CUDA selects one compatible visible NVIDIA GPU by exact UUID; other runtimes retain ordinary automatic device behavior",
+                ),
+            ),
             "llama.cpp.chat_template_file"
             | "llama.cpp.chat_template_sha256"
             | "llama.cpp.speculative_draft_model"
@@ -3785,6 +3903,7 @@ fn llama_setting_contract(id: &str) -> Vec<&'static str> {
         return vec![setting.required];
     }
     match id {
+        "llama.cpp.devices" => vec!["--device"],
         "llama.cpp.context_length" => vec!["--ctx-size"],
         "llama.cpp.parallel_requests" => vec!["--parallel"],
         "llama.cpp.temperature" => vec!["--temp"],
@@ -3835,7 +3954,8 @@ fn llama_setting_has_execution_path(id: &str) -> bool {
     llama_direct_setting(id).is_some()
         || matches!(
             id,
-            "llama.cpp.context_length"
+            "llama.cpp.devices"
+                | "llama.cpp.context_length"
                 | "llama.cpp.parallel_requests"
                 | "llama.cpp.temperature"
                 | "llama.cpp.top_p"
@@ -4283,6 +4403,34 @@ fn help_has_option(help: &str, option: &str) -> bool {
         .any(|line| help_line_has_option_header(line, option))
 }
 
+fn unclassified_llama_help_option(help: &str) -> Option<String> {
+    let classified = MANAGED_NATIVE_ARGUMENTS
+        .iter()
+        .copied()
+        .chain(structured_llama_argument_aliases())
+        .map(|option| option.to_ascii_lowercase().replace('_', "-"))
+        .collect::<BTreeSet<_>>();
+    help.lines()
+        .filter(|line| {
+            line.starts_with("--")
+                || line
+                    .as_bytes()
+                    .get(1)
+                    .is_some_and(|byte| !byte.is_ascii_whitespace())
+        })
+        .flat_map(|line| {
+            line.split_ascii_whitespace()
+                .take_while(|token| token.starts_with('-'))
+                .map(|token| token.trim_end_matches(',').to_owned())
+                .filter(|token| token.bytes().any(|byte| byte.is_ascii_alphanumeric()))
+                .collect::<Vec<_>>()
+        })
+        .find(|option| {
+            let normalized = option.to_ascii_lowercase().replace('_', "-");
+            !classified.contains(&normalized)
+        })
+}
+
 fn help_line_has_option_header(line: &str, option: &str) -> bool {
     line.match_indices(option).any(|(index, _)| {
         let prefix = &line[..index];
@@ -4466,6 +4614,79 @@ fn validate_llama_semantic_settings(
         )));
     }
     Ok(())
+}
+
+fn validate_llama_accelerator_settings(
+    settings: &norted_core::ResolvedSettings,
+    binding: &AcceleratorBinding,
+) -> Result<(), EngineError> {
+    let device_count = binding.devices.len();
+    if device_count == 0 {
+        return Err(EngineError::InvalidConfiguration(
+            "llama.cpp accelerator binding contains no devices".to_owned(),
+        ));
+    }
+    if let Some(SettingValue::UnsignedInteger(main_gpu)) = settings.value("llama.cpp.main_gpu")
+        && usize::try_from(*main_gpu).map_or(true, |index| index >= device_count)
+    {
+        return Err(EngineError::InvalidConfiguration(format!(
+            "`llama.cpp.main_gpu` index {main_gpu} is outside the selected {device_count}-device CUDA binding"
+        )));
+    }
+    if let Some(SettingValue::StringList(values)) = settings.value("llama.cpp.tensor_split") {
+        let values = llama_per_device_values(values, "llama.cpp.tensor_split")?;
+        if values.len() > device_count {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "`llama.cpp.tensor_split` supplies {} proportions for a {device_count}-device CUDA binding",
+                values.len()
+            )));
+        }
+        for value in values {
+            let parsed = value.parse::<f32>().map_err(|_| {
+                EngineError::InvalidConfiguration(format!(
+                    "`llama.cpp.tensor_split` value `{value}` is not a numeric proportion"
+                ))
+            })?;
+            if !parsed.is_finite() || parsed < 0.0 {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "`llama.cpp.tensor_split` value `{value}` must be a finite non-negative proportion"
+                )));
+            }
+        }
+    }
+    if let Some(SettingValue::StringList(values)) = settings.value("llama.cpp.fit_target_mib") {
+        let values = llama_per_device_values(values, "llama.cpp.fit_target_mib")?;
+        if values.len() != 1 && values.len() > device_count {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "`llama.cpp.fit_target_mib` supplies {} margins for a {device_count}-device CUDA binding; upstream accepts one broadcast value or at most one value per selected device",
+                values.len()
+            )));
+        }
+        for value in values {
+            value.parse::<u64>().map_err(|_| {
+                EngineError::InvalidConfiguration(format!(
+                    "`llama.cpp.fit_target_mib` value `{value}` is not a non-negative integer MiB margin"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn llama_per_device_values<'a>(
+    values: &'a [String],
+    setting: &str,
+) -> Result<Vec<&'a str>, EngineError> {
+    let values = values
+        .iter()
+        .flat_map(|value| value.split([',', '/']))
+        .collect::<Vec<_>>();
+    if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+        return Err(EngineError::InvalidConfiguration(format!(
+            "`{setting}` contains an empty per-device value"
+        )));
+    }
+    Ok(values)
 }
 
 async fn validate_llama_bound_files(
@@ -4723,6 +4944,7 @@ fn translate_llama_settings_for_model(
         }
         environment_remove.extend(environment_names.iter().map(OsString::from));
         match (id.as_str(), &resolved.value) {
+            ("llama.cpp.devices", SettingValue::StringList(_)) => {}
             ("llama.cpp.context_length", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--ctx-size", *value);
             }
@@ -5010,6 +5232,7 @@ fn llama_setting_collision_contract(
     id: &str,
 ) -> (&'static [&'static str], &'static [&'static str]) {
     match id {
+        "llama.cpp.devices" => (&["-dev", "--device"], &["LLAMA_ARG_DEVICE"]),
         "llama.cpp.context_length" => (&["-c", "--ctx-size"], &["LLAMA_ARG_CTX_SIZE"]),
         "llama.cpp.parallel_requests" => (&["-np", "--parallel"], &["LLAMA_ARG_N_PARALLEL"]),
         "llama.cpp.temperature" => (&["--temp", "--temperature"], &["LLAMA_ARG_TEMP"]),
@@ -5178,11 +5401,12 @@ fn structured_llama_argument_aliases() -> impl Iterator<Item = &'static str> {
 }
 
 fn conflicts_with_managed_environment(name: &str) -> bool {
-    MANAGED_ENVIRONMENT_VARIABLES
-        .iter()
-        .copied()
-        .chain(structured_llama_environment_names())
-        .any(|managed| name.eq_ignore_ascii_case(managed))
+    is_llama_engine_environment(name)
+        || MANAGED_ENVIRONMENT_VARIABLES
+            .iter()
+            .copied()
+            .chain(structured_llama_environment_names())
+            .any(|managed| name.eq_ignore_ascii_case(managed))
 }
 
 fn managed_environment_removals() -> Vec<OsString> {
@@ -5190,10 +5414,23 @@ fn managed_environment_removals() -> Vec<OsString> {
         .iter()
         .copied()
         .chain(structured_llama_environment_names())
+        .map(OsString::from)
         .collect::<Vec<_>>();
+    names.extend(std::env::vars_os().filter_map(|(name, _)| {
+        name.to_str()
+            .is_some_and(is_llama_engine_environment)
+            .then_some(name)
+    }));
     names.sort_unstable();
     names.dedup();
-    names.into_iter().map(OsString::from).collect()
+    names
+}
+
+fn is_llama_engine_environment(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    ["LLAMA_", "MTMD_", "GGML_", "LLGUIDANCE_", "AIP_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 fn structured_llama_environment_names() -> impl Iterator<Item = &'static str> {
@@ -6055,6 +6292,122 @@ mod settings_tests {
         ] {
             assert!(conflicts_with_managed_environment(managed), "{managed}");
         }
+        for unknown_engine_control in [
+            "LLAMA_ARG_FUTURE_CONTROL",
+            "LLAMA_SERVER_FUTURE_CONTROL",
+            "MTMD_FUTURE_CONTROL",
+            "GGML_FUTURE_CONTROL",
+        ] {
+            assert!(
+                conflicts_with_managed_environment(unknown_engine_control),
+                "{unknown_engine_control}"
+            );
+        }
+        assert!(!conflicts_with_managed_environment(
+            "ORDINARY_APPLICATION_VALUE"
+        ));
+        assert_eq!(
+            unclassified_llama_help_option("--model FILE\n--brand-new-control VALUE\n"),
+            Some("--brand-new-control".to_owned())
+        );
+
+        let raw: EngineConfig = serde_json::from_value(json!({
+            "enabled": true,
+            "native": { "arguments": ["--brand-new-control"] }
+        }))
+        .expect("engine config");
+        let adapter = LlamaCppAdapter::from_config(Some(&raw), Path::new("."));
+        assert!(
+            adapter
+                .configuration_error
+                .as_deref()
+                .is_some_and(|error| error.contains("native arguments are disabled"))
+        );
+        assert!(adapter.native_options().is_empty());
+    }
+
+    #[test]
+    fn ordered_llama_device_binding_validates_index_and_per_device_arity() {
+        let first_uuid = "GPU-11111111-1111-1111-1111-111111111111";
+        let second_uuid = "GPU-22222222-2222-2222-2222-222222222222";
+        let device = |uuid: &str, vram_gib: u64| AcceleratorDevice {
+            accelerator: "cuda".to_owned(),
+            stable_id: Some(uuid.to_owned()),
+            name: Some(format!("fixture-{vram_gib}")),
+            vram_bytes: Some(vram_gib * 1024 * 1024 * 1024),
+            driver_version: Some("580.1".to_owned()),
+            compute_capability: Some(norted_core::ComputeCapability::new(8, 9)),
+        };
+        let host = HostCapabilities {
+            platform: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+            accelerators: vec![device(first_uuid, 24), device(second_uuid, 32)],
+            nvidia_gpu_absence_confirmed: false,
+            cuda_visible_devices: None,
+            observations: Vec::new(),
+        };
+        let requirements = norted_core::RuntimeRequirements {
+            requires_nvidia_gpu: true,
+            ..Default::default()
+        };
+        let settings = resolved(&[
+            (
+                "llama.cpp.devices",
+                SettingValue::StringList(vec![second_uuid.to_owned(), first_uuid.to_owned()]),
+            ),
+            ("llama.cpp.main_gpu", SettingValue::UnsignedInteger(1)),
+            (
+                "llama.cpp.tensor_split",
+                SettingValue::StringList(vec!["3,1".to_owned()]),
+            ),
+            (
+                "llama.cpp.fit_target_mib",
+                SettingValue::StringList(vec!["1024".to_owned()]),
+            ),
+        ]);
+        let evaluated = llama_device_evaluation(
+            "cuda",
+            "linux",
+            "x86_64",
+            &requirements,
+            &host,
+            Some(&settings),
+        );
+        let binding = evaluated.binding.expect("explicit binding");
+        assert_eq!(binding.devices[0].stable_id.as_deref(), Some(second_uuid));
+        assert_eq!(binding.devices[1].stable_id.as_deref(), Some(first_uuid));
+        validate_llama_accelerator_settings(&settings, &binding).expect("valid arity");
+        assert_eq!(
+            combine_llama_compatibility(
+                RuntimeCompatibility::Recommended,
+                RuntimeCompatibility::Compatible,
+            ),
+            RuntimeCompatibility::Compatible
+        );
+
+        let bad_main = resolved(&[("llama.cpp.main_gpu", SettingValue::UnsignedInteger(2))]);
+        assert!(validate_llama_accelerator_settings(&bad_main, &binding).is_err());
+        let bad_split = resolved(&[(
+            "llama.cpp.tensor_split",
+            SettingValue::StringList(vec!["1,1,1".to_owned()]),
+        )]);
+        assert!(validate_llama_accelerator_settings(&bad_split, &binding).is_err());
+        let duplicate = resolved(&[(
+            "llama.cpp.devices",
+            SettingValue::StringList(vec![first_uuid.to_owned(), first_uuid.to_owned()]),
+        )]);
+        assert!(matches!(
+            llama_device_evaluation(
+                "cuda",
+                "linux",
+                "x86_64",
+                &requirements,
+                &host,
+                Some(&duplicate),
+            )
+            .compatibility,
+            RuntimeCompatibility::Incompatible(_)
+        ));
     }
 
     #[test]
