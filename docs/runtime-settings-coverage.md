@@ -85,12 +85,23 @@ binaries do not receive them.
 - CLI: context/secondary-slot context/slot count, fast head, thinking/request-thinking/budget, constrained
   tools, continuous batching, sampled graphs, KV representation, MTP depth/probability, suffix drafting and
   width, and every disk/RAM prefix-cache limit.
-- Reviewed environment: serving profile, forced default sampling, fused batch graphs/capacity/GEMM, KV
+- Reviewed environment: Qwen3.8 trained-template reasoning effort (`q27.reasoning_effort`: `low`,
+  `medium`, or `xhigh`), serving profile, forced default sampling, fused batch graphs/capacity/GEMM, KV
   pooling, shared prefill arena, prefill threshold/split-K/kernel/activation group/token tile, draft early
   exit, plain sampling, tool split, GPU interleaving, phase statistics, readiness floor, thinking budget
   fraction, suffix minimum, GEMM threshold, recurrent checkpoint controls, adaptive-depth thresholds,
   FD decode attention, delta-scan mode/split, tool dialect/parser/error/size controls, and bare-system policy.
 - Protocol defaults remain `q27.*` identities even though OpenAI request fields are engine-neutral DTOs.
+
+`q27.reasoning_effort` is admitted only for the exact v0.10.0 source contract together with bounded
+artifact metadata proving both a recognized Qwen3.8 v2 tier and q27's own normalized `general.name`
+`qwen38` trained-template selector. Qwen3.6 and unknown/mismatched fine-tune identities do not receive the
+row. The reviewed Qwen3.8 runtime default is `xhigh`; a persisted/Profile/invocation process value is
+translated only by the adapter to `Q27_REASONING_EFFORT`. Persistent choices intentionally exclude q27's
+legacy `off` A/B arm and internal aliases. Explicit request `minimal`/`low` becomes q27 `low`, `medium`
+remains `medium`, and `high`/`xhigh`/`max` becomes q27 `xhigh`; request `none` retains q27's distinct
+disable-thinking behavior. Request overrides are ephemeral and never rewrite the process default or the
+separate `q27.thinking` setting.
 
 ### NORTED_MANAGED
 
@@ -110,7 +121,7 @@ binaries do not receive them.
   `Q27_GEMM_SPLITK_DBG`, `Q27_KV_SCATTER`, `Q27_MPROBE`, `Q27_NJOINT`, `Q27_P0B_T`,
   `Q27_PF4_INSTRUMENT`, `Q27_PF_ARENA_NODRAIN`, `Q27_PF_CPASYNC`, `Q27_PF_FP8MMA`,
   `Q27_PF_NOSERIAL`, `Q27_PF_NTX`, `Q27_PF_NTX_DBG`, `Q27_PF_PV8`, `Q27_PF_SPLIT`,
-  `Q27_PRINT_WSUM`, `Q27_PROF_DECODE`, `Q27_REASONING_EFFORT`, `Q27_SUFFIX_DBG`, `Q27_SYSBLK`,
+  `Q27_PRINT_WSUM`, `Q27_PROF_DECODE`, `Q27_SUFFIX_DBG`, `Q27_SYSBLK`,
   `Q27_TG_REENGAGE`, `Q27_TG_TRACE`, `Q27_VG_CTA_TARGET`, and `Q27_WSUM_LOCATE`. These are diagnostic,
   A/B, corpus, trace/dump/instrumentation, unstable internal lifecycle, or low-level launch-geometry controls;
   the exact q27 schema intentionally does not promote them into normal serving configuration.

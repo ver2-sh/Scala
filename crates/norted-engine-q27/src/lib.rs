@@ -116,6 +116,7 @@ const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &[
     "Q27_PHASE_STATS",
     "Q27_READY_FLOOR_MB",
     "Q27_THINK_BUDGET_FRAC",
+    "Q27_REASONING_EFFORT",
     "Q27_SUFFIX_L",
     "Q27_PF_BATCH_MIN",
     "Q27_GEMM_MIN",
@@ -1083,6 +1084,7 @@ struct Q27RuntimeCapabilities {
     top_k_min_p: bool,
     request_seed: bool,
     request_thinking: bool,
+    reasoning_effort: bool,
     tool_calling: bool,
     stable_serving_environment: bool,
     mtp_environment: bool,
@@ -1130,6 +1132,7 @@ fn q27_runtime_capabilities(
         top_k_min_p: exact_source_contract,
         request_seed: exact_source_contract,
         request_thinking: exact_source_contract,
+        reasoning_effort: exact_source_contract,
         tool_calling: exact_source_contract,
         stable_serving_environment: exact_source_contract,
         mtp_environment: trustworthy_identity,
@@ -1246,6 +1249,9 @@ fn validate_q27_settings_prelaunch(
     }
     if settings.value("q27.request_thinking").is_some() && !capabilities.request_thinking {
         failures.push("per-request thinking control is unproven");
+    }
+    if settings.value("q27.reasoning_effort").is_some() && !capabilities.reasoning_effort {
+        failures.push("reasoning-effort process default is unproven");
     }
     if settings.value("q27.constrain_tools").is_some() && !capabilities.tool_calling {
         failures.push("tool grammar constraint control is unproven");
@@ -1568,6 +1574,17 @@ fn setting_choice<'a>(settings: &'a norted_core::ResolvedSettings, id: &str) -> 
     }
 }
 
+fn q27_request_reasoning_effort(effort: norted_engine::ReasoningEffort) -> &'static str {
+    match effort {
+        norted_engine::ReasoningEffort::None => "none",
+        norted_engine::ReasoningEffort::Minimal | norted_engine::ReasoningEffort::Low => "low",
+        norted_engine::ReasoningEffort::Medium => "medium",
+        norted_engine::ReasoningEffort::High
+        | norted_engine::ReasoningEffort::Xhigh
+        | norted_engine::ReasoningEffort::Max => "xhigh",
+    }
+}
+
 fn setting_unsigned_with_source<'a>(
     settings: &'a norted_core::ResolvedSettings,
     id: &str,
@@ -1607,6 +1624,7 @@ fn q27_has_configured_execution(settings: &norted_core::ResolvedSettings) -> boo
                     | "q27.system_prompt"
                     | "q27.reasoning"
                     | "q27.reasoning_budget"
+                    | "q27.reasoning_effort"
                     | "q27.thinking"
                     | "q27.thinking_budget"
                     | "q27.request_thinking"
@@ -1722,6 +1740,14 @@ fn q27_configured_launch(
         };
         let value = match (id.as_str(), &setting.value) {
             ("q27.serving_profile", SettingValue::Choice(value)) if value == "cc" => continue,
+            ("q27.reasoning_effort", SettingValue::Choice(value)) => match value.as_str() {
+                "low" | "medium" | "xhigh" => value.clone(),
+                _ => {
+                    return Err(EngineError::InvalidConfiguration(
+                        "q27.reasoning_effort must be low, medium, or xhigh".to_owned(),
+                    ));
+                }
+            },
             (
                 "q27.tool_dialect"
                 | "q27.decode_attention"
@@ -2178,6 +2204,7 @@ impl Q27Adapter {
             || request.generation_settings.min_p.is_some()
             || request.generation_settings.reasoning_enabled.is_some()
             || request.generation_settings.reasoning_budget.is_some()
+            || request.generation_settings.reasoning_effort.is_some()
         {
             return Err(EngineError::InvalidGenerationSettings(
                 "the unverified external q27 contract supports only text, temperature, top_p, and max-token translation"
@@ -2251,6 +2278,14 @@ impl Q27Adapter {
                 "q27 per-request thinking requires `q27.request_thinking` to be enabled".to_owned(),
             ));
         }
+        if request.generation_settings.reasoning_effort.is_some()
+            && !execution.capabilities.reasoning_effort
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "this exact q27 runtime does not prove reasoning-effort request semantics"
+                    .to_owned(),
+            ));
+        }
         if request
             .generation_settings
             .reasoning_budget
@@ -2288,19 +2323,25 @@ impl Q27Adapter {
                     .to_owned(),
             ));
         }
+        let request_effort = request
+            .generation_settings
+            .reasoning_effort
+            .map(q27_request_reasoning_effort);
+        let request_reasoning_enabled = match request.generation_settings.reasoning_effort {
+            Some(norted_engine::ReasoningEffort::None) => Some(false),
+            _ => request.generation_settings.reasoning_enabled,
+        };
         let mut body = json!({"model": request.model_profile_id.as_str(), "stream": stream});
         let route = if let Some(template) = execution.sharp_template.as_deref() {
             body["prompt"] = json!(render_sharp_template(
                 template,
                 &request.messages,
                 setting_toggle(&execution.settings, "q27.render_generation_prompt").unwrap_or(true),
-                setting_toggle(&execution.settings, "q27.template_thinking")
+                request_reasoning_enabled
+                    .or_else(|| setting_toggle(&execution.settings, "q27.template_thinking"))
                     .or_else(|| setting_toggle(&execution.settings, "q27.thinking"))
                     .unwrap_or(false),
-                request
-                    .generation_settings
-                    .reasoning_effort
-                    .map(norted_engine::ReasoningEffort::as_str)
+                request_effort
                     .or_else(|| setting_choice(&execution.settings, "q27.reasoning_effort")),
             )?);
             "/v1/completions"
@@ -2359,8 +2400,11 @@ impl Q27Adapter {
         if let Some(seed) = request.generation_settings.seed {
             body["seed"] = json!(seed);
         }
-        if let Some(enabled) = request.generation_settings.reasoning_enabled {
+        if let Some(enabled) = request_reasoning_enabled {
             body["enable_thinking"] = json!(enabled);
+        }
+        if let Some(effort) = request_effort {
+            body["reasoning_effort"] = json!(effort);
         }
         if let Some(budget) = request.generation_settings.reasoning_budget {
             body["thinking_token_budget"] = json!(budget);
@@ -2450,6 +2494,13 @@ impl EngineAdapter for Q27Adapter {
         features
     }
 
+    fn uses_setting_as_request_default(&self, id: &str) -> bool {
+        // q27.reasoning_effort is a process-level trained-template default
+        // translated to Q27_REASONING_EFFORT. Explicit request effort remains
+        // ephemeral and is translated separately in configured_backend_request.
+        id != "reasoning_effort"
+    }
+
     fn validate_generation_settings(
         &self,
         settings: &GenerationSettingsPatch,
@@ -2465,9 +2516,23 @@ impl EngineAdapter for Q27Adapter {
                     .to_owned(),
             ));
         }
-        if settings.reasoning_effort.is_some() {
+        if matches!(
+            (settings.reasoning_enabled, settings.reasoning_effort),
+            (Some(true), Some(norted_engine::ReasoningEffort::None))
+                | (
+                    Some(false),
+                    Some(
+                        norted_engine::ReasoningEffort::Minimal
+                            | norted_engine::ReasoningEffort::Low
+                            | norted_engine::ReasoningEffort::Medium
+                            | norted_engine::ReasoningEffort::High
+                            | norted_engine::ReasoningEffort::Xhigh
+                            | norted_engine::ReasoningEffort::Max
+                    )
+                )
+        ) {
             return Err(EngineError::InvalidGenerationSettings(
-                "q27 does not expose reasoning-effort levels; use the exact thinking toggle and budget semantics"
+                "q27 request reasoning enable/disable conflicts with the requested reasoning effort"
                     .to_owned(),
             ));
         }
@@ -2521,9 +2586,18 @@ impl EngineAdapter for Q27Adapter {
         &self,
         request: &InferenceRequest,
         backend_defaults: &EffectiveGenerationSettings,
-        _settings_schema: &SettingsSchema,
+        settings_schema: &SettingsSchema,
     ) -> Result<(), EngineError> {
         self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
+        if request.generation_settings.reasoning_effort.is_some() {
+            let id = SettingId::new("q27.reasoning_effort").expect("static setting ID");
+            if settings_schema.definition(&id).is_none() {
+                return Err(EngineError::InvalidGenerationSettings(
+                    "the exact q27 runtime/model contract does not support reasoning effort"
+                        .to_owned(),
+                ));
+            }
+        }
         if request.messages.iter().any(InferenceMessage::has_media) {
             return Err(EngineError::InvalidGenerationSettings(
                 "q27 does not support media content".to_owned(),
@@ -2820,6 +2894,7 @@ impl EngineAdapter for Q27Adapter {
                 .as_ref()
                 .map(Q27SourceBuildEvidence::Provenance),
             &usage,
+            false,
         ))
     }
 
@@ -2850,6 +2925,7 @@ impl EngineAdapter for Q27Adapter {
                 .as_ref()
                 .map(Q27SourceBuildEvidence::Provenance),
             &usage,
+            true,
         );
         let facts = inspect_q27_model(&model.path).map_err(EngineError::InvalidConfiguration)?;
         apply_q27_model_capabilities(&mut schema.definitions, &facts);
@@ -4556,6 +4632,7 @@ fn q27_settings_schema_from_usage(
     acquisition: &RuntimeAcquisitionMethod,
     source_evidence: Option<Q27SourceBuildEvidence<'_>>,
     usage: &str,
+    include_model_dependent_settings: bool,
 ) -> SettingsSchema {
     let managed = !matches!(acquisition, RuntimeAcquisitionMethod::ExternalBinary);
     let version = identity.version.as_str();
@@ -4616,7 +4693,9 @@ fn q27_settings_schema_from_usage(
             "q27.seed" => capabilities.request_seed,
             "q27.max_output_tokens" | "q27.system_prompt" => capabilities.trustworthy_identity,
             "q27.reasoning" | "q27.reasoning_budget" => capabilities.request_thinking,
-            "q27.reasoning_effort" => false,
+            "q27.reasoning_effort" => {
+                include_model_dependent_settings && capabilities.reasoning_effort
+            }
             "q27.kv_mode" => !capabilities.supported_kv_modes.is_empty(),
             "q27.mtp" | "q27.mtp_max_depth" | "q27.mtp_min_probability" | "q27.suffix_drafting" => {
                 capabilities.mtp_environment
@@ -4683,6 +4762,18 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
     ];
     let mut definitions = common_setting_definitions_for(ENGINE_ID, COMMON_SETTINGS);
     definitions.extend([
+        q27_definition(
+            "q27.reasoning_effort",
+            "Reasoning effort",
+            "Qwen3.8 trained-template process default; explicit request effort may override it without changing this setting",
+            SettingKind::Choice {
+                choices: ["low", "medium", "xhigh"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            Some("exact Qwen3.8 runtime default"),
+        ),
         q27_definition(
             "q27.slot1_context_length",
             "Background slot context length",
@@ -5266,6 +5357,7 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
         ("q27.max_output_tokens", "8192"),
         ("q27.reasoning", "off"),
         ("q27.reasoning_budget", "auto"),
+        ("q27.reasoning_effort", "xhigh"),
         ("q27.slot1_context_length", "auto"),
         ("q27.kv_mode", "auto"),
         ("q27.fast_head", "enabled"),
@@ -5544,17 +5636,28 @@ fn apply_q27_model_capabilities(
     definitions: &mut [SettingDefinition],
     facts: &model::Q27ModelFacts,
 ) {
-    if facts.capabilities.contains("mtp_layer_1") {
-        return;
-    }
     for definition in definitions {
-        if definition.id.as_str().starts_with("q27.mtp")
-            || definition.id.as_str().starts_with("q27.suffix")
+        let (unsupported, reason) = if (definition.id.as_str().starts_with("q27.mtp")
+            || definition.id.as_str().starts_with("q27.suffix"))
+            && !facts.capabilities.contains("mtp_layer_1")
         {
+            (
+                true,
+                "bounded q27 artifact inspection did not prove an MTP prediction layer",
+            )
+        } else if definition.id.as_str() == "q27.reasoning_effort"
+            && !facts.capabilities.contains("qwen38_trained_template")
+        {
+            (
+                true,
+                "bounded q27 artifact metadata did not prove the Qwen3.8 trained-template contract",
+            )
+        } else {
+            (false, "")
+        };
+        if unsupported {
             definition.supported = false;
-            definition.unsupported_reason = Some(
-                "bounded q27 artifact inspection did not prove an MTP prediction layer".to_owned(),
-            );
+            definition.unsupported_reason = Some(reason.to_owned());
         }
     }
 }
@@ -5563,13 +5666,21 @@ fn validate_q27_model_settings(
     facts: &model::Q27ModelFacts,
     settings: &norted_core::ResolvedSettings,
 ) -> Result<(), String> {
-    if facts.capabilities.contains("mtp_layer_1") {
-        return Ok(());
+    if settings.value("q27.reasoning_effort").is_some()
+        && !facts.capabilities.contains("qwen38_trained_template")
+    {
+        return Err(
+            "q27.reasoning_effort requires bounded artifact metadata proving the Qwen3.8 trained-template contract"
+                .to_owned(),
+        );
     }
-    let contradicted = settings
-        .configured
-        .keys()
-        .find(|id| id.as_str().starts_with("q27.mtp") || id.as_str().starts_with("q27.suffix"));
+    let contradicted = (!facts.capabilities.contains("mtp_layer_1"))
+        .then(|| {
+            settings.configured.keys().find(|id| {
+                id.as_str().starts_with("q27.mtp") || id.as_str().starts_with("q27.suffix")
+            })
+        })
+        .flatten();
     match contradicted {
         Some(id) => Err(format!(
             "q27 setting `{id}` requires an MTP prediction layer, but bounded artifact inspection did not prove one"
@@ -5628,7 +5739,7 @@ fn q27_definition(
 }
 
 fn q27_setting_category(id: &str) -> SettingCategory {
-    if id.contains("thinking") {
+    if id.contains("thinking") || id.contains("reasoning") {
         SettingCategory::Reasoning
     } else if id.contains("prompt") || id.contains("template") || id.contains("response_filter") {
         SettingCategory::Prompt
@@ -5678,6 +5789,7 @@ fn q27_environment_name(id: &str) -> Option<&'static str> {
         "q27.phase_stats" => "Q27_PHASE_STATS",
         "q27.readiness_floor_mib" => "Q27_READY_FLOOR_MB",
         "q27.thinking_budget_fraction" => "Q27_THINK_BUDGET_FRAC",
+        "q27.reasoning_effort" => "Q27_REASONING_EFFORT",
         "q27.suffix_min_match" => "Q27_SUFFIX_L",
         "q27.prefill_batch_min" => "Q27_PF_BATCH_MIN",
         "q27.gemm_min_width" => "Q27_GEMM_MIN",
@@ -6088,6 +6200,7 @@ mod tests {
             top_k_min_p: true,
             request_seed: true,
             request_thinking: true,
+            reasoning_effort: true,
             tool_calling: true,
             stable_serving_environment: true,
             mtp_environment: true,
@@ -6119,6 +6232,7 @@ mod tests {
             "q27.min_p",
             "q27.thinking",
             "q27.thinking_budget",
+            "q27.reasoning_effort",
             "q27.fast_head",
             "q27.kv_mode",
             "q27.mtp",
@@ -6142,7 +6256,6 @@ mod tests {
             "q27.repeat_penalty",
             "q27.structured_output_schema",
             "q27.reasoning_budget_message",
-            "q27.reasoning_effort",
             "q27.stop_strings",
             "q27.context_overflow",
         ] {
@@ -6197,6 +6310,16 @@ mod tests {
                 .contains("did not prove")
         );
         assert!(validate_q27_model_settings(&facts, &resolved(&[])).is_ok());
+
+        let reasoning = resolved(&[(
+            "q27.reasoning_effort",
+            SettingValue::Choice("xhigh".to_owned()),
+        )]);
+        assert!(
+            validate_q27_model_settings(&facts, &reasoning)
+                .unwrap_err()
+                .contains("Qwen3.8")
+        );
     }
 
     #[test]
@@ -6222,6 +6345,10 @@ mod tests {
             ("q27.min_p", SettingValue::Float(0.05)),
             ("q27.thinking", SettingValue::Toggle(true)),
             ("q27.thinking_budget", SettingValue::UnsignedInteger(0)),
+            (
+                "q27.reasoning_effort",
+                SettingValue::Choice("medium".to_owned()),
+            ),
             ("q27.mtp", SettingValue::Toggle(true)),
             ("q27.mtp_max_depth", SettingValue::UnsignedInteger(7)),
             ("q27.mtp_min_probability", SettingValue::Float(0.5)),
@@ -6237,6 +6364,7 @@ mod tests {
         assert!(arguments.iter().any(|argument| argument == "--think"));
         assert!(arguments.windows(2).any(|pair| pair == ["--top-k", "32"]));
         assert_eq!(launch.environment["Q27_KV"], "fp8");
+        assert_eq!(launch.environment["Q27_REASONING_EFFORT"], "medium");
         assert_eq!(launch.environment["Q27_MAXD"], "7");
         assert_eq!(launch.environment["Q27_SUFFIX_W"], "12");
 
@@ -6305,6 +6433,7 @@ mod tests {
                 generation_settings: GenerationSettingsPatch {
                     temperature: Some(0.4),
                     top_p: Some(0.7),
+                    reasoning_effort: Some(norted_engine::ReasoningEffort::High),
                     ..Default::default()
                 },
                 tools: Vec::new(),
@@ -6319,7 +6448,55 @@ mod tests {
         .expect("request body");
         assert_eq!(body["temperature"], 0.4);
         assert_eq!(body["top_p"], 0.7);
+        assert_eq!(body["reasoning_effort"], "xhigh");
         assert_eq!(body["model"], "profile-alias");
+    }
+
+    #[test]
+    fn request_reasoning_effort_is_deliberately_canonicalized() {
+        for (effort, expected) in [
+            (norted_engine::ReasoningEffort::None, "none"),
+            (norted_engine::ReasoningEffort::Minimal, "low"),
+            (norted_engine::ReasoningEffort::Low, "low"),
+            (norted_engine::ReasoningEffort::Medium, "medium"),
+            (norted_engine::ReasoningEffort::High, "xhigh"),
+            (norted_engine::ReasoningEffort::Xhigh, "xhigh"),
+            (norted_engine::ReasoningEffort::Max, "xhigh"),
+        ] {
+            assert_eq!(q27_request_reasoning_effort(effort), expected);
+        }
+
+        let execution = Q27ConfiguredExecution {
+            settings: resolved(&[(
+                "q27.reasoning_effort",
+                SettingValue::Choice("xhigh".to_owned()),
+            )]),
+            sharp_template: None,
+            compiled_w_max: Some(12),
+            selected_kv_mode: None,
+            capabilities: exact_capabilities(),
+        };
+        let (_, body) = Q27Adapter::configured_backend_request(
+            &execution,
+            &InferenceRequest {
+                model_profile_id: ModelProfileId::new("profile-alias").expect("profile ID"),
+                messages: Vec::new(),
+                generation_settings: GenerationSettingsPatch {
+                    reasoning_effort: Some(norted_engine::ReasoningEffort::None),
+                    ..Default::default()
+                },
+                tools: Vec::new(),
+                tool_choice: None,
+                parallel_tool_calls: None,
+                output_format: None,
+                max_output_tokens: None,
+                stream: false,
+            },
+            false,
+        )
+        .expect("request body");
+        assert_eq!(body["reasoning_effort"], "none");
+        assert_eq!(body["enable_thinking"], false);
     }
 
     #[test]

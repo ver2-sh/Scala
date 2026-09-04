@@ -590,7 +590,7 @@ Discovery recognizes `.gguf`, `.q27`, and `.ninfer` primary artifacts. GGUF disc
 bounded metadata header, not tensor payloads, and records `general.architecture`, model context,
 expert/expert-used counts, and a tokenizer-metadata digest when present. This is what permits
 architecture-specific expert override and conservative draft-tokenizer proof without filename or
-model-family guesses. Q27 admission reads only its fixed 16-byte `Q27F` v1 header and a metadata JSON blob capped at 1 MiB; it never maps or hashes the tensor payload. The current q27 runtime family requires the metadata-declared `qwen35` 65-block/MTP architecture and the upstream shape constants. Published Qwen3.6 tiers are proven from the exact `quant_policy`/`q4_head`/`q8_extra` tuple: default/q4s/q5f require 24 GiB-class, q6/q6f/q6k require 32 GiB-class, and q8 requires 48 GiB-class. Qwen3.8's distinct v2 tuples map q4s/default/q6 to 24 GiB-class and q6k to 32 GiB-class. A valid architecture with an unknown recipe remains explicit needs-attention rather than being guessed from its filename.
+model-family guesses. Q27 admission reads only its fixed 16-byte `Q27F` v1 header and a metadata JSON blob capped at 1 MiB; it never maps or hashes the tensor payload. The current q27 runtime family requires the metadata-declared `qwen35` 65-block/MTP architecture and the upstream shape constants. Published Qwen3.6 tiers are proven from the exact `quant_policy`/`q4_head`/`q8_extra` tuple: default/q4s/q5f require 24 GiB-class, q6/q6f/q6k require 32 GiB-class, and q8 requires 48 GiB-class. Qwen3.8's distinct v2 tuples map q4s/default/q6 to 24 GiB-class and q6k to 32 GiB-class. Its trained-template reasoning-effort capability additionally requires bounded `general.name` metadata matching q27's own normalized `qwen38` selector; this keeps Qwen3.6 and ambiguous fine-tunes from receiving a false capability. A valid architecture with an unknown recipe remains explicit needs-attention rather than being guessed from its filename.
 
 Q27 serving also requires one unambiguous `.tok` companion. An exact same-stem tokenizer is preferred; otherwise discovery may associate a unique boundary-safe prefix match for quantized filenames. The tokenizer must have the current `Q27T` magic/version header. It is recorded as an auxiliary artifact, never listed as an independent model, and does not change the stable primary model ID. During load the adapter canonicalizes and hashes the declared tokenizer into a prepared engine-neutral input. q27-server receives that exact path, and size/SHA-256 are revalidated immediately before launch; the adapter no longer performs a second companion search.
 
@@ -685,7 +685,10 @@ omitted formats and explicit text/schema overrides. Unsupported runtimes receive
 rather than an unknown flag or silently ignored request field. q27 request seed/top-k/min-p require
 sampled v0.10 execution; q27 accepts only numeric seeds and rejects the common `random` sentinel
 instead of treating it as an omitted seed. Its request thinking fields require
-`q27.request_thinking`. NInfer's
+`q27.request_thinking`. On a proven Qwen3.8 v0.10.0 combination, persistent
+`q27.reasoning_effort` selects the process default `low`, `medium`, or `xhigh` (runtime default
+`xhigh`), while request `minimal`/`low`, `medium`, and `high`/`xhigh`/`max` map to those three q27
+profiles and request `none` disables thinking without changing the persistent default. NInfer's
 configured reasoning budget is a launch default because its private Chat route has no matching
 per-request budget field. System prompt, output limit, sampler, stop, penalty, thinking, and effort
 values otherwise act as request defaults where the exact private contract supports them, and an

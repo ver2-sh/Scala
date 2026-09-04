@@ -113,6 +113,15 @@ definition constructors do not create shared setting identity. A stale or
 incompatible stored override is reported as unavailable for the selected schema, but it is not shown
 as an ordinary editable `Unsupported` row. An exposed setting may not use an ambiguous placeholder.
 
+For the exact reviewed q27 v0.10.0 source contract, `q27.reasoning_effort` is a persistent process
+default only when bounded artifact metadata proves a recognized Qwen3.8 v2 tier and the normalized
+`general.name` selector used by q27 itself identifies the Qwen3.8 trained template. Its choices are
+`low`, `medium`, and `xhigh`, with the actual Qwen3.8 runtime default shown as `xhigh`; Qwen3.6 and
+unproven fine-tunes have no row. The adapter translates configured values to a scrubbed, adapter-owned
+`Q27_REASONING_EFFORT`. Explicit request effort is separate and ephemeral: `minimal`/`low` maps to
+`low`, `medium` to `medium`, `high`/`xhigh`/`max` to `xhigh`, and `none` disables thinking according
+to q27 request semantics. It does not mutate or masquerade as the process default.
+
 ## Future bulk editing
 
 An `Apply to all runtimes` feature must be a bulk copy. For example, applying temperature `0.7`
