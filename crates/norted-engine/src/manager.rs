@@ -2666,7 +2666,8 @@ async fn prepare_inference_request(
     {
         request.generation_settings.reasoning_budget = Some(*value);
     }
-    if request.generation_settings.reasoning_effort.is_none()
+    if adapter.uses_setting_as_request_default("reasoning_effort")
+        && request.generation_settings.reasoning_effort.is_none()
         && let Some(norted_core::SettingValue::Choice(value)) =
             settings.runtime_value("reasoning_effort")
     {

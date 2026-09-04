@@ -120,7 +120,9 @@ default only when bounded artifact metadata proves a recognized Qwen3.8 v2 tier 
 unproven fine-tunes have no row. The adapter translates configured values to a scrubbed, adapter-owned
 `Q27_REASONING_EFFORT`. Explicit request effort is separate and ephemeral: `minimal`/`low` maps to
 `low`, `medium` to `medium`, `high`/`xhigh`/`max` to `xhigh`, and `none` disables thinking according
-to q27 request semantics. It does not mutate or masquerade as the process default.
+to q27 request semantics when `q27.request_thinking=true`; otherwise `none` is rejected because the
+upstream process would ignore that engine-level disable. It does not mutate or masquerade as the
+process default.
 
 ## Future bulk editing
 

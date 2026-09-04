@@ -688,7 +688,8 @@ instead of treating it as an omitted seed. Its request thinking fields require
 `q27.request_thinking`. On a proven Qwen3.8 v0.10.0 combination, persistent
 `q27.reasoning_effort` selects the process default `low`, `medium`, or `xhigh` (runtime default
 `xhigh`), while request `minimal`/`low`, `medium`, and `high`/`xhigh`/`max` map to those three q27
-profiles and request `none` disables thinking without changing the persistent default. NInfer's
+profiles. Request `none` disables thinking without changing the persistent default only when
+`q27.request_thinking` is enabled, and is rejected otherwise. NInfer's
 configured reasoning budget is a launch default because its private Chat route has no matching
 per-request budget field. System prompt, output limit, sampler, stop, penalty, thinking, and effort
 values otherwise act as request defaults where the exact private contract supports them, and an
