@@ -9,9 +9,12 @@ counted as first-class coverage.
 ## llama.cpp
 
 The adapter probes the installed executable's own `llama-server --help`; every definition is hidden unless
-that exact executable advertises its required option. The 2026-09-04 audit additionally built and inspected
-upstream commit `d230ddd763ffe27781c7ffd237ea78b639b36b6d`. New nightlies discovered by the provider receive only
-the settings their own help proves.
+that exact executable advertises its required option and a trustworthy omitted/default value. The
+2026-09-04 audit built and inspected upstream commit
+`64a155d242cb427766055ea9caea6f34df1ca94b`, tree
+`100e2797e2540b5f4a9a7b8dc6858e5acb09ceca`. Generic definitions carry no snapshot-derived runtime scalar;
+new nightlies discovered by the provider receive only the settings and defaults their own help/model evidence
+proves.
 
 ### FIRST_CLASS_CONFIGURABLE
 
@@ -38,8 +41,9 @@ the settings their own help proves.
 ### NORTED_MANAGED
 
 - Primary model/source selectors (`--model`, model URL, Docker/Hugging Face selectors and token), alias/public
-  model identity, bind host/port/reuse/API prefix, API keys/TLS, and `--device` are owned by acquisition,
-  routing, private transport, authentication, and selected-accelerator isolation.
+  model identity, bind host/port/reuse/API prefix, API keys/TLS, and `--device`/`LLAMA_ARG_DEVICE` are owned by
+  acquisition, routing, private transport, authentication, and selected-accelerator isolation. CUDA launch
+  selects one UUID-identified GPU, constrains `CUDA_VISIBLE_DEVICES` to that UUID, and passes `--device CUDA0`.
 - `--props` is kept off because mutable backend-global properties bypass resolved settings and provenance.
 - Help/version/list/completion/cache-list are probe or one-shot commands, not launch configuration.
 
@@ -50,9 +54,14 @@ the settings their own help proves.
 - Removed/deprecated defrag, mmap/mlock/direct-IO, legacy draft and legacy N-gram switches are not reintroduced;
   their current replacements are used.
 - Raw grammar/logit-bias and synthetic benchmark switches remain intentionally unavailable as persistent
-  defaults: Norted's public request
-  contract does not yet preserve their semantics or file/content identity. They remain visible only in the
-  exact upstream help and therefore do not silently masquerade as first-class settings.
+  defaults: Norted's public request contract does not yet preserve their semantics or file/content identity.
+
+All aliases in the three classifications are enforced at the raw boundary. First-class CLI/environment
+aliases are reserved even when their structured setting is omitted; Norted-managed and unsupported aliases
+are rejected (and managed environment names are removed from launch inheritance). Thus `--rpc`, generic
+`--override-kv`, device/list-device, multimodal/media, router, UI/tools/MCP, one-shot, legacy-removed, raw
+grammar/logit-bias, and synthetic controls cannot change the private single-model process through
+`engine."llama.cpp".native`.
 
 ## q27
 
@@ -95,9 +104,11 @@ binaries do not receive them.
 ## NInfer
 
 The reviewed/current upstream capability revision is commit
+`863aa8a5f1e866db74f29f8999b83b4021398dee`, tree
+`5368f514bafbcab89ce1272df3a13d9d9af55820`. The prior exact revision
 `a140e7ae82a11ed2f370a4d8f2cc16268a3790b8`, tree
-`1474697c790de8df18ed07a469f560bb33e8f324`. Capability domains are separately fingerprinted so future
-source snapshots retain only unchanged reviewed domains.
+`1474697c790de8df18ed07a469f560bb33e8f324`, remains an immutable legacy contract. Capability domains are
+separately fingerprinted so future source snapshots retain only unchanged reviewed domains.
 
 ### FIRST_CLASS_CONFIGURABLE
 
@@ -107,6 +118,9 @@ source snapshots retain only unchanged reviewed domains.
 - Speculative backend, draft tokens, LM-head draft, default output/thinking budgets, thinking and preservation,
   CUDA Graph, Vision/media budgets/threads, response-store limits, CORS, log level, context-cost preset file,
   sampling overrides, seed and greedy mode.
+- DFlash remains limited to exact `qwen3.6-35b-a3b`/`groupwise-int` artifacts. MTP and DFlash are one mutually
+  exclusive backend selection. Current revision `863aa8a...` admits DFlash with Vision; the legacy reviewed
+  revision retains its DFlash+Vision rejection, and exact runtime/model schemas filter the combination.
 
 ### NORTED_MANAGED
 
@@ -120,3 +134,10 @@ source snapshots retain only unchanged reviewed domains.
 
 - None of the reviewed `ninfer-serve` normal controls are silently unclassified. Build flags and target
   constants belong to the immutable runtime variant rather than a per-run setting.
+
+The capability-domain fingerprints include the target-runtime implementation owners, not only the serving
+front end: admission/scheduling and resource search; context cost, KV capacity, materialization, Host/Device
+checkpoint state and prefix reuse; target layouts/program/request plans/resource projections/state images;
+MTP/DFlash contexts and schedules; Vision/text residency and prefill; and request/log/protocol owners. Commit
+and tree identity remain alongside these focused blob sets. `ninfer.context_cost_presets` is structured-only;
+its canonical path and SHA-256 are bound immediately before launch.

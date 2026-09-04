@@ -19,11 +19,11 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, stream};
 use norted_core::{
-    AcquisitionMethod, ArtifactFormat, ArtifactNativeIdentity, AvailableRuntime, EngineConfig,
-    EngineInstallation, EngineRevision, GpuOffload, HostCapabilities, InstalledRuntime,
-    ModelArtifact, RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId, RuntimeIdentity,
-    RuntimeProbeObservation, SettingDefaultPreview, SettingDefaultSource, SettingDefinition,
-    SettingId, SettingKind, SettingScope, SettingValue, SettingsSchema,
+    AcceleratorDevice, AcquisitionMethod, ArtifactFormat, ArtifactNativeIdentity, AvailableRuntime,
+    EngineConfig, EngineInstallation, EngineRevision, GpuOffload, HostCapabilities,
+    InstalledRuntime, ModelArtifact, RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId,
+    RuntimeIdentity, RuntimeProbeObservation, SettingDefaultPreview, SettingDefaultSource,
+    SettingDefinition, SettingId, SettingKind, SettingScope, SettingValue, SettingsSchema,
     UnsignedIntegerOrChoiceValue,
 };
 use norted_engine::{
@@ -35,9 +35,10 @@ use norted_engine::{
     InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter, NativeOption,
     OptionValueKind, OutputFormat, PreparedModelInput, ProcessDescriptor,
     RuntimeVariantUpdateIdentity, StartupObservation, UpdateState, capture_command,
-    common_setting_definitions_for, configurable_setting_definitions, prepare_norted_package_input,
+    common_setting_definitions_for, compatibility_for, configurable_setting_definitions,
+    isolated_cuda_environment, prepare_norted_package_input,
     prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
-    revalidate_norted_package_before_launch_with_progress,
+    revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -89,15 +90,21 @@ fn managed_llama_variant_update_identity(
     })
 }
 
-// These variables select semantics that Norted must own for its private backend.
-// Keep ordinary llama.cpp tuning variables inherited and available to users.
+// Reserve every environment alias owned by either Norted's private-backend
+// contract or an engine-qualified setting. Unrelated process environment is
+// still inherited.
 const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &[
+    "CUDA_VISIBLE_DEVICES",
     "LLAMA_ARG_MODEL",
     "LLAMA_ARG_MODEL_URL",
     "LLAMA_ARG_DOCKER_REPO",
     "LLAMA_ARG_HF_REPO",
     "LLAMA_ARG_HF_FILE",
+    "HF_TOKEN",
     "LLAMA_ARG_ALIAS",
+    "LLAMA_ARG_TAGS",
+    "LLAMA_ARG_DEVICE",
+    "LLAMA_ARG_RPC",
     "LLAMA_ARG_HOST",
     "LLAMA_ARG_PORT",
     "LLAMA_ARG_REUSE_PORT",
@@ -114,11 +121,41 @@ const MANAGED_ENVIRONMENT_VARIABLES: &[&str] = &[
     "LLAMA_ARG_MODELS_AUTOLOAD",
     "LLAMA_ARG_NO_MODELS_AUTOLOAD",
     "LLAMA_ARG_ENDPOINT_PROPS",
+    "LLAMA_ARG_STATIC_PATH",
+    "LLAMA_ARG_CORS_ORIGINS",
+    "LLAMA_ARG_CORS_METHODS",
+    "LLAMA_ARG_CORS_HEADERS",
+    "LLAMA_ARG_CORS_CREDENTIALS",
+    "LLAMA_ARG_UI_CONFIG",
+    "LLAMA_ARG_UI_CONFIG_FILE",
+    "LLAMA_ARG_UI_MCP_PROXY",
+    "LLAMA_ARG_UI",
+    "LLAMA_ARG_POOLING",
+    "LLAMA_ARG_DEFRAG_THOLD",
+    "LLAMA_ARG_MMPROJ",
+    "LLAMA_ARG_MMPROJ_URL",
+    "LLAMA_ARG_MMPROJ_AUTO",
+    "LLAMA_ARG_MMPROJ_OFFLOAD",
+    "MTMD_BACKEND_DEVICE",
+    "LLAMA_ARG_IMAGE_MIN_TOKENS",
+    "LLAMA_ARG_IMAGE_MAX_TOKENS",
+    "LLAMA_ARG_MTMD_BATCH_MAX_TOKENS",
+    "LLAMA_ARG_VIDEO_FPS",
+    "LLAMA_ARG_VIDEO_TIMESTAMP_INTERVAL",
+    "LLAMA_ARG_VIDEO_FFMPEG_DIR",
+    "LLAMA_ARG_SPEC_DRAFT_HF_REPO",
+    "LLAMA_ARG_SPEC_SYNTH_LEN",
+    "LLAMA_ARG_SPEC_SYNTH_RATES",
+    "LLAMA_ARG_DRAFT_MAX",
+    "LLAMA_ARG_DRAFT_MIN",
     "LLAMA_SERVER_ROUTER_PORT",
     "LLAMA_SERVER_CHILD_MODE",
     "LLAMA_ARG_AGENT",
     "LLAMA_ARG_TOOLS",
+    "LLAMA_ARG_TOOLS_RUNTIME",
     "LLAMA_ARG_MCP_CONFIG",
+    "LLAMA_ARG_MCP_SERVERS_CONFIG",
+    "LLAMA_ARG_MCP_SERVERS_JSON",
 ];
 
 fn llama_model_compatibility(artifact: CompatibilityDecision) -> RuntimeCompatibility {
@@ -129,6 +166,14 @@ fn llama_model_compatibility(artifact: CompatibilityDecision) -> RuntimeCompatib
 }
 
 const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
+    "-h",
+    "--help",
+    "--usage",
+    "--version",
+    "-cl",
+    "--cache-list",
+    "--completion-bash",
+    "--server-base",
     "-m",
     "--model",
     "-mu",
@@ -140,8 +185,15 @@ const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "--hf-repo",
     "-hff",
     "--hf-file",
+    "-hft",
+    "--hf-token",
     "-a",
     "--alias",
+    "--tags",
+    "-dev",
+    "--device",
+    "--list-devices",
+    "--rpc",
     "--host",
     "--port",
     "--reuse-port",
@@ -160,11 +212,92 @@ const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "--models-autoload",
     "--no-models-autoload",
     "--props",
+    "--path",
+    "--cors-origins",
+    "--cors-methods",
+    "--cors-headers",
+    "--cors-credentials",
+    "--no-cors-credentials",
+    "--ui-config",
+    "--webui-config",
+    "--ui-config-file",
+    "--webui-config-file",
+    "--ui-mcp-proxy",
+    "--webui-mcp-proxy",
+    "--no-ui-mcp-proxy",
+    "--no-webui-mcp-proxy",
+    "--ui",
+    "--webui",
+    "--no-ui",
+    "--no-webui",
+    "--pooling",
+    "--embd-normalize",
+    "-dt",
+    "--defrag-thold",
+    "--override-kv",
+    "-mm",
+    "--mmproj",
+    "-mmu",
+    "--mmproj-url",
+    "--mmproj-auto",
+    "--no-mmproj",
+    "--no-mmproj-auto",
+    "--mmproj-offload",
+    "--no-mmproj-offload",
+    "-mmdev",
+    "--mmproj-device",
+    "--image",
+    "--audio",
+    "--video",
+    "--image-min-tokens",
+    "--image-max-tokens",
+    "--mtmd-batch-max-tokens",
+    "--video-fps",
+    "--video-timestamp-interval",
+    "--video-ffmpeg-dir",
+    "--media-path",
     "--agent",
+    "-ag",
+    "-no-ag",
+    "--no-agent",
     "--tools",
+    "--tools-runtime",
     "--tools-file",
     "--mcp-config",
     "--mcp-config-file",
+    "--mcp-servers-config",
+    "--mcp-servers-json",
+    "--lookup-cache-static",
+    "--lookup-cache-dynamic",
+    "-lcs",
+    "-lcd",
+    "--spec-synth-len",
+    "--spec-synth-rates",
+    "--spec-draft-hf",
+    "-hfd",
+    "-hfrd",
+    "--hf-repo-draft",
+    "--spec-draft-device",
+    "-devd",
+    "--device-draft",
+    "--sampler-seq",
+    "--sampling-seq",
+    "-l",
+    "--logit-bias",
+    "-v",
+    "--verbose",
+    "--log-verbose",
+    "-sp",
+    "--special",
+    "--spm-infill",
+    "--draft",
+    "--draft-n",
+    "--draft-max",
+    "--draft-min",
+    "--draft-n-min",
+    "--spec-ngram-size-n",
+    "--spec-ngram-size-m",
+    "--spec-ngram-min-hits",
     // Current llama-server convenience presets assign a different primary model
     // (and some also replace the managed port or generation mode).
     "--embd-gemma-default",
@@ -178,6 +311,7 @@ const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "--gpt-oss-120b-default",
     "--vision-gemma-4b-default",
     "--vision-gemma-12b-default",
+    "--spec-default",
 ];
 
 pub struct LlamaCppAdapter {
@@ -781,7 +915,7 @@ impl EngineAdapter for LlamaCppAdapter {
         &self,
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
-        _host: &HostCapabilities,
+        host: &HostCapabilities,
         settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
         let model_compatibility = llama_model_compatibility(self.compatibility(model));
@@ -793,25 +927,47 @@ impl EngineAdapter for LlamaCppAdapter {
             .try_read()
             .ok()
             .and_then(|cache| cache.get(&Self::capability_key(runtime)).cloned());
-        settings.map_or(model_compatibility, |settings| {
+        let configured = settings.map_or(model_compatibility, |settings| {
             llama_configured_runtime_compatibility(settings, Some(model), help.as_deref())
-        })
+        });
+        combine_llama_compatibility(
+            configured,
+            llama_device_evaluation(
+                &runtime.manifest.identity.accelerator,
+                &runtime.manifest.identity.platform,
+                &runtime.manifest.identity.architecture,
+                &runtime.manifest.requirements,
+                host,
+            )
+            .compatibility,
+        )
     }
 
     fn available_runtime_model_compatibility(
         &self,
-        _runtime: &AvailableRuntime,
+        runtime: &AvailableRuntime,
         model: &ModelArtifact,
-        _host: &HostCapabilities,
+        host: &HostCapabilities,
         settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
         let model_compatibility = llama_model_compatibility(self.compatibility(model));
         if matches!(model_compatibility, RuntimeCompatibility::Incompatible(_)) {
             return model_compatibility;
         }
-        settings.map_or(model_compatibility, |settings| {
+        let configured = settings.map_or(model_compatibility, |settings| {
             llama_configured_runtime_compatibility(settings, Some(model), None)
-        })
+        });
+        combine_llama_compatibility(
+            configured,
+            llama_device_evaluation(
+                &runtime.identity.accelerator,
+                &runtime.identity.platform,
+                &runtime.identity.architecture,
+                &runtime.requirements,
+                host,
+            )
+            .compatibility,
+        )
     }
 
     fn runtime_model_preference(
@@ -830,6 +986,22 @@ impl EngineAdapter for LlamaCppAdapter {
         host: &HostCapabilities,
     ) -> u16 {
         llama_runtime_preference(&runtime.identity.accelerator, host)
+    }
+
+    fn runtime_model_accelerator(
+        &self,
+        runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        host: &HostCapabilities,
+    ) -> Option<AcceleratorDevice> {
+        llama_device_evaluation(
+            &runtime.manifest.identity.accelerator,
+            &runtime.manifest.identity.platform,
+            &runtime.manifest.identity.architecture,
+            &runtime.manifest.requirements,
+            host,
+        )
+        .accelerator
     }
 
     fn normalize_settings(
@@ -1067,7 +1239,10 @@ impl EngineAdapter for LlamaCppAdapter {
         })
     }
 
-    async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError> {
+    async fn build_launch_spec(
+        &self,
+        mut request: LaunchRequest,
+    ) -> Result<LaunchSpec, EngineError> {
         if !request.backend_address.ip().is_loopback() {
             return Err(EngineError::InvalidConfiguration(
                 "llama.cpp backend address must be loopback".to_owned(),
@@ -1078,6 +1253,7 @@ impl EngineAdapter for LlamaCppAdapter {
             .validate(&request.settings)
             .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
         validate_llama_bound_files(&request.settings, &request.model.primary).await?;
+        let bound_files = bind_llama_inference_files(&mut request.settings).await?;
         let structured = translate_llama_settings_for_model(
             &request.settings,
             Some(&request.model.primary),
@@ -1116,7 +1292,7 @@ impl EngineAdapter for LlamaCppAdapter {
                 "resolved settings do not identify the loaded Model Profile".to_owned(),
             )
         })?;
-        let arguments = vec![
+        let mut arguments = vec![
             OsString::from("--model"),
             request.model.primary.path.as_os_str().to_owned(),
             OsString::from("--alias"),
@@ -1125,23 +1301,42 @@ impl EngineAdapter for LlamaCppAdapter {
             OsString::from(request.backend_address.ip().to_string()),
             OsString::from("--port"),
             OsString::from(request.backend_address.port().to_string()),
-        ]
-        .into_iter()
-        .chain(structured.arguments)
-        .chain(self.native_arguments.iter().map(OsString::from))
-        .collect();
+        ];
+        let mut environment = self.environment.clone();
+        if manifest.identity.accelerator == "cuda" {
+            let accelerator = request.accelerator.as_ref().ok_or_else(|| {
+                EngineError::InvalidConfiguration(
+                    "llama.cpp CUDA launch has no exact NVIDIA GPU selected by compatibility evaluation"
+                        .to_owned(),
+                )
+            })?;
+            let help = self.cached_runtime_help(&request.runtime).await?;
+            if !help_has_option(&help, "--device") {
+                return Err(EngineError::InvalidConfiguration(
+                    "the exact CUDA llama-server does not advertise Norted's required --device isolation contract"
+                        .to_owned(),
+                ));
+            }
+            environment = isolated_cuda_environment(&environment, accelerator, "llama.cpp")
+                .map_err(EngineError::InvalidConfiguration)?;
+            arguments.extend([OsString::from("--device"), OsString::from("CUDA0")]);
+        }
+        arguments.extend(structured.arguments);
+        arguments.extend(self.native_arguments.iter().map(OsString::from));
         let mut environment_remove = managed_environment_removals();
         environment_remove.extend(structured.environment_remove);
+        let mut normalized_settings = llama_normalized_generation_defaults(&request.settings);
+        normalized_settings.extend(bound_files);
         Ok(LaunchSpec {
             executable: binary_path,
             arguments,
-            environment: self.environment.clone(),
+            environment,
             environment_remove,
             inherits_parent_environment: true,
             working_directory: None,
             temporary_files: Vec::new(),
             endpoint: Some(http_endpoint(request.backend_address)),
-            normalized_settings: llama_normalized_generation_defaults(&request.settings),
+            normalized_settings,
             settings: request.settings,
             native_arguments: self.native_arguments.clone(),
             installation: (*installation).clone(),
@@ -1413,6 +1608,106 @@ fn llama_runtime_preference(accelerator: &str, host: &HostCapabilities) -> u16 {
         (_, "vulkan") => 10,
         (true, "cpu") | (false, "cuda") => 20,
         _ => 100,
+    }
+}
+
+#[derive(Debug)]
+struct LlamaDeviceEvaluation {
+    compatibility: RuntimeCompatibility,
+    accelerator: Option<AcceleratorDevice>,
+}
+
+fn llama_device_evaluation(
+    accelerator: &str,
+    platform: &str,
+    architecture: &str,
+    requirements: &norted_core::RuntimeRequirements,
+    host: &HostCapabilities,
+) -> LlamaDeviceEvaluation {
+    if accelerator != "cuda" {
+        return LlamaDeviceEvaluation {
+            compatibility: RuntimeCompatibility::Compatible,
+            accelerator: None,
+        };
+    }
+    let devices = match visible_nvidia_devices(host, "llama.cpp") {
+        Ok(devices) => devices,
+        Err(compatibility) => {
+            return LlamaDeviceEvaluation {
+                compatibility,
+                accelerator: None,
+            };
+        }
+    };
+    let mut evaluated = devices
+        .into_iter()
+        .map(|device| {
+            let device_host = HostCapabilities {
+                platform: host.platform.clone(),
+                architecture: host.architecture.clone(),
+                accelerators: vec![device.clone()],
+                nvidia_gpu_absence_confirmed: false,
+                cuda_visible_devices: None,
+                observations: Vec::new(),
+            };
+            (
+                device.clone(),
+                compatibility_for(
+                    platform,
+                    architecture,
+                    accelerator,
+                    requirements,
+                    &device_host,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    evaluated.sort_by(|left, right| {
+        left.1
+            .preference_rank()
+            .cmp(&right.1.preference_rank())
+            .then_with(|| {
+                right
+                    .0
+                    .vram_bytes
+                    .unwrap_or(0)
+                    .cmp(&left.0.vram_bytes.unwrap_or(0))
+            })
+            .then_with(|| left.0.stable_id.cmp(&right.0.stable_id))
+    });
+    match evaluated.into_iter().next() {
+        Some((accelerator, compatibility)) => LlamaDeviceEvaluation {
+            compatibility,
+            accelerator: Some(accelerator),
+        },
+        None => LlamaDeviceEvaluation {
+            compatibility: RuntimeCompatibility::NeedsAttention(
+                "llama.cpp CUDA requires a stable NVIDIA GPU UUID, but none was observed"
+                    .to_owned(),
+            ),
+            accelerator: None,
+        },
+    }
+}
+
+fn combine_llama_compatibility(
+    left: RuntimeCompatibility,
+    right: RuntimeCompatibility,
+) -> RuntimeCompatibility {
+    if matches!(left, RuntimeCompatibility::Incompatible(_)) {
+        left
+    } else if matches!(right, RuntimeCompatibility::Incompatible(_)) {
+        right
+    } else if matches!(left, RuntimeCompatibility::NeedsAttention(_)) {
+        left
+    } else if matches!(right, RuntimeCompatibility::NeedsAttention(_)) {
+        right
+    } else if matches!(left, RuntimeCompatibility::Recommended)
+        || matches!(right, RuntimeCompatibility::Recommended)
+    {
+        RuntimeCompatibility::Recommended
+    } else {
+        RuntimeCompatibility::Compatible
     }
 }
 
@@ -2836,44 +3131,16 @@ fn llama_extended_setting_definitions() -> Vec<SettingDefinition> {
     ];
     specs
         .into_iter()
-        .map(|(suffix, label, description, kind, default)| {
-            let mut definition = llama_definition(
-                &format!("{ENGINE_ID}.{suffix}"),
-                label,
-                description,
-                kind,
-            );
-            definition.default_preview = Some(
-                SettingDefaultPreview::new(default, SettingDefaultSource::Runtime)
-                    .with_detail("Exact llama-server omitted/default policy; availability is checked against this binary's help"),
-            );
-            definition
-        })
+        .map(
+            |(suffix, label, description, kind, _audited_snapshot_default)| {
+                llama_definition(&format!("{ENGINE_ID}.{suffix}"), label, description, kind)
+            },
+        )
         .collect()
 }
 
 fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<SettingDefinition> {
     let mut definitions = llama_setting_definitions();
-    if model.is_some() {
-        for id in [
-            "llama.cpp.context_length",
-            "llama.cpp.rope_frequency_base",
-            "llama.cpp.rope_frequency_scale",
-            "llama.cpp.chat_template",
-        ] {
-            if let Some(definition) = definitions
-                .iter_mut()
-                .find(|definition| definition.id.as_str() == id)
-            {
-                definition.default_preview = Some(
-                    SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
-                    .with_detail(
-                        "The selected GGUF does not expose this inspected value, so the exact runtime remains authoritative",
-                    ),
-                );
-            }
-        }
-    }
     if let Some(temperature) = definitions
         .iter_mut()
         .find(|definition| definition.id.as_str() == "llama.cpp.temperature")
@@ -3077,7 +3344,12 @@ fn llama_definition(
         default_preview: match id {
             "llama.cpp.chat_template_file"
             | "llama.cpp.chat_template_sha256"
-            | "llama.cpp.speculative_draft_sha256" => Some(SettingDefaultPreview::new(
+            | "llama.cpp.speculative_draft_model"
+            | "llama.cpp.speculative_draft_sha256"
+            | "llama.cpp.lora_adapters"
+            | "llama.cpp.lora_scaled"
+            | "llama.cpp.control_vectors"
+            | "llama.cpp.control_vectors_scaled" => Some(SettingDefaultPreview::new(
                 "None",
                 SettingDefaultSource::Norted,
             )),
@@ -3290,16 +3562,24 @@ fn llama_direct_setting(id: &str) -> Option<LlamaDirectSetting> {
         "llama.cpp.mirostat" => value!("--mirostat"),
         "llama.cpp.mirostat_learning_rate" => value!("--mirostat-lr"),
         "llama.cpp.mirostat_entropy" => value!("--mirostat-ent"),
-        "llama.cpp.backend_sampling" => flag!("--backend-sampling"),
+        "llama.cpp.backend_sampling" => {
+            flag!("--backend-sampling", "LLAMA_ARG_BACKEND_SAMPLING")
+        }
         "llama.cpp.draft_kv_cache_k" => {
             value!("--cache-type-k-draft", "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K")
         }
         "llama.cpp.draft_kv_cache_v" => {
             value!("--cache-type-v-draft", "LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V")
         }
-        "llama.cpp.draft_tokens_max" => value!("--spec-draft-n-max"),
-        "llama.cpp.draft_tokens_min" => value!("--spec-draft-n-min"),
-        "llama.cpp.draft_probability_min" => value!("--spec-draft-p-min"),
+        "llama.cpp.draft_tokens_max" => {
+            value!("--spec-draft-n-max", "LLAMA_ARG_SPEC_DRAFT_N_MAX")
+        }
+        "llama.cpp.draft_tokens_min" => {
+            value!("--spec-draft-n-min", "LLAMA_ARG_SPEC_DRAFT_N_MIN")
+        }
+        "llama.cpp.draft_probability_min" => {
+            value!("--spec-draft-p-min", "LLAMA_ARG_SPEC_DRAFT_P_MIN")
+        }
         "llama.cpp.draft_probability_split" => {
             value!("--spec-draft-p-split", "LLAMA_ARG_SPEC_DRAFT_P_SPLIT")
         }
@@ -3338,24 +3618,32 @@ fn llama_direct_setting(id: &str) -> Option<LlamaDirectSetting> {
         "llama.cpp.ngram_map4_size_n" => value!("--spec-ngram-map-k4v-size-n"),
         "llama.cpp.ngram_map4_size_m" => value!("--spec-ngram-map-k4v-size-m"),
         "llama.cpp.ngram_map4_min_hits" => value!("--spec-ngram-map-k4v-min-hits"),
-        "llama.cpp.kv_per_slot" => value!("--kv-unified-per-slot"),
-        "llama.cpp.checkpoint_min_step" => value!("--checkpoint-min-step"),
-        "llama.cpp.cache_ram_mib" => value!("--cache-ram"),
+        "llama.cpp.kv_per_slot" => {
+            value!("--kv-unified-per-slot", "LLAMA_ARG_KV_UNIFIED_PER_SLOT")
+        }
+        "llama.cpp.checkpoint_min_step" => value!(
+            "--checkpoint-min-step",
+            "LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT"
+        ),
+        "llama.cpp.cache_ram_mib" => value!("--cache-ram", "LLAMA_ARG_CACHE_RAM"),
         "llama.cpp.cache_idle_slots" => toggle!(
             "--cache-idle-slots",
             Some("--cache-idle-slots"),
-            Some("--no-cache-idle-slots")
+            Some("--no-cache-idle-slots"),
+            "LLAMA_ARG_CACHE_IDLE_SLOTS"
         ),
         "llama.cpp.context_shift" => toggle!(
             "--context-shift",
             Some("--context-shift"),
-            Some("--no-context-shift")
+            Some("--no-context-shift"),
+            "LLAMA_ARG_CONTEXT_SHIFT"
         ),
         "llama.cpp.warmup" => toggle!("--warmup", Some("--warmup"), Some("--no-warmup")),
         "llama.cpp.continuous_batching" => toggle!(
             "--cont-batching",
             Some("--cont-batching"),
-            Some("--no-cont-batching")
+            Some("--no-cont-batching"),
+            "LLAMA_ARG_CONT_BATCHING"
         ),
         "llama.cpp.timeout_seconds" => value!("--timeout", "LLAMA_ARG_TIMEOUT"),
         "llama.cpp.sse_ping_interval" => {
@@ -3420,6 +3708,9 @@ fn llama_direct_aliases(id: &str, required: &'static str) -> Vec<&'static str> {
         "llama.cpp.cpu_range" => &["-Cr", "--cpu-range"],
         "llama.cpp.cpu_mask_batch" => &["-Cb", "--cpu-mask-batch"],
         "llama.cpp.cpu_range_batch" => &["-Crb", "--cpu-range-batch"],
+        "llama.cpp.performance_timings" => &["--perf", "--no-perf"],
+        "llama.cpp.escape_sequences" => &["-e", "--escape", "--no-escape"],
+        "llama.cpp.weight_repacking" => &["--repack", "-nr", "--no-repack"],
         "llama.cpp.lazy_mode" => &["-lzm", "--lazy-mode"],
         "llama.cpp.override_tensor" => &["-ot", "--override-tensor"],
         "llama.cpp.cpu_ffn_layers" => &["-ncffn", "--n-cpu-ffn"],
@@ -3435,8 +3726,50 @@ fn llama_direct_aliases(id: &str, required: &'static str) -> Vec<&'static str> {
         "llama.cpp.backend_sampling" => &["-bs", "--backend-sampling"],
         "llama.cpp.draft_kv_cache_k" => &["--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"],
         "llama.cpp.draft_kv_cache_v" => &["--spec-draft-type-v", "-ctvd", "--cache-type-v-draft"],
+        "llama.cpp.draft_threads" => &["--spec-draft-threads", "-td", "--threads-draft"],
+        "llama.cpp.draft_threads_batch" => &[
+            "--spec-draft-threads-batch",
+            "-tbd",
+            "--threads-batch-draft",
+        ],
+        "llama.cpp.draft_cpu_mask" => &["--spec-draft-cpu-mask", "-Cd", "--cpu-mask-draft"],
+        "llama.cpp.draft_cpu_range" => &["--spec-draft-cpu-range", "-Crd", "--cpu-range-draft"],
+        "llama.cpp.draft_cpu_strict" => &["--spec-draft-cpu-strict", "--cpu-strict-draft"],
+        "llama.cpp.draft_priority" => &["--spec-draft-prio", "--prio-draft"],
+        "llama.cpp.draft_poll" => &["--spec-draft-poll", "--poll-draft"],
+        "llama.cpp.draft_cpu_mask_batch" => &[
+            "--spec-draft-cpu-mask-batch",
+            "-Cbd",
+            "--cpu-mask-batch-draft",
+        ],
+        "llama.cpp.draft_cpu_strict_batch" => {
+            &["--spec-draft-cpu-strict-batch", "--cpu-strict-batch-draft"]
+        }
+        "llama.cpp.draft_priority_batch" => &["--spec-draft-prio-batch", "--prio-batch-draft"],
+        "llama.cpp.draft_poll_batch" => &["--spec-draft-poll-batch", "--poll-batch-draft"],
+        "llama.cpp.draft_override_tensor" => &[
+            "--spec-draft-override-tensor",
+            "-otd",
+            "--override-tensor-draft",
+        ],
+        "llama.cpp.draft_cpu_moe" => &["--spec-draft-cpu-moe", "-cmoed", "--cpu-moe-draft"],
+        "llama.cpp.draft_cpu_moe_layers" => &[
+            "--spec-draft-n-cpu-moe",
+            "--spec-draft-ncmoe",
+            "-ncmoed",
+            "--n-cpu-moe-draft",
+        ],
+        "llama.cpp.draft_gpu_offload" => &[
+            "--spec-draft-ngl",
+            "-ngld",
+            "--gpu-layers-draft",
+            "--n-gpu-layers-draft",
+        ],
+        "llama.cpp.draft_probability_split" => &["--spec-draft-p-split", "--draft-p-split"],
         "llama.cpp.draft_probability_min" => &["--spec-draft-p-min", "--draft-p-min"],
         "llama.cpp.context_checkpoints" => &["-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"],
+        "llama.cpp.checkpoint_min_step" => &["-cms", "--checkpoint-min-step"],
+        "llama.cpp.cache_ram_mib" => &["-cram", "--cache-ram"],
         "llama.cpp.continuous_batching" => {
             &["-cb", "--cont-batching", "-nocb", "--no-cont-batching"]
         }
@@ -3710,10 +4043,21 @@ fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &s
     }) {
         return;
     }
+    let id = definition.id.as_str();
+    if id == "llama.cpp.chat_template"
+        && contract
+            .to_ascii_lowercase()
+            .contains("template taken from model")
+    {
+        definition.default_preview = Some(
+            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+                .with_detail("The exact runtime selects the template from model metadata"),
+        );
+        return;
+    }
     let Some(reported) = llama_help_reported_default(contract) else {
         return;
     };
-    let id = definition.id.as_str();
     let lower = reported.to_ascii_lowercase();
     let preview = match id {
         _ if lower == "same" => SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
@@ -3836,6 +4180,12 @@ fn llama_help_reported_default(contract: &str) -> Option<String> {
     let tail = contract[index + marker_len..].trim_start_matches(|character: char| {
         character.is_whitespace() || matches!(character, '(' | '[' | '{' | '`' | '\'' | '"')
     });
+    if contract[index + marker_len..]
+        .trim_start()
+        .starts_with("\"\"")
+    {
+        return Some("\"\"".to_owned());
+    }
     let value = tail
         .split(|character: char| {
             character.is_whitespace()
@@ -4185,6 +4535,106 @@ async fn validate_llama_bound_files(
         }
     }
     Ok(())
+}
+
+async fn bind_llama_inference_files(
+    settings: &mut norted_core::ResolvedSettings,
+) -> Result<BTreeMap<String, Value>, EngineError> {
+    const MAXIMUM_INFERENCE_INPUT_BYTES: u64 = 1024_u64 * 1024 * 1024 * 1024;
+
+    let mut provenance = BTreeMap::new();
+    for (setting_id, scaled) in [
+        ("llama.cpp.lora_adapters", false),
+        ("llama.cpp.lora_scaled", true),
+        ("llama.cpp.control_vectors", false),
+        ("llama.cpp.control_vectors_scaled", true),
+    ] {
+        let id = SettingId::new(setting_id).expect("static llama.cpp setting ID");
+        let Some(SettingValue::StringList(configured)) = settings.value(setting_id).cloned() else {
+            continue;
+        };
+        let mut launch_values = Vec::with_capacity(configured.len());
+        let mut identities = Vec::with_capacity(configured.len());
+        for configured_entry in configured {
+            let (configured_path, scale) = if scaled {
+                let (path, scale) = configured_entry.rsplit_once(':').ok_or_else(|| {
+                    EngineError::InvalidConfiguration(format!(
+                        "`{setting_id}` entry `{configured_entry}` must use PATH:SCALE"
+                    ))
+                })?;
+                let parsed = scale.parse::<f64>().map_err(|_| {
+                    EngineError::InvalidConfiguration(format!(
+                        "`{setting_id}` entry `{configured_entry}` has an invalid scale"
+                    ))
+                })?;
+                if !parsed.is_finite() {
+                    return Err(EngineError::InvalidConfiguration(format!(
+                        "`{setting_id}` entry `{configured_entry}` has a non-finite scale"
+                    )));
+                }
+                (path, Some((scale, parsed)))
+            } else {
+                (configured_entry.as_str(), None)
+            };
+            if configured_path.is_empty() {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "`{setting_id}` contains an empty file path"
+                )));
+            }
+            let canonical = tokio::fs::canonicalize(configured_path)
+                .await
+                .map_err(|error| {
+                    EngineError::InvalidConfiguration(format!(
+                        "could not resolve `{setting_id}` file `{configured_path}`: {error}"
+                    ))
+                })?;
+            let metadata = tokio::fs::metadata(&canonical).await.map_err(|error| {
+                EngineError::InvalidConfiguration(format!(
+                    "could not inspect `{setting_id}` file {}: {error}",
+                    canonical.display()
+                ))
+            })?;
+            if !metadata.is_file() || metadata.len() > MAXIMUM_INFERENCE_INPUT_BYTES {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "`{setting_id}` file {} must be regular and no larger than {MAXIMUM_INFERENCE_INPUT_BYTES} bytes",
+                    canonical.display()
+                )));
+            }
+            let digest = norted_core::bounded_setting_file_sha256(
+                &id,
+                &canonical,
+                Path::new("/"),
+                MAXIMUM_INFERENCE_INPUT_BYTES,
+            )
+            .await
+            .map_err(|error| EngineError::InvalidConfiguration(error.to_string()))?;
+            if let Some((scale_text, scale_value)) = scale {
+                launch_values.push(format!("{}:{scale_text}", canonical.display()));
+                identities.push(json!({
+                    "path": canonical,
+                    "sha256": digest,
+                    "scale": scale_value,
+                }));
+            } else {
+                launch_values.push(canonical.display().to_string());
+                identities.push(json!({
+                    "path": canonical,
+                    "sha256": digest,
+                }));
+            }
+        }
+        let resolved = settings.configured.get_mut(&id).ok_or_else(|| {
+            EngineError::InvalidConfiguration(format!(
+                "resolved setting `{setting_id}` disappeared while binding files"
+            ))
+        })?;
+        resolved.value = SettingValue::StringList(launch_values);
+        provenance.insert(
+            format!("bound_files.{setting_id}"),
+            Value::Array(identities),
+        );
+    }
+    Ok(provenance)
 }
 
 async fn verify_bound_file(
@@ -4562,7 +5012,7 @@ fn llama_setting_collision_contract(
     match id {
         "llama.cpp.context_length" => (&["-c", "--ctx-size"], &["LLAMA_ARG_CTX_SIZE"]),
         "llama.cpp.parallel_requests" => (&["-np", "--parallel"], &["LLAMA_ARG_N_PARALLEL"]),
-        "llama.cpp.temperature" => (&["--temp"], &["LLAMA_ARG_TEMP"]),
+        "llama.cpp.temperature" => (&["--temp", "--temperature"], &["LLAMA_ARG_TEMP"]),
         "llama.cpp.top_p" => (&["--top-p"], &["LLAMA_ARG_TOP_P"]),
         "llama.cpp.top_k" => (&["--top-k"], &["LLAMA_ARG_TOP_K"]),
         "llama.cpp.min_p" => (&["--min-p"], &["LLAMA_ARG_MIN_P"]),
@@ -4692,12 +5142,39 @@ fn push_value_argument(arguments: &mut Vec<OsString>, option: &str, value: impl 
 
 fn conflicts_with_managed_argument(argument: &str) -> bool {
     let argument = argument.to_ascii_lowercase().replace('_', "-");
-    MANAGED_NATIVE_ARGUMENTS.iter().any(|managed| {
-        argument == *managed
-            || argument
-                .strip_prefix(managed)
-                .is_some_and(|suffix| suffix.starts_with('='))
-    })
+    MANAGED_NATIVE_ARGUMENTS
+        .iter()
+        .copied()
+        .chain(structured_llama_argument_aliases())
+        .any(|managed| {
+            argument == managed
+                || argument
+                    .strip_prefix(managed)
+                    .is_some_and(|suffix| suffix.starts_with('='))
+        })
+}
+
+fn structured_llama_argument_aliases() -> impl Iterator<Item = &'static str> {
+    llama_setting_definitions()
+        .into_iter()
+        .flat_map(|definition| {
+            if let Some(setting) = llama_direct_setting(definition.id.as_str()) {
+                let mut aliases = setting.aliases.to_vec();
+                aliases.extend(llama_direct_aliases(
+                    definition.id.as_str(),
+                    setting.required,
+                ));
+                if let LlamaDirectMode::Toggle { enabled, disabled } = setting.mode {
+                    aliases.extend(enabled);
+                    aliases.extend(disabled);
+                }
+                aliases
+            } else {
+                llama_setting_collision_contract(definition.id.as_str())
+                    .0
+                    .to_vec()
+            }
+        })
 }
 
 fn conflicts_with_managed_environment(name: &str) -> bool {
@@ -5508,7 +5985,7 @@ mod settings_tests {
     }
 
     #[test]
-    fn structured_load_mode_owns_equivalent_environment_only_when_active() {
+    fn structured_load_mode_owns_equivalent_environment_and_raw_aliases_are_reserved() {
         let settings = resolved(&[(
             "llama.cpp.load_mode",
             SettingValue::Choice("dio".to_owned()),
@@ -5538,14 +6015,8 @@ mod settings_tests {
             equivalent.map(OsString::from)
         );
 
-        let absent = translate_llama_settings(
-            &resolved(&[]),
-            &["--load-mode=none".to_owned()],
-            &BTreeMap::from([("LLAMA_ARG_MMAP".to_owned(), "0".to_owned())]),
-        )
-        .expect("native controls remain available without structured ownership");
-        assert!(absent.arguments.is_empty());
-        assert!(absent.environment_remove.is_empty());
+        assert!(conflicts_with_managed_argument("--load-mode=none"));
+        assert!(conflicts_with_managed_environment("LLAMA_ARG_MMAP"));
     }
 
     #[test]
@@ -5561,6 +6032,28 @@ mod settings_tests {
             let error = translate_llama_settings(&settings, &native, &BTreeMap::new())
                 .expect_err("native collision");
             assert!(error.to_string().contains("conflicts"));
+        }
+        for managed in [
+            "--device=CUDA1",
+            "--rpc",
+            "--override-kv",
+            "--list-devices",
+            "--mmproj",
+            "--models-dir",
+            "--grammar-file",
+            "--logit-bias",
+            "--spec-synth-len",
+        ] {
+            assert!(conflicts_with_managed_argument(managed), "{managed}");
+        }
+        for managed in [
+            "LLAMA_ARG_DEVICE",
+            "LLAMA_ARG_RPC",
+            "LLAMA_ARG_MMPROJ",
+            "LLAMA_ARG_SPEC_SYNTH_LEN",
+            "LLAMA_ARG_CTX_SIZE",
+        ] {
+            assert!(conflicts_with_managed_environment(managed), "{managed}");
         }
     }
 

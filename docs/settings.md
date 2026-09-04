@@ -73,6 +73,16 @@ llama.cpp runtime-default previews require evidence from the exact selected runt
 metadata, an exact immutable reviewed contract, or a Norted-owned value that Norted actually applies.
 Common but unversioned upstream defaults are not treated as authoritative; when exact evidence cannot
 establish an omitted default, schema resolution reports that absence instead of inventing a value.
+Generic llama.cpp definitions therefore carry type/category/semantic information but no runtime scalar
+copied from an audited snapshot. Exact executable help supplies advertised defaults, inspected GGUF metadata
+supplies model-derived values, and genuinely Norted-owned omission policies remain explicit. Exact-help
+availability gating is applied before a definition can enter the concrete runtime/model schema.
+
+Inference-affecting file inputs are bound again immediately before launch. LoRA adapters, control vectors,
+and NInfer context-cost presets record the canonical launch path and SHA-256 in normalized launch provenance;
+scaled LoRA/control-vector identities also retain their numeric scale. This makes changed content at the same
+configured path distinguishable. Mutable output/state destinations, including ordinary log and slot-save
+paths, are not hashed as if they were immutable inputs.
 
 Each runtime/model schema contains only settings configurable for that exact combination. Reusable
 definition constructors do not create shared setting identity. A stale or

@@ -202,11 +202,12 @@ reuse, thinking, speculation/backend/draft/proposal head, samplers and greedy mo
 request/statistics limits, Vision residency and media budgets/workers, Responses-store bounds, and
 advanced cache controls. There is no nested named speculation abstraction. The exact source
 commit/tree, executable help, native container v2 identity, revision-specific startup schema,
-DFlash/Vision restriction, and observed startup state remain authoritative. The audited current
-source advertises `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`; older executable help narrows the
-choice list instead of inheriting newer formats.
-`--context-cost-presets` remains a narrowly allowlisted native file escape hatch until Norted can
-bind its canonical path and content identity as strongly as other file-backed settings. NInfer
+DFlash/Vision capability, and observed startup state remain authoritative. DFlash remains limited
+to exact `qwen3.6-35b-a3b`/`groupwise-int`; current reviewed runtimes allow it with Vision, while the
+older reviewed contract retains its rejection. The audited current source advertises `bf16`,
+`int8`, `fp8`, `nvfp4`, and `k8v4`; older executable help narrows the choice list instead of
+inheriting newer formats. `ninfer.context_cost_presets` is first-class and binds its canonical path
+and SHA-256 immediately before launch; raw `--context-cost-presets` is rejected. NInfer
 host/port/key/model alias/device/CORS/request-log controls remain Norted-owned, and diagnostic,
 benchmark, tracing, and kernel-development controls are not promoted into ordinary settings.
 
@@ -298,8 +299,9 @@ For a q27 source build, discovery resolves the release tag to a full Git commit/
 NInfer publishes source rather than an installable release binary. Its provider resolves the canonical `Neroued/ninfer` default-branch HEAD into one `Latest` source snapshot containing the full commit and Git-tree SHAs. It deliberately exposes no `Stable` channel and no fake release asset. Revalidation targets the selected commit itself, so a normal later HEAD does not substitute new source; bounded historical source descriptors retained from explicit searches keep that exact selection addressable after a refresh. Update checks use Git ancestry: identical is current, a descendant is an available update, and backward or diverged history is a provider warning rather than an implicit downgrade. Installed snapshots and selections remain side by side and unchanged until explicitly updated/selected.
 
 The currently reviewed NInfer request/startup authority is commit
-`a140e7ae82a11ed2f370a4d8f2cc16268a3790b8`, tree
-`1474697c790de8df18ed07a469f560bb33e8f324`, with request-log schema 20.
+`863aa8a5f1e866db74f29f8999b83b4021398dee`, tree
+`5368f514bafbcab89ce1272df3a13d9d9af55820`, with request-log schema 20. The exact older
+`a140e7ae...` contract remains recognized without inheriting the current DFlash+Vision capability.
 NInfer admission is capability-domain based: exact process/launch and sampler controls use the
 observed executable help plus reviewed default-owning source blobs, while request semantics,
 request-log/startup proof, thinking, tools, and Vision/media use their own reviewed source-blob
@@ -571,7 +573,7 @@ Relative paths resolve against the directory containing `config.toml`. Observed 
 
 External binaries participate in the same resolver as managed packs. Norted canonicalizes and probes the executable, records its SHA-256 and observed facts, labels acquisition as `ExternalBinary`, leaves the repository unverified, and treats updates as unmanaged. External runtime manifests are synthesized in memory and are never mistaken for Norted-owned installations.
 
-All adapters keep native configuration engine-namespaced while rejecting flags or variables that can replace Norted-owned model inputs, identity, loopback host/port, authentication, API behavior, observation files, GPU binding, structured settings, or provable generation settings. NInfer additionally uses a strict allowlist of non-semantic operational options; sampler, greedy, vision, CORS, Responses-state, cache, structured-load, and request-log controls remain Norted-owned. A native tuning option remains usable until a resolved structured setting owns the same option; that load then fails with the stable setting ID and conflicting native option. Because q27 uses a hand-written positional parser, its custom arguments are limited to the known, non-conflicting q27 options with their exact separate-token arity. Raw environment values are never placed in provenance.
+All adapters keep native configuration engine-namespaced while rejecting flags or variables that can replace Norted-owned model inputs, identity, loopback host/port, authentication, API behavior, observation files, GPU binding, structured settings, or provable generation settings. llama.cpp reserves every CLI/environment alias of every first-class setting even when that setting is omitted, and also rejects managed or unsupported process-contract switches. NInfer currently admits no raw native option; its ordinary controls are structured. Because q27 uses a hand-written positional parser, its custom arguments are limited to the known, non-conflicting q27 options with their exact separate-token arity. Raw environment values are never placed in provenance.
 
 ## Model artifacts and native identity
 
@@ -725,7 +727,7 @@ Public `/v1/models` remains the minimal OpenAI list (`id`, `object`, `created`, 
 
 The common runtime manager resolves a concrete runtime before asking its engine adapter for a launch specification. The common supervisor owns process creation, stdout/stderr draining, crash observation, cancellation, bounded shutdown, and cleanup. Load still transitions through Stopped, Loading, Running, Stopping, and Failed; unloading during startup cancels and cleans up the child.
 
-Private control status identifies the model, engine, exact runtime ID/version/variant, executable SHA-256, process, and private endpoint. Launch provenance additionally snapshots the selected profile and the complete concrete effective settings map with runtime-default, Model Profile, or invocation source attribution and optional derivation detail. Startup-confirmed runtime values replace pre-launch calculations without changing the winning layer; when startup changes a value, structured `requested_value` preserves the pre-start policy/value. This is separate from adapter/generation `normalized_settings` and redacted native argument provenance. Provenance also retains the immutable runtime manifest, selection source, accelerator UUID and observations, typed model native identity, auxiliary facts, release digests or source commit/tree/recipe/toolchain facts as appropriate, environment names/value hashes, process identity, endpoint, and launch time. External, official-binary, and managed-source acquisition are never blurred. Public `/v1/models` and Responses objects receive no profile, runtime, source, hardware, or NInfer native-identity metadata; `models info` exposes the latter locally.
+Private control status identifies the model, engine, exact runtime ID/version/variant, executable SHA-256, process, and private endpoint. Launch provenance additionally snapshots the selected profile and the complete concrete effective settings map with runtime-default, Model Profile, or invocation source attribution and optional derivation detail. Startup-confirmed runtime values replace pre-launch calculations without changing the winning layer; when startup changes a value, structured `requested_value` preserves the pre-start policy/value. This is separate from adapter/generation `normalized_settings` and redacted native argument provenance. Provenance also retains the immutable runtime manifest, selection source, accelerator UUID and observations, typed model native identity, auxiliary facts, release digests or source commit/tree/recipe/toolchain facts as appropriate, environment names/value hashes, process identity, endpoint, and launch time. Inference-affecting LoRA/control-vector/context-cost inputs additionally record canonical bound paths and SHA-256 digests; scaled entries retain their scale. Mutable output destinations such as log and slot-save paths are not content-hashed. External, official-binary, and managed-source acquisition are never blurred. Public `/v1/models` and Responses objects receive no profile, runtime, source, hardware, or NInfer native-identity metadata; `models info` exposes the latter locally.
 
 ## Development
 

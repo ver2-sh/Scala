@@ -607,8 +607,16 @@ pub(crate) fn apply_runtime_bounds(definitions: &mut [SettingDefinition]) {
 pub(crate) fn apply_model_capabilities(
     definitions: &mut [SettingDefinition],
     model: &ModelArtifact,
+    settings: Option<&ResolvedSettings>,
+    dflash_vision_supported: bool,
 ) {
-    if dflash_target(model) {
+    let vision_requested = settings.is_some_and(|settings| {
+        matches!(
+            settings.value("ninfer.vision"),
+            Some(SettingValue::Toggle(true))
+        )
+    });
+    if dflash_target(model) && (!vision_requested || dflash_vision_supported) {
         return;
     }
     if let Some(definition) = definitions
@@ -623,15 +631,22 @@ pub(crate) fn apply_model_capabilities(
 pub(crate) fn validate_model_settings(
     settings: &ResolvedSettings,
     model: &ModelArtifact,
+    dflash_vision_supported: bool,
 ) -> Result<(), String> {
     if choice_value(settings, "ninfer.speculative_backend").map_err(|error| error.to_string())?
         == Some("dflash")
-        && !dflash_target(model)
     {
-        return Err(
-            "NInfer DFlash is supported only for the exact qwen3.6-35b-a3b/groupwise-int text target"
-                .to_owned(),
-        );
+        if !dflash_target(model) {
+            return Err(
+                "NInfer DFlash is supported only for the exact qwen3.6-35b-a3b/groupwise-int target"
+                    .to_owned(),
+            );
+        }
+        if toggle_value(settings, "ninfer.vision").map_err(|error| error.to_string())? == Some(true)
+            && !dflash_vision_supported
+        {
+            return Err("this exact NInfer runtime does not support DFlash with Vision".to_owned());
+        }
     }
     Ok(())
 }
@@ -785,6 +800,7 @@ pub(crate) fn translate(
     settings: &ResolvedSettings,
     model: &ModelArtifact,
     native_arguments: &[String],
+    dflash_vision_supported: bool,
 ) -> Result<Vec<OsString>, EngineError> {
     for id in settings.configured.keys() {
         let option = match execution_path_for_setting(id.as_str()) {
@@ -857,9 +873,12 @@ pub(crate) fn translate(
                 .to_owned(),
         ));
     }
-    if toggle_value(settings, "ninfer.vision")? == Some(true) && speculative == Some("dflash") {
+    if toggle_value(settings, "ninfer.vision")? == Some(true)
+        && speculative == Some("dflash")
+        && !dflash_vision_supported
+    {
         return Err(EngineError::InvalidConfiguration(
-            "NInfer vision cannot be combined with the DFlash speculative backend".to_owned(),
+            "this exact NInfer runtime does not support DFlash with Vision".to_owned(),
         ));
     }
     if toggle_value(settings, "ninfer.vision")? != Some(true)
@@ -909,7 +928,7 @@ pub(crate) fn translate(
             }
             if !dflash_target(model) {
                 return Err(EngineError::InvalidConfiguration(
-                    "NInfer DFlash is supported only for the exact qwen3.6-35b-a3b/groupwise-int text target"
+                    "NInfer DFlash is supported only for the exact qwen3.6-35b-a3b/groupwise-int target"
                         .to_owned(),
                 ));
             }
@@ -1148,7 +1167,7 @@ mod tests {
     }
 
     fn translated(values: &[(&str, SettingValue)], model_id: &str) -> Vec<String> {
-        translate(&settings(values), &model(model_id), &[])
+        translate(&settings(values), &model(model_id), &[], true)
             .expect("setting translation")
             .into_iter()
             .map(|value| value.to_string_lossy().into_owned())
@@ -1158,7 +1177,7 @@ mod tests {
     #[test]
     fn omitted_settings_emit_no_flags() {
         assert!(
-            translate(&settings(&[]), &model("qwen3.6-27b"), &[])
+            translate(&settings(&[]), &model("qwen3.6-27b"), &[], true)
                 .expect("translation")
                 .is_empty()
         );
@@ -1260,7 +1279,7 @@ mod tests {
             "ninfer.speculative_backend",
             SettingValue::Choice("mtp".to_owned()),
         )]);
-        assert!(translate(&missing_draft, &model("qwen3.6-27b"), &[]).is_err());
+        assert!(translate(&missing_draft, &model("qwen3.6-27b"), &[], true).is_err());
 
         let mtp = settings(&[
             (
@@ -1269,7 +1288,7 @@ mod tests {
             ),
             ("ninfer.draft_tokens", SettingValue::UnsignedInteger(6)),
         ]);
-        assert!(translate(&mtp, &model("qwen3.6-27b"), &[]).is_err());
+        assert!(translate(&mtp, &model("qwen3.6-27b"), &[], true).is_err());
 
         let dflash = settings(&[
             (
@@ -1278,11 +1297,11 @@ mod tests {
             ),
             ("ninfer.draft_tokens", SettingValue::UnsignedInteger(7)),
         ]);
-        assert!(translate(&dflash, &model("qwen3.6-27b"), &[]).is_err());
-        assert!(translate(&dflash, &model("qwen3.6-35b-a3b"), &[]).is_ok());
+        assert!(translate(&dflash, &model("qwen3.6-27b"), &[], true).is_err());
+        assert!(translate(&dflash, &model("qwen3.6-35b-a3b"), &[], true).is_ok());
 
         let missing_backend = settings(&[("ninfer.lm_head_draft", SettingValue::Toggle(true))]);
-        assert!(translate(&missing_backend, &model("qwen3.6-27b"), &[]).is_err());
+        assert!(translate(&missing_backend, &model("qwen3.6-27b"), &[], true).is_err());
 
         let valid_mtp = translated(
             &[
@@ -1308,7 +1327,7 @@ mod tests {
     fn model_capabilities_filter_and_reject_dflash_for_non_target_models() {
         let non_target = model("qwen3.6-27b");
         let mut non_target_definitions = definitions();
-        apply_model_capabilities(&mut non_target_definitions, &non_target);
+        apply_model_capabilities(&mut non_target_definitions, &non_target, None, true);
         let choices = non_target_definitions
             .iter()
             .find(|definition| definition.id.as_str() == "ninfer.speculative_backend")
@@ -1324,14 +1343,14 @@ mod tests {
             SettingValue::Choice("dflash".to_owned()),
         )]);
         assert!(
-            validate_model_settings(&dflash, &non_target)
+            validate_model_settings(&dflash, &non_target, true)
                 .unwrap_err()
                 .contains("exact qwen3.6-35b-a3b/groupwise-int")
         );
 
         let target = model("qwen3.6-35b-a3b");
         let mut target_definitions = definitions();
-        apply_model_capabilities(&mut target_definitions, &target);
+        apply_model_capabilities(&mut target_definitions, &target, None, true);
         let target_choices = target_definitions
             .iter()
             .find(|definition| definition.id.as_str() == "ninfer.speculative_backend")
@@ -1341,7 +1360,18 @@ mod tests {
             })
             .expect("target speculative backend choices");
         assert_eq!(target_choices, ["mtp", "dflash"]);
-        assert!(validate_model_settings(&dflash, &target).is_ok());
+        assert!(validate_model_settings(&dflash, &target, true).is_ok());
+
+        let dflash_vision = settings(&[
+            (
+                "ninfer.speculative_backend",
+                SettingValue::Choice("dflash".to_owned()),
+            ),
+            ("ninfer.draft_tokens", SettingValue::UnsignedInteger(7)),
+            ("ninfer.vision", SettingValue::Toggle(true)),
+        ]);
+        assert!(translate(&dflash_vision, &target, &[], true).is_ok());
+        assert!(translate(&dflash_vision, &target, &[], false).is_err());
     }
 
     #[test]
@@ -1355,7 +1385,7 @@ mod tests {
                 ),
             ),
         ]);
-        assert!(translate(&undersized, &model("qwen3.6-27b"), &[]).is_err());
+        assert!(translate(&undersized, &model("qwen3.6-27b"), &[], true).is_err());
 
         let automatic = settings(&[
             ("ninfer.context_length", SettingValue::UnsignedInteger(8192)),
@@ -1366,7 +1396,7 @@ mod tests {
                 )),
             ),
         ]);
-        assert!(translate(&automatic, &model("qwen3.6-27b"), &[]).is_ok());
+        assert!(translate(&automatic, &model("qwen3.6-27b"), &[], true).is_ok());
     }
 
     #[test]
@@ -1379,7 +1409,7 @@ mod tests {
             vec!["--spec".to_owned(), "mtp".to_owned()],
             vec!["--spec=mtp".to_owned()],
         ] {
-            assert!(translate(&structured, &model("qwen3.6-27b"), &native).is_err());
+            assert!(translate(&structured, &model("qwen3.6-27b"), &native, true).is_err());
         }
     }
 }

@@ -381,7 +381,8 @@ Launch is conceptually:
 
 ```text
 llama-server --model <canonical-gguf> --alias <stable-id>
-             --host 127.0.0.1 --port <dynamic> [allowed native arguments]
+             --host 127.0.0.1 --port <dynamic>
+             [--device CUDA0] [allowed native arguments]
 ```
 
 The adapter polls `/health`, then obtains authoritative effective `temperature` and `top_p` from
@@ -392,7 +393,13 @@ reasoning, chat template, and speculative mode/draft artifact. Every setting
 owns its current aliases and environment variables for collision removal/rejection. Omission emits
 nothing. `load_mode` intentionally replaces deprecated mmap/mlock/direct-I/O controls.
 
-The four-layer resolver normalizes llama.cpp semantic alternatives before compatibility, launch,
+For CUDA runtimes, compatibility selects one stable GPU UUID. Launch restricts
+`CUDA_VISIBLE_DEVICES` to that UUID and explicitly selects the now-local `CUDA0`; raw device/RPC,
+multimodal, router, API/security, one-shot, and other contract-changing aliases are rejected.
+Inference-affecting LoRA/control-vector files are canonicalized and SHA-256-bound before launch,
+with each scaled entry retaining its scale in both arguments and provenance.
+
+The three-layer resolver normalizes llama.cpp semantic alternatives before compatibility, launch,
 inspection, and provenance: a higher-layer built-in/file template choice or all/exact CPU-MoE
 choice suppresses its inherited sibling, while `off`, n-gram, and `draft-mtp` modes suppress an
 inherited external draft identity. Same-layer contradictions remain visible and invalid.
@@ -437,16 +444,23 @@ ninfer-serve <canonical-model.ninfer>
              --device 0
              --request-log-jsonl <private restrictive temporary path>
              [explicit structured settings]
-             [strictly allowlisted operational arguments]
 ```
 
 The positional artifact, binding, alias, device, auth/CORS surface, typed load/cache/media/store
 controls, sampler/greedy controls, and startup log are reserved. `/health` alone is insufficient for
 readiness. Norted selects the bounded schema-20 `server_start` record reviewed at source commit
-`a140e7ae...`, validates public alias, artifact target/weights and context-cost identity, selected GPU
+`863aa8a...`, validates public alias, artifact target/weights and context-cost identity, selected GPU
 identity, context/KV/cache/CUDA/speculation state, queue and media limits, thinking state, greedy
 state, and configured sampler defaults, then records the runtime-resolved effective values. The file
 is unlinked before requests are served; failure and cancellation paths remove it as well.
+
+The current contract admits DFlash plus Vision only for exact
+`qwen3.6-35b-a3b`/`groupwise-int`; older reviewed `a140e7ae...` runtimes retain the previous
+rejection. MTP and DFlash remain one exclusive backend choice. Capability retention fingerprints
+the admission/resource scheduler, context/KV and checkpoint stores, target program/layout/request
+plan/resource projection, speculation, Vision residency/prefill, state, and request owners in
+addition to immutable commit/tree identity. The structured context-cost preset is canonicalized and
+SHA-256-bound before launch; there is no raw native bypass.
 
 Public Responses and Chat messages both become one ordered canonical `InferenceRequest`, then
 private NInfer Chat JSON. The reviewed source contract forwards seed, top-k/min-p,
