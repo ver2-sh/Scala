@@ -523,19 +523,25 @@ impl NinferReviewedDomains {
 
 fn setting_capability_is_reviewed(id: &str, capabilities: NinferRuntimeCapabilities) -> bool {
     match id {
-        "stop_strings" | "system_prompt" => capabilities.request_protocol_semantics,
-        "reasoning" | "reasoning_effort" => {
+        "ninfer.stop_strings" | "ninfer.system_prompt" => capabilities.request_protocol_semantics,
+        "ninfer.reasoning" | "ninfer.reasoning_effort" => {
             capabilities.request_protocol_semantics
                 && capabilities.thinking_process_controls
                 && capabilities.thinking_request_semantics
         }
-        "temperature" | "top_p" | "top_k" | "min_p" | "seed" | "presence_penalty"
-        | "frequency_penalty" | "ninfer.greedy" => capabilities.process_sampler_controls,
-        "max_output_tokens" => capabilities.request_default_controls,
-        "reasoning_budget" | "ninfer.thinking" | "ninfer.preserve_thinking" => {
+        "ninfer.temperature"
+        | "ninfer.top_p"
+        | "ninfer.top_k"
+        | "ninfer.min_p"
+        | "ninfer.seed"
+        | "ninfer.presence_penalty"
+        | "ninfer.frequency_penalty"
+        | "ninfer.greedy" => capabilities.process_sampler_controls,
+        "ninfer.max_output_tokens" => capabilities.request_default_controls,
+        "ninfer.reasoning_budget" | "ninfer.thinking" | "ninfer.preserve_thinking" => {
             capabilities.thinking_process_controls
         }
-        "context_length"
+        "ninfer.context_length"
         | "ninfer.kv_dtype"
         | "ninfer.kv_capacity"
         | "ninfer.prefill_chunk"
@@ -551,11 +557,13 @@ fn setting_capability_is_reviewed(id: &str, capabilities: NinferRuntimeCapabilit
         | "ninfer.speculative_backend"
         | "ninfer.draft_tokens"
         | "ninfer.lm_head_draft" => capabilities.speculation_controls,
-        "parallel_requests"
+        "ninfer.parallel_requests"
         | "ninfer.max_pending_requests"
         | "ninfer.pending_timeout_ms"
         | "ninfer.log_stats_interval_ms"
         | "ninfer.max_request_mib" => capabilities.serving_limit_controls,
+        "ninfer.cors" | "ninfer.log_level" => capabilities.core_process_controls,
+        "ninfer.context_cost_presets" => capabilities.context_cache_controls,
         "ninfer.response_store_max_records" | "ninfer.response_store_max_mib" => {
             capabilities.responses_store_controls
         }
@@ -580,10 +588,10 @@ fn apply_ninfer_runtime_contract(
         };
         if matches!(
             id,
-            "repeat_penalty"
-                | "reasoning_budget_message"
-                | "structured_output_schema"
-                | "context_overflow"
+            "ninfer.repeat_penalty"
+                | "ninfer.reasoning_budget_message"
+                | "ninfer.structured_output_schema"
+                | "ninfer.context_overflow"
         ) {
             unsupported(
                 definition,
@@ -833,7 +841,7 @@ fn ninfer_startup_requirements(
             "setting `{id}` must be an integer"
         ))),
     };
-    let seed = match settings.value("seed") {
+    let seed = match settings.value("ninfer.seed") {
         Some(SettingValue::UnsignedIntegerOrChoice(
             norted_core::UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
         )) => Some(*value),
@@ -859,7 +867,7 @@ fn ninfer_startup_requirements(
     let speculation = toggle("ninfer.speculation")?;
     let backend = choice("ninfer.speculative_backend")?;
     let speculation_enabled = speculation.unwrap_or(backend.is_some());
-    let default_thinking_budget = integer("reasoning_budget")?
+    let default_thinking_budget = integer("ninfer.reasoning_budget")?
         .map(|value| {
             u64::try_from(value).map_err(|_| {
                 EngineError::InvalidConfiguration(
@@ -883,8 +891,8 @@ fn ninfer_startup_requirements(
         }
     };
     Ok(NinferStartupRequirements {
-        minimum_context_tokens: unsigned("context_length")?,
-        max_concurrency: unsigned("parallel_requests")?,
+        minimum_context_tokens: unsigned("ninfer.context_length")?,
+        max_concurrency: unsigned("ninfer.parallel_requests")?,
         kv_capacity_mode,
         kv_capacity,
         kv_dtype: choice("ninfer.kv_dtype")?,
@@ -915,14 +923,14 @@ fn ninfer_startup_requirements(
         ))
         .is_none(),
         preserve_thinking: toggle("ninfer.preserve_thinking")?,
-        temperature: float("temperature")?,
-        top_p: float("top_p")?,
-        top_k: unsigned("top_k")?,
-        min_p: float("min_p")?,
-        presence_penalty: float("presence_penalty")?,
-        frequency_penalty: float("frequency_penalty")?,
+        temperature: float("ninfer.temperature")?,
+        top_p: float("ninfer.top_p")?,
+        top_k: unsigned("ninfer.top_k")?,
+        min_p: float("ninfer.min_p")?,
+        presence_penalty: float("ninfer.presence_penalty")?,
+        frequency_penalty: float("ninfer.frequency_penalty")?,
         seed,
-        default_output_tokens: unsigned("max_output_tokens")?,
+        default_output_tokens: unsigned("ninfer.max_output_tokens")?,
         default_thinking_budget,
         max_pending_requests: unsigned("ninfer.max_pending_requests")?,
         pending_timeout_ms: unsigned("ninfer.pending_timeout_ms")?,
@@ -1884,45 +1892,45 @@ impl EngineAdapter for NinferAdapter {
         if let Some(requirements) = settings_requirements.as_ref() {
             normalized_settings.extend([
                 (
-                    "configured_thinking".to_owned(),
+                    "configured_ninfer.thinking".to_owned(),
                     json!(requirements.expected_thinking),
                 ),
                 (
-                    "configured_kv_dtype".to_owned(),
+                    "configured_ninfer.kv_dtype".to_owned(),
                     json!(requirements.kv_dtype),
                 ),
                 (
-                    "configured_speculative_backend".to_owned(),
+                    "configured_ninfer.speculative_backend".to_owned(),
                     json!(requirements.speculative_backend),
                 ),
                 (
-                    "configured_speculative_draft_window".to_owned(),
+                    "configured_ninfer.draft_tokens".to_owned(),
                     json!(requirements.speculative_draft_window),
                 ),
                 (
-                    "configured_proposal_head".to_owned(),
+                    "configured_ninfer.lm_head_draft".to_owned(),
                     json!(requirements.proposal_head),
                 ),
             ]);
             for (name, value) in [
                 (
-                    "configured_temperature",
+                    "configured_ninfer.temperature",
                     requirements.temperature.map(serde_json::Value::from),
                 ),
                 (
-                    "configured_top_p",
+                    "configured_ninfer.top_p",
                     requirements.top_p.map(serde_json::Value::from),
                 ),
                 (
-                    "configured_top_k",
+                    "configured_ninfer.top_k",
                     requirements.top_k.map(serde_json::Value::from),
                 ),
                 (
-                    "configured_min_p",
+                    "configured_ninfer.min_p",
                     requirements.min_p.map(serde_json::Value::from),
                 ),
                 (
-                    "configured_minimum_context_tokens",
+                    "configured_ninfer.context_length",
                     requirements
                         .minimum_context_tokens
                         .map(serde_json::Value::from),
@@ -2158,8 +2166,8 @@ impl EngineAdapter for NinferAdapter {
             ));
         }
         for (name, value) in [
-            ("presence_penalty", settings.presence_penalty),
-            ("frequency_penalty", settings.frequency_penalty),
+            ("ninfer.presence_penalty", settings.presence_penalty),
+            ("ninfer.frequency_penalty", settings.frequency_penalty),
         ] {
             if value.is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value)) {
                 return Err(EngineError::InvalidGenerationSettings(format!(
@@ -2937,11 +2945,11 @@ async fn read_and_validate_startup_log(
     }
     let mut resolved_settings = BTreeMap::from([
         (
-            "context_length".to_owned(),
+            "ninfer.context_length".to_owned(),
             json!(startup.engine.max_context),
         ),
         (
-            "parallel_requests".to_owned(),
+            "ninfer.parallel_requests".to_owned(),
             json!(startup.engine.max_concurrency),
         ),
         ("ninfer.kv_dtype".to_owned(), json!(startup.engine.kv_cache)),
@@ -3004,30 +3012,30 @@ async fn read_and_validate_startup_log(
             json!(startup.engine.log_stats_interval_ms),
         ),
         (
-            "max_output_tokens".to_owned(),
+            "ninfer.max_output_tokens".to_owned(),
             json!(startup.server.default_output_tokens),
         ),
         (
-            "reasoning_budget".to_owned(),
+            "ninfer.reasoning_budget".to_owned(),
             startup
                 .server
                 .default_thinking_budget
                 .map_or_else(|| json!("unlimited"), serde_json::Value::from),
         ),
-        ("temperature".to_owned(), json!(defaults.temperature)),
-        ("top_p".to_owned(), json!(defaults.top_p)),
-        ("top_k".to_owned(), json!(effective_top_k)),
-        ("min_p".to_owned(), json!(effective_min_p)),
+        ("ninfer.temperature".to_owned(), json!(defaults.temperature)),
+        ("ninfer.top_p".to_owned(), json!(defaults.top_p)),
+        ("ninfer.top_k".to_owned(), json!(effective_top_k)),
+        ("ninfer.min_p".to_owned(), json!(effective_min_p)),
         (
-            "presence_penalty".to_owned(),
+            "ninfer.presence_penalty".to_owned(),
             json!(effective_presence_penalty),
         ),
         (
-            "frequency_penalty".to_owned(),
+            "ninfer.frequency_penalty".to_owned(),
             json!(effective_frequency_penalty),
         ),
         (
-            "seed".to_owned(),
+            "ninfer.seed".to_owned(),
             startup
                 .sampling_defaults
                 .server_overrides
@@ -3041,7 +3049,7 @@ async fn read_and_validate_startup_log(
         .is_none_or(|requirements| requirements.reconcile_reasoning_from_startup)
     {
         resolved_settings.insert(
-            "reasoning".to_owned(),
+            "ninfer.reasoning".to_owned(),
             json!(if startup.server.default_thinking {
                 "on"
             } else {
@@ -3461,7 +3469,7 @@ mod tests {
     fn configured_features_require_their_capability_domain_evidence() {
         let settings = resolved(&[
             ("ninfer.thinking", SettingValue::Toggle(true)),
-            ("temperature", SettingValue::Float(0.8)),
+            ("ninfer.temperature", SettingValue::Float(0.8)),
             ("ninfer.speculation", SettingValue::Toggle(true)),
         ]);
         let no_evidence = NinferRuntimeCapabilities::default();
@@ -3483,10 +3491,10 @@ mod tests {
             "ninfer.lm_head_draft",
             "ninfer.thinking",
             "ninfer.kv_dtype",
-            "temperature",
-            "top_p",
-            "top_k",
-            "min_p",
+            "ninfer.temperature",
+            "ninfer.top_p",
+            "ninfer.top_k",
+            "ninfer.min_p",
         ] {
             assert!(ids.contains(expected), "missing setting {expected}");
         }

@@ -828,6 +828,10 @@ async fn exact_model_profile_context(
         &SettingsPatch::default(),
         &core.paths.data_dir,
     )?;
+    let adapter = registry.get(profile.engine_id.as_str()).ok_or_else(|| {
+        color_eyre::eyre::eyre!("bound engine `{}` is not registered", profile.engine_id)
+    })?;
+    adapter.normalize_settings(&mut resolved)?;
     let packs = composition::runtime_pack_manager(core, registry.clone())?;
     let runtime = runtime.map(RuntimeId::new).transpose()?;
     let (selection, schema) = packs
@@ -839,9 +843,6 @@ async fn exact_model_profile_context(
         )
         .await?;
     let host = packs.host_capabilities().await;
-    let adapter = registry.get(profile.engine_id.as_str()).ok_or_else(|| {
-        color_eyre::eyre::eyre!("bound engine `{}` is not registered", profile.engine_id)
-    })?;
     schema.materialize_runtime_configuration(&mut resolved)?;
     schema.validate(&resolved)?;
     schema.materialize_effective(&mut resolved)?;

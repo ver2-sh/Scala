@@ -1184,6 +1184,9 @@ async fn execute_settings_action(
                         &paths.data_dir,
                     )
                     .map_err(|error| error.to_string())?;
+                runtime_packs
+                    .normalize_settings(profile.engine_id.as_str(), &mut resolved)
+                    .map_err(|error| error.to_string())?;
                 let model_schema = runtime_packs
                     .model_settings_schema_for_engine(&model, profile.engine_id.as_str())
                     .map_err(|error| error.to_string())?;

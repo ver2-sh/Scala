@@ -4794,7 +4794,7 @@ mod tests {
             description: id.to_owned(),
             kind: SettingKind::Toggle,
             scope,
-            category: if id == "temperature" {
+            category: if id.ends_with(".temperature") {
                 SettingCategory::Generation
             } else if id.contains("mtp") || id.contains("speculation") {
                 SettingCategory::Speculation
@@ -4836,7 +4836,7 @@ mod tests {
         let app = test_app(vec![
             definition("server.max_parallel_downloads", SettingScope::Server),
             definition(
-                "temperature",
+                "q27.temperature",
                 SettingScope::Runtime {
                     engine_id: "q27".to_owned(),
                 },
@@ -4868,7 +4868,7 @@ mod tests {
     fn model_profile_editor_shows_bound_runtime_only() {
         let definitions = vec![
             definition(
-                "temperature",
+                "q27.temperature",
                 SettingScope::Runtime {
                     engine_id: "q27".to_owned(),
                 },
@@ -4917,7 +4917,7 @@ mod tests {
             .into_iter()
             .map(|definition| definition.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(ids, ["temperature", "q27.mtp"]);
+        assert_eq!(ids, ["q27.temperature", "q27.mtp"]);
     }
 
     #[test]

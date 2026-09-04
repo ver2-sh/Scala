@@ -1112,7 +1112,7 @@ async fn inspect_model_profiles(
             ));
             continue;
         }
-        let resolved = match settings.resolve(
+        let mut resolved = match settings.resolve(
             &profile.id,
             profile.engine_id.as_str(),
             &profile.overrides,
@@ -1138,6 +1138,23 @@ async fn inspect_model_profiles(
                 continue;
             }
         };
+        if let Err(error) = adapter.normalize_settings(&mut resolved) {
+            checks.push(finding(
+                "model_profile.settings_invalid",
+                "model_profiles",
+                DoctorStatus::Fail,
+                format!(
+                    "Model Profile '{}' settings cannot be normalized for its engine.",
+                    profile.id
+                ),
+                Some(error.to_string()),
+                &[&format!(
+                    "Run:\n  norted-server model-profiles show {}",
+                    profile.id
+                )],
+            ));
+            continue;
+        }
         match packs.model_settings_schema_for_engine(model, profile.engine_id.as_str()) {
             Ok(schema) => {
                 if let Err(error) = schema.validate(&resolved) {
