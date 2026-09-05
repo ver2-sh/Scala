@@ -216,6 +216,18 @@ pub struct ModelRegistry {
     warnings: Vec<String>,
 }
 
+/// Returns true for Norted-internal directory names that must never be
+/// presented as discovered model artifacts: the managed acquisition staging
+/// directory and the cross-filesystem install temp directories.
+fn is_norted_internal_entry(name: &std::ffi::OsStr) -> bool {
+    if name == std::ffi::OsStr::new(".norted-staging") {
+        return true;
+    }
+    name.to_string_lossy()
+        .strip_prefix(".norted-install-")
+        .is_some()
+}
+
 impl ModelRegistry {
     pub fn discover(search_paths: &[PathBuf]) -> Self {
         let mut registry = Self::default();
@@ -231,7 +243,7 @@ impl ModelRegistry {
             for entry in WalkDir::new(root)
                 .follow_links(false)
                 .into_iter()
-                .filter_entry(|entry| entry.file_name() != ".norted-staging")
+                .filter_entry(|entry| !is_norted_internal_entry(entry.file_name()))
             {
                 let entry = match entry {
                     Ok(entry) => entry,

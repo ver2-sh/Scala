@@ -203,14 +203,18 @@ pub struct ModelLibrary {
 }
 
 impl ModelLibrary {
-    pub fn new(paths: &AppPaths) -> Self {
-        Self::with_max_parallel_downloads(paths, DEFAULT_MAX_PARALLEL_DOWNLOADS)
+    pub fn new(paths: &AppPaths, downloads_root: &Path) -> Self {
+        Self::with_max_parallel_downloads(paths, downloads_root, DEFAULT_MAX_PARALLEL_DOWNLOADS)
     }
 
-    pub fn with_max_parallel_downloads(paths: &AppPaths, maximum_parallel: usize) -> Self {
+    pub fn with_max_parallel_downloads(
+        paths: &AppPaths,
+        downloads_root: &Path,
+        maximum_parallel: usize,
+    ) -> Self {
         let (progress, _) = broadcast::channel(256);
         Self {
-            root: paths.data_dir.join("models"),
+            root: downloads_root.to_path_buf(),
             staging: paths.data_dir.join("models").join(".norted-staging"),
             download_cache: paths.cache_dir.join("model-downloads"),
             providers: vec![Arc::new(HuggingFaceCatalogProvider::new())],
@@ -2164,12 +2168,93 @@ async fn activate_stage(stage: &Path, destination: &Path) -> Result<()> {
             path: parent.to_path_buf(),
             source,
         })?;
-    tokio::fs::rename(stage, destination)
-        .await
-        .map_err(|source| ModelLibraryError::Io {
+    match tokio::fs::rename(stage, destination).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+            cross_filesystem_install(stage, destination).await
+        }
+        Err(source) => Err(ModelLibraryError::Io {
             path: destination.to_path_buf(),
             source,
-        })
+        }),
+    }
+}
+
+/// Installs a staged acquisition when staging and the destination live on
+/// different filesystems, where `rename(2)` fails with `EXDEV`. The stage is
+/// copied into a sibling temporary directory on the destination's filesystem
+/// and then atomically renamed into place, so a partial copy never appears at
+/// the final destination. The original stage is left intact for the caller's
+/// `StagingDirectory` cleanup on failure.
+async fn cross_filesystem_install(stage: &Path, destination: &Path) -> Result<()> {
+    let parent = destination.parent().ok_or_else(|| {
+        ModelLibraryError::InvalidCatalog("managed destination has no parent".to_owned())
+    })?;
+    let temp = parent.join(format!(".norted-install-{}", uuid::Uuid::new_v4()));
+    tokio::fs::create_dir(&temp)
+        .await
+        .map_err(|source| ModelLibraryError::Io {
+            path: temp.clone(),
+            source,
+        })?;
+    if let Err(error) = copy_dir_tree(stage, &temp).await {
+        let _ = tokio::fs::remove_dir_all(&temp).await;
+        return Err(error);
+    }
+    match tokio::fs::rename(&temp, destination).await {
+        Ok(()) => Ok(()),
+        Err(source) => {
+            let _ = tokio::fs::remove_dir_all(&temp).await;
+            Err(ModelLibraryError::Io {
+                path: destination.to_path_buf(),
+                source,
+            })
+        }
+    }
+}
+
+async fn copy_dir_tree(src: &Path, dst: &Path) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(src)
+        .await
+        .map_err(|source| ModelLibraryError::Io {
+            path: src.to_path_buf(),
+            source,
+        })?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|source| ModelLibraryError::Io {
+            path: src.to_path_buf(),
+            source,
+        })?
+    {
+        let file_type = entry
+            .file_type()
+            .await
+            .map_err(|source| ModelLibraryError::Io {
+                path: entry.path(),
+                source,
+            })?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            tokio::fs::create_dir(&to)
+                .await
+                .map_err(|source| ModelLibraryError::Io {
+                    path: to.clone(),
+                    source,
+                })?;
+            Box::pin(copy_dir_tree(&from, &to)).await?;
+        } else {
+            tokio::fs::copy(&from, &to)
+                .await
+                .map_err(|source| ModelLibraryError::Io {
+                    path: to.clone(),
+                    source,
+                })?;
+        }
+    }
+    Ok(())
 }
 
 fn discover_exact(root: &Path, relative: &Path) -> Result<ModelArtifact> {

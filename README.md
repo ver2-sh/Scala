@@ -571,6 +571,41 @@ enabled = true
 binary_path = "C:/tools/llama.cpp/llama-server.exe"
 ```
 
+### Model discovery and download destination
+
+The `[models]` table controls two distinct concerns:
+
+- `models.paths` is the list of additional directories scanned for local model
+  artifacts. Use it to expose pre-existing model files that live outside
+  Norted's managed library (for example a manually maintained GGUF directory on
+  another disk). Relative entries resolve against the directory containing
+  `config.toml`.
+- `models.model_downloads_path` is the destination root for models that Norted
+  Server downloads itself. When omitted, downloads land under
+  `<Norted data_dir>/models`, preserving the historical managed library root.
+  Relative paths resolve against the config directory, matching `paths`. A
+  common reason to set it is to place large models on a separate mounted disk.
+
+The effective download destination is always scanned automatically; do not
+repeat it inside `models.paths`. Download staging and the download cache stay
+under Norted's own data and cache directories and are not configurable. When
+`model_downloads_path` is overridden, the previous `<data_dir>/models` location
+is no longer an implicit discovery root, but it can still be scanned by adding
+it to `models.paths`.
+
+```toml
+[models]
+model_downloads_path = "/mnt/ai/models"
+
+paths = [
+    "/mnt/other-models",
+    "/home/user/manual-models",
+]
+```
+
+With the above, Norted downloads to `/mnt/ai/models`, automatically discovers
+models there, and additionally discovers the two `paths` entries.
+
 An external q27 executable can use the same setting under `[engine.q27]`. An advanced external NInfer server uses:
 
 ```toml

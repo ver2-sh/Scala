@@ -115,6 +115,11 @@ impl AppConfig {
                 *path = config_dir.join(&*path);
             }
         }
+        if let Some(path) = &mut self.models.model_downloads_path
+            && path.is_relative()
+        {
+            *path = config_dir.join(&*path);
+        }
     }
 }
 
@@ -213,6 +218,22 @@ impl ServerConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ModelConfig {
     pub paths: Vec<PathBuf>,
+    /// Destination root for models downloaded by Norted Server. When omitted,
+    /// downloads land under `<data_dir>/models`, preserving the historical
+    /// managed library root. Relative paths resolve against the config
+    /// directory, matching `paths`. The effective destination automatically
+    /// participates in model discovery and need not be repeated in `paths`.
+    pub model_downloads_path: Option<PathBuf>,
+}
+
+impl ModelConfig {
+    /// Returns the effective managed download root, falling back to the
+    /// historical `<data_dir>/models` location when unset.
+    pub fn effective_downloads_path(&self, data_dir: &Path) -> PathBuf {
+        self.model_downloads_path
+            .clone()
+            .unwrap_or_else(|| data_dir.join("models"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,6 +298,82 @@ impl LoadedConfig {
 mod tests {
     use super::{AppConfig, ServerConfig};
     use crate::{EffectivePublicAuthMode, PublicAuthMode};
+
+    #[test]
+    fn model_downloads_path_defaults_to_data_dir_models() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            version = 1
+
+            [server]
+            host = "127.0.0.1"
+            port = 8742
+            "#,
+        )
+        .expect("parse default config");
+        assert!(config.models.model_downloads_path.is_none());
+        let data_dir = std::path::Path::new("/var/lib/norted-server");
+        assert_eq!(
+            config.models.effective_downloads_path(data_dir).as_path(),
+            std::path::Path::new("/var/lib/norted-server/models"),
+        );
+    }
+
+    #[test]
+    fn model_downloads_path_absolute_is_preserved() {
+        let mut config: AppConfig = toml::from_str(
+            r#"
+            version = 1
+
+            [server]
+            host = "127.0.0.1"
+            port = 8742
+
+            [models]
+            model_downloads_path = "/mnt/ai/models"
+            "#,
+        )
+        .expect("parse configured download path");
+        config.resolve_model_paths(std::path::Path::new("/etc/norted"));
+        assert_eq!(
+            config.models.model_downloads_path.as_deref().unwrap(),
+            std::path::Path::new("/mnt/ai/models"),
+        );
+        assert_eq!(
+            config
+                .models
+                .effective_downloads_path(std::path::Path::new("/var/lib/norted-server"))
+                .as_path(),
+            std::path::Path::new("/mnt/ai/models"),
+        );
+    }
+
+    #[test]
+    fn model_downloads_path_relative_resolves_against_config_dir() {
+        let mut config: AppConfig = toml::from_str(
+            r#"
+            version = 1
+
+            [server]
+            host = "127.0.0.1"
+            port = 8742
+
+            [models]
+            model_downloads_path = "downloads"
+            paths = ["extra-models"]
+            "#,
+        )
+        .expect("parse relative download path");
+        config.resolve_model_paths(std::path::Path::new("/etc/norted"));
+        assert_eq!(
+            config.models.model_downloads_path.as_deref().unwrap(),
+            std::path::Path::new("/etc/norted/downloads"),
+        );
+        assert_eq!(
+            config.models.paths.first().unwrap().as_path(),
+            std::path::Path::new("/etc/norted/extra-models"),
+        );
+    }
 
     #[test]
     fn existing_version_one_config_defaults_to_safe_auto_auth() {

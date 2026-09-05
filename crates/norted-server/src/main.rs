@@ -131,14 +131,14 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 model_info(core, ModelId(model_id), cli.json).await?
             }
             ModelsCommand::Search { query, format } => {
-                let library = norted_model_library::ModelLibrary::new(&core.paths);
+                let library = build_model_library(&core);
                 let search = library
                     .search(query.as_deref().unwrap_or(""), format)
                     .await?;
                 output::models_search(&search, cli.json)?;
             }
             ModelsCommand::Download { model_ref } => {
-                let library = norted_model_library::ModelLibrary::new(&core.paths);
+                let library = build_model_library(&core);
                 let download = download_model_with_progress(&library, &model_ref, cli.json).await?;
                 core.refresh_models().await?;
                 output::model_operation(
@@ -152,7 +152,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 )?;
             }
             ModelsCommand::Import { path } => {
-                let library = norted_model_library::ModelLibrary::new(&core.paths);
+                let library = build_model_library(&core);
                 let artifact = library.import(&path).await?;
                 core.refresh_models().await?;
                 output::model_operation("import", &artifact, cli.json)?;
@@ -165,7 +165,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                         "model `{model_id}` does not exist in the discovered registry"
                     )
                 })?;
-                let library = norted_model_library::ModelLibrary::new(&core.paths);
+                let library = build_model_library(&core);
                 let plan = library.plan_removal(&model)?;
                 let active = match ControlClient::discover(&core.paths).await {
                     Ok(client) => client
@@ -315,6 +315,16 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn build_model_library(core: &ApplicationCore) -> norted_model_library::ModelLibrary {
+    norted_model_library::ModelLibrary::new(
+        &core.paths,
+        &core
+            .config
+            .models
+            .effective_downloads_path(&core.paths.data_dir),
+    )
+}
+
 async fn run_tui(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
     let services = composition::ApplicationServices::new(&core)?;
     let setting_definitions = server_setting_definitions(&services.registry)?;
@@ -326,7 +336,7 @@ async fn run_tui(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
     {
         drop(startup_guard);
         let _ = core.refresh_server_state().await;
-        let model_library = Arc::new(norted_model_library::ModelLibrary::new(&core.paths));
+        let model_library = Arc::new(build_model_library(&core));
         return norted_tui::run(
             core,
             services.runtime_packs,
@@ -351,7 +361,7 @@ async fn run_tui(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
             {
                 drop(startup_guard);
                 let _ = core.refresh_server_state().await;
-                let model_library = Arc::new(norted_model_library::ModelLibrary::new(&core.paths));
+                let model_library = Arc::new(build_model_library(&core));
                 return norted_tui::run(
                     core,
                     services.runtime_packs,
@@ -365,7 +375,7 @@ async fn run_tui(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
     };
     drop(startup_guard);
     report_insecure_remote(server.auth_status(), json_output);
-    let model_library = Arc::new(norted_model_library::ModelLibrary::new(&core.paths));
+    let model_library = Arc::new(build_model_library(&core));
     server
         .run_while(norted_tui::run(
             core,

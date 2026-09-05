@@ -9,6 +9,7 @@ description = "Managed local model library and remote model catalogs"
 async-trait.workspace = true
 futures-util.workspace = true
 fs2.workspace = true
+libc.workspace = true
 norted-core = { path = "../norted-core" }
 norted-engine-q27 = { path = "../norted-engine-q27" }
 reqwest.workspace = true
