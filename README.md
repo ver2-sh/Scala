@@ -765,3 +765,57 @@ Focused tests cover bounded NInfer admission, typed identity, source manifests a
 - There is no built-in TLS/certificate management, permissive CORS, rate-limit infrastructure, service installer, or web UI.
 
 See [docs/architecture.md](docs/architecture.md) for component boundaries and the exact runtime acquisition, resolution, and launch flow.
+## Reclaiming managed storage
+
+```sh
+norted-server prune
+norted-server prune --dry-run
+norted-server prune --all
+norted-server prune --all --dry-run
+norted-server prune --all --yes
+norted-server --json prune --dry-run
+```
+
+Normal prune removes reproducible runtime download packages/provider catalogs,
+abandoned runtime staging/trash, incomplete model downloads and acquisition
+staging, stale operational descriptors, and obsolete daily logs (keeping the newest
+log). Complete managed model acquisitions are durable user artifacts and survive,
+even when nothing is loaded.
+
+An installed runtime is removed only when the validated runtime-store scan finds a
+newer valid replacement in the same engine, package family, platform, architecture,
+accelerator, variant, provider/repository, requirements and supported-format/native
+compatibility group. Explicit selections and update preferences are protected.
+Unordered version labels, malformed selections, invalid installations and any pack
+without a proven replacement survive. Runtime identity, entrypoint containment and
+entrypoint hashes are checked using the existing store validator.
+
+`prune --all` resets generated/heavy storage: all managed model acquisitions in the
+library's `huggingface` and `imports` namespaces, managed runtime packs, download
+and provider caches, staging, logs and regeneratable runtime state. Generated
+runtime selections are removed before packs so they cannot reference deleted
+installations. This does **not** delete the application data directory wholesale.
+`config.toml`, Server/engine settings, user Model Profiles, API keys/authentication,
+external model/runtime configuration and other authored data survive. Preserved
+profiles can remain unresolved until their artifacts are reinstalled. Independently
+placed model files outside acquisition namespaces are retained. Stable operation
+lock files remain so waiting processes cannot acquire a different lock inode.
+
+Both modes refuse while a Server/control or other application storage session is
+active. An exclusive storage lease excludes concurrent startup/download sessions;
+existing runtime/model operation locks and recorded process IDs are checked too.
+An unreachable control endpoint does not authorize deletion of a running process's
+storage. Stop the application before pruning. Unknown process state fails closed.
+
+`--all` displays a destructive warning and requires typing `yes`. Non-interactive
+execution requires `--yes`; a dry-run never prompts. `--dry-run` uses the same
+planner and reports exact deletion targets, categories, file counts and estimated
+logical bytes without initializing configuration, logs, directories or lock files.
+`--json` returns the structured plan/result. Actual runs also report removed counts
+and a measured filesystem free-space delta where available; hard links, sparse
+files and concurrent disk activity can make this differ from logical estimates.
+
+Deletion is bounded to application-owned paths and never follows symlinks or
+Windows reparse points out of managed storage. Missing paths are harmless. Global
+caches, external files, Cargo `target/`, global Cargo caches, and Norted build
+storage are never part of Server pruning.

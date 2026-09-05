@@ -8,6 +8,7 @@ mod model;
 mod model_profile;
 mod norted_package;
 mod provenance;
+pub mod prune;
 mod runtime;
 mod runtime_pack;
 mod settings;

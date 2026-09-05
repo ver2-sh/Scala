@@ -79,6 +79,7 @@ struct MutableState {
 
 #[derive(Debug)]
 pub struct ApplicationCore {
+    _storage_lease: Option<crate::prune::StorageLease>,
     pub config: AppConfig,
     pub config_path: std::path::PathBuf,
     pub paths: AppPaths,
@@ -97,6 +98,13 @@ impl ApplicationCore {
     /// composition and isolated control-path tests independent of process-wide
     /// directory environment variables.
     pub async fn load_from_paths(paths: AppPaths) -> Result<Arc<Self>> {
+        let storage_lease =
+            crate::prune::StorageLease::acquire(&paths, false, false).map_err(|source| {
+                CoreError::RuntimeState {
+                    path: paths.data_dir.join(".storage.lock"),
+                    source,
+                }
+            })?;
         paths.ensure_required()?;
         let LoadedConfig {
             config,
@@ -105,6 +113,7 @@ impl ApplicationCore {
         } = LoadedConfig::load(&paths)?;
         let (events, _) = broadcast::channel(256);
         Ok(Arc::new(Self {
+            _storage_lease: storage_lease,
             config,
             config_path,
             paths,

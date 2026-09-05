@@ -27,8 +27,10 @@ mod control;
 mod installer;
 mod manager;
 mod packs;
+mod prune;
 mod store;
 mod supervisor;
+pub use prune::plan_runtime_prune;
 
 pub use catalog::{
     CatalogError, GitHubCommit, GitHubCompare, GitHubComparisonStatus, GitHubRelease,

@@ -25,6 +25,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 
 mod download_manager;
+mod prune;
+pub use prune::plan_model_prune;
 
 use download_manager::DownloadManager;
 pub use download_manager::{

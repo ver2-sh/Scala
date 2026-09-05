@@ -2242,7 +2242,7 @@ fn compare_installed_recency_with_registry(
     compare_installed_recency(left, right, adapter.as_deref())
 }
 
-fn compare_installed_recency(
+pub(crate) fn compare_installed_recency(
     left: &InstalledRuntime,
     right: &InstalledRuntime,
     adapter: Option<&dyn crate::EngineAdapter>,
