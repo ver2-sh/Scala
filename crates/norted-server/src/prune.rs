@@ -39,7 +39,13 @@ pub async fn run(paths: &AppPaths, args: &crate::cli::PruneArgs, json: bool) -> 
     let _operations = lock_existing_operations(paths)?;
     ensure_no_server_process(paths)?;
     let mut plan = PrunePlan::new(args.all, args.dry_run);
-    norted_engine::plan_runtime_prune(paths, &mut plan).await?;
+    let registry = if args.all {
+        norted_engine::EngineRegistry::default()
+    } else {
+        let loaded = norted_core::LoadedConfig::load(paths)?;
+        crate::composition::engine_registry_from_config(&loaded.config, &loaded.path)?
+    };
+    norted_engine::plan_runtime_prune(paths, &registry, &mut plan).await?;
     norted_model_library::plan_model_prune(paths, &mut plan)?;
     plan.operational_storage(paths)?;
     plan.protected.push("config.toml, settings, Model Profiles, authentication, external files and stable operation lock files".into());
