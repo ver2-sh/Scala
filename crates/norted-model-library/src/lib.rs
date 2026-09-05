@@ -34,7 +34,7 @@ pub use download_manager::{
     ModelDownloadJob, ModelDownloadJobId,
 };
 
-const RECEIPT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const RECEIPT_SCHEMA_VERSION: u32 = 2;
 const MAX_PACKAGE_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -1826,7 +1826,7 @@ fn safe_segment(value: &str) -> Result<&str> {
     }
 }
 
-fn safe_relative(path: &Path) -> bool {
+pub(crate) fn safe_relative(path: &Path) -> bool {
     !path.as_os_str().is_empty()
         && !path.to_string_lossy().contains('\\')
         && path
@@ -2170,7 +2170,7 @@ async fn activate_stage(stage: &Path, destination: &Path) -> Result<()> {
         })?;
     match tokio::fs::rename(stage, destination).await {
         Ok(()) => Ok(()),
-        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+        Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
             cross_filesystem_install(stage, destination).await
         }
         Err(source) => Err(ModelLibraryError::Io {
@@ -2181,11 +2181,12 @@ async fn activate_stage(stage: &Path, destination: &Path) -> Result<()> {
 }
 
 /// Installs a staged acquisition when staging and the destination live on
-/// different filesystems, where `rename(2)` fails with `EXDEV`. The stage is
-/// copied into a sibling temporary directory on the destination's filesystem
-/// and then atomically renamed into place, so a partial copy never appears at
-/// the final destination. The original stage is left intact for the caller's
-/// `StagingDirectory` cleanup on failure.
+/// different filesystems/volumes, where the direct rename fails with
+/// `ErrorKind::CrossesDevices` (Unix `EXDEV` / Windows `ERROR_NOT_SAME_DEVICE`).
+/// The stage is copied into a sibling temporary directory on the destination's
+/// filesystem and then atomically renamed into place, so a partial copy never
+/// appears at the final destination. The original stage is left intact for the
+/// caller's `StagingDirectory` cleanup on failure.
 async fn cross_filesystem_install(stage: &Path, destination: &Path) -> Result<()> {
     let parent = destination.parent().ok_or_else(|| {
         ModelLibraryError::InvalidCatalog("managed destination has no parent".to_owned())
