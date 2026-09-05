@@ -72,6 +72,8 @@ pub struct ModelProfileEngineSwitchCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledRuntimeStatus {
     pub runtime: InstalledRuntime,
+    /// Newest local lineage for this engine; equally recent variants share the badge.
+    pub latest_installed: bool,
     pub compatibility: RuntimeCompatibility,
     pub selected_for: Vec<String>,
 }
@@ -552,6 +554,23 @@ impl RuntimePackManager {
         selections: &RuntimeSelections,
         host: &HostCapabilities,
     ) -> Vec<InstalledRuntimeStatus> {
+        let latest_installed = runtimes
+            .iter()
+            .filter(|runtime| {
+                let engine_id = &runtime.manifest.identity.engine_id;
+                let adapter = self.registry.get(engine_id);
+                !runtimes.iter().any(|candidate| {
+                    candidate.manifest.identity.engine_id == *engine_id
+                        && compare_installed_recency_inner(
+                            candidate,
+                            runtime,
+                            adapter.as_deref(),
+                            true,
+                        ) == Ordering::Greater
+                })
+            })
+            .map(|runtime| runtime.manifest.runtime_id.clone())
+            .collect::<BTreeSet<_>>();
         runtimes
             .into_iter()
             .map(|runtime| {
@@ -576,6 +595,7 @@ impl RuntimePackManager {
                     ),
                 };
                 InstalledRuntimeStatus {
+                    latest_installed: latest_installed.contains(&runtime.manifest.runtime_id),
                     compatibility,
                     selected_for: selected_for(selections, &runtime.manifest.runtime_id),
                     runtime,
@@ -2317,6 +2337,15 @@ pub(crate) fn compare_installed_recency(
     right: &InstalledRuntime,
     adapter: Option<&dyn crate::EngineAdapter>,
 ) -> Ordering {
+    compare_installed_recency_inner(left, right, adapter, false)
+}
+
+fn compare_installed_recency_inner(
+    left: &InstalledRuntime,
+    right: &InstalledRuntime,
+    adapter: Option<&dyn crate::EngineAdapter>,
+    lineage_only: bool,
+) -> Ordering {
     let left_manifest = &left.manifest;
     let right_manifest = &right.manifest;
     let left_variant = adapter.map_or_else(
@@ -2336,19 +2365,28 @@ pub(crate) fn compare_installed_recency(
         (Some(left), Some(right)) => left.cmp(&right),
         _ => Ordering::Equal,
     };
-    if same_update_line
+    if (same_update_line || lineage_only)
         && let (Some(left_source), Some(right_source)) = (
             left_manifest.source_build.as_ref(),
             right_manifest.source_build.as_ref(),
         )
     {
-        // Commit time provides deterministic offline recency for installed
-        // snapshots only. It is not ancestry evidence; update availability is
-        // decided separately by source_history_update_state using Git history.
-        return left_source
+        // Commit time provides offline recency, not ancestry evidence.
+        // Update availability is decided separately using Git history.
+        let commit_ordering = left_source
             .source
             .commit_timestamp_unix
-            .cmp(&right_source.source.commit_timestamp_unix)
+            .cmp(&right_source.source.commit_timestamp_unix);
+        if lineage_only {
+            // The local badge spans variants. Hashes and runtime IDs are not
+            // recency evidence, and recipe generations only rank one update line.
+            return commit_ordering.then(if same_update_line {
+                recipe_ordering
+            } else {
+                Ordering::Equal
+            });
+        }
+        return commit_ordering
             .then_with(|| {
                 left_source
                     .source
@@ -2841,6 +2879,10 @@ mod tests {
             compare_installed_recency(&release_v2, &release_v1, None),
             std::cmp::Ordering::Greater
         );
+        assert_eq!(
+            super::compare_installed_recency_inner(&release_v2, &release_v1, None, true),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]
@@ -2871,6 +2913,10 @@ mod tests {
 
         assert_eq!(
             compare_installed_recency(&v3, &v2, Some(&adapter)),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            super::compare_installed_recency_inner(&v3, &v2, Some(&adapter), true),
             std::cmp::Ordering::Greater
         );
         assert_eq!(
@@ -2936,6 +2982,44 @@ mod tests {
             compare_installed_recency(&newer_source, &older_source, None),
             std::cmp::Ordering::Greater
         );
+        // The badge comparison spans functional variants for every engine,
+        // without using SHA order or installation time as recency evidence.
+        for engine_id in ["llama.cpp", "q27", "ninfer", "future-engine"] {
+            let adapter = BoundSchemaAdapter { id: engine_id };
+            let mut older = older_source.clone();
+            let mut newer = newer_source.clone();
+            older.manifest.identity.engine_id = engine_id.to_owned();
+            newer.manifest.identity.engine_id = engine_id.to_owned();
+            newer.manifest.identity.variant = "specialist".to_owned();
+            assert_eq!(
+                super::compare_installed_recency_inner(&newer, &older, Some(&adapter), true),
+                std::cmp::Ordering::Greater,
+            );
+            older
+                .manifest
+                .source_build
+                .as_mut()
+                .expect("source fixture")
+                .source
+                .commit_timestamp_unix = newer
+                .manifest
+                .source_build
+                .as_ref()
+                .expect("source fixture")
+                .source
+                .commit_timestamp_unix;
+            assert_eq!(
+                super::compare_installed_recency_inner(&newer, &older, Some(&adapter), true),
+                std::cmp::Ordering::Equal,
+                "equal commit times must not be ranked by SHA",
+            );
+            older.manifest.source_build = newer.manifest.source_build.clone();
+            assert_eq!(
+                super::compare_installed_recency_inner(&newer, &older, Some(&adapter), true),
+                std::cmp::Ordering::Equal,
+                "variants of the same newest lineage share the badge",
+            );
+        }
     }
 
     #[test]
