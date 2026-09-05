@@ -50,12 +50,15 @@ Persistent state is deliberately split:
 
 ```text
 <data>/settings.json         schema 3: Server Settings and strictly namespaced runtime defaults
-<data>/model-profiles.json   schema 1: user-owned Model Profiles
+<data>/model-profiles.json   schema 2: user-owned Model Profiles
 ```
 
 Each has its own inter-process lock and atomic replacement. Older combined state is not consumed or
-deleted; settings schemas 1 and 2 and obsolete Global/unqualified fields are rejected rather than migrated. Recreate
-current settings and profiles explicitly.
+deleted; settings schemas 1 and 2, model-profiles schema 1, and obsolete Global/unqualified fields
+are rejected rather than migrated. Current inference overrides use fully qualified engine setting
+IDs (for example `llama.cpp.context_length`); unqualified names are not accepted. Because the
+application is unreleased, stale development state should be recreated or manually updated by the
+developer/user.
 
 ### Model Library
 

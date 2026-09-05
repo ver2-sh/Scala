@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use crate::settings::{lock_file, write_json_state};
 use crate::{AppPaths, ModelId, SettingsError, SettingsPatch, StateStoreError};
 
-pub const MODEL_PROFILES_STATE_VERSION: u32 = 1;
+pub const MODEL_PROFILES_STATE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
