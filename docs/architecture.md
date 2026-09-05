@@ -169,10 +169,13 @@ settings—not from profile-authored applicability declarations. Runtime IDs mus
 bound engine; unqualified or foreign namespaces are rejected at every layer.
 
 `SettingsState` schema 3 lives at `<data>/settings.json` and stores Server Settings separately from
-independent per-runtime defaults. `ModelProfilesState` schema 1 lives at
+independent per-runtime defaults. `ModelProfilesState` schema 2 lives at
 `<data>/model-profiles.json`. Both stores have
-independent locks and atomic replacement. Settings schemas 1 and 2 and obsolete Global fields are
-rejected; no compatibility reader, alias, or migration path exists.
+independent locks and atomic replacement. Settings schemas 1 and 2, model-profiles schema 1, and
+obsolete Global fields are rejected; no compatibility reader, alias, or migration path exists.
+Current inference overrides use fully qualified engine setting IDs; unqualified names are not
+accepted. Because the application is unreleased, stale development state should be recreated or
+manually updated by the developer/user.
 
 One resolver applies the selected runtime's defaults, Model Profile overrides, then ephemeral
 invocation overrides. It rejects unrelated runtime namespaces and records the winning inference
