@@ -1,17 +1,26 @@
 //! Complete acquisitions are durable user artifacts; only reset removes them.
 use norted_core::{AppPaths, prune::PrunePlan};
 use std::io;
+use std::path::Path;
 
-pub fn plan_model_prune(paths: &AppPaths, plan: &mut PrunePlan) -> io::Result<()> {
-    let models = paths.data_dir.join("models");
+pub fn plan_model_prune(
+    paths: &AppPaths,
+    downloads_root: &Path,
+    plan: &mut PrunePlan,
+) -> io::Result<()> {
+    // Staging always lives under Norted's own data directory, independent of
+    // the configured download destination.
+    let staging = paths.data_dir.join("models").join(".norted-staging");
     if plan.mode == "all" {
         // Only namespaces created by ModelLibrary are reclaimable. A user may
-        // also have placed independent model files under the models directory.
-        for name in ["huggingface", "imports", ".norted-staging"] {
-            plan.children(&models.join(name), "managed model acquisitions")?;
+        // also have placed independent model files under the download root or
+        // any configured `models.paths` entry.
+        for name in ["huggingface", "imports"] {
+            plan.children(&downloads_root.join(name), "managed model acquisitions")?;
         }
+        plan.children(&staging, "abandoned model staging")?;
     } else {
-        plan.children(&models.join(".norted-staging"), "abandoned model staging")?;
+        plan.children(&staging, "abandoned model staging")?;
         plan.protected
             .push("complete managed model acquisitions and externally configured models".into());
     }

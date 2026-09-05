@@ -111,6 +111,11 @@ impl ApplicationCore {
             path: config_path,
             ..
         } = LoadedConfig::load(&paths)?;
+        let downloads_path = config.models.effective_downloads_path(&paths.data_dir);
+        std::fs::create_dir_all(&downloads_path).map_err(|source| CoreError::CreateDirectory {
+            path: downloads_path,
+            source,
+        })?;
         let (events, _) = broadcast::channel(256);
         Ok(Arc::new(Self {
             _storage_lease: storage_lease,
@@ -249,7 +254,11 @@ impl ApplicationCore {
 
     async fn complete_model_discovery(&self) -> Result<()> {
         let mut paths = self.config.models.paths.clone();
-        paths.push(self.paths.data_dir.join("models"));
+        paths.push(
+            self.config
+                .models
+                .effective_downloads_path(&self.paths.data_dir),
+        );
         match discover_models(paths).await {
             Ok(registry) => {
                 let registry_state = if registry.warnings().is_empty() {
