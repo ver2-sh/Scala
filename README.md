@@ -783,9 +783,12 @@ log). Complete managed model acquisitions are durable user artifacts and survive
 even when nothing is loaded.
 
 An installed runtime is removed only when the validated runtime-store scan finds a
-newer valid replacement in the same engine, package family, platform, architecture,
-accelerator, variant, provider/repository, requirements and supported-format/native
-compatibility group. Explicit selections and update preferences are protected.
+strictly newer proven replacement in the same authoritative logical update line,
+with matching platform, architecture, accelerator, provider/repository, requirements
+and supported-format/native compatibility. Adapter-defined source recipe generations
+may supersede older generations on the same source snapshot; intentional functional
+variants remain separate. Established logical families can span release and source
+packages. Timestamps and identity tie-breakers alone never prove replacement. Explicit selections and update preferences are protected.
 Unordered version labels, malformed selections, invalid installations and any pack
 without a proven replacement survive. Runtime identity, entrypoint containment and
 entrypoint hashes are checked using the existing store validator.

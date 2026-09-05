@@ -1,12 +1,15 @@
 //! Runtime-store policy, using the same validated installation scan as serving.
-use std::cmp::Ordering;
 use std::io;
 
-use norted_core::{AppPaths, RuntimeManifest, prune::PrunePlan};
+use norted_core::{AppPaths, prune::PrunePlan};
 
-use crate::RuntimeStore;
+use crate::{EngineRegistry, RuntimeStore};
 
-pub async fn plan_runtime_prune(paths: &AppPaths, plan: &mut PrunePlan) -> io::Result<()> {
+pub async fn plan_runtime_prune(
+    paths: &AppPaths,
+    registry: &EngineRegistry,
+    plan: &mut PrunePlan,
+) -> io::Result<()> {
     let root = &paths.runtimes_dir;
     plan.categories
         .push("managed runtimes (active/selected/newest protected)".into());
@@ -50,10 +53,7 @@ pub async fn plan_runtime_prune(paths: &AppPaths, plan: &mut PrunePlan) -> io::R
                     .any(|value| value == id)
                     || selections.update_preferences.contains_key(id);
                 let superseded = snapshot.runtimes.iter().any(|newer| {
-                    same_group(&runtime.manifest, &newer.manifest)
-                        && comparable_versions(&runtime.manifest, &newer.manifest)
-                        && crate::packs::compare_installed_recency(newer, runtime, None)
-                            == Ordering::Greater
+                    crate::packs::is_proven_superseding_installed_runtime(registry, newer, runtime)
                 });
                 if !selected && superseded {
                     plan.add(
@@ -84,38 +84,4 @@ pub async fn plan_runtime_prune(paths: &AppPaths, plan: &mut PrunePlan) -> io::R
         "runtime downloads and provider catalogs",
     )?;
     Ok(())
-}
-
-fn same_group(old: &RuntimeManifest, new: &RuntimeManifest) -> bool {
-    let a = &old.identity;
-    let b = &new.identity;
-    a.engine_id == b.engine_id
-        && a.package_family == b.package_family
-        && a.platform == b.platform
-        && a.architecture == b.architecture
-        && a.accelerator == b.accelerator
-        && a.variant == b.variant
-        && a.package.provider_id == b.package.provider_id
-        && a.package.repository == b.package.repository
-        && old.supported_formats == new.supported_formats
-        && old.supported_native_identities == new.supported_native_identities
-        && old.requirements == new.requirements
-        && old.acquisition_method == new.acquisition_method
-}
-
-fn comparable_versions(old: &RuntimeManifest, new: &RuntimeManifest) -> bool {
-    if old.source_build.is_some() && new.source_build.is_some() {
-        return true;
-    }
-    // Unknown version labels cannot prove supersession. Numeric releases and
-    // llama.cpp's bNNNN releases have a well-defined existing ordering.
-    [&old.identity.version, &new.identity.version]
-        .iter()
-        .all(|version| {
-            let version = version.trim_start_matches(['v', 'b']);
-            !version.is_empty()
-                && version
-                    .split('.')
-                    .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-        })
 }

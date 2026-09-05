@@ -2042,7 +2042,14 @@ fn same_update_line(
     candidate: &AvailableRuntime,
     adapter: Option<&dyn crate::EngineAdapter>,
 ) -> bool {
-    let candidate = &candidate.identity;
+    same_runtime_update_line(identity, &candidate.identity, adapter)
+}
+
+fn same_runtime_update_line(
+    identity: &RuntimeIdentity,
+    candidate: &RuntimeIdentity,
+    adapter: Option<&dyn crate::EngineAdapter>,
+) -> bool {
     let installed_variant = adapter.map_or_else(
         || crate::RuntimeVariantUpdateIdentity::exact(identity),
         |adapter| adapter.runtime_variant_update_identity(identity),
@@ -2231,6 +2238,69 @@ fn update_channel_matches(
     candidate.channels.contains(&channel)
 }
 
+/// Conservative deletion proof layered on the resolver's update line and ordering.
+/// Fallback timestamp, hash and RuntimeId tie-breakers are not replacement evidence.
+pub(crate) fn is_proven_superseding_installed_runtime(
+    registry: &crate::EngineRegistry,
+    newer: &InstalledRuntime,
+    older: &InstalledRuntime,
+) -> bool {
+    let new = &newer.manifest;
+    let old = &older.manifest;
+    let adapter = registry.get(&old.identity.engine_id);
+    if !same_runtime_update_line(&old.identity, &new.identity, adapter.as_deref())
+        || old.identity.package.repository != new.identity.package.repository
+        || old.supported_formats != new.supported_formats
+        || old.supported_native_identities != new.supported_native_identities
+        || old.requirements != new.requirements
+        || matches!(
+            old.acquisition_method,
+            norted_core::RuntimeAcquisitionMethod::ExternalBinary
+        )
+        || matches!(
+            new.acquisition_method,
+            norted_core::RuntimeAcquisitionMethod::ExternalBinary
+        )
+        || (old.acquisition_method != new.acquisition_method
+            && !q27_logical_update_family(&old.identity, &new.identity))
+    {
+        return false;
+    }
+    let recipe_upgrade = match (&old.source_build, &new.source_build) {
+        (Some(old_source), Some(new_source)) => {
+            old_source.source == new_source.source
+                && source_recipe_ordering(&old.identity, &new.identity, adapter.as_deref())
+                    == Ordering::Greater
+        }
+        _ => false,
+    };
+    // Only recognized numeric releases (including llama.cpp bNNNN) prove a
+    // version advance. Different Git snapshots need ancestry evidence, which
+    // this offline operation does not have.
+    let release_parts = |version: &str| -> Option<Vec<u64>> {
+        version
+            .trim_start_matches(['v', 'b'])
+            .split('.')
+            .map(|part| {
+                if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                    None
+                } else {
+                    part.parse().ok()
+                }
+            })
+            .collect()
+    };
+    let release_upgrade = match (
+        release_parts(&new.identity.version),
+        release_parts(&old.identity.version),
+    ) {
+        (Some(new), Some(old)) => new > old,
+        _ => false,
+    };
+    (recipe_upgrade || release_upgrade)
+        && compare_installed_recency_with_registry(registry, newer, older) == Ordering::Greater
+}
+
 fn compare_installed_recency_with_registry(
     registry: &crate::EngineRegistry,
     left: &InstalledRuntime,
@@ -2257,15 +2327,8 @@ pub(crate) fn compare_installed_recency(
         || crate::RuntimeVariantUpdateIdentity::exact(&right_manifest.identity),
         |adapter| adapter.runtime_variant_update_identity(&right_manifest.identity),
     );
-    let same_update_line = left_manifest.identity.engine_id == right_manifest.identity.engine_id
-        && (left_manifest.identity.package_family == right_manifest.identity.package_family
-            || q27_logical_update_family(&left_manifest.identity, &right_manifest.identity))
-        && left_manifest.identity.platform == right_manifest.identity.platform
-        && left_manifest.identity.architecture == right_manifest.identity.architecture
-        && left_manifest.identity.accelerator == right_manifest.identity.accelerator
-        && left_variant.functional_variant == right_variant.functional_variant
-        && left_manifest.identity.package.provider_id
-            == right_manifest.identity.package.provider_id;
+    let same_update_line =
+        same_runtime_update_line(&left_manifest.identity, &right_manifest.identity, adapter);
     let recipe_ordering = match (
         left_variant.source_recipe_generation,
         right_variant.source_recipe_generation,
