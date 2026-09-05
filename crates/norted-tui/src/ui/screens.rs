@@ -1,6 +1,6 @@
 use norted_core::{
     ArtifactFormat, RegistryState, RuntimeCompatibility, RuntimeSourceBuildSystem,
-    RuntimeUpdateState,
+    RuntimeUpdatePreference, RuntimeUpdateState,
 };
 use norted_engine::{
     BackendLifecycle, BackendParallelism, BackendStatus, InferenceActivity, InferenceActivityPhase,
@@ -1541,6 +1541,25 @@ fn render_selected_runtime_actions(
         return;
     };
     let runtime_id = &status.runtime.manifest.runtime_id;
+    if ui_layout.runtime_actions.height > 1 {
+        let detail = runtime_policy_detail(app, status);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                marquee_text(
+                    &detail,
+                    ui_layout.runtime_actions.width as usize,
+                    app.marquee_animation_frame / 3,
+                ),
+                theme.hint,
+            ))),
+            Rect::new(
+                ui_layout.runtime_actions.x,
+                ui_layout.runtime_actions.y + 1,
+                ui_layout.runtime_actions.width,
+                1,
+            ),
+        );
+    }
     for (action, area) in &ui_layout.selected_runtime_actions {
         let (label, state) = match action {
             SelectedRuntimeAction::Default(format) => {
@@ -1601,6 +1620,25 @@ fn render_selected_runtime_actions(
     }
 }
 
+pub(super) fn runtime_policy_detail(app: &App, status: &InstalledRuntimeStatus) -> String {
+    let runtime_id = &status.runtime.manifest.runtime_id;
+    let policy = app
+        .runtime_list
+        .as_ref()
+        .and_then(|snapshot| snapshot.selections.update_preferences.get(runtime_id));
+    let policy = match policy {
+        Some(RuntimeUpdatePreference::Pinned) => "Pinned",
+        Some(RuntimeUpdatePreference::Stable) => "Stable",
+        Some(RuntimeUpdatePreference::Latest) => "Latest",
+        None => "Latest",
+    };
+    let update = app
+        .runtime_updates
+        .get(runtime_id)
+        .map_or_else(|| "  unchecked".to_owned(), runtime_update_text);
+    format!("UPDATE POLICY  {policy}    STATUS{update}")
+}
+
 fn runtime_update_text(state: &RuntimeUpdateState) -> String {
     match state {
         RuntimeUpdateState::Current => "  current".to_owned(),
@@ -1611,8 +1649,8 @@ fn runtime_update_text(state: &RuntimeUpdateState) -> String {
         RuntimeUpdateState::Pinned {
             newer_version: Some(version),
             ..
-        } => format!("  pinned; {version} available"),
-        RuntimeUpdateState::Pinned { .. } => "  pinned".to_owned(),
+        } => format!("  update: {version}"),
+        RuntimeUpdateState::Pinned { .. } => "  current".to_owned(),
         RuntimeUpdateState::CatalogUnavailable(_) => "  catalog unavailable".to_owned(),
         RuntimeUpdateState::ProviderError(_) => "  provider warning".to_owned(),
         RuntimeUpdateState::NoLongerPublished => "  no longer published".to_owned(),
@@ -1722,7 +1760,18 @@ pub(super) fn runtime_secondary_text(
         .get(&manifest.runtime_id)
         .map(runtime_update_text)
         .unwrap_or_default();
-    split_runtime_metadata(row_width, metadata, selected, update)
+    let badge = if status.latest_installed {
+        "  LATEST INSTALLED"
+    } else {
+        ""
+    };
+    let (metadata, selected, update) = split_runtime_metadata(
+        row_width.saturating_sub(badge.len() as u16),
+        metadata,
+        selected,
+        update,
+    );
+    (metadata, format!("{badge}{selected}"), update)
 }
 
 pub(super) fn runtime_metadata_width(row_width: u16, stationary_state: &str) -> usize {

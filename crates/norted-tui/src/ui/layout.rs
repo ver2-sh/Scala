@@ -572,7 +572,11 @@ impl UiLayout {
             let has_selection = app
                 .selected_runtime
                 .and_then(|index| app.runtime_list.as_ref()?.installed.get(index));
-            let requested_action_height = if has_selection.is_some() { 3 } else { 1 };
+            let requested_action_height = if has_selection.is_some() {
+                if compact { 4 } else { 3 }
+            } else {
+                1
+            };
             let action_height = screen_body
                 .height
                 .saturating_sub(summary_height)
@@ -620,13 +624,9 @@ impl UiLayout {
                 if let Some(status) = has_selection {
                     let selected_area = Rect::new(
                         runtime_actions.x,
-                        runtime_actions
-                            .y
-                            .saturating_add(if compact { 1 } else { 2 }),
+                        runtime_actions.y.saturating_add(2),
                         runtime_actions.width,
-                        runtime_actions
-                            .height
-                            .saturating_sub(if compact { 1 } else { 2 }),
+                        runtime_actions.height.saturating_sub(2),
                     );
                     let mut actions = status
                         .runtime
@@ -1720,6 +1720,17 @@ impl UiLayout {
                 }
                 Screen::Runtimes => {
                     if let Some(snapshot) = &app.runtime_list {
+                        if self.runtime_actions.height > 1
+                            && let Some(status) = app
+                                .selected_runtime
+                                .and_then(|index| snapshot.installed.get(index))
+                        {
+                            track(
+                                "runtime-policy",
+                                &super::screens::runtime_policy_detail(app, status),
+                                self.runtime_actions.width as usize,
+                            );
+                        }
                         for (index, row) in &self.runtime_rows {
                             if app.selected_runtime != Some(*index)
                                 && app.hover != Some(HoverTarget::Runtime(*index))
