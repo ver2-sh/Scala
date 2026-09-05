@@ -36,6 +36,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Reclaim unused managed storage; --all resets generated/heavy artifacts
+    Prune(PruneArgs),
     /// Launch the interactive interface, attaching to or owning the serving stack
     Tui,
     /// Run the local HTTP API gateway headlessly until interrupted
@@ -71,6 +73,19 @@ pub enum Command {
     Config(ConfigArgs),
     /// Run offline, read-only whole-system diagnostics
     Doctor(DoctorArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PruneArgs {
+    /// Remove all managed models, runtimes, caches, logs and transient state
+    #[arg(long)]
+    pub all: bool,
+    /// Show the exact deletion plan and estimated bytes without writing
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Confirm destructive --all without an interactive prompt
+    #[arg(long, requires = "all")]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]

@@ -2,6 +2,7 @@ mod cli;
 mod composition;
 mod doctor;
 mod output;
+mod prune;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -58,11 +59,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         });
     }
     let paths = AppPaths::discover()?;
-    paths.ensure_required()?;
-    let _log_guard = init_logging(&paths);
+    if let Some(Command::Prune(args)) = &cli.command {
+        prune::run(&paths, args, cli.json).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let core = ApplicationCore::load().await?;
+    let _log_guard = init_logging(&paths);
 
     match cli.command.unwrap_or(Command::Tui) {
+        Command::Prune(_) => unreachable!("prune dispatches before application initialization"),
         Command::Tui => {
             run_tui(core, cli.json).await?;
         }
