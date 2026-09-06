@@ -4168,6 +4168,9 @@ struct ChatUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
+    // q27 0.10.0's routed chat usage reports this top-level field.
+    // It is a subset of completion_tokens, never an additional population.
+    reasoning_tokens: Option<u64>,
 }
 
 impl From<ChatUsage> for InferenceUsage {
@@ -4178,7 +4181,7 @@ impl From<ChatUsage> for InferenceUsage {
             total_tokens: usage.total_tokens,
             cached_input_tokens: None,
             cache_write_input_tokens: None,
-            reasoning_output_tokens: None,
+            reasoning_output_tokens: usage.reasoning_tokens,
         }
     }
 }
@@ -4419,26 +4422,32 @@ fn parse_sse_frames(state: &mut SseState) {
                 }
             }
         }
-        if let Some(delta) = value
+        if let Some(choice) = value
             .get("choices")
             .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| {
-                choice
-                    .get("text")
-                    .or_else(|| choice.get("delta").and_then(|delta| delta.get("content")))
-            })
-            .and_then(Value::as_str)
-            .filter(|delta| !delta.is_empty())
+            .and_then(|v| v.first())
         {
-            let delta = state
-                .initial_reasoning_filter
-                .as_mut()
-                .map_or_else(|| delta.to_owned(), |filter| filter.push(delta));
-            if !delta.is_empty() {
-                state
-                    .queued
-                    .push_back(Ok(InferenceEvent::TextDelta { delta }));
+            let raw = choice.get("text").and_then(Value::as_str);
+            let content = choice
+                .get("delta")
+                .and_then(|v| v.get("content"))
+                .and_then(Value::as_str);
+            if let Some(delta) = raw.or(content).filter(|v| !v.is_empty()) {
+                // Chat content is already routed by q27's StreamSplitter;
+                // waiting for a raw </think> here would discard the answer.
+                let delta = if raw.is_some() {
+                    state
+                        .initial_reasoning_filter
+                        .as_mut()
+                        .map_or_else(|| delta.to_owned(), |filter| filter.push(delta))
+                } else {
+                    delta.to_owned()
+                };
+                if !delta.is_empty() {
+                    state
+                        .queued
+                        .push_back(Ok(InferenceEvent::TextDelta { delta }));
+                }
             }
         }
         if let Some(tool_calls) = value
@@ -6156,6 +6165,7 @@ impl Q27Adapter {
             ));
         }
 
+        let raw_text = choice.text.is_some();
         let (text, tool_calls) = match (choice.text, choice.message) {
             (Some(text), _) => (text, Vec::new()),
             (None, Some(message)) => (
@@ -6176,7 +6186,7 @@ impl Q27Adapter {
                 ));
             }
         };
-        let text = if filter_reasoning {
+        let text = if filter_reasoning && raw_text {
             filter_q27_initial_reasoning(&text)
         } else {
             text

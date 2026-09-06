@@ -1621,6 +1621,7 @@ dependencies = [
  "norted-engine",
  "norted-model-library",
  "ratatui",
+ "serde_json",
  "tokio",
  "unicode-segmentation",
  "unicode-width",
