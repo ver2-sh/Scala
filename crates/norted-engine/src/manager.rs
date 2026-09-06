@@ -320,6 +320,8 @@ impl Default for RuntimeManagerOptions {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
+    #[error("the requested capability is unsupported by this model/runtime")]
+    UnsupportedCapability,
     #[error("Model Profile `{0}` does not exist")]
     ModelProfileNotFound(ModelProfileId),
     #[error(
@@ -1705,6 +1707,72 @@ impl RuntimeManager {
         Ok(self.status_from_state(&state))
     }
 
+    pub async fn complete_routed(
+        self: &Arc<Self>,
+        mut request: crate::CompletionRequest,
+        routing: InferenceRoutingContext,
+    ) -> Result<crate::InferenceOutput, RuntimeError> {
+        let target = self
+            .inference_target(
+                &request.model_profile_id,
+                routing,
+                crate::ApiCapability::Completions,
+            )
+            .await?;
+        prepare_completion_request(&target, &mut request)?;
+        target.lease.mark_processing_prompt();
+        target
+            .adapter
+            .complete(&target.endpoint, request)
+            .await
+            .map_err(map_inference_error)
+    }
+
+    pub async fn complete_stream_routed(
+        self: &Arc<Self>,
+        mut request: crate::CompletionRequest,
+        routing: InferenceRoutingContext,
+    ) -> Result<crate::InferenceStream, RuntimeError> {
+        let target = self
+            .inference_target(
+                &request.model_profile_id,
+                routing,
+                crate::ApiCapability::Completions,
+            )
+            .await?;
+        prepare_completion_request(&target, &mut request)?;
+        target.lease.mark_processing_prompt();
+        let stream = target
+            .adapter
+            .complete_stream(&target.endpoint, request, target.lease.activity_reporter())
+            .await
+            .map_err(map_inference_error)?;
+        Ok(Box::pin(LeasedInferenceStream {
+            inner: stream,
+            lease: Some(target.lease),
+        }))
+    }
+
+    pub async fn embed_routed(
+        self: &Arc<Self>,
+        request: crate::EmbeddingRequest,
+        routing: InferenceRoutingContext,
+    ) -> Result<crate::EmbeddingOutput, RuntimeError> {
+        let target = self
+            .inference_target(
+                &request.model_profile_id,
+                routing,
+                crate::ApiCapability::Embeddings,
+            )
+            .await?;
+        target.lease.mark_processing_prompt();
+        target
+            .adapter
+            .embed(&target.endpoint, request)
+            .await
+            .map_err(map_inference_error)
+    }
+
     pub async fn infer(
         self: &Arc<Self>,
         request: InferenceRequest,
@@ -1719,7 +1787,11 @@ impl RuntimeManager {
         routing: InferenceRoutingContext,
     ) -> Result<RoutedInferenceOutput, RuntimeError> {
         let target = self
-            .inference_target(&request.model_profile_id, routing)
+            .inference_target(
+                &request.model_profile_id,
+                routing,
+                crate::ApiCapability::ChatCompletions,
+            )
             .await?;
         prepare_inference_request(
             &target.adapter,
@@ -1768,7 +1840,11 @@ impl RuntimeManager {
         routing: InferenceRoutingContext,
     ) -> Result<RoutedInferenceStream, RuntimeError> {
         let target = self
-            .inference_target(&request.model_profile_id, routing)
+            .inference_target(
+                &request.model_profile_id,
+                routing,
+                crate::ApiCapability::ChatCompletions,
+            )
             .await?;
         prepare_inference_request(
             &target.adapter,
@@ -2068,6 +2144,7 @@ impl RuntimeManager {
         self: &Arc<Self>,
         requested: &ModelProfileId,
         routing: InferenceRoutingContext,
+        capability: crate::ApiCapability,
     ) -> Result<InferenceTarget, RuntimeError> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(RuntimeError::ShuttingDown);
@@ -2082,6 +2159,19 @@ impl RuntimeManager {
             .get(requested)
             .cloned()
             .ok_or_else(|| RuntimeError::ModelProfileNotFound(requested.clone()))?;
+        let model = self.core.model(&profile.model_id).await.ok_or_else(|| {
+            RuntimeError::BoundModelMissing {
+                profile_id: requested.clone(),
+                model_id: profile.model_id.clone(),
+            }
+        })?;
+        let adapter = self
+            .registry
+            .get(profile.engine_id.as_str())
+            .ok_or(RuntimeError::UnsupportedCapability)?;
+        if !adapter.supports_model_capability(&model, capability) {
+            return Err(RuntimeError::UnsupportedCapability);
+        }
         let role = routing.role.unwrap_or(profile.role);
         let profile_role = profile.role;
         let profile_hash = profile.content_hash();
@@ -2180,12 +2270,6 @@ impl RuntimeManager {
         if !self.options.jit_enabled {
             return Err(RuntimeError::ModelProfileNotLoaded(requested.clone()));
         }
-        let model = self.core.model(&profile.model_id).await.ok_or_else(|| {
-            RuntimeError::BoundModelMissing {
-                profile_id: requested.clone(),
-                model_id: profile.model_id.clone(),
-            }
-        })?;
         let cancellation_epoch = self.cancellation_epoch.load(Ordering::Acquire);
         let generation = self
             .reserve_loading(
@@ -2610,54 +2694,78 @@ async fn cleanup_pending_launch_files(attempts: &VecDeque<crate::LaunchSpec>) {
     }
 }
 
+fn prepare_generation_patch(
+    settings: &norted_core::ResolvedSettings,
+    patch: &mut crate::GenerationSettingsPatch,
+) {
+    if patch.top_k.is_none()
+        && let Some(norted_core::SettingValue::UnsignedInteger(value)) =
+            settings.runtime_value("top_k")
+    {
+        patch.top_k = Some(*value);
+    }
+    if patch.min_p.is_none()
+        && let Some(norted_core::SettingValue::Float(value)) = settings.runtime_value("min_p")
+    {
+        patch.min_p = Some(*value);
+    }
+    if patch.seed.is_none()
+        && let Some(norted_core::SettingValue::UnsignedIntegerOrChoice(
+            norted_core::UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
+        )) = settings.runtime_value("seed")
+    {
+        patch.seed = Some(*value);
+    }
+    if patch.repeat_penalty.is_none()
+        && let Some(norted_core::SettingValue::Float(value)) =
+            settings.runtime_value("repeat_penalty")
+    {
+        patch.repeat_penalty = Some(*value);
+    }
+    if patch.presence_penalty.is_none()
+        && let Some(norted_core::SettingValue::Float(value)) =
+            settings.runtime_value("presence_penalty")
+    {
+        patch.presence_penalty = Some(*value);
+    }
+    if patch.frequency_penalty.is_none()
+        && let Some(norted_core::SettingValue::Float(value)) =
+            settings.runtime_value("frequency_penalty")
+    {
+        patch.frequency_penalty = Some(*value);
+    }
+    if patch.stop.is_none()
+        && let Some(norted_core::SettingValue::StringList(value)) =
+            settings.runtime_value("stop_strings")
+    {
+        patch.stop = Some(value.clone());
+    }
+}
+
+fn prepare_completion_request(
+    target: &InferenceTarget,
+    request: &mut crate::CompletionRequest,
+) -> Result<(), RuntimeError> {
+    prepare_generation_patch(&target.settings, &mut request.generation_settings);
+    if request.max_output_tokens.is_none()
+        && let Some(norted_core::SettingValue::UnsignedInteger(value)) =
+            target.settings.runtime_value("max_output_tokens")
+    {
+        request.max_output_tokens = u32::try_from(*value).ok();
+    }
+    target
+        .adapter
+        .validate_generation_settings(&request.generation_settings, &target.generation_settings)
+        .map_err(map_inference_error)
+}
+
 async fn prepare_inference_request(
     adapter: &Arc<dyn EngineAdapter>,
     endpoint: &str,
     settings: &norted_core::ResolvedSettings,
     request: &mut InferenceRequest,
 ) -> Result<(), EngineError> {
-    if request.generation_settings.top_k.is_none()
-        && let Some(norted_core::SettingValue::UnsignedInteger(value)) =
-            settings.runtime_value("top_k")
-    {
-        request.generation_settings.top_k = Some(*value);
-    }
-    if request.generation_settings.min_p.is_none()
-        && let Some(norted_core::SettingValue::Float(value)) = settings.runtime_value("min_p")
-    {
-        request.generation_settings.min_p = Some(*value);
-    }
-    if request.generation_settings.seed.is_none()
-        && let Some(norted_core::SettingValue::UnsignedIntegerOrChoice(
-            norted_core::UnsignedIntegerOrChoiceValue::UnsignedInteger(value),
-        )) = settings.runtime_value("seed")
-    {
-        request.generation_settings.seed = Some(*value);
-    }
-    if request.generation_settings.repeat_penalty.is_none()
-        && let Some(norted_core::SettingValue::Float(value)) =
-            settings.runtime_value("repeat_penalty")
-    {
-        request.generation_settings.repeat_penalty = Some(*value);
-    }
-    if request.generation_settings.presence_penalty.is_none()
-        && let Some(norted_core::SettingValue::Float(value)) =
-            settings.runtime_value("presence_penalty")
-    {
-        request.generation_settings.presence_penalty = Some(*value);
-    }
-    if request.generation_settings.frequency_penalty.is_none()
-        && let Some(norted_core::SettingValue::Float(value)) =
-            settings.runtime_value("frequency_penalty")
-    {
-        request.generation_settings.frequency_penalty = Some(*value);
-    }
-    if request.generation_settings.stop.is_none()
-        && let Some(norted_core::SettingValue::StringList(value)) =
-            settings.runtime_value("stop_strings")
-    {
-        request.generation_settings.stop = Some(value.clone());
-    }
+    prepare_generation_patch(settings, &mut request.generation_settings);
     if request.generation_settings.reasoning_enabled.is_none()
         && let Some(norted_core::SettingValue::Choice(value)) = settings.runtime_value("reasoning")
     {
@@ -2972,6 +3080,7 @@ fn map_inference_error(error: EngineError) -> RuntimeError {
         EngineError::InvalidGenerationSettings(message) => {
             RuntimeError::InvalidGenerationSettings(message)
         }
+        EngineError::Unsupported(_) => RuntimeError::UnsupportedCapability,
         EngineError::TimedOut(message) => RuntimeError::InferenceTimedOut(message),
         EngineError::BackendUnavailable(message) => RuntimeError::InferenceUnavailable(message),
         error => RuntimeError::Inference(error.to_string()),

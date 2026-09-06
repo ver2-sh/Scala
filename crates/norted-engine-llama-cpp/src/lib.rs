@@ -698,8 +698,35 @@ impl EngineAdapter for LlamaCppAdapter {
     fn capabilities(&self) -> EngineCapabilities {
         EngineCapabilities {
             artifact_formats: vec![ArtifactFormat::Gguf],
-            api: vec![ApiCapability::ChatCompletions],
+            api: vec![
+                ApiCapability::ChatCompletions,
+                ApiCapability::Completions,
+                ApiCapability::Embeddings,
+            ],
             features: vec![EngineFeature::TextGeneration],
+        }
+    }
+
+    fn serving_features(
+        &self,
+        _runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        _settings: Option<&norted_core::ResolvedSettings>,
+    ) -> Vec<EngineFeature> {
+        if pooled_embedding_model(model) {
+            Vec::new()
+        } else {
+            self.capabilities().features
+        }
+    }
+
+    fn supports_model_capability(&self, model: &ModelArtifact, capability: ApiCapability) -> bool {
+        let pooled = pooled_embedding_model(model);
+        match capability {
+            ApiCapability::Embeddings => pooled,
+            ApiCapability::Completions
+            | ApiCapability::ChatCompletions
+            | ApiCapability::Responses => !pooled,
         }
     }
 
@@ -1327,6 +1354,15 @@ impl EngineAdapter for LlamaCppAdapter {
             OsString::from("--port"),
             OsString::from(request.backend_address.port().to_string()),
         ];
+        if pooled_embedding_model(&request.model.primary) {
+            let help = self.cached_runtime_help(&request.runtime).await?;
+            if !help_has_option(&help, "--embedding") {
+                return Err(EngineError::Unsupported(
+                    "runtime does not advertise embedding mode".to_owned(),
+                ));
+            }
+            arguments.push(OsString::from("--embedding"));
+        }
         let mut environment = self.environment.clone();
         if manifest.identity.accelerator == "cuda" {
             let binding = request.accelerator_binding.as_ref().ok_or_else(|| {
@@ -1496,43 +1532,104 @@ impl EngineAdapter for LlamaCppAdapter {
         })
     }
 
+    async fn embed(
+        &self,
+        endpoint: &str,
+        request: norted_engine::EmbeddingRequest,
+    ) -> Result<norted_engine::EmbeddingOutput, EngineError> {
+        let response = self.client.post(format!("{endpoint}/v1/embeddings"))
+            .timeout(INFERENCE_TIMEOUT)
+            .json(&json!({"model": request.model_profile_id.as_str(), "input": request.input, "encoding_format": "float"}))
+            .send().await.map_err(map_transport_error)?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| EngineError::BackendUnavailable(e.to_string()))?;
+        if !status.is_success() {
+            return Err(backend_http_error(status, &bytes));
+        }
+        #[derive(Deserialize)]
+        struct Item {
+            index: usize,
+            embedding: Vec<f32>,
+        }
+        #[derive(Deserialize)]
+        struct Usage {
+            prompt_tokens: u64,
+            total_tokens: u64,
+        }
+        #[derive(Deserialize)]
+        struct Embeddings {
+            data: Vec<Item>,
+            usage: Option<Usage>,
+        }
+        let response: Embeddings = serde_json::from_slice(&bytes)
+            .map_err(|e| EngineError::Operation(format!("invalid embedding response: {e}")))?;
+        let invalid = || EngineError::Operation("invalid embedding indexes or vectors".to_owned());
+        if response.data.len() != request.input.len() {
+            return Err(invalid());
+        }
+        let mut vectors = vec![None; request.input.len()];
+        let mut dimension = None;
+        for item in response.data {
+            if item.index >= vectors.len()
+                || vectors[item.index].is_some()
+                || item.embedding.is_empty()
+                || item.embedding.iter().any(|v| !v.is_finite())
+                || dimension.is_some_and(|d| d != item.embedding.len())
+            {
+                return Err(invalid());
+            }
+            dimension = Some(item.embedding.len());
+            vectors[item.index] = Some(item.embedding);
+        }
+        let (prompt_tokens, total_tokens) = match response.usage {
+            Some(usage) if usage.prompt_tokens == usage.total_tokens => {
+                (Some(usage.prompt_tokens), Some(usage.total_tokens))
+            }
+            _ => (None, None),
+        };
+        Ok(norted_engine::EmbeddingOutput {
+            vectors: vectors
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(invalid)?,
+            prompt_tokens,
+            total_tokens,
+        })
+    }
+
+    async fn complete(
+        &self,
+        endpoint: &str,
+        request: norted_engine::CompletionRequest,
+    ) -> Result<InferenceOutput, EngineError> {
+        let body = self.raw_completion_body(endpoint, &request, false).await?;
+        self.send_completion(endpoint, "/v1/completions", body)
+            .await
+    }
+    async fn complete_stream(
+        &self,
+        endpoint: &str,
+        request: norted_engine::CompletionRequest,
+        activity: InferenceActivityReporter,
+    ) -> Result<InferenceStream, EngineError> {
+        let body = self.raw_completion_body(endpoint, &request, true).await?;
+        self.send_completion_stream(endpoint, "/v1/completions", body, activity)
+            .await
+    }
     async fn infer(
         &self,
         endpoint: &str,
         request: InferenceRequest,
     ) -> Result<InferenceOutput, EngineError> {
-        let response = self
-            .client
-            .post(format!("{endpoint}/v1/chat/completions"))
-            .timeout(INFERENCE_TIMEOUT)
-            .json(&self.backend_request(&request, false))
-            .send()
-            .await
-            .map_err(map_transport_error)?;
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
-        if !status.is_success() {
-            return Err(backend_http_error(status, &body));
-        }
-        let response: ChatCompletionResponse = serde_json::from_slice(&body).map_err(|error| {
-            EngineError::Operation(format!("invalid llama.cpp completion response: {error}"))
-        })?;
-        let choice = response.choices.into_iter().next().ok_or_else(|| {
-            EngineError::Operation("llama.cpp response contained no completion choice".to_owned())
-        })?;
-        let finish_reason = map_finish_reason(choice.finish_reason.as_deref())?;
-        let text = choice.message.content.ok_or_else(|| {
-            EngineError::Operation("llama.cpp response contained no assistant text".to_owned())
-        })?;
-        Ok(InferenceOutput {
-            text,
-            tool_calls: Vec::new(),
-            usage: response.usage.map(Into::into),
-            finish_reason,
-        })
+        self.send_completion(
+            endpoint,
+            "/v1/chat/completions",
+            self.backend_request(&request, false),
+        )
+        .await
     }
 
     async fn infer_stream(
@@ -1541,23 +1638,13 @@ impl EngineAdapter for LlamaCppAdapter {
         request: InferenceRequest,
         activity: InferenceActivityReporter,
     ) -> Result<InferenceStream, EngineError> {
-        let response = self
-            .client
-            .post(format!("{endpoint}/v1/chat/completions"))
-            .timeout(INFERENCE_TIMEOUT)
-            .json(&self.backend_request(&request, true))
-            .send()
-            .await
-            .map_err(map_transport_error)?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .bytes()
-                .await
-                .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
-            return Err(backend_http_error(status, &body));
-        }
-        Ok(llama_sse_stream(response.bytes_stream().boxed(), activity))
+        self.send_completion_stream(
+            endpoint,
+            "/v1/chat/completions",
+            self.backend_request(&request, true),
+            activity,
+        )
+        .await
     }
 }
 
@@ -1886,7 +1973,8 @@ struct ChatCompletionResponse {
 
 #[derive(Deserialize)]
 struct ChatChoice {
-    message: ChatMessage,
+    message: Option<ChatMessage>,
+    text: Option<String>,
     finish_reason: Option<String>,
 }
 
@@ -2089,8 +2177,11 @@ fn parse_sse_frames(state: &mut SseState) {
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("delta"))
-            .and_then(|delta| delta.get("content"))
+            .and_then(|choice| {
+                choice
+                    .get("text")
+                    .or_else(|| choice.get("delta").and_then(|delta| delta.get("content")))
+            })
             .and_then(Value::as_str)
             .filter(|delta| !delta.is_empty())
         {
@@ -5221,6 +5312,126 @@ fn push_llama_direct_argument(
         arguments.push(OsString::from(rendered));
     }
     Ok(())
+}
+
+impl LlamaCppAdapter {
+    async fn send_completion(
+        &self,
+        endpoint: &str,
+        route: &str,
+        body: Value,
+    ) -> Result<InferenceOutput, EngineError> {
+        let response = self
+            .client
+            .post(format!("{endpoint}{route}"))
+            .timeout(INFERENCE_TIMEOUT)
+            .json(&body)
+            .send()
+            .await
+            .map_err(map_transport_error)?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
+        if !status.is_success() {
+            return Err(backend_http_error(status, &body));
+        }
+        let response: ChatCompletionResponse = serde_json::from_slice(&body).map_err(|error| {
+            EngineError::Operation(format!("invalid llama.cpp completion response: {error}"))
+        })?;
+        let choice = response.choices.into_iter().next().ok_or_else(|| {
+            EngineError::Operation("llama.cpp response contained no completion choice".to_owned())
+        })?;
+        if route == "/v1/completions"
+            && (choice.text.is_none() || choice.finish_reason.as_deref() == Some("tool_calls"))
+        {
+            return Err(EngineError::Operation(
+                "raw completion returned an invalid choice".to_owned(),
+            ));
+        }
+
+        let finish_reason = map_finish_reason(choice.finish_reason.as_deref())?;
+        let text = choice
+            .text
+            .or_else(|| choice.message.and_then(|message| message.content))
+            .ok_or_else(|| {
+                EngineError::Operation("llama.cpp response contained no assistant text".to_owned())
+            })?;
+        Ok(InferenceOutput {
+            text,
+            tool_calls: Vec::new(),
+            usage: response.usage.map(Into::into),
+            finish_reason,
+        })
+    }
+
+    async fn send_completion_stream(
+        &self,
+        endpoint: &str,
+        route: &str,
+        body: Value,
+        activity: InferenceActivityReporter,
+    ) -> Result<InferenceStream, EngineError> {
+        let response = self
+            .client
+            .post(format!("{endpoint}{route}"))
+            .timeout(INFERENCE_TIMEOUT)
+            .json(&body)
+            .send()
+            .await
+            .map_err(map_transport_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .bytes()
+                .await
+                .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
+            return Err(backend_http_error(status, &body));
+        }
+        Ok(llama_sse_stream(response.bytes_stream().boxed(), activity))
+    }
+}
+
+impl LlamaCppAdapter {
+    async fn raw_completion_body(
+        &self,
+        endpoint: &str,
+        request: &norted_engine::CompletionRequest,
+        stream: bool,
+    ) -> Result<Value, EngineError> {
+        let settings = &request.generation_settings;
+        let _ = endpoint;
+        if settings.reasoning_enabled.is_some()
+            || settings.reasoning_effort.is_some()
+            || settings.reasoning_budget.is_some()
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "chat reasoning controls do not apply to raw prompts".to_owned(),
+            ));
+        }
+        let mut body = json!({"model": request.model_profile_id.as_str(), "prompt": request.prompt, "stream": stream});
+        for (key, value) in serde_json::to_value(settings)
+            .map_err(|e| EngineError::Operation(e.to_string()))?
+            .as_object()
+            .expect("generation settings object")
+        {
+            if !value.is_null() {
+                body[key] = value.clone();
+            }
+        }
+        if let Some(maximum) = request.max_output_tokens {
+            body["max_tokens"] = json!(maximum);
+        }
+        if stream {
+            body["stream_options"] = json!({"include_usage": true});
+        }
+        Ok(body)
+    }
+}
+
+fn pooled_embedding_model(model: &ModelArtifact) -> bool {
+    matches!(model.native_identity.as_ref(), Some(norted_core::ArtifactNativeIdentity::Gguf(identity)) if matches!(identity.pooling_type, Some(1..=3)))
 }
 
 #[cfg(test)]

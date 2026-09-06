@@ -2460,7 +2460,11 @@ impl EngineAdapter for Q27Adapter {
     fn capabilities(&self) -> EngineCapabilities {
         EngineCapabilities {
             artifact_formats: vec![ArtifactFormat::Q27],
-            api: vec![ApiCapability::Responses, ApiCapability::ChatCompletions],
+            api: vec![
+                ApiCapability::Responses,
+                ApiCapability::ChatCompletions,
+                ApiCapability::Completions,
+            ],
             features: vec![EngineFeature::TextGeneration, EngineFeature::ToolCalling],
         }
     }
@@ -3478,6 +3482,25 @@ impl EngineAdapter for Q27Adapter {
         ))
     }
 
+    async fn complete(
+        &self,
+        endpoint: &str,
+        request: norted_engine::CompletionRequest,
+    ) -> Result<InferenceOutput, EngineError> {
+        let body = self.raw_completion_body(endpoint, &request, false).await?;
+        self.send_completion(endpoint, "/v1/completions", body, false)
+            .await
+    }
+    async fn complete_stream(
+        &self,
+        endpoint: &str,
+        request: norted_engine::CompletionRequest,
+        _activity: InferenceActivityReporter,
+    ) -> Result<InferenceStream, EngineError> {
+        let body = self.raw_completion_body(endpoint, &request, true).await?;
+        self.send_completion_stream(endpoint, "/v1/completions", body, false)
+            .await
+    }
     async fn infer(
         &self,
         endpoint: &str,
@@ -3497,62 +3520,16 @@ impl EngineAdapter for Q27Adapter {
                 self.backend_request(&request, false)?,
             )
         };
-        let response = self
-            .client
-            .post(format!("{endpoint}{route}"))
-            .timeout(INFERENCE_TIMEOUT)
-            .json(&body)
-            .send()
-            .await
-            .map_err(map_transport_error)?;
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
-        if !status.is_success() {
-            return Err(backend_http_error(status, &body));
-        }
-        let response: ChatCompletionResponse = serde_json::from_slice(&body).map_err(|error| {
-            EngineError::Operation(format!("invalid q27 completion response: {error}"))
-        })?;
-        let choice = response.choices.into_iter().next().ok_or_else(|| {
-            EngineError::Operation("q27 response contained no completion choice".to_owned())
-        })?;
-        let (text, tool_calls) = match (choice.text, choice.message) {
-            (Some(text), _) => (text, Vec::new()),
-            (None, Some(message)) => (
-                message.content.unwrap_or_default(),
-                message
-                    .tool_calls
-                    .into_iter()
-                    .map(|call| InferenceToolCall {
-                        id: call.id,
-                        name: call.function.name,
-                        arguments: call.function.arguments,
-                    })
-                    .collect(),
-            ),
-            (None, None) => {
-                return Err(EngineError::Operation(
-                    "q27 response contained neither assistant text nor tool calls".to_owned(),
-                ));
-            }
-        };
-        let text = if configured.as_ref().is_some_and(|execution| {
-            setting_choice(&execution.settings, "q27.response_filter")
-                == Some("strip_initial_reasoning")
-        }) {
-            filter_q27_initial_reasoning(&text)
-        } else {
-            text
-        };
-        Ok(InferenceOutput {
-            text,
-            tool_calls,
-            usage: response.usage.map(Into::into),
-            finish_reason: map_finish_reason(choice.finish_reason.as_deref())?,
-        })
+        self.send_completion(
+            endpoint,
+            route,
+            body,
+            configured.as_ref().is_some_and(|execution| {
+                setting_choice(&execution.settings, "q27.response_filter")
+                    == Some("strip_initial_reasoning")
+            }),
+        )
+        .await
     }
 
     async fn infer_stream(
@@ -3575,29 +3552,16 @@ impl EngineAdapter for Q27Adapter {
                 self.backend_request(&request, true)?,
             )
         };
-        let response = self
-            .client
-            .post(format!("{endpoint}{route}"))
-            .timeout(INFERENCE_TIMEOUT)
-            .json(&body)
-            .send()
-            .await
-            .map_err(map_transport_error)?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response
-                .bytes()
-                .await
-                .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
-            return Err(backend_http_error(status, &body));
-        }
-        Ok(q27_sse_stream(
-            response.bytes_stream().boxed(),
+        self.send_completion_stream(
+            endpoint,
+            route,
+            body,
             configured.as_ref().is_some_and(|execution| {
                 setting_choice(&execution.settings, "q27.response_filter")
                     == Some("strip_initial_reasoning")
             }),
-        ))
+        )
+        .await
     }
 }
 
@@ -6152,6 +6116,179 @@ fn unix_timestamp() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
         .unwrap_or(0)
+}
+
+impl Q27Adapter {
+    async fn send_completion(
+        &self,
+        endpoint: &str,
+        route: &str,
+        body: Value,
+        filter_reasoning: bool,
+    ) -> Result<InferenceOutput, EngineError> {
+        let response = self
+            .client
+            .post(format!("{endpoint}{route}"))
+            .timeout(INFERENCE_TIMEOUT)
+            .json(&body)
+            .send()
+            .await
+            .map_err(map_transport_error)?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
+        if !status.is_success() {
+            return Err(backend_http_error(status, &body));
+        }
+        let response: ChatCompletionResponse = serde_json::from_slice(&body).map_err(|error| {
+            EngineError::Operation(format!("invalid q27 completion response: {error}"))
+        })?;
+        let choice = response.choices.into_iter().next().ok_or_else(|| {
+            EngineError::Operation("q27 response contained no completion choice".to_owned())
+        })?;
+        if route == "/v1/completions"
+            && (choice.text.is_none() || choice.finish_reason.as_deref() == Some("tool_calls"))
+        {
+            return Err(EngineError::Operation(
+                "raw completion returned an invalid choice".to_owned(),
+            ));
+        }
+
+        let (text, tool_calls) = match (choice.text, choice.message) {
+            (Some(text), _) => (text, Vec::new()),
+            (None, Some(message)) => (
+                message.content.unwrap_or_default(),
+                message
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| InferenceToolCall {
+                        id: call.id,
+                        name: call.function.name,
+                        arguments: call.function.arguments,
+                    })
+                    .collect(),
+            ),
+            (None, None) => {
+                return Err(EngineError::Operation(
+                    "q27 response contained neither assistant text nor tool calls".to_owned(),
+                ));
+            }
+        };
+        let text = if filter_reasoning {
+            filter_q27_initial_reasoning(&text)
+        } else {
+            text
+        };
+        Ok(InferenceOutput {
+            text,
+            tool_calls,
+            usage: response.usage.map(Into::into),
+            finish_reason: map_finish_reason(choice.finish_reason.as_deref())?,
+        })
+    }
+
+    async fn send_completion_stream(
+        &self,
+        endpoint: &str,
+        route: &str,
+        body: Value,
+        filter_reasoning: bool,
+    ) -> Result<InferenceStream, EngineError> {
+        let response = self
+            .client
+            .post(format!("{endpoint}{route}"))
+            .timeout(INFERENCE_TIMEOUT)
+            .json(&body)
+            .send()
+            .await
+            .map_err(map_transport_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .bytes()
+                .await
+                .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
+            return Err(backend_http_error(status, &body));
+        }
+        Ok(q27_sse_stream(
+            response.bytes_stream().boxed(),
+            filter_reasoning,
+        ))
+    }
+}
+
+impl Q27Adapter {
+    async fn raw_completion_body(
+        &self,
+        endpoint: &str,
+        request: &norted_engine::CompletionRequest,
+        stream: bool,
+    ) -> Result<Value, EngineError> {
+        let mut settings = request.generation_settings.clone();
+        let executions = self.configured_executions.read().await;
+        let execution = executions.get(endpoint).ok_or_else(|| {
+            EngineError::Unsupported("unproven q27 raw completion runtime".to_owned())
+        })?;
+        settings.temperature = settings
+            .temperature
+            .or_else(|| setting_float(&execution.settings, "q27.temperature"));
+        settings.top_p = settings
+            .top_p
+            .or_else(|| setting_float(&execution.settings, "q27.top_p"));
+        settings.top_k = settings
+            .top_k
+            .or_else(|| setting_unsigned(&execution.settings, "q27.top_k"));
+        settings.min_p = settings
+            .min_p
+            .or_else(|| setting_float(&execution.settings, "q27.min_p"));
+        if request.prompt.is_empty() {
+            return Err(EngineError::InvalidGenerationSettings(
+                "q27 requires a non-empty raw prompt".to_owned(),
+            ));
+        }
+        if !execution.capabilities.raw_completions {
+            return Err(EngineError::Unsupported(
+                "unproven q27 raw completion runtime".to_owned(),
+            ));
+        }
+        if (settings.seed.is_some() && !execution.capabilities.request_seed)
+            || ((settings.top_k.is_some() || settings.min_p.is_some())
+                && !execution.capabilities.top_k_min_p)
+            || (settings.temperature.is_some_and(|v| v > 0.0)
+                && setting_toggle(&execution.settings, "q27.sampled_graphs") == Some(false))
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "unsupported q27 raw completion sampling controls".to_owned(),
+            ));
+        }
+        if settings.reasoning_enabled.is_some()
+            || settings.reasoning_effort.is_some()
+            || settings.reasoning_budget.is_some()
+        {
+            return Err(EngineError::InvalidGenerationSettings(
+                "chat reasoning controls do not apply to raw prompts".to_owned(),
+            ));
+        }
+        let mut body = json!({"model": request.model_profile_id.as_str(), "prompt": request.prompt, "stream": stream});
+        for (key, value) in serde_json::to_value(settings)
+            .map_err(|e| EngineError::Operation(e.to_string()))?
+            .as_object()
+            .expect("generation settings object")
+        {
+            if !value.is_null() {
+                body[key] = value.clone();
+            }
+        }
+        if let Some(maximum) = request.max_output_tokens {
+            body["max_tokens"] = json!(maximum);
+        }
+        if stream {
+            body["stream_options"] = json!({"include_usage": true});
+        }
+        Ok(body)
+    }
 }
 
 #[cfg(test)]

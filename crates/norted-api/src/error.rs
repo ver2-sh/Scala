@@ -19,6 +19,16 @@ pub(crate) struct OpenAiError {
 }
 
 impl OpenAiError {
+    pub(crate) fn model_not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: "The requested Model Profile does not exist.".to_owned(),
+            kind: "invalid_request_error",
+            parameter: Some("model".to_owned()),
+            code: "model_not_found",
+        }
+    }
+
     pub(crate) fn invalid(
         message: impl Into<String>,
         parameter: Option<impl Into<String>>,
@@ -108,6 +118,8 @@ impl IntoResponse for OpenAiError {
 pub(crate) fn runtime_error(error: RuntimeError) -> OpenAiError {
     tracing::warn!(%error, "public inference request could not be routed");
     match error {
+        RuntimeError::ModelProfileNotFound(_) => OpenAiError::model_not_found(),
+        RuntimeError::UnsupportedCapability => OpenAiError::invalid("The requested capability is unsupported by this Model Profile/runtime.", Some("model"), "unsupported_capability"),
         RuntimeError::ModelNotFound(_) => OpenAiError {
             status: StatusCode::NOT_FOUND,
             message: "The requested model does not exist in the local model registry.".to_owned(),

@@ -82,11 +82,12 @@ impl EngineCapabilities {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiCapability {
     Responses,
     ChatCompletions,
+    Completions,
     Embeddings,
 }
 
@@ -1266,6 +1267,29 @@ pub struct InferenceRequest {
     pub stream: bool,
 }
 
+/// Raw text, never rendered through a chat template.
+#[derive(Debug, Clone)]
+pub struct CompletionRequest {
+    pub model_profile_id: norted_core::ModelProfileId,
+    pub prompt: String,
+    pub generation_settings: GenerationSettingsPatch,
+    pub max_output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingRequest {
+    pub model_profile_id: norted_core::ModelProfileId,
+    pub input: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingOutput {
+    /// One numeric vector per input, in original input order.
+    pub vectors: Vec<Vec<f32>>,
+    pub prompt_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InferenceUsage {
     pub input_tokens: u64,
@@ -1713,6 +1737,34 @@ pub trait EngineAdapter: Send + Sync {
         _request: &InferenceRequest,
     ) -> Result<Option<u64>, EngineError> {
         Ok(None)
+    }
+    /// Artifact-specific support, separate from format compatibility and provenance.
+    fn supports_model_capability(&self, _model: &ModelArtifact, capability: ApiCapability) -> bool {
+        self.capabilities().api.contains(&capability)
+    }
+    async fn complete(
+        &self,
+        _endpoint: &str,
+        _request: CompletionRequest,
+    ) -> Result<InferenceOutput, EngineError> {
+        Err(EngineError::Unsupported("raw completions".to_owned()))
+    }
+    async fn complete_stream(
+        &self,
+        _endpoint: &str,
+        _request: CompletionRequest,
+        _activity: InferenceActivityReporter,
+    ) -> Result<InferenceStream, EngineError> {
+        Err(EngineError::Unsupported(
+            "streaming raw completions".to_owned(),
+        ))
+    }
+    async fn embed(
+        &self,
+        _endpoint: &str,
+        _request: EmbeddingRequest,
+    ) -> Result<EmbeddingOutput, EngineError> {
+        Err(EngineError::Unsupported("embeddings".to_owned()))
     }
     async fn infer(
         &self,

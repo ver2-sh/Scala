@@ -1466,6 +1466,11 @@ impl RuntimePackManager {
             false
         };
 
+        let text_generation = !self.registry.compatible_with(model).iter().any(|adapter| {
+            adapter.supports_model_capability(model, crate::ApiCapability::Embeddings)
+                && !adapter.supports_model_capability(model, crate::ApiCapability::ChatCompletions)
+                && !adapter.supports_model_capability(model, crate::ApiCapability::Responses)
+        });
         Ok(ModelServingCapabilities {
             model_id: model.id.clone(),
             format: model.format,
@@ -1476,10 +1481,10 @@ impl RuntimePackManager {
             selected_runtime_id,
             active: active_model == Some(&model.id),
             text_input: true,
-            text_output: true,
-            responses: true,
-            chat_completions: true,
-            streaming: true,
+            text_output: text_generation,
+            responses: text_generation,
+            chat_completions: text_generation,
+            streaming: text_generation,
             tools: selected_features.contains(&EngineFeature::ToolCalling),
             vision: selected_features.contains(&EngineFeature::Vision),
             structured_output,

@@ -29,8 +29,11 @@ PUBLIC CLIENT
 PUBLIC NORTED GATEWAY
     ├── GET  /health                 (minimal liveness, never key-authorized control)
     ├── GET  /v1/models              ┐
-    ├── POST /v1/responses           ├ authenticated together when required
-    └── POST /v1/chat/completions    ┘
+    ├── GET  /v1/models/{model}      │
+    ├── POST /v1/responses           │
+    ├── POST /v1/chat/completions    ├ authenticated together when required
+    ├── POST /v1/completions         │
+    └── POST /v1/embeddings          ┘
               │
        Responses parser ─┐
        Chat parser ──────┴──▶ canonical InferenceRequest
@@ -530,9 +533,13 @@ private upstream JSON/SSE. Output-limit and tool-call terminal reasons map disti
 tool choice, modality, structured output, or sampler behavior is rejected rather than forwarded or
 silently weakened.
 
+Responses is the primary generation API, Chat Completions the modern compatibility API, and Completions the legacy raw-prompt API. `POST /v1/completions` uses a dedicated `CompletionRequest` through the same RuntimeManager routing and leases. It applies generation defaults without chat templates, system messages, or chat context rewriting. llama.cpp uses native `/v1/completions`; q27 shares its existing raw response/stream protocol and exact-runtime capability checks. NInfer rejects this capability.
+
+`POST /v1/embeddings` uses `EmbeddingRequest` and ordered numeric `EmbeddingOutput` vectors through RuntimeManager. The adapter's model-specific capability check rejects unproven models before JIT loading. Bounded inspection reads `<architecture>.pooling_type` from actual GGUF bytes for both raw and package-managed artifacts: only mean/CLS/last (1/2/3) prove pooled embeddings. This is technical metadata, independent of Builder lineage. llama.cpp checks that its exact binary advertises embedding mode, launches with `--embedding`, and leaves pooling native. The adapter validates vector count, indexes, dimensions, finite values, and usage accounting; the public layer owns float/base64 formatting. q27 and NInfer remain unsupported. Supplied `dimensions` and token-array inputs fail explicitly. See the [README embedding example](../README.md#secure-serving-and-openai-compatible-apis) for the supported public contract.
+
 Public middleware assigns an independent `req_...` ID and returns it as `x-request-id` on success, JSON errors, and streams. `X-Client-Request-Id` is accepted only as ASCII correlation metadata up to 512 characters. Authentication runs before bounded JSON extraction; inference bodies are capped at 32 MiB. Errors share the OpenAI-style `error { message, type, param, code }` envelope and map internal conditions deliberately without local paths, private addresses, credentials, or debug text. No permissive CORS layer is installed. NInfer follows this same canonical path; its upstream Responses/Anthropic/state surfaces are not proxied into a second public surface.
 
-`GET /v1/models` remains the audited OpenAI-style list with exactly `id`, `object`, `created`, and `owned_by`. Runtime metadata and NInfer model/weights identities remain private control-plane state rather than leaking into this public compatibility surface; local `models info` may show the typed identity.
+`GET /v1/models` and `GET /v1/models/{model}` share model construction; retrieval returns a sanitized 404 for a missing Model Profile. Each model has exactly `id`, `object`, `created`, and `owned_by`. Runtime metadata and NInfer model/weights identities remain private control-plane state rather than leaking into this public compatibility surface; local `models info` may show the typed identity.
 
 The richer `ModelServingCapabilities` view is local/private: it derives format, compatible
 registered engines, compatible installed runtimes, resolved runtime, active state, and gateway
