@@ -32,6 +32,7 @@ pub enum InstalledModelAction {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ModelProfileAction {
+    Benchmark,
     Load,
     Unload,
     Model,
@@ -68,6 +69,8 @@ impl DownloadJobAction {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum HoverTarget {
+    BenchmarkRow(usize),
+    BenchmarkAction(crate::benchmarks::Action),
     Navigation(Screen),
     ModelLibraryTab(ModelLibraryView),
     ModelSearchField,
@@ -121,6 +124,7 @@ pub enum HoverTarget {
 
 #[derive(Debug, Clone, Default)]
 pub struct UiLayout {
+    pub benchmarks: crate::benchmarks::BenchmarkLayout,
     pub too_small: bool,
     pub compact: bool,
     pub model_row_height: u16,
@@ -1396,7 +1400,10 @@ impl UiLayout {
                         2
                     },
                 );
-                let mut actions = vec![(ModelProfileAction::Load, 8)];
+                let mut actions = vec![
+                    (ModelProfileAction::Load, 8),
+                    (ModelProfileAction::Benchmark, 21),
+                ];
                 if app.selected_profile_is_active() {
                     actions.push((ModelProfileAction::Unload, 10));
                 }
@@ -1521,6 +1528,11 @@ impl UiLayout {
         };
 
         Self {
+            benchmarks: if app.screen == Screen::Benchmarks {
+                crate::benchmarks::BenchmarkLayout::calculate(content, &app.benchmarks)
+            } else {
+                Default::default()
+            },
             too_small: false,
             compact,
             model_row_height,
@@ -1718,6 +1730,16 @@ impl UiLayout {
             .find(|(_, area)| contains(*area, position))
         {
             return Some(HoverTarget::Navigation(*screen));
+        }
+        for (action, rect) in &self.benchmarks.actions {
+            if contains(*rect, position) {
+                return Some(HoverTarget::BenchmarkAction(*action));
+            }
+        }
+        for (index, rect) in &self.benchmarks.rows {
+            if contains(*rect, position) {
+                return Some(HoverTarget::BenchmarkRow(*index));
+            }
         }
         if contains(self.model_jobs_action, position) {
             return Some(HoverTarget::ModelDownloadsView);
@@ -2078,7 +2100,7 @@ impl UiLayout {
                     }
                 }
                 Screen::Server => {}
-                Screen::Logs | Screen::Help => {}
+                Screen::Logs | Screen::Help | Screen::Benchmarks => {}
             },
         }
 

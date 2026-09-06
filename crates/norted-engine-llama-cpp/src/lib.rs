@@ -1433,6 +1433,36 @@ impl EngineAdapter for LlamaCppAdapter {
         revalidate_norted_package_before_launch_with_progress(&spec.model, &progress).await
     }
 
+    async fn confirm_request_stopped(
+        &self,
+        process: &ProcessDescriptor,
+    ) -> Result<bool, EngineError> {
+        let endpoint = process
+            .endpoint
+            .as_deref()
+            .ok_or_else(|| EngineError::Operation("missing endpoint".into()))?;
+        // Dropping the SSE body closes its HTTP connection. llama-server's
+        // response reader cancels its tasks on destruction. /slots is handled
+        // by the inference queue, so observe actual slot release, not HTTP health.
+        // Disabled/unknown slots contracts fail closed; never change settings.
+        let response = self
+            .client
+            .get(format!("{endpoint}/slots"))
+            .send()
+            .await
+            .map_err(map_transport_error)?;
+        if !response.status().is_success() {
+            return Ok(false);
+        }
+        let slots: serde_json::Value = response.json().await.map_err(map_transport_error)?;
+        Ok(slots.as_array().is_some_and(|slots| {
+            !slots.is_empty()
+                && slots
+                    .iter()
+                    .all(|slot| slot["is_processing"].as_bool() == Some(false))
+        }))
+    }
+
     async fn health(&self, process: &ProcessDescriptor) -> Result<bool, EngineError> {
         let endpoint = process.endpoint.as_deref().ok_or_else(|| {
             EngineError::Operation("llama.cpp process has no backend endpoint".to_owned())

@@ -37,6 +37,7 @@ pub fn render_screen(
         Screen::Overview => render_overview(frame, area, app, theme, glyphs, ui_layout),
         Screen::Models => render_models(frame, area, app, theme, glyphs, ui_layout),
         Screen::ModelProfiles => render_model_profiles(frame, area, app, theme, ui_layout),
+        Screen::Benchmarks => crate::benchmarks::render(frame, app, theme, glyphs, ui_layout),
         Screen::Runtimes => render_runtimes(frame, area, app, theme, glyphs, ui_layout),
         Screen::Server => render_server(frame, area, app, theme, glyphs, ui_layout),
         Screen::Logs => render_logs(frame, area, app, theme, ui_layout),
@@ -2454,6 +2455,14 @@ fn render_model_profile_actions(
     let active = app.selected_profile_is_active();
     for (action, area) in &ui_layout.model_profile_actions {
         let (label, state) = match action {
+            ModelProfileAction::Benchmark => (
+                "[ b Run benchmark ]",
+                if has_model && app.control.is_some() {
+                    ActionState::Normal
+                } else {
+                    ActionState::Disabled
+                },
+            ),
             ModelProfileAction::Load => (
                 "[ Load ]",
                 if has_model && app.control.is_some() && !active && !app.control_busy() {

@@ -82,6 +82,7 @@ struct ManagedProcess {
 
 enum ProcessCommand {
     Terminate {
+        immediate: bool,
         response: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -239,7 +240,10 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         let (response, completed) = oneshot::channel();
         if managed
             .commands
-            .send(ProcessCommand::Terminate { response })
+            .send(ProcessCommand::Terminate {
+                response,
+                immediate: false,
+            })
             .await
             .is_err()
         {
@@ -281,6 +285,52 @@ impl ProcessSupervisor for TokioProcessSupervisor {
                     ))
                 }
             }
+        }
+    }
+
+    async fn terminate_immediately(&self, process: &ProcessDescriptor) -> Result<(), EngineError> {
+        let managed = self
+            .inner
+            .processes
+            .read()
+            .await
+            .get(&process.supervisor_id)
+            .cloned()
+            .ok_or_else(|| EngineError::Operation("managed process is not tracked".into()))?;
+        if managed.descriptor.process_id != process.process_id {
+            return Err(EngineError::Operation(
+                "managed process identity mismatch".into(),
+            ));
+        }
+        if managed.exit.borrow().is_some() {
+            return Ok(());
+        }
+        let (response, completed) = oneshot::channel();
+        let sent = managed
+            .commands
+            .send(ProcessCommand::Terminate {
+                response,
+                immediate: true,
+            })
+            .await;
+        if sent.is_err() {
+            return if managed.exit.borrow().is_some() {
+                Ok(())
+            } else {
+                Err(EngineError::Operation(
+                    "managed cancellation channel closed".into(),
+                ))
+            };
+        }
+        let result = tokio::time::timeout(Duration::from_secs(4), completed)
+            .await
+            .map_err(|_| EngineError::TimedOut("managed immediate termination".into()))?
+            .map_err(|_| EngineError::Operation("managed cancellation response closed".into()))?
+            .map_err(EngineError::Operation);
+        if result.is_err() && managed.exit.borrow().is_some() {
+            Ok(())
+        } else {
+            result
         }
     }
 
@@ -358,10 +408,10 @@ async fn run_child_actor(actor: ChildActor) {
     let result = tokio::select! {
         result = child.wait() => result,
         command = commands.recv() => {
-            if let Some(ProcessCommand::Terminate { response }) = command {
+            if let Some(ProcessCommand::Terminate { response, immediate }) = command {
                 expected = true;
                 termination_response = Some(response);
-                terminate_child(&mut child, descriptor.process_id, termination_timeout).await
+                terminate_child(&mut child, descriptor.process_id, if immediate { Duration::ZERO } else { termination_timeout }).await
             } else {
                 child.wait().await
             }

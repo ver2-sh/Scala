@@ -98,6 +98,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 })
                 .await?;
         }
+        Command::Benchmarks(args) => {
+            let client = norted_engine::ControlClient::discover(&core.paths).await?;
+            let response = client.benchmark(args.command.into()).await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!("{}", norted_engine::benchmark::inspection_text(&response));
+            }
+        }
         Command::Status => output::status(core, cli.json).await?,
         Command::Auth(args) => {
             handle_auth(&core, args.command, cli.json).await?;
