@@ -1,0 +1,30 @@
+Settings-editor-46x13
+ Parallel downloads [server.max_parallel_mode
+ Applies now · Server operations
+ Parent: not yet known
+ Settings layer: absent (Inherited)
+ non-negative integer (1 to 16)
+ ↑↓/Tab · Enter save · Esc     [F1 More info]
+ (●) Inherit from server baseline
+ ( ) Number
+
+
+ [F10 Save]    [ Cancel ]
+
+
+
+ModelProfiles-editor-46x13
+ Flash attention [llama.cpp.flash_attn]
+ Applies on next load · Profile / review-prof
+ Settings layer: not yet known
+ Profile layer: absent (Inherited)
+ true or false
+ ↑↓/Tab · Enter save · Esc     [F1 More info]
+ (●) Inherit from Settings
+ ( ) Enabled
+ ( ) Disabled
+
+ [F10 Save]    [ Cancel ]
+
+
+

@@ -40,11 +40,25 @@ pub fn section_title<'a>(title: &'a str, subtitle: &'a str, theme: &Theme) -> Pa
     .wrap(Wrap { trim: true })
 }
 
+pub fn model_content_layout(area: Rect, compact: bool) -> std::rc::Rc<[Rect]> {
+    Layout::vertical([
+        Constraint::Length(if compact { 3 } else { 4 }),
+        Constraint::Min(1),
+    ])
+    .split(area)
+}
+
 pub fn content_layout(area: Rect, compact: bool) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(if compact { 3 } else { 4 }),
+            Constraint::Length(if area.height < 10 {
+                2
+            } else if compact {
+                3
+            } else {
+                4
+            }),
             Constraint::Min(3),
         ])
         .split(area)
@@ -461,6 +475,57 @@ pub fn load_progress_compact(
         let remaining = inner_width.saturating_sub(bar.chars().count());
         let full_bar = bar + &track.repeat(remaining);
         format!("{phase} {full_bar}")
+    }
+}
+
+/// Shared geometry for inventory headings and rows. Width depends only on the table.
+pub fn inventory_columns(area: Rect, wide: &[u16], compact: &[u16]) -> Vec<Rect> {
+    let tails = if area.width >= 85 { wide } else { compact };
+    let reserved: u16 = tails.iter().map(|width| width + 1).sum();
+    let mut widths = vec![area.width.saturating_sub(reserved)];
+    widths.extend_from_slice(tails);
+    let mut x = area.x;
+    widths
+        .into_iter()
+        .map(|width| {
+            let cell = Rect::new(
+                x,
+                area.y,
+                width.min(area.right().saturating_sub(x)),
+                area.height,
+            );
+            x = x.saturating_add(width + 1);
+            cell
+        })
+        .collect()
+}
+
+pub fn inventory_row(
+    frame: &mut Frame<'_>,
+    row: Rect,
+    columns: &[Rect],
+    values: &[String],
+    style: ratatui::style::Style,
+    glyphs: &Glyphs,
+) {
+    if row.width == 0 || row.height == 0 {
+        return;
+    }
+    frame.render_widget(Paragraph::new("").style(style), row);
+    for (index, (column, value)) in columns.iter().zip(values).enumerate() {
+        frame.render_widget(
+            Paragraph::new(
+                if index == 0 && display_width(value) > column.width as usize {
+                    let width =
+                        (column.width as usize).saturating_sub(display_width(glyphs.ellipsis));
+                    format!("{}{}", display_prefix(value, width), glyphs.ellipsis)
+                } else {
+                    truncate_middle(value, column.width as usize, glyphs.ellipsis)
+                },
+            )
+            .style(style),
+            Rect::new(column.x, row.y, column.width, 1),
+        );
     }
 }
 

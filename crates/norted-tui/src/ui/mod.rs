@@ -4,7 +4,7 @@ pub(crate) mod layout;
 mod model_runtime;
 mod profile_engine;
 mod runtime_search;
-mod screens;
+pub(crate) mod screens;
 mod shell;
 
 use ratatui::Frame;
@@ -41,6 +41,32 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) -> UiLayout {
         return layout;
     }
 
+    if let Some(text) = &app.detail_text {
+        let body = ratatui::layout::Rect::new(
+            area.x + 1,
+            area.y + 2,
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(3),
+        );
+        let paragraph = ratatui::widgets::Paragraph::new(text.as_str())
+            .wrap(ratatui::widgets::Wrap { trim: false });
+        let max = paragraph
+            .line_count(body.width)
+            .saturating_sub(body.height as usize)
+            .min(u16::MAX as usize) as u16;
+        app.detail_scroll = app.detail_scroll.min(max);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new("[ Esc / D: Back ]  Details  |  Up/Down: scroll")
+                .style(theme.accent),
+            ratatui::layout::Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1),
+        );
+        frame.render_widget(paragraph.scroll((app.detail_scroll, 0)), body);
+        return UiLayout {
+            content: area,
+            ..UiLayout::default()
+        };
+    }
+
     if app
         .settings_input
         .as_ref()
@@ -51,6 +77,35 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) -> UiLayout {
     }
     shell::render_header(frame, app, &theme, &glyphs, &layout);
     screens::render_screen(frame, app, &theme, &glyphs, &layout);
+    if layout.model_jobs_action.height > 0 {
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(if app.downloads_focused {
+                "[ Esc Back ]"
+            } else {
+                "[ J Jobs ]"
+            })
+            .style(
+                if app.hover == Some(layout::HoverTarget::ModelDownloadsView) {
+                    theme.accent.patch(theme.hovered)
+                } else {
+                    theme.accent
+                },
+            ),
+            layout.model_jobs_action,
+        );
+    }
+    if layout.inspection_action.height > 0 {
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new("[ D Details ]").style(
+                if app.hover == Some(layout::HoverTarget::InspectionDetails) {
+                    theme.accent.patch(theme.hovered)
+                } else {
+                    theme.accent
+                },
+            ),
+            layout.inspection_action,
+        );
+    }
     shell::render_command_bar(frame, layout.command_bar, app, &theme, &glyphs);
     shell::render_footer(frame, layout.footer, app, &theme, &glyphs);
     command_palette::render_overlays(frame, app, &theme, &glyphs, &layout);

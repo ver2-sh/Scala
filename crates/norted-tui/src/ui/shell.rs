@@ -158,7 +158,11 @@ pub fn render_command_bar(
     frame.render_widget(
         Paragraph::new(input).block(
             Block::default()
-                .borders(Borders::TOP | Borders::BOTTOM)
+                .borders(if area.height < 3 {
+                    Borders::NONE
+                } else {
+                    Borders::TOP | Borders::BOTTOM
+                })
                 .border_set(glyphs.border)
                 .border_style(focused)
                 .padding(Padding::horizontal(1)),
@@ -178,6 +182,7 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
         vec![
             hint("Enter", "apply / search", theme),
             hint("Esc", "cancel", theme),
+            hint("D", "details", theme),
             hint(glyphs.up_down, "select", theme),
             hint("s", "search available", theme),
             hint("x/Del", "clear override", theme),
@@ -187,6 +192,7 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
         vec![
             hint("Enter/i", "install", theme),
             hint("Esc", "close", theme),
+            hint("D", "details", theme),
             hint("Tab", "query/results", theme),
             hint(glyphs.up_down, "select", theme),
         ]
@@ -197,7 +203,19 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
             hint("Esc", "cancel", theme),
         ]
     } else if app.focus == FocusArea::Content && app.screen == Screen::Models {
-        models_footer(app, area.width, theme, glyphs)
+        if app.downloads_focused {
+            vec![
+                hint("J/Esc", "back", theme),
+                hint(glyphs.up_down, "job", theme),
+                if app.selected_model_download_job_is_controllable() {
+                    hint("p/x", "pause/cancel", theme)
+                } else {
+                    hint("D", "diagnostics", theme)
+                },
+            ]
+        } else {
+            models_footer(app, area.width, theme, glyphs)
+        }
     } else {
         match (app.focus, app.screen) {
             (FocusArea::Navigation, _) => vec![
@@ -393,5 +411,8 @@ pub fn set_command_cursor(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .saturating_add(2)
         .saturating_add(window.cursor_column)
         .min(area.right().saturating_sub(2));
-    frame.set_cursor_position(Position::new(cursor_x, area.y + 1));
+    frame.set_cursor_position(Position::new(
+        cursor_x,
+        area.y + u16::from(area.height >= 3),
+    ));
 }
