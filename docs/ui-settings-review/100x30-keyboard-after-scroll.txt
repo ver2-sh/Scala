@@ -1,0 +1,29 @@
+   ◆  NORTED SERVER  local runtime control                                         ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+
+      Server  llama.cpp  NInfer  q27
+     Baseline      0.10.0 / CUDA / w12
+     Applies       Next load
+     [ / Search ]  [ o Overrides ]     [ R Reset scope ]  [ i Details ]
+     Setting                      Value                 Source             Action     Status
+     GENERATION
+     Min P                        0.0                   Runtime default    —
+     Random seed                  0                     Runtime default    —
+     Temperature                  0.0                   Runtime default    —
+     Top K                        0                     Runtime default    —
+     Top P                        1.0                   Runtime default    —
+     REASONING
+     Enable thinking              off                   Runtime default    —
+      Setting · i expand/close · [ ] scroll ───────────────────────────────────────────────────
+     Identifier: q27.seed
+     Description: Configured numeric q27 request seed; q27 does not implement the `random`
+     sentinel
+     Effective value: 0
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+    !  Settings saved; operational changes apply now and model settings on the next load
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+   Left/Right scope   ↑↓ setting   Enter edit   Delete inherit   ? help

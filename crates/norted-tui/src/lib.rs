@@ -219,6 +219,9 @@ pub async fn run(
                 Some(Ok(Event::Paste(text))) => app.handle_paste(&text),
                 Some(Ok(Event::Resize(_, _))) => {
                     app.clear_hover();
+                    if matches!(app.screen, app::Screen::Settings | app::Screen::ModelProfiles) {
+                        app.settings_scroll = app.settings_setting_index;
+                    }
                     Update::Render
                 },
                 Some(Ok(_)) => Update::None,

@@ -1,0 +1,29 @@
+   ◆  NORTED SERVER  local runtime control                                         ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+
+      Server  llama.cpp  NInfer  q27
+     Settings / Max parallel downloads
+     [invalid_]
+     [ Save ]         [ Cancel ]
+     setting `server.max_parallel_model_downloads` value `invalid` is invalid: expected a
+     non-negative integer
+
+
+
+
+
+
+
+
+
+
+
+
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+    !  setting `server.max_parallel_model_downloads` value `invalid` is invalid: expected a no
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+   Left/Right scope   ↑↓ setting   Enter edit   Delete inherit   ? help
