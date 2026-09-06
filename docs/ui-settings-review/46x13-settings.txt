@@ -1,0 +1,13 @@
+ ◆  NORTED SERVER              ●  API Running
+  Overview  Models  Model Profiles  Runtimes
+  Server  Logs  Settings  Help
+ ────────────────────────────────────────────
+   Server  llama.cpp  NInfer  q27
+  [ / ]  [ o ]    [ R ]  [ i ]
+  Setting      Value       Source   Action
+  GENERAL
+  Conte…length auto        Runtime  —
+ ────────────────────────────────────────────
+  ›  Press / to run a command
+ ────────────────────────────────────────────
+ Left/Right scope   ↑↓ setting   ? help

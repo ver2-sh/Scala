@@ -1,0 +1,30 @@
+   ◆  NORTED SERVER  local runtime control                                         ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+          ┌ Runtime search ──────────────────────────────────────────────────────────────┐
+   ───────│                                                                              │───────
+          │  Search  filter by runtime, backend, accelerator, or format    [ Search ]    │
+     Runti│  [ ] Show incompatible                                                       │ils ]
+     Insta│                                                                              │
+          │  Runtime candidate               Version      Compatibility    State         │
+          │  > llama.cpp b9000 CPU package   b9000        compatible       Installed     │
+     gguf │    llama.cpp b8999 CPU package   b8999        needs attention  Installed     │
+     q27  │  Selected candidate | D: full details                                        │
+     ninfe│  ENGINE            llama.cpp                                                 │
+     Engin│  VERSION           b9000                                                     │
+     > lla│  TARGET            linux / x86_64                                            │ed
+       lla│  BACKEND           cpu / avx2                                                │ed
+       lla│  FORMATS           GGUF                                                      │ed
+          │  ACQUIRE           verified release download                                 │
+     Selec│  SIZE              9.5 MiB                                                   │
+     Candi│  PROVIDER          github                                                    │
+     Versi│  SOURCE            ggml-org/llama.cpp                                        │
+     [ Sea│  FIT               compatible                                                │
+     Selec│                                                                              │
+     [ GGU│                                                                              │
+          │  Installed              D: details                               [ Close ]   │
+   ───────│                                                                              │───────
+    ›  Pre└──────────────────────────────────────────────────────────────────────────────┘
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+   Enter/i install   Esc close   D details   Tab query/results   ↑↓ select
+

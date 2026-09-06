@@ -1,0 +1,29 @@
+   ◆  NORTED SERVER  local runtime control                                         ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+
+      Server  llama.cpp  NInfer  q27
+     Baseline      Server operational defaults
+     Applies       Immediately
+     [ / Search ]  [ o Overrides ]     [ R Reset scope ]  [ i Details ]
+     Setting                      Value                 Source             Action     Status
+     DOWNLOADS
+     Max parallel downloads       7                     Settings           Inherit
+
+
+
+
+
+
+      Setting · i expand/close · [ ] scroll ───────────────────────────────────────────────────
+     Identifier: server.max_parallel_model_downloads
+     Description: Maximum number of separate model acquisitions that may download at once;
+     additional downloads wait in FIFO order
+     Effective value: 7
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+    !  Settings saved; operational changes apply now and model settings on the next load
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+   Left/Right scope   ↑↓ setting   Enter edit   Delete inherit   ? help

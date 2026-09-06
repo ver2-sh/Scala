@@ -1,0 +1,30 @@
+   ◆  NORTED SERVER  local runtime control                                         ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+
+     Model Library                                                                [ D Details ]
+       Installed    [ Discover · Hugging Face ] [ J Jobs ]
+     Search: [Search Hugging Face models…]                                           [ Search ]
+
+     Format [ All ] [ GGUF ] [ Q27 ] [ NInfer ]
+
+     Artifact                      Repository         Format  Size      State
+     > long-artifact-variant-0.gg… publishe…rch-model gguf    3.7 GiB   Candidate  [ Download ]
+       long-artifact-variant-1.gg… publishe…rch-model gguf    3.7 GiB   Candidate  [ Download ]
+       long-artifact-variant-2.gg… publishe…rch-model gguf    3.7 GiB   Candidate  [ Download ]
+       long-artifact-variant-3.gg… publishe…rch-model gguf    3.7 GiB   Candidate  [ Download ]
+       long-artifact-variant-4.gg… publishe…rch-model gguf    3.7 GiB   Candidate  [ Download ]
+     Selected item  |  D: full details
+     Artifact: long-artifact-variant-0.gguf
+     Downloads  1 active · 0 queued · limit 4
+     > ↓ artifact-0.gguf  publisher/long-repository-name                            [ × ] [ Ⅱ ]
+     ██████████████████────────────────────────────────────────────────────────────────────────
+     Downloading · 95.4 MiB / unknown
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+    ›  Press / to run a command
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+   Left/Right view   e search   f format   Up/Down select   d download   p pause/resume
+

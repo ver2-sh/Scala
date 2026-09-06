@@ -1,0 +1,29 @@
+   ◆  NORTED SERVER  local runtime control                                         ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+
+      Server  llama.cpp  NInfer  q27
+     Baseline      0.10.0 / CUDA / w12
+     Applies       Next load
+     [ / r…fort ]  [ o Overrides ]     [ R Reset scope ]  [ i Details ]
+     Setting                      Value                 Source             Action     Status
+     REASONING
+     Reasoning effort             high                  Settings           Inherit    Invalid
+
+
+
+
+
+
+      Setting · i expand/close · [ ] scroll ───────────────────────────────────────────────────
+     Identifier: q27.reasoning_effort
+     Description: Qwen3.8 trained-template process default; explicit request effort may
+     override it without changing this setting
+     Effective value: high
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+    !  ted-runtime diagnostics: q27: setting `q27.reasoning_effort` is unsupported: the exact
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+   Left/Right scope   ↑↓ setting   Enter edit   Delete inherit   ? help

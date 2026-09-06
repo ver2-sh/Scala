@@ -1,0 +1,29 @@
+   ◆  NORTED SERVER  local runtime control                                         ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+
+      ‹  zz-long-profile-name-for-review-with-shared-prefix-and-distinct-tail                ›
+      Setting · i expand/close · [ ] scroll ───────────────────────────────────────────────────
+     Source: model profile
+     Applies: Next load
+     Runtime baseline (read-only): 262144
+     Settings layer: 262144
+     Profile layer: 32768
+     Inherit target: Settings
+     Baseline policy: Selected GGUF metadata `gemma4.context_length`
+     Constraints: non-negative integer (at least 1)
+     Profile: zz-long-profile-name-for-review-with-shared-prefix-and-distinct-tail
+     Engine: llama.cpp
+     Role: Primary
+     Model path:
+     /srv/norted/models/huggingface/llmfan46/gemma-4-31B-it-uncensored-heretic-GGUF/eee61b81461
+     ac75eb920a24ca9e5d420bb66e33d/bd79402490823028/gemma-4-31B-it-uncensored-heretic-Q6_K.gguf
+     Runtime ID: llama-cpp-b10786-linux-x86-64-cuda-managed-portable-cuda13-v2-dfd3cf2dd6aaaddc
+     [ / Search ]  [ o Overrides ]     [ R Reset scope ]  [ i Details ]
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+    ›  Press / to run a command
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+   Left/Right profile   ↑↓ setting   Enter edit   e change engine   l load profile   ? help

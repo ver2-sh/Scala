@@ -1,0 +1,43 @@
+
+   ◆  NORTED SERVER  local runtime control                                                                                                     ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+      Server
+                             Baseline      b10786 / CUDA / managed-portable-cuda13-v2
+      llama.cpp              Applies       Next load
+                             [ / c…ange ]  [ o Overrides ]     [ R Reset scope ]  [ i Details ]
+      NInfer                 Setting                    Value                Source           Action     Status     Setting · i expand/close · [ ] scroll ─
+                             LOAD                                                                                  Identifier: llama.cpp.cpu_range
+      q27                    CPU affinity range         Default n… yet known Runtime default  —                    Description: Generation-thread CPU
+                             Batch CPU affinity range   Default n… yet known Runtime default  —                    affinity range
+                             SPECULATION                                                                           Effective value: Default not yet known
+                             Draft CPU range            Default n… yet known Runtime default  —                    Source: runtime
+                                                                                                                   Applies: Next load
+                                                                                                                   Runtime baseline (read-only): not yet
+                                                                                                                   known
+                                                                                                                   Parent: not yet known
+                                                                                                                   Settings layer: absent (Inherited)
+                                                                                                                   Inherit target: runtime
+                                                                                                                   Constraints: non-empty text
+                                                                                                                   Runtime ID:
+                                                                                                                   llama-cpp-b10786-linux-x86-64-cuda-manag
+                                                                                                                   ed-portable-cuda13-v2-dfd3cf2dd6aaaddc
+
+
+
+
+
+
+
+
+
+
+
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    ›  Press / to run a command
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Left/Right scope   ↑↓ setting   Enter edit   Delete inherit   ? help

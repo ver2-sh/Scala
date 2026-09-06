@@ -1,0 +1,13 @@
+ ◆  NORTED SERVER              ●  API Running
+  Overview  Models  Model Profiles  Runtimes
+  Server  Logs  Settings  Help
+ ────────────────────────────────────────────
+  [ Esc Back ]                 [ D Details ]
+  Downloads  1 active · 0 queued · limit 4
+  > ↓ artifact-0.gguf  publisher/lon [×] [Ⅱ]
+  ████████──────────────────────────────────
+  Downloading · 95.4 MiB / unknown
+
+
+  ›  Press / to run a command
+ J/Esc back   ↑↓ job   p/x pause/cancel

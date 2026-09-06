@@ -21,7 +21,7 @@ ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 ## Models, Settings, Model Profiles, and Runtimes
 
 - Models is artifact inventory: format, path, size, technical capability, and provenance.
-- Settings contains Server Settings plus llama.cpp, NInfer, and q27 runtime defaults.
+- Settings separates Server operations from independent llama.cpp, NInfer, and q27 overrides.
 - Model Profiles are user-created mutable serving targets and the normal load unit.
 - Runtimes are installed executable implementations selected for the profile's bound engine.
 
@@ -33,7 +33,7 @@ the `model` value accepted by inference requests.
 Effective settings use one typed system with this complete precedence:
 
 ```text
-selected-runtime defaults
+runtime defaults → Settings runtime overrides
   → Model Profile overrides
   → ephemeral invocation overrides
 ```
@@ -49,7 +49,7 @@ winning layer remain invalid.
 Persistent state is deliberately split:
 
 ```text
-<data>/settings.json         schema 3: Server Settings and strictly namespaced runtime defaults
+<data>/settings.json         schema 3: Server Settings and strictly namespaced Settings overrides
 <data>/model-profiles.json   schema 2: user-owned Model Profiles
 ```
 
@@ -162,10 +162,10 @@ Common semantic definitions and runtime-specific settings share `SettingId`, `Se
 General, Downloads, Load, Generation, Reasoning, Prompt, KV / Memory, Speculation, Cache, and
 Advanced. Server-operational definitions appear only in Server Settings. Common inference semantics
 are defined once in code, then bound independently into each runtime's categories; a Runtime or
-Model Profile editor shows only the selected runtime's supported schema.
+Model Profile editor shows the selected runtime's schema, including unsupported fields for diagnosis and removal.
 
-Every supported effective setting is presented as a concrete value followed by its winning source,
-for example `1.0 (runtime default)`, `0.7 (model profile)`, or `200000 (boot inference)`.
+Known effective settings show their value and winning source; unknown pre-start defaults remain explicitly unknown,
+for example `1.0 (runtime default)`, `0.7 (Settings override)`, `0.5 (model profile)`, or `200000 (boot inference)`.
 Source text supplements the value and never replaces it. Dynamic runtime/model/host derivations
 remain part of the runtime-default layer and carry optional secondary detail. A genuine `auto`
 policy remains automatic before startup; presenting it never causes Norted to materialize an
@@ -282,7 +282,7 @@ explicit load --runtime
   → best compatible installed fallback
 ```
 
-Every candidate is checked through the selected engine's model+runtime+host compatibility contract as well as the artifact format, adapter, host, and exact installed manifest. The same decision is used for explicit selection, stored overrides/defaults, candidate listing, automatic fallback, and final load admission. When a persisted selection is missing or invalid, fallback is reported rather than hidden. Selecting an older runtime is the rollback mechanism.
+Every candidate is checked through the selected engine's model+runtime+host compatibility contract as well as the artifact format, adapter, host, and exact installed manifest. The same decision is used for explicit selection, stored overrides/defaults, candidate listing, automatic fallback, and final load admission. A missing or incompatible persisted selection is reported as an error; select another runtime explicitly. Selecting an older runtime is the rollback mechanism.
 
 ## Official providers and compatibility
 
@@ -529,7 +529,17 @@ cargo run -p norted-server -- tui
 
 At startup the TUI safely chooses one of two modes: it attaches to a healthy instance discovered through the existing runtime descriptor, public identity probe, and authenticated private control `status`, or it starts and owns the same serving composition used by headless `serve`. In owned mode the configured OpenAI-compatible endpoint is live while the TUI runs. Exiting shuts down the owned listeners and all managed backends and removes the owned descriptor; exiting an attached TUI leaves the external server running.
 
-Its top-level pages are Overview, Models, Model Profiles, Runtimes, Server, Logs, Settings, and Help. Models is an integrated Model Library: Installed preserves the local artifact/profile/runtime workflow, while Discover provides Hugging Face query editing, format filtering, repository-qualified artifact details, compact revision and size, known companion/package-manifest status, live download bytes, and explicit managed removal. Identical filenames from different repositories remain visibly distinct and retain their exact repository-qualified download reference. Remote rows say compatibility is unverified; the existing runtime picker continues to provide proven engine/runtime/host compatibility after acquisition. Model Profiles lists, creates, duplicates, deletes, rebinds, edits, validates, and loads user serving targets; it displays missing/incompatible state, active identity, and concrete effective values with source annotations. Settings shows Server, llama.cpp, q27, and NInfer scopes; there is no Global or Common inference page. The Server view and CLI status expose each backend's ordered physical GPU UUID binding. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Incompatible candidates are hidden by default and can be revealed with the keyboard- and mouse-accessible `Show incompatible` checkbox; Recommended, Compatible, and Needs Attention results remain visible. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Installed source-runtime details include short commit/tree, recipe, Make or CMake, and CUDA provenance.
+Its top-level pages are Overview, Models, Model Profiles, Runtimes, Server, Logs, Settings, and Help. Models is an integrated Model Library: Installed preserves the local artifact/profile/runtime workflow, while Discover provides Hugging Face query editing, format filtering, repository-qualified artifact details, compact revision and size, known companion/package-manifest status, live download bytes, and explicit managed removal. Repository columns and full selected-artifact details distinguish identical filenames and retain their exact repository-qualified download reference. Remote rows remain format candidates; full details explain that compatibility is unverified, and the existing runtime picker continues to provide proven engine/runtime/host compatibility after acquisition. Model Profiles lists, creates, duplicates, deletes, rebinds, edits, validates, and loads user serving targets; it displays missing/incompatible state, active identity, and concrete effective values with source annotations. Settings shows Server, llama.cpp, q27, and NInfer scopes; there is no Global or Common inference page. The Server view and CLI status expose each backend's ordered physical GPU UUID binding. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Incompatible candidates are hidden by default and can be revealed with the keyboard- and mouse-accessible `Show incompatible` checkbox; Recommended, Compatible, and Needs Attention results remain visible. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Full installed-runtime details retain commit/tree, recipe, Make or CMake, and CUDA provenance.
+
+Inventory rows use aligned columns; full paths, concrete runtime IDs, provenance and diagnostics are available with **D** (Shift+d) or **[ D Details ]**. Escape returns to the same view; arrows, Page Up/Down, Home/End and the mouse wheel scroll the details. Details capture the selected identity, so a background refresh cannot replace the item being read. This shortcut applies to Overview, Models, Runtimes, Server, Logs and Help, and to runtime dialog results. Model Profiles keeps its existing **D** duplicate action and Settings/Profile editors keep **i** details.
+
+- **Installed models:** **f** edits a local name/path filter. Enter or Escape finishes editing; Escape outside the editor clears the filter, and Ctrl+U clears its input. No search service is involved.
+- **Discover:** **f** and the format buttons filter already fetched results. Only explicit Search/Enter requests another upstream search. Exact repository, revision, filename, companions and provenance remain in details.
+- **Downloads:** **J** or **[ J Jobs ]** opens the focused job list; **J/Escape** or **[ Esc Back ]** returns. Arrows/wheel select among all jobs, including recent failures. **p** pauses/resumes and **x** cancels only when supported by the job phase. **D** reads the selected job's complete diagnostic. Unknown totals, rates and ETA remain unknown.
+- **Logs:** Up/Down reads history, **End** follows latest, and **D** opens complete multiline messages. New entries preserve the history position while follow mode is off.
+
+The 46×13 layout retains selection and essential actions using fewer columns and focused details. Runtime format defaults, explicit model bindings and observed in-use runtimes remain distinct. Server rows associate each resident profile with its own engine/version, lifecycle, request count and private endpoint; full backend/device details remain grouped by profile. [Render review and validation](docs/ui-inventory-review/README.md).
+
 
 The Models download panel presents active, queued, completed, and failed acquisitions independently
 with phase, progress bar, bytes, percentage, measured rate, ETA, and FIFO position whenever those

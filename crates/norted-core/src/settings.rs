@@ -172,6 +172,46 @@ pub enum SettingKind {
 }
 
 impl SettingKind {
+    pub fn constraints(&self) -> String {
+        fn bounds<T: std::fmt::Display>(minimum: &Option<T>, maximum: &Option<T>) -> String {
+            match (minimum, maximum) {
+                (Some(low), Some(high)) => format!(" ({low} to {high})"),
+                (Some(low), None) => format!(" (at least {low})"),
+                (None, Some(high)) => format!(" (at most {high})"),
+                (None, None) => String::new(),
+            }
+        }
+        match self {
+            Self::Toggle => "true or false".to_owned(),
+            Self::OneWayFlag => "enabled; Inherit removes the flag".to_owned(),
+            Self::Integer { minimum, maximum } => format!("integer{}", bounds(minimum, maximum)),
+            Self::UnsignedInteger { minimum, maximum } => {
+                format!("non-negative integer{}", bounds(minimum, maximum))
+            }
+            Self::UnsignedIntegerOrChoice {
+                minimum,
+                maximum,
+                choices,
+            } => {
+                let mut text = format!("non-negative integer{}", bounds(minimum, maximum));
+                if !choices.is_empty() {
+                    text.push_str(&format!(" or {}", choices.join(", ")));
+                }
+                text
+            }
+            Self::Float { minimum, maximum } => {
+                format!("finite number{}", bounds(minimum, maximum))
+            }
+            Self::String => "non-empty text".to_owned(),
+            Self::StringList => "JSON array of non-empty strings".to_owned(),
+            Self::JsonObject => "JSON object".to_owned(),
+            Self::Choice { choices } if choices.is_empty() => "non-empty choice".to_owned(),
+            Self::Choice { choices } => format!("one of: {}", choices.join(", ")),
+            Self::Path => "file path".to_owned(),
+            Self::GpuOffload => "none, auto, all, or an exact layer count".to_owned(),
+        }
+    }
+
     pub fn parse(&self, id: &SettingId, raw: &str) -> Result<SettingValue, SettingsError> {
         let invalid = |reason: String| SettingsError::InvalidValue {
             setting_id: id.clone(),
@@ -431,9 +471,11 @@ pub enum SettingDefaultSource {
 impl std::fmt::Display for SettingDefaultSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Norted | Self::Runtime | Self::Model | Self::Derived | Self::StartupDynamic => {
-                "runtime default"
-            }
+            Self::Norted => "server execution policy",
+            Self::Runtime => "runtime default",
+            Self::Model => "model-dependent runtime default",
+            Self::Derived => "derived runtime default",
+            Self::StartupDynamic => "runtime startup policy",
         })
     }
 }
@@ -537,6 +579,8 @@ impl SettingsPatch {
 pub struct SettingsState {
     pub version: u32,
     pub server_settings: SettingsPatch,
+    /// Explicit Settings overrides, independently owned by each engine. The serialized
+    /// field name is retained as-is so existing user state does not need rewriting.
     pub runtime_defaults: BTreeMap<String, SettingsPatch>,
 }
 
@@ -611,7 +655,7 @@ impl SettingsState {
         })
     }
 
-    /// Resolves the persisted customization of one runtime's default layer.
+    /// Resolves independent, explicit Settings overrides for one engine.
     pub fn resolve_runtime_defaults(
         &self,
         engine_id: &str,
@@ -623,7 +667,7 @@ impl SettingsState {
                 &mut effective,
                 defaults,
                 engine_id,
-                SettingSource::RuntimeDefault,
+                SettingSource::SettingsOverride,
             )?;
         }
         resolve_structured_paths(&mut effective, structured_path_base)?;
@@ -777,6 +821,7 @@ pub async fn bounded_setting_file_sha256(
 #[serde(rename_all = "snake_case", tag = "source")]
 pub enum SettingSource {
     RuntimeDefault,
+    SettingsOverride,
     ModelProfile { model_profile_id: ModelProfileId },
     Invocation,
 }
@@ -785,6 +830,7 @@ impl std::fmt::Display for SettingSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RuntimeDefault => formatter.write_str("runtime default"),
+            Self::SettingsOverride => formatter.write_str("Settings override"),
             Self::ModelProfile { .. } => formatter.write_str("model profile"),
             Self::Invocation => formatter.write_str("invocation"),
         }
@@ -886,6 +932,24 @@ impl SettingsSchema {
             .find(|definition| &definition.id == id)
     }
 
+    /// Preserve stale local keys in editors without claiming that the runtime supports them.
+    pub fn retain_override_definitions(&mut self, settings: &ResolvedSettings) {
+        for id in settings.configured.keys() {
+            if self.definition(id).is_some() {
+                continue;
+            }
+            self.definitions.push(SettingDefinition {
+                id: id.clone(), label: id.to_string(),
+                description: "Stored override is not supported by the selected runtime. Use Inherit to remove it.".to_owned(),
+                kind: SettingKind::String,
+                scope: SettingScope::Runtime { engine_id: self.engine_id.clone() },
+                category: SettingCategory::Advanced, supported: false,
+                unsupported_reason: Some("No definition in the selected runtime schema".to_owned()),
+                unit: None, default_preview: None,
+            });
+        }
+    }
+
     pub fn validate(&self, settings: &ResolvedSettings) -> Result<(), SettingsError> {
         self.validate_contract()?;
         if settings.engine_id != self.engine_id {
@@ -976,10 +1040,10 @@ impl SettingsSchema {
             .iter()
             .filter(|definition| definition.supported)
         {
-            let runtime_default = definition
-                .default_preview
-                .as_ref()
-                .ok_or_else(|| SettingsError::MissingRuntimeDefault(definition.id.clone()))?;
+            let Some(runtime_default) = definition.default_preview.as_ref() else {
+                // Unknown before startup is distinct from unsupported. Do not invent a value.
+                continue;
+            };
             if is_ambiguous_effective_value(&runtime_default.value) {
                 return Err(SettingsError::AmbiguousRuntimeDefault {
                     setting_id: definition.id.clone(),
@@ -1212,8 +1276,6 @@ pub enum SettingsError {
         setting_id: SettingId,
         reason: String,
     },
-    #[error("supported setting `{0}` has no concrete runtime default")]
-    MissingRuntimeDefault(SettingId),
     #[error("supported setting `{setting_id}` has ambiguous runtime default `{value}`")]
     AmbiguousRuntimeDefault {
         setting_id: SettingId,

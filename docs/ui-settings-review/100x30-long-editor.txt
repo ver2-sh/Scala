@@ -1,0 +1,29 @@
+   ◆  NORTED SERVER  local runtime control                                         ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+
+      Server  llama.cpp  NInfer  q27
+     Settings q27 / System prompt
+     [e values accessible. Keep complete values accessible. Keep complete values accessible. _]
+     [ Save ]         [ Cancel ]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+    !  Settings saved; operational changes apply now and model settings on the next load
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+   Left/Right scope   ↑↓ setting   Enter edit   Delete inherit   ? help

@@ -1,0 +1,13 @@
+ ◆  NORTED SERVER              ●  API Running
+  Overview  Models  Model Profiles  Runtimes
+  Server  Logs  Settings  Help
+ ────────────────────────────────────────────
+   ‹  gemma-4-31b-roleplay                ›
+  [ Load ] [ Model ] [ Engine ] [ Role ]
+  [ Copy ]  [ Delete ]         [ Sync ]
+
+  [ / ]  [ o ]    [ R ]  [ i ]   [a Actions]
+ ────────────────────────────────────────────
+  ›  Press / to run a command
+ ────────────────────────────────────────────
+ Left/Right profile   ↑↓ setting   ? help

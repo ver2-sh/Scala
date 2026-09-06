@@ -34,10 +34,10 @@ use norted_engine::{
     LaunchRequest, LaunchSpec, LoadProgressReporter, NativeOption, OutputFormat,
     PreparedAuxiliaryArtifact, PreparedModelInput, ProcessDescriptor, RuntimeCatalogProvider,
     StartupObservation, UpdateState, capture_command, common_setting_definitions_for,
-    compatibility_for, compatibility_for_nvidia_device, configurable_setting_definitions,
-    isolated_cuda_environment, prepare_norted_package_input,
-    prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
-    revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
+    compatibility_for, compatibility_for_nvidia_device, isolated_cuda_environment,
+    prepare_norted_package_input, prepare_norted_package_input_with_progress,
+    revalidate_norted_package_before_launch, revalidate_norted_package_before_launch_with_progress,
+    visible_nvidia_devices,
 };
 use reqwest::redirect::Policy;
 use serde::Deserialize;
@@ -932,49 +932,42 @@ fn q27_runtime_preference(variant: &str, device: Option<&AcceleratorDevice>) -> 
 
 #[derive(Debug, Clone, Copy)]
 enum Q27SourceBuildEvidence<'a> {
-    Plan(&'a RuntimeSourceBuildPlan),
     Provenance(&'a RuntimeSourceBuildProvenance),
 }
 
 impl<'a> Q27SourceBuildEvidence<'a> {
     fn source(self) -> &'a RuntimeSourceSnapshot {
         match self {
-            Self::Plan(plan) => &plan.source,
             Self::Provenance(provenance) => &provenance.source,
         }
     }
 
     fn recipe_version(self) -> &'a str {
         match self {
-            Self::Plan(plan) => &plan.recipe.recipe_version,
             Self::Provenance(provenance) => &provenance.recipe_version,
         }
     }
 
     fn build_system(self) -> RuntimeSourceBuildSystem {
         match self {
-            Self::Plan(plan) => plan.recipe.build_system,
             Self::Provenance(provenance) => provenance.build_system,
         }
     }
 
     fn build_definition_sha256(self) -> Option<&'a str> {
         match self {
-            Self::Plan(plan) => plan.recipe.build_definition_sha256.as_deref(),
             Self::Provenance(provenance) => provenance.build_definition_sha256.as_deref(),
         }
     }
 
     fn build_target(self) -> &'a str {
         match self {
-            Self::Plan(plan) => &plan.recipe.build_target,
             Self::Provenance(provenance) => &provenance.build_target,
         }
     }
 
     fn entrypoint_matches_target(self) -> bool {
         match self {
-            Self::Plan(plan) => plan.recipe.entrypoint == Path::new(&plan.recipe.build_target),
             Self::Provenance(provenance) => {
                 provenance.entrypoint == Path::new("source").join(&provenance.build_target)
             }
@@ -1154,21 +1147,6 @@ fn q27_runtime_capabilities(
     }
 }
 
-fn evaluate_q27_configured_runtime(
-    settings: &norted_core::ResolvedSettings,
-    capabilities: Q27RuntimeCapabilities,
-) -> RuntimeCompatibility {
-    match validate_q27_settings_prelaunch(settings, capabilities) {
-        Ok(()) => RuntimeCompatibility::NeedsAttention(
-            "the exact runtime satisfies the configured q27 controls; actual served context, KV mode, and W_MAX still require bounded startup observation"
-                .to_owned(),
-        ),
-        Err(reason) => RuntimeCompatibility::Incompatible(format!(
-            "{reason}; startup evidence cannot be collected because pre-launch admission failed"
-        )),
-    }
-}
-
 fn validate_q27_settings_prelaunch(
     settings: &norted_core::ResolvedSettings,
     capabilities: Q27RuntimeCapabilities,
@@ -1187,7 +1165,32 @@ fn validate_q27_settings_prelaunch(
                 .to_owned(),
         );
     }
+    if setting_float(settings, "q27.top_p").is_some_and(|value| value <= 0.0) {
+        return Err(
+            "q27.top_p must be greater than zero and at most 1; the runtime reinterprets zero as 1"
+                .to_owned(),
+        );
+    }
     let mut failures = Vec::new();
+    for (force, regular, active) in [
+        (
+            "q27.force_temperature",
+            "q27.temperature",
+            setting_float(settings, "q27.force_temperature").is_some_and(|value| value > 0.0),
+        ),
+        (
+            "q27.force_top_p",
+            "q27.top_p",
+            setting_float(settings, "q27.force_top_p").is_some_and(|value| value < 1.0),
+        ),
+    ] {
+        if active && settings.value(regular).is_some() {
+            return Err(format!(
+                "conflicting settings `{force}` and `{regular}` both define an omitted-request default; inherit one of them"
+            ));
+        }
+    }
+
     if setting_toggle(settings, "q27.mtp") == Some(false) && !capabilities.mtp_disable_control {
         failures.push(
             "the exact q27 runtime always uses its NextN/MTP speculative engine and exposes no proven MTP-disable control",
@@ -1229,14 +1232,6 @@ fn validate_q27_settings_prelaunch(
     }
     if settings.value("q27.seed").is_some() && !capabilities.request_seed {
         failures.push("request-default seed control is unproven");
-    }
-    if (settings.value("q27.seed").is_some()
-        || setting_unsigned(settings, "q27.top_k").is_some_and(|value| value > 0)
-        || setting_float(settings, "q27.min_p").is_some_and(|value| value > 0.0))
-        && setting_float(settings, "q27.temperature").unwrap_or(0.0) <= 0.0
-    {
-        failures
-            .push("q27 seed/top-k/min-p request defaults require a positive temperature default");
     }
     if (settings.value("q27.reasoning").is_some()
         || settings.value("q27.reasoning_budget").is_some())
@@ -1602,6 +1597,7 @@ fn setting_unsigned_with_source<'a>(
 
 fn setting_source_label(source: &norted_core::SettingSource) -> &'static str {
     match source {
+        norted_core::SettingSource::SettingsOverride => "Settings override",
         norted_core::SettingSource::RuntimeDefault => "Runtime Default",
         norted_core::SettingSource::ModelProfile { .. } => "Model Profile",
         norted_core::SettingSource::Invocation => "invocation",
@@ -2061,29 +2057,36 @@ impl Q27Adapter {
                 "runtime entrypoint SHA-256 mismatch: expected {expected}, observed {binary_sha256}"
             )));
         }
-        let usage_output = capture_command(
-            &binary_path,
-            &[],
-            &self.environment,
-            &managed_environment_removals(),
-            PROBE_TIMEOUT,
-        )
-        .await?;
-        let usage = command_detail(&usage_output.stdout, &usage_output.stderr);
-        let usage_contract_error = q27_usage_contract_error(&usage);
-        if usage_output.success || usage_contract_error.is_some() {
-            return Err(EngineError::InvalidConfiguration(format!(
-                "entrypoint does not satisfy the q27-server launch contract ({}): {usage}",
-                usage_contract_error.unwrap_or_else(|| {
-                    "invocation without positional model arguments unexpectedly succeeded"
-                        .to_owned()
-                })
-            )));
-        }
-        self.capability_cache
-            .write()
+        let cached = self
+            .capability_cache
+            .read()
             .await
-            .insert(binary_sha256.clone(), usage.clone());
+            .contains_key(&binary_sha256);
+        if !cached {
+            let usage_output = capture_command(
+                &binary_path,
+                &[],
+                &self.environment,
+                &managed_environment_removals(),
+                PROBE_TIMEOUT,
+            )
+            .await?;
+            let usage = command_detail(&usage_output.stdout, &usage_output.stderr);
+            let usage_contract_error = q27_usage_contract_error(&usage);
+            if usage_output.success || usage_contract_error.is_some() {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "entrypoint does not satisfy the q27-server launch contract ({}): {usage}",
+                    usage_contract_error.unwrap_or_else(|| {
+                        "invocation without positional model arguments unexpectedly succeeded"
+                            .to_owned()
+                    })
+                )));
+            }
+            self.capability_cache
+                .write()
+                .await
+                .insert(binary_sha256.clone(), usage.clone());
+        }
         let observed_at_unix = unix_timestamp();
         Ok((
             binary_path,
@@ -2214,10 +2217,14 @@ impl Q27Adapter {
         let mut body = json!({
             "model": request.model_profile_id.as_str(),
             "messages": request.messages.iter().map(message_json).collect::<Vec<_>>(),
-            "temperature": request.generation_settings.temperature.unwrap_or(0.0),
-            "top_p": request.generation_settings.top_p.unwrap_or(1.0),
             "stream": stream,
         });
+        if let Some(value) = request.generation_settings.temperature {
+            body["temperature"] = json!(value);
+        }
+        if let Some(value) = request.generation_settings.top_p {
+            body["top_p"] = json!(value);
+        }
         if let Some(maximum) = request.max_output_tokens {
             body["max_tokens"] = json!(maximum);
         }
@@ -2304,22 +2311,11 @@ impl Q27Adapter {
             .generation_settings
             .temperature
             .or_else(|| setting_float(&execution.settings, "q27.temperature"))
+            .or_else(|| {
+                setting_float(&execution.settings, "q27.force_temperature")
+                    .filter(|value| *value > 0.0)
+            })
             .unwrap_or(0.0);
-        let requests_sampling_control = request.generation_settings.seed.is_some()
-            || request
-                .generation_settings
-                .top_k
-                .is_some_and(|value| value > 0)
-            || request
-                .generation_settings
-                .min_p
-                .is_some_and(|value| value > 0.0);
-        if requests_sampling_control && effective_temperature <= 0.0 {
-            return Err(EngineError::InvalidGenerationSettings(
-                "q27 seed/top_k/min_p apply only to sampled requests with temperature above zero"
-                    .to_owned(),
-            ));
-        }
         if setting_toggle(&execution.settings, "q27.sampled_graphs") == Some(false)
             && effective_temperature > 0.0
         {
@@ -2363,23 +2359,19 @@ impl Q27Adapter {
         for (name, value) in [
             (
                 "temperature",
-                Some(Value::from(
-                    request
-                        .generation_settings
-                        .temperature
-                        .or_else(|| setting_float(&execution.settings, "q27.temperature"))
-                        .unwrap_or(0.0),
-                )),
+                request
+                    .generation_settings
+                    .temperature
+                    .or_else(|| setting_float(&execution.settings, "q27.temperature"))
+                    .map(Value::from),
             ),
             (
                 "top_p",
-                Some(Value::from(
-                    request
-                        .generation_settings
-                        .top_p
-                        .or_else(|| setting_float(&execution.settings, "q27.top_p"))
-                        .unwrap_or(1.0),
-                )),
+                request
+                    .generation_settings
+                    .top_p
+                    .or_else(|| setting_float(&execution.settings, "q27.top_p"))
+                    .map(Value::from),
             ),
             (
                 "top_k",
@@ -2509,7 +2501,7 @@ impl EngineAdapter for Q27Adapter {
     fn validate_generation_settings(
         &self,
         settings: &GenerationSettingsPatch,
-        backend_defaults: &EffectiveGenerationSettings,
+        _backend_defaults: &EffectiveGenerationSettings,
     ) -> Result<(), EngineError> {
         if settings.repeat_penalty.is_some()
             || settings.presence_penalty.is_some()
@@ -2568,22 +2560,8 @@ impl EngineAdapter for Q27Adapter {
                 "q27 min_p must be finite and in the range 0..=1; zero disables it".to_owned(),
             ));
         }
-        let effective_temperature = settings.temperature.unwrap_or(backend_defaults.temperature);
-        if settings.top_p.is_some_and(|top_p| top_p < 1.0) && effective_temperature <= 0.0 {
-            return Err(EngineError::InvalidGenerationSettings(
-                "q27 top_p below 1 requires a positive effective temperature; q27 uses greedy decoding otherwise"
-                    .to_owned(),
-            ));
-        }
-        if (settings.seed.is_some()
-            || settings.top_k.is_some_and(|value| value > 0)
-            || settings.min_p.is_some_and(|value| value > 0.0))
-            && effective_temperature <= 0.0
-        {
-            return Err(EngineError::InvalidGenerationSettings(
-                "q27 seed/top_k/min_p require a positive effective temperature".to_owned(),
-            ));
-        }
+        // Sampling controls remain configured while greedy decoding is active.
+        // They become active when a later request supplies positive temperature.
         Ok(())
     }
 
@@ -2679,17 +2657,12 @@ impl EngineAdapter for Q27Adapter {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        settings: Option<&norted_core::ResolvedSettings>,
+        _settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
         let facts = match inspect_q27_model(&model.path) {
             Ok(facts) => facts,
             Err(reason) => return RuntimeCompatibility::Incompatible(reason),
         };
-        if let Some(settings) = settings
-            && let Err(reason) = validate_q27_model_settings(&facts, settings)
-        {
-            return RuntimeCompatibility::Incompatible(reason);
-        }
         let evaluation = q27_device_evaluation(
             &runtime.manifest.identity.platform,
             &runtime.manifest.identity.architecture,
@@ -2698,29 +2671,38 @@ impl EngineAdapter for Q27Adapter {
             host,
             runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
         );
-        let artifact_and_device = qualify_tier_compatibility(facts.tier, evaluation.compatibility);
-        if let Some(settings) = settings {
-            if !q27_has_configured_execution(settings) {
-                return artifact_and_device;
-            }
-            combine_q27_compatibility(
-                artifact_and_device,
-                evaluate_q27_configured_runtime(
-                    settings,
-                    q27_runtime_capabilities(
-                        &runtime.manifest.identity,
-                        &runtime.manifest.acquisition_method,
-                        runtime
-                            .manifest
-                            .source_build
-                            .as_ref()
-                            .map(Q27SourceBuildEvidence::Provenance),
-                    ),
+        qualify_tier_compatibility(facts.tier, evaluation.compatibility)
+    }
+
+    fn validate_configuration(
+        &self,
+        runtime: &InstalledRuntime,
+        model: Option<&ModelArtifact>,
+        _host: &HostCapabilities,
+        settings: &norted_core::ResolvedSettings,
+    ) -> Result<(), EngineError> {
+        if let Some(model) = model {
+            let facts =
+                inspect_q27_model(&model.path).map_err(EngineError::InvalidConfiguration)?;
+            validate_q27_model_settings(&facts, settings)
+                .map_err(EngineError::InvalidConfiguration)?;
+        }
+        if q27_has_configured_execution(settings) {
+            validate_q27_settings_prelaunch(
+                settings,
+                q27_runtime_capabilities(
+                    &runtime.manifest.identity,
+                    &runtime.manifest.acquisition_method,
+                    runtime
+                        .manifest
+                        .source_build
+                        .as_ref()
+                        .map(Q27SourceBuildEvidence::Provenance),
                 ),
             )
-        } else {
-            artifact_and_device
+            .map_err(EngineError::InvalidConfiguration)?;
         }
+        Ok(())
     }
 
     fn runtime_model_preference(
@@ -2748,7 +2730,7 @@ impl EngineAdapter for Q27Adapter {
         runtime: &AvailableRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        settings: Option<&norted_core::ResolvedSettings>,
+        _settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
         if let CompatibilityDecision::Unsupported { reason } = self.compatibility(model) {
             return RuntimeCompatibility::Incompatible(reason);
@@ -2757,11 +2739,6 @@ impl EngineAdapter for Q27Adapter {
             Ok(facts) => facts,
             Err(reason) => return RuntimeCompatibility::Incompatible(reason),
         };
-        if let Some(settings) = settings
-            && let Err(reason) = validate_q27_model_settings(&facts, settings)
-        {
-            return RuntimeCompatibility::Incompatible(reason);
-        }
         let evaluation = q27_device_evaluation(
             &runtime.identity.platform,
             &runtime.identity.architecture,
@@ -2770,36 +2747,7 @@ impl EngineAdapter for Q27Adapter {
             host,
             false,
         );
-        let artifact_and_device = qualify_tier_compatibility(facts.tier, evaluation.compatibility);
-        if let Some(settings) = settings {
-            if !q27_has_configured_execution(settings) {
-                return artifact_and_device;
-            }
-            let acquisition = match runtime.acquisition {
-                RuntimeAcquisitionPlan::ReleaseAsset { .. } => {
-                    RuntimeAcquisitionMethod::OfficialReleaseAsset
-                }
-                RuntimeAcquisitionPlan::SourceBuild(_) => RuntimeAcquisitionMethod::SourceBuild,
-            };
-            combine_q27_compatibility(
-                artifact_and_device,
-                evaluate_q27_configured_runtime(
-                    settings,
-                    q27_runtime_capabilities(
-                        &runtime.identity,
-                        &acquisition,
-                        match &runtime.acquisition {
-                            RuntimeAcquisitionPlan::SourceBuild(plan) => {
-                                Some(Q27SourceBuildEvidence::Plan(plan))
-                            }
-                            RuntimeAcquisitionPlan::ReleaseAsset { .. } => None,
-                        },
-                    ),
-                ),
-            )
-        } else {
-            artifact_and_device
-        }
+        qualify_tier_compatibility(facts.tier, evaluation.compatibility)
     }
 
     fn available_runtime_model_preference(
@@ -2877,7 +2825,7 @@ impl EngineAdapter for Q27Adapter {
         &self,
         runtime: &InstalledRuntime,
         _host: &HostCapabilities,
-        _settings: Option<&norted_core::ResolvedSettings>,
+        settings: Option<&norted_core::ResolvedSettings>,
     ) -> Result<SettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
         let usage = self
@@ -2889,7 +2837,7 @@ impl EngineAdapter for Q27Adapter {
             .ok_or_else(|| {
                 EngineError::Operation("q27 usage observation was not cached".to_owned())
             })?;
-        Ok(q27_settings_schema_from_usage(
+        let mut schema = q27_settings_schema_from_usage(
             Some(runtime.manifest.runtime_id.clone()),
             &runtime.manifest.identity,
             &runtime.manifest.acquisition_method,
@@ -2900,7 +2848,9 @@ impl EngineAdapter for Q27Adapter {
                 .map(Q27SourceBuildEvidence::Provenance),
             &usage,
             false,
-        ))
+        );
+        apply_q27_sampler_context(&mut schema.definitions, settings);
+        Ok(schema)
     }
 
     async fn settings_schema(
@@ -2935,8 +2885,8 @@ impl EngineAdapter for Q27Adapter {
         let facts = inspect_q27_model(&model.path).map_err(EngineError::InvalidConfiguration)?;
         apply_q27_model_capabilities(&mut schema.definitions, &facts);
         apply_q27_profile_defaults(&mut schema.definitions, settings);
+        apply_q27_sampler_context(&mut schema.definitions, settings);
         apply_q27_context_defaults(&mut schema.definitions, runtime, model, host, settings);
-        schema.definitions = configurable_setting_definitions(schema.definitions);
         Ok(schema)
     }
 
@@ -3058,6 +3008,8 @@ impl EngineAdapter for Q27Adapter {
         }
         let model_facts =
             inspect_q27_model(&model_path).map_err(EngineError::InvalidConfiguration)?;
+        validate_q27_model_settings(&model_facts, &request.settings)
+            .map_err(EngineError::InvalidConfiguration)?;
         if setting_toggle(&request.settings, "q27.mtp") == Some(true)
             && !model_facts.capabilities.contains("mtp_layer_1")
         {
@@ -3493,9 +3445,8 @@ impl EngineAdapter for Q27Adapter {
         &self,
         process: &ProcessDescriptor,
     ) -> Result<EffectiveGenerationSettings, EngineError> {
-        // q27 exposes no effective-config endpoint. These values are owned by
-        // this adapter, sent explicitly on every request, and force env vars
-        // are removed from the child environment.
+        // q27 has no effective-config endpoint. Use the reviewed runtime defaults
+        // plus explicit process configuration; omitted request fields stay omitted.
         let configured = if let Some(endpoint) = process.endpoint.as_deref() {
             self.configured_executions
                 .read()
@@ -3511,8 +3462,18 @@ impl EngineAdapter for Q27Adapter {
                 top_p: 1.0,
             },
             |execution| EffectiveGenerationSettings {
-                temperature: setting_float(&execution.settings, "q27.temperature").unwrap_or(0.0),
-                top_p: setting_float(&execution.settings, "q27.top_p").unwrap_or(1.0),
+                temperature: setting_float(&execution.settings, "q27.temperature")
+                    .or_else(|| {
+                        setting_float(&execution.settings, "q27.force_temperature")
+                            .filter(|value| *value > 0.0)
+                    })
+                    .unwrap_or(0.0),
+                top_p: setting_float(&execution.settings, "q27.top_p")
+                    .or_else(|| {
+                        setting_float(&execution.settings, "q27.force_top_p")
+                            .filter(|value| *value < 1.0)
+                    })
+                    .unwrap_or(1.0),
             },
         ))
     }
@@ -4735,19 +4696,10 @@ fn q27_settings_schema_from_usage(
             });
         }
     }
-    if !capabilities.stable_serving_environment {
-        for definition in &mut definitions {
-            definition.supported = false;
-            definition.unsupported_reason = Some(
-                "the exact q27 runtime lacks a reviewed concrete settings/defaults contract"
-                    .to_owned(),
-            );
-        }
-    }
     SettingsSchema {
         engine_id: ENGINE_ID.to_owned(),
         runtime_id,
-        definitions: configurable_setting_definitions(definitions),
+        definitions,
     }
 }
 
@@ -5477,6 +5429,42 @@ fn apply_q27_reviewed_runtime_defaults(definitions: &mut [SettingDefinition]) {
             "When request thinking is enabled, an omitted request budget remains request-derived",
         ),
     );
+}
+
+fn apply_q27_sampler_context(
+    definitions: &mut [SettingDefinition],
+    settings: Option<&norted_core::ResolvedSettings>,
+) {
+    let Some(settings) = settings else {
+        return;
+    };
+    for (force, regular, active) in [
+        (
+            "q27.force_temperature",
+            "q27.temperature",
+            setting_float(settings, "q27.force_temperature").filter(|value| *value > 0.0),
+        ),
+        (
+            "q27.force_top_p",
+            "q27.top_p",
+            setting_float(settings, "q27.force_top_p").filter(|value| *value < 1.0),
+        ),
+    ] {
+        if let Some(value) = active {
+            set_q27_default(
+                definitions,
+                regular,
+                SettingDefaultPreview::new(value.to_string(), SettingDefaultSource::Derived)
+                    .with_detail(format!(
+                        "Runtime omitted-request behavior with `{force}` configured"
+                    )),
+            );
+        }
+    }
+    if setting_float(settings, "q27.force_temperature").is_some_and(|value| value > 0.0) {
+        set_q27_default(definitions, "q27.seed", SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+            .with_detail("Runtime assigns a new counter seed per sampled request when the force-temperature policy is active"));
+    }
 }
 
 fn apply_q27_profile_defaults(

@@ -2,13 +2,13 @@ use norted_core::{RuntimeCompatibility, RuntimeOperationPhase, RuntimeSourceBuil
 use ratatui::Frame;
 use ratatui::layout::Position;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 use crate::app::{App, Overlay, RuntimeSearchFocus};
 use crate::theme::{Glyphs, Theme};
 use crate::ui::components::{
-    ActionState, KEY_COLUMN, action_style, format_bytes, input_window, key_value, key_value_width,
-    marquee_text, popup_block, remaining_width, truncate_middle,
+    ActionState, KEY_COLUMN, action_style, format_bytes, input_window, inventory_columns,
+    inventory_row, key_value, key_value_width, marquee_text, popup_block,
 };
 use crate::ui::layout::{HoverTarget, UiLayout};
 use crate::ui::screens::compatibility_label;
@@ -168,66 +168,64 @@ fn render_results(
         return;
     }
 
-    let items = layout.runtime_search_rows.iter().map(|(index, row)| {
+    let columns = inventory_columns(
+        layout.runtime_search_results,
+        &[12, 16, 12],
+        if layout.runtime_search_results.width >= 60 {
+            &[12, 16, 12]
+        } else {
+            &[12]
+        },
+    );
+    let wide = layout.runtime_search_results.width >= 60;
+    let headings = if wide {
+        vec!["Runtime candidate", "Version", "Compatibility", "State"]
+    } else {
+        vec!["Runtime candidate", "Fit"]
+    };
+    inventory_row(
+        frame,
+        layout.runtime_search_header,
+        &columns,
+        &headings.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+        theme.hint,
+        glyphs,
+    );
+    for (index, row) in &layout.runtime_search_rows {
         let result = &search.results[*index];
         let available = &result.entry.available;
-        let (compatibility, compatibility_style) =
-            compatibility_label(&result.entry.compatibility, theme);
-        let marker = if result.installed {
-            glyphs.running
+        let selected = app.selected_runtime_search_result == Some(*index);
+        let name = format!(
+            "{} {}",
+            if selected { ">" } else { " " },
+            available.display_name
+        );
+        let compatibility = compatibility_label(&result.entry.compatibility, theme);
+        let values = if wide {
+            vec![
+                name,
+                available.identity.version.clone(),
+                compatibility.0.to_owned(),
+                if result.installed {
+                    "Installed"
+                } else {
+                    "Available"
+                }
+                .to_owned(),
+            ]
         } else {
-            glyphs.empty
+            vec![name, compatibility.0.to_owned()]
         };
-        let marker_style = if result.installed {
-            theme.success
-        } else {
-            theme.muted
-        };
-        let mut style = if app.selected_runtime_search_result == Some(*index) {
+        let mut style = if selected {
             theme.selected
         } else {
-            ratatui::style::Style::default()
+            compatibility.1
         };
         if app.hover == Some(HoverTarget::RuntimeSearchResult(*index)) {
             style = style.patch(theme.hovered);
         }
-        let active_row = app.selected_runtime_search_result == Some(*index)
-            || app.hover == Some(HoverTarget::RuntimeSearchResult(*index));
-        let name_width = result_name_width(row.width, marker, compatibility);
-        let display_name = if active_row {
-            marquee_text(
-                &available.display_name,
-                name_width,
-                app.marquee_animation_frame / 3,
-            )
-        } else {
-            truncate_middle(&available.display_name, name_width, glyphs.ellipsis)
-        };
-        let metadata = result_metadata_text(available);
-        let installed = if result.installed { "  installed" } else { "" };
-        let metadata_width = result_metadata_width(row.width, installed);
-        let metadata = if active_row {
-            marquee_text(&metadata, metadata_width, app.marquee_animation_frame / 3)
-        } else {
-            truncate_middle(&metadata, metadata_width, glyphs.ellipsis)
-        };
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled(format!("{marker}  "), marker_style),
-                Span::styled(display_name, theme.text),
-                Span::styled(format!("  {compatibility}"), compatibility_style),
-            ]),
-            Line::from(vec![
-                Span::styled(metadata, theme.muted),
-                Span::styled(installed, theme.success),
-            ]),
-        ];
-        if layout.overlay_row_height > 2 {
-            lines.push(Line::default());
-        }
-        ListItem::new(lines).style(style)
-    });
-    frame.render_widget(List::new(items), layout.runtime_search_results);
+        inventory_row(frame, *row, &columns, &values, style, glyphs);
+    }
 }
 
 fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLayout) {
@@ -236,7 +234,7 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
         .and_then(|index| app.runtime_search.as_ref()?.results.get(index))
     else {
         let mut lines = vec![
-            Line::from(Span::styled("Details", theme.hint)),
+            Line::from(Span::styled("Details | D: full details", theme.hint)),
             Line::from(Span::styled(
                 "Select a result to inspect its identity and compatibility.",
                 theme.muted,
@@ -269,11 +267,6 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
         .unwrap_or(available.source_url.as_str());
     let detail_value_width = key_value_width(layout.runtime_search_details.width);
     let source = marquee_text(source, detail_value_width, app.marquee_animation_frame / 3);
-    let display_name = marquee_text(
-        &available.display_name,
-        layout.runtime_search_details.width as usize,
-        app.marquee_animation_frame / 3,
-    );
     let target = format!("{} / {}", identity.platform, identity.architecture);
     let backend = format!("{} / {}", identity.accelerator, identity.variant);
     let (acquisition, size) = match available.download_size_bytes() {
@@ -282,7 +275,10 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
     };
     let selected_for = result.selected_for.join(", ");
     let mut lines = vec![
-        Line::from(Span::styled(display_name, theme.text)),
+        Line::from(Span::styled(
+            "Selected candidate | D: full details",
+            theme.hint,
+        )),
         key_value("ENGINE", &identity.engine_id, theme),
         key_value("VERSION", &identity.version, theme),
         key_value("TARGET", &target, theme),
@@ -481,45 +477,10 @@ fn render_action(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLay
         );
     } else {
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "Tab focus  Space toggle  Up/Down or j/k select  F5 refresh",
-                theme.hint,
-            ))),
+            Paragraph::new(Line::from(Span::styled("D: details", theme.hint))),
             layout.runtime_operation_status,
         );
     }
-}
-
-pub(super) fn result_name_width(row_width: u16, marker: &str, compatibility: &str) -> usize {
-    let prefix = format!("{marker}  ");
-    let suffix = format!("  {compatibility}");
-    remaining_width(row_width, &[&prefix, &suffix])
-}
-
-pub(super) fn result_metadata_width(row_width: u16, installed: &str) -> usize {
-    remaining_width(row_width, &[installed])
-}
-
-pub(super) fn result_metadata_text(available: &norted_core::AvailableRuntime) -> String {
-    let formats = available
-        .supported_formats
-        .iter()
-        .map(|format| format.as_str().to_ascii_uppercase())
-        .collect::<Vec<_>>()
-        .join("/");
-    let acquisition = if available.source_build().is_some() {
-        "source build"
-    } else {
-        "upstream binary"
-    };
-    format!(
-        "{}  {} / {}  {} · {}",
-        available.identity.version,
-        available.identity.accelerator,
-        available.identity.variant,
-        formats,
-        acquisition,
-    )
 }
 
 pub(crate) fn progress_text(progress: &norted_core::RuntimeOperationProgress) -> String {
