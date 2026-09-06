@@ -1,13 +1,13 @@
-//! Frozen, offline inputs and binary oracles for Norted Quick Bench v1.
+//! Frozen, offline inputs and binary oracles for Norted Quick Bench v2.
 use crate::{InferenceTool, InferenceToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const INTELLIGENCE: &str = include_str!("intelligence.json");
-pub const SUITE: &str = "norted-quick-bench/1";
-pub const METHOD: &str = "binary-json-fixture-visible-delivery/1";
-pub const POLICY: &str = "600s monotonic: preparation 90; warmup 10; probes 4x15; intelligence 24x10; tools 8x8; agents 4x30; reserve 16. Each ceiling reserves its last 4s for managed termination; preparation work 86s, warmup inference 6s, probe inference 11s, intelligence inference 6s, single-tool inference 4s, multi-step execution 26s. Timeout stops the suite and leaves remaining tasks unattempted. One attempt. Internal managed streaming boundary. Per-run random nonce before all prompts; native cache state unverified. No decode-only or first-answer estimate.";
+pub const SUITE: &str = "norted-quick-bench/2";
+pub const METHOD: &str = "binary-json-fixture-visible-delivery/2";
+pub const POLICY: &str = "600s monotonic admission deadline: preparation 60; warmup 10; probes 4x15; intelligence 24x10; tools 8x8; agents 4x30 (6 turns / 8 calls). Full task work ceilings; cancellation confirmation up to 1s per stopped request shares global budget. Execution ends at 584s, cleanup by 599s, finalization by 600s. Candidate deadlines/limits score zero after confirmed request stop and health; unverified cancellation or infrastructure failure interrupts suite. Insufficient metrics remain unavailable; completed sections retain fixed denominators. One attempt. Internal managed streaming boundary. Per-run nonce; cache unverified. No decode-only or first-answer estimate.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Question {
@@ -156,10 +156,10 @@ pub fn parse_arguments(text: &str) -> Result<Value, String> {
 }
 
 pub const AGENT_PROMPTS: [&str; 4] = [
-    "Fixture calls in one response execute in listed order. Inspect config/mode before acting. Change it to safe using the observed revision, then verify the changed state.",
-    "Fixture calls in one response execute in listed order. Read target to discover which key to change and desired to discover the new value. Inspect the target key, update it using its revision, then verify the changed state. You may combine independent reads.",
-    "Fixture calls in one response execute in listed order. Inspect config/mode, change it to safe, and verify. A concurrent fixture writer will cause the first update to conflict. Recover by reading the current revision and then retrying the update.",
-    "Fixture calls in one response execute in listed order. Search for keys containing service/. Inspect the returned service key, change its value to enabled using its revision, and verify the changed state.",
+    "Fixture calls in one response execute in listed order, but their results are available only in your next response. Use returned information before dependent actions; verify in a response after the update. Inspect config/mode before acting. Change it to safe using the observed revision, then verify the changed state.",
+    "Fixture calls in one response execute in listed order, but their results are available only in your next response. Use returned information before dependent actions; verify in a response after the update. Read target to discover which key to change and desired to discover the new value. Inspect the target key, update it using its revision, then verify the changed state. You may combine independent reads.",
+    "Fixture calls in one response execute in listed order, but their results are available only in your next response. Use returned information before dependent actions; verify in a response after the update. Inspect config/mode, change it to safe, and verify. A concurrent fixture writer will cause the first update to conflict. Recover by reading the current revision and then retrying the update.",
+    "Fixture calls in one response execute in listed order, but their results are available only in your next response. Use returned information before dependent actions; verify in a response after the update. Search for keys containing service/. Inspect the returned service key, change its value to enabled using its revision, and verify the changed state.",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +167,10 @@ pub struct Fixture {
     case: usize,
     values: BTreeMap<String, (String, u64)>,
     inspected: BTreeSet<String>,
+    observed_revisions: BTreeMap<String, u64>,
+    delivered_revisions: BTreeMap<String, u64>,
+    delivered_search: bool,
+    delivered_changed: BTreeSet<String>,
     verified: BTreeSet<String>,
     changed: BTreeSet<String>,
     searched: bool,
@@ -188,12 +192,23 @@ impl Fixture {
             .map(|(k, (v, r))| (k.into(), (v.into(), r)))
             .collect(),
             inspected: BTreeSet::new(),
+            observed_revisions: BTreeMap::new(),
+            delivered_revisions: BTreeMap::new(),
+            delivered_search: false,
+            delivered_changed: BTreeSet::new(),
             verified: BTreeSet::new(),
             changed: BTreeSet::new(),
             searched: false,
             conflict: case == 2,
             conflict_seen: false,
         }
+    }
+    /// Freeze only information returned before this model response. Mutations
+    /// during a batch cannot retroactively give its arguments observation credit.
+    pub fn begin_response(&mut self) {
+        self.delivered_revisions = self.observed_revisions.clone();
+        self.delivered_search = self.searched;
+        self.delivered_changed = self.changed.clone();
     }
     pub fn apply(&mut self, call: &InferenceToolCall) -> Result<Value, String> {
         let args = parse_arguments(&call.arguments)?;
@@ -210,7 +225,7 @@ impl Fixture {
         }
         if call.name == "search" {
             let q = args["query"].as_str().ok_or("query must be a string")?;
-            self.searched = true;
+            self.searched |= "service/worker".contains(q);
             return Ok(json!(
                 self.values
                     .keys()
@@ -239,6 +254,13 @@ impl Fixture {
                     .map(|k| {
                         self.inspected.insert(k.into());
                         let (v, r) = &self.values[k];
+                        if (self.case != 1
+                            || k != "config/port"
+                            || self.delivered_revisions.contains_key("target"))
+                            && (self.case != 3 || k != "service/worker" || self.delivered_search)
+                        {
+                            self.observed_revisions.insert(k.into(), *r);
+                        }
                         json!({"key":k,"value":v,"revision":r})
                     })
                     .collect(),
@@ -249,10 +271,19 @@ impl Fixture {
         match call.name.as_str() {
             "read" => {
                 self.inspected.insert(key.into());
+                if (self.case != 1
+                    || key != "config/port"
+                    || self.delivered_revisions.contains_key("target"))
+                    && (self.case != 3 || key != "service/worker" || self.delivered_search)
+                {
+                    self.observed_revisions.insert(key.into(), *revision);
+                }
             }
             "verify" => {
                 self.inspected.insert(key.into());
-                self.verified.insert(key.into());
+                if self.delivered_changed.contains(key) {
+                    self.verified.insert(key.into());
+                }
             }
             "update" => {
                 let r = args["revision"]
@@ -267,19 +298,24 @@ impl Fixture {
                     self.conflict_seen = true;
                     *revision += 1;
                     self.inspected.remove(key);
+                    self.observed_revisions.remove(key);
+                    self.changed.remove(key);
                     return Err("revision conflict: read again".into());
                 }
                 if r != *revision {
                     return Err("revision conflict: read again".into());
                 }
-                if self.inspected.contains(key)
+                if self.delivered_revisions.get(key) == Some(revision)
                     && (self.case != 1
-                        || (self.inspected.contains("target")
-                            && self.inspected.contains("desired")))
-                    && (self.case != 3 || self.searched)
+                        || (self.delivered_revisions.contains_key("target")
+                            && self.delivered_revisions.contains_key("desired")))
+                    && (self.case != 3 || self.delivered_search)
                 {
                     self.changed.insert(key.into());
+                } else {
+                    self.changed.remove(key);
                 }
+                self.observed_revisions.remove(key);
                 self.verified.remove(key);
                 *value = v.into();
                 *revision += 1;

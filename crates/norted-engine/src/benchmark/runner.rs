@@ -171,7 +171,7 @@ impl RuntimeManager {
                 .cloned()
                 .collect::<Vec<_>>();
             let (result, state) = bench::select(&h, key.as_deref(), &pack);
-            let state = if state == "Current"
+            let state = if state.starts_with("Current")
                 && result.is_some_and(|r| r.saved_equals_served_requested_settings == Some(false))
             {
                 "Current served session — differs from saved"
@@ -198,7 +198,7 @@ impl RuntimeManager {
             };
             let state = if running_profile.as_ref() == Some(&profile.id) {
                 "Running"
-            } else if result.is_some_and(|r| r.status != "completed") {
+            } else if result.is_some_and(|r| !bench::finished(&r.status)) {
                 if result.is_some_and(|r| r.status == "failed") {
                     "Failed"
                 } else {
@@ -216,7 +216,7 @@ impl RuntimeManager {
                 state
             };
             rows.push(json!({"profile_id":profile.id,"display_name":profile.display_name,"state":state,"configuration_notes":reasons,
-                "result":result,"last_benchmark_unix_ms":result.filter(|s|s.status=="completed").and_then(|s|s.ended_unix_ms),"latest_attempt":h.first(),
+                "result":result,"last_benchmark_unix_ms":result.filter(|s|bench::finished(&s.status)).and_then(|s|s.ended_unix_ms),"latest_attempt":h.first(),
                 "identity_note":"Current requires a running observed runtime. Hardware cache and external workloads remain unverified."}));
         }
         let active = self.benchmark.active.lock().await;
@@ -378,7 +378,20 @@ impl RuntimeManager {
                 }
             }
         } else {
-            run.status = "completed".into();
+            let summary = run.summary();
+            run.status = if summary.speed["combined"]["native_end_to_end_output_tokens_per_second"]
+                ["median"]
+                .is_null()
+                || summary.intelligence.is_none()
+                || summary.agentic.is_none()
+                || summary.speed["combined"]["visible_delivery_characters_per_second"]["median"]
+                    .is_null()
+            {
+                "completed_unavailable"
+            } else {
+                "completed"
+            }
+            .into();
         }
         for evidence in &mut run.evidence {
             if evidence.status == "running" {
@@ -389,8 +402,18 @@ impl RuntimeManager {
         }
         run.duration_seconds = started.elapsed().as_secs_f64();
         run.ended_unix_ms = Some(bench::now_ms());
-        if let Err(error) = self.benchmark.store.save(&run).await {
-            tracing::error!(%error, "benchmark finalization failed; checkpoint will recover as interrupted");
+        let final_deadline = started + Duration::from_secs(600);
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(final_deadline),
+            self.benchmark.store.save_before(&run, Some(final_deadline)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            result => tracing::error!(
+                ?result,
+                "benchmark finalization failed; checkpoint will recover as interrupted"
+            ),
         }
         *self.benchmark.active.lock().await = None;
     }
@@ -449,7 +472,7 @@ impl RuntimeManager {
     ) -> Result<(), String> {
         self.benchmark.store.save(run).await?;
         let prep = Instant::now();
-        tokio::time::timeout(Duration::from_secs(86).saturating_sub(started.elapsed()),async {
+        tokio::time::timeout(Duration::from_secs(60).saturating_sub(started.elapsed()),async {
             run.saved_configuration=self.saved_benchmark_configuration(&run.profile).await?;
             run.environment=self.benchmark_environment().await;
             let before=self.status().await;
@@ -481,7 +504,7 @@ impl RuntimeManager {
             run.provenance=Some(provenance);
             run.load_seconds=Some(prep.elapsed().as_secs_f64());
             Ok::<_,String>(())
-        }).await.map_err(|_|"setup timeout (90 seconds, including integrity checks)")??;
+        }).await.map_err(|_|"setup timeout (60 seconds, including integrity checks)")??;
         run.phases
             .insert("preparation".into(), prep.elapsed().as_secs_f64());
         self.checkpoint(run, started, "warmup").await?;
@@ -582,7 +605,7 @@ impl RuntimeManager {
                     &format!("agent-{}", case + 1),
                     "agent",
                     prompt,
-                    json!({"rubric":"fixture-final-state-v1","case":case}),
+                    json!({"rubric":"fixture-observed-state-v2","case":case}),
                     30,
                     request.max_output_tokens,
                 );
@@ -594,7 +617,7 @@ impl RuntimeManager {
                 self.benchmark.store.save(run).await?;
                 let begin = Instant::now();
                 let result = tokio::time::timeout(
-                    Duration::from_secs(26),
+                    Duration::from_secs(30),
                     self.agent_task(run, case, request, &mut e),
                 )
                 .await;
@@ -606,11 +629,15 @@ impl RuntimeManager {
                     Ok(Ok(passed)) => {
                         e.score = Some(f64::from(passed));
                         e.status = if passed { "passed" } else { "failed" }.into();
-                        e.explanation="Binary rubric: inspected, changed and verified final virtual state, within 4 turns / 8 calls".into();
+                        if e.explanation.is_empty() {
+                            e.explanation = "Binary rubric: used delivered observations, changed and verified final virtual state, within 6 turns / 8 calls".into();
+                        }
                     }
                     Ok(Err(error)) => {
-                        e.status = "infrastructure_error".into();
-                        e.explanation = error.clone();
+                        if e.status != "failed" {
+                            e.status = "infrastructure_error".into();
+                        }
+                        e.explanation = format!("{}; {error}", e.explanation);
                         if let Some(attempt) = run.evidence.last_mut() {
                             *attempt = e;
                         }
@@ -620,11 +647,12 @@ impl RuntimeManager {
                         e.status = "timeout".into();
                         e.score = Some(0.0);
                         e.explanation =
-                            "30-second task ceiling; terminating managed backend".into();
+                            "30-second task deadline; unsuccessful under fixed budget".into();
+                        let stopped = self.confirm_benchmark_request_stopped(run, &mut e).await;
                         if let Some(attempt) = run.evidence.last_mut() {
-                            *attempt = e;
+                            *attempt = e.clone();
                         }
-                        return Err("agent task timeout; remaining tasks unattempted".into());
+                        stopped?;
                     }
                 }
                 if let Some(attempt) = run.evidence.last_mut() {
@@ -640,7 +668,10 @@ impl RuntimeManager {
             .filter(|e| e.category == "speed")
             .any(|e| !speed_sample(e)["valid"].as_bool().unwrap_or(false))
         {
-            return Err("Speed coverage incomplete: invalid/insufficient probe samples".into());
+            run.missing.push(
+                "Speed unavailable: invalid/insufficient probe samples; quality coverage retained"
+                    .into(),
+            );
         }
         self.checkpoint(run, started, "finalization").await?;
         Ok(())
@@ -761,11 +792,8 @@ impl RuntimeManager {
         run.evidence.push(e.clone());
         self.benchmark.store.save(run).await?;
         let begin = Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_secs(seconds.saturating_sub(4)),
-            self.measure(request, e),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(seconds), self.measure(request, e)).await;
         run.phases
             .entry(e.category.clone())
             .and_modify(|v| *v += begin.elapsed().as_secs_f64())
@@ -800,7 +828,13 @@ impl RuntimeManager {
                 );
                 None
             }
-            Ok(Err(error)) => {
+            Ok(Err(MeasureError::Candidate(reason))) => {
+                e.status = "failed".into();
+                e.score = (!matches!(e.category.as_str(), "warmup" | "speed")).then_some(0.0);
+                e.explanation = reason;
+                self.confirm_benchmark_request_stopped(run, e).await.err()
+            }
+            Ok(Err(MeasureError::Infrastructure(error))) => {
                 e.status = "infrastructure_error".into();
                 e.explanation = error.clone();
                 Some(error)
@@ -808,8 +842,9 @@ impl RuntimeManager {
             Err(_) => {
                 e.status = "timeout".into();
                 e.score = (!matches!(e.category.as_str(), "warmup" | "speed")).then_some(0.0);
-                e.explanation = format!("{seconds}-second task ceiling; terminating backend");
-                Some("task timeout; remaining tasks unattempted".into())
+                e.explanation =
+                    format!("{seconds}-second task deadline; unsuccessful under fixed budget");
+                self.confirm_benchmark_request_stopped(run, e).await.err()
             }
         };
         if let Some(attempt) = run.evidence.last_mut() {
@@ -833,19 +868,31 @@ impl RuntimeManager {
         let mut fixture = suite::Fixture::new(case);
         let mut count = 0;
         let mut ids = std::collections::BTreeSet::new();
-        for turn in 0..4 {
-            let r = self.measure(request.clone(), e).await?;
+        for turn in 0..6 {
+            fixture.begin_response();
+            let r = match self.measure(request.clone(), e).await {
+                Ok(r) => r,
+                Err(MeasureError::Candidate(reason)) => {
+                    e.status = "failed".into();
+                    e.score = Some(0.0);
+                    e.explanation = reason;
+                    self.confirm_benchmark_request_stopped(run, e).await?;
+                    return Ok(false);
+                }
+                Err(MeasureError::Infrastructure(reason)) => return Err(reason),
+            };
             if e.response.len() > 65536 {
                 return Ok(false);
             }
             e.timing = r.timing.clone();
             e.usage = r.usage.clone();
-            e.tools.push(json!({"turn":turn+1,"text":r.text,"calls":r.calls,"timing":r.timing,"usage":r.usage}));
+            e.tools.push(json!({"turn":turn+1,"observations_before_response":fixture,"text":r.text,"calls":r.calls,"timing":r.timing,"usage":r.usage}));
             if r.calls.is_empty() {
                 break;
             }
             count += r.calls.len();
             if count > 8 {
+                e.explanation = "Candidate exceeded 8 tool calls in this task".into();
                 return Ok(false);
             }
             let mut assistant = InferenceMessage::text(InferenceRole::Assistant, r.text);
@@ -878,11 +925,60 @@ impl RuntimeManager {
         }
         Ok(fixture.solved(case))
     }
+    async fn confirm_benchmark_request_stopped(
+        &self,
+        run: &mut Run,
+        e: &mut Evidence,
+    ) -> Result<(), String> {
+        if let Some(attempt) = run.evidence.last_mut() {
+            *attempt = e.clone();
+        }
+        // An event proves this request reached inference. Before that, an idle
+        // snapshot cannot exclude a delayed HTTP submission; fail closed.
+        if !e.stream_event_observed {
+            return Err("Request admission/cancellation unverified; stopping owned backend".into());
+        }
+        let (adapter, process) = {
+            let state = self.state.read().await;
+            let running = state
+                .backends
+                .get(&run.profile.id)
+                .and_then(|b| b.running.as_ref())
+                .ok_or("backend missing during cancellation")?;
+            (running.adapter.clone(), running.process.clone())
+        };
+        let stopped = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if adapter
+                    .confirm_request_stopped(&process)
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    if !adapter.health(&process).await.map_err(|e| e.to_string())? {
+                        return Err("backend unhealthy after cancellation".to_owned());
+                    }
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            "Request cancellation not confirmed within 1s; stopping owned backend".to_owned()
+        })?;
+        stopped?;
+        self.verify_pinned(run).await?;
+        e.explanation
+            .push_str("; HTTP stream closed, engine idle and health confirmed");
+        Ok(())
+    }
+
     async fn measure(
         self: &Arc<Self>,
         request: crate::InferenceRequest,
         evidence: &mut Evidence,
-    ) -> Result<bench::Response, String> {
+    ) -> Result<bench::Response, MeasureError> {
+        evidence.stream_event_observed = false;
         let tools_requested = !request.tools.is_empty();
         evidence.timing = Timing {
             request_start_unix_ms: bench::now_ms(),
@@ -902,11 +998,15 @@ impl RuntimeManager {
         let mut finish = None;
         while let Some(event) = stream.next().await {
             let elapsed = begin.elapsed().as_secs_f64() * 1000.0;
-            match event.map_err(|e| e.to_string())? {
+            let event = event.map_err(|e| e.to_string())?;
+            evidence.stream_event_observed = true;
+            match event {
                 InferenceEvent::TextDelta { delta } => {
                     bytes += delta.len();
                     if bytes > 65536 {
-                        return Err("response evidence limit exceeded".into());
+                        return Err(MeasureError::Candidate(
+                            "response evidence limit exceeded".into(),
+                        ));
                     }
                     if !delta.is_empty() {
                         let chars = delta.chars().count();
@@ -923,7 +1023,9 @@ impl RuntimeManager {
                         timing.visible_characters += chars;
                     }
                     if evidence.response.len() + delta.len() > 65536 {
-                        return Err("response evidence limit exceeded".into());
+                        return Err(MeasureError::Candidate(
+                            "response evidence limit exceeded".into(),
+                        ));
                     }
                     evidence.response.push_str(&delta);
                     text.push_str(&delta);
@@ -935,13 +1037,17 @@ impl RuntimeManager {
                     arguments_delta,
                 } => {
                     if calls.len() >= 8 && !calls.contains_key(&index) {
-                        return Err("tool-call evidence limit exceeded".into());
+                        return Err(MeasureError::Candidate(
+                            "tool-call evidence limit exceeded".into(),
+                        ));
                     }
                     bytes += arguments_delta.len()
                         + id.as_ref().map_or(0, String::len)
                         + name.as_ref().map_or(0, String::len);
                     if bytes > 65536 {
-                        return Err("tool evidence limit exceeded".into());
+                        return Err(MeasureError::Candidate(
+                            "tool evidence limit exceeded".into(),
+                        ));
                     }
                     let call = calls.entry(index).or_insert(InferenceToolCall {
                         id: String::new(),
@@ -1007,6 +1113,7 @@ fn new_evidence(
         input_unicode_characters: input.chars().count(),
         expected,
         request_overrides: json!({"max_output_tokens":max,"generation_settings":{},"output_format":null,"tools":matches!(category,"tool"|"agent"),"cache_policy":"run nonce prefix"}),
+        stream_event_observed: false,
         seconds_limit: seconds,
         max_output_tokens: max,
         response: String::new(),
@@ -1134,4 +1241,20 @@ async fn setting_file_observations(settings: &norted_core::ResolvedSettings) -> 
         }
     }
     json!(files)
+}
+
+#[derive(Debug)]
+enum MeasureError {
+    Candidate(String),
+    Infrastructure(String),
+}
+impl From<String> for MeasureError {
+    fn from(value: String) -> Self {
+        Self::Infrastructure(value)
+    }
+}
+impl From<&str> for MeasureError {
+    fn from(value: &str) -> Self {
+        Self::Infrastructure(value.into())
+    }
 }

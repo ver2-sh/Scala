@@ -202,6 +202,11 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &Benchmarks) {
                 &row["last_benchmark_unix_ms"],
             )
         };
+        let status = if status == "completed_unavailable" {
+            "Finished — metrics unavailable"
+        } else {
+            status
+        };
         let title: String = title.chars().take(36).collect();
         lines.push(Line::from(format!(
             "{} {} · {}",
@@ -210,11 +215,16 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &Benchmarks) {
             status
         )));
         lines.push(Line::from(format!(
-            "  I {}  A {}  Speed {}  Latency {}  Last {}",
+            "  I {}  A {}  Speed {}  Latency {}  {} {}",
             number(&r["intelligence"]),
             number(&r["agentic"]),
             number(&r["speed"]["combined"]["visible_delivery_characters_per_second"]["median"]),
             number(&r["speed"]["combined"]["first_visible_ms"]["median"]),
+            if state.history.is_some() {
+                "Ended"
+            } else {
+                "Last"
+            },
             timestamp(last)
         )));
         let note = if state.history.is_some() {

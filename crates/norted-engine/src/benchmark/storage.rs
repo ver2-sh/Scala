@@ -46,6 +46,13 @@ impl Store {
     }
 
     pub async fn save(&self, run: &Run) -> Result<(), String> {
+        self.save_before(run, None).await
+    }
+    pub async fn save_before(
+        &self,
+        run: &Run,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<(), String> {
         let path = self.path.clone();
         let run = run.clone();
         let _serial = self.serial.lock().await;
@@ -61,7 +68,7 @@ impl Store {
             }
             let active = path.join(format!("{}.active", run.run_id));
             let finished = run.status != "running";
-            atomic(if finished { &terminal } else { &active }, &run)?;
+            atomic_before(if finished { &terminal } else { &active }, &run, deadline)?;
             atomic(
                 &path.join(format!("{}.summary", run.run_id)),
                 &run.summary(),
@@ -196,6 +203,13 @@ fn lock(path: &Path) -> Result<std::fs::File, String> {
     Ok(file)
 }
 fn atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    atomic_before(path, value, None)
+}
+fn atomic_before<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), String> {
     let parent = path.parent().ok_or("missing benchmark parent")?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
     let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
@@ -206,6 +220,9 @@ fn atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
         .write_all(&bytes)
         .and_then(|()| temporary.as_file().sync_all())
         .map_err(|e| e.to_string())?;
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err("benchmark finalization deadline; checkpoint retained".into());
+    }
     temporary.persist(path).map_err(|e| e.to_string())?;
     std::fs::File::open(parent)
         .and_then(|f| f.sync_all())

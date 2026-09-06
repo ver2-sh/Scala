@@ -1,6 +1,6 @@
 # Private per-profile benchmarks
 
-Norted Quick Bench v1 is an original, bundled, offline task pack. The running
+Norted Quick Bench v2 is an original, bundled, offline task pack. The running
 server executes it through its normal managed inference path. The TUI and CLI
 use authenticated private control; no benchmark endpoints are added to the
 public OpenAI-compatible API. No judge model, downloads, shell tools, Python
@@ -72,7 +72,7 @@ There is no host filesystem, shell, arbitrary evaluation or network access.
 Multi-step tasks require inspection before mutation and verification of the
 correct final state. They cover using discovered keys/values, recovering from a
 forced revision conflict, and discovering a service before enabling it. Calls
-in a response execute in listed order. Each task allows at most four model
+in a response execute in listed order. Each task allows at most six model
 turns and eight calls; alternative valid sequences are accepted. Saying “done”
 without the required state change and verification fails.
 
@@ -93,25 +93,27 @@ preparation or loading. The budget ceilings are frozen:
 
 | Phase | Ceiling |
 |---|---:|
-| Preparation, integrity checks and compatible loading | 90 s |
+| Preparation, integrity checks and compatible loading | 60 s |
 | One separate unscored warm-up | 10 s |
 | Four streaming speed/latency requests | 4 × 15 s |
 | Intelligence | 24 × 10 s |
 | Single-turn native tools | 8 × 8 s |
 | Multi-step fixtures | 4 × 30 s |
-| Global cancellation/finalization reserve | 16 s |
-| Total | 600 s |
+| Task work ceilings including preparation | 554 s |
+| Shared cancellation, bookkeeping and finalization headroom | 46 s |
+| Total maximum | 600 s |
 
-Each task/preparation ceiling reserves its last **four seconds for managed
-termination**. Thus preparation work is capped at 86 s; inference is capped at
-6 s for warm-up/intelligence, 11 s per probe, 4 s per single-turn tool case and
-26 s for the whole multi-step task. This conservative split covers the native
-supervisor's forced-stop and pipe-drain allowance. Unused time is not lent to
-other tasks. Work stops immediately on completion. The global execution future
-is cancelled by 584 s, retaining the final reserve for stopping and recording
-work. Ordinary OS/storage failure can prevent confirmation of cleanup; the
-server then quarantines inference instead of claiming successful cancellation
-or admitting conflicting requests.
+Tasks receive the full stated work ceilings: intelligence gets 10 s, single-turn
+tools 8 s and a complete multi-step task 30 s. There is no per-task four-second
+termination deduction. Each stopped request has up to 1 s to confirm engine-side
+cancellation and health, charged to the same global budget. Preparation receives
+60 s; unused time remains global headroom, not extra task retries or inference.
+Execution ends at 584 s, cleanup is bounded by 599 s, and finalization waits no
+later than 600 s. The terminal writer checks the monotonic deadline before
+publishing, so a delayed disk operation cannot publish a new successful record
+after an expired finalization deadline. OS/storage stalls can prevent durable
+finalization or confirmation of process cleanup; checkpoints remain recoverable,
+and unconfirmed stopped work quarantines inference.
 
 Additional output limits are 32 tokens for warm-up, 512 for probes and 384 for
 intelligence/tool turns, capped further by a stricter configured or known
@@ -121,13 +123,24 @@ not invented. The record distinguishes the saved configuration, actual served
 requested settings, effective provenance and startup observations. Reusing a
 session with different load settings is explicitly identified.
 
-A timeout records an unsuccessful attempted task (zero for a scored task),
-stops the managed backend, and ends the suite as incomplete. Remaining tasks
-stay unattempted; there are no silent retries or timed reloads. Setup failure,
-infrastructure failure, unsupported capabilities, cancellation and interruption
-remain distinct. Only full task coverage yields a normal section score. A
-partial attempt can never replace a previous completed result or advance its
-Last benchmark timestamp.
+A timeout records an unsuccessful attempted task (zero for a scored task).
+Candidate output/call-limit violations also fail the task. Continuation requires
+proof of stopped work and a healthy, unchanged runtime. The llama.cpp adapter
+closes its HTTP stream and polls its inference-queue `/slots` contract for idle
+slots, then checks health. This path requires an emitted inference event (proof
+of admission) and an already-enabled slots endpoint; it never changes profile
+settings. Missing admission proof, disabled/unknown slot contracts, q27/NInfer
+without an implemented stop acknowledgement, broken transport or unhealthy
+backends retain safe termination and an incomplete run. Merely dropping the
+manager's request lease is not treated as proof. There are no reloads or retries.
+
+A finished evaluation with missing speed/native metrics or unsupported agentic
+capabilities is `completed_unavailable`, distinct from interruption. Fully
+covered scored sections remain usable with their fixed denominators. Both
+finished statuses participate in latest-result selection and advance Last
+benchmark; failed, cancelled and incomplete attempts preserve previous finished
+results and appear separately. Every row comes from one run. Insufficient samples
+and aggregate measurements remain unavailable, never zero or synthesized.
 
 Loading and inference use the normal runtime manager. An admission reservation
 rejects concurrent inference/load/unload and conflicting runtime mutations;
@@ -200,6 +213,14 @@ on restart without resuming. Offline CLI runtime probes cannot recover or rewrit
 a running server's checkpoints. The restart
 observation is identified separately from an unknown actual process-stop time.
 
+Tool results become observation evidence only for the next response. Independent
+reads can share a response; discovery must precede the dependent inspection,
+an observed revision must precede an update, and verification must follow the
+update in a later response. Conflict recovery needs the returned conflict and a
+fresh read before correction. The six-turn/eight-call limit accommodates the
+five-turn read → conflict → read → update → verify solution. Per-turn evidence
+includes the pre-response fixture observations, calls and returned results.
+
 Responses/tool arguments are bounded to 64 KiB per model turn; multi-step
 response text, calls and turns are bounded; records have an 8 MiB ceiling.
 Summary inspection is cached and bounded to 4096 recent records, with at most
@@ -207,7 +228,7 @@ Summary inspection is cached and bounded to 4096 recent records, with at most
 inspectable/exportable by ID after their artifact/runtime is removed. The TUI
 never deserializes all historical transcripts to draw a row.
 
-Selection prefers the latest completed result matching the current semantic
+Selection prefers the latest finished result (including `completed_unavailable`) matching the current semantic
 configuration and task-pack hash, never the highest score. Otherwise the latest
 completed result is historical, accompanied by configuration-change or
 unverified-identity reasons. The latest attempt is shown separately. If no completed result exists, its
@@ -242,3 +263,18 @@ storage and restart recovery can be validated offline. Live task difficulty,
 repeatability, output-length adequacy and score discrimination need calibration
 on safely available inference hardware. No calibrated runtime duration or
 measured model score is implied by the suite's maximum budget.
+
+## Version 2 correctness review
+
+All 24 intelligence prompts and keys were reviewed. `logic-5` now asks for all
+possible culprits, alphabetically: `["Ada", "Cy"]`. Exhaustive truth assignments
+show Bo violates the one-true-statement premise, while Ada and Cy both satisfy
+it. `context-2` explicitly requests a JSON array, and `code-3` explicitly requests
+only the option letter. Other keys retain their results. Full JSON equality
+remains the oracle; commentary, substrings and alternative shapes fail.
+
+Suite `norted-quick-bench/2` and methodology
+`binary-json-fixture-visible-delivery/2` identify the corrected pack, observation
+grading and task-failure policy. The manifest hash includes prompts, answers,
+fixture state and frozen limits. Version 1 records remain immutable and are not
+regraded or labelled comparable to version 2.

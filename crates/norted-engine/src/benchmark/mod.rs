@@ -66,6 +66,8 @@ pub struct Evidence {
     pub input_unicode_characters: usize,
     pub expected: Value,
     pub request_overrides: Value,
+    #[serde(default)]
+    pub stream_event_observed: bool,
     pub seconds_limit: u64,
     pub max_output_tokens: Option<u32>,
     pub response: String,
@@ -151,7 +153,7 @@ pub fn manifest() -> Value {
         "agents":suite::AGENT_PROMPTS,"tools":suite::tools(),"fixture":(0..4).map(suite::Fixture::new).collect::<Vec<_>>(),
         "probes":suite::probes().into_iter().map(|(id,input)|json!({"id":id,"utf8_bytes":input.len(),"unicode_characters":input.chars().count(),"input":input,"seconds":15,"max_output_tokens":512})).collect::<Vec<_>>(),
         "warmup":{"input":"Reply with the word ready.","seconds":10,"max_output_tokens":32},
-        "agent_limits":{"single_seconds":8,"single_turns":1,"multi_seconds":30,"multi_turns":4,"multi_calls":8,"max_output_tokens":384},
+        "agent_limits":{"single_seconds":8,"single_turns":1,"multi_seconds":30,"multi_turns":6,"multi_calls":8,"max_output_tokens":384},
         "evidence_limit_bytes":65536,"speed_min_characters":400,"delivery_min_span_ms":50,"delivery_min_characters_after_first":128})
 }
 pub fn now_ms() -> u128 {
@@ -354,20 +356,31 @@ impl Run {
 
 /// Latest complete applicable result, never best score. The fallback is a
 /// coherent historical run; latest attempt is displayed separately.
+pub fn finished(status: &str) -> bool {
+    matches!(status, "completed" | "completed_unavailable")
+}
+
 pub fn select<'a>(
     history: &'a [Summary],
     key: Option<&str>,
     pack: &str,
 ) -> (Option<&'a Summary>, &'static str) {
     if let Some(current) = history.iter().find(|s| {
-        s.status == "completed"
+        finished(&s.status)
             && key.is_some()
             && s.configuration_key.as_deref() == key
             && s.pack_hash == pack
     }) {
-        return (Some(current), "Current");
+        return (
+            Some(current),
+            if current.status == "completed_unavailable" {
+                "Current — metrics unavailable"
+            } else {
+                "Current"
+            },
+        );
     }
-    if let Some(old) = history.iter().find(|s| s.status == "completed") {
+    if let Some(old) = history.iter().find(|s| finished(&s.status)) {
         return (
             Some(old),
             if key.is_some() {

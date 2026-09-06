@@ -41,8 +41,8 @@
   {
     "id": "logic-5",
     "category": "logic",
-    "prompt": "Exactly one of Ada, Bo, Cy broke a cup. Ada says Bo did it. Bo says Cy did it. Cy says Bo is lying. Exactly one statement is true. Return the culprit name as a JSON string. Return only the requested JSON value, without Markdown or explanation.",
-    "answer": "Cy",
+    "prompt": "Exactly one of Ada, Bo, Cy broke a cup. Ada says Bo did it. Bo says Cy did it. Cy says Bo is lying. Exactly one statement is true. Return all possible culprit names in alphabetical order as a JSON array of strings. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": ["Ada", "Cy"],
     "rubric": "exact-json-v1",
     "seconds": 10,
     "max_output_tokens": 384
@@ -75,7 +75,7 @@
   {
     "id": "context-2",
     "category": "context",
-    "prompt": "Policy: expenses over 100 require manager approval; all overseas expenses also require finance approval. Receipt R: domestic, 140, manager approved. S: overseas, 80, manager approved only. T: overseas, 120, both approvals. U: domestic, 100, no approval. Return the IDs eligible for payment sorted alphabetically. Return only the requested JSON value, without Markdown or explanation.",
+    "prompt": "Policy: expenses over 100 require manager approval; all overseas expenses also require finance approval. Receipt R: domestic, 140, manager approved. S: overseas, 80, manager approved only. T: overseas, 120, both approvals. U: domestic, 100, no approval. Return the IDs eligible for payment sorted alphabetically as a JSON array of strings. Return only the requested JSON value, without Markdown or explanation.",
     "answer": [
       "R",
       "T",
@@ -170,7 +170,7 @@
   {
     "id": "code-3",
     "category": "code",
-    "prompt": "A binary search on sorted a uses inclusive lo=0, hi=len(a)-1. While lo<=hi, mid=(lo+hi)//2; if a[mid]<target it does lo=mid, else if a[mid]>target it does hi=mid-1, else returns mid. Which repair prevents the stalled lower-bound case while preserving correctness? Return one JSON string: A: lo=mid+1; B: hi=mid; C: lo=mid-1. Return only the requested JSON value, without Markdown or explanation.",
+    "prompt": "A binary search on sorted a uses inclusive lo=0, hi=len(a)-1. While lo<=hi, mid=(lo+hi)//2; if a[mid]<target it does lo=mid, else if a[mid]>target it does hi=mid-1, else returns mid. Which repair prevents the stalled lower-bound case while preserving correctness? Return only the option letter as a JSON string (\"A\", \"B\", or \"C\"): A: lo=mid+1; B: hi=mid; C: lo=mid-1. Return only the requested JSON value, without Markdown or explanation.",
     "answer": "A",
     "rubric": "exact-json-v1",
     "seconds": 10,
