@@ -1,5 +1,7 @@
 # Settings and Model Profiles terminal review
 
+Follow-up: [supported controls with unknown runtime defaults](unknown-default-correction.md). The original captures below document the redesign before that adapter correction.
+
 Redesign based on `ab06f27` on `fix/runtime-settings-inheritance`. The checkout was clean at that commit before editing. Changes are confined to Norted-Server's TUI; no configuration resolver, engine adapter, model artifact, runtime selection, or user preference was changed by the implementation.
 
 ## Layout

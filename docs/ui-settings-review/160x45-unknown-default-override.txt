@@ -1,0 +1,43 @@
+
+   ◆  NORTED SERVER  local runtime control                                                                                                     ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+      gemma-4-31b-roleplay
+                             Profile       gemma-4-31b-roleplay                             Role          Primary
+      qwen38-27b-q27-q6      Model         gemma-4-31B-it-uncensored-heretic-Q6_K
+                             Engine        llama.cpp                                        Runtime       b10786 / CUDA / managed-portable-cuda13-v2
+      zz-long-pr…tinct-tail  Configuration Next load
+                             [ Load ]  [ Model ]  [ Engine ]  [ Role ]  [ Duplicate ]  [ Delete ]          [ Refresh ]
+
+                             [ / c…ange ]  [ o Overrides ]     [ R Reset scope ]  [ i Details ]
+                             Setting                    Value                Source           Action     Status     Setting · i expand/close · [ ] scroll ─
+                             LOAD                                                                                  Identifier: llama.cpp.cpu_range
+                             CPU affinity range         4-7                  Profile          Inherit              Description: Generation-thread CPU
+                             Batch CPU affinity range   Default n… yet known Runtime default  —                    affinity range
+                             SPECULATION                                                                           Effective value: 4-7
+                             Draft CPU range            Default n… yet known Runtime default  —                    Source: model profile
+                                                                                                                   Applies: Next load
+                                                                                                                   Runtime baseline (read-only): not yet
+                                                                                                                   known
+                                                                                                                   Settings layer: not yet known
+                                                                                                                   Profile layer: 4-7
+                                                                                                                   Inherit target: Settings
+                                                                                                                   Constraints: non-empty text
+                                                                                                                   Profile: gemma-4-31b-roleplay
+                                                                                                                   Engine: llama.cpp
+                                                                                                                   Role: Primary
+                                                                                                                   Model path:
+                                                                                                                   /srv/norted/models/huggingface/llmfan46/
+                                                                                                                   gemma-4-31B-it-uncensored-heretic-GGUF/e
+                                                                                                                   ee61b81461ac75eb920a24ca9e5d420bb66e33d/
+                                                                                                                   bd79402490823028/gemma-4-31B-it-uncensor
+                                                                                                                   ed-heretic-Q6_K.gguf
+                                                                                                                   Runtime ID:
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    !  Settings saved; operational changes apply now and model settings on the next load
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Left/Right profile   ↑↓ setting   Enter edit   e change engine   l load profile   u unload active   Delete inherit   ? help
