@@ -1,6 +1,6 @@
 //! Presentation and private-control actions only; selection/scoring live on server.
 use crossterm::event::{KeyCode, KeyEvent};
-use norted_engine::benchmark::BenchmarkRequest;
+use norted_engine::benchmark::{BenchmarkRequest, performance_lines};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -152,7 +152,12 @@ fn timestamp(value: &Value) -> String {
 }
 pub fn render(frame: &mut Frame<'_>, area: Rect, state: &Benchmarks) {
     let mut lines = vec![
-        Line::from("Benchmarks · Norted Quick Bench v1"),
+        Line::from(format!(
+            "Benchmarks · {}",
+            state.overview["suite"]
+                .as_str()
+                .unwrap_or("suite metadata unavailable")
+        )),
         Line::from("b Run selected profile  h History  x Cancel  r Refresh"),
         Line::from("History: Enter Details  Space Mark  c Compare  Backspace Profiles"),
     ];
@@ -178,7 +183,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &Benchmarks) {
         "Norted Quick Intelligence / Agentic: points; speed: visible chars/s; latency: first visible ms",
     ));
     lines.push(Line::from(""));
-    let capacity = (area.height as usize).saturating_sub(lines.len() + 2) / 3;
+    let capacity = (area.height as usize).saturating_sub(lines.len() + 2) / 11;
     let start = state.selected.saturating_sub(capacity.saturating_sub(1));
     for (i, row) in state
         .rows()
@@ -215,18 +220,22 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, state: &Benchmarks) {
             status
         )));
         lines.push(Line::from(format!(
-            "  I {}  A {}  Speed {}  Latency {}  {} {}",
+            "  I {}  A {}  {} {} · {}",
             number(&r["intelligence"]),
             number(&r["agentic"]),
-            number(&r["speed"]["combined"]["visible_delivery_characters_per_second"]["median"]),
-            number(&r["speed"]["combined"]["first_visible_ms"]["median"]),
             if state.history.is_some() {
                 "Ended"
             } else {
                 "Last"
             },
-            timestamp(last)
+            timestamp(last),
+            r["suite"].as_str().unwrap_or("suite unknown")
         )));
+        lines.extend(
+            performance_lines(&r["speed"])
+                .into_iter()
+                .map(|line| Line::from(format!("  {line}"))),
+        );
         let note = if state.history.is_some() {
             row["diagnostic"].as_str().unwrap_or("").to_owned()
         } else {

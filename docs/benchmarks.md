@@ -1,6 +1,6 @@
 # Private per-profile benchmarks
 
-Norted Quick Bench v2 is an original, bundled, offline task pack. The running
+Norted Quick Bench v3 is an original, bundled, offline task pack. The running
 server executes it through its normal managed inference path. The TUI and CLI
 use authenticated private control; no benchmark endpoints are added to the
 public OpenAI-compatible API. No judge model, downloads, shell tools, Python
@@ -95,12 +95,12 @@ preparation or loading. The budget ceilings are frozen:
 |---|---:|
 | Preparation, integrity checks and compatible loading | 60 s |
 | One separate unscored warm-up | 10 s |
-| Four streaming speed/latency requests | 4 × 15 s |
+| Four streaming speed/latency requests | 4 × 20 s |
 | Intelligence | 24 × 10 s |
 | Single-turn native tools | 8 × 8 s |
 | Multi-step fixtures | 4 × 30 s |
-| Task work ceilings including preparation | 554 s |
-| Shared cancellation, bookkeeping and finalization headroom | 46 s |
+| Task work ceilings including preparation | 574 s |
+| Shared cancellation, bookkeeping and finalization headroom | 26 s |
 | Total maximum | 600 s |
 
 Tasks receive the full stated work ceilings: intelligence gets 10 s, single-turn
@@ -108,6 +108,9 @@ tools 8 s and a complete multi-step task 30 s. There is no per-task four-second
 termination deduction. Each stopped request has up to 1 s to confirm engine-side
 cancellation and health, charged to the same global budget. Preparation receives
 60 s; unused time remains global headroom, not extra task retries or inference.
+The 574 s phase ceilings leave 26 s of headroom. Cancellation and bookkeeping
+share that headroom; the global deadline still interrupts execution if it is
+exhausted, rather than extending the benchmark.
 Execution ends at 584 s, cleanup is bounded by 599 s, and finalization waits no
 later than 600 s. The terminal writer checks the monotonic deadline before
 publishing, so a delayed disk operation cannot publish a new successful record
@@ -115,7 +118,7 @@ after an expired finalization deadline. OS/storage stalls can prevent durable
 finalization or confirmation of process cleanup; checkpoints remain recoverable,
 and unconfirmed stopped work quarantines inference.
 
-Additional output limits are 32 tokens for warm-up, 512 for probes and 384 for
+Additional output limits are 32 tokens for warm-up, 2048 for probes and 384 for
 intelligence/tool turns, capped further by a stricter configured or known
 effective profile limit. Sampling, reasoning, templates, system prompts,
 quantization and runtime selection are preserved. Unknown runtime defaults are
@@ -154,11 +157,14 @@ preserves evidence.
 
 ## Physical speed and latency measurements
 
-The four probes are two short technical/data prompts plus two distinct medium
-contexts: 48 synthetic service records and 48 repository change records. Their
-fixed full text, exact UTF-8 byte/Unicode character sizes and output limits are
-in the manifest. Each requests 180–240 words. Workloads are never shortened for
-a profile. `input_utf8_bytes` and `input_unicode_characters` describe the fixed
+The four probes copy two fixed approximately 200-word passages, once with short
+context and once after medium context (48 synthetic service records or 48
+repository change records). The requested output population is identical within
+each short/medium pair. Their fixed full text, exact UTF-8 byte/Unicode character
+sizes and output limits are in the manifest. All profiles receive the same
+copy instructions, 2048-token cap and 20-second deadline. The cap includes
+reasoning where the runtime uses a shared output budget. No request disables or
+caps thinking separately. Workloads are never shortened for a profile. `input_utf8_bytes` and `input_unicode_characters` describe the fixed
 task text, not native tokens or the profile's complete rendered prompt. The
 record also includes the nonce-prefixed model-visible messages. Native usage,
 when supplied, describes the runtime's whole request including templates and
@@ -182,24 +188,48 @@ action. A parseable intermediate argument prefix is insufficient.
   (last-text time − first-text time)`. The first chunk is excluded from both
   the delivered population and elapsed delivery span. At least 400 total
   characters, 128 subsequent characters and 50 ms of delivery are required.
+* Visible Unicode characters divided by whole request duration are separately
+  labelled **text end-to-end chars/s**. A completed one-chunk response can
+  provide this rate, but cannot provide delivery speed. Whole-request rates
+  require a finite, ordered completion time of at least 50 ms. They are never
+  substituted into a delivery-speed comparison.
 * Native output tokens divided by whole request duration are labelled
   **native end-to-end output tokens/s**, never decode speed. Native counts
-  must be present, nonzero and arithmetically consistent; invalid or
+  must be present, with nonzero output and arithmetically consistent totals; invalid or
   reasoning-count-inconsistent usage cannot yield a rate. Reasoning-inclusive
   counts are never divided by a visible-only timing interval.
 * Headline latency is **time to first visible output in milliseconds**.
   First-text and completion latency remain separate. The shared event contract
   does not distinguish answer text from reasoning, so first-answer latency and
-  native decode-only rates are unavailable.
+  native decode-only rates are unavailable. q27 routed chat supplies separate
+  `reasoning_content`, which is not visible text; its top-level
+  `usage.reasoning_tokens` is preserved as the optional reasoning subset of
+  completion tokens. Raw completions without that counter remain unknown.
 
-Details retain short and medium groups separately, with medians, counts and
-ranges. A combined median requires all four samples for that method; each
-context group's median requires both samples. There is no substitution of short
-samples for missing medium samples, P95 estimate, mixed-method ranking or
-manufactured 0–100 speed/latency score. Empty, explicitly detected refusal,
-short and invalid samples retain failure/insufficiency reasons. The text
-workloads are not quality-judged; refusal detection is conservative and cannot
-recognize every paraphrased refusal.
+Metric validity is independent. A short response or absent native usage does
+not erase first-visible latency. Insufficient delivery span does not erase a
+valid whole-request rate. A later timeout retains the observed first-visible
+and last-text timestamps with its unsuccessful outcome; without completion it
+has no whole-request rate. No output before a timeout means “no output before
+deadline,” never zero. A terminal token limit retains its measured whole-request
+rate and latency but is not a successful full performance probe.
+
+Details retain every probe and its outcome, values and per-metric reasons.
+Short and medium groups have separate medians, counts and ranges. A full
+combined median requires four successful samples for that method; each context
+group requires both. Available subsets have a separate `partial_median`, labelled
+**partial**, with n/N and short/medium coverage in both TUI and CLI. Unsuccessful
+observations remain inspectable individually and do not fill the successful
+comparison denominator. Missing native usage does not invalidate the text rate.
+No short-only or mixed-method result is presented as a full comparison. There
+is no P95 estimate or manufactured 0–100 speed/latency score. Refusal detection
+remains conservative; performance text is not quality-judged.
+
+The TUI heading and each result identify the reported suite. Summaries identify
+their evidence-derivation algorithm as `independent-observed-metrics/3`; this can
+expose previously hidden observations in historical records without rewriting
+those records or changing their collection suite/methodology. Version 2 and 3
+workloads remain distinct and are not comparable performance measurements.
 
 ## Storage, identity and privacy
 
@@ -278,3 +308,28 @@ Suite `norted-quick-bench/2` and methodology
 grading and task-failure policy. The manifest hash includes prompts, answers,
 fixture state and frozen limits. Version 1 records remain immutable and are not
 regraded or labelled comparable to version 2.
+
+## Version 3 performance correction
+
+The local v2 q27 Q6/Q6K records exhausted all 512 output tokens without visible
+text in roughly 3.5–4.7 s. Their exact installed q27 v0.10.0 source
+(`4770e053656af9aababdc49c81f280ad21b74986`, w12) uses a shared reasoning/answer
+output cap. The recorded profiles enabled thinking with an unbounded thinking
+budget. Their runtime chat path separates reasoning from visible content;
+Norted previously discarded its native reasoning-token counter. A replay of
+the original short probe through the corrected serving path confirmed 512
+completion tokens, all 512 reasoning tokens, zero visible characters and a
+`length` finish after 4.66 s. Raising the
+cap alone did not make the explanatory workload reliable in live validation:
+one request still had no visible answer at a 30 s deadline.
+
+Version 3 replaces performance-only reasoning/review prompts with fixed passage
+copying and reserves 2048 total output tokens and 20 s per probe. The scored
+intelligence and agentic packs, settings precedence, runtime/template selection,
+and 600 s ownership/cancellation deadline are unchanged. The existing delivery
+guards (400 total characters, 128 after the first chunk, 50 ms) are unchanged.
+The q27 SSE parser continues forwarding text incrementally and collecting final
+usage after the finish frame. It filters initial raw-template reasoning only
+for raw completion text, since routed chat content has already been separated
+from reasoning by the runtime. This prevents suppression of an answer when the
+optional initial-reasoning filter is selected on the chat route.

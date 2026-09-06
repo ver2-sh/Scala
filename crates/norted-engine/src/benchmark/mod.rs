@@ -151,7 +151,7 @@ pub fn manifest() -> Value {
     json!({"suite":suite::SUITE,"method":suite::METHOD,"policy":suite::POLICY,
         "intelligence":suite::questions(),"single_tools":suite::single_cases(),
         "agents":suite::AGENT_PROMPTS,"tools":suite::tools(),"fixture":(0..4).map(suite::Fixture::new).collect::<Vec<_>>(),
-        "probes":suite::probes().into_iter().map(|(id,input)|json!({"id":id,"utf8_bytes":input.len(),"unicode_characters":input.chars().count(),"input":input,"seconds":15,"max_output_tokens":512})).collect::<Vec<_>>(),
+        "probes":suite::probes().into_iter().map(|(id,input)|json!({"id":id,"utf8_bytes":input.len(),"unicode_characters":input.chars().count(),"input":input,"seconds":suite::PROBE_SECONDS,"max_output_tokens":suite::PROBE_TOKENS})).collect::<Vec<_>>(),
         "warmup":{"input":"Reply with the word ready.","seconds":10,"max_output_tokens":32},
         "agent_limits":{"single_seconds":8,"single_turns":1,"multi_seconds":30,"multi_turns":6,"multi_calls":8,"max_output_tokens":384},
         "evidence_limit_bytes":65536,"speed_min_characters":400,"delivery_min_span_ms":50,"delivery_min_characters_after_first":128})
@@ -180,64 +180,94 @@ pub fn distribution(mut values: Vec<f64>) -> Value {
 
 pub fn speed_sample(e: &Evidence) -> Value {
     let t = &e.timing;
-    let reason = if e.status != "passed" {
+    let timestamp = |v: Option<f64>| v.filter(|v| v.is_finite() && *v >= 0.0);
+    let end = timestamp(t.completion_ms);
+    let first = timestamp(t.first_text_ms).filter(|v| end.is_none_or(|end| *v <= end));
+    let visible = timestamp(t.first_visible_ms)
+        .filter(|v| first.is_none_or(|first| *v >= first) && end.is_none_or(|end| *v <= end));
+    let last = timestamp(t.last_text_ms)
+        .filter(|v| first.is_some_and(|first| *v >= first) && end.is_none_or(|end| *v <= end));
+    let refusal = ["i cannot", "i can’t", "i can't", "i'm sorry"]
+        .iter()
+        .any(|prefix| e.response.trim().to_lowercase().starts_with(prefix));
+    let delivery_reason = if e.status != "passed" {
         Some(e.explanation.as_str())
-    } else if e.response.trim().to_lowercase().starts_with("i cannot")
-        || e.response.trim().to_lowercase().starts_with("i can’t")
-        || e.response.trim().to_lowercase().starts_with("i can't")
-        || e.response.trim().to_lowercase().starts_with("i'm sorry")
-    {
+    } else if refusal {
         Some("refusal, not a usable workload response")
     } else if t.visible_characters < 400 {
         Some("insufficient output: fewer than 400 Unicode characters")
-    } else if t.completion_ms.is_none_or(|v| !v.is_finite() || v < 50.0)
-        || t.first_text_ms
-            .zip(t.last_text_ms)
-            .zip(t.completion_ms)
-            .is_none_or(|((first, last), end)| {
-                !first.is_finite() || !last.is_finite() || first < 0.0 || first > last || last > end
-            })
-        || t.first_visible_ms
-            .zip(t.first_text_ms)
-            .zip(t.completion_ms)
-            .is_none_or(|((visible, text), end)| {
-                !visible.is_finite() || visible < text || visible > end
-            })
-        || t.first_chunk_characters > t.visible_characters
+    } else if t.first_chunk_characters == t.visible_characters {
+        Some("response delivered in one chunk")
+    } else if t.first_chunk_characters > t.visible_characters
+        || first
+            .zip(last)
+            .is_none_or(|(first, last)| last - first < 50.0)
+        || end.is_none()
+        || t.visible_characters
+            .saturating_sub(t.first_chunk_characters)
+            < 128
     {
-        Some("unusable timing: require ordered finite timestamps and at least 50 ms")
+        Some(
+            "insufficient post-first-chunk delivery: need ordered timestamps, 128 characters and 50 ms",
+        )
     } else {
         None
     };
-    if let Some(reason) = reason {
-        return json!({"id":e.id,"valid":false,"reason":reason});
-    }
-    let delivery = t
-        .first_text_ms
-        .zip(t.last_text_ms)
-        .and_then(|(first, last)| {
-            let remaining = t
-                .visible_characters
-                .saturating_sub(t.first_chunk_characters);
-            (last - first >= 50.0 && remaining >= 128)
-                .then_some(remaining as f64 * 1000.0 / (last - first))
-        });
-    // Native counters include any hidden reasoning. Only the whole-request
-    // interval covers that population; no visible-interval native decode rate.
-    let native = e
-        .usage
-        .as_ref()
-        .filter(|u| {
-            u.input_tokens > 0
-                && u.output_tokens > 0
-                && Some(u.total_tokens) == u.input_tokens.checked_add(u.output_tokens)
-                && u.reasoning_output_tokens
-                    .is_none_or(|r| r <= u.output_tokens)
-        })
-        .map(|u| u.output_tokens as f64 * 1000.0 / t.completion_ms.unwrap_or(1.0));
-    json!({"id":e.id,"valid":delivery.is_some(),"reason":if delivery.is_none(){Some("insufficient post-first-chunk delivery: need 128 characters and 50 ms")}else{None},"visible_delivery_characters_per_second":delivery,
-        "native_end_to_end_output_tokens_per_second":native,"first_visible_ms":t.first_visible_ms,
-        "first_text_ms":t.first_text_ms,"completion_ms":t.completion_ms,
+    let delivery = delivery_reason.is_none().then(|| {
+        (t.visible_characters - t.first_chunk_characters) as f64 * 1000.0
+            / (last.unwrap() - first.unwrap())
+    });
+    // Completion counters cover the entire request, including hidden reasoning.
+    // A terminal length limit still has an observed whole-request rate; its
+    // unsuccessful outcome is retained and excluded from complete comparisons.
+    let native_reason = if end.is_none_or(|end| end < 50.0) {
+        Some("whole-request completion timing unavailable or below 50 ms")
+    } else if e.usage.is_none() {
+        Some("native token usage unavailable")
+    } else if e.usage.as_ref().is_some_and(|u| {
+        u.output_tokens == 0
+            || Some(u.total_tokens) != u.input_tokens.checked_add(u.output_tokens)
+            || u.reasoning_output_tokens
+                .is_some_and(|r| r > u.output_tokens)
+    }) {
+        Some("native token usage inconsistent")
+    } else {
+        None
+    };
+    let native = native_reason
+        .is_none()
+        .then(|| e.usage.as_ref().unwrap().output_tokens as f64 * 1000.0 / end.unwrap());
+    let text_reason = if end.is_none_or(|end| end < 50.0) {
+        Some("whole-request completion timing unavailable or below 50 ms")
+    } else if t.visible_characters == 0 || first.is_none() || last.is_none() {
+        Some("no measured text output")
+    } else {
+        None
+    };
+    let text_rate = text_reason
+        .is_none()
+        .then(|| t.visible_characters as f64 * 1000.0 / end.unwrap());
+    let latency_reason =
+        visible
+            .is_none()
+            .then_some(if e.status == "timeout" && t.first_visible_ms.is_none() {
+                "no output before deadline"
+            } else {
+                "no valid first-visible timestamp"
+            });
+    json!({"id":e.id,"outcome":e.status,"outcome_reason":e.explanation,
+        "workload_complete":e.status == "passed" && !refusal,
+        "visible_delivery_characters_per_second":delivery,
+        "visible_end_to_end_characters_per_second":text_rate,
+        "native_end_to_end_output_tokens_per_second":native,
+        "first_visible_ms":visible,"first_text_ms":first,"completion_ms":end,
+        "reasons":{
+            "visible_delivery_characters_per_second":delivery_reason,
+            "visible_end_to_end_characters_per_second":text_reason,
+            "native_end_to_end_output_tokens_per_second":native_reason,
+            "first_visible_ms":latency_reason,
+            "first_text_ms":first.is_none().then_some("no valid first-text timestamp"),
+            "completion_ms":end.is_none().then_some("no valid completion timestamp")},
         "native_decode_tokens_per_second":null,"first_answer_ms":null})
 }
 
@@ -294,16 +324,45 @@ impl Run {
             for field in [
                 "visible_delivery_characters_per_second",
                 "native_end_to_end_output_tokens_per_second",
+                "visible_end_to_end_characters_per_second",
                 "first_visible_ms",
                 "first_text_ms",
                 "completion_ms",
             ] {
                 let values = selected
                     .iter()
+                    .filter(|s| s["workload_complete"] == true)
                     .filter_map(|s| s[field].as_f64())
                     .collect::<Vec<_>>();
                 let required = if prefix.is_empty() { 4 } else { 2 };
                 let mut stats = distribution(values);
+                stats["required"] = json!(required);
+                stats["partial_median"] = stats["median"].clone();
+                stats["complete"] = json!(stats["count"].as_u64() == Some(required));
+                stats["missing"] = json!(
+                    ["short-1", "short-2", "medium-1", "medium-2"]
+                        .into_iter()
+                        .filter(|id| id.starts_with(prefix))
+                        .filter_map(|id| {
+                            let sample = selected.iter().find(|s| s["id"] == id);
+                            match sample {
+                                Some(s)
+                                    if s["workload_complete"] == true && s[field].is_number() =>
+                                {
+                                    None
+                                }
+                                Some(s) => {
+                                    Some(json!({"id":id,"reason": if s["outcome"] != "passed" {
+                                s["outcome_reason"].clone()
+                            } else if s["workload_complete"] != true {
+                                json!("refusal, not a usable workload response")
+                            } else { s["reasons"][field].clone() }}))
+                                }
+                                None => Some(json!({"id":id,"reason":"probe not attempted"})),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                );
                 if stats["count"].as_u64() != Some(required) {
                     stats["median"] = Value::Null;
                 }
@@ -320,6 +379,10 @@ impl Run {
             );
         }
         groups.insert("samples".into(), json!(samples));
+        groups.insert(
+            "summary_method".into(),
+            json!("independent-observed-metrics/3"),
+        );
         Summary {
             run_id: self.run_id.clone(),
             profile_id: self.profile.id.clone(),
@@ -419,7 +482,7 @@ pub fn compare(left: &Run, right: &Run) -> Value {
         "runtime":{"left":left.provenance.as_ref().map(|p|&p.runtime),"right":right.provenance.as_ref().map(|p|&p.runtime)},
         "hardware":{"left":left.environment,"right":right.environment},
         "intelligence_delta":a.intelligence.zip(b.intelligence).map(|(a,b)|b-a),"agentic_delta":a.agentic.zip(b.agentic).map(|(a,b)|b-a),
-        "latency_delta_ms":a.speed["combined"]["first_visible_ms"]["median"].as_f64().zip(b.speed["combined"]["first_visible_ms"]["median"].as_f64()).map(|(a,b)|b-a)})
+        "latency_delta_ms":a.speed["combined"]["first_visible_ms"]["median"].as_f64().zip(b.speed["combined"]["first_visible_ms"]["median"].as_f64()).filter(|_|comparable).map(|(a,b)|b-a)})
 }
 
 pub(crate) struct Response {
@@ -467,6 +530,77 @@ fn value_changes(left: &Value, right: &Value) -> Vec<Value> {
     changes
 }
 
+/// Shared TUI/CLI presentation of one method; never substitutes another rate.
+pub fn performance_metric(speed: &Value, field: &str, units: &str) -> String {
+    let combined = &speed["combined"][field];
+    let count = combined["count"].as_u64().unwrap_or(0);
+    let value = combined["median"]
+        .as_f64()
+        .or_else(|| combined["partial_median"].as_f64());
+    let coverage = |group: &str| {
+        let stats = &speed[group][field];
+        let value = stats["median"]
+            .as_f64()
+            .or_else(|| stats["partial_median"].as_f64());
+        format!(
+            "{} {}/2{}",
+            group,
+            stats["count"].as_u64().unwrap_or(0),
+            value.map(|v| format!("={v:.2}")).unwrap_or_default()
+        )
+    };
+    let mut text = format!(
+        "{}{} {units} ({count}/4; {}; {})",
+        if count > 0 && count < 4 {
+            "partial "
+        } else {
+            ""
+        },
+        value
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_else(|| "unavailable".into()),
+        coverage("short"),
+        coverage("medium")
+    );
+    if let Some(missing) = combined["missing"]
+        .as_array()
+        .and_then(|items| items.first())
+    {
+        text.push_str(&format!(
+            "; {}: {}",
+            missing["id"].as_str().unwrap_or("probe"),
+            missing["reason"]
+                .as_str()
+                .unwrap_or("measurement unavailable")
+        ));
+    }
+    text
+}
+
+pub fn performance_lines(speed: &Value) -> Vec<String> {
+    [
+        (
+            "Delivery speed",
+            "visible_delivery_characters_per_second",
+            "chars/s after first chunk",
+        ),
+        (
+            "Text end-to-end",
+            "visible_end_to_end_characters_per_second",
+            "chars/s whole request",
+        ),
+        (
+            "Native end-to-end",
+            "native_end_to_end_output_tokens_per_second",
+            "output tokens/s whole request",
+        ),
+        ("First visible latency", "first_visible_ms", "ms"),
+    ]
+    .into_iter()
+    .map(|(label, field, units)| format!("{label}: {}", performance_metric(speed, field, units)))
+    .collect()
+}
+
 /// Shared result presentation; scoring stays in Run::summary for every client.
 pub fn inspection_text(value: &Value) -> String {
     let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
@@ -479,16 +613,23 @@ pub fn inspection_text(value: &Value) -> String {
         return pretty(value);
     }
     let s = &value["summary"];
+    let observations = s["speed"]["samples"].as_array().into_iter().flatten()
+        .map(|sample| format!("{} [{}]: first visible {} ms; delivery {} chars/s; text end-to-end {} chars/s; native end-to-end {} output tokens/s. {}",
+            sample["id"].as_str().unwrap_or("probe"), sample["outcome"].as_str().unwrap_or("unknown"),
+            number(&sample["first_visible_ms"]), number(&sample["visible_delivery_characters_per_second"]),
+            number(&sample["visible_end_to_end_characters_per_second"]), number(&sample["native_end_to_end_output_tokens_per_second"]),
+            sample["outcome_reason"].as_str().unwrap_or("")))
+        .collect::<Vec<_>>().join("\n");
     format!(
-        "Norted Quick Intelligence: {} / 100\nAgentic: {} / 100 (single {} / 8; multi {} / 4)\nVisible delivery: {} Unicode chars/s after first chunk\nFirst visible latency: {} ms\nStatus: {} · Suite: {}\n\nSummary and category counts:\n{}\n\nImmutable evidence record:\n{}",
+        "Norted Quick Intelligence: {} / 100\nAgentic: {} / 100 (single {} / 8; multi {} / 4)\n{}\nStatus: {} · Suite: {}\n\nProbe observations (outcomes retained):\n{}\n\nSummary and category counts:\n{}\n\nImmutable evidence record:\n{}",
         number(&s["intelligence"]),
         number(&s["agentic"]),
         s["single_pass"],
         s["multi_pass"],
-        number(&s["speed"]["combined"]["visible_delivery_characters_per_second"]["median"]),
-        number(&s["speed"]["combined"]["first_visible_ms"]["median"]),
+        performance_lines(&s["speed"]).join("\n"),
         s["status"].as_str().unwrap_or("unknown"),
         s["suite"].as_str().unwrap_or("unknown"),
+        observations,
         pretty(s),
         pretty(&value["record"])
     )
