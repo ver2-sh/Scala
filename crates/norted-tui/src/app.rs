@@ -2838,6 +2838,7 @@ impl App {
             },
             Screen::ModelProfiles => self.handle_model_profiles_key(key, layout),
             Screen::Benchmarks => {
+                self.clear_hover();
                 self.benchmarks.key(key);
                 Update::Render
             }
@@ -4116,6 +4117,21 @@ impl App {
             self.pending_profile_delete_confirmation = None;
         }
         match target {
+            Some(HoverTarget::BenchmarkRow(index)) => {
+                self.close_command();
+                self.focus = FocusArea::Content;
+                self.benchmarks.selected = index;
+                self.benchmarks.scroll = 0;
+                self.clear_hover();
+                Update::Render
+            }
+            Some(HoverTarget::BenchmarkAction(action)) => {
+                self.close_command();
+                self.focus = FocusArea::Content;
+                self.benchmarks.dispatch(action);
+                self.clear_hover();
+                Update::Render
+            }
             Some(HoverTarget::ModelDownloadsView) => {
                 self.downloads_focused = !self.downloads_focused;
                 self.model_search_editing = false;
@@ -4490,6 +4506,12 @@ impl App {
         match self.screen {
             Screen::Models if self.model_library_view == ModelLibraryView::Discover => {
                 self.move_model_search_selection(direction * 3)
+            }
+            Screen::Benchmarks => {
+                self.clear_hover();
+                self.benchmarks
+                    .navigate(direction, layout.benchmarks.detail.contains(position));
+                Update::Render
             }
             Screen::Models => self.scroll_models(direction * 3, layout),
             Screen::Overview => self.move_overview_selection(direction, layout),
