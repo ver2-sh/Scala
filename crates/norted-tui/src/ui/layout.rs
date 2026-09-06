@@ -91,6 +91,10 @@ pub enum HoverTarget {
     RuntimePickerResult(usize),
     RuntimePickerApply,
     RuntimePickerClear,
+    SettingsDetails,
+    SettingsSearch,
+    SettingsFilter,
+    SettingsReset,
     SettingsScope(usize),
     Setting(usize),
     SettingValue(usize),
@@ -163,6 +167,9 @@ pub struct UiLayout {
     pub logs_follow_latest: Rect,
     pub settings_scopes: Rect,
     pub settings_list: Rect,
+    pub settings_detail: Rect,
+    pub settings_dense: bool,
+    pub settings_tools: Vec<(HoverTarget, Rect)>,
     pub settings_scope_rows: Vec<(usize, Rect)>,
     pub settings_rows: Vec<(usize, Rect)>,
     pub setting_values: Vec<(usize, Rect)>,
@@ -868,6 +875,10 @@ impl UiLayout {
 
         let mut settings_scopes = Rect::default();
         let mut settings_list = Rect::default();
+        let mut settings_detail = Rect::default();
+        let settings_dense = screen_body.height < 18;
+        let settings_row_height = if compact { 2 } else { two_line_row_height };
+        let mut settings_tools = Vec::new();
         let mut settings_scope_rows = Vec::new();
         let mut settings_rows = Vec::new();
         let mut setting_values = Vec::new();
@@ -883,11 +894,19 @@ impl UiLayout {
                 screen_body.width,
                 screen_body.height.min(2),
             );
-            let settings_intro_height = match (app.screen, compact) {
-                (Screen::ModelProfiles, true) => 8,
-                (Screen::ModelProfiles, false) => 9,
-                (_, true) => 6,
-                (_, false) => 7,
+            let settings_intro_height = if settings_dense {
+                if app.screen == Screen::ModelProfiles {
+                    6
+                } else {
+                    4
+                }
+            } else {
+                (match (app.screen, compact) {
+                    (Screen::ModelProfiles, true) => 8,
+                    (Screen::ModelProfiles, false) => 9,
+                    (_, true) => 6,
+                    (_, false) => 7,
+                }) + 1
             };
             settings_list = Rect::new(
                 screen_body.x,
@@ -928,15 +947,88 @@ impl UiLayout {
                 ));
                 x = x.saturating_add(width);
             }
+            if screen_body.width >= 110 {
+                let sidebar_width = 24;
+                let selected = if app.screen == Screen::ModelProfiles {
+                    app.selected_model_profile.unwrap_or(0)
+                } else {
+                    app.settings_scope_index
+                };
+                let capacity = screen_body.height as usize / 2;
+                let start = selected.saturating_sub(capacity.saturating_sub(1));
+                settings_scope_rows = labels
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(capacity)
+                    .map(|(index, _)| {
+                        (
+                            index,
+                            Rect::new(
+                                screen_body.x,
+                                screen_body.y + ((index - start) * 2) as u16,
+                                sidebar_width - 1,
+                                2,
+                            ),
+                        )
+                    })
+                    .collect();
+                settings_scopes.x += sidebar_width;
+                settings_scopes.width = settings_scopes.width.saturating_sub(sidebar_width);
+                settings_list.x = settings_scopes.x;
+                settings_list.width = settings_scopes.width;
+            }
+            settings_tools = flow_actions(
+                Rect::new(
+                    settings_scopes.x,
+                    settings_list.y.saturating_sub(1),
+                    settings_scopes.width,
+                    1,
+                ),
+                &[
+                    (HoverTarget::SettingsSearch, 12),
+                    (HoverTarget::SettingsFilter, 18),
+                    (HoverTarget::SettingsReset, 17),
+                    (HoverTarget::SettingsDetails, 13),
+                ],
+                compact,
+            );
+            if screen_body.width >= 145 {
+                let detail_width = 40;
+                settings_detail = Rect::new(
+                    settings_list.right().saturating_sub(detail_width),
+                    settings_list.y,
+                    detail_width,
+                    settings_list.height,
+                );
+                settings_list.width = settings_list.width.saturating_sub(detail_width + 1);
+            } else {
+                let detail_height = settings_list.height.saturating_sub(4).min(8);
+                settings_detail = Rect::new(
+                    settings_list.x,
+                    settings_list.bottom().saturating_sub(detail_height),
+                    settings_list.width,
+                    detail_height,
+                );
+                settings_list.height = settings_list.height.saturating_sub(detail_height);
+            }
+            if app.settings_show_detail {
+                settings_detail = Rect::new(
+                    settings_scopes.x,
+                    settings_scopes.y.saturating_add(1),
+                    settings_scopes.width,
+                    settings_list.bottom().saturating_sub(settings_scopes.y + 2),
+                );
+            }
             let definitions = app.settings_definitions();
-            let capacity = (settings_list.height / two_line_row_height) as usize;
+            let capacity = (settings_list.height / settings_row_height) as usize;
             let end = (app.settings_scroll + capacity).min(definitions.len());
             for index in app.settings_scroll..end {
                 let row = Rect::new(
                     settings_list.x,
-                    settings_list.y + ((index - app.settings_scroll) as u16 * two_line_row_height),
+                    settings_list.y + ((index - app.settings_scroll) as u16 * settings_row_height),
                     settings_list.width,
-                    two_line_row_height,
+                    settings_row_height,
                 );
                 settings_rows.push((index, row));
                 let can_clear = app
@@ -998,13 +1090,23 @@ impl UiLayout {
             {
                 let action_area = Rect::new(
                     settings_scopes.x,
-                    settings_scopes
-                        .y
-                        .saturating_add(if compact { 6 } else { 7 }),
+                    settings_scopes.y.saturating_add(if settings_dense {
+                        3
+                    } else if compact {
+                        6
+                    } else {
+                        7
+                    }),
                     settings_scopes.width,
                     screen_body
                         .height
-                        .saturating_sub(if compact { 6 } else { 7 })
+                        .saturating_sub(if settings_dense {
+                            3
+                        } else if compact {
+                            6
+                        } else {
+                            7
+                        })
                         .min(2),
                 );
                 let mut actions = vec![(ModelProfileAction::Load, 8)];
@@ -1020,6 +1122,18 @@ impl UiLayout {
                     (ModelProfileAction::Refresh, if compact { 9 } else { 11 }),
                 ]);
                 model_profile_actions = flow_actions(action_area, &actions, compact);
+            }
+        }
+
+        if app.settings_show_detail
+            && matches!(app.screen, Screen::Settings | Screen::ModelProfiles)
+        {
+            settings_rows.clear();
+            setting_values.clear();
+            setting_inherit_actions.clear();
+            model_profile_actions.clear();
+            for (_, rect) in &mut settings_tools {
+                rect.y = settings_list.bottom().saturating_sub(1);
             }
         }
 
@@ -1104,7 +1218,7 @@ impl UiLayout {
             compact,
             model_row_height,
             runtime_row_height: two_line_row_height,
-            settings_row_height: two_line_row_height,
+            settings_row_height,
             overlay_row_height: two_line_row_height,
             nav_items,
             content,
@@ -1151,6 +1265,9 @@ impl UiLayout {
             logs_follow_latest,
             settings_scopes,
             settings_list,
+            settings_detail,
+            settings_dense,
+            settings_tools,
             settings_scope_rows,
             settings_rows,
             setting_values,
@@ -1323,6 +1440,13 @@ impl UiLayout {
             .find(|(_, area)| contains(*area, position))
         {
             return Some(HoverTarget::SelectedRuntimeAction(*action));
+        }
+        if let Some((target, _)) = self
+            .settings_tools
+            .iter()
+            .find(|(_, rect)| contains(*rect, position))
+        {
+            return Some(*target);
         }
         if contains(self.settings_input_submit, position) {
             return Some(HoverTarget::SettingsInputSubmit);

@@ -508,6 +508,7 @@ pub fn control_operation(operation: &str, status: &ControlStatus, json_output: b
                 println!("    Effective settings:");
                 for (id, setting) in &provenance.settings.effective {
                     let source = match &setting.source {
+                        norted_core::SettingSource::SettingsOverride => "Settings override",
                         norted_core::SettingSource::RuntimeDefault => "runtime default",
                         norted_core::SettingSource::ModelProfile { .. } => "model profile",
                         norted_core::SettingSource::Invocation => "boot inference",
@@ -944,7 +945,7 @@ pub fn model_profile(
     println!("  Role:           {:?}", profile.role);
     println!("  Content SHA:    {}", profile.content_hash());
     if profile.overrides.is_empty() {
-        println!("  Overrides:      none (runtime defaults apply)");
+        println!("  Overrides:      none (inherits from Settings)");
     } else {
         println!("  Overrides:");
         for (id, value) in profile.overrides.iter() {
@@ -1018,6 +1019,7 @@ pub fn settings_defaults(
     scope: &str,
     state: &norted_core::SettingsState,
     definitions: &[norted_core::SettingDefinition],
+    runtime_id: Option<&norted_core::RuntimeId>,
     json_output: bool,
 ) -> Result<()> {
     let patch = if scope == "server" {
@@ -1043,6 +1045,8 @@ pub fn settings_defaults(
                 } else {
                     "server default"
                 }
+            } else if configured.is_some() {
+                "Settings override"
             } else {
                 "runtime default"
             };
@@ -1055,11 +1059,14 @@ pub fn settings_defaults(
             serde_json::to_string_pretty(&json!({
                 "operation": operation,
                 "scope": scope,
+                "runtime_id": runtime_id,
                 "state": state,
                 "effective_settings": effective.iter().map(|(definition, value, source)| json!({
                     "id": definition.id,
                     "value": value,
                     "source": source,
+                    "supported": definition.supported,
+                    "unsupported_reason": definition.unsupported_reason,
                     "detail": definition.default_preview.as_ref().and_then(|default| default.detail.as_deref()),
                 })).collect::<Vec<_>>(),
             }))?
@@ -1067,11 +1074,25 @@ pub fn settings_defaults(
         return Ok(());
     }
     println!("Settings {operation}: {scope}");
+    if let Some(runtime_id) = runtime_id {
+        println!("  Runtime baseline: {runtime_id}");
+    }
     for (definition, value, source) in effective {
         if let Some(value) = value {
             println!("  {:<38} {:<18} ({source})", definition.id, value);
         } else {
-            println!("  {:<38} Unavailable (resolution error)", definition.id);
+            println!(
+                "  {:<38} {}",
+                definition.id,
+                if definition.supported {
+                    "Default not yet known"
+                } else {
+                    definition
+                        .unsupported_reason
+                        .as_deref()
+                        .unwrap_or("Unsupported by selected runtime")
+                }
+            );
         }
     }
     println!(

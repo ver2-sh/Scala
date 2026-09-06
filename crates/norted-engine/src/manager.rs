@@ -1066,6 +1066,15 @@ impl RuntimeManager {
             self.fail_loading(generation, error.to_string(), None).await;
             return Err(RuntimeError::StartupFailed(error.to_string()));
         }
+        if let Err(error) = adapter.validate_configuration(
+            &selection.runtime,
+            Some(&model),
+            &host,
+            &resolved_settings,
+        ) {
+            self.fail_loading(generation, error.to_string(), None).await;
+            return Err(RuntimeError::StartupFailed(error.to_string()));
+        }
         let selected_runtime_id = selection.runtime.manifest.runtime_id.clone();
         self.set_load_progress(
             generation,

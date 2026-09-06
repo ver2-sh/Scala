@@ -184,15 +184,6 @@ pub fn common_setting_definitions_for(
         .collect()
 }
 
-/// Removes capability-diagnostic definitions before a schema is exposed to
-/// ordinary settings clients.
-pub fn configurable_setting_definitions(
-    mut definitions: Vec<SettingDefinition>,
-) -> Vec<SettingDefinition> {
-    definitions.retain(|definition| definition.supported);
-    definitions
-}
-
 fn common_setting_definition_library(engine_id: &str) -> Vec<SettingDefinition> {
     vec![
         SettingDefinition {
@@ -1449,7 +1440,7 @@ pub trait EngineAdapter: Send + Sync {
         true
     }
     /// Applies adapter-owned cross-setting normalization after the generic
-    /// three-layer resolver has selected exact, engine-qualified values.
+    /// four-layer resolver has selected exact, engine-qualified values.
     fn normalize_settings(&self, settings: &mut ResolvedSettings) -> Result<(), EngineError> {
         if settings.engine_id == self.identity().id {
             Ok(())
@@ -1460,6 +1451,16 @@ pub trait EngineAdapter: Send + Sync {
                 self.identity().id
             )))
         }
+    }
+    /// Validate configuration after selecting a runtime. This never influences runtime identity.
+    fn validate_configuration(
+        &self,
+        _runtime: &InstalledRuntime,
+        _model: Option<&ModelArtifact>,
+        _host: &HostCapabilities,
+        _settings: &ResolvedSettings,
+    ) -> Result<(), EngineError> {
+        Ok(())
     }
     /// Lower values are preferred after compatibility. Engines own the
     /// semantic ordering of their runtime variants.
@@ -1554,7 +1555,7 @@ pub trait EngineAdapter: Send + Sync {
         Ok(SettingsSchema {
             engine_id: self.identity().id,
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
-            definitions: configurable_setting_definitions(self.setting_definitions()),
+            definitions: self.setting_definitions(),
         })
     }
     /// Gates the curated semantic settings against one exact runtime contract.
@@ -1568,7 +1569,7 @@ pub trait EngineAdapter: Send + Sync {
         Ok(SettingsSchema {
             engine_id: self.identity().id,
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
-            definitions: configurable_setting_definitions(self.model_setting_definitions(model)?),
+            definitions: self.model_setting_definitions(model)?,
         })
     }
     /// Reports the legacy/flexible-entry runtime configured directly for this

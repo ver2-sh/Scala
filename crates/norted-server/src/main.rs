@@ -720,7 +720,17 @@ async fn handle_model_profiles(
             let model = require_model(&core, &existing.model_id).await?;
             let mut candidate = existing.overrides.clone();
             candidate.0.extend(patch.0.clone());
-            validate_patch_for_model(&registry, &model, existing.engine_id.as_str(), &candidate)?;
+            let packs = composition::runtime_pack_manager(&core, registry.clone())?;
+            let settings_state = SettingsStore::new(&core.paths).read().await?;
+            packs
+                .validate_profile_settings(
+                    &settings_state,
+                    existing,
+                    &model,
+                    &candidate,
+                    &core.paths.data_dir,
+                )
+                .await?;
             let selected = profile_id.clone();
             let state = store
                 .update(move |state| {
@@ -861,6 +871,7 @@ async fn exact_model_profile_context(
     schema.materialize_runtime_configuration(&mut resolved)?;
     schema.validate(&resolved)?;
     schema.materialize_effective(&mut resolved)?;
+    adapter.validate_configuration(&selection.runtime, Some(&model), &host, &resolved)?;
     let compatibility =
         adapter.runtime_model_compatibility(&selection.runtime, &model, &host, Some(&resolved));
     Ok((profile, model, selection, schema, resolved, compatibility))
@@ -892,6 +903,7 @@ async fn output_settings_scope(
     json_output: bool,
 ) -> Result<()> {
     let registry = composition::engine_registry(core)?;
+    let mut runtime_id = None;
     let definitions = match scope {
         DefaultsScope::Server => server_setting_definitions(&registry)?
             .into_iter()
@@ -902,19 +914,18 @@ async fn output_settings_scope(
             let (mut schemas, warnings) = packs
                 .selected_runtime_settings_schemas(state, &core.paths.data_dir)
                 .await?;
-            schemas
-                .remove(engine_id)
-                .ok_or_else(|| {
-                    color_eyre::eyre::eyre!(
-                        "selected runtime defaults for `{engine_id}` are unavailable{}",
-                        if warnings.is_empty() {
-                            String::new()
-                        } else {
-                            format!(": {}", warnings.join("; "))
-                        }
-                    )
-                })?
-                .definitions
+            let schema = schemas.remove(engine_id).ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "selected runtime defaults for `{engine_id}` are unavailable{}",
+                    if warnings.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", warnings.join("; "))
+                    }
+                )
+            })?;
+            runtime_id = schema.runtime_id;
+            schema.definitions
         }
     };
     output::settings_defaults(
@@ -922,6 +933,7 @@ async fn output_settings_scope(
         &scope.to_string(),
         state,
         &definitions,
+        runtime_id.as_ref(),
         json_output,
     )
 }
@@ -1004,7 +1016,7 @@ async fn validate_runtime_default_candidate(
         .0
         .extend(patch.0.clone());
     let resolved = candidate.resolve_runtime_defaults(engine, &core.paths.data_dir)?;
-    schema.validate(&resolved)?;
+    packs.validate_runtime_settings(&schema, &resolved).await?;
     Ok(())
 }
 
@@ -1213,28 +1225,19 @@ fn model_schema_for_engine(
     Ok(norted_core::SettingsSchema {
         engine_id: engine.to_owned(),
         runtime_id: None,
-        definitions: norted_engine::configurable_setting_definitions(
-            adapter.model_setting_definitions(model)?,
-        ),
+        definitions: adapter.model_setting_definitions(model)?,
     })
 }
 
-fn parse_known_setting_ids(registry: &EngineRegistry, values: &[String]) -> Result<Vec<SettingId>> {
-    let known = server_setting_definitions(registry)?
-        .into_iter()
-        .map(|definition| definition.id)
-        .collect::<std::collections::BTreeSet<_>>();
+fn parse_known_setting_ids(
+    _registry: &EngineRegistry,
+    values: &[String],
+) -> Result<Vec<SettingId>> {
+    // Removal must work for obsolete and unsupported keys, without runtime discovery.
     values
         .iter()
-        .map(|value| {
-            let id = SettingId::new(value.clone())?;
-            if !known.contains(&id) {
-                return Err(SettingsError::UnknownSetting(id));
-            }
-            Ok(id)
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
+        .map(|value| SettingId::new(value.clone()).map_err(Into::into))
+        .collect()
 }
 
 fn server_setting_definitions(
