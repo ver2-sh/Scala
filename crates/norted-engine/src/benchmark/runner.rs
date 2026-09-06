@@ -384,6 +384,7 @@ impl RuntimeManager {
                 .is_null()
                 || summary.intelligence.is_none()
                 || summary.agentic.is_none()
+                || summary.speed["combined"]["first_visible_ms"]["median"].is_null()
                 || summary.speed["combined"]["visible_delivery_characters_per_second"]["median"]
                     .is_null()
             {
@@ -523,16 +524,19 @@ impl RuntimeManager {
         self.checkpoint(run, started, "speed").await?;
         for (id, prompt) in suite::probes() {
             self.verify_pinned(run).await?;
-            let request = self.request(run, &prompt, 512, false, Vec::new()).await?;
+            let request = self
+                .request(run, &prompt, suite::PROBE_TOKENS, false, Vec::new())
+                .await?;
             let mut e = new_evidence(
                 &id,
                 "speed",
                 &prompt,
                 Value::Null,
-                15,
+                suite::PROBE_SECONDS,
                 request.max_output_tokens,
             );
-            self.one_request(run, &mut e, request, 15).await?;
+            self.one_request(run, &mut e, request, suite::PROBE_SECONDS)
+                .await?;
             self.checkpoint(run, started, "speed").await?;
         }
         for q in suite::questions() {
@@ -662,16 +666,21 @@ impl RuntimeManager {
             }
         }
         self.verify_pinned(run).await?;
-        if run
-            .evidence
-            .iter()
-            .filter(|e| e.category == "speed")
-            .any(|e| !speed_sample(e)["valid"].as_bool().unwrap_or(false))
-        {
-            run.missing.push(
-                "Speed unavailable: invalid/insufficient probe samples; quality coverage retained"
-                    .into(),
-            );
+        let summary = run.summary();
+        for (field, label) in [
+            ("visible_delivery_characters_per_second", "Delivery speed"),
+            (
+                "native_end_to_end_output_tokens_per_second",
+                "Native end-to-end speed",
+            ),
+            ("first_visible_ms", "First visible latency"),
+        ] {
+            if summary.speed["combined"][field]["median"].is_null() {
+                run.missing.push(format!(
+                    "{label} incomplete: {}",
+                    bench::performance_metric(&summary.speed, field, "")
+                ));
+            }
         }
         self.checkpoint(run, started, "finalization").await?;
         Ok(())
@@ -808,7 +817,11 @@ impl RuntimeManager {
                     let case: suite::ToolCase =
                         serde_json::from_value(e.expected.clone()).map_err(|e| e.to_string())?;
                     suite::grade_single(&case, &e.response, &response.calls)
-                } else if e.category == "speed" || e.category == "warmup" {
+                } else if e.category == "speed" {
+                    response.calls.is_empty()
+                        && !e.response.trim().is_empty()
+                        && response.finish == "Stop"
+                } else if e.category == "warmup" {
                     response.calls.is_empty() && !e.response.trim().is_empty()
                 } else {
                     response.calls.is_empty() && suite::grade_json(&e.response, &e.expected)

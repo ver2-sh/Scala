@@ -1,13 +1,15 @@
-//! Frozen, offline inputs and binary oracles for Norted Quick Bench v2.
+//! Frozen, offline inputs and binary oracles for Norted Quick Bench v3.
 use crate::{InferenceTool, InferenceToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const INTELLIGENCE: &str = include_str!("intelligence.json");
-pub const SUITE: &str = "norted-quick-bench/2";
-pub const METHOD: &str = "binary-json-fixture-visible-delivery/2";
-pub const POLICY: &str = "600s monotonic admission deadline: preparation 60; warmup 10; probes 4x15; intelligence 24x10; tools 8x8; agents 4x30 (6 turns / 8 calls). Full task work ceilings; cancellation confirmation up to 1s per stopped request shares global budget. Execution ends at 584s, cleanup by 599s, finalization by 600s. Candidate deadlines/limits score zero after confirmed request stop and health; unverified cancellation or infrastructure failure interrupts suite. Insufficient metrics remain unavailable; completed sections retain fixed denominators. One attempt. Internal managed streaming boundary. Per-run nonce; cache unverified. No decode-only or first-answer estimate.";
+pub const SUITE: &str = "norted-quick-bench/3";
+pub const METHOD: &str = "binary-json-fixture-independent-performance/3";
+pub const PROBE_SECONDS: u64 = 20;
+pub const PROBE_TOKENS: u32 = 2048;
+pub const POLICY: &str = "600s monotonic admission deadline: preparation 60; warmup 10; probes 4x20 (2048 total output tokens, including reasoning); intelligence 24x10; tools 8x8; agents 4x30 (6 turns / 8 calls). Full task work ceilings; cancellation confirmation up to 1s per stopped request shares global budget. Execution ends at 584s, cleanup by 599s, finalization by 600s. Candidate deadlines/limits score zero after confirmed request stop and health; unverified cancellation or infrastructure failure interrupts suite. Insufficient metrics remain unavailable; completed sections retain fixed denominators. One attempt. Internal managed streaming boundary. Per-run nonce; cache unverified. No decode-only or first-answer estimate.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Question {
@@ -342,14 +344,26 @@ impl Fixture {
 }
 
 pub fn probes() -> Vec<(String, String)> {
-    let short1="Write a 180 to 240 word technical explanation of how a bounded work queue handles overload. Cover admission, backpressure, cancellation, and observability with concrete examples.".to_owned();
-    let short2="Write a 180 to 240 word review of this deployment table: alpha requests=120 errors=3 p50_ms=40; beta requests=80 errors=8 p50_ms=35; gamma requests=200 errors=2 p50_ms=65. Discuss aggregate error rate, latency tradeoffs and what cannot be inferred from medians.".to_owned();
-    let mut medium1="Review these synthetic service records. Write 180 to 240 words explaining capacity planning, failure patterns and data limitations. Cite at least three different records.\n".to_owned();
-    let mut medium2="Review this synthetic repository change log. Write 180 to 240 words proposing a release verification plan and describing dependencies and rollback concerns. Cite at least three entries.\n".to_owned();
+    // Performance measures delivery, not another reasoning rubric. A fixed
+    // copy workload provides the same output population after both contexts,
+    // while preserving each profile's reasoning and generation settings.
+    let passage1 = "A bounded work queue places a fixed limit on waiting jobs. When arrivals exceed available capacity, the service must decide whether to reject new work, delay admission, or ask the caller to try again later. This decision should be explicit so that overload does not silently become an ever growing memory allocation. A worker takes one admitted job, performs its operation, records the result, and releases the capacity associated with that job. Cancellation should remove work that has not started and notify running work when its result is no longer wanted. A deadline follows the job through each stage instead of restarting whenever the job enters another queue. Operators need separate measurements for arrivals, admissions, rejections, waiting time, active work, and completion time. Queue length alone cannot explain whether a service is healthy. A short queue may indicate low demand, rapid processing, or aggressive rejection. A long queue may hide a slow dependency even when local processors are mostly idle. Capacity changes should therefore be evaluated against the complete request path. Clear ownership of each job and a bounded shutdown procedure help the service stop without losing track of work that is still running.";
+    let passage2 = "A deployment review compares observations from several services while keeping their measurement boundaries explicit. Request totals describe traffic volume, and error totals describe recorded failures within the same observation period. A combined error rate uses the sum of errors divided by the sum of requests. Individual service rates should not be averaged without accounting for their different traffic volumes. Reported latency medians describe the middle of each service distribution. They do not reveal the slowest requests, and their average is not the median of all requests combined. A release plan should record which version produced each observation, when collection started, and whether the traffic mix changed during the review. Independent checks can run together, but a check that relies on a migration must wait until that migration completes. A rollback plan must explain which data remains readable by the previous version and which operations require special handling. After a release, operators should compare rejection counts, queue age, error rates, and resource use with the earlier observation period. These measurements support investigation rather than proving a cause on their own. Keeping the original records makes later comparisons possible when new information changes the interpretation of an apparent improvement or regression.";
+    let copy = |passage: &str| {
+        format!(
+            "Copy the passage below verbatim as your entire response, without a heading or quotation marks. The preceding context, if any, is background only.\n<passage>\n{passage}\n</passage>"
+        )
+    };
+    let short1 = copy(passage1);
+    let short2 = copy(passage2);
+    let mut medium1 = "Background service records:\n".to_owned();
+    let mut medium2 = "Background repository change records:\n".to_owned();
     for i in 0..48 {
         medium1.push_str(&format!("Service s{i:02}: workers={}, queue_limit={}, requests={}, failures={}, timeout_ms={}. Retries require an idempotency key; health checks exclude upstream latency.\n",2+i%7,32+8*(i%5),500+13*i,i%9,100+25*(i%6)));
         medium2.push_str(&format!("Change c{i:02}: module m{} now validates field f{} before storage; migration v{} supplies missing values. Release flag r{} controls activation. Rollback retains the prior reader; monitor rejected records and queue age.\n",i%9,i%13,1+i/8,i%5));
     }
+    medium1.push_str(&copy(passage1));
+    medium2.push_str(&copy(passage2));
     vec![
         ("short-1".into(), short1),
         ("short-2".into(), short2),
