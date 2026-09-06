@@ -35,7 +35,7 @@ impl Action {
             Self::Run => "[b Run]",
             Self::History => "[h History]",
             Self::Details => "[d Details]",
-            Self::Mark => "[Space Mark baseline]",
+            Self::Mark => "[Space Mark/clear]",
             Self::Compare => "[c Compare]",
             Self::Back => "[Backspace Back]",
             Self::Refresh => "[r Refresh]",
@@ -50,6 +50,7 @@ pub struct Benchmarks {
     pub history: Option<Value>,
     pub selected: usize,
     pub marked: Option<String>,
+    pub marked_profile: Option<String>,
     pub pending: Option<BenchmarkRequest>,
     pub busy: bool,
     pub polling: bool,
@@ -137,7 +138,6 @@ impl Benchmarks {
                         .iter()
                         .position(|r| r["profile_id"].as_str() == profile.as_deref())
                         .unwrap_or(0);
-                    self.marked = None;
                 }
                 self.scroll = 0;
             }
@@ -145,7 +145,20 @@ impl Benchmarks {
                 self.evidence = true;
                 self.scroll = 0;
             }
-            Mark => self.marked = self.row()["run_id"].as_str().map(str::to_owned),
+            Mark => {
+                let run = self.row()["run_id"].as_str().map(str::to_owned);
+                if self.marked == run {
+                    self.marked = None;
+                    self.marked_profile = None;
+                } else {
+                    self.marked_profile = Some(format!(
+                        "{} ({})",
+                        text(&self.row()["display_name"]),
+                        text(&self.history.as_ref().unwrap()["profile_id"])
+                    ));
+                    self.marked = run;
+                }
+            }
             Cancel => self.pending = Some(BenchmarkRequest::Cancel),
             Refresh => {
                 self.pending = Some(
@@ -439,25 +452,50 @@ pub fn clamp_scroll(state: &mut Benchmarks, area: Rect) {
     state.scroll = state.scroll.min(max);
 }
 
+/// Short measurement overview; coverage and reasons follow below, before Details.
+fn overview_lines(s: &Value) -> Vec<String> {
+    if s.is_null() {
+        return vec!["No selected result. Measurements unavailable until a run finishes.".into()];
+    }
+    vec![
+        format!(
+            "Intelligence: {} /100 | Agentic: {} /100",
+            number(&s["intelligence"]),
+            number(&s["agentic"])
+        ),
+        format!(
+            "Delivery: {} chars/s | First visible: {} ms",
+            metric(s, "visible_delivery_characters_per_second"),
+            metric(s, "first_visible_ms")
+        ),
+        format!(
+            "Text end-to-end: {} chars/s",
+            metric(s, "visible_end_to_end_characters_per_second")
+        ),
+        format!(
+            "Native end-to-end: {} output tokens/s",
+            metric(s, "native_end_to_end_output_tokens_per_second")
+        ),
+    ]
+}
+
 fn summary_lines(s: &Value) -> Vec<String> {
     if s.is_null() {
         return vec![
             "No selected result. Measurements are unavailable until a run finishes.".into(),
         ];
     }
-    let mut lines = vec![
-        format!("Run: {} | {}", text(&s["run_id"]), text(&s["status"])),
-        format!(
-            "Intelligence: {} / 100 | Agentic: {} / 100",
-            number(&s["intelligence"]),
-            number(&s["agentic"])
-        ),
-    ];
+    let mut lines = overview_lines(s);
     lines.extend(performance_lines(&s["speed"]).into_iter().map(|line| {
         line.split_once(": ")
             .map(|(label, value)| format!("{label:<24} {value}"))
             .unwrap_or(line)
     }));
+    lines.push(format!(
+        "Run: {} | {}",
+        text(&s["run_id"]),
+        text(&s["status"])
+    ));
     for key in [
         "display_name",
         "agentic_unavailable",
@@ -509,7 +547,7 @@ fn summary_lines(s: &Value) -> Vec<String> {
 fn detail_lines(state: &Benchmarks) -> Vec<String> {
     let mut lines = content_lines(state);
     if let Some(error) = &state.error {
-        lines.insert(0, format!("Error: {error}"));
+        lines.push(format!("Error: {error}"));
     }
     lines
 }
@@ -526,6 +564,14 @@ fn content_lines(state: &Benchmarks) -> Vec<String> {
             return summary_lines(&value["summary"]);
         }
         let mut lines = vec!["Comparison: baseline (left) -> selected (right)".into()];
+        for (label, side) in [("Baseline", "left"), ("Selected", "right")] {
+            lines.push(format!(
+                "{label}: {} ({}) | Run: {}",
+                text(&value[side]["display_name"]),
+                text(&value[side]["profile_id"]),
+                text(&value[side]["run_id"])
+            ));
+        }
         for key in [
             "same_methods",
             "same_configuration",
@@ -619,14 +665,15 @@ fn content_lines(state: &Benchmarks) -> Vec<String> {
         }];
     }
     let row = state.row();
-    let mut lines = vec![format!(
+    let mut lines = overview_lines(state.result());
+    lines.push(format!(
         "Selected: {}",
         text(if state.history.is_some() {
             &row["run_id"]
         } else {
             &row["display_name"]
         })
-    )];
+    ));
     if state.history.is_none() {
         lines.push(format!(
             "State: {} | Last finished: {}",
@@ -648,9 +695,26 @@ fn content_lines(state: &Benchmarks) -> Vec<String> {
         }
     }
     if let Some(mark) = &state.marked {
-        lines.insert(0, format!("* Baseline: {mark}"));
+        lines.push(format!(
+            "* Baseline: {} | Run: {mark}. Space on this run clears; on another replaces.",
+            state.marked_profile.as_deref().unwrap_or("unknown profile")
+        ));
     }
-    lines.extend(summary_lines(state.result()));
+    let result = state.result();
+    for key in ["status", "suite", "agentic_unavailable", "diagnostic"] {
+        if !result[key].is_null() {
+            fields(&mut lines, &key.replace('_', " "), &result[key]);
+        }
+    }
+    lines.push(format!(
+        "Run: {} | Finished: {}",
+        text(&result["run_id"]),
+        timestamp(&result["ended_unix_ms"])
+    ));
+    lines.extend(performance_lines(&result["speed"]));
+    lines.push(
+        "Details: configuration, diagnostics and probe outcomes. Evidence: raw result.".into(),
+    );
     lines
 }
 pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, layout: &UiLayout) {
@@ -665,14 +729,15 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     } else {
         "Benchmarks"
     };
-    frame.render_widget(
-        section_title(
-            title,
-            "Manual runs | PgUp/PgDn or wheel: selected details",
-            theme,
-        ),
-        l.title,
-    );
+    let subtitle = if let Some(mark) = &state.marked {
+        format!(
+            "Baseline: {} | {mark} (full identity in selected details)",
+            state.marked_profile.as_deref().unwrap_or("unknown profile")
+        )
+    } else {
+        "Manual runs | PgUp/PgDn or wheel: selected details".into()
+    };
+    frame.render_widget(section_title(title, &subtitle, theme), l.title);
     let active = &state.overview["active"];
     let status = if active.is_object() {
         format!(
@@ -705,29 +770,31 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         }),
         l.progress,
     );
-    let wide = l.header.width >= 120;
+    // Secondary metadata yields to measurements; use the same columns for every row.
+    let wide = l.header.width >= 140;
+    let intermediate = l.header.width >= 96;
+    let compact = l.header.width >= 64;
     let tails: &[u16] = if wide {
-        &[12, 11, 16, 16, 22, 17]
+        &[12, 11, 17, 17, 22, 17]
+    } else if intermediate {
+        &[12, 11, 17, 17]
+    } else if compact {
+        &[12, 11, 17]
     } else {
-        &[22]
+        &[12, 11]
     };
-    let columns = inventory_columns(l.header, tails, &[18]);
-    let headings: Vec<String> = if wide {
-        vec![
-            "Profile / run",
-            "Intelligence",
-            "Agentic",
-            "Delivery chars/s",
-            "First visible ms",
-            "State",
-            "Last finished UTC",
-        ]
-    } else {
-        vec!["Profile / run", "State"]
+    let columns = inventory_columns(l.header, tails, tails);
+    let mut headings = vec!["Profile / run", "Intel /100", "Agent /100"];
+    if compact {
+        headings.push("Delivery chars/s");
     }
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
+    if intermediate {
+        headings.push("First visible ms");
+    }
+    if wide {
+        headings.extend(["State", "Last finished UTC"]);
+    }
+    let headings = headings.into_iter().map(str::to_owned).collect::<Vec<_>>();
     inventory_row(frame, l.header, &columns, &headings, theme.muted, glyphs);
     for (index, rect) in &l.rows {
         let row = &state.rows()[*index];
@@ -740,7 +807,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         let marked = state
             .marked
             .as_deref()
-            .is_some_and(|m| row["run_id"].as_str() == Some(m));
+            .is_some_and(|m| result["run_id"].as_str() == Some(m));
         let name = format!(
             "{}{} {}",
             if selected { ">" } else { " " },
@@ -756,23 +823,25 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         } else {
             &row["state"]
         });
-        let values = if wide {
-            vec![
-                name,
-                number(&result["intelligence"]),
-                number(&result["agentic"]),
-                metric(result, "visible_delivery_characters_per_second"),
-                metric(result, "first_visible_ms"),
-                status,
-                timestamp(if state.history.is_some() {
-                    &row["ended_unix_ms"]
-                } else {
-                    &row["last_benchmark_unix_ms"]
-                }),
-            ]
-        } else {
-            vec![name, status]
-        };
+        let mut values = vec![
+            name,
+            number(&result["intelligence"]),
+            number(&result["agentic"]),
+        ];
+        if compact {
+            values.push(metric(result, "visible_delivery_characters_per_second"));
+        }
+        if intermediate {
+            values.push(metric(result, "first_visible_ms"));
+        }
+        if wide {
+            values.push(status);
+            values.push(timestamp(if state.history.is_some() {
+                &row["ended_unix_ms"]
+            } else {
+                &row["last_benchmark_unix_ms"]
+            }));
+        }
         let style = if selected { theme.selected } else { theme.text };
         let style = if app.hover == Some(HoverTarget::BenchmarkRow(*index)) {
             style.patch(theme.hovered)
