@@ -644,15 +644,18 @@ Q27 serving also requires one unambiguous `.tok` companion. An exact same-stem t
 
 A `.ninfer` file is one self-contained primary artifact; embedded tokenizer, template, frontend, and other resources are not discovered as companions. Admission reads the 16-byte `NINFER\0\x02`/little-endian directory framing and at most 16 MiB of JSON directory metadata, validates object ranges against the actual file, and recovers typed `container_version`, `model_id`, and `weights_id` identity from the container—not its filename. Version 1, bad magic, truncated/absurd directories, malformed closed metadata shapes, and invalid payload ranges fail closed. Discovery never maps or hashes the multi-gigabyte payload and never invokes NInfer or a network. The adapter re-inspects the same bounded identity during preparation and immediately before launch. Managed runtime capabilities are generated from the exact checked-out target registry; an unrecognized registry degrades to needs-attention rather than a hard-coded filename/model allowlist.
 
-## Secure serving and OpenAI-compatible text APIs
+## Secure serving and OpenAI-compatible APIs
 
 The public gateway defaults to `127.0.0.1:8742`:
 
 ```text
 GET  /health
 GET  /v1/models
+GET  /v1/models/{model}
 POST /v1/responses
 POST /v1/chat/completions
+POST /v1/completions
+POST /v1/embeddings
 ```
 
 Public authentication is configured under `[server]` with `auth = "auto"`, `"required"`, or `"disabled"`:
@@ -661,7 +664,7 @@ Public authentication is configured under `[server]` with `auth = "auto"`, `"req
 - `required` requires a key even on loopback.
 - `disabled` is an explicit insecure override. A non-loopback bind is allowed but produces prominent CLI, log, status, and TUI warnings.
 
-When authentication is effective, it applies to `/v1/models`, `/v1/responses`, and `/v1/chat/completions`. `/health` remains a minimal unauthenticated liveness endpoint. `serve` validates that at least one active key exists before binding a required-auth public listener.
+When authentication is effective, it applies to `/v1/models`, `/v1/models/{model}`, `/v1/responses`, `/v1/chat/completions`, `/v1/completions`, and `/v1/embeddings`. `/health` remains a minimal unauthenticated liveness endpoint. `serve` validates that at least one active key exists before binding a required-auth public listener.
 
 Create and manage keys with the scriptable CLI:
 
@@ -772,7 +775,7 @@ curl http://127.0.0.1:8742/v1/chat/completions \
 
 Responses streaming emits the current ordered Norted-generated Responses SSE events and ends in completed, incomplete, or failed state. Chat streaming emits stable `chat.completion.chunk` IDs, assistant/text deltas, a truthful stop/length finish reason, optional known usage, and `[DONE]`. Dropping a client stream drops its owned backend stream rather than leaving detached generation.
 
-For NInfer, both public endpoints pass through the canonical Norted `InferenceRequest` and private
+For NInfer, Responses and Chat Completions pass through the canonical Norted `InferenceRequest` and private
 `/v1/chat/completions` translation; they are never raw-proxied to NInfer's richer APIs. The reviewed
 source contract carries seed, top-k/min-p, penalties, stops, thinking/effort, ordinary function
 tools, tool history/results, and streaming tool deltas. NInfer supports only `auto`/`none` tool
@@ -781,6 +784,21 @@ choice and cannot guarantee single-call mode, so required/named choices, strict 
 `ninfer.vision=on`, user images/videos and tool-result images may use bounded HTTP(S) or data URLs;
 audio, file paths, assistant/system media, and arbitrary modalities remain unsupported. Structured
 output stays false because the audited NInfer source rejects constrained non-text response formats.
+
+Responses remains the primary generation API; Chat Completions is the modern compatibility generation API. `/v1/completions` provides legacy **raw-prompt** compatibility, with no chat template or system-message injection. llama.cpp and exact reviewed q27 runtimes support it, including streaming; NInfer does not. Requests accept one string `prompt`, `model`, `stream`, `stream_options.include_usage`, `max_tokens`, `temperature`, `top_p`, and adapter-supported `top_k`, `min_p`, `seed`, stop strings and penalties. q27 rejects stop strings and repetition/presence/frequency penalties. Non-default `n`/`best_of`, `echo=true`, non-null `logprobs`/`suffix`, non-empty `logit_bias`, token-ID prompts and multiple prompts fail explicitly. `user` is accepted as client metadata without changing inference.
+
+`/v1/embeddings` requires an embedding-capable Model Profile/runtime. Initially only llama.cpp is supported. Bounded inspection of the actual GGUF reads `<architecture>.pooling_type`: mean (1), CLS (2), or last (3) establishes pooled embedding capability. Missing/unknown, none (0), and rank (4) do not. Raw and package-managed artifacts use the same inspection, independently of Builder provenance and filenames. Such profiles launch normally with `--embedding`, without forcing pooling. Runtime inference supplies numeric vectors; Norted formats float arrays or base64 little-endian float32 bytes, preserving input order and indexes. Token accounting is included only when supplied consistently by the runtime.
+
+Embeddings accepts `input` as a non-empty string or non-empty array of non-empty strings, `encoding_format` of `float` (default) or `base64`, and optional `user`. Any supplied `dimensions`, token-array inputs, or unknown fields are rejected. Unsupported model/runtime capabilities fail explicitly with sanitized OpenAI-style errors. Both new inference routes share authentication, request correlation, the 32 MiB body limit, X-Norted routing, JIT loading, and runtime leases.
+
+```sh
+curl http://127.0.0.1:8742/v1/embeddings \
+  -H "Authorization: Bearer $NORTED_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"<EMBEDDING_MODEL_PROFILE_ID>","input":["First text","Second text"],"encoding_format":"float"}'
+```
+
+`GET /v1/models/{model}` retrieves one Model Profile ID with the same fields as the list, or returns an OpenAI-style 404.
 
 Public `/v1/models` remains the minimal OpenAI list (`id`, `object`, `created`, `owned_by`). Use the private local `norted-server models info <MODEL_ID>` command, with optional `--json`, to inspect compatible engines/runtimes, current resolution and active state, and model/engine serving capabilities without exposing them publicly.
 

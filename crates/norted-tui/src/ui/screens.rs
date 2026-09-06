@@ -1760,8 +1760,11 @@ fn render_server(
             }
         )));
         lines.push(Line::from(Span::styled("API ROUTES", theme.hint)));
-        lines.push(Line::from("GET /health   GET /v1/models"));
+        lines.push(Line::from(
+            "GET /health   GET /v1/models   GET /v1/models/{model}",
+        ));
         lines.push(Line::from("POST /v1/responses   POST /v1/chat/completions"));
+        lines.push(Line::from("POST /v1/completions   POST /v1/embeddings"));
     }
     let used = lines.len() as u16;
     frame.render_widget(
@@ -3280,7 +3283,7 @@ fn server_text(app: &App) -> String {
     if let Some(error) = &app.public_auth_error {
         text.push_str(&format!("Auth state unavailable: {error}\n"));
     }
-    text.push_str("\nAPI ROUTES\nGET /health\nGET /v1/models\nPOST /v1/responses\nPOST /v1/chat/completions\n\nRESIDENT BACKENDS\n");
+    text.push_str("\nAPI ROUTES\nGET /health\nGET /v1/models\nGET /v1/models/{model}\nPOST /v1/responses\nPOST /v1/chat/completions\nPOST /v1/completions\nPOST /v1/embeddings\n\nRESIDENT BACKENDS\n");
     if let Some(control) = &app.control {
         for backend in &control.backends {
             text.push('\n');

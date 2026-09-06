@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64 = "0.22"
 async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true

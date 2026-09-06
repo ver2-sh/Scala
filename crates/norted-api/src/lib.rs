@@ -2,6 +2,8 @@
 
 mod auth;
 mod chat;
+mod completions;
+mod embeddings;
 mod error;
 mod input;
 mod responses;
@@ -240,6 +242,9 @@ struct PublicApiState {
 fn public_routes(state: PublicApiState, auth: PublicAuth) -> Router {
     let openai_routes = Router::new()
         .route("/v1/models", get(models))
+        .route("/v1/models/{model}", get(retrieve_model))
+        .route("/v1/completions", post(completions::create))
+        .route("/v1/embeddings", post(embeddings::create))
         .route("/v1/responses", post(responses::create))
         .route("/v1/chat/completions", post(chat::create))
         .layer(axum::extract::DefaultBodyLimit::max(
@@ -293,36 +298,47 @@ struct ApiModel {
     created: i64,
 }
 
-async fn models(
-    State(state): State<PublicApiState>,
-) -> Result<Json<ModelList>, (StatusCode, String)> {
+async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::OpenAiError> {
     let snapshot = state.core.snapshot().await;
     let profiles = ModelProfilesStore::new(&state.core.paths)
         .read()
         .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not read Model Profiles: {error}"),
-            )
-        })?;
+        .map_err(|e| error::runtime_error(norted_engine::RuntimeError::Operation(e.to_string())))?;
+    Ok(profiles
+        .profiles
+        .into_values()
+        .map(|profile| ApiModel {
+            id: profile.id.to_string(),
+            object: "model",
+            owned_by: "norted-user",
+            created: snapshot
+                .models
+                .iter()
+                .find(|model| model.id == profile.model_id)
+                .map_or(0, |model| model.created),
+        })
+        .collect())
+}
+
+async fn models(
+    State(state): State<PublicApiState>,
+) -> Result<Json<ModelList>, error::OpenAiError> {
     Ok(Json(ModelList {
         object: "list",
-        data: profiles
-            .profiles
-            .into_values()
-            .map(|profile| ApiModel {
-                id: profile.id.to_string(),
-                object: "model",
-                owned_by: "norted-user",
-                created: snapshot
-                    .models
-                    .iter()
-                    .find(|model| model.id == profile.model_id)
-                    .map_or(0, |model| model.created),
-            })
-            .collect(),
+        data: public_models(&state).await?,
     }))
+}
+
+async fn retrieve_model(
+    State(state): State<PublicApiState>,
+    axum::extract::Path(model): axum::extract::Path<String>,
+) -> Result<Json<ApiModel>, error::OpenAiError> {
+    public_models(&state)
+        .await?
+        .into_iter()
+        .find(|profile| profile.id == model)
+        .map(Json)
+        .ok_or_else(error::OpenAiError::model_not_found)
 }
 
 #[derive(Clone)]

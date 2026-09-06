@@ -759,7 +759,10 @@ fn parse_response_format(value: Option<&Value>) -> Result<Option<OutputFormat>, 
     }
 }
 
-fn validate_stream_options(value: Option<&Value>, stream: bool) -> Result<bool, OpenAiError> {
+pub(crate) fn validate_stream_options(
+    value: Option<&Value>,
+    stream: bool,
+) -> Result<bool, OpenAiError> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(false);
     };

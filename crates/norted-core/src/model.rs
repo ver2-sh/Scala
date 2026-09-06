@@ -58,6 +58,8 @@ pub enum ArtifactNativeIdentity {
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct GgufArtifactIdentity {
+    /// Native pooling: 1 = mean, 2 = CLS, 3 = last; other values are not pooled embeddings.
+    pub pooling_type: Option<u64>,
     pub version: u32,
     pub architecture: String,
     pub context_length: Option<u64>,
@@ -304,15 +306,15 @@ impl ModelRegistry {
                 };
                 match entry.metadata() {
                     Ok(metadata) => {
-                        let native_identity = if let Some(identity) = package_member
+                        let native_identity = if format == ArtifactFormat::Gguf {
+                            inspect_gguf_metadata(&canonical_path)
+                                .ok()
+                                .map(ArtifactNativeIdentity::Gguf)
+                        } else if let Some(identity) = package_member
                             .as_ref()
                             .and_then(|member| member.native_identity.clone())
                         {
                             Some(identity)
-                        } else if format == ArtifactFormat::Gguf {
-                            inspect_gguf_metadata(&canonical_path)
-                                .ok()
-                                .map(ArtifactNativeIdentity::Gguf)
                         } else if format == ArtifactFormat::Ninfer {
                             match inspect_ninfer_container(&canonical_path) {
                                 Ok(metadata) => {
@@ -494,6 +496,7 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
             continue;
         }
         let capture = key == "general.architecture"
+            || key.ends_with(".pooling_type")
             || key.ends_with(".context_length")
             || key.ends_with(".expert_count")
             || key.ends_with(".expert_used_count")
@@ -517,7 +520,8 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
                 architecture_decimals.insert(key, value);
             }
         } else if let Some(value) = value.and_then(GgufScalar::into_u64) {
-            if key.ends_with(".context_length")
+            if key.ends_with(".pooling_type")
+                || key.ends_with(".context_length")
                 || key.ends_with(".expert_count")
                 || key.ends_with(".expert_used_count")
             {
@@ -551,6 +555,9 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
         .and_then(|key| architecture_decimals.get(key))
         .cloned();
     Ok(GgufArtifactIdentity {
+        pooling_type: architecture_numbers
+            .get(&format!("{architecture}.pooling_type"))
+            .copied(),
         version,
         architecture,
         context_length,
