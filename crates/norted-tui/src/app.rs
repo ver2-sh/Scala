@@ -414,6 +414,7 @@ pub struct App {
     pub settings_query: String,
     pub settings_detail_scroll: u16,
     pub settings_show_detail: bool,
+    pub profile_actions_open: bool,
     pub settings_overrides_only: bool,
     pub settings_model: Option<ModelId>,
     pub settings_schema: Option<SettingsSchema>,
@@ -541,6 +542,7 @@ impl App {
             settings_query: String::new(),
             settings_detail_scroll: 0,
             settings_show_detail: false,
+            profile_actions_open: false,
             settings_overrides_only: false,
             settings_model: None,
             settings_schema: None,
@@ -1511,11 +1513,31 @@ impl App {
             "runtime"
         };
         let mut lines = vec![
-            format!("{timing}: {} · {}", current.value, current.source),
+            format!("Effective value: {}", current.value),
+            format!("Source: {}", current.source),
+            format!("Applies: {timing}"),
             format!("{baseline_label}: {baseline}"),
-            format!("Parent: {parent} · Local: {local}"),
-            format!("Delete: Inherit from {inherit} · / Search · o Overrides only · R Reset scope"),
+            format!(
+                "{}: {parent}",
+                if self.screen == Screen::ModelProfiles {
+                    "Settings layer"
+                } else {
+                    "Parent"
+                }
+            ),
+            format!(
+                "{}: {local}",
+                if self.screen == Screen::ModelProfiles {
+                    "Profile layer"
+                } else {
+                    "Settings layer"
+                }
+            ),
+            format!("Inherit target: {inherit}"),
         ];
+        if let Some(detail) = preview.and_then(|preview| preview.detail.as_deref()) {
+            lines.push(format!("Baseline policy: {detail}"));
+        }
         if let Some(definition) = definition {
             lines.push(format!("Constraints: {}", definition.kind.constraints()));
             if let Some(reason) = &definition.unsupported_reason {
@@ -1542,6 +1564,40 @@ impl App {
                     lines.push(format!("Running detail: {detail}"));
                 }
             }
+        }
+        if let Some(profile) = self
+            .selected_model_profile_value()
+            .filter(|_| self.screen == Screen::ModelProfiles)
+        {
+            lines.push(format!("Profile: {}", profile.id));
+            lines.push(format!("Engine: {}", profile.engine_id));
+            lines.push(format!("Role: {:?}", profile.role));
+            lines.push(format!(
+                "Model path: {}",
+                self.selected_profile_model()
+                    .map(|model| model.path.display().to_string())
+                    .unwrap_or_else(|| "Missing model".to_owned())
+            ));
+            lines.push(format!(
+                "Runtime ID: {}",
+                self.settings_runtime_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "Unresolved".to_owned())
+            ));
+        }
+        if let Some(SettingsScope::Runtime(engine)) = self
+            .selected_settings_scope()
+            .filter(|_| self.screen == Screen::Settings)
+        {
+            lines.push(format!(
+                "Runtime ID: {}",
+                self.runtime_settings_schemas
+                    .get(&engine)
+                    .and_then(|schema| schema.runtime_id.as_ref())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "Not installed/selected".to_owned())
+            ));
         }
         lines.join("\n")
     }
@@ -2362,6 +2418,7 @@ impl App {
             self.screen != Screen::ModelProfiles && screen == Screen::ModelProfiles;
         let entering_settings = self.screen != Screen::Settings && screen == Screen::Settings;
         self.screen = screen;
+        self.profile_actions_open = false;
         if entering_model_profiles {
             self.reconcile_settings_selection();
             if !self.settings_loading && !self.settings_busy {
@@ -2816,6 +2873,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('i') => {
+                self.profile_actions_open = false;
                 self.settings_show_detail = !self.settings_show_detail;
                 Update::Render
             }
@@ -2851,8 +2909,30 @@ impl App {
         if self.settings_busy {
             return Update::None;
         }
+        if self.profile_actions_open
+            && matches!(
+                key.code,
+                KeyCode::Enter
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Char('j' | 'k')
+            )
+        {
+            return Update::None;
+        }
         match key.code {
+            KeyCode::Char('a') => {
+                self.profile_actions_open = !self.profile_actions_open;
+                self.settings_show_detail = false;
+                Update::Render
+            }
+
             KeyCode::Char('i') => {
+                self.profile_actions_open = false;
                 self.settings_show_detail = !self.settings_show_detail;
                 Update::Render
             }
@@ -2889,11 +2969,13 @@ impl App {
             KeyCode::Char('m') => self.cycle_profile_model(),
             KeyCode::Char('e') => self.cycle_profile_engine(),
             KeyCode::Char('r') => self.refresh_selected_model_profile(),
+            KeyCode::Char('p') => self.cycle_profile_role(),
             _ => Update::None,
         }
     }
 
     fn begin_settings_command(&mut self, kind: SettingsInputKind) -> Update {
+        self.profile_actions_open = false;
         let text = if kind == SettingsInputKind::Search {
             self.settings_query.clone()
         } else {
@@ -3276,9 +3358,10 @@ impl App {
         if len == 0 {
             return Update::None;
         }
+        self.settings_detail_scroll = 0;
         self.settings_setting_index =
             (self.settings_setting_index as isize + direction).clamp(0, len as isize - 1) as usize;
-        let capacity = layout.settings_capacity().max(1);
+        let capacity = (layout.settings_list.height.saturating_sub(1) as usize / 2).max(1);
         if self.settings_setting_index < self.settings_scroll {
             self.settings_scroll = self.settings_setting_index;
         } else if self.settings_setting_index >= self.settings_scroll + capacity {
@@ -3299,6 +3382,14 @@ impl App {
                 .saturating_add(amount as usize)
                 .min(max_scroll)
         };
+        self.settings_scroll = self.settings_scroll.min(max_scroll);
+        let visible = (layout.settings_list.height.saturating_sub(1) as usize / 2).max(1);
+        self.settings_setting_index = self.settings_setting_index.clamp(
+            self.settings_scroll,
+            (self.settings_scroll + visible - 1)
+                .min(self.settings_definitions().len().saturating_sub(1)),
+        );
+        self.settings_detail_scroll = 0;
         Update::Render
     }
 
@@ -3714,7 +3805,13 @@ impl App {
                     Update::Render
                 }
             }
+            Some(HoverTarget::ProfileActions) => {
+                self.profile_actions_open = !self.profile_actions_open;
+                self.settings_show_detail = false;
+                Update::Render
+            }
             Some(HoverTarget::SettingsDetails) => {
+                self.profile_actions_open = false;
                 self.settings_show_detail = !self.settings_show_detail;
                 Update::Render
             }

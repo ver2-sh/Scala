@@ -1,0 +1,43 @@
+
+   ◆  NORTED SERVER  local runtime control                                                                                                     ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+      gemma-4-31b-roleplay
+                             Profile       gemma-4-31b-roleplay                             Role          Primary
+      qwen38-27b-q27-q6      Model         gemma-4-31B-it-uncensored-heretic-Q6_K
+                             Engine        llama.cpp                                        Runtime       b10786 / CUDA / managed-portable-cuda13-v2
+                             Configuration Next load
+                             [ Load ]  [ Model ]  [ Engine ]  [ Role ]  [ Duplicate ]  [ Delete ]          [ Refresh ]
+
+                             [ / Search ]  [ o Overrides ]     [ R Reset scope ]  [ i Details ]
+                             Setting                    Value                Source           Action     Status     Setting · i expand/close · [ ] scroll ─
+                             GENERAL                                                                               Identifier: llama.cpp.context_length
+                             Context length             32768                Profile          Inherit              Description: Explicit context window
+                             Parallel requests          auto                 Runtime default  —                    requested from the selected runtime
+                             LOAD                                                                                  Effective value: 32768
+                             Number of active experts   Unsupported          —                —          Unsup.    Source: model profile
+                             Adaptive decay             0.90                 Runtime default  —                    Applies: Next load
+                             Adaptive target            -1.00                Runtime default  —                    Runtime baseline (read-only): 262144
+                             Backend sampling           disabled             Runtime default  —                    Settings layer: 262144
+                             Batch size                 2048                 Runtime default  —                    Profile layer: 32768
+                             Check tensors              disabled             Runtime default  —                    Inherit target: Settings
+                             Context shifting           disabled             Runtime default  —                    Baseline policy: Selected GGUF metadata
+                             Continuous batching        enabled              Runtime default  —                    `gemma4.context_length`
+                             Control-vector layer range Unsupported          —                —          Unsup.    Constraints: non-negative integer (at
+                             Control vectors            None                 Runtime default  —                    least 1)
+                             Scaled control vectors     None                 Runtime default  —                    Profile: gemma-4-31b-roleplay
+                             Dense FFN layers on CPU    Unsupported          —                —          Unsup.    Engine: llama.cpp
+                             CPU affinity mask          ""                   Runtime default  —                    Role: Primary
+                             Batch CPU affinity mask    auto                 Runtime default  —                    Model path:
+                             All MoE weights on CPU     Unsupported          —                —          Unsup.    /srv/norted/models/huggingface/llmfan46/
+                             MoE layers on CPU          Unsupported          —                —          Unsup.    gemma-4-31B-it-uncensored-heretic-GGUF/e
+                             CPU affinity range         Unsupported          —                —          Unsup.    ee61b81461ac75eb920a24ca9e5d420bb66e33d/
+                             Batch CPU affinity range   Unsupported          —                —          Unsup.    bd79402490823028/gemma-4-31B-it-uncensor
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    ›  Press / to run a command
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Left/Right profile   ↑↓ setting   Enter edit   e change engine   l load profile   u unload active   Delete inherit   ? help

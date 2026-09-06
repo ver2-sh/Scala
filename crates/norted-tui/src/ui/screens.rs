@@ -9,7 +9,7 @@ use norted_engine::{
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Padding, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, FocusArea, ModelLibraryView, Screen};
@@ -2126,22 +2126,61 @@ fn render_logs(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, ui_l
     frame.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), layout[1]);
 }
 
+fn runtime_summary(app: &App, id: &norted_core::RuntimeId) -> String {
+    app.runtime_list
+        .as_ref()
+        .and_then(|list| {
+            list.installed
+                .iter()
+                .find(|item| &item.runtime.manifest.runtime_id == id)
+        })
+        .map(|item| {
+            let identity = &item.runtime.manifest.identity;
+            format!(
+                "{} / {} / {}",
+                identity.version,
+                identity.accelerator.to_uppercase(),
+                identity.variant
+            )
+        })
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn render_metadata(frame: &mut Frame<'_>, area: Rect, fields: &[(&str, String)], theme: &Theme) {
+    let columns = if fields.len() > area.height as usize {
+        2
+    } else {
+        1
+    };
+    for (index, (label, value)) in fields.iter().enumerate() {
+        let y = area.y + (index / columns) as u16;
+        if y >= area.bottom() {
+            break;
+        }
+        let width = area.width / columns as u16;
+        let x = area.x + (index % columns) as u16 * width;
+        let cells = Layout::horizontal([Constraint::Length(14.min(width / 2)), Constraint::Min(0)])
+            .split(Rect::new(x, y, width, 1));
+        frame.render_widget(Paragraph::new(*label).style(theme.hint), cells[0]);
+        frame.render_widget(
+            Paragraph::new(truncate_middle(
+                value,
+                cells[1].width.saturating_sub(2) as usize,
+                "…",
+            ))
+            .style(theme.text),
+            cells[1],
+        );
+    }
+}
+
 fn render_settings(
     frame: &mut Frame<'_>,
-    area: Rect,
+    _area: Rect,
     app: &App,
     theme: &Theme,
     ui_layout: &UiLayout,
 ) {
-    let layout = content_layout(area, ui_layout.compact);
-    frame.render_widget(
-        section_title(
-            "Settings",
-            "Server operations | Independent engine overrides · / Search · o Overrides · R Reset",
-            theme,
-        ),
-        layout[0],
-    );
     let scopes = app.settings_scopes();
     for (index, rect) in &ui_layout.settings_scope_rows {
         let Some(scope) = scopes.get(*index) else {
@@ -2164,69 +2203,50 @@ fn render_settings(
         };
         frame.render_widget(Paragraph::new(format!(" {label} ")).style(style), *rect);
     }
-    let info = if app.settings_input.is_some() {
-        String::new()
-    } else {
+    if app.settings_input.is_none() && ui_layout.settings_list.y >= ui_layout.settings_scopes.y + 4
+    {
         let runtime = match app.selected_settings_scope() {
             Some(crate::app::SettingsScope::Runtime(engine)) => app
                 .runtime_settings_schemas
                 .get(&engine)
                 .and_then(|schema| schema.runtime_id.as_ref())
-                .map(ToString::to_string)
+                .map(|id| runtime_summary(app, id))
                 .unwrap_or_else(|| "No runtime selected/installed".to_owned()),
-            _ => "Server operational settings".to_owned(),
+            _ => "Server operational defaults".to_owned(),
         };
-        let timing = if app.selected_settings_scope() == Some(crate::app::SettingsScope::Server) {
-            "Operational changes apply now"
-        } else {
-            "Next-load configuration · runtime baseline is read-only"
-        };
-        format!(
-            "{runtime}\n{timing}\nSearch: {} · {}",
-            app.settings_query,
-            if app.settings_overrides_only {
-                "Overrides only"
-            } else {
-                "All settings"
-            }
-        )
-    };
-    let info_y = ui_layout.settings_scopes.y.saturating_add(1);
-    frame.render_widget(
-        Paragraph::new(info)
-            .style(theme.hint)
-            .wrap(Wrap { trim: true }),
-        Rect::new(
-            ui_layout.settings_scopes.x,
-            info_y,
-            ui_layout.settings_scopes.width,
-            ui_layout
-                .settings_list
-                .y
-                .saturating_sub(info_y)
-                .saturating_sub(1),
-        ),
-    );
+        render_metadata(
+            frame,
+            Rect::new(
+                ui_layout.settings_scopes.x,
+                ui_layout.settings_scopes.y + 1,
+                ui_layout.settings_scopes.width,
+                2,
+            ),
+            &[
+                ("Baseline", runtime),
+                (
+                    "Applies",
+                    if app.selected_settings_scope() == Some(crate::app::SettingsScope::Server) {
+                        "Immediately".to_owned()
+                    } else {
+                        "Next load".to_owned()
+                    },
+                ),
+            ],
+            theme,
+        );
+    }
     render_setting_rows(frame, app, theme, ui_layout);
     render_settings_input(frame, app, theme, ui_layout);
 }
 
 fn render_model_profiles(
     frame: &mut Frame<'_>,
-    area: Rect,
+    _area: Rect,
     app: &App,
     theme: &Theme,
     ui_layout: &UiLayout,
 ) {
-    let layout = content_layout(area, ui_layout.compact);
-    frame.render_widget(
-        section_title(
-            "Model Profiles",
-            "User-created model + engine + settings serving targets",
-            theme,
-        ),
-        layout[0],
-    );
     for (index, rect) in &ui_layout.settings_scope_rows {
         let Some(profile) = app.model_profile_values().get(*index).copied() else {
             continue;
@@ -2236,17 +2256,15 @@ fn render_model_profiles(
             .models
             .iter()
             .any(|model| model.id == profile.model_id);
-        let active = app
-            .control
-            .as_ref()
-            .is_some_and(|status| status.backend(&profile.id).is_some());
-        let label = format!(
-            " {} · {:?}{}{} ",
-            profile.display_name,
-            profile.role,
-            if active { " · active" } else { "" },
-            if missing { " · missing" } else { "" },
-        );
+        let label = if rect.width == 3 {
+            if rect.x == ui_layout.settings_scopes.x {
+                " ‹ ".to_owned()
+            } else {
+                " › ".to_owned()
+            }
+        } else {
+            format!(" {} ", profile.id)
+        };
         let style = if app.selected_model_profile == Some(*index) {
             theme.selected
         } else if !app.settings_busy() && app.hover == Some(HoverTarget::SettingsScope(*index)) {
@@ -2265,141 +2283,64 @@ fn render_model_profiles(
         ui_layout.settings_scopes.x,
         ui_layout.settings_scopes.y.saturating_add(1),
         ui_layout.settings_scopes.width,
-        if ui_layout.settings_dense {
-            2
-        } else if ui_layout.compact {
-            5
-        } else {
-            6
-        },
+        3,
     );
-    let info = if app.settings_input.is_some() {
-        Vec::new()
-    } else if let Some(profile) = app.selected_model_profile_value() {
-        let model = app.selected_profile_model();
-        let model_path = model
-            .map(|model| model.path.display().to_string())
-            .unwrap_or_default();
-        let model_path = marquee_text(
-            &model_path,
-            info_area.width as usize,
-            app.marquee_animation_frame / 3,
-        );
-        let profile_id = format!(
-            "{}{}",
-            profile.id,
-            if ui_layout.compact { " · " } else { "  " }
-        );
-        let engine = if ui_layout.compact {
-            format!("{} · ", profile.engine_id)
-        } else {
-            format!("engine {}  ", profile.engine_id)
-        };
-        let model_name = model
-            .map(|model| model.display_name.clone())
-            .unwrap_or_else(|| format!("MISSING {}", profile.model_id));
-        let model_name_width = remaining_width(info_area.width, &[&profile_id, &engine]);
-        let identity = if model_name_width == 0 {
-            Line::from(Span::styled(
-                truncate_middle(
-                    &format!("{profile_id}{engine}{model_name}"),
-                    info_area.width as usize,
-                    "…",
-                ),
-                if model.is_some() {
-                    theme.text
-                } else {
-                    theme.warning
-                },
-            ))
-        } else {
-            Line::from(vec![
-                Span::styled(profile_id, theme.text),
-                Span::styled(engine, theme.accent),
-                Span::styled(
-                    truncate_middle(&model_name, model_name_width, "…"),
-                    if model.is_some() {
-                        theme.hint
-                    } else {
-                        theme.warning
-                    },
-                ),
-            ])
-        };
-        let mut lines = vec![
-            identity,
-            Line::from(Span::styled(model_path, theme.muted)),
-            Line::from(Span::styled(
-                if app.settings_busy() && app.settings_schema.is_none() {
-                    "resolving runtime/model settings…".to_owned()
-                } else {
-                    app.settings_validation_error.as_deref().map_or_else(
-                        || {
-                            format!(
-                                "runtime {} · rows select; explicit buttons act",
-                                app.settings_runtime_id
-                                    .as_ref()
-                                    .map(ToString::to_string)
-                                    .unwrap_or_else(|| "not validated".to_owned()),
-                            )
-                        },
-                        |error| {
-                            format!(
-                                "runtime {} · Configuration: {error}",
-                                app.settings_runtime_id
-                                    .as_ref()
-                                    .map(ToString::to_string)
-                                    .unwrap_or_else(|| "unresolved".to_owned())
-                            )
-                        },
-                    )
-                },
-                if app.settings_validation_error.is_some() {
-                    theme.warning
-                } else {
-                    theme.hint
-                },
-            )),
-        ];
-        lines.push(Line::from(Span::styled(
-            format!(
-                "Next-load configuration · / Search: {} · o {} · R Reset",
-                app.settings_query,
-                if app.settings_overrides_only {
-                    "Overrides only"
-                } else {
-                    "All settings"
-                }
-            ),
-            theme.muted,
-        )));
-        if ui_layout.settings_dense {
+    if app.settings_input.is_none()
+        && !app.profile_actions_open
+        && ui_layout.settings_list.y >= ui_layout.settings_scopes.y + 8
+    {
+        if let Some(profile) = app.selected_model_profile_value() {
+            let model = app.selected_profile_model();
             let runtime = app
                 .settings_runtime_id
                 .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| "Runtime unresolved".to_owned());
-            lines.truncate(1);
-            lines.push(Line::from(Span::styled(
-                truncate_middle(
-                    &format!("Next load · {runtime}"),
-                    info_area.width as usize,
-                    "…",
+                .map(|id| runtime_summary(app, id))
+                .unwrap_or_else(|| "Unresolved / missing runtime".to_owned());
+            let fields = [
+                ("Profile", profile.id.to_string()),
+                ("Role", format!("{:?}", profile.role)),
+                (
+                    "Model",
+                    model
+                        .map(|m| m.display_name.clone())
+                        .unwrap_or_else(|| format!("Missing {}", profile.model_id)),
                 ),
-                theme.hint,
-            )));
+                ("Engine", profile.engine_id.to_string()),
+                ("Runtime", runtime),
+                (
+                    "Configuration",
+                    if app.settings_validation_error.is_some() {
+                        "Next load · invalid (see details)".to_owned()
+                    } else {
+                        "Next load".to_owned()
+                    },
+                ),
+            ];
+            for (row, indices) in [&[0, 1][..], &[2][..], &[3, 4][..], &[5][..]]
+                .iter()
+                .enumerate()
+            {
+                let fields = indices
+                    .iter()
+                    .map(|index| fields[*index].clone())
+                    .collect::<Vec<_>>();
+                render_metadata(
+                    frame,
+                    Rect::new(info_area.x, info_area.y + row as u16, info_area.width, 1),
+                    &fields,
+                    theme,
+                );
+            }
+        } else {
+            frame.render_widget(
+                Paragraph::new("No profiles. Create a profile from Models.").style(theme.muted),
+                info_area,
+            );
         }
-        lines
-    } else {
-        vec![Line::from(Span::styled(
-            "No Model Profiles. Select an artifact on Models and use Create Profile.",
-            theme.muted,
-        ))]
-    };
-    frame.render_widget(Paragraph::new(info).wrap(Wrap { trim: true }), info_area);
-    render_settings_input(frame, app, theme, ui_layout);
+    }
     render_model_profile_actions(frame, app, theme, ui_layout);
     if app.selected_model_profile_value().is_none() {
+        render_settings_input(frame, app, theme, ui_layout);
         return;
     }
     render_setting_rows(frame, app, theme, ui_layout);
@@ -2434,12 +2375,43 @@ fn render_settings_input(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_lay
         }
         .to_owned()
     };
-    let field_width = ui_layout
-        .settings_input_field
-        .width
-        .saturating_sub(prompt.len() as u16 + 4) as usize;
+    let prompt = if input.kind == crate::app::SettingsInputKind::SettingValue {
+        let name = app
+            .settings_definitions()
+            .get(app.settings_setting_index)
+            .map(|d| d.label.clone())
+            .unwrap_or_default();
+        let scope = if app.screen == Screen::ModelProfiles {
+            app.selected_model_profile_value()
+                .map(|profile| format!("Profile {}", profile.id))
+                .unwrap_or_else(|| "Profile".to_owned())
+        } else {
+            match app.selected_settings_scope() {
+                Some(crate::app::SettingsScope::Runtime(engine)) => format!("Settings {engine}"),
+                _ => "Server operations".to_owned(),
+            }
+        };
+        format!("{scope} / {name}")
+    } else {
+        prompt
+    };
+    let panel = Rect::new(
+        ui_layout.settings_scopes.x,
+        ui_layout.settings_scopes.y + 1,
+        ui_layout.settings_scopes.width,
+        ui_layout
+            .content
+            .bottom()
+            .saturating_sub(ui_layout.settings_scopes.y + 1),
+    );
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Paragraph::new(truncate_middle(&prompt, panel.width as usize, "…")).style(theme.hint),
+        Rect::new(panel.x, panel.y, panel.width, 1),
+    );
+    let field_width = ui_layout.settings_input_field.width.saturating_sub(2) as usize;
     let field = format!(
-        "{prompt}: [{}]",
+        "[{}]",
         marked_input_window(&input.text, input.cursor, field_width, "_")
     );
     let field_style = if app.hover == Some(HoverTarget::SettingsInputField) {
@@ -2481,22 +2453,8 @@ fn render_settings_input(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_lay
         ui_layout.settings_input_cancel,
     );
     if let Some(error) = &app.settings_input_error {
-        let candidate_y = ui_layout.settings_input_field.y.saturating_add(2);
-        let (y, height) = if candidate_y >= ui_layout.settings_list.y.saturating_sub(1) {
-            (
-                ui_layout.settings_list.y,
-                ui_layout.settings_list.height.min(2),
-            )
-        } else {
-            (
-                candidate_y,
-                ui_layout
-                    .settings_list
-                    .y
-                    .saturating_sub(candidate_y + 1)
-                    .min(2),
-            )
-        };
+        let y = ui_layout.settings_input_submit.y + 1;
+        let height = ui_layout.content.bottom().saturating_sub(y);
         frame.render_widget(
             Paragraph::new(error.as_str())
                 .style(theme.error)
@@ -2614,15 +2572,22 @@ fn render_model_profile_actions(
     }
 }
 
+pub(super) fn selected_setting_detail(app: &App) -> Option<String> {
+    let definitions = app.settings_definitions();
+    let definition = definitions.get(app.settings_setting_index)?;
+    Some(format!(
+        "Identifier: {}\nDescription: {}\n{}",
+        definition.id,
+        definition.description,
+        app.settings_default_detail(&definition.id)
+    ))
+}
+
 fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layout: &UiLayout) {
     if app.settings_input.is_none()
-        && let Some(definition) = app.settings_definitions().get(app.settings_setting_index)
+        && let Some(detail) = selected_setting_detail(app)
     {
-        let detail = format!(
-            "{}\n{}",
-            definition.description,
-            app.settings_default_detail(&definition.id)
-        );
+        frame.render_widget(Clear, ui_layout.settings_detail);
         frame.render_widget(
             Paragraph::new(detail)
                 .scroll((app.settings_detail_scroll, 0))
@@ -2640,11 +2605,24 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
     for (target, rect) in &ui_layout.settings_tools {
         let label = match target {
             HoverTarget::SettingsDetails => "[ i Details ]",
+            HoverTarget::ProfileActions => "[a Actions]",
             HoverTarget::SettingsSearch => "[ / Search ]",
             HoverTarget::SettingsFilter if app.settings_overrides_only => "[ o Overrides ✓ ]",
             HoverTarget::SettingsFilter => "[ o Overrides ]",
             HoverTarget::SettingsReset => "[ R Reset scope ]",
             _ => "",
+        };
+        let label = if rect.width < 10 {
+            match target {
+                HoverTarget::SettingsSearch => "[ / ]",
+                HoverTarget::SettingsFilter if app.settings_overrides_only => "[ o ✓ ]",
+                HoverTarget::SettingsFilter => "[ o ]",
+                HoverTarget::SettingsReset => "[ R ]",
+                HoverTarget::SettingsDetails => "[ i ]",
+                _ => label,
+            }
+        } else {
+            label
         };
         let label = if *target == HoverTarget::SettingsSearch && !app.settings_query.is_empty() {
             truncate_middle(
@@ -2665,7 +2643,8 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
         );
     }
 
-    if app.settings_show_detail {
+    if app.settings_show_detail || (app.screen == Screen::ModelProfiles && app.profile_actions_open)
+    {
         return;
     }
     if app.settings_loading {
@@ -2720,120 +2699,92 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
         );
         return;
     }
+    for (column, label) in ui_layout
+        .settings_columns
+        .iter()
+        .zip(["Setting", "Value", "Source", "Action", "Status"])
+    {
+        frame.render_widget(Paragraph::new(label).style(theme.hint), *column);
+    }
+    for (category, rect) in &ui_layout.settings_categories {
+        frame.render_widget(
+            Paragraph::new(category.to_uppercase()).style(theme.accent),
+            *rect,
+        );
+    }
     for (index, rect) in &ui_layout.settings_rows {
         let Some(definition) = definitions.get(*index) else {
             continue;
         };
         let display = app.settings_value_display(&definition.id);
-        let mut style = if app.settings_setting_index == *index {
-            theme.selected
-        } else {
-            ratatui::style::Style::default()
-        };
-        if app.hover == Some(HoverTarget::Setting(*index)) {
-            style = style.patch(theme.hovered);
-        }
-        let label = &definition.label;
-        let starts_category = index == &0
-            || definitions
-                .get(index.saturating_sub(1))
-                .is_none_or(|previous| previous.category != definition.category);
-        let state = if display.can_clear {
-            "Overridden"
-        } else {
-            "Inherited"
-        };
+        let selected = app.settings_setting_index == *index;
+        let style = if selected { theme.selected } else { theme.text };
+        frame.render_widget(Paragraph::new("").style(style), *rect);
         let invalid = app
             .settings_validation_error
             .as_ref()
             .is_some_and(|error| error.contains(definition.id.as_str()));
-        let status = format!(
-            "{label} · {state}{}",
-            if invalid {
-                " · Invalid"
-            } else if !definition.supported {
-                " · Unsupported"
+        let status = if invalid {
+            "Invalid"
+        } else if !definition.supported {
+            "Unsup."
+        } else {
+            ""
+        };
+        let source = if display.can_clear {
+            if app.screen == Screen::ModelProfiles {
+                "Profile"
             } else {
-                ""
+                "Settings"
             }
-        );
-        let heading = if starts_category {
-            format!("{}  ──  {status}", definition.category)
+        } else if !definition.supported {
+            "—"
+        } else if display.source.to_lowercase().contains("settings") {
+            "Settings"
+        } else if display.source.contains("server") {
+            "Server default"
+        } else if ui_layout.settings_list.width >= 70 {
+            "Runtime default"
         } else {
-            format!("              {status}")
+            "Runtime"
         };
-        let value_area = ui_layout
-            .setting_values
-            .iter()
-            .find(|(value_index, _)| value_index == index)
-            .map(|(_, area)| *area)
-            .unwrap_or_default();
-        let id_width = value_area.x.saturating_sub(rect.x).saturating_sub(2) as usize;
-        let active_row =
-            app.settings_setting_index == *index || app.hover == Some(HoverTarget::Setting(*index));
-        let setting_id = definition.id.to_string();
-        let id_text = if active_row {
-            marquee_text(&setting_id, id_width, app.marquee_animation_frame / 3)
-        } else {
-            truncate_middle(&setting_id, id_width, "…")
-        };
-        let lines = vec![
-            Line::from(Span::styled(
-                heading,
-                if starts_category {
-                    theme.hint
-                } else {
-                    theme.muted
-                },
-            )),
-            Line::from(vec![Span::styled(format!("  {id_text}"), theme.text)]),
-        ];
-        frame.render_widget(Paragraph::new(lines).style(style), *rect);
-        let value_enabled = !app.settings_busy();
-        let value_label = format!("[ {} ]", display.value);
-        let value_text = if active_row || app.hover == Some(HoverTarget::SettingValue(*index)) {
-            marquee_text(
-                &value_label,
-                value_area.width as usize,
-                app.marquee_animation_frame / 3,
-            )
-        } else {
-            truncate_middle(&value_label, value_area.width as usize, "…")
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                value_text,
-                action_style(
-                    theme,
-                    if value_enabled {
-                        ActionState::Primary
-                    } else {
-                        ActionState::Disabled
-                    },
-                    app.hover == Some(HoverTarget::SettingValue(*index)),
-                ),
-            ))),
-            value_area,
-        );
-        if let Some((_, inherit_area)) = ui_layout
-            .setting_inherit_actions
-            .iter()
-            .find(|(inherit_index, _)| inherit_index == index)
+        let action = if display.can_clear { "Inherit" } else { "—" };
+        for (i, text) in [
+            definition.label.as_str(),
+            display.value.as_str(),
+            source,
+            action,
+            status,
+        ]
+        .iter()
+        .enumerate()
         {
+            let mut cell = ui_layout.settings_columns[i];
+            cell.y = rect.y;
+            let hovered = app.hover == Some(HoverTarget::Setting(*index))
+                || (i == 1
+                    && definition.supported
+                    && app.hover == Some(HoverTarget::SettingValue(*index)))
+                || (i == 3
+                    && display.can_clear
+                    && app.hover == Some(HoverTarget::SettingInherit(*index)));
+            let cell_style = if hovered {
+                theme.hovered
+            } else if i == 4 && !status.is_empty() {
+                theme.warning
+            } else if i == 1 && (!definition.supported || app.settings_busy()) {
+                theme.muted
+            } else {
+                style
+            };
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "[ Inherit ]",
-                    action_style(
-                        theme,
-                        if app.settings_busy() {
-                            ActionState::Disabled
-                        } else {
-                            ActionState::Normal
-                        },
-                        app.hover == Some(HoverTarget::SettingInherit(*index)),
-                    ),
-                ))),
-                *inherit_area,
+                Paragraph::new(truncate_middle(
+                    text,
+                    cell.width.saturating_sub(1) as usize,
+                    "…",
+                ))
+                .style(cell_style),
+                cell,
             );
         }
     }
@@ -2969,6 +2920,21 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         key_value(
             "Model Profiles",
             "normal load and per-profile override screen",
+            theme,
+        ),
+        key_value(
+            "m / p / D / d / r",
+            "profile model, role, duplicate, delete, refresh",
+            theme,
+        ),
+        key_value(
+            "i / [ / ]",
+            "setting details; scroll details up/down",
+            theme,
+        ),
+        key_value(
+            "/ / o / R",
+            "search settings, overrides filter, scoped reset",
             theme,
         ),
         key_value(

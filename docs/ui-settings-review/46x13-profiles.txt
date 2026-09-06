@@ -1,0 +1,13 @@
+ ◆  NORTED SERVER              ●  API Running
+  Overview  Models  Model Profiles  Runtimes
+  Server  Logs  Settings  Help
+ ────────────────────────────────────────────
+   ‹  gemma-4-31b-roleplay                ›
+  [ / ]  [ o ]    [ R ]  [ i ]   [a Actions]
+  Setting      Value       Source   Action
+  GENERAL
+  Conte…length 32768       Profile  Inherit
+ ────────────────────────────────────────────
+  ›  Press / to run a command
+ ────────────────────────────────────────────
+ Left/Right profile   ↑↓ setting   ? help

@@ -1,0 +1,29 @@
+   ◆  NORTED SERVER  local runtime control                                         ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+
+      ‹  zz-long-profile-name-for-review-with-shared-prefix-and-distinct-tail                ›
+     Profile       zz-long-profil…-distinct-tail  Role          Primary
+     Model         gemma-4-31B-it-uncensored-heretic-Q6_K
+     Engine        llama.cpp                      Runtime       b10786 / CUDA …able-cuda13-v2
+     Configuration Next load
+     [ Load ]  [ Model ]  [ Engine ]  [ Role ]  [ Duplicate ]  [ Delete ]          [ Refresh ]
+
+     [ / Search ]  [ o Overrides ]     [ R Reset scope ]  [ i Details ]
+     Setting                      Value                 Source             Action     Status
+     GENERAL
+     Context length               32768                 Profile            Inherit
+     Parallel requests            auto                  Runtime default    —
+     LOAD
+     Number of active experts     Unsupported           —                  —          Unsup.
+     Adaptive decay               0.90                  Runtime default    —
+     Adaptive target              -1.00                 Runtime default    —
+     Backend sampling             disabled              Runtime default    —
+     Batch size                   2048                  Runtime default    —
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+    ›  Press / to run a command
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+   Left/Right profile   ↑↓ setting   Enter edit   e change engine   l load profile   ? help
