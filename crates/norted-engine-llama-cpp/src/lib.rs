@@ -35,10 +35,9 @@ use norted_engine::{
     InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter, NativeOption, OutputFormat,
     PreparedModelInput, ProcessDescriptor, RuntimeVariantUpdateIdentity, StartupObservation,
     UpdateState, capture_command, common_setting_definitions_for, compatibility_for,
-    configurable_setting_definitions, isolated_cuda_environment_for_binding,
-    prepare_norted_package_input, prepare_norted_package_input_with_progress,
-    revalidate_norted_package_before_launch, revalidate_norted_package_before_launch_with_progress,
-    visible_nvidia_device_set,
+    isolated_cuda_environment_for_binding, prepare_norted_package_input,
+    prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
+    revalidate_norted_package_before_launch_with_progress, visible_nvidia_device_set,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -922,29 +921,21 @@ impl EngineAdapter for LlamaCppAdapter {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        settings: Option<&norted_core::ResolvedSettings>,
+        _settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
         let model_compatibility = llama_model_compatibility(self.compatibility(model));
         if matches!(model_compatibility, RuntimeCompatibility::Incompatible(_)) {
             return model_compatibility;
         }
-        let help = self
-            .capability_cache
-            .try_read()
-            .ok()
-            .and_then(|cache| cache.get(&Self::capability_key(runtime)).cloned());
-        let configured = settings.map_or(model_compatibility, |settings| {
-            llama_configured_runtime_compatibility(settings, Some(model), help.as_deref())
-        });
         combine_llama_compatibility(
-            configured,
+            model_compatibility,
             llama_device_evaluation(
                 &runtime.manifest.identity.accelerator,
                 &runtime.manifest.identity.platform,
                 &runtime.manifest.identity.architecture,
                 &runtime.manifest.requirements,
                 host,
-                settings,
+                None,
             )
             .compatibility,
         )
@@ -955,27 +946,56 @@ impl EngineAdapter for LlamaCppAdapter {
         runtime: &AvailableRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        settings: Option<&norted_core::ResolvedSettings>,
+        _settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
         let model_compatibility = llama_model_compatibility(self.compatibility(model));
         if matches!(model_compatibility, RuntimeCompatibility::Incompatible(_)) {
             return model_compatibility;
         }
-        let configured = settings.map_or(model_compatibility, |settings| {
-            llama_configured_runtime_compatibility(settings, Some(model), None)
-        });
         combine_llama_compatibility(
-            configured,
+            model_compatibility,
             llama_device_evaluation(
                 &runtime.identity.accelerator,
                 &runtime.identity.platform,
                 &runtime.identity.architecture,
                 &runtime.requirements,
                 host,
-                settings,
+                None,
             )
             .compatibility,
         )
+    }
+
+    fn validate_configuration(
+        &self,
+        runtime: &InstalledRuntime,
+        model: Option<&ModelArtifact>,
+        host: &HostCapabilities,
+        settings: &norted_core::ResolvedSettings,
+    ) -> Result<(), EngineError> {
+        let help = self
+            .capability_cache
+            .try_read()
+            .ok()
+            .and_then(|cache| cache.get(&Self::capability_key(runtime)).cloned());
+        if let RuntimeCompatibility::Incompatible(reason) =
+            llama_configured_runtime_compatibility(settings, model, help.as_deref())
+        {
+            return Err(EngineError::InvalidConfiguration(reason));
+        }
+        if let RuntimeCompatibility::Incompatible(reason) = llama_device_evaluation(
+            &runtime.manifest.identity.accelerator,
+            &runtime.manifest.identity.platform,
+            &runtime.manifest.identity.architecture,
+            &runtime.manifest.requirements,
+            host,
+            Some(settings),
+        )
+        .compatibility
+        {
+            return Err(EngineError::InvalidConfiguration(reason));
+        }
+        Ok(())
     }
 
     fn runtime_model_preference(
@@ -1055,9 +1075,7 @@ impl EngineAdapter for LlamaCppAdapter {
         &self,
         model: &ModelArtifact,
     ) -> Result<Vec<SettingDefinition>, EngineError> {
-        Ok(configurable_setting_definitions(
-            llama_model_setting_definitions(Some(model)),
-        ))
+        Ok(llama_model_setting_definitions(Some(model)))
     }
 
     async fn runtime_settings_schema(
@@ -1079,7 +1097,6 @@ impl EngineAdapter for LlamaCppAdapter {
                 "active experts requires a bound model with inspected expert metadata".to_owned(),
             );
         }
-        let definitions = configurable_setting_definitions(definitions);
         Ok(SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -1098,7 +1115,6 @@ impl EngineAdapter for LlamaCppAdapter {
         let help = self.cached_runtime_help(runtime).await?;
         let mut definitions = self.model_setting_definitions(model)?;
         apply_llama_exact_help_contract(&mut definitions, &help);
-        let definitions = configurable_setting_definitions(definitions);
         Ok(SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -1548,8 +1564,9 @@ impl EngineAdapter for LlamaCppAdapter {
 fn setting_source_rank(source: &norted_core::SettingSource) -> u8 {
     match source {
         norted_core::SettingSource::RuntimeDefault => 0,
-        norted_core::SettingSource::ModelProfile { .. } => 1,
-        norted_core::SettingSource::Invocation => 2,
+        norted_core::SettingSource::SettingsOverride => 1,
+        norted_core::SettingSource::ModelProfile { .. } => 2,
+        norted_core::SettingSource::Invocation => 3,
     }
 }
 
@@ -4348,7 +4365,6 @@ fn llama_configured_runtime_compatibility(
     };
     let mut definitions = llama_model_setting_definitions(model);
     apply_llama_exact_help_contract(&mut definitions, help);
-    let definitions = configurable_setting_definitions(definitions);
     let schema = SettingsSchema {
         engine_id: ENGINE_ID.to_owned(),
         runtime_id: None,

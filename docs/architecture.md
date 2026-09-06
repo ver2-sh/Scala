@@ -169,7 +169,7 @@ settings—not from profile-authored applicability declarations. Runtime IDs mus
 bound engine; unqualified or foreign namespaces are rejected at every layer.
 
 `SettingsState` schema 3 lives at `<data>/settings.json` and stores Server Settings separately from
-independent per-runtime defaults. `ModelProfilesState` schema 2 lives at
+independent per-engine Settings overrides. `ModelProfilesState` schema 2 lives at
 `<data>/model-profiles.json`. Both stores have
 independent locks and atomic replacement. Settings schemas 1 and 2, model-profiles schema 1, and
 obsolete Global fields are rejected; no compatibility reader, alias, or migration path exists.
@@ -177,9 +177,9 @@ Current inference overrides use fully qualified engine setting IDs; unqualified 
 accepted. Because the application is unreleased, stale development state should be recreated or
 manually updated by the developer/user.
 
-One resolver applies the selected runtime's defaults, Model Profile overrides, then ephemeral
-invocation overrides. It rejects unrelated runtime namespaces and records the winning inference
-source as runtime default, Model Profile, or invocation. In boot-loading presentation, invocation
+One resolver applies independent Settings overrides over the selected runtime baseline, then
+Model Profile overrides and ephemeral load/request overrides. It rejects unrelated runtime namespaces and records the winning inference
+source as runtime default, Settings override, Model Profile, or invocation. In boot-loading presentation, invocation
 is labeled `boot inference`. There is no Global inference parent, model-default layer, or hidden
 policy. Relative typed paths resolve beneath the data directory before downstream consumers receive
 the same absolute value.
@@ -408,7 +408,7 @@ and other contract-changing aliases cannot bypass structured configuration.
 Inference-affecting LoRA/control-vector files are canonicalized and SHA-256-bound before launch,
 with each scaled entry retaining its scale in both arguments and provenance.
 
-The three-layer resolver normalizes llama.cpp semantic alternatives before compatibility, launch,
+The four-layer resolver normalizes llama.cpp semantic alternatives before compatibility, launch,
 inspection, and provenance: a higher-layer built-in/file template choice or all/exact CPU-MoE
 choice suppresses its inherited sibling, while `off`, n-gram, and `draft-mtp` modes suppress an
 inherited external draft identity. Same-layer contradictions remain visible and invalid.

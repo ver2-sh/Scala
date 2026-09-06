@@ -21,7 +21,7 @@ ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 ## Models, Settings, Model Profiles, and Runtimes
 
 - Models is artifact inventory: format, path, size, technical capability, and provenance.
-- Settings contains Server Settings plus llama.cpp, NInfer, and q27 runtime defaults.
+- Settings separates Server operations from independent llama.cpp, NInfer, and q27 overrides.
 - Model Profiles are user-created mutable serving targets and the normal load unit.
 - Runtimes are installed executable implementations selected for the profile's bound engine.
 
@@ -33,7 +33,7 @@ the `model` value accepted by inference requests.
 Effective settings use one typed system with this complete precedence:
 
 ```text
-selected-runtime defaults
+runtime defaults → Settings runtime overrides
   → Model Profile overrides
   → ephemeral invocation overrides
 ```
@@ -49,7 +49,7 @@ winning layer remain invalid.
 Persistent state is deliberately split:
 
 ```text
-<data>/settings.json         schema 3: Server Settings and strictly namespaced runtime defaults
+<data>/settings.json         schema 3: Server Settings and strictly namespaced Settings overrides
 <data>/model-profiles.json   schema 2: user-owned Model Profiles
 ```
 
@@ -162,10 +162,10 @@ Common semantic definitions and runtime-specific settings share `SettingId`, `Se
 General, Downloads, Load, Generation, Reasoning, Prompt, KV / Memory, Speculation, Cache, and
 Advanced. Server-operational definitions appear only in Server Settings. Common inference semantics
 are defined once in code, then bound independently into each runtime's categories; a Runtime or
-Model Profile editor shows only the selected runtime's supported schema.
+Model Profile editor shows the selected runtime's schema, including unsupported fields for diagnosis and removal.
 
-Every supported effective setting is presented as a concrete value followed by its winning source,
-for example `1.0 (runtime default)`, `0.7 (model profile)`, or `200000 (boot inference)`.
+Known effective settings show their value and winning source; unknown pre-start defaults remain explicitly unknown,
+for example `1.0 (runtime default)`, `0.7 (Settings override)`, `0.5 (model profile)`, or `200000 (boot inference)`.
 Source text supplements the value and never replaces it. Dynamic runtime/model/host derivations
 remain part of the runtime-default layer and carry optional secondary detail. A genuine `auto`
 policy remains automatic before startup; presenting it never causes Norted to materialize an
@@ -282,7 +282,7 @@ explicit load --runtime
   → best compatible installed fallback
 ```
 
-Every candidate is checked through the selected engine's model+runtime+host compatibility contract as well as the artifact format, adapter, host, and exact installed manifest. The same decision is used for explicit selection, stored overrides/defaults, candidate listing, automatic fallback, and final load admission. When a persisted selection is missing or invalid, fallback is reported rather than hidden. Selecting an older runtime is the rollback mechanism.
+Every candidate is checked through the selected engine's model+runtime+host compatibility contract as well as the artifact format, adapter, host, and exact installed manifest. The same decision is used for explicit selection, stored overrides/defaults, candidate listing, automatic fallback, and final load admission. A missing or incompatible persisted selection is reported as an error; select another runtime explicitly. Selecting an older runtime is the rollback mechanism.
 
 ## Official providers and compatibility
 

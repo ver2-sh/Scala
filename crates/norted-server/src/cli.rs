@@ -67,7 +67,7 @@ pub enum Command {
     Runtimes(RuntimesArgs),
     /// Create, edit, load, and inspect user-owned Model Profiles
     ModelProfiles(ModelProfilesArgs),
-    /// Manage Server Settings and runtime inference defaults
+    /// Manage Server Settings and independent engine overrides
     Settings(SettingsArgs),
     /// Inspect resolved application configuration
     Config(ConfigArgs),
@@ -268,7 +268,7 @@ pub enum ModelProfilesCommand {
         #[arg(required = true, value_name = "SETTING_ID=VALUE")]
         settings: Vec<String>,
     },
-    /// Clear overrides so values use runtime defaults again
+    /// Clear profile overrides to inherit from Settings
     Unset {
         profile: String,
         #[arg(required = true, value_name = "SETTING_ID")]
@@ -314,14 +314,14 @@ pub struct SettingsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SettingsCommand {
-    /// Show persisted Server Settings or runtime defaults
+    /// Show Server Settings or independent engine overrides and runtime baselines
     Show {
         #[arg(long, conflicts_with = "runtime", required_unless_present = "runtime")]
         server: bool,
         #[arg(long, conflicts_with = "server", required_unless_present = "server")]
         runtime: Option<String>,
     },
-    /// Set one or more persisted defaults
+    /// Set one or more explicit local overrides
     Set(SettingsMutationArgs),
     /// Remove persisted values so the runtime baseline applies again
     Unset(SettingsUnsetArgs),

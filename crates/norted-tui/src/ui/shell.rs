@@ -210,7 +210,7 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
             (FocusArea::Content, crate::app::Screen::ModelProfiles) => vec![
                 hint("Left/Right", "profile", theme),
                 hint(glyphs.up_down, "setting", theme),
-                hint("Enter", "edit/cycle", theme),
+                hint("Enter", "edit", theme),
                 hint("e", "change engine", theme),
                 hint("l", "load profile", theme),
                 hint("u", "unload active", theme),
@@ -239,7 +239,7 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
             (FocusArea::Content, crate::app::Screen::Settings) => vec![
                 hint("Left/Right", "scope", theme),
                 hint(glyphs.up_down, "setting", theme),
-                hint("Enter", "edit/cycle", theme),
+                hint("Enter", "edit", theme),
                 hint("Delete", "inherit", theme),
                 hint("?", "help", theme),
             ],

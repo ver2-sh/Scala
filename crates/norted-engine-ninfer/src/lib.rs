@@ -21,8 +21,7 @@ use norted_engine::{
     InferenceOutput, InferenceRequest, InferenceStream, InstallationState, LaunchRequest,
     LaunchSpec, LoadProgressReporter, NativeOption, OptionValueKind, OutputFormat,
     PreparedModelInput, ProcessDescriptor, RuntimeVariantUpdateIdentity, UpdateState,
-    capture_command, compatibility_for, configurable_setting_definitions,
-    isolated_cuda_environment, prepare_norted_package_input,
+    capture_command, compatibility_for, isolated_cuda_environment, prepare_norted_package_input,
     prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
     revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
 };
@@ -1322,30 +1321,37 @@ impl NinferAdapter {
                 "runtime entrypoint SHA-256 mismatch: expected {expected}, observed {binary_sha256}"
             )));
         }
-        let output = capture_command(
-            &binary_path,
-            &["--help"],
-            &self.environment,
-            &managed_environment_removals(),
-            PROBE_TIMEOUT,
-        )
-        .await?;
-        let help = command_detail(&output.stdout, &output.stderr);
-        if !output.success {
-            return Err(EngineError::InvalidConfiguration(format!(
-                "ninfer-serve --help failed with exit code {:?}: {help}",
-                output.code
-            )));
-        }
-        if let Some(reason) = help_contract_error(&help, &self.native_arguments) {
-            return Err(EngineError::InvalidConfiguration(format!(
-                "entrypoint does not satisfy the ninfer-serve launch contract ({reason}): {help}"
-            )));
-        }
-        self.capability_cache
-            .write()
+        let cached = self
+            .capability_cache
+            .read()
             .await
-            .insert(binary_sha256.clone(), help);
+            .contains_key(&binary_sha256);
+        if !cached {
+            let output = capture_command(
+                &binary_path,
+                &["--help"],
+                &self.environment,
+                &managed_environment_removals(),
+                PROBE_TIMEOUT,
+            )
+            .await?;
+            let help = command_detail(&output.stdout, &output.stderr);
+            if !output.success {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "ninfer-serve --help failed with exit code {:?}: {help}",
+                    output.code
+                )));
+            }
+            if let Some(reason) = help_contract_error(&help, &self.native_arguments) {
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "entrypoint does not satisfy the ninfer-serve launch contract ({reason}): {help}"
+                )));
+            }
+            self.capability_cache
+                .write()
+                .await
+                .insert(binary_sha256.clone(), help);
+        }
         Ok((
             binary_path,
             binary_sha256,
@@ -1516,7 +1522,7 @@ impl EngineAdapter for NinferAdapter {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        settings: Option<&ResolvedSettings>,
+        _settings: Option<&ResolvedSettings>,
     ) -> RuntimeCompatibility {
         if let CompatibilityDecision::Unsupported { reason } = self.compatibility(model) {
             return RuntimeCompatibility::Incompatible(reason);
@@ -1525,12 +1531,6 @@ impl EngineAdapter for NinferAdapter {
             return RuntimeCompatibility::Incompatible(reason);
         }
         let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
-        if let Some(settings) = settings
-            && let Err(reason) =
-                settings::validate_model_settings(settings, model, capabilities.dflash_vision)
-        {
-            return RuntimeCompatibility::Incompatible(reason);
-        }
         let native = native_compatibility(
             &runtime.manifest.supported_native_identities,
             model
@@ -1547,7 +1547,7 @@ impl EngineAdapter for NinferAdapter {
         )
         .compatibility;
         let base = combine_compatibility(native, device);
-        let base = if runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::SourceBuild
+        if runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::SourceBuild
             && (!capabilities.trustworthy_identity
                 || !capabilities.request_protocol_semantics
                 || !capabilities.request_sampler_semantics
@@ -1562,19 +1562,6 @@ impl EngineAdapter for NinferAdapter {
             )
         } else {
             base
-        };
-        match settings.map(|settings| validate_ninfer_settings_prelaunch(settings, capabilities)) {
-            Some(Err(reason)) => RuntimeCompatibility::Incompatible(reason),
-            Some(Ok(())) if !settings.is_some_and(ResolvedSettings::is_empty) => {
-                combine_compatibility(
-                    base,
-                    RuntimeCompatibility::NeedsAttention(
-                        "configured NInfer settings require final exact-schema startup proof"
-                            .to_owned(),
-                    ),
-                )
-            }
-            _ => base,
         }
     }
 
@@ -1583,7 +1570,7 @@ impl EngineAdapter for NinferAdapter {
         runtime: &AvailableRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        settings: Option<&ResolvedSettings>,
+        _settings: Option<&ResolvedSettings>,
     ) -> RuntimeCompatibility {
         if let CompatibilityDecision::Unsupported { reason } = self.compatibility(model) {
             return RuntimeCompatibility::Incompatible(reason);
@@ -1594,12 +1581,6 @@ impl EngineAdapter for NinferAdapter {
             return RuntimeCompatibility::Incompatible(reason);
         }
         let capabilities = ninfer_runtime_capabilities_for_available(runtime);
-        if let Some(settings) = settings
-            && let Err(reason) =
-                settings::validate_model_settings(settings, model, capabilities.dflash_vision)
-        {
-            return RuntimeCompatibility::Incompatible(reason);
-        }
         let native = native_compatibility(
             &runtime.supported_native_identities,
             model
@@ -1616,7 +1597,7 @@ impl EngineAdapter for NinferAdapter {
         )
         .compatibility;
         let base = combine_compatibility(native, device);
-        let base = if matches!(
+        if matches!(
             &runtime.acquisition,
             norted_core::RuntimeAcquisitionPlan::SourceBuild(_)
         ) && (!capabilities.trustworthy_identity
@@ -1633,20 +1614,24 @@ impl EngineAdapter for NinferAdapter {
             )
         } else {
             base
-        };
-        match settings.map(|settings| validate_ninfer_settings_prelaunch(settings, capabilities)) {
-            Some(Err(reason)) => RuntimeCompatibility::Incompatible(reason),
-            Some(Ok(())) if !settings.is_some_and(ResolvedSettings::is_empty) => {
-                combine_compatibility(
-                    base,
-                    RuntimeCompatibility::NeedsAttention(
-                        "configured NInfer settings require final exact-schema startup proof"
-                            .to_owned(),
-                    ),
-                )
-            }
-            _ => base,
         }
+    }
+
+    fn validate_configuration(
+        &self,
+        runtime: &InstalledRuntime,
+        model: Option<&ModelArtifact>,
+        _host: &HostCapabilities,
+        resolved: &ResolvedSettings,
+    ) -> Result<(), EngineError> {
+        let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
+        validate_ninfer_settings_prelaunch(resolved, capabilities)
+            .map_err(EngineError::InvalidConfiguration)?;
+        if let Some(model) = model {
+            settings::validate_model_settings(resolved, model, capabilities.dflash_vision)
+                .map_err(EngineError::InvalidConfiguration)?;
+        }
+        Ok(())
     }
 
     fn runtime_model_accelerator_binding(
@@ -1776,7 +1761,7 @@ impl EngineAdapter for NinferAdapter {
     ) -> Result<Vec<norted_core::SettingDefinition>, EngineError> {
         let mut definitions = settings::definitions();
         settings::apply_model_capabilities(&mut definitions, model, None, false);
-        Ok(configurable_setting_definitions(definitions))
+        Ok(definitions)
     }
 
     async fn runtime_settings_schema(
@@ -1802,7 +1787,6 @@ impl EngineAdapter for NinferAdapter {
             settings::apply_reviewed_runtime_defaults(&mut definitions, settings);
         }
         apply_ninfer_runtime_contract(&mut definitions, &help, capabilities);
-        let definitions = configurable_setting_definitions(definitions);
         Ok(norted_core::SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -1843,7 +1827,6 @@ impl EngineAdapter for NinferAdapter {
             settings::apply_model_sampler_defaults(&mut definitions, model, settings);
         }
         apply_ninfer_runtime_contract(&mut definitions, &help, capabilities);
-        let definitions = configurable_setting_definitions(definitions);
         Ok(norted_core::SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),

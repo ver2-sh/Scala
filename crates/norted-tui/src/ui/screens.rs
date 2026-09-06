@@ -2137,7 +2137,7 @@ fn render_settings(
     frame.render_widget(
         section_title(
             "Settings",
-            "Server Settings and runtime defaults; Model Profiles are edited on their own screen",
+            "Server operations | Independent engine overrides · / Search · o Overrides · R Reset",
             theme,
         ),
         layout[0],
@@ -2167,28 +2167,48 @@ fn render_settings(
     let info = if app.settings_input.is_some() {
         String::new()
     } else {
-        let definitions = app.settings_definitions();
-        let definition = definitions.get(app.settings_setting_index);
-        let description = definition.map_or("", |definition| definition.description.as_str());
-        let default = definition.map_or_else(String::new, |definition| {
-            app.settings_default_detail(&definition.id)
-        });
+        let runtime = match app.selected_settings_scope() {
+            Some(crate::app::SettingsScope::Runtime(engine)) => app
+                .runtime_settings_schemas
+                .get(&engine)
+                .and_then(|schema| schema.runtime_id.as_ref())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "No runtime selected/installed".to_owned()),
+            _ => "Server operational settings".to_owned(),
+        };
+        let timing = if app.selected_settings_scope() == Some(crate::app::SettingsScope::Server) {
+            "Operational changes apply now"
+        } else {
+            "Next-load configuration · runtime baseline is read-only"
+        };
         format!(
-            "Rows select. Click a value to edit or change it; Inherit clears this layer's override.\n{description}\n{default}"
+            "{runtime}\n{timing}\nSearch: {} · {}",
+            app.settings_query,
+            if app.settings_overrides_only {
+                "Overrides only"
+            } else {
+                "All settings"
+            }
         )
     };
     let info_y = ui_layout.settings_scopes.y.saturating_add(1);
     frame.render_widget(
-        Paragraph::new(info).style(theme.hint),
+        Paragraph::new(info)
+            .style(theme.hint)
+            .wrap(Wrap { trim: true }),
         Rect::new(
             ui_layout.settings_scopes.x,
             info_y,
             ui_layout.settings_scopes.width,
-            ui_layout.settings_list.y.saturating_sub(info_y),
+            ui_layout
+                .settings_list
+                .y
+                .saturating_sub(info_y)
+                .saturating_sub(1),
         ),
     );
-    render_settings_input(frame, app, theme, ui_layout);
     render_setting_rows(frame, app, theme, ui_layout);
+    render_settings_input(frame, app, theme, ui_layout);
 }
 
 fn render_model_profiles(
@@ -2245,7 +2265,13 @@ fn render_model_profiles(
         ui_layout.settings_scopes.x,
         ui_layout.settings_scopes.y.saturating_add(1),
         ui_layout.settings_scopes.width,
-        if ui_layout.compact { 5 } else { 6 },
+        if ui_layout.settings_dense {
+            2
+        } else if ui_layout.compact {
+            5
+        } else {
+            6
+        },
     );
     let info = if app.settings_input.is_some() {
         Vec::new()
@@ -2259,8 +2285,6 @@ fn render_model_profiles(
             info_area.width as usize,
             app.marquee_animation_frame / 3,
         );
-        let definitions = app.settings_definitions();
-        let selected_definition = definitions.get(app.settings_setting_index);
         let profile_id = format!(
             "{}{}",
             profile.id,
@@ -2319,7 +2343,15 @@ fn render_model_profiles(
                                     .unwrap_or_else(|| "not validated".to_owned()),
                             )
                         },
-                        ToOwned::to_owned,
+                        |error| {
+                            format!(
+                                "runtime {} · Configuration: {error}",
+                                app.settings_runtime_id
+                                    .as_ref()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_else(|| "unresolved".to_owned())
+                            )
+                        },
                     )
                 },
                 if app.settings_validation_error.is_some() {
@@ -2329,16 +2361,33 @@ fn render_model_profiles(
                 },
             )),
         ];
-        if let Some(definition) = selected_definition {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "Next-load configuration · / Search: {} · o {} · R Reset",
+                app.settings_query,
+                if app.settings_overrides_only {
+                    "Overrides only"
+                } else {
+                    "All settings"
+                }
+            ),
+            theme.muted,
+        )));
+        if ui_layout.settings_dense {
+            let runtime = app
+                .settings_runtime_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "Runtime unresolved".to_owned());
+            lines.truncate(1);
             lines.push(Line::from(Span::styled(
-                definition.description.clone(),
+                truncate_middle(
+                    &format!("Next load · {runtime}"),
+                    info_area.width as usize,
+                    "…",
+                ),
                 theme.hint,
             )));
-            lines.extend(
-                app.settings_default_detail(&definition.id)
-                    .lines()
-                    .map(|detail| Line::from(Span::styled(detail.to_owned(), theme.muted))),
-            );
         }
         lines
     } else {
@@ -2354,16 +2403,36 @@ fn render_model_profiles(
         return;
     }
     render_setting_rows(frame, app, theme, ui_layout);
+    render_settings_input(frame, app, theme, ui_layout);
 }
 
 fn render_settings_input(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layout: &UiLayout) {
     let Some(input) = &app.settings_input else {
         return;
     };
-    let prompt = match input.kind {
-        crate::app::SettingsInputKind::ProfileName => "New Model Profile ID",
-        crate::app::SettingsInputKind::DuplicateProfile => "Duplicate Model Profile ID",
-        crate::app::SettingsInputKind::SettingValue => "Override value",
+    let prompt = if input.kind == crate::app::SettingsInputKind::Reset {
+        let scope = if app.screen == crate::app::Screen::ModelProfiles {
+            app.selected_model_profile_value()
+                .map(|profile| profile.id.to_string())
+                .unwrap_or_default()
+        } else {
+            match app.selected_settings_scope() {
+                Some(crate::app::SettingsScope::Server) => "Server".to_owned(),
+                Some(crate::app::SettingsScope::Runtime(engine)) => engine,
+                Some(crate::app::SettingsScope::ModelProfile(id)) => id.to_string(),
+                None => "selected scope".to_owned(),
+            }
+        };
+        format!("Reset {scope}: type RESET")
+    } else {
+        match input.kind {
+            crate::app::SettingsInputKind::Search => "Search settings (empty clears filter)",
+            crate::app::SettingsInputKind::Reset => "Reset this scope: type RESET",
+            crate::app::SettingsInputKind::ProfileName => "New Model Profile ID",
+            crate::app::SettingsInputKind::DuplicateProfile => "Duplicate Model Profile ID",
+            crate::app::SettingsInputKind::SettingValue => "Override value",
+        }
+        .to_owned()
     };
     let field_width = ui_layout
         .settings_input_field
@@ -2386,6 +2455,8 @@ fn render_settings_input(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_lay
         crate::app::SettingsInputKind::ProfileName => "[ Create ]",
         crate::app::SettingsInputKind::DuplicateProfile => "[ Duplicate ]",
         crate::app::SettingsInputKind::SettingValue => "[ Save ]",
+        crate::app::SettingsInputKind::Search => "[ Search ]",
+        crate::app::SettingsInputKind::Reset => "[ Confirm ]",
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -2409,6 +2480,35 @@ fn render_settings_input(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_lay
         ))),
         ui_layout.settings_input_cancel,
     );
+    if let Some(error) = &app.settings_input_error {
+        let candidate_y = ui_layout.settings_input_field.y.saturating_add(2);
+        let (y, height) = if candidate_y >= ui_layout.settings_list.y.saturating_sub(1) {
+            (
+                ui_layout.settings_list.y,
+                ui_layout.settings_list.height.min(2),
+            )
+        } else {
+            (
+                candidate_y,
+                ui_layout
+                    .settings_list
+                    .y
+                    .saturating_sub(candidate_y + 1)
+                    .min(2),
+            )
+        };
+        frame.render_widget(
+            Paragraph::new(error.as_str())
+                .style(theme.error)
+                .wrap(Wrap { trim: true }),
+            Rect::new(
+                ui_layout.settings_scopes.x,
+                y,
+                ui_layout.settings_scopes.width,
+                height,
+            ),
+        );
+    }
 }
 
 fn render_model_profile_actions(
@@ -2515,6 +2615,59 @@ fn render_model_profile_actions(
 }
 
 fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layout: &UiLayout) {
+    if app.settings_input.is_none()
+        && let Some(definition) = app.settings_definitions().get(app.settings_setting_index)
+    {
+        let detail = format!(
+            "{}\n{}",
+            definition.description,
+            app.settings_default_detail(&definition.id)
+        );
+        frame.render_widget(
+            Paragraph::new(detail)
+                .scroll((app.settings_detail_scroll, 0))
+                .style(theme.hint)
+                .wrap(Wrap { trim: true })
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .title(" Setting · i expand/close · [ ] scroll "),
+                ),
+            ui_layout.settings_detail,
+        );
+    }
+
+    for (target, rect) in &ui_layout.settings_tools {
+        let label = match target {
+            HoverTarget::SettingsDetails => "[ i Details ]",
+            HoverTarget::SettingsSearch => "[ / Search ]",
+            HoverTarget::SettingsFilter if app.settings_overrides_only => "[ o Overrides ✓ ]",
+            HoverTarget::SettingsFilter => "[ o Overrides ]",
+            HoverTarget::SettingsReset => "[ R Reset scope ]",
+            _ => "",
+        };
+        let label = if *target == HoverTarget::SettingsSearch && !app.settings_query.is_empty() {
+            truncate_middle(
+                &format!("[ / {} ]", app.settings_query),
+                rect.width as usize,
+                "…",
+            )
+        } else {
+            label.to_owned()
+        };
+        frame.render_widget(
+            Paragraph::new(label).style(if app.hover == Some(*target) {
+                theme.hovered
+            } else {
+                theme.hint
+            }),
+            *rect,
+        );
+    }
+
+    if app.settings_show_detail {
+        return;
+    }
     if app.settings_loading {
         frame.render_widget(
             Paragraph::new("Loading settings state…").style(theme.muted),
@@ -2580,20 +2733,30 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
         if app.hover == Some(HoverTarget::Setting(*index)) {
             style = style.patch(theme.hovered);
         }
-        let label = match &definition.kind {
-            norted_core::SettingKind::Choice { choices } => {
-                format!("{} [{}]", definition.label, choices.join("|"))
-            }
-            norted_core::SettingKind::UnsignedIntegerOrChoice { choices, .. } => {
-                format!("{} [number|{}]", definition.label, choices.join("|"))
-            }
-            _ => definition.label.clone(),
-        };
+        let label = &definition.label;
         let starts_category = index == &0
             || definitions
                 .get(index.saturating_sub(1))
                 .is_none_or(|previous| previous.category != definition.category);
-        let status = format!("{label} · {}", display.source);
+        let state = if display.can_clear {
+            "Overridden"
+        } else {
+            "Inherited"
+        };
+        let invalid = app
+            .settings_validation_error
+            .as_ref()
+            .is_some_and(|error| error.contains(definition.id.as_str()));
+        let status = format!(
+            "{label} · {state}{}",
+            if invalid {
+                " · Invalid"
+            } else if !definition.supported {
+                " · Unsupported"
+            } else {
+                ""
+            }
+        );
         let heading = if starts_category {
             format!("{}  ──  {status}", definition.category)
         } else {
@@ -2738,7 +2901,7 @@ fn concise_help_columns<'a>(theme: &Theme, glyphs: &Glyphs) -> (Vec<Line<'a>>, V
     ];
     let right = vec![
         Line::from(Span::styled("SETTINGS AND RUNTIMES", theme.hint)),
-        key_value("Settings", "Server Settings and runtime defaults", theme),
+        key_value("Settings", "Server operations and engine overrides", theme),
         key_value(glyphs.up_down, "select or scroll", theme),
         key_value("s", "search available runtimes", theme),
         key_value("g / Q / N", "set format default", theme),
@@ -2763,7 +2926,11 @@ fn compact_help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         key_value("Models", "e search, f format, d download", theme),
         key_value("p / x", "pause/resume or cancel download", theme),
         key_value("Runtimes", "s search, g/Q/N default", theme),
-        key_value("Settings", "Enter edit, Delete inherit", theme),
+        key_value(
+            "Settings",
+            "Enter edit, Delete inherit, / search, o filter, R reset, i details",
+            theme,
+        ),
         key_value("/", "commands", theme),
         key_value("? / Ctrl+C", "help / exit", theme),
         key_value(glyphs.up_down, "select or scroll", theme),
@@ -2811,7 +2978,7 @@ pub fn help_lines<'a>(theme: &Theme, glyphs: &Glyphs) -> Vec<Line<'a>> {
         ),
         Line::default(),
         Line::from(Span::styled("SETTINGS AND RUNTIMES", theme.hint)),
-        key_value("Settings", "Server Settings and runtime defaults", theme),
+        key_value("Settings", "Server operations and engine overrides", theme),
         key_value("Up/Down or j/k", "select or scroll the current page", theme),
         key_value("s", "search available runtimes from Runtimes", theme),
         key_value("g / Q / N", "select runtime for GGUF / Q27 / NInfer", theme),
