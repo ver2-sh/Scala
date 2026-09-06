@@ -808,6 +808,32 @@ The common runtime manager resolves a concrete runtime before asking its engine 
 
 Private control status identifies the model, engine, exact runtime ID/version/variant, executable SHA-256, process, and private endpoint. Launch provenance additionally snapshots the selected profile and the complete concrete effective settings map with runtime-default, Model Profile, or invocation source attribution and optional derivation detail. Startup-confirmed runtime values replace pre-launch calculations without changing the winning layer; when startup changes a value, structured `requested_value` preserves the pre-start policy/value. This is separate from adapter/generation `normalized_settings` and redacted native argument provenance. Provenance also retains the immutable runtime manifest, selection source, accelerator UUID and observations, typed model native identity, auxiliary facts, release digests or source commit/tree/recipe/toolchain facts as appropriate, environment names/value hashes, process identity, endpoint, and launch time. Inference-affecting LoRA/control-vector/context-cost inputs additionally record canonical bound paths and SHA-256 digests; scaled entries retain their scale. Mutable output destinations such as log and slot-save paths are not content-hashed. External, official-binary, and managed-source acquisition are never blurred. Public `/v1/models` and Responses objects receive no profile, runtime, source, hardware, or NInfer native-identity metadata; `models info` exposes the latter locally.
 
+## Per-profile benchmarks
+
+Select **Run benchmark** (`b`) in Model Profiles, or open `/benchmarks` for
+progress, cancellation, per-profile history and historical comparisons. The
+running server executes the original, offline **Norted Quick Bench v1** through
+normal managed inference, with a maximum 600-second execution budget. It
+reports Norted Quick Intelligence, short-task agentic capability, visible-text
+throughput and first-visible latency. Each profile keeps independent results;
+failed/cancelled attempts never replace its last completed result.
+
+Scriptable access uses private authenticated control:
+
+```console
+norted-server benchmarks start PROFILE_ID
+norted-server benchmarks status --json
+norted-server benchmarks history PROFILE_ID --json
+norted-server benchmarks result RUN_ID --json
+norted-server benchmarks compare LEFT_RUN_ID RIGHT_RUN_ID --json
+norted-server benchmarks cancel
+```
+
+Benchmarking temporarily reserves inference. See [benchmark methodology and
+operations](docs/benchmarks.md) for exact scoring, task limits, measurement units,
+configuration matching, privacy/storage and calibration limitations. These
+scores are specific to the bundled pack and are not AA, MMLU or IQ estimates.
+
 ## Development
 
 Rust 1.88 or newer is required; `rust-toolchain.toml` pins 1.88.0. Normal validation is:

@@ -18,6 +18,11 @@ pub struct SlashCommand {
 
 pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
+        name: "/benchmarks",
+        description: "Run and inspect per-profile benchmarks",
+        action: CommandAction::Navigate(Screen::Benchmarks),
+    },
+    SlashCommand {
         name: "/load",
         description: "Load the selected Model Profile through the running server",
         action: CommandAction::LoadSelected,

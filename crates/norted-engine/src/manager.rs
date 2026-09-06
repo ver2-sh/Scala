@@ -320,6 +320,10 @@ impl Default for RuntimeManagerOptions {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
+    #[error(
+        "Inference is temporarily reserved for a benchmark; inspect or cancel it through private control"
+    )]
+    BenchmarkReserved,
     #[error("the requested capability is unsupported by this model/runtime")]
     UnsupportedCapability,
     #[error("Model Profile `{0}` does not exist")]
@@ -613,7 +617,11 @@ struct ManagerState {
     notices: VecDeque<RuntimeNotice>,
 }
 
+#[path = "benchmark/runner.rs"]
+mod benchmark_runner;
+
 pub struct RuntimeManager {
+    benchmark: crate::benchmark::Service,
     core: Arc<ApplicationCore>,
     registry: EngineRegistry,
     packs: Arc<RuntimePackManager>,
@@ -642,6 +650,7 @@ impl RuntimeManager {
         let settings = SettingsStore::new(&core.paths);
         let model_profiles = ModelProfilesStore::new(&core.paths);
         let manager = Arc::new(Self {
+            benchmark: crate::benchmark::Service::new(core.paths.data_dir.join("benchmarks")),
             core,
             registry,
             packs,
@@ -777,6 +786,7 @@ impl RuntimeManager {
         settings: SettingsPatch,
         intent: LoadIntent,
     ) -> Result<LoadAdmission, RuntimeError> {
+        let _reservation = self.benchmark_admission()?;
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(RuntimeError::ShuttingDown);
         }
@@ -852,24 +862,36 @@ impl RuntimeManager {
         let status = self.status().await;
         let (completion_sender, completion) = oneshot::channel();
         let manager = Arc::clone(self);
-        tokio::spawn(async move {
-            let result = manager
-                .load_admitted(
-                    AdmittedLoad {
-                        model_profile,
-                        model,
-                        runtime_id,
-                        settings,
-                        cancellation_epoch,
-                        generation,
-                        profile_role: role,
-                        residency,
-                    },
-                    operation,
-                )
-                .await;
+        let benchmark_load = crate::benchmark::EXECUTOR.try_with(|()| ()).is_ok();
+        let load_task = tokio::spawn(async move {
+            let future = manager.load_admitted(
+                AdmittedLoad {
+                    model_profile,
+                    model,
+                    runtime_id,
+                    settings,
+                    cancellation_epoch,
+                    generation,
+                    profile_role: role,
+                    residency,
+                },
+                operation,
+            );
+            let result = if benchmark_load {
+                crate::benchmark::EXECUTOR.scope((), future).await
+            } else {
+                future.await
+            };
             let _ = completion_sender.send(result);
         });
+        if crate::benchmark::EXECUTOR.try_with(|()| ()).is_ok() {
+            *self
+                .benchmark
+                .load_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(load_task.abort_handle());
+        }
         Ok(LoadAdmission { status, completion })
     }
 
@@ -1245,6 +1267,13 @@ impl RuntimeManager {
                 BackendLoadProgress::indeterminate(BackendLoadPhase::SpawningBackend),
             )
             .await;
+            // Preserve process ownership across the spawn-to-manager handoff
+            // when a benchmark cancels its load future.
+            let benchmark_handoff = if crate::benchmark::EXECUTOR.try_with(|()| ()).is_ok() {
+                Some(self.benchmark.load_handoff.lock().await)
+            } else {
+                None
+            };
             let process = match self
                 .supervisor
                 .spawn(launch_spec, installation.engine.clone(), model_id.clone())
@@ -1274,6 +1303,13 @@ impl RuntimeManager {
                     false
                 }
             };
+            // Even a cancelled process must be registered until termination.
+            if benchmark_handoff.is_some() && cancelled {
+                if let Some(backend) = self.state.write().await.backends.get_mut(&profile_id) {
+                    backend.loading_process = Some(process.clone());
+                }
+            }
+            drop(benchmark_handoff);
             if cancelled {
                 cleanup_pending_launch_files(&launch_attempts).await;
                 let detail = "model load was cancelled".to_owned();
@@ -1585,6 +1621,7 @@ impl RuntimeManager {
         self: &Arc<Self>,
         profile_id: ModelProfileId,
     ) -> Result<ControlStatus, RuntimeError> {
+        let _reservation = self.benchmark_admission()?;
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             manager.cancel_loading(&profile_id).await;
@@ -1886,6 +1923,7 @@ impl RuntimeManager {
 
     pub async fn shutdown(self: &Arc<Self>) {
         self.shutting_down.store(true, Ordering::Release);
+        self.cancel_benchmark_shutdown().await;
         self.cancellation_epoch.fetch_add(1, Ordering::AcqRel);
         if let Some(reaper) = self.reaper.lock().await.take() {
             reaper.abort();
@@ -1913,6 +1951,7 @@ impl RuntimeManager {
             }
         }
         self.supervisor.shutdown().await;
+        self.benchmark.owner.lock().await.take();
     }
 
     async fn set_load_progress(&self, generation: u64, progress: BackendLoadProgress) {
@@ -2146,8 +2185,14 @@ impl RuntimeManager {
         routing: InferenceRoutingContext,
         capability: crate::ApiCapability,
     ) -> Result<InferenceTarget, RuntimeError> {
+        let _reservation = self.benchmark_admission()?;
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(RuntimeError::ShuttingDown);
+        }
+        if crate::benchmark::EXECUTOR.try_with(|()| ()).is_ok() {
+            // Benchmark reservation pins the already admitted running backend;
+            // never JIT-reload edited next-load settings between task turns.
+            return self.acquire_target(requested).await;
         }
         let profiles = self
             .model_profiles
@@ -2396,6 +2441,9 @@ impl RuntimeManager {
     }
 
     async fn reap_idle(self: &Arc<Self>) {
+        let Ok(_reservation) = self.benchmark_admission() else {
+            return;
+        };
         let Ok(operation) = Arc::clone(&self.operation).try_lock_owned() else {
             return;
         };

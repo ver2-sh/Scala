@@ -1,0 +1,298 @@
+[
+  {
+    "id": "logic-1",
+    "category": "logic",
+    "prompt": "Three jobs A,B,C run serially without gaps, starting at 09:00. A lasts 25 minutes; B lasts twice as long as C. C lasts 15 minutes. B must precede A and C must follow A. At what time does C start? Return a JSON string HH:MM. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": "09:55",
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "logic-2",
+    "category": "logic",
+    "prompt": "A four-digit access code uses 1,2,3,4 once each. 2 is immediately before 4. 1 is not at either end. 3 precedes 1. Return the code as a JSON string. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": "3124",
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "logic-3",
+    "category": "logic",
+    "prompt": "A tank begins with 80 liters. Remove one quarter, add 20 liters, then remove three eighths of the current amount. How many liters remain? Return a JSON integer. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": 50,
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "logic-4",
+    "category": "logic",
+    "prompt": "A directed graph has weighted edges S-A:4, S-B:2, B-A:1, A-T:5, B-T:9, A-C:2, C-T:1. Return [minimum cost from S to T, path as a string with hyphens]. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      6,
+      "S-B-A-C-T"
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "logic-5",
+    "category": "logic",
+    "prompt": "Exactly one of Ada, Bo, Cy broke a cup. Ada says Bo did it. Bo says Cy did it. Cy says Bo is lying. Exactly one statement is true. Return the culprit name as a JSON string. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": "Cy",
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "logic-6",
+    "category": "logic",
+    "prompt": "Packets numbered 1 through 30 are retained if their number is divisible by 3 or 5, but not both. Return [retained packet count, sum of retained numbers]. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      12,
+      180
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "context-1",
+    "category": "context",
+    "prompt": "Ledger (units, status): North 12 shipped; South 9 pending; North 5 returned; East 7 shipped; South 4 shipped; North 8 shipped. Returns subtract from shipped units for their region; pending contributes zero. Return region names ordered by descending net shipped units as a JSON array. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      "North",
+      "East",
+      "South"
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "context-2",
+    "category": "context",
+    "prompt": "Policy: expenses over 100 require manager approval; all overseas expenses also require finance approval. Receipt R: domestic, 140, manager approved. S: overseas, 80, manager approved only. T: overseas, 120, both approvals. U: domestic, 100, no approval. Return the IDs eligible for payment sorted alphabetically. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      "R",
+      "T",
+      "U"
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "context-3",
+    "category": "context",
+    "prompt": "Incident notes: cache disabled at 10:00; deployment at 10:05; errors rose at 10:07; rollback at 10:12; errors fell at 10:14. Traffic volume was not measured. Can these notes establish that the deployment, rather than traffic changes, caused the error rise? Return a JSON string: established, disproved, or insufficient. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": "insufficient",
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "context-4",
+    "category": "context",
+    "prompt": "Repository excerpts: defaults.conf: retries=2, timeout=8. prod.conf: include defaults.conf; timeout=12. service.conf: include prod.conf; retries=0. Later assignments replace earlier ones; zero is explicit, not inheritance. A diagnostic note says legacy timeout was 30. Return [service retries, service timeout, maximum attempts if attempts=1+retries]. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      0,
+      12,
+      1
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "context-5",
+    "category": "context",
+    "prompt": "Inventory at close: A 18 units, 6 reserved, reorder threshold 10; B 14 units, 5 reserved, threshold 8; C 11 units, 4 reserved, threshold 9. A unit reserved cannot be sold. Reorder when sellable stock is strictly below threshold, to reach threshold+5. Return [[item, units to order], ...] for items requiring reorder, alphabetical. Prior-month thresholds are irrelevant: A=20, B=20, C=20. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      [
+        "C",
+        7
+      ]
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "context-6",
+    "category": "context",
+    "prompt": "A study table gives successes/attempts: system P easy 80/90, hard 2/10; system Q easy 9/10, hard 24/90. Return [system with higher overall success rate, system with higher rate within BOTH difficulty groups]. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      "P",
+      "Q"
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "code-1",
+    "category": "code",
+    "prompt": "Python: a=[1,2]; b=a; c=a[:]; b.append(3); c[0]=9; a=a+[4]. Return [a,b,c] as JSON. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      [
+        1,
+        2,
+        3,
+        4
+      ],
+      [
+        1,
+        2,
+        3
+      ],
+      [
+        9,
+        2
+      ]
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "code-2",
+    "category": "code",
+    "prompt": "Python: x=0\nfor i in range(1,6):\n if i%2==0: continue\n x=x*10+i\nReturn final x as a JSON integer. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": 135,
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "code-3",
+    "category": "code",
+    "prompt": "A binary search on sorted a uses inclusive lo=0, hi=len(a)-1. While lo<=hi, mid=(lo+hi)//2; if a[mid]<target it does lo=mid, else if a[mid]>target it does hi=mid-1, else returns mid. Which repair prevents the stalled lower-bound case while preserving correctness? Return one JSON string: A: lo=mid+1; B: hi=mid; C: lo=mid-1. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": "A",
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "code-4",
+    "category": "code",
+    "prompt": "Python: def f(n):\n if n<2: return 1\n return f(n-1)+2*f(n-2)\nReturn [f(3),f(5)]. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      5,
+      21
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "code-5",
+    "category": "code",
+    "prompt": "JavaScript: const a=[3,1,4]; const b=a.map((x,i)=>x+i).filter(x=>x%2===0); Return b as JSON. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      2,
+      6
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "code-6",
+    "category": "code",
+    "prompt": "A cache uses if cache.get(key): return cache[key]; otherwise compute(key) and store it. compute can return 0. Which single replacement checks presence correctly in Python? Return one JSON string: A for if key in cache:, B for if cache[key] != 0:, C for if key not in cache:. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": "A",
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "instruction-1",
+    "category": "instruction",
+    "prompt": "From [12,3,8,3,5,12,2], select unique even values, order descending, and return exactly three JSON integers in an array. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      12,
+      8,
+      2
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "instruction-2",
+    "category": "instruction",
+    "prompt": "Return a JSON array of two strings: first the lowercase word obtained by reversing STRESSED, second the number of letters in that reversed word written as an English word. No other items. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      "desserts",
+      "eight"
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "instruction-3",
+    "category": "instruction",
+    "prompt": "Given pairs oak:7, elm:4, ash:7, fir:2: keep values at least 4; order by value descending then name ascending; return only the names as a JSON array. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      "ash",
+      "oak",
+      "elm"
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "instruction-4",
+    "category": "instruction",
+    "prompt": "Return a JSON array of three booleans corresponding in order to these statements: every multiple of 6 is even; every even number is a multiple of 6; zero is an integer. Use JSON booleans, not strings. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      true,
+      false,
+      true
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "instruction-5",
+    "category": "instruction",
+    "prompt": "Encode the words blue, red, green as follows: keep original order, uppercase only words of length 4, replace all other words by their length as a JSON number. Return a JSON array. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      "BLUE",
+      3,
+      5
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  },
+  {
+    "id": "instruction-6",
+    "category": "instruction",
+    "prompt": "The input is \"mint lime mint pear lime fig\". Return two arrays inside one JSON array: distinct words in order of first occurrence, then their occurrence counts in the same order. Do not alphabetize. Return only the requested JSON value, without Markdown or explanation.",
+    "answer": [
+      [
+        "mint",
+        "lime",
+        "pear",
+        "fig"
+      ],
+      [
+        2,
+        2,
+        1,
+        1
+      ]
+    ],
+    "rubric": "exact-json-v1",
+    "seconds": 10,
+    "max_output_tokens": 384
+  }
+]

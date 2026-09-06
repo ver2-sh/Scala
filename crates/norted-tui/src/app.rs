@@ -32,6 +32,7 @@ pub enum Screen {
     Overview,
     Models,
     ModelProfiles,
+    Benchmarks,
     Runtimes,
     Server,
     Logs,
@@ -40,10 +41,11 @@ pub enum Screen {
 }
 
 impl Screen {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Overview,
         Self::Models,
         Self::ModelProfiles,
+        Self::Benchmarks,
         Self::Runtimes,
         Self::Server,
         Self::Logs,
@@ -56,6 +58,7 @@ impl Screen {
             Self::Overview => "Overview",
             Self::Models => "Models",
             Self::ModelProfiles => "Model Profiles",
+            Self::Benchmarks => "Benchmarks",
             Self::Runtimes => "Runtimes",
             Self::Server => "Server",
             Self::Logs => "Logs",
@@ -341,6 +344,7 @@ pub struct LogEntry {
 }
 
 pub struct App {
+    pub benchmarks: crate::benchmarks::Benchmarks,
     pub snapshot: AppSnapshot,
     pub public_auth_status: PublicAuthStatus,
     pub public_auth_loading: bool,
@@ -512,6 +516,7 @@ impl App {
             model_download_jobs: Vec::new(),
             selected_model_download_job: None,
             selected_model_profile: None,
+            benchmarks: Default::default(),
             log_scroll: 0,
             detail_text: None,
             detail_scroll: 0,
@@ -2832,6 +2837,10 @@ impl App {
                 _ => Update::None,
             },
             Screen::ModelProfiles => self.handle_model_profiles_key(key, layout),
+            Screen::Benchmarks => {
+                self.benchmarks.key(key);
+                Update::Render
+            }
             Screen::Logs => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => self.scroll_logs(1, layout),
                 KeyCode::Down | KeyCode::Char('j') => self.scroll_logs(-1, layout),
@@ -3202,6 +3211,17 @@ impl App {
             return Update::None;
         }
         match key.code {
+            KeyCode::Char('b') => {
+                if let Some(profile) = self.selected_model_profile_value() {
+                    self.benchmarks.pending =
+                        Some(norted_engine::benchmark::BenchmarkRequest::Start {
+                            profile_id: profile.id.clone(),
+                        });
+                    self.screen = Screen::Benchmarks;
+                    self.nav_focus = Screen::Benchmarks;
+                }
+                Update::Render
+            }
             KeyCode::Char('a') => {
                 self.profile_actions_open = !self.profile_actions_open;
                 self.settings_show_detail = false;
@@ -4338,6 +4358,10 @@ impl App {
             Some(HoverTarget::ModelProfileAction(action)) => {
                 self.focus = FocusArea::Content;
                 match action {
+                    ModelProfileAction::Benchmark => self.handle_model_profiles_key(
+                        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+                        layout,
+                    ),
                     ModelProfileAction::Load
                         if self.selected_profile_model().is_some()
                             && self.control.is_some()

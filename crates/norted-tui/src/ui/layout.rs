@@ -32,6 +32,7 @@ pub enum InstalledModelAction {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ModelProfileAction {
+    Benchmark,
     Load,
     Unload,
     Model,
@@ -1396,7 +1397,10 @@ impl UiLayout {
                         2
                     },
                 );
-                let mut actions = vec![(ModelProfileAction::Load, 8)];
+                let mut actions = vec![
+                    (ModelProfileAction::Load, 8),
+                    (ModelProfileAction::Benchmark, 21),
+                ];
                 if app.selected_profile_is_active() {
                     actions.push((ModelProfileAction::Unload, 10));
                 }
@@ -2078,7 +2082,7 @@ impl UiLayout {
                     }
                 }
                 Screen::Server => {}
-                Screen::Logs | Screen::Help => {}
+                Screen::Logs | Screen::Help | Screen::Benchmarks => {}
             },
         }
 

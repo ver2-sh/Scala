@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
+pub mod benchmark;
 mod catalog;
 mod control;
 mod installer;
@@ -821,6 +822,18 @@ async fn hash_file_with_progress<F>(path: &Path, progress: F) -> std::io::Result
 where
     F: Fn(u64, u64, Option<u64>) + Send + 'static,
 {
+    // Dropping preparation (for example at a benchmark deadline) must also
+    // stop the blocking verifier instead of hashing a multi-gigabyte artifact
+    // after its owning load future has gone away. A cancelled hash never yields
+    // an integrity identity.
+    struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_on_drop = CancelOnDrop(Arc::clone(&cancelled));
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let mut file = std::fs::File::open(&path).map_err(|error| {
@@ -846,6 +859,12 @@ where
         let mut buffer = vec![0_u8; HASH_BUFFER_SIZE];
         progress(0, total, None);
         loop {
+            if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "artifact verification cancelled",
+                ));
+            }
             let read = file.read(&mut buffer).map_err(|error| {
                 std::io::Error::new(
                     error.kind(),
@@ -1789,6 +1808,12 @@ pub trait ProcessSupervisor: Send + Sync {
         model_id: norted_core::ModelId,
     ) -> Result<ProcessDescriptor, EngineError>;
     async fn terminate(&self, process: &ProcessDescriptor) -> Result<(), EngineError>;
+    /// Cancel deadline-bound work through the same supervisor ownership. The
+    /// native supervisor skips the graceful wait; other supervisors may retain
+    /// their normal termination contract.
+    async fn terminate_immediately(&self, process: &ProcessDescriptor) -> Result<(), EngineError> {
+        self.terminate(process).await
+    }
     async fn subscribe(
         &self,
         process: &ProcessDescriptor,
