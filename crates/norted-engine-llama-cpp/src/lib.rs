@@ -4155,20 +4155,8 @@ fn apply_llama_exact_help_contract(definitions: &mut [SettingDefinition], help: 
             apply_llama_reported_default(definition, &help_option_block(help, option));
         }
     }
-    finalize_llama_exact_schema(definitions);
-}
-
-fn finalize_llama_exact_schema(definitions: &mut [SettingDefinition]) {
-    for definition in definitions
-        .iter_mut()
-        .filter(|definition| definition.supported && definition.default_preview.is_none())
-    {
-        definition.supported = false;
-        definition.unsupported_reason = Some(
-            "the exact llama-server advertises this control but does not expose a trustworthy omitted/default value"
-                .to_owned(),
-        );
-    }
+    // An advertised, implemented control can remain supported without a known
+    // default. Inheritance omits it; explicit overrides still validate normally.
 }
 
 fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &str) {
@@ -6122,7 +6110,7 @@ mod settings_tests {
                 None,
                 Some("  --temp N  temperature")
             ),
-            RuntimeCompatibility::Incompatible(_)
+            RuntimeCompatibility::Compatible
         ));
         assert!(matches!(
             llama_configured_runtime_compatibility(&configured, None, Some("  --top-p N  top p")),
@@ -6139,7 +6127,7 @@ mod settings_tests {
             "  --temp N  temperature\n  --top-p N  top p\n  --top-k N  top k\n  --min-p N  min p";
         assert!(matches!(
             llama_configured_runtime_compatibility(&all_generation, None, Some(generation_help)),
-            RuntimeCompatibility::Incompatible(_)
+            RuntimeCompatibility::Compatible
         ));
         let mut definitions = llama_model_setting_definitions(None);
         apply_llama_exact_help_contract(&mut definitions, "  --temp N  temperature");
