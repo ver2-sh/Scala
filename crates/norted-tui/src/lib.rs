@@ -275,9 +275,13 @@ pub async fn run(
             },
             result = benchmark_receiver.recv() => {
                 if let Some((request, result)) = result {
-                    if let Some(detail) = app.benchmarks.accept(&request, result) {
-                        app.detail_text = Some(detail);
-                        app.detail_scroll = 0;
+                    let identities = |state: &crate::benchmarks::Benchmarks| state.rows().iter()
+                        .map(|row| (row["profile_id"].clone(), row["run_id"].clone())).collect::<Vec<_>>();
+                    let before = identities(&app.benchmarks);
+                    app.benchmarks.accept(&request, result);
+                    if !matches!(request, norted_engine::benchmark::BenchmarkRequest::Status)
+                        || before != identities(&app.benchmarks) {
+                        app.clear_hover();
                     }
                 }
                 Update::Render
@@ -369,6 +373,8 @@ pub async fn run(
         if !app.benchmarks.busy {
             if let Some(request) = app.benchmarks.pending.take() {
                 app.benchmarks.busy = true;
+                app.benchmarks.polling =
+                    matches!(request, norted_engine::benchmark::BenchmarkRequest::Status);
                 let paths = core.paths.clone();
                 let results = benchmark_results.clone();
                 tokio::spawn(async move {

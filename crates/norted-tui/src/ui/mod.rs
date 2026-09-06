@@ -1,5 +1,5 @@
 mod command_palette;
-mod components;
+pub(crate) mod components;
 pub(crate) mod layout;
 mod model_runtime;
 mod profile_engine;
@@ -31,6 +31,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) -> UiLayout {
         app.settings_detail_scroll = app
             .settings_detail_scroll
             .min(max_scroll.min(u16::MAX as usize) as u16);
+    }
+    if app.screen == crate::app::Screen::Benchmarks {
+        crate::benchmarks::clamp_scroll(&mut app.benchmarks, layout.benchmarks.detail);
     }
     app.sync_marquee_target(layout.active_marquee_target(app));
     let theme = Theme::current(app.no_color);

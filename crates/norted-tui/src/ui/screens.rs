@@ -37,7 +37,7 @@ pub fn render_screen(
         Screen::Overview => render_overview(frame, area, app, theme, glyphs, ui_layout),
         Screen::Models => render_models(frame, area, app, theme, glyphs, ui_layout),
         Screen::ModelProfiles => render_model_profiles(frame, area, app, theme, ui_layout),
-        Screen::Benchmarks => crate::benchmarks::render(frame, area, &app.benchmarks),
+        Screen::Benchmarks => crate::benchmarks::render(frame, app, theme, glyphs, ui_layout),
         Screen::Runtimes => render_runtimes(frame, area, app, theme, glyphs, ui_layout),
         Screen::Server => render_server(frame, area, app, theme, glyphs, ui_layout),
         Screen::Logs => render_logs(frame, area, app, theme, ui_layout),
