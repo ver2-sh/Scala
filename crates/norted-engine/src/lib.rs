@@ -1668,6 +1668,15 @@ pub trait EngineAdapter: Send + Sync {
     /// unload, or crash. Process supervision itself remains manager-owned.
     async fn clear_launch_state(&self, _endpoint: Option<&str>) {}
     async fn health(&self, process: &ProcessDescriptor) -> Result<bool, EngineError>;
+    /// After dropping an admitted HTTP stream, prove engine-side work is idle.
+    /// A live health endpoint alone is not cancellation acknowledgement.
+    async fn confirm_request_stopped(
+        &self,
+        _process: &ProcessDescriptor,
+    ) -> Result<bool, EngineError> {
+        Ok(false)
+    }
+
     /// Converts bounded process startup output into facts that must be proven
     /// before a backend is promoted to healthy. Adapters should reject absent
     /// or contradictory observations when a model policy requires them.

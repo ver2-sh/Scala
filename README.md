@@ -812,11 +812,13 @@ Private control status identifies the model, engine, exact runtime ID/version/va
 
 Select **Run benchmark** (`b`) in Model Profiles, or open `/benchmarks` for
 progress, cancellation, per-profile history and historical comparisons. The
-running server executes the original, offline **Norted Quick Bench v1** through
+running server executes the original, offline **Norted Quick Bench v2** through
 normal managed inference, with a maximum 600-second execution budget. It
 reports Norted Quick Intelligence, short-task agentic capability, visible-text
 throughput and first-visible latency. Each profile keeps independent results;
-failed/cancelled attempts never replace its last completed result.
+failed/cancelled attempts never replace its last finished result. Finished
+evaluations may have explicitly unavailable metrics; confirmed safe task
+cancellation permits later tasks, while unverified backend state interrupts the run.
 
 Scriptable access uses private authenticated control:
 
