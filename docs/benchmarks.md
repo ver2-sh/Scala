@@ -333,3 +333,37 @@ usage after the finish frame. It filters initial raw-template reasoning only
 for raw completion text, since routed chat content has already been separated
 from reasoning by the runtime. This prevents suppression of an answer when the
 optional initial-reasoning filter is selected on the chat route.
+
+## NInfer startup validation
+
+NInfer's reviewed startup log uses different names for different identity
+fields: `artifact.target` is the registry dispatch key (for example
+`qwen3_8_27b`), while `engine.context_cost.model_id` is the container's native
+model ID (`qwen3.8-27b`). Norted validates the explicit registry mapping, both
+weights IDs, and the independent public Model Profile ID. Unknown mappings and
+mismatches are rejected; punctuation is not normalized speculatively.
+
+The same distinction applies to KV settings: the CLI choices `fp8` and `int8`
+are reported as `fp8-e4m3-row256` and `int8-group64`. Validated settings use the
+canonical CLI choice, and `kv_cache_format` retains the exact native format as
+a startup observation. Sampler arguments are parsed by NInfer as 32-bit floats;
+Norted validates the exact value obtained from the same decimal argument at
+that precision, including values such as `0.6` reported as
+`0.6000000238418579`. This does not change the saved or requested setting.
+
+Previously, these valid representation differences rejected startup, and the
+health polling loop treated the rejection as retryable after its startup proof
+had already been discarded. It eventually reported a setup timeout instead of
+the cause. Startup-proof rejection now returns a permanent configuration error
+with the validation reason, so the manager stops the owned process promptly.
+Temporary lack of readiness still follows the existing polling contract.
+Artifact verification, GPU binding, profile settings and the 60 s setup / 600 s
+overall benchmark limits are unchanged.
+
+Live validation on the installed `a140e7ae82a11ed2f370a4d8f2cc16268a3790b8`
+NInfer runtime (`ninfer-serve-v2-sm120a`) completed all four performance probes
+and both scored sections without preloading the model. Temporary startup-record
+replay also checked valid target/KV mappings, float conversion and rejection of
+wrong target/model/weights, GPU, public profile, context, speculation, format and
+schema values. These checks do not establish compatibility with unreviewed
+runtime contracts.
