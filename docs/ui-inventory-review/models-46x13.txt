@@ -1,0 +1,13 @@
+ ◆  NORTED SERVER              ●  API Running
+  Overview  Models  Model Profiles  Runtimes
+  Server  Logs  Settings  Help
+ ────────────────────────────────────────────
+  Model Library                [ D Details ]
+  [ Installed ]    Discover   [ J Jobs ]
+  f: filter | J: jobs | 1 warning(s): Logs
+  Model                    Format  Usage
+  > 模型 Research model 0… gguf    Running
+  [ Profile ] [ Runtime ] [ Unload ]
+
+  ›  Press / to run a command
+ →/s Discover   ↑↓ select   p pause/resume

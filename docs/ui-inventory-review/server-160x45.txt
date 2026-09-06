@@ -1,0 +1,45 @@
+
+   ◆  NORTED SERVER  local runtime control                                                                                                     ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+     API Server                                                                                                                               [ D Details ]
+     Cross-process state verified through the local health endpoint
+
+
+     WARNING: remote authentication is disabled
+     PUBLIC  Running | http://127.0.0.1:8080
+     EXPOSURE  Remote | Auth: disabled
+     CONFIGURED  0.0.0.0:8080 | Auth: disabled | Keys: Loading
+     API ROUTES
+     GET /health   GET /v1/models
+     POST /v1/responses   POST /v1/chat/completions
+     Resident profile                                                                     Engine / version   Lifecycle      Requests Private endpoint
+     research-profile-0                                                                   llama.cpp / b8999  Running        0        http://127.0.0.1:9000
+     research-profile-1                                                                   llama.cpp / b8999  Running        1        http://127.0.0.1:9001
+     research-profile-2                                                                   llama.cpp / b8999  Loading        2        http://127.0.0.1:9002
+
+
+
+
+
+
+
+
+
+
+
+
+
+     █████████████████████████████████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  40%
+     Loading model: Loading model tensors 40 B / 100 B
+
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    ›  Press / to run a command
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Tab change focus   / commands   ? help   mouse click / hover   Ctrl+C exit
+
+

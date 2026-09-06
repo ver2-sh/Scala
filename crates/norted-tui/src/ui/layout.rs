@@ -5,13 +5,13 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, ModelLibraryView, Overlay, Screen};
 
-use super::components::{content_layout, format_bytes, needs_marquee};
+use super::components::{content_layout, model_content_layout, needs_marquee};
 use super::shell::{COMPACT_WIDTH, MIN_HEIGHT, MIN_WIDTH};
 
-const MODEL_ROW_HEIGHT_COMPACT: u16 = 3;
-const MODEL_ROW_HEIGHT_COMFORTABLE: u16 = 4;
-const TWO_LINE_ROW_HEIGHT_COMPACT: u16 = 2;
-const TWO_LINE_ROW_HEIGHT_COMFORTABLE: u16 = 3;
+const MODEL_ROW_HEIGHT_COMPACT: u16 = 1;
+const MODEL_ROW_HEIGHT_COMFORTABLE: u16 = 1;
+const TWO_LINE_ROW_HEIGHT_COMPACT: u16 = 1;
+const TWO_LINE_ROW_HEIGHT_COMFORTABLE: u16 = 1;
 const OVERVIEW_CARD_HEIGHT_COMPACT: u16 = 3;
 const OVERVIEW_CARD_HEIGHT_COMFORTABLE: u16 = 6;
 
@@ -71,6 +71,8 @@ pub enum HoverTarget {
     Navigation(Screen),
     ModelLibraryTab(ModelLibraryView),
     ModelSearchField,
+    ModelDownloadsView,
+    InspectionDetails,
     ModelSearchSubmit,
     ModelFormatFilter(Option<ArtifactFormat>),
     ModelDownloadAction(usize),
@@ -132,11 +134,15 @@ pub struct UiLayout {
     pub overview_backend_actions: Vec<(usize, Rect)>,
     pub model_installed_tab: Rect,
     pub model_discover_tab: Rect,
+    pub model_jobs_action: Rect,
     pub model_search_field: Rect,
     pub model_search_submit: Rect,
     pub model_format_row: Rect,
     pub model_format_filters: Vec<(Option<ArtifactFormat>, Rect)>,
     pub model_list: Rect,
+    pub inventory_header: Rect,
+    pub inspection_action: Rect,
+    pub inventory_detail: Rect,
     pub model_progress: Rect,
     pub model_downloads: Rect,
     pub model_rows: Vec<(usize, Rect)>,
@@ -157,6 +163,7 @@ pub struct UiLayout {
     pub runtime_search_input: Rect,
     pub runtime_search_incompatible_toggle: Rect,
     pub runtime_search_results: Rect,
+    pub runtime_search_header: Rect,
     pub runtime_search_rows: Vec<(usize, Rect)>,
     pub runtime_search_details: Rect,
     pub runtime_search_submit: Rect,
@@ -283,7 +290,15 @@ impl UiLayout {
             .constraints([
                 Constraint::Length(if compact { 4 } else { 5 }),
                 Constraint::Min(5),
-                Constraint::Length(3),
+                Constraint::Length(
+                    if area.height < 20
+                        && !matches!(app.screen, Screen::Settings | Screen::ModelProfiles)
+                    {
+                        1
+                    } else {
+                        3
+                    },
+                ),
                 Constraint::Length(if area.height == MIN_HEIGHT { 1 } else { 2 }),
             ])
             .split(shell_area);
@@ -293,6 +308,8 @@ impl UiLayout {
         });
         let screen_body = if matches!(app.screen, Screen::Settings | Screen::ModelProfiles) {
             content
+        } else if app.screen == Screen::Models {
+            model_content_layout(content, compact)[1]
         } else {
             content_layout(content, compact)[1]
         };
@@ -306,8 +323,14 @@ impl UiLayout {
             let overview = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(if compact { 3 } else { 4 }),
-                    Constraint::Length(if compact { 4 } else { 5 }),
+                    Constraint::Length(if content.height < 10 { 2 } else { 3 }),
+                    Constraint::Length(if content.height < 10 {
+                        1
+                    } else if compact {
+                        4
+                    } else {
+                        3
+                    }),
                     Constraint::Min(2),
                 ])
                 .split(content);
@@ -315,6 +338,8 @@ impl UiLayout {
             overview_resident = overview[2];
             let mut card_height = if compact {
                 OVERVIEW_CARD_HEIGHT_COMPACT
+            } else if content.height < 24 {
+                5
             } else {
                 OVERVIEW_CARD_HEIGHT_COMFORTABLE
             };
@@ -369,7 +394,7 @@ impl UiLayout {
         let mut installed_model_actions = Vec::new();
         let mut model_downloads = Rect::default();
         let (model_list, model_progress) = if app.screen == Screen::Models {
-            let model_header = content_layout(content, compact)[0];
+            let model_header = model_content_layout(content, compact)[0];
             model_installed_tab = Rect::new(model_header.x, model_header.y + 1, 13, 1);
             model_discover_tab = Rect::new(
                 model_installed_tab.right().saturating_add(2),
@@ -467,17 +492,23 @@ impl UiLayout {
                 model_row_height
             };
             let available_after_models = model_body.height.saturating_sub(preserved_rows);
-            let proportional_cap = model_body.height.saturating_mul(3) / 5;
+            let proportional_cap = model_body.height / 3;
             let mut download_height =
                 desired_download_height.min(available_after_models.min(proportional_cap.max(4)));
-            if download_count > 0 && model_body.height >= 4 && download_height < 4 {
+            if download_count > 0 && model_body.height >= 8 && download_height < 4 {
                 download_height = 4;
+            }
+            if model_body.height < 8 {
+                download_height = 0;
             }
             let (model_body, downloads) =
                 reserve_bottom(model_body, download_height > 0, download_height);
             model_downloads = downloads;
-            let (mut list, progress) =
-                reserve_bottom(model_body, app.selected_model_load_progress().is_some(), 3);
+            let (mut list, progress) = reserve_bottom(
+                model_body,
+                app.selected_model_load_progress().is_some() && model_body.height >= 9,
+                3,
+            );
             if app.model_library_view == ModelLibraryView::Installed {
                 if let Some(model) = app
                     .selected_model
@@ -523,6 +554,41 @@ impl UiLayout {
             (Rect::default(), Rect::default())
         };
 
+        let mut model_list = model_list;
+        let mut model_progress = model_progress;
+        if app.screen == Screen::Models && app.downloads_focused {
+            model_downloads = Rect::new(
+                content.x,
+                content.y + 1,
+                content.width,
+                content.height.saturating_sub(1),
+            );
+            model_list = Rect::default();
+            model_progress = Rect::default();
+            installed_model_actions.clear();
+            model_installed_tab = Rect::default();
+            model_discover_tab = Rect::default();
+            model_search_field = Rect::default();
+            model_search_submit = Rect::default();
+            model_format_filters.clear();
+        }
+        let mut inventory_header = Rect::default();
+        let mut inventory_detail = Rect::default();
+        if app.screen == Screen::Models && model_list.height > 1 {
+            inventory_header = Rect::new(model_list.x, model_list.y, model_list.width, 1);
+            model_list.y += 1;
+            model_list.height -= 1;
+            if model_list.height >= 7 {
+                let height = 3.min(model_list.height / 3);
+                inventory_detail = Rect::new(
+                    model_list.x,
+                    model_list.bottom() - height,
+                    model_list.width,
+                    height,
+                );
+                model_list.height -= height;
+            }
+        }
         let mut model_rows = Vec::new();
         let mut model_download_actions = Vec::new();
         let mut download_job_rows = Vec::new();
@@ -530,10 +596,11 @@ impl UiLayout {
         let model_count = if app.model_library_view == ModelLibraryView::Discover {
             app.model_search_artifacts().len()
         } else {
-            app.snapshot.models.len()
+            app.installed_model_indices().len()
         };
         if app.screen == Screen::Models
             && (app.model_library_view == ModelLibraryView::Discover
+                || !app.snapshot.models.is_empty()
                 || matches!(
                     app.snapshot.registry_state,
                     RegistryState::Ready | RegistryState::ReadyWithWarnings { .. }
@@ -546,7 +613,17 @@ impl UiLayout {
                     .unwrap_or_default()
                     .saturating_sub(capacity.saturating_sub(1))
             } else {
-                app.model_scroll
+                let indices = app.installed_model_indices();
+                let selected = app
+                    .selected_model
+                    .and_then(|i| indices.iter().position(|v| *v == i))
+                    .unwrap_or(app.model_scroll);
+                if selected < app.model_scroll {
+                    selected
+                } else {
+                    app.model_scroll
+                        .max(selected.saturating_sub(capacity.saturating_sub(1)))
+                }
             };
             let end = (start + capacity).min(model_count);
             for index in start..end {
@@ -556,17 +633,17 @@ impl UiLayout {
                     model_list.width,
                     model_row_height,
                 );
-                model_rows.push((index, row));
+                let model_index = if app.model_library_view == ModelLibraryView::Installed {
+                    app.installed_model_indices()[index]
+                } else {
+                    index
+                };
+                model_rows.push((model_index, row));
                 if app.model_library_view == ModelLibraryView::Discover {
                     let width = 12.min(row.width);
                     model_download_actions.push((
                         index,
-                        Rect::new(
-                            row.right().saturating_sub(width),
-                            row.y.saturating_add(2),
-                            width,
-                            u16::from(row.height > 2),
-                        ),
+                        Rect::new(row.right().saturating_sub(width), row.y, width, 1),
                     ));
                 }
             }
@@ -576,7 +653,19 @@ impl UiLayout {
             let glyphs = crate::theme::Glyphs::current(app.unicode);
             let stride = if compact { 3 } else { 4 };
             let mut y = model_downloads.y.saturating_add(1);
-            for index in app.model_download_display_indices() {
+            let indices = app.model_download_display_indices();
+            let capacity = (model_downloads.height.saturating_sub(1) / stride).max(1) as usize;
+            let selected = app
+                .selected_model_download_job
+                .as_ref()
+                .and_then(|id| {
+                    indices
+                        .iter()
+                        .position(|i| &app.model_download_jobs[*i].id == id)
+                })
+                .unwrap_or(0);
+            let start = selected.saturating_sub(capacity.saturating_sub(1));
+            for index in indices.into_iter().skip(start) {
                 if y.saturating_add(3) > model_downloads.bottom() {
                     break;
                 }
@@ -628,7 +717,11 @@ impl UiLayout {
         }
 
         let (server_details, server_progress) = if app.screen == Screen::Server {
-            reserve_bottom(screen_body, app.load_progress().is_some(), 3)
+            reserve_bottom(
+                screen_body,
+                app.load_progress().is_some() && screen_body.height >= 9,
+                3,
+            )
         } else {
             (Rect::default(), Rect::default())
         };
@@ -641,13 +734,13 @@ impl UiLayout {
         let mut selected_runtime_actions = Vec::new();
         let mut runtime_rows = Vec::new();
         if app.screen == Screen::Runtimes {
-            let summary_height = screen_body.height.min(if compact { 3 } else { 5 });
+            let summary_height = if screen_body.height >= 12 { 3 } else { 0 };
             let compact_runtime_actions = compact || screen_body.width < 83;
             let has_selection = app
                 .selected_runtime
                 .and_then(|index| app.runtime_list.as_ref()?.installed.get(index));
             let requested_action_height = if has_selection.is_some() {
-                if compact { 4 } else { 3 }
+                if screen_body.height < 7 { 2 } else { 3 }
             } else {
                 1
             };
@@ -698,9 +791,15 @@ impl UiLayout {
                 if let Some(status) = has_selection {
                     let selected_area = Rect::new(
                         runtime_actions.x,
-                        runtime_actions.y.saturating_add(2),
+                        runtime_actions
+                            .y
+                            .saturating_add(if action_height > 2 { 2 } else { 1 }),
                         runtime_actions.width,
-                        runtime_actions.height.saturating_sub(2),
+                        runtime_actions.height.saturating_sub(if action_height > 2 {
+                            2
+                        } else {
+                            1
+                        }),
                     );
                     let mut actions = status
                         .runtime
@@ -735,18 +834,38 @@ impl UiLayout {
                     selected_runtime_actions = flow_actions(selected_area, &actions, compact);
                 }
             }
+            if runtime_list.height > 1 {
+                inventory_header = Rect::new(runtime_list.x, runtime_list.y, runtime_list.width, 1);
+                runtime_list.y += 1;
+                runtime_list.height -= 1;
+                if runtime_list.height >= 7 {
+                    inventory_detail = Rect::new(
+                        runtime_list.x,
+                        runtime_list.bottom() - 3,
+                        runtime_list.width,
+                        3,
+                    );
+                    runtime_list.height -= 3;
+                }
+            }
             if let Some(snapshot) = &app.runtime_list {
-                let capacity = (runtime_list.height / two_line_row_height) as usize;
-                let end = (app.runtime_scroll + capacity).min(snapshot.installed.len());
-                for index in app.runtime_scroll..end {
+                let capacity = runtime_list.height as usize;
+                let selected = app.selected_runtime.unwrap_or(app.runtime_scroll);
+                let start = if selected < app.runtime_scroll {
+                    selected
+                } else {
+                    app.runtime_scroll
+                        .max(selected.saturating_sub(capacity.saturating_sub(1)))
+                };
+                let end = (start + capacity).min(snapshot.installed.len());
+                for index in start..end {
                     runtime_rows.push((
                         index,
                         Rect::new(
                             runtime_list.x,
-                            runtime_list.y
-                                + ((index - app.runtime_scroll) as u16 * two_line_row_height),
+                            runtime_list.y + (index - start) as u16,
                             runtime_list.width,
-                            two_line_row_height,
+                            1,
                         ),
                     ));
                 }
@@ -757,6 +876,7 @@ impl UiLayout {
         let mut runtime_search_input = Rect::default();
         let mut runtime_search_incompatible_toggle = Rect::default();
         let mut runtime_search_results = Rect::default();
+        let mut runtime_search_header = Rect::default();
         let mut runtime_search_details = Rect::default();
         let mut runtime_search_submit = Rect::default();
         let mut runtime_install_action = Rect::default();
@@ -771,10 +891,14 @@ impl UiLayout {
         ) {
             let horizontal_margin = if compact { 1 } else { (area.width / 10).max(4) };
             let vertical_margin = if compact { 1 } else { 3 };
-            let popup = area.inner(Margin {
+            let mut popup = area.inner(Margin {
                 horizontal: horizontal_margin,
                 vertical: vertical_margin,
             });
+            if !compact && popup.height > 26 {
+                popup.y += (popup.height - 26) / 2;
+                popup.height = 26;
+            }
             runtime_search_popup = Some(popup);
             let inner = popup.inner(Margin {
                 horizontal: if compact { 2 } else { 3 },
@@ -814,7 +938,7 @@ impl UiLayout {
                     .height
                     .saturating_sub(body_top.saturating_add(body_bottom)),
             );
-            if !compact && body.width >= 68 {
+            if !compact && body.width >= 110 {
                 let result_width = body.width.saturating_mul(3) / 5;
                 runtime_search_results = Rect::new(body.x, body.y, result_width, body.height);
                 runtime_search_details = Rect::new(
@@ -824,7 +948,13 @@ impl UiLayout {
                     body.height,
                 );
             } else {
-                let result_height = body.height.saturating_mul(3) / 5;
+                let count = if runtime_picker_active {
+                    app.runtime_picker_indices().len()
+                } else {
+                    app.runtime_search_indices().len()
+                };
+                let result_height = (body.height.saturating_mul(3) / 5)
+                    .min(count.max(1).saturating_add(1).min(u16::MAX as usize) as u16);
                 runtime_search_results = Rect::new(body.x, body.y, body.width, result_height);
                 runtime_search_details = Rect::new(
                     body.x,
@@ -883,6 +1013,16 @@ impl UiLayout {
                     runtime_install_action.height,
                 )
             };
+            if runtime_search_results.height > 1 {
+                runtime_search_header = Rect::new(
+                    runtime_search_results.x,
+                    runtime_search_results.y,
+                    runtime_search_results.width,
+                    1,
+                );
+                runtime_search_results.y += 1;
+                runtime_search_results.height -= 1;
+            }
             let (indices, scroll) = if runtime_picker_active {
                 (app.runtime_picker_indices(), app.runtime_picker_scroll)
             } else {
@@ -1384,7 +1524,7 @@ impl UiLayout {
             too_small: false,
             compact,
             model_row_height,
-            runtime_row_height: two_line_row_height,
+            runtime_row_height: 1,
             overlay_row_height: two_line_row_height,
             nav_items,
             content,
@@ -1394,11 +1534,46 @@ impl UiLayout {
             overview_backend_actions,
             model_installed_tab,
             model_discover_tab,
+            model_jobs_action: if app.screen == Screen::Models {
+                if app.downloads_focused {
+                    Rect::new(content.x, content.y, 12, 1)
+                } else {
+                    let x = model_discover_tab.right().saturating_add(1);
+                    Rect::new(
+                        x,
+                        model_discover_tab.y,
+                        content.right().saturating_sub(x).min(10),
+                        1,
+                    )
+                }
+            } else {
+                Rect::default()
+            },
             model_search_field,
             model_search_submit,
             model_format_row,
             model_format_filters,
             model_list,
+            inventory_header,
+            inspection_action: if matches!(
+                app.screen,
+                Screen::Models
+                    | Screen::Runtimes
+                    | Screen::Overview
+                    | Screen::Server
+                    | Screen::Logs
+                    | Screen::Help
+            ) {
+                Rect::new(
+                    content.right().saturating_sub(13),
+                    content.y,
+                    13.min(content.width),
+                    1,
+                )
+            } else {
+                Rect::default()
+            },
+            inventory_detail,
             model_progress,
             model_downloads,
             model_rows,
@@ -1419,6 +1594,7 @@ impl UiLayout {
             runtime_search_input,
             runtime_search_incompatible_toggle,
             runtime_search_results,
+            runtime_search_header,
             runtime_search_rows,
             runtime_search_details,
             runtime_search_submit,
@@ -1542,6 +1718,12 @@ impl UiLayout {
             .find(|(_, area)| contains(*area, position))
         {
             return Some(HoverTarget::Navigation(*screen));
+        }
+        if contains(self.model_jobs_action, position) {
+            return Some(HoverTarget::ModelDownloadsView);
+        }
+        if contains(self.inspection_action, position) {
+            return Some(HoverTarget::InspectionDetails);
         }
         if contains(self.model_installed_tab, position) {
             return Some(HoverTarget::ModelLibraryTab(ModelLibraryView::Installed));
@@ -1760,49 +1942,10 @@ impl UiLayout {
                     );
                 }
                 if let Some(search) = &app.runtime_search {
-                    for (index, row) in &self.runtime_search_rows {
-                        if app.selected_runtime_search_result != Some(*index)
-                            && app.hover != Some(HoverTarget::RuntimeSearchResult(*index))
-                        {
-                            continue;
-                        }
-                        let Some(result) = search.results.get(*index) else {
-                            continue;
-                        };
-                        let available = &result.entry.available;
-                        let compatibility =
-                            super::screens::compatibility_text(&result.entry.compatibility);
-                        let marker = if result.installed {
-                            glyphs.running
-                        } else {
-                            glyphs.empty
-                        };
-                        track(
-                            &format!("runtime-search-name:{index}"),
-                            &available.display_name,
-                            super::runtime_search::result_name_width(
-                                row.width,
-                                marker,
-                                compatibility,
-                            ),
-                        );
-                        let metadata = super::runtime_search::result_metadata_text(available);
-                        let installed = if result.installed { "  installed" } else { "" };
-                        track(
-                            &format!("runtime-search-metadata:{index}"),
-                            &metadata,
-                            super::runtime_search::result_metadata_width(row.width, installed),
-                        );
-                    }
                     if let Some(index) = app.selected_runtime_search_result
                         && let Some(result) = search.results.get(index)
                     {
                         let available = &result.entry.available;
-                        track(
-                            &format!("runtime-search-detail-name:{index}"),
-                            &available.display_name,
-                            self.runtime_search_details.width as usize,
-                        );
                         let source = available
                             .identity
                             .package
@@ -1831,46 +1974,6 @@ impl UiLayout {
                         ),
                     );
                 }
-                if let Some(snapshot) = &app.runtime_list {
-                    for (index, row) in &self.runtime_search_rows {
-                        if app.runtime_picker_selection != Some(*index)
-                            && app.hover != Some(HoverTarget::RuntimePickerResult(*index))
-                        {
-                            continue;
-                        }
-                        let Some(status) = snapshot.installed.get(*index) else {
-                            continue;
-                        };
-                        let identity = &status.runtime.manifest.identity;
-                        let compatibility = app
-                            .runtime_picker_compatibility(&status.runtime.manifest.runtime_id)
-                            .unwrap_or(&status.compatibility);
-                        let compatibility = super::screens::compatibility_text(compatibility);
-                        let identity_text = format!("{}  {}", identity.engine_id, identity.version);
-                        track(
-                            &format!("model-runtime-identity:{index}"),
-                            &identity_text,
-                            super::model_runtime::picker_identity_width(row.width, compatibility),
-                        );
-                        let is_override = app.selected_model.is_some_and(|model_index| {
-                            app.snapshot.models.get(model_index).is_some_and(|model| {
-                                snapshot.selections.model_overrides.get(&model.id)
-                                    == Some(&status.runtime.manifest.runtime_id)
-                            })
-                        });
-                        let override_status = if is_override {
-                            "  current override"
-                        } else {
-                            ""
-                        };
-                        let metadata = format!("{} / {}", identity.accelerator, identity.variant);
-                        track(
-                            &format!("model-runtime-metadata:{index}"),
-                            &metadata,
-                            super::model_runtime::picker_metadata_width(row.width, override_status),
-                        );
-                    }
-                }
             }
             Some(Overlay::ProfileEngine) => {
                 if let Some(selection) = &app.profile_engine_selection
@@ -1887,57 +1990,7 @@ impl UiLayout {
             }
             Some(Overlay::Help) => {}
             None => match app.screen {
-                Screen::Overview => {
-                    let backends = app.resident_backends();
-                    for (index, row) in &self.overview_backend_rows {
-                        let Some(backend) = backends.get(*index) else {
-                            continue;
-                        };
-                        let profile = app
-                            .model_profiles
-                            .as_ref()
-                            .and_then(|profiles| profiles.profiles.get(&backend.model_profile_id));
-                        let model = app
-                            .snapshot
-                            .models
-                            .iter()
-                            .find(|model| model.id == backend.model_id);
-                        let profile_name = profile.map_or_else(
-                            || {
-                                backend.provenance.as_ref().map_or_else(
-                                    || backend.model_profile_id.to_string(),
-                                    |provenance| provenance.model_profile.display_name.clone(),
-                                )
-                            },
-                            |profile| profile.display_name.clone(),
-                        );
-                        let model_name = model.map_or_else(
-                            || backend.model_id.to_string(),
-                            |model| model.display_name.clone(),
-                        );
-                        let mut identity = if profile_name == backend.model_profile_id.as_str() {
-                            format!("{profile_name} / {model_name}")
-                        } else {
-                            format!(
-                                "{profile_name} [{}] / {model_name}",
-                                backend.model_profile_id
-                            )
-                        };
-                        if self.compact {
-                            identity.push_str("  /  ");
-                            identity.push_str(&super::screens::backend_runtime_label(backend));
-                        }
-                        let width = row.width.saturating_sub(3) as usize;
-                        track(&format!("overview-identity:{index}"), &identity, width);
-                        if !self.compact {
-                            track(
-                                &format!("overview-runtime:{index}"),
-                                &super::screens::backend_runtime_label(backend),
-                                width,
-                            );
-                        }
-                    }
-                }
+                Screen::Overview => {}
                 Screen::Models => {
                     for (index, row) in &self.download_job_rows {
                         let Some(job) = app.model_download_jobs.get(*index) else {
@@ -1975,101 +2028,8 @@ impl UiLayout {
                             identity_width,
                         );
                     }
-                    for (index, row) in &self.model_rows {
-                        if app.selected_model != Some(*index)
-                            && app.hover != Some(HoverTarget::Model(*index))
-                        {
-                            continue;
-                        }
-                        if app.model_library_view == ModelLibraryView::Discover {
-                            if let Some((_, artifact)) = app.model_search_artifact(*index) {
-                                let format =
-                                    super::screens::available_format_span(artifact.format.as_str());
-                                track(
-                                    &format!("model-discover:{index}"),
-                                    &artifact.filename,
-                                    super::components::remaining_width(row.width, &[&format]),
-                                );
-                            }
-                        } else if let Some(model) = app.snapshot.models.get(*index) {
-                            let marker = if app.control.as_ref().is_some_and(|control| {
-                                control.backends.iter().any(|backend| {
-                                    matches!(
-                                        backend.lifecycle,
-                                        norted_engine::BackendLifecycle::Loading
-                                            | norted_engine::BackendLifecycle::Running
-                                    ) && backend.model_id == model.id
-                                })
-                            }) {
-                                format!("{}  ", glyphs.running)
-                            } else {
-                                "   ".to_owned()
-                            };
-                            let format = format!("  {}", model.format.as_str());
-                            track(
-                                &format!("model-name:{index}"),
-                                &model.display_name,
-                                super::screens::installed_model_name_width(
-                                    row.width, &marker, &format,
-                                ),
-                            );
-                            let size = format_bytes(model.size_bytes);
-                            track(
-                                &format!("model-path:{index}"),
-                                &model.path.display().to_string(),
-                                super::components::remaining_width(row.width, &[&size, "  "]),
-                            );
-                        }
-                    }
                 }
-                Screen::Runtimes => {
-                    if let Some(snapshot) = &app.runtime_list {
-                        if self.runtime_actions.height > 1
-                            && let Some(status) = app
-                                .selected_runtime
-                                .and_then(|index| snapshot.installed.get(index))
-                        {
-                            track(
-                                "runtime-policy",
-                                &super::screens::runtime_policy_detail(app, status),
-                                self.runtime_actions.width as usize,
-                            );
-                        }
-                        for (index, row) in &self.runtime_rows {
-                            if app.selected_runtime != Some(*index)
-                                && app.hover != Some(HoverTarget::Runtime(*index))
-                            {
-                                continue;
-                            }
-                            let Some(status) = snapshot.installed.get(*index) else {
-                                continue;
-                            };
-                            let identity = &status.runtime.manifest.identity;
-                            let marker = format!("{}  ", glyphs.running);
-                            let compatibility =
-                                super::screens::compatibility_text(&status.compatibility);
-                            let identity_text =
-                                format!("{}  {}", identity.engine_id, identity.version);
-                            track(
-                                &format!("runtime-identity:{index}"),
-                                &identity_text,
-                                super::screens::runtime_identity_width(
-                                    row.width,
-                                    &marker,
-                                    compatibility,
-                                ),
-                            );
-                            let (metadata, selected, update) =
-                                super::screens::runtime_secondary_text(app, status, row.width);
-                            let state = format!("{selected}{update}");
-                            track(
-                                &format!("runtime-metadata:{index}"),
-                                &metadata,
-                                super::screens::runtime_metadata_width(row.width, &state),
-                            );
-                        }
-                    }
-                }
+                Screen::Runtimes => {}
                 Screen::Settings | Screen::ModelProfiles => {
                     let definitions = app.settings_definitions();
                     for (index, row) in &self.settings_rows {
@@ -2117,131 +2077,7 @@ impl UiLayout {
                         );
                     }
                 }
-                Screen::Server => {
-                    let width = super::components::key_value_width(self.server_details.width);
-                    let pending = app.control_observation_pending();
-                    let fallback = |value: String| {
-                        if value.is_empty() {
-                            if pending {
-                                "Unknown".to_owned()
-                            } else {
-                                "None".to_owned()
-                            }
-                        } else {
-                            value
-                        }
-                    };
-                    let endpoint = app
-                        .control
-                        .as_ref()
-                        .and_then(|control| control.public_endpoint.clone())
-                        .or_else(|| app.snapshot.server.endpoint().map(ToOwned::to_owned))
-                        .unwrap_or_else(|| {
-                            if pending { "Observing" } else { "Not serving" }.to_owned()
-                        });
-                    track("server-endpoint", &endpoint, width);
-                    if let Some(control) = &app.control {
-                        let profiles = fallback(
-                            control
-                                .backends
-                                .iter()
-                                .map(|backend| {
-                                    format!(
-                                        "{} [{:?}/{:?}/{:?}; req {}; leases {}]",
-                                        backend.model_profile_id,
-                                        backend.role,
-                                        backend.residency,
-                                        backend.lifecycle,
-                                        backend.active_request_count,
-                                        backend.primary_lease_count,
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        );
-                        let models = fallback(
-                            control
-                                .backends
-                                .iter()
-                                .map(|backend| backend.model_id.to_string())
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        );
-                        let engines = fallback(
-                            control
-                                .backends
-                                .iter()
-                                .filter_map(|backend| backend.engine_id.clone())
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        );
-                        let runtimes = fallback(
-                            control
-                                .backends
-                                .iter()
-                                .filter_map(|backend| {
-                                    backend.runtime_id.as_ref().map(ToString::to_string)
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        );
-                        let accelerators = fallback(
-                            control
-                                .backends
-                                .iter()
-                                .filter_map(|backend| {
-                                    backend.accelerator_binding.as_ref().map(|binding| {
-                                        let devices = binding
-                                            .devices
-                                            .iter()
-                                            .enumerate()
-                                            .map(|(index, device)| {
-                                                format!(
-                                                    "[{index}] {}",
-                                                    device
-                                                        .stable_id
-                                                        .as_deref()
-                                                        .unwrap_or("unknown-id")
-                                                )
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join(", ");
-                                        format!("{}: {devices}", backend.model_profile_id)
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        );
-                        track("server-profiles", &profiles, width);
-                        track("server-models", &models, width);
-                        track("server-engines", &engines, width);
-                        track("server-runtimes", &runtimes, width);
-                        track("server-accelerators", &accelerators, width);
-                        if self.server_details.height >= 20 {
-                            let private = fallback(
-                                control
-                                    .backends
-                                    .iter()
-                                    .filter_map(|backend| backend.private_endpoint.clone())
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                            );
-                            track("server-bind", &app.public_auth_status.bind, width);
-                            track("server-private", &private, width);
-                        }
-                    } else {
-                        let fallback = if pending { "Unknown" } else { "None" };
-                        track("server-profiles", fallback, width);
-                        track("server-models", fallback, width);
-                        track("server-engines", fallback, width);
-                        track("server-runtimes", fallback, width);
-                        track("server-accelerators", fallback, width);
-                        if self.server_details.height >= 20 {
-                            track("server-bind", &app.public_auth_status.bind, width);
-                            track("server-private", fallback, width);
-                        }
-                    }
-                }
+                Screen::Server => {}
                 Screen::Logs | Screen::Help => {}
             },
         }

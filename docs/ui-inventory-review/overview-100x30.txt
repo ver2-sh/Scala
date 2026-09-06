@@ -1,0 +1,30 @@
+   ◆  NORTED SERVER  local runtime control                                         ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+
+     Overview                                                                     [ D Details ]
+     Your local model runtime, from artifacts to API
+
+     │                      │                      │                      │
+     │  SERVER              │  MODELS              │  RUNTIMES            │  ACTIVE MODEL
+     │  Running             │  9                   │  3                   │  3 resident
+     Loaded Models  3                                                                   1-2 / 3
+     │ RUNNING | Idle | 0 requests
+     │ Profile: research-profile-0 | Primary / Jit
+     │ Runtime: llama.cpp / b8999 / avx2
+     │ Size 3.7 GiB                                                                 [ Unload ]
+     │
+     │ GEN 42 tok
+     │ Profile: research-profile-1 | Primary / Jit
+     │ Runtime: llama.cpp / b8999 / avx2
+     │ Size 3.7 GiB                                                                 [ Unload ]
+     │ review-request  GEN 42 tok
+
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+    ›  Press / to run a command
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+   Tab change focus   / commands   ? help   mouse click / hover   Ctrl+C exit
+

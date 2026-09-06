@@ -1,0 +1,30 @@
+   ◆  NORTED SERVER  local runtime control                                         ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+
+     Runtimes                                                                     [ D Details ]
+     Installed packs, persisted format defaults, and upstream runtimes
+
+
+     gguf     default  llama.cpp b9000 cpu / avx2
+     q27      default  none
+     ninfer   default  none
+     Engine                 Version    Variant        Compatibility   State        Update
+     > llama.cpp            b9000      cpu / avx2     compatible      Default      Unchecked
+       llama.cpp            b8999      cpu / avx2     needs attention In us… Model Unchecked
+       llama.cpp            b8998      cpu / avx2     incompatible    Installed    Unchecked
+
+     Selected item  |  D: full details
+     Engine: llama.cpp
+     Version: b9000
+     [ Search Available ]  [ Check Updates ]
+     Selected: llama.cpp b9000 | D: identity / update policy
+     [ GGUF Default ]  [ Update ]    [ Remove ]
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+    ›  Press / to run a command
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+   ↑↓ select   s search   U update selected   d d remove   r refresh   g GGUF default   ? help
+

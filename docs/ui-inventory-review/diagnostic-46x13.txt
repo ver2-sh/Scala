@@ -1,0 +1,13 @@
+ [ Esc / D: Back ]  Details  |  Up/Down: scro
+
+ Phase: Failed
+ Transferred: 95.4 MiB
+ Total: Unknown
+ Progress: Unknown
+ Rate: Unknown
+ ETA: Unknown
+ Message: Diagnostic with a long filesystem
+ path: /isolated/review/models/companion.bin
+ Remote response: connection closed before
+ the complete file arrived
+

@@ -365,6 +365,9 @@ pub struct App {
     pub overview_scroll: usize,
     pub selected_model: Option<usize>,
     pub model_scroll: usize,
+    pub model_filter: String,
+    pub downloads_focused: bool,
+    pub model_filter_editing: bool,
     pub model_library_view: ModelLibraryView,
     pub model_search_query: String,
     pub model_search_cursor: usize,
@@ -377,6 +380,8 @@ pub struct App {
     pub selected_model_download_job: Option<ModelDownloadJobId>,
     pub selected_model_profile: Option<usize>,
     pub log_scroll: usize,
+    pub detail_text: Option<String>,
+    pub detail_scroll: u16,
     pub runtime_list: Option<RuntimeListSnapshot>,
     pub runtime_list_error: Option<String>,
     pub runtime_list_loading: bool,
@@ -493,6 +498,9 @@ impl App {
             overview_scroll: 0,
             selected_model: None,
             model_scroll: 0,
+            model_filter: String::new(),
+            downloads_focused: false,
+            model_filter_editing: false,
             model_library_view: ModelLibraryView::Installed,
             model_search_query: String::new(),
             model_search_cursor: 0,
@@ -505,6 +513,8 @@ impl App {
             selected_model_download_job: None,
             selected_model_profile: None,
             log_scroll: 0,
+            detail_text: None,
+            detail_scroll: 0,
             runtime_list: None,
             runtime_list_error: None,
             runtime_list_loading: true,
@@ -586,8 +596,46 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Update::Quit;
         }
+        if self.detail_text.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('D') => {
+                    self.detail_text = None;
+                    self.detail_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1)
+                }
+                KeyCode::PageUp => {
+                    self.detail_scroll = self
+                        .detail_scroll
+                        .saturating_sub(layout.content.height.max(1))
+                }
+                KeyCode::PageDown => {
+                    self.detail_scroll = self
+                        .detail_scroll
+                        .saturating_add(layout.content.height.max(1))
+                }
+                KeyCode::Home => self.detail_scroll = 0,
+                KeyCode::End => self.detail_scroll = u16::MAX,
+                _ => return Update::None,
+            }
+            return Update::Render;
+        }
         if self.settings_input.is_some() {
             return self.handle_settings_input_key(key);
+        }
+        if key.code == KeyCode::Char('D')
+            && (self.overlay == Some(Overlay::Help)
+                || self.overlay == Some(Overlay::ModelRuntime)
+                || (self.overlay == Some(Overlay::RuntimeSearch)
+                    && self.runtime_search_focus == RuntimeSearchFocus::Results))
+        {
+            self.detail_text = crate::ui::screens::inspection_text(self);
+            self.detail_scroll = 0;
+            return Update::Render;
         }
         if let Some(overlay) = self.overlay {
             return match overlay {
@@ -614,6 +662,100 @@ impl App {
             && !matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
         {
             return self.handle_model_discover_key(key);
+        }
+        if self.screen == Screen::Models
+            && self.model_library_view == ModelLibraryView::Installed
+            && !self.downloads_focused
+            && self.focus == FocusArea::Content
+        {
+            if self.model_filter_editing {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => self.model_filter_editing = false,
+                    KeyCode::Backspace => {
+                        self.model_filter.pop();
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.model_filter.clear()
+                    }
+                    KeyCode::Char(c)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        self.model_filter.push(c)
+                    }
+                    _ => return Update::None,
+                }
+                let indices = self.installed_model_indices();
+                if !self.selected_model.is_some_and(|i| indices.contains(&i)) {
+                    self.selected_model = indices.first().copied();
+                }
+                self.model_scroll = 0;
+                return Update::Render;
+            }
+            if key.code == KeyCode::Char('f') {
+                self.pending_model_remove_confirmation = None;
+                self.model_filter_editing = true;
+                return Update::Render;
+            }
+            if key.code == KeyCode::Esc && !self.model_filter.is_empty() {
+                self.model_filter.clear();
+                self.model_scroll = 0;
+                return Update::Render;
+            }
+        }
+        if self.screen == Screen::Models && self.focus == FocusArea::Content {
+            if key.code == KeyCode::Char('J')
+                || (self.downloads_focused && key.code == KeyCode::Esc)
+            {
+                self.downloads_focused = !self.downloads_focused;
+                return Update::Render;
+            }
+            if self.downloads_focused {
+                return match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.move_model_download_selection(-1, layout)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.move_model_download_selection(1, layout)
+                    }
+                    KeyCode::Char('q') => Update::Quit,
+                    KeyCode::Tab => {
+                        self.cycle_focus(1);
+                        Update::Render
+                    }
+                    KeyCode::BackTab => {
+                        self.cycle_focus(-1);
+                        Update::Render
+                    }
+                    KeyCode::Char('p') => self.toggle_selected_model_download(),
+                    KeyCode::Char('x') => {
+                        self.request_selected_model_download_action(DownloadJobAction::Cancel)
+                    }
+                    KeyCode::Char('D') => {
+                        self.detail_text = crate::ui::screens::inspection_text(self);
+                        self.detail_scroll = 0;
+                        Update::Render
+                    }
+                    _ => Update::None,
+                };
+            }
+        }
+        if key.code == KeyCode::Char('D')
+            && self.focus == FocusArea::Content
+            && matches!(
+                self.screen,
+                Screen::Models
+                    | Screen::Runtimes
+                    | Screen::Overview
+                    | Screen::Server
+                    | Screen::Logs
+                    | Screen::Help
+            )
+        {
+            self.detail_text = crate::ui::screens::inspection_text(self);
+            self.detail_scroll = 0;
+            return Update::Render;
         }
         if key.code != KeyCode::Char('d') {
             self.pending_runtime_remove_confirmation = None;
@@ -671,6 +813,28 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent, layout: &UiLayout) -> Update {
+        if self.detail_text.is_some() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(3)
+                }
+                MouseEventKind::ScrollDown => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(3)
+                }
+                MouseEventKind::Down(MouseButton::Left) if mouse.row == layout.content.y => {
+                    self.detail_text = None
+                }
+                _ => return Update::None,
+            }
+            return Update::Render;
+        }
+        if self.overlay.is_none() && self.screen == Screen::Models && self.downloads_focused {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => return self.move_model_download_selection(-1, layout),
+                MouseEventKind::ScrollDown => return self.move_model_download_selection(1, layout),
+                _ => {}
+            }
+        }
         if let Some(overlay) = self.overlay {
             let position = Position::new(mouse.column, mouse.row);
             return match mouse.kind {
@@ -810,6 +974,22 @@ impl App {
 
     pub fn handle_paste(&mut self, text: &str) -> Update {
         let normalized = text.replace(['\r', '\n', '\t'], " ");
+        if self.detail_text.is_some() {
+            return Update::None;
+        }
+        if self.model_filter_editing
+            && self.screen == Screen::Models
+            && self.overlay.is_none()
+            && !self.command_active
+        {
+            self.model_filter.push_str(&normalized);
+            let indices = self.installed_model_indices();
+            if !self.selected_model.is_some_and(|i| indices.contains(&i)) {
+                self.selected_model = indices.first().copied();
+            }
+            self.model_scroll = 0;
+            return Update::Render;
+        }
         if let Some(input) = &mut self.settings_input {
             if self.settings_busy {
                 return Update::None;
@@ -893,6 +1073,12 @@ impl App {
     }
 
     pub fn replace_snapshot(&mut self, snapshot: AppSnapshot) {
+        let selected_id = self
+            .selected_model
+            .and_then(|i| self.snapshot.models.get(i))
+            .map(|m| m.id.clone());
+        self.selected_model =
+            selected_id.and_then(|id| snapshot.models.iter().position(|m| m.id == id));
         self.snapshot = snapshot;
         self.reconcile_models();
     }
@@ -1024,9 +1210,18 @@ impl App {
                 self.model_search_loading = false;
                 match result {
                     Ok(search) => {
+                        let selected_ref = self
+                            .model_search_artifacts()
+                            .get(self.selected_model_search_result.unwrap_or(usize::MAX))
+                            .map(|(_, artifact)| artifact.model_ref.clone());
                         self.model_search = Some(search);
-                        self.selected_model_search_result =
-                            (!self.model_search_artifacts().is_empty()).then_some(0);
+                        self.selected_model_search_result = selected_ref
+                            .and_then(|reference| {
+                                self.model_search_artifacts()
+                                    .iter()
+                                    .position(|(_, artifact)| artifact.model_ref == reference)
+                            })
+                            .or_else(|| (!self.model_search_artifacts().is_empty()).then_some(0));
                     }
                     Err(error) => {
                         self.notice = Some(error.clone());
@@ -1101,11 +1296,10 @@ impl App {
             }
         }
         self.model_download_jobs = jobs;
-        let selected_is_present = self.selected_model_download_job.as_ref().is_some_and(|id| {
-            self.model_download_jobs
-                .iter()
-                .any(|job| &job.id == id && download_job_is_controllable(job))
-        });
+        let selected_is_present = self
+            .selected_model_download_job
+            .as_ref()
+            .is_some_and(|id| self.model_download_jobs.iter().any(|job| &job.id == id));
         if !selected_is_present {
             self.selected_model_download_job = self
                 .model_download_jobs
@@ -1151,26 +1345,13 @@ impl App {
                 repository
                     .artifacts
                     .iter()
+                    .filter(|artifact| {
+                        self.model_search_format
+                            .is_none_or(|format| artifact.format == format)
+                    })
                     .map(move |artifact| (repository, artifact))
             })
             .collect()
-    }
-
-    pub fn model_search_artifact(
-        &self,
-        index: usize,
-    ) -> Option<(&CatalogRepository, &CatalogFile)> {
-        self.model_search
-            .as_ref()?
-            .repositories
-            .iter()
-            .flat_map(|repository| {
-                repository
-                    .artifacts
-                    .iter()
-                    .map(move |artifact| (repository, artifact))
-            })
-            .nth(index)
     }
 
     pub fn model_removal_busy(&self) -> bool {
@@ -1824,10 +2005,21 @@ impl App {
                 self.runtime_search_loading = false;
                 match result {
                     Ok(snapshot) => {
+                        let selected_id = self
+                            .selected_runtime_search_result
+                            .and_then(|i| self.runtime_search.as_ref()?.results.get(i))
+                            .map(|r| r.entry.available.runtime_id.clone());
+                        let selected = selected_id.and_then(|id| {
+                            snapshot
+                                .results
+                                .iter()
+                                .position(|r| r.entry.available.runtime_id == id)
+                        });
                         self.runtime_search = Some(snapshot);
                         self.runtime_search_error = None;
-                        self.selected_runtime_search_result =
-                            self.runtime_search_indices().first().copied();
+                        self.selected_runtime_search_result = selected
+                            .filter(|i| self.runtime_search_indices().contains(i))
+                            .or_else(|| self.runtime_search_indices().first().copied());
                         self.runtime_search_scroll = 0;
                         self.runtime_search_focus = RuntimeSearchFocus::Results;
                     }
@@ -2623,10 +2815,16 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.move_model_selection(1, layout),
                 KeyCode::PageUp => self.scroll_models(-(layout.model_capacity() as isize), layout),
                 KeyCode::PageDown => self.scroll_models(layout.model_capacity() as isize, layout),
-                KeyCode::Home => self.select_model(0, layout),
-                KeyCode::End if !self.snapshot.models.is_empty() => {
-                    self.select_model(self.snapshot.models.len() - 1, layout)
-                }
+                KeyCode::Home => self
+                    .installed_model_indices()
+                    .first()
+                    .copied()
+                    .map_or(Update::None, |i| self.select_model(i, layout)),
+                KeyCode::End if !self.snapshot.models.is_empty() => self
+                    .installed_model_indices()
+                    .last()
+                    .copied()
+                    .map_or(Update::None, |i| self.select_model(i, layout)),
                 KeyCode::Enter | KeyCode::Char('c') => self.create_profile_for_selected_model(),
                 KeyCode::Char('u') => self.request_unload(),
                 KeyCode::Char('v') => self.open_model_runtime_picker(),
@@ -2800,12 +2998,10 @@ impl App {
             return Update::Render;
         }
         self.model_search_format = format;
-        if self.model_search.is_some() {
-            self.model_search_editing = false;
-            self.request_model_search()
-        } else {
-            Update::Render
-        }
+        self.model_search_editing = false;
+        self.selected_model_search_result =
+            (!self.model_search_artifacts().is_empty()).then_some(0);
+        Update::Render
     }
 
     fn move_model_search_selection(&mut self, direction: isize) -> Update {
@@ -2834,13 +3030,11 @@ impl App {
         Update::Render
     }
 
-    fn move_model_download_selection(&mut self, direction: isize, layout: &UiLayout) -> Update {
-        let jobs = layout
-            .download_job_rows
-            .iter()
-            .filter_map(|(index, _)| self.model_download_jobs.get(*index))
-            .filter(|job| download_job_is_controllable(job))
-            .map(|job| job.id.clone())
+    fn move_model_download_selection(&mut self, direction: isize, _layout: &UiLayout) -> Update {
+        let jobs = self
+            .model_download_display_indices()
+            .into_iter()
+            .map(|i| self.model_download_jobs[i].id.clone())
             .collect::<Vec<_>>();
         if jobs.is_empty() {
             return Update::None;
@@ -3902,6 +4096,19 @@ impl App {
             self.pending_profile_delete_confirmation = None;
         }
         match target {
+            Some(HoverTarget::ModelDownloadsView) => {
+                self.downloads_focused = !self.downloads_focused;
+                self.model_search_editing = false;
+                self.model_filter_editing = false;
+                self.focus = FocusArea::Content;
+                Update::Render
+            }
+            Some(HoverTarget::InspectionDetails) => {
+                self.detail_text = crate::ui::screens::inspection_text(self);
+                self.detail_scroll = 0;
+                Update::Render
+            }
+
             Some(HoverTarget::Navigation(screen)) => {
                 if self.command_active {
                     self.close_command();
@@ -5061,20 +5268,7 @@ impl App {
     }
 
     fn scroll_runtimes(&mut self, amount: isize, layout: &UiLayout) -> Update {
-        let len = self
-            .runtime_list
-            .as_ref()
-            .map_or(0, |snapshot| snapshot.installed.len());
-        let capacity = layout.runtime_capacity().max(1);
-        let max_scroll = len.saturating_sub(capacity);
-        self.runtime_scroll = if amount < 0 {
-            self.runtime_scroll.saturating_sub(amount.unsigned_abs())
-        } else {
-            self.runtime_scroll
-                .saturating_add(amount as usize)
-                .min(max_scroll)
-        };
-        Update::Render
+        self.move_runtime_selection(amount, layout)
     }
 
     fn apply_runtime_list_result(&mut self, result: Result<RuntimeListSnapshot, String>) {
@@ -5089,6 +5283,16 @@ impl App {
     }
 
     fn apply_runtime_list(&mut self, snapshot: RuntimeListSnapshot) {
+        let picker_id = self
+            .runtime_picker_selection
+            .and_then(|i| self.runtime_list.as_ref()?.installed.get(i))
+            .map(|s| s.runtime.manifest.runtime_id.clone());
+        self.runtime_picker_selection = picker_id.and_then(|id| {
+            snapshot
+                .installed
+                .iter()
+                .position(|s| s.runtime.manifest.runtime_id == id)
+        });
         let selected_id = self.selected_runtime.and_then(|index| {
             self.runtime_list
                 .as_ref()?
@@ -5111,43 +5315,53 @@ impl App {
         self.runtime_list = Some(snapshot);
     }
 
+    pub fn installed_model_indices(&self) -> Vec<usize> {
+        let query = self.model_filter.to_lowercase();
+        self.snapshot
+            .models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| {
+                query.is_empty()
+                    || model.display_name.to_lowercase().contains(&query)
+                    || model.path.to_string_lossy().to_lowercase().contains(&query)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     fn move_model_selection(&mut self, direction: isize, layout: &UiLayout) -> Update {
-        if self.snapshot.models.is_empty() {
+        let indices = self.installed_model_indices();
+        if indices.is_empty() {
             return Update::None;
         }
-        let next = self.selected_model.map_or(0, |current| {
-            (current as isize + direction).clamp(0, self.snapshot.models.len() as isize - 1)
-                as usize
+        let current = self
+            .selected_model
+            .and_then(|i| indices.iter().position(|v| *v == i));
+        let next = current.map_or(0, |i| {
+            (i as isize + direction).clamp(0, indices.len() as isize - 1) as usize
         });
-        self.select_model(next, layout)
+        self.select_model(indices[next], layout)
     }
 
     fn select_model(&mut self, index: usize, layout: &UiLayout) -> Update {
-        if self.snapshot.models.is_empty() {
+        let indices = self.installed_model_indices();
+        let Some(position) = indices.iter().position(|i| *i == index) else {
             return Update::None;
-        }
-        let index = index.min(self.snapshot.models.len() - 1);
+        };
         self.selected_model = Some(index);
+        self.pending_model_remove_confirmation = None;
         let capacity = layout.model_capacity().max(1);
-        if index < self.model_scroll {
-            self.model_scroll = index;
-        } else if index >= self.model_scroll + capacity {
-            self.model_scroll = index + 1 - capacity;
+        if position < self.model_scroll {
+            self.model_scroll = position;
+        } else if position >= self.model_scroll + capacity {
+            self.model_scroll = position + 1 - capacity;
         }
         Update::Render
     }
 
     fn scroll_models(&mut self, amount: isize, layout: &UiLayout) -> Update {
-        let capacity = layout.model_capacity().max(1);
-        let max_scroll = self.snapshot.models.len().saturating_sub(capacity);
-        self.model_scroll = if amount < 0 {
-            self.model_scroll.saturating_sub(amount.unsigned_abs())
-        } else {
-            self.model_scroll
-                .saturating_add(amount as usize)
-                .min(max_scroll)
-        };
-        Update::Render
+        self.move_model_selection(amount, layout)
     }
 
     fn scroll_logs(&mut self, amount: isize, layout: &UiLayout) -> Update {
@@ -5162,11 +5376,9 @@ impl App {
     }
 
     fn reconcile_models(&mut self) {
-        let len = self.snapshot.models.len();
-        self.selected_model = self
-            .selected_model
-            .and_then(|index| (len > 0).then(|| index.min(len - 1)));
-        self.model_scroll = self.model_scroll.min(len.saturating_sub(1));
+        let indices = self.installed_model_indices();
+        self.selected_model = self.selected_model.filter(|index| indices.contains(index));
+        self.model_scroll = self.model_scroll.min(indices.len().saturating_sub(1));
     }
 
     fn request_load(&mut self) -> Update {
