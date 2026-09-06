@@ -2197,7 +2197,7 @@ impl EngineAdapter for NinferAdapter {
             .get(endpoint)
             .cloned()
             .ok_or_else(|| {
-                EngineError::Operation(
+                EngineError::InvalidConfiguration(
                     "NInfer startup provenance is unavailable for this process".to_owned(),
                 )
             })?;
@@ -2207,14 +2207,19 @@ impl EngineAdapter for NinferAdapter {
             Err(error) => {
                 self.pending_startups.write().await.remove(endpoint);
                 let _ = tokio::fs::remove_file(&pending.request_log_path).await;
-                return Err(error);
+                // A rejected startup proof cannot recover by polling: its
+                // pending state has been consumed. Preserve the cause and let
+                // the manager stop this owned process immediately.
+                return Err(EngineError::InvalidConfiguration(format!(
+                    "NInfer startup validation failed: {error}"
+                )));
             }
         };
         self.pending_startups.write().await.remove(endpoint);
         if let Err(error) = tokio::fs::remove_file(&pending.request_log_path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            return Err(EngineError::Operation(format!(
+            return Err(EngineError::InvalidConfiguration(format!(
                 "could not unlink the private NInfer startup log before serving requests: {error}"
             )));
         }
@@ -2275,6 +2280,10 @@ impl EngineAdapter for NinferAdapter {
                 )
             })?;
         Ok(norted_engine::StartupObservation::Ready(BTreeMap::from([
+            (
+                "kv_cache_format".to_owned(),
+                json!(observed.kv_cache_format),
+            ),
             (
                 "resolved_settings".to_owned(),
                 serde_json::to_value(observed.resolved_settings).map_err(|error| {
@@ -2665,6 +2674,7 @@ struct StartupContextCache {
 
 #[derive(Clone)]
 struct ObservedNinferStartup {
+    kv_cache_format: String,
     generation_settings: EffectiveGenerationSettings,
     resolved_settings: BTreeMap<String, serde_json::Value>,
 }
@@ -2820,13 +2830,34 @@ async fn read_and_validate_startup_log(
             "NInfer startup public model ID differs from the Model Profile/public alias".to_owned(),
         ));
     }
-    if startup.artifact.target != pending.native_identity.model_id
-        || startup.artifact.weights_id != pending.native_identity.weights_id
+    // In the reviewed NInfer registry, load.target is a dispatch key while
+    // context_cost.model_id is the artifact's native model ID. They are not
+    // aliases of the public Model Profile ID and must be checked separately.
+    // Keep this mapping explicit: punctuation normalization could admit an
+    // unreviewed target. Unknown native identities remain unsupported.
+    let expected_target = match pending.native_identity.model_id.as_str() {
+        "qwen3.6-27b" => "qwen3_6_27b",
+        "qwen3.8-27b" => "qwen3_8_27b",
+        "qwen3.6-35b-a3b" => "qwen3_6_35b_a3b",
+        model => {
+            return Err(EngineError::Operation(format!(
+                "NInfer startup target mapping is unreviewed for native model `{model}`"
+            )));
+        }
+    };
+    if startup.artifact.target != expected_target {
+        return Err(EngineError::Operation(format!(
+            "NInfer startup target `{}` differs from expected target `{expected_target}` for native model `{}`",
+            startup.artifact.target, pending.native_identity.model_id
+        )));
+    }
+    if startup.artifact.weights_id != pending.native_identity.weights_id
         || startup.engine.context_cost.model_id != pending.native_identity.model_id
         || startup.engine.context_cost.weights_id != pending.native_identity.weights_id
     {
         return Err(EngineError::Operation(
-            "NInfer startup native target differs from the inspected artifact identity".to_owned(),
+            "NInfer startup native model or weights differ from the inspected artifact identity"
+                .to_owned(),
         ));
     }
     let expected_uuid = pending.accelerator.stable_id.as_deref().ok_or_else(|| {
@@ -2852,6 +2883,20 @@ async fn read_and_validate_startup_log(
             "NInfer reported a different compute capability than the selected device".to_owned(),
         ));
     }
+    // CLI choices and request-log storage descriptions name the same enum
+    // differently. Decode only the formats proved by the reviewed log schema.
+    let kv_dtype = match startup.engine.kv_cache.as_str() {
+        "bf16" => "bf16",
+        "int8-group64" => "int8",
+        "fp8-e4m3-row256" => "fp8",
+        "nvfp4" => "nvfp4",
+        "k8v4" => "k8v4",
+        format => {
+            return Err(EngineError::Operation(format!(
+                "NInfer startup reported an unreviewed KV-cache format `{format}`"
+            )));
+        }
+    };
     let preset = if startup.server.default_thinking {
         startup.sampling_defaults.thinking
     } else {
@@ -3029,7 +3074,7 @@ async fn read_and_validate_startup_log(
         if requirements
             .kv_dtype
             .as_ref()
-            .is_some_and(|expected| startup.engine.kv_cache != *expected)
+            .is_some_and(|expected| kv_dtype != expected)
             || requirements
                 .cuda_graph
                 .is_some_and(|expected| startup.engine.cuda_graph != expected)
@@ -3087,16 +3132,16 @@ async fn read_and_validate_startup_log(
         }
         if requirements
             .temperature
-            .is_some_and(|expected| !approximately_equal(defaults.temperature, expected))
+            .is_some_and(|expected| !matches_runtime_float(defaults.temperature, expected))
             || requirements
                 .top_p
-                .is_some_and(|expected| !approximately_equal(defaults.top_p, expected))
+                .is_some_and(|expected| !matches_runtime_float(defaults.top_p, expected))
             || requirements
                 .top_k
                 .is_some_and(|expected| effective_top_k != expected)
             || requirements
                 .min_p
-                .is_some_and(|expected| !approximately_equal(effective_min_p, expected))
+                .is_some_and(|expected| !matches_runtime_float(effective_min_p, expected))
         {
             return Err(EngineError::Operation(
                 "NInfer startup did not resolve the configured sampler defaults".to_owned(),
@@ -3107,13 +3152,13 @@ async fn read_and_validate_startup_log(
                 .sampling_defaults
                 .server_overrides
                 .presence_penalty
-                .is_none_or(|observed| !approximately_equal(observed, expected))
+                .is_none_or(|observed| !matches_runtime_float(observed, expected))
         }) || requirements.frequency_penalty.is_some_and(|expected| {
             startup
                 .sampling_defaults
                 .server_overrides
                 .frequency_penalty
-                .is_none_or(|observed| !approximately_equal(observed, expected))
+                .is_none_or(|observed| !matches_runtime_float(observed, expected))
         }) || requirements.seed.is_some_and(|expected| {
             startup.sampling_defaults.server_overrides.seed != Some(expected)
         }) {
@@ -3131,7 +3176,7 @@ async fn read_and_validate_startup_log(
             "ninfer.parallel_requests".to_owned(),
             json!(startup.engine.max_concurrency),
         ),
-        ("ninfer.kv_dtype".to_owned(), json!(startup.engine.kv_cache)),
+        ("ninfer.kv_dtype".to_owned(), json!(kv_dtype)),
         (
             "ninfer.kv_capacity".to_owned(),
             json!(startup.engine.kv_capacity),
@@ -3237,13 +3282,23 @@ async fn read_and_validate_startup_log(
         );
     }
     Ok(Some(ObservedNinferStartup {
+        kv_cache_format: startup.engine.kv_cache,
         generation_settings: defaults,
         resolved_settings,
     }))
 }
 
-fn approximately_equal(left: f64, right: f64) -> bool {
-    (left - right).abs() <= f64::EPSILON * left.abs().max(right.abs()).max(1.0) * 8.0
+fn matches_runtime_float(observed: f64, requested: f64) -> bool {
+    // NInfer parses process sampler controls as float (f32) and its JSON log
+    // widens those exact values to double. Parse the same decimal argument
+    // emitted by settings::push_value directly as f32 to avoid double rounding
+    // at a midpoint, then require equality with the reported runtime value.
+    observed.is_finite()
+        && requested.is_finite()
+        && requested
+            .to_string()
+            .parse::<f32>()
+            .is_ok_and(|expected| observed == f64::from(expected))
 }
 
 fn create_private_request_log() -> Result<PathBuf, EngineError> {
