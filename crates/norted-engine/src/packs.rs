@@ -257,6 +257,14 @@ impl RuntimePackManager {
         }))
     }
 
+    /// Keep installed-runtime mutations out of an admitted benchmark. Serving
+    /// resolution remains read-only and does not acquire this operation guard.
+    pub(crate) fn try_reserve_benchmark(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+        Arc::clone(&self.operation)
+            .try_lock_owned()
+            .map_err(|_| "Busy: runtime-pack mutation in progress".to_owned())
+    }
+
     pub fn progress(&self) -> broadcast::Receiver<RuntimeOperationProgress> {
         self.installer.subscribe()
     }
@@ -905,7 +913,11 @@ impl RuntimePackManager {
         runtime_id: &RuntimeId,
     ) -> Result<InstalledRuntime, RuntimePackError> {
         let host = self.refresh_host_capabilities().await;
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation.try_lock().map_err(|_| {
+            RuntimePackError::Selection(
+                "Busy: runtime mutation or benchmark reservation in progress".to_owned(),
+            )
+        })?;
         let entry = self.catalog.find(runtime_id, &host, false).await?;
         let adapter = self
             .registry
@@ -961,7 +973,11 @@ impl RuntimePackManager {
         runtime_id: &RuntimeId,
         active_runtime: Option<&RuntimeId>,
     ) -> Result<(), RuntimePackError> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation.try_lock().map_err(|_| {
+            RuntimePackError::Selection(
+                "Busy: runtime mutation or benchmark reservation in progress".to_owned(),
+            )
+        })?;
         if active_runtime == Some(runtime_id) {
             return Err(RuntimePackError::Active(runtime_id.clone()));
         }
@@ -1006,7 +1022,11 @@ impl RuntimePackManager {
         update_preference: RuntimeUpdatePreference,
     ) -> Result<RuntimeSelections, RuntimePackError> {
         let host = self.refresh_host_capabilities().await;
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation.try_lock().map_err(|_| {
+            RuntimePackError::Selection(
+                "Busy: runtime mutation or benchmark reservation in progress".to_owned(),
+            )
+        })?;
         let transaction = self.store.acquire_transaction().await?;
         let runtime = self
             .installed(&runtime_id)
@@ -1047,7 +1067,11 @@ impl RuntimePackManager {
         update_preference: RuntimeUpdatePreference,
     ) -> Result<RuntimeSelections, RuntimePackError> {
         let host = self.refresh_host_capabilities().await;
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation.try_lock().map_err(|_| {
+            RuntimePackError::Selection(
+                "Busy: runtime mutation or benchmark reservation in progress".to_owned(),
+            )
+        })?;
         let transaction = self.store.acquire_transaction().await?;
         let runtime = self
             .installed(&runtime_id)
@@ -1076,7 +1100,11 @@ impl RuntimePackManager {
         &self,
         format: ArtifactFormat,
     ) -> Result<RuntimeSelections, RuntimePackError> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation.try_lock().map_err(|_| {
+            RuntimePackError::Selection(
+                "Busy: runtime mutation or benchmark reservation in progress".to_owned(),
+            )
+        })?;
         let transaction = self.store.acquire_transaction().await?;
         let mut selections = self.store.selections().await?;
         if let Some(runtime_id) = selections.format_defaults.remove(&format)
@@ -1094,7 +1122,11 @@ impl RuntimePackManager {
         &self,
         model_id: &ModelId,
     ) -> Result<RuntimeSelections, RuntimePackError> {
-        let _operation = self.operation.lock().await;
+        let _operation = self.operation.try_lock().map_err(|_| {
+            RuntimePackError::Selection(
+                "Busy: runtime mutation or benchmark reservation in progress".to_owned(),
+            )
+        })?;
         let transaction = self.store.acquire_transaction().await?;
         let mut selections = self.store.selections().await?;
         if let Some(runtime_id) = selections.model_overrides.remove(model_id)

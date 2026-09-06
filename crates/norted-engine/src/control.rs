@@ -122,6 +122,26 @@ impl ControlClient {
         })
     }
 
+    pub async fn benchmark(
+        &self,
+        request: crate::benchmark::BenchmarkRequest,
+    ) -> Result<serde_json::Value, ControlClientError> {
+        self.send(
+            self.client
+                .post(format!(
+                    "{}{}",
+                    self.endpoint,
+                    crate::benchmark::CONTROL_BENCHMARK_PATH
+                ))
+                .timeout(STATUS_TIMEOUT)
+                .json(&request),
+            "benchmark control",
+            STATUS_TIMEOUT,
+        )
+        .await
+        .map(|(_, value)| value)
+    }
+
     pub async fn status(&self) -> Result<ControlStatus, ControlClientError> {
         self.send(
             self.client

@@ -104,6 +104,10 @@ impl ApiServer {
         let control_address = control_listener
             .local_addr()
             .map_err(|error| ApiError::Serve(error.to_string()))?;
+        runtime
+            .initialize_benchmark_server()
+            .await
+            .map_err(ApiError::Serve)?;
         let control_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let publisher = RuntimePublisher::publish(
             &core.paths,
@@ -352,7 +356,36 @@ fn control_routes(state: ControlApiState) -> Router {
         .route(CONTROL_STATUS_PATH, get(control_status))
         .route(CONTROL_LOAD_PATH, post(control_load))
         .route(CONTROL_UNLOAD_PATH, post(control_unload))
+        .route(
+            norted_engine::benchmark::CONTROL_BENCHMARK_PATH,
+            post(control_benchmark),
+        )
         .with_state(state)
+}
+
+async fn control_benchmark(
+    State(state): State<ControlApiState>,
+    headers: HeaderMap,
+    payload: Result<Json<norted_engine::benchmark::BenchmarkRequest>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ControlApiError> {
+    authorize(&headers, &state.token)?;
+    let Json(request) = payload.map_err(|error| ControlApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: error.body_text(),
+    })?;
+    state
+        .runtime
+        .benchmark_control(request)
+        .await
+        .map(Json)
+        .map_err(|message| ControlApiError {
+            status: if message.starts_with("Busy:") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            message,
+        })
 }
 
 async fn control_status(
@@ -387,7 +420,8 @@ async fn control_load(
                 norted_engine::RuntimeError::ModelProfileNotFound(_)
                 | norted_engine::RuntimeError::BoundModelMissing { .. }
                 | norted_engine::RuntimeError::ModelNotFound(_) => StatusCode::NOT_FOUND,
-                norted_engine::RuntimeError::Busy(_) => StatusCode::CONFLICT,
+                norted_engine::RuntimeError::Busy(_)
+                | norted_engine::RuntimeError::BenchmarkReserved => StatusCode::CONFLICT,
                 norted_engine::RuntimeError::Incompatible { .. } => {
                     StatusCode::UNPROCESSABLE_ENTITY
                 }

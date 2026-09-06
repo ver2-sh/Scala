@@ -1,6 +1,7 @@
 //! Interactive terminal interface for Norted Server.
 
 mod app;
+mod benchmarks;
 mod commands;
 mod settings_editor;
 mod terminal;
@@ -132,6 +133,8 @@ pub async fn run(
     let (model_library_results, mut model_library_result_receiver) = tokio::sync::mpsc::channel(4);
     let (settings_results, mut settings_result_receiver) = tokio::sync::mpsc::channel(4);
     let (auth_updates, mut auth_update_receiver) = tokio::sync::mpsc::channel(2);
+    let (benchmark_results, mut benchmark_receiver) = tokio::sync::mpsc::channel(2);
+    let mut benchmark_tick = tokio::time::interval(Duration::from_secs(2));
     let mut runtime_progress = runtime_packs.progress();
     let mut model_progress = model_library.subscribe();
     spawn_runtime_action(
@@ -264,6 +267,21 @@ pub async fn run(
                 }
                 None => Update::None,
             },
+            _ = benchmark_tick.tick() => {
+                if app.screen == app::Screen::Benchmarks && !app.benchmarks.busy && app.benchmarks.pending.is_none() {
+                    app.benchmarks.pending = Some(norted_engine::benchmark::BenchmarkRequest::Status);
+                }
+                Update::None
+            },
+            result = benchmark_receiver.recv() => {
+                if let Some((request, result)) = result {
+                    if let Some(detail) = app.benchmarks.accept(&request, result) {
+                        app.detail_text = Some(detail);
+                        app.detail_scroll = 0;
+                    }
+                }
+                Update::Render
+            },
             result = runtime_result_receiver.recv() => match result {
                 Some(result) => {
                     app.handle_runtime_task_result(result);
@@ -347,6 +365,23 @@ pub async fn run(
         };
         if update == Update::Quit {
             break;
+        }
+        if !app.benchmarks.busy {
+            if let Some(request) = app.benchmarks.pending.take() {
+                app.benchmarks.busy = true;
+                let paths = core.paths.clone();
+                let results = benchmark_results.clone();
+                tokio::spawn(async move {
+                    let result = match ControlClient::discover(&paths).await {
+                        Ok(client) => client
+                            .benchmark(request.clone())
+                            .await
+                            .map_err(|e| e.to_string()),
+                        Err(error) => Err(error.to_string()),
+                    };
+                    let _ = results.send((request, result)).await;
+                });
+            }
         }
         if let Some(action) = app.take_control_action() {
             if matches!(action, ControlAction::Load(_)) {

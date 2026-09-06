@@ -36,6 +36,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run and inspect private, server-owned per-profile benchmarks
+    Benchmarks(BenchmarksArgs),
     /// Reclaim unused managed storage; --all resets generated/heavy artifacts
     Prune(PruneArgs),
     /// Launch the interactive interface, attaching to or owning the serving stack
@@ -359,4 +361,41 @@ pub struct SettingsUnsetArgs {
     #[arg(long)]
     #[arg(required = true, value_name = "SETTING_ID")]
     pub settings: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BenchmarksArgs {
+    #[command(subcommand)]
+    pub command: BenchmarksCommand,
+}
+#[derive(Debug, Subcommand)]
+pub enum BenchmarksCommand {
+    /// Reserve inference and start one saved Model Profile (maximum 600 seconds)
+    Start {
+        profile_id: norted_core::ModelProfileId,
+    },
+    /// Show current progress and each profile's latest applicable result
+    Status,
+    /// Cancel the active attempt and stop its managed inference
+    Cancel,
+    /// List this profile's independently produced results
+    History {
+        profile_id: norted_core::ModelProfileId,
+    },
+    /// Inspect/export the complete local run record as JSON
+    Result { run_id: String },
+    /// Compare two historical records, including two from the same profile
+    Compare { left: String, right: String },
+}
+impl From<BenchmarksCommand> for norted_engine::benchmark::BenchmarkRequest {
+    fn from(command: BenchmarksCommand) -> Self {
+        match command {
+            BenchmarksCommand::Start { profile_id } => Self::Start { profile_id },
+            BenchmarksCommand::Status => Self::Status,
+            BenchmarksCommand::Cancel => Self::Cancel,
+            BenchmarksCommand::History { profile_id } => Self::History { profile_id },
+            BenchmarksCommand::Result { run_id } => Self::Result { run_id },
+            BenchmarksCommand::Compare { left, right } => Self::Compare { left, right },
+        }
+    }
 }
