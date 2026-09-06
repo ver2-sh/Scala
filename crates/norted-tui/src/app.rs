@@ -241,6 +241,9 @@ pub enum SettingsAction {
         value: SettingValue,
         model: Option<Box<ModelArtifact>>,
     },
+    Reset {
+        scope: SettingsScope,
+    },
     Unset {
         scope: SettingsScope,
         id: SettingId,
@@ -280,6 +283,7 @@ pub struct ModelSettingsInspection {
     pub runtime_id: Option<RuntimeId>,
     pub schema: SettingsSchema,
     pub resolved: ResolvedSettings,
+    pub parent: ResolvedSettings,
     pub validation_error: Option<String>,
 }
 
@@ -307,6 +311,7 @@ pub enum SettingsTaskResult {
     Stored(Result<SettingsLoad, String>),
     ChooseProfileEngine(ProfileEngineSelection),
     Inspected {
+        profile: ModelProfile,
         model_id: ModelId,
         result: Box<Result<ModelSettingsInspection, String>>,
     },
@@ -314,6 +319,8 @@ pub enum SettingsTaskResult {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SettingsInputKind {
+    Search,
+    Reset,
     ProfileName,
     DuplicateProfile,
     SettingValue,
@@ -324,7 +331,7 @@ pub struct SettingsInput {
     pub kind: SettingsInputKind,
     pub text: String,
     pub cursor: usize,
-    setting_id: Option<SettingId>,
+    pub editor: Option<crate::settings_editor::SettingsEditor>,
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +365,9 @@ pub struct App {
     pub overview_scroll: usize,
     pub selected_model: Option<usize>,
     pub model_scroll: usize,
+    pub model_filter: String,
+    pub downloads_focused: bool,
+    pub model_filter_editing: bool,
     pub model_library_view: ModelLibraryView,
     pub model_search_query: String,
     pub model_search_cursor: usize,
@@ -370,6 +380,8 @@ pub struct App {
     pub selected_model_download_job: Option<ModelDownloadJobId>,
     pub selected_model_profile: Option<usize>,
     pub log_scroll: usize,
+    pub detail_text: Option<String>,
+    pub detail_scroll: u16,
     pub runtime_list: Option<RuntimeListSnapshot>,
     pub runtime_list_error: Option<String>,
     pub runtime_list_loading: bool,
@@ -404,12 +416,19 @@ pub struct App {
     pub settings_scope_index: usize,
     pub settings_setting_index: usize,
     pub settings_scroll: usize,
+    pub settings_query: String,
+    pub settings_detail_scroll: u16,
+    pub settings_show_detail: bool,
+    pub profile_actions_open: bool,
+    pub settings_overrides_only: bool,
     pub settings_model: Option<ModelId>,
     pub settings_schema: Option<SettingsSchema>,
     pub settings_resolved: Option<ResolvedSettings>,
+    pub settings_parent: Option<ResolvedSettings>,
     pub settings_runtime_id: Option<RuntimeId>,
     pub settings_validation_error: Option<String>,
     pub settings_input: Option<SettingsInput>,
+    pub settings_input_error: Option<String>,
     pub profile_engine_selection: Option<ProfileEngineSelection>,
     pub load_animation_frame: u32,
     pub marquee_animation_frame: u32,
@@ -479,6 +498,9 @@ impl App {
             overview_scroll: 0,
             selected_model: None,
             model_scroll: 0,
+            model_filter: String::new(),
+            downloads_focused: false,
+            model_filter_editing: false,
             model_library_view: ModelLibraryView::Installed,
             model_search_query: String::new(),
             model_search_cursor: 0,
@@ -491,6 +513,8 @@ impl App {
             selected_model_download_job: None,
             selected_model_profile: None,
             log_scroll: 0,
+            detail_text: None,
+            detail_scroll: 0,
             runtime_list: None,
             runtime_list_error: None,
             runtime_list_loading: true,
@@ -525,12 +549,19 @@ impl App {
             settings_scope_index: 0,
             settings_setting_index: 0,
             settings_scroll: 0,
+            settings_query: String::new(),
+            settings_detail_scroll: 0,
+            settings_show_detail: false,
+            profile_actions_open: false,
+            settings_overrides_only: false,
             settings_model: None,
             settings_schema: None,
             settings_resolved: None,
+            settings_parent: None,
             settings_runtime_id: None,
             settings_validation_error: None,
             settings_input: None,
+            settings_input_error: None,
             profile_engine_selection: None,
             load_animation_frame: 0,
             marquee_animation_frame: 0,
@@ -565,8 +596,46 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Update::Quit;
         }
+        if self.detail_text.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('D') => {
+                    self.detail_text = None;
+                    self.detail_scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1)
+                }
+                KeyCode::PageUp => {
+                    self.detail_scroll = self
+                        .detail_scroll
+                        .saturating_sub(layout.content.height.max(1))
+                }
+                KeyCode::PageDown => {
+                    self.detail_scroll = self
+                        .detail_scroll
+                        .saturating_add(layout.content.height.max(1))
+                }
+                KeyCode::Home => self.detail_scroll = 0,
+                KeyCode::End => self.detail_scroll = u16::MAX,
+                _ => return Update::None,
+            }
+            return Update::Render;
+        }
         if self.settings_input.is_some() {
             return self.handle_settings_input_key(key);
+        }
+        if key.code == KeyCode::Char('D')
+            && (self.overlay == Some(Overlay::Help)
+                || self.overlay == Some(Overlay::ModelRuntime)
+                || (self.overlay == Some(Overlay::RuntimeSearch)
+                    && self.runtime_search_focus == RuntimeSearchFocus::Results))
+        {
+            self.detail_text = crate::ui::screens::inspection_text(self);
+            self.detail_scroll = 0;
+            return Update::Render;
         }
         if let Some(overlay) = self.overlay {
             return match overlay {
@@ -594,6 +663,100 @@ impl App {
         {
             return self.handle_model_discover_key(key);
         }
+        if self.screen == Screen::Models
+            && self.model_library_view == ModelLibraryView::Installed
+            && !self.downloads_focused
+            && self.focus == FocusArea::Content
+        {
+            if self.model_filter_editing {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => self.model_filter_editing = false,
+                    KeyCode::Backspace => {
+                        self.model_filter.pop();
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.model_filter.clear()
+                    }
+                    KeyCode::Char(c)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        self.model_filter.push(c)
+                    }
+                    _ => return Update::None,
+                }
+                let indices = self.installed_model_indices();
+                if !self.selected_model.is_some_and(|i| indices.contains(&i)) {
+                    self.selected_model = indices.first().copied();
+                }
+                self.model_scroll = 0;
+                return Update::Render;
+            }
+            if key.code == KeyCode::Char('f') {
+                self.pending_model_remove_confirmation = None;
+                self.model_filter_editing = true;
+                return Update::Render;
+            }
+            if key.code == KeyCode::Esc && !self.model_filter.is_empty() {
+                self.model_filter.clear();
+                self.model_scroll = 0;
+                return Update::Render;
+            }
+        }
+        if self.screen == Screen::Models && self.focus == FocusArea::Content {
+            if key.code == KeyCode::Char('J')
+                || (self.downloads_focused && key.code == KeyCode::Esc)
+            {
+                self.downloads_focused = !self.downloads_focused;
+                return Update::Render;
+            }
+            if self.downloads_focused {
+                return match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.move_model_download_selection(-1, layout)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.move_model_download_selection(1, layout)
+                    }
+                    KeyCode::Char('q') => Update::Quit,
+                    KeyCode::Tab => {
+                        self.cycle_focus(1);
+                        Update::Render
+                    }
+                    KeyCode::BackTab => {
+                        self.cycle_focus(-1);
+                        Update::Render
+                    }
+                    KeyCode::Char('p') => self.toggle_selected_model_download(),
+                    KeyCode::Char('x') => {
+                        self.request_selected_model_download_action(DownloadJobAction::Cancel)
+                    }
+                    KeyCode::Char('D') => {
+                        self.detail_text = crate::ui::screens::inspection_text(self);
+                        self.detail_scroll = 0;
+                        Update::Render
+                    }
+                    _ => Update::None,
+                };
+            }
+        }
+        if key.code == KeyCode::Char('D')
+            && self.focus == FocusArea::Content
+            && matches!(
+                self.screen,
+                Screen::Models
+                    | Screen::Runtimes
+                    | Screen::Overview
+                    | Screen::Server
+                    | Screen::Logs
+                    | Screen::Help
+            )
+        {
+            self.detail_text = crate::ui::screens::inspection_text(self);
+            self.detail_scroll = 0;
+            return Update::Render;
+        }
         if key.code != KeyCode::Char('d') {
             self.pending_runtime_remove_confirmation = None;
             self.pending_model_remove_confirmation = None;
@@ -605,6 +768,13 @@ impl App {
                     && self.focus == FocusArea::Content =>
             {
                 self.handle_model_discover_key(key)
+            }
+            KeyCode::Char('/')
+                if matches!(self.screen, Screen::Settings | Screen::ModelProfiles)
+                    && self.focus == FocusArea::Content
+                    && !self.settings_busy =>
+            {
+                self.begin_settings_command(SettingsInputKind::Search)
             }
             KeyCode::Char('/') => {
                 self.open_command(true);
@@ -643,6 +813,28 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent, layout: &UiLayout) -> Update {
+        if self.detail_text.is_some() {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(3)
+                }
+                MouseEventKind::ScrollDown => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(3)
+                }
+                MouseEventKind::Down(MouseButton::Left) if mouse.row == layout.content.y => {
+                    self.detail_text = None
+                }
+                _ => return Update::None,
+            }
+            return Update::Render;
+        }
+        if self.overlay.is_none() && self.screen == Screen::Models && self.downloads_focused {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => return self.move_model_download_selection(-1, layout),
+                MouseEventKind::ScrollDown => return self.move_model_download_selection(1, layout),
+                _ => {}
+            }
+        }
         if let Some(overlay) = self.overlay {
             let position = Position::new(mouse.column, mouse.row);
             return match mouse.kind {
@@ -685,12 +877,17 @@ impl App {
         }
         if self.settings_input.is_some() {
             let position = Position::new(mouse.column, mouse.row);
+            if self.settings_busy {
+                return Update::None;
+            }
             return match mouse.kind {
                 MouseEventKind::Moved => {
                     let hover = match layout.hit_test(position) {
                         target @ Some(
                             HoverTarget::SettingsInputSubmit
                             | HoverTarget::SettingsInputCancel
+                            | HoverTarget::SettingsEditorOption(_)
+                            | HoverTarget::SettingsEditorAction(_)
                             | HoverTarget::SettingsInputField,
                         ) => target,
                         _ => None,
@@ -703,11 +900,57 @@ impl App {
                     }
                 }
                 MouseEventKind::Down(MouseButton::Left) => match layout.hit_test(position) {
+                    Some(HoverTarget::SettingsEditorOption(index)) => {
+                        if let Some(editor) =
+                            self.settings_input.as_mut().and_then(|i| i.editor.as_mut())
+                        {
+                            if !editor.editing_item {
+                                editor.selected = index;
+                            }
+                        }
+                        Update::Render
+                    }
+                    Some(HoverTarget::SettingsEditorAction(key)) => self.handle_settings_input_key(
+                        KeyEvent::new(KeyCode::F(key), KeyModifiers::NONE),
+                    ),
                     Some(HoverTarget::SettingsInputSubmit) => self.submit_settings_input(),
                     Some(HoverTarget::SettingsInputCancel) => self.cancel_settings_input(),
                     Some(HoverTarget::SettingsInputField) => Update::Render,
                     _ => Update::None,
                 },
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    if layout.hit_test(position) == Some(HoverTarget::SettingsInputField)
+                        && self
+                            .settings_input
+                            .as_ref()
+                            .and_then(|i| i.editor.as_ref())
+                            .is_some_and(|e| {
+                                e.custom()
+                                    && e.definition.kind == norted_core::SettingKind::JsonObject
+                            })
+                    {
+                        return self.handle_settings_input_key(KeyEvent::new(
+                            if mouse.kind == MouseEventKind::ScrollUp {
+                                KeyCode::Up
+                            } else {
+                                KeyCode::Down
+                            },
+                            KeyModifiers::NONE,
+                        ));
+                    }
+                    if let Some(editor) =
+                        self.settings_input.as_mut().and_then(|i| i.editor.as_mut())
+                    {
+                        if !editor.editing_item {
+                            editor.move_selection(if mouse.kind == MouseEventKind::ScrollUp {
+                                -1
+                            } else {
+                                1
+                            });
+                        }
+                    }
+                    Update::Render
+                }
                 _ => Update::None,
             };
         }
@@ -731,7 +974,39 @@ impl App {
 
     pub fn handle_paste(&mut self, text: &str) -> Update {
         let normalized = text.replace(['\r', '\n', '\t'], " ");
+        if self.detail_text.is_some() {
+            return Update::None;
+        }
+        if self.model_filter_editing
+            && self.screen == Screen::Models
+            && self.overlay.is_none()
+            && !self.command_active
+        {
+            self.model_filter.push_str(&normalized);
+            let indices = self.installed_model_indices();
+            if !self.selected_model.is_some_and(|i| indices.contains(&i)) {
+                self.selected_model = indices.first().copied();
+            }
+            self.model_scroll = 0;
+            return Update::Render;
+        }
         if let Some(input) = &mut self.settings_input {
+            if self.settings_busy {
+                return Update::None;
+            }
+            if let Some(editor) = &input.editor {
+                if !editor.custom()
+                    || (editor.definition.kind == norted_core::SettingKind::StringList
+                        && !editor.editing_item)
+                {
+                    return Update::None;
+                }
+            }
+            let normalized = if input.editor.is_some() {
+                text.to_owned()
+            } else {
+                normalized
+            };
             let index = byte_index(&input.text, input.cursor);
             input.text.insert_str(index, &normalized);
             input.cursor += normalized.chars().count();
@@ -798,6 +1073,12 @@ impl App {
     }
 
     pub fn replace_snapshot(&mut self, snapshot: AppSnapshot) {
+        let selected_id = self
+            .selected_model
+            .and_then(|i| self.snapshot.models.get(i))
+            .map(|m| m.id.clone());
+        self.selected_model =
+            selected_id.and_then(|id| snapshot.models.iter().position(|m| m.id == id));
         self.snapshot = snapshot;
         self.reconcile_models();
     }
@@ -929,9 +1210,18 @@ impl App {
                 self.model_search_loading = false;
                 match result {
                     Ok(search) => {
+                        let selected_ref = self
+                            .model_search_artifacts()
+                            .get(self.selected_model_search_result.unwrap_or(usize::MAX))
+                            .map(|(_, artifact)| artifact.model_ref.clone());
                         self.model_search = Some(search);
-                        self.selected_model_search_result =
-                            (!self.model_search_artifacts().is_empty()).then_some(0);
+                        self.selected_model_search_result = selected_ref
+                            .and_then(|reference| {
+                                self.model_search_artifacts()
+                                    .iter()
+                                    .position(|(_, artifact)| artifact.model_ref == reference)
+                            })
+                            .or_else(|| (!self.model_search_artifacts().is_empty()).then_some(0));
                     }
                     Err(error) => {
                         self.notice = Some(error.clone());
@@ -1006,11 +1296,10 @@ impl App {
             }
         }
         self.model_download_jobs = jobs;
-        let selected_is_present = self.selected_model_download_job.as_ref().is_some_and(|id| {
-            self.model_download_jobs
-                .iter()
-                .any(|job| &job.id == id && download_job_is_controllable(job))
-        });
+        let selected_is_present = self
+            .selected_model_download_job
+            .as_ref()
+            .is_some_and(|id| self.model_download_jobs.iter().any(|job| &job.id == id));
         if !selected_is_present {
             self.selected_model_download_job = self
                 .model_download_jobs
@@ -1056,26 +1345,13 @@ impl App {
                 repository
                     .artifacts
                     .iter()
+                    .filter(|artifact| {
+                        self.model_search_format
+                            .is_none_or(|format| artifact.format == format)
+                    })
                     .map(move |artifact| (repository, artifact))
             })
             .collect()
-    }
-
-    pub fn model_search_artifact(
-        &self,
-        index: usize,
-    ) -> Option<(&CatalogRepository, &CatalogFile)> {
-        self.model_search
-            .as_ref()?
-            .repositories
-            .iter()
-            .flat_map(|repository| {
-                repository
-                    .artifacts
-                    .iter()
-                    .map(move |artifact| (repository, artifact))
-            })
-            .nth(index)
     }
 
     pub fn model_removal_busy(&self) -> bool {
@@ -1116,15 +1392,15 @@ impl App {
                     self.settings_state = Some(loaded.state);
                     self.model_profiles = Some(loaded.profiles);
                     self.runtime_settings_schemas = loaded.runtime_schemas;
+                    self.settings_validation_error = (!loaded.runtime_schema_warnings.is_empty())
+                        .then(|| loaded.runtime_schema_warnings.join("; "));
                     self.settings_error = None;
                     if !loaded.runtime_schema_warnings.is_empty() {
                         self.notice = Some(format!(
-                            "Some selected-runtime defaults are unavailable: {}",
+                            "Selected-runtime diagnostics: {}",
                             loaded.runtime_schema_warnings.join("; ")
                         ));
-                    } else if self.notice.as_deref()
-                        == Some("Refreshing selected-runtime defaults…")
-                    {
+                    } else if self.notice.as_deref() == Some("Refreshing runtime settings…") {
                         self.notice = None;
                     }
                     self.reconcile_settings_selection();
@@ -1142,6 +1418,8 @@ impl App {
                     self.settings_state = Some(loaded.state);
                     self.model_profiles = Some(loaded.profiles);
                     self.runtime_settings_schemas = loaded.runtime_schemas;
+                    self.settings_validation_error = (!loaded.runtime_schema_warnings.is_empty())
+                        .then(|| loaded.runtime_schema_warnings.join("; "));
                     self.settings_error = None;
                     self.notice = Some(if let Some(notice) = loaded.save_notice {
                         notice
@@ -1150,21 +1428,23 @@ impl App {
                             .to_owned()
                     } else {
                         format!(
-                            "Settings saved. Some selected-runtime defaults are unavailable: {}",
+                            "Settings saved. Selected-runtime diagnostics: {}",
                             loaded.runtime_schema_warnings.join("; ")
                         )
                     });
+                    self.restore_editor_selection();
+                    self.settings_input = None;
+                    self.settings_input_error = None;
+                    self.hover = None;
                     self.reconcile_settings_selection();
                     if self.screen == Screen::ModelProfiles {
                         let _ = self.refresh_selected_model_profile();
                     }
                 }
                 Err(error) => {
-                    self.settings_error = Some(error.clone());
+                    self.settings_input_error = Some(error.clone());
+                    self.settings_validation_error = Some(error.clone());
                     self.notice = Some(error);
-                    if self.screen == Screen::ModelProfiles {
-                        let _ = self.refresh_selected_model_profile();
-                    }
                 }
             },
             SettingsTaskResult::ChooseProfileEngine(selection) => {
@@ -1172,11 +1452,14 @@ impl App {
                 self.overlay = Some(Overlay::ProfileEngine);
                 self.notice = Some("Choose the engine bound to this Model Profile".to_owned());
             }
-            SettingsTaskResult::Inspected { model_id, result } => {
-                if self
-                    .selected_model_profile_value()
-                    .is_none_or(|profile| profile.model_id != model_id)
-                {
+            SettingsTaskResult::Inspected {
+                profile: inspected_profile,
+                model_id,
+                result,
+            } => {
+                if self.selected_model_profile_value().is_none_or(|profile| {
+                    profile.model_id != model_id || profile != &inspected_profile
+                }) {
                     return;
                 }
                 match *result {
@@ -1187,11 +1470,13 @@ impl App {
                         self.settings_runtime_id = inspection.runtime_id;
                         self.settings_schema = Some(inspection.schema);
                         self.settings_resolved = Some(inspection.resolved);
+                        self.settings_parent = Some(inspection.parent);
                         self.settings_validation_error = inspection.validation_error;
                     }
                     Err(error) => {
                         self.settings_schema = None;
                         self.settings_resolved = None;
+                        self.settings_parent = None;
                         self.settings_runtime_id = None;
                         self.settings_validation_error = Some(error.clone());
                         self.notice = Some(error);
@@ -1263,6 +1548,20 @@ impl App {
                 None => false,
             })
             .collect::<Vec<_>>();
+        let query = self.settings_query.to_lowercase();
+        definitions.retain(|definition| {
+            (!self.settings_overrides_only || self.current_layer_value(&definition.id).is_some())
+                && (query.is_empty()
+                    || format!(
+                        "{} {} {} {}",
+                        definition.id,
+                        definition.label,
+                        definition.description,
+                        definition.category
+                    )
+                    .to_lowercase()
+                    .contains(&query))
+        });
         definitions.sort_by(|left, right| {
             left.category
                 .cmp(&right.category)
@@ -1297,6 +1596,9 @@ impl App {
                 return SettingValueDisplay {
                     value: setting.value.clone(),
                     source: match &setting.source {
+                        norted_core::SettingSource::SettingsOverride => {
+                            "Settings override".to_owned()
+                        }
                         norted_core::SettingSource::RuntimeDefault => "runtime default".to_owned(),
                         norted_core::SettingSource::ModelProfile { .. } => {
                             "model profile".to_owned()
@@ -1304,7 +1606,8 @@ impl App {
                         norted_core::SettingSource::Invocation => "boot inference".to_owned(),
                     },
                     state: match setting.source {
-                        norted_core::SettingSource::RuntimeDefault => {
+                        norted_core::SettingSource::SettingsOverride
+                        | norted_core::SettingSource::RuntimeDefault => {
                             SettingPresentationState::Default
                         }
                         norted_core::SettingSource::ModelProfile { .. }
@@ -1321,6 +1624,18 @@ impl App {
                     source: "model profile".to_owned(),
                     state: SettingPresentationState::Override,
                     can_clear: true,
+                };
+            }
+            if let Some(value) = self
+                .settings_parent
+                .as_ref()
+                .and_then(|parent| parent.configured.get(id))
+            {
+                return SettingValueDisplay {
+                    value: value.value.to_string(),
+                    source: value.source.to_string(),
+                    state: SettingPresentationState::Default,
+                    can_clear: false,
                 };
             }
             return self.settings_default_display(id);
@@ -1350,7 +1665,7 @@ impl App {
                 value: value.to_string(),
                 source: match scope {
                     SettingsScope::Server => "server setting".to_owned(),
-                    SettingsScope::Runtime(_) => "runtime default".to_owned(),
+                    SettingsScope::Runtime(_) => "Settings override".to_owned(),
                     SettingsScope::ModelProfile(_) => "model profile".to_owned(),
                 },
                 state: SettingPresentationState::Override,
@@ -1365,6 +1680,25 @@ impl App {
             .settings_definitions()
             .into_iter()
             .find(|definition| &definition.id == id);
+        if let Some(definition) = definition.filter(|definition| !definition.supported) {
+            let reason = definition
+                .unsupported_reason
+                .as_deref()
+                .unwrap_or("Unsupported by selected runtime");
+            let value = if reason.contains("No runtime") {
+                "Runtime not installed/selected"
+            } else if reason.contains("metadata/probe") {
+                "Runtime probe failed"
+            } else {
+                "Unsupported"
+            };
+            return SettingValueDisplay {
+                value: value.to_owned(),
+                source: reason.to_owned(),
+                state: SettingPresentationState::Default,
+                can_clear: false,
+            };
+        }
         if let Some(preview) = definition.and_then(|definition| definition.default_preview.as_ref())
         {
             return SettingValueDisplay {
@@ -1380,20 +1714,16 @@ impl App {
                 can_clear: false,
             };
         }
-        if self.screen == Screen::ModelProfiles {
-            SettingValueDisplay {
-                value: "Unavailable".to_owned(),
-                source: "resolution error".to_owned(),
-                state: SettingPresentationState::Default,
-                can_clear: false,
+        SettingValueDisplay {
+            value: if definition.is_some_and(|definition| !definition.supported) {
+                "Unsupported"
+            } else {
+                "Default not yet known"
             }
-        } else {
-            SettingValueDisplay {
-                value: "Unavailable".to_owned(),
-                source: "exact runtime unresolved".to_owned(),
-                state: SettingPresentationState::Default,
-                can_clear: false,
-            }
+            .to_owned(),
+            source: "runtime".to_owned(),
+            state: SettingPresentationState::Default,
+            can_clear: false,
         }
     }
 
@@ -1404,50 +1734,90 @@ impl App {
             .find(|definition| &definition.id == id);
         let current = self.settings_value_display(id);
         let preview = definition.and_then(|definition| definition.default_preview.as_ref());
-        let mut lines = vec![format!("Current: {} · {}", current.value, current.source)];
-        if self.screen == Screen::ModelProfiles {
-            if self.current_layer_value(id).is_some() {
-                lines.push(
-                    "Clear the profile override to use the runtime-default layer.".to_owned(),
-                );
-            }
-        } else if let Some(preview) = preview {
-            let preview_source =
-                if definition.is_some_and(|definition| definition.scope == SettingScope::Server) {
-                    "server default".to_owned()
-                } else {
-                    "runtime default".to_owned()
-                };
-            let current_is_same_default = current.state == SettingPresentationState::Default
-                && current.value == preview.value
-                && current.source == preview_source;
-            if !current_is_same_default {
-                let label = if definition
-                    .is_some_and(|definition| definition.scope == SettingScope::Server)
-                {
-                    "Server baseline"
-                } else {
-                    "Runtime baseline"
-                };
-                lines.push(format!("{label}: {}", preview.value));
-            }
-            if let Some(detail) = preview.detail.as_deref() {
-                lines.push(format!("Detail: {detail}"));
-            }
-        } else if current.state != SettingPresentationState::Default {
-            let fallback = self.settings_default_display(id);
-            lines.push(format!("Default: {} · {}", fallback.value, fallback.source));
+        let baseline = preview
+            .map(|preview| preview.value.as_str())
+            .unwrap_or("not yet known");
+        let parent = if self.screen == Screen::ModelProfiles {
+            self.settings_parent
+                .as_ref()
+                .and_then(|parent| parent.effective.get(id))
+                .map(|setting| {
+                    format!(
+                        "{} ({})",
+                        setting.requested_value.as_ref().unwrap_or(&setting.value),
+                        match setting.source {
+                            norted_core::SettingSource::SettingsOverride => "Settings override",
+                            norted_core::SettingSource::RuntimeDefault => "runtime default",
+                            norted_core::SettingSource::ModelProfile { .. } => "model profile",
+                            norted_core::SettingSource::Invocation => "invocation",
+                        }
+                    )
+                })
+                .unwrap_or_else(|| "not yet known".to_owned())
         } else {
-            lines.push(if self.screen == Screen::ModelProfiles {
-                "Detail: The selected adapter did not produce a required concrete runtime value"
-                    .to_owned()
-            } else {
-                "Detail: If unset, no model-specific preview is available in this configuration scope"
-                    .to_owned()
-            });
+            baseline.to_owned()
+        };
+        let local = self
+            .current_layer_value(id)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "absent (Inherited)".to_owned());
+        let server_scope = self.screen == Screen::Settings
+            && self.selected_settings_scope() == Some(SettingsScope::Server);
+        let timing = if server_scope { "Current" } else { "Next load" };
+        let baseline_label = if server_scope {
+            "Server baseline"
+        } else {
+            "Runtime baseline (read-only)"
+        };
+        let inherit = if server_scope {
+            "server baseline"
+        } else if self.screen == Screen::ModelProfiles {
+            "Settings"
+        } else {
+            "runtime"
+        };
+        let mut lines = vec![
+            format!("Effective value: {}", current.value),
+            format!("Source: {}", current.source),
+            format!("Applies: {timing}"),
+            format!("{baseline_label}: {baseline}"),
+            format!(
+                "{}: {parent}",
+                if self.screen == Screen::ModelProfiles {
+                    "Settings layer"
+                } else {
+                    "Parent"
+                }
+            ),
+            format!(
+                "{}: {local}",
+                if self.screen == Screen::ModelProfiles {
+                    "Profile layer"
+                } else {
+                    "Settings layer"
+                }
+            ),
+            format!("Inherit target: {inherit}"),
+        ];
+        if let Some(detail) = preview.and_then(|preview| preview.detail.as_deref()) {
+            lines.push(format!("Baseline policy: {detail}"));
+        }
+        if let Some(definition) = definition {
+            lines.push(format!("Constraints: {}", definition.kind.constraints()));
+            if let Some(reason) = &definition.unsupported_reason {
+                lines.push(format!("Unsupported: {reason}"));
+            }
+        }
+        if let Some(error) = self
+            .settings_validation_error
+            .as_ref()
+            .filter(|error| error.contains(id.as_str()))
+        {
+            lines.push(format!("Invalid: {error}"));
         }
         if let Some(running) = self.settings_running_effective_setting(id) {
             let running_source = match &running.source {
+                norted_core::SettingSource::SettingsOverride => "Settings override",
                 norted_core::SettingSource::RuntimeDefault => "runtime default",
                 norted_core::SettingSource::ModelProfile { .. } => "model profile",
                 norted_core::SettingSource::Invocation => "boot inference",
@@ -1458,6 +1828,40 @@ impl App {
                     lines.push(format!("Running detail: {detail}"));
                 }
             }
+        }
+        if let Some(profile) = self
+            .selected_model_profile_value()
+            .filter(|_| self.screen == Screen::ModelProfiles)
+        {
+            lines.push(format!("Profile: {}", profile.id));
+            lines.push(format!("Engine: {}", profile.engine_id));
+            lines.push(format!("Role: {:?}", profile.role));
+            lines.push(format!(
+                "Model path: {}",
+                self.selected_profile_model()
+                    .map(|model| model.path.display().to_string())
+                    .unwrap_or_else(|| "Missing model".to_owned())
+            ));
+            lines.push(format!(
+                "Runtime ID: {}",
+                self.settings_runtime_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "Unresolved".to_owned())
+            ));
+        }
+        if let Some(SettingsScope::Runtime(engine)) = self
+            .selected_settings_scope()
+            .filter(|_| self.screen == Screen::Settings)
+        {
+            lines.push(format!(
+                "Runtime ID: {}",
+                self.runtime_settings_schemas
+                    .get(&engine)
+                    .and_then(|schema| schema.runtime_id.as_ref())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "Not installed/selected".to_owned())
+            ));
         }
         lines.join("\n")
     }
@@ -1601,10 +2005,21 @@ impl App {
                 self.runtime_search_loading = false;
                 match result {
                     Ok(snapshot) => {
+                        let selected_id = self
+                            .selected_runtime_search_result
+                            .and_then(|i| self.runtime_search.as_ref()?.results.get(i))
+                            .map(|r| r.entry.available.runtime_id.clone());
+                        let selected = selected_id.and_then(|id| {
+                            snapshot
+                                .results
+                                .iter()
+                                .position(|r| r.entry.available.runtime_id == id)
+                        });
                         self.runtime_search = Some(snapshot);
                         self.runtime_search_error = None;
-                        self.selected_runtime_search_result =
-                            self.runtime_search_indices().first().copied();
+                        self.selected_runtime_search_result = selected
+                            .filter(|i| self.runtime_search_indices().contains(i))
+                            .or_else(|| self.runtime_search_indices().first().copied());
                         self.runtime_search_scroll = 0;
                         self.runtime_search_focus = RuntimeSearchFocus::Results;
                     }
@@ -2278,6 +2693,7 @@ impl App {
             self.screen != Screen::ModelProfiles && screen == Screen::ModelProfiles;
         let entering_settings = self.screen != Screen::Settings && screen == Screen::Settings;
         self.screen = screen;
+        self.profile_actions_open = false;
         if entering_model_profiles {
             self.reconcile_settings_selection();
             if !self.settings_loading && !self.settings_busy {
@@ -2287,7 +2703,7 @@ impl App {
         if entering_settings && !self.settings_loading && !self.settings_busy {
             self.pending_settings_action = Some(SettingsAction::Refresh);
             self.settings_busy = true;
-            self.notice = Some("Refreshing selected-runtime defaults…".to_owned());
+            self.notice = Some("Refreshing runtime settings…".to_owned());
         }
         Update::Render
     }
@@ -2399,10 +2815,16 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.move_model_selection(1, layout),
                 KeyCode::PageUp => self.scroll_models(-(layout.model_capacity() as isize), layout),
                 KeyCode::PageDown => self.scroll_models(layout.model_capacity() as isize, layout),
-                KeyCode::Home => self.select_model(0, layout),
-                KeyCode::End if !self.snapshot.models.is_empty() => {
-                    self.select_model(self.snapshot.models.len() - 1, layout)
-                }
+                KeyCode::Home => self
+                    .installed_model_indices()
+                    .first()
+                    .copied()
+                    .map_or(Update::None, |i| self.select_model(i, layout)),
+                KeyCode::End if !self.snapshot.models.is_empty() => self
+                    .installed_model_indices()
+                    .last()
+                    .copied()
+                    .map_or(Update::None, |i| self.select_model(i, layout)),
                 KeyCode::Enter | KeyCode::Char('c') => self.create_profile_for_selected_model(),
                 KeyCode::Char('u') => self.request_unload(),
                 KeyCode::Char('v') => self.open_model_runtime_picker(),
@@ -2576,12 +2998,10 @@ impl App {
             return Update::Render;
         }
         self.model_search_format = format;
-        if self.model_search.is_some() {
-            self.model_search_editing = false;
-            self.request_model_search()
-        } else {
-            Update::Render
-        }
+        self.model_search_editing = false;
+        self.selected_model_search_result =
+            (!self.model_search_artifacts().is_empty()).then_some(0);
+        Update::Render
     }
 
     fn move_model_search_selection(&mut self, direction: isize) -> Update {
@@ -2610,13 +3030,11 @@ impl App {
         Update::Render
     }
 
-    fn move_model_download_selection(&mut self, direction: isize, layout: &UiLayout) -> Update {
-        let jobs = layout
-            .download_job_rows
-            .iter()
-            .filter_map(|(index, _)| self.model_download_jobs.get(*index))
-            .filter(|job| download_job_is_controllable(job))
-            .map(|job| job.id.clone())
+    fn move_model_download_selection(&mut self, direction: isize, _layout: &UiLayout) -> Update {
+        let jobs = self
+            .model_download_display_indices()
+            .into_iter()
+            .map(|i| self.model_download_jobs[i].id.clone())
             .collect::<Vec<_>>();
         if jobs.is_empty() {
             return Update::None;
@@ -2731,6 +3149,27 @@ impl App {
             return Update::None;
         }
         match key.code {
+            KeyCode::Char('i') => {
+                self.profile_actions_open = false;
+                self.settings_show_detail = !self.settings_show_detail;
+                Update::Render
+            }
+            KeyCode::Char('[') => {
+                self.settings_detail_scroll = self.settings_detail_scroll.saturating_sub(1);
+                Update::Render
+            }
+            KeyCode::Char(']') => {
+                self.settings_detail_scroll = self.settings_detail_scroll.saturating_add(1);
+                Update::Render
+            }
+            KeyCode::Char('/') => self.begin_settings_command(SettingsInputKind::Search),
+            KeyCode::Char('o') => {
+                self.settings_overrides_only = !self.settings_overrides_only;
+                self.settings_setting_index = 0;
+                self.settings_scroll = 0;
+                Update::Render
+            }
+            KeyCode::Char('R') => self.begin_settings_command(SettingsInputKind::Reset),
             KeyCode::Left => self.move_settings_scope(-1),
             KeyCode::Right | KeyCode::Tab => self.move_settings_scope(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_settings_selection(-1, layout),
@@ -2747,7 +3186,49 @@ impl App {
         if self.settings_busy {
             return Update::None;
         }
+        if self.profile_actions_open
+            && matches!(
+                key.code,
+                KeyCode::Enter
+                    | KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Char('j' | 'k')
+            )
+        {
+            return Update::None;
+        }
         match key.code {
+            KeyCode::Char('a') => {
+                self.profile_actions_open = !self.profile_actions_open;
+                self.settings_show_detail = false;
+                Update::Render
+            }
+
+            KeyCode::Char('i') => {
+                self.profile_actions_open = false;
+                self.settings_show_detail = !self.settings_show_detail;
+                Update::Render
+            }
+            KeyCode::Char('[') => {
+                self.settings_detail_scroll = self.settings_detail_scroll.saturating_sub(1);
+                Update::Render
+            }
+            KeyCode::Char(']') => {
+                self.settings_detail_scroll = self.settings_detail_scroll.saturating_add(1);
+                Update::Render
+            }
+            KeyCode::Char('/') => self.begin_settings_command(SettingsInputKind::Search),
+            KeyCode::Char('o') => {
+                self.settings_overrides_only = !self.settings_overrides_only;
+                self.settings_setting_index = 0;
+                self.settings_scroll = 0;
+                Update::Render
+            }
+            KeyCode::Char('R') => self.begin_settings_command(SettingsInputKind::Reset),
             KeyCode::Left | KeyCode::Char('h') => self.move_model_profile_selection(-1),
             KeyCode::Right | KeyCode::Char('l') if key.code != KeyCode::Char('l') => {
                 self.move_model_profile_selection(1)
@@ -2765,11 +3246,171 @@ impl App {
             KeyCode::Char('m') => self.cycle_profile_model(),
             KeyCode::Char('e') => self.cycle_profile_engine(),
             KeyCode::Char('r') => self.refresh_selected_model_profile(),
+            KeyCode::Char('p') => self.cycle_profile_role(),
             _ => Update::None,
         }
     }
 
+    fn begin_settings_command(&mut self, kind: SettingsInputKind) -> Update {
+        self.profile_actions_open = false;
+        let text = if kind == SettingsInputKind::Search {
+            self.settings_query.clone()
+        } else {
+            String::new()
+        };
+        self.settings_input = Some(SettingsInput {
+            kind,
+            cursor: text.chars().count(),
+            text,
+            editor: None,
+        });
+        Update::Render
+    }
+
+    fn handle_typed_editor_key(&mut self, key: KeyEvent) -> Option<Update> {
+        let input = self.settings_input.as_mut()?;
+        let editor = input.editor.as_mut()?;
+        if key.code == KeyCode::F(1) {
+            editor.info_page = editor.info_page.saturating_add(1);
+            return Some(Update::Render);
+        }
+        if key.code == KeyCode::Esc {
+            return None;
+        }
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return None;
+        }
+        if editor.editing_item {
+            if matches!(key.code, KeyCode::Enter | KeyCode::F(3)) {
+                editor.items[editor.item] = input.text.clone();
+                editor.editing_item = false;
+                return Some(Update::Render);
+            }
+            return None;
+        }
+        if editor.custom()
+            && editor.definition.kind == norted_core::SettingKind::JsonObject
+            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+        {
+            let chars: Vec<char> = input.text.chars().collect();
+            let start = chars[..input.cursor]
+                .iter()
+                .rposition(|c| *c == '\n')
+                .map_or(0, |i| i + 1);
+            let column = input.cursor - start;
+            if key.code == KeyCode::Up && start > 0 {
+                let previous = chars[..start - 1]
+                    .iter()
+                    .rposition(|c| *c == '\n')
+                    .map_or(0, |i| i + 1);
+                input.cursor = previous + column.min(start - 1 - previous);
+            } else if key.code == KeyCode::Down {
+                if let Some(end) = chars[input.cursor..].iter().position(|c| *c == '\n') {
+                    let next = input.cursor + end + 1;
+                    let length = chars[next..]
+                        .iter()
+                        .position(|c| *c == '\n')
+                        .unwrap_or(chars.len() - next);
+                    input.cursor = next + column.min(length);
+                }
+            }
+            return Some(Update::Render);
+        }
+        match key.code {
+            KeyCode::Up => editor.move_selection(-1),
+            KeyCode::Down => editor.move_selection(1),
+            KeyCode::Tab => {
+                if editor.visible().last() == Some(&editor.selected) {
+                    editor.selected = 0;
+                } else {
+                    editor.move_selection(1);
+                }
+            }
+            KeyCode::BackTab => {
+                if editor.selected == 0 {
+                    editor.selected = *editor.visible().last().unwrap_or(&0);
+                } else {
+                    editor.move_selection(-1);
+                }
+            }
+            KeyCode::F(2)
+                if editor.custom()
+                    && editor.definition.kind == norted_core::SettingKind::StringList =>
+            {
+                editor.items.push(String::new());
+                editor.item = editor.items.len() - 1;
+                editor.editing_item = true;
+                input.text.clear();
+                input.cursor = 0;
+            }
+            KeyCode::F(3) if editor.custom() && !editor.items.is_empty() => {
+                editor.editing_item = true;
+                input.text = editor.items[editor.item].clone();
+                input.cursor = input.text.chars().count();
+            }
+            KeyCode::F(4) if editor.custom() && !editor.items.is_empty() => {
+                editor.items.remove(editor.item);
+                editor.item = editor.item.min(editor.items.len().saturating_sub(1));
+            }
+            KeyCode::F(5) if editor.item > 0 => {
+                editor.items.swap(editor.item, editor.item - 1);
+                editor.item -= 1;
+            }
+            KeyCode::F(6) if editor.item + 1 < editor.items.len() => {
+                editor.items.swap(editor.item, editor.item + 1);
+                editor.item += 1;
+            }
+            KeyCode::PageUp | KeyCode::F(7) => editor.item = editor.item.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::F(8) => {
+                editor.item = (editor.item + 1).min(editor.items.len().saturating_sub(1))
+            }
+            KeyCode::Enter
+                if editor.custom()
+                    && editor.definition.kind == norted_core::SettingKind::JsonObject =>
+            {
+                let index = byte_index(&input.text, input.cursor);
+                input.text.insert(index, '\n');
+                input.cursor += 1;
+            }
+            KeyCode::Enter => return None,
+            KeyCode::Char(c)
+                if !editor.custom()
+                    && editor.options.len() > 8
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                editor.filter.push(c);
+                editor.selected = *editor.visible().last().unwrap_or(&0);
+            }
+            KeyCode::Backspace if !editor.custom() => {
+                editor.filter.pop();
+            }
+            _ if editor.custom()
+                && editor.definition.kind != norted_core::SettingKind::StringList =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        Some(Update::Render)
+    }
+
     fn handle_settings_input_key(&mut self, key: KeyEvent) -> Update {
+        if self.settings_busy {
+            return Update::None;
+        }
+        if key.code == KeyCode::F(10)
+            && self
+                .settings_input
+                .as_ref()
+                .is_some_and(|i| i.editor.is_some())
+        {
+            return self.submit_settings_input();
+        }
+        if let Some(update) = self.handle_typed_editor_key(key) {
+            return update;
+        }
         match key.code {
             KeyCode::Esc => self.cancel_settings_input(),
             KeyCode::Enter => self.submit_settings_input(),
@@ -2829,12 +3470,36 @@ impl App {
         }
     }
 
+    fn restore_editor_selection(&mut self) {
+        let Some(editor) = self
+            .settings_input
+            .as_ref()
+            .and_then(|input| input.editor.as_ref())
+        else {
+            return;
+        };
+        let id = editor.definition.id.clone();
+        if let Some(index) = self
+            .settings_definitions()
+            .iter()
+            .position(|definition| definition.id == id)
+        {
+            self.settings_setting_index = index;
+            self.settings_scroll = self.settings_scroll.min(index);
+        }
+    }
+
     fn cancel_settings_input(&mut self) -> Update {
+        if self.settings_busy {
+            return Update::None;
+        }
         let creating_profile = self
             .settings_input
             .as_ref()
             .is_some_and(|input| input.kind == SettingsInputKind::ProfileName);
+        self.restore_editor_selection();
         self.settings_input = None;
+        self.settings_input_error = None;
         self.hover = None;
         if creating_profile && self.screen == Screen::ModelProfiles {
             self.refresh_selected_model_profile()
@@ -2844,10 +3509,45 @@ impl App {
     }
 
     fn submit_settings_input(&mut self) -> Update {
-        let Some(input) = self.settings_input.take() else {
+        if self.settings_busy {
+            return Update::None;
+        }
+        let Some(mut input) = self.settings_input.take() else {
             return Update::None;
         };
+        self.settings_input_error = None;
+        if let Some(editor) = &mut input.editor {
+            if editor.editing_item {
+                editor.items[editor.item] = input.text.clone();
+                editor.editing_item = false;
+            }
+        }
         match input.kind {
+            SettingsInputKind::Search => {
+                self.settings_query = input.text;
+                self.settings_setting_index = 0;
+                self.settings_scroll = 0;
+                Update::Render
+            }
+            SettingsInputKind::Reset => {
+                if input.text != "RESET" {
+                    self.notice = Some(
+                        "Reset cancelled; type RESET to remove all overrides in this scope"
+                            .to_owned(),
+                    );
+                    return Update::Render;
+                }
+                let scope = if self.screen == Screen::ModelProfiles {
+                    self.selected_model_profile_value()
+                        .map(|profile| SettingsScope::ModelProfile(profile.id.clone()))
+                } else {
+                    self.selected_settings_scope()
+                };
+                scope.map_or(Update::None, |scope| {
+                    self.queue_settings_action(SettingsAction::Reset { scope })
+                })
+            }
+
             SettingsInputKind::ProfileName => match ModelProfileId::new(input.text.clone()) {
                 Ok(id) => {
                     let Some(model) = self
@@ -2899,22 +3599,29 @@ impl App {
                 }
             },
             SettingsInputKind::SettingValue => {
-                let Some(id) = input.setting_id else {
+                let Some(editor) = input.editor.as_ref() else {
                     return Update::None;
                 };
-                let definition = self
-                    .settings_definitions()
-                    .into_iter()
-                    .find(|definition| definition.id == id)
-                    .cloned();
-                let Some(definition) = definition else {
-                    self.notice = Some("The selected setting is no longer available".to_owned());
-                    return Update::Render;
-                };
-                match definition.parse(&input.text) {
-                    Ok(value) => self.set_selected_setting(id, value),
+                match editor.value(&input.text) {
+                    Ok(value) => {
+                        let action = match value {
+                            Some(value) => SettingsAction::Set {
+                                scope: editor.scope.clone(),
+                                id: editor.definition.id.clone(),
+                                value,
+                                model: editor.model.clone(),
+                            },
+                            None => SettingsAction::Unset {
+                                scope: editor.scope.clone(),
+                                id: editor.definition.id.clone(),
+                            },
+                        };
+                        self.settings_input = Some(input);
+                        self.queue_settings_action(action)
+                    }
                     Err(error) => {
-                        self.notice = Some(error.to_string());
+                        self.settings_input_error = Some(error);
+                        self.settings_input = Some(input);
                         Update::Render
                     }
                 }
@@ -2931,62 +3638,57 @@ impl App {
         let Some(definition) = definition else {
             return Update::None;
         };
-        let current = self.current_layer_value(&definition.id);
-        match &definition.kind {
-            norted_core::SettingKind::Toggle => {
-                let value = !matches!(current, Some(SettingValue::Toggle(true)));
-                self.set_selected_setting(definition.id, SettingValue::Toggle(value))
-            }
-            norted_core::SettingKind::OneWayFlag => {
-                self.set_selected_setting(definition.id, SettingValue::FlagEnabled)
-            }
-            norted_core::SettingKind::Choice { choices } if !choices.is_empty() => {
-                let current = match current {
-                    Some(SettingValue::Choice(value)) => choices
-                        .iter()
-                        .position(|choice| choice == &value)
-                        .map(|index| (index + 1) % choices.len()),
-                    _ => None,
-                }
-                .unwrap_or(0);
-                let value = choices[current].clone();
-                self.set_selected_setting(definition.id, SettingValue::Choice(value))
-            }
-            _ => {
-                let text = current.map(|value| value.to_string()).unwrap_or_default();
-                let cursor = text.chars().count();
-                self.settings_input = Some(SettingsInput {
-                    kind: SettingsInputKind::SettingValue,
-                    text,
-                    cursor,
-                    setting_id: Some(definition.id),
-                });
-                Update::Render
-            }
+        if !definition.supported {
+            self.notice = Some(format!(
+                "{}: unsupported; Delete removes the local override",
+                definition.id
+            ));
+            return Update::Render;
         }
-    }
-
-    fn set_selected_setting(&mut self, id: SettingId, value: SettingValue) -> Update {
-        let (scope, model) = if self.screen == Screen::ModelProfiles {
-            let Some(profile) = self.selected_model_profile_value() else {
-                return Update::None;
-            };
-            (
-                SettingsScope::ModelProfile(profile.id.clone()),
-                self.selected_profile_model().cloned().map(Box::new),
-            )
-        } else {
-            let Some(scope) = self.selected_settings_scope() else {
-                return Update::None;
-            };
-            (scope, None)
+        let local = self.current_layer_value(&definition.id);
+        let text = match local.as_ref() {
+            Some(
+                SettingValue::UnsignedIntegerOrChoice(
+                    norted_core::UnsignedIntegerOrChoiceValue::Choice(_),
+                )
+                | SettingValue::GpuOffload(
+                    norted_core::GpuOffload::None
+                    | norted_core::GpuOffload::Auto
+                    | norted_core::GpuOffload::All,
+                ),
+            ) => String::new(),
+            value => value.map(ToString::to_string).unwrap_or_default(),
         };
-        self.queue_settings_action(SettingsAction::Set {
+        let scope = if self.screen == Screen::ModelProfiles {
+            self.selected_model_profile_value()
+                .map(|p| SettingsScope::ModelProfile(p.id.clone()))
+        } else {
+            self.selected_settings_scope()
+        };
+        let Some(scope) = scope else {
+            return Update::None;
+        };
+        let metadata = self.settings_default_detail(&definition.id);
+        let model = if self.screen == Screen::ModelProfiles {
+            self.selected_profile_model().cloned().map(Box::new)
+        } else {
+            None
+        };
+        let editor = crate::settings_editor::SettingsEditor::new(
+            definition.clone(),
             scope,
-            id,
-            value,
             model,
-        })
+            metadata,
+            local.as_ref(),
+        );
+        self.settings_input_error = None;
+        self.settings_input = Some(SettingsInput {
+            kind: SettingsInputKind::SettingValue,
+            cursor: text.chars().count(),
+            text,
+            editor: Some(editor),
+        });
+        Update::Render
     }
 
     fn handle_profile_engine_key(&mut self, key: KeyEvent) -> Update {
@@ -3066,10 +3768,7 @@ impl App {
             return Update::None;
         };
         if self.current_layer_value(&id).is_none() {
-            self.notice = Some(
-                "This layer has no override; the concrete lower-layer value already applies"
-                    .to_owned(),
-            );
+            self.notice = Some("This layer already inherits from its parent".to_owned());
             return Update::Render;
         }
         self.queue_settings_action(SettingsAction::Unset { scope, id })
@@ -3126,9 +3825,10 @@ impl App {
         if len == 0 {
             return Update::None;
         }
+        self.settings_detail_scroll = 0;
         self.settings_setting_index =
             (self.settings_setting_index as isize + direction).clamp(0, len as isize - 1) as usize;
-        let capacity = layout.settings_capacity().max(1);
+        let capacity = (layout.settings_list.height.saturating_sub(1) as usize / 2).max(1);
         if self.settings_setting_index < self.settings_scroll {
             self.settings_scroll = self.settings_setting_index;
         } else if self.settings_setting_index >= self.settings_scroll + capacity {
@@ -3149,6 +3849,14 @@ impl App {
                 .saturating_add(amount as usize)
                 .min(max_scroll)
         };
+        self.settings_scroll = self.settings_scroll.min(max_scroll);
+        let visible = (layout.settings_list.height.saturating_sub(1) as usize / 2).max(1);
+        self.settings_setting_index = self.settings_setting_index.clamp(
+            self.settings_scroll,
+            (self.settings_scroll + visible - 1)
+                .min(self.settings_definitions().len().saturating_sub(1)),
+        );
+        self.settings_detail_scroll = 0;
         Update::Render
     }
 
@@ -3190,7 +3898,7 @@ impl App {
             kind: SettingsInputKind::DuplicateProfile,
             text: String::new(),
             cursor: 0,
-            setting_id: None,
+            editor: None,
         });
         Update::Render
     }
@@ -3257,6 +3965,7 @@ impl App {
         self.profile_inspection_stale = false;
         self.settings_schema = None;
         self.settings_resolved = None;
+        self.settings_parent = None;
         self.settings_runtime_id = None;
         self.settings_validation_error = None;
         let Some(profile) = self.selected_model_profile_value().cloned() else {
@@ -3315,6 +4024,7 @@ impl App {
         self.profile_inspection_stale = false;
         self.settings_schema = None;
         self.settings_resolved = None;
+        self.settings_parent = None;
         self.settings_runtime_id = None;
         self.settings_validation_error = None;
         self.screen = Screen::ModelProfiles;
@@ -3325,7 +4035,7 @@ impl App {
             kind: SettingsInputKind::ProfileName,
             text: String::new(),
             cursor: 0,
-            setting_id: None,
+            editor: None,
         });
         Update::Render
     }
@@ -3386,6 +4096,19 @@ impl App {
             self.pending_profile_delete_confirmation = None;
         }
         match target {
+            Some(HoverTarget::ModelDownloadsView) => {
+                self.downloads_focused = !self.downloads_focused;
+                self.model_search_editing = false;
+                self.model_filter_editing = false;
+                self.focus = FocusArea::Content;
+                Update::Render
+            }
+            Some(HoverTarget::InspectionDetails) => {
+                self.detail_text = crate::ui::screens::inspection_text(self);
+                self.detail_scroll = 0;
+                Update::Render
+            }
+
             Some(HoverTarget::Navigation(screen)) => {
                 if self.command_active {
                     self.close_command();
@@ -3562,6 +4285,33 @@ impl App {
                     Update::Render
                 }
             }
+            Some(HoverTarget::ProfileActions) => {
+                self.profile_actions_open = !self.profile_actions_open;
+                self.settings_show_detail = false;
+                Update::Render
+            }
+            Some(HoverTarget::SettingsDetails) => {
+                self.profile_actions_open = false;
+                self.settings_show_detail = !self.settings_show_detail;
+                Update::Render
+            }
+            Some(HoverTarget::SettingsSearch) if !self.settings_busy => {
+                self.begin_settings_command(SettingsInputKind::Search)
+            }
+            Some(HoverTarget::SettingsReset) if !self.settings_busy => {
+                self.begin_settings_command(SettingsInputKind::Reset)
+            }
+            Some(HoverTarget::SettingsFilter) if !self.settings_busy => {
+                self.settings_overrides_only = !self.settings_overrides_only;
+                self.settings_setting_index = 0;
+                self.settings_scroll = 0;
+                Update::Render
+            }
+            Some(
+                HoverTarget::SettingsSearch
+                | HoverTarget::SettingsReset
+                | HoverTarget::SettingsFilter,
+            ) => Update::None,
             Some(HoverTarget::Setting(index)) => {
                 self.focus = FocusArea::Content;
                 self.settings_setting_index = index;
@@ -3666,6 +4416,8 @@ impl App {
                 | HoverTarget::ProfileEngineApply
                 | HoverTarget::ProfileEngineCancel
                 | HoverTarget::HelpClose
+                | HoverTarget::SettingsEditorOption(_)
+                | HoverTarget::SettingsEditorAction(_)
                 | HoverTarget::SettingsInputField
                 | HoverTarget::SettingsInputSubmit
                 | HoverTarget::SettingsInputCancel,
@@ -3687,6 +4439,13 @@ impl App {
     }
 
     fn handle_wheel(&mut self, position: Position, layout: &UiLayout, direction: isize) -> Update {
+        if layout.settings_detail.contains(position) {
+            self.settings_detail_scroll = self
+                .settings_detail_scroll
+                .saturating_add_signed(direction as i16);
+            return Update::Render;
+        }
+
         if self.command_active && layout.contains_suggestions(position) {
             let len = self.suggestions().len();
             if len == 0 {
@@ -4509,20 +5268,7 @@ impl App {
     }
 
     fn scroll_runtimes(&mut self, amount: isize, layout: &UiLayout) -> Update {
-        let len = self
-            .runtime_list
-            .as_ref()
-            .map_or(0, |snapshot| snapshot.installed.len());
-        let capacity = layout.runtime_capacity().max(1);
-        let max_scroll = len.saturating_sub(capacity);
-        self.runtime_scroll = if amount < 0 {
-            self.runtime_scroll.saturating_sub(amount.unsigned_abs())
-        } else {
-            self.runtime_scroll
-                .saturating_add(amount as usize)
-                .min(max_scroll)
-        };
-        Update::Render
+        self.move_runtime_selection(amount, layout)
     }
 
     fn apply_runtime_list_result(&mut self, result: Result<RuntimeListSnapshot, String>) {
@@ -4537,6 +5283,16 @@ impl App {
     }
 
     fn apply_runtime_list(&mut self, snapshot: RuntimeListSnapshot) {
+        let picker_id = self
+            .runtime_picker_selection
+            .and_then(|i| self.runtime_list.as_ref()?.installed.get(i))
+            .map(|s| s.runtime.manifest.runtime_id.clone());
+        self.runtime_picker_selection = picker_id.and_then(|id| {
+            snapshot
+                .installed
+                .iter()
+                .position(|s| s.runtime.manifest.runtime_id == id)
+        });
         let selected_id = self.selected_runtime.and_then(|index| {
             self.runtime_list
                 .as_ref()?
@@ -4559,43 +5315,53 @@ impl App {
         self.runtime_list = Some(snapshot);
     }
 
+    pub fn installed_model_indices(&self) -> Vec<usize> {
+        let query = self.model_filter.to_lowercase();
+        self.snapshot
+            .models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| {
+                query.is_empty()
+                    || model.display_name.to_lowercase().contains(&query)
+                    || model.path.to_string_lossy().to_lowercase().contains(&query)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     fn move_model_selection(&mut self, direction: isize, layout: &UiLayout) -> Update {
-        if self.snapshot.models.is_empty() {
+        let indices = self.installed_model_indices();
+        if indices.is_empty() {
             return Update::None;
         }
-        let next = self.selected_model.map_or(0, |current| {
-            (current as isize + direction).clamp(0, self.snapshot.models.len() as isize - 1)
-                as usize
+        let current = self
+            .selected_model
+            .and_then(|i| indices.iter().position(|v| *v == i));
+        let next = current.map_or(0, |i| {
+            (i as isize + direction).clamp(0, indices.len() as isize - 1) as usize
         });
-        self.select_model(next, layout)
+        self.select_model(indices[next], layout)
     }
 
     fn select_model(&mut self, index: usize, layout: &UiLayout) -> Update {
-        if self.snapshot.models.is_empty() {
+        let indices = self.installed_model_indices();
+        let Some(position) = indices.iter().position(|i| *i == index) else {
             return Update::None;
-        }
-        let index = index.min(self.snapshot.models.len() - 1);
+        };
         self.selected_model = Some(index);
+        self.pending_model_remove_confirmation = None;
         let capacity = layout.model_capacity().max(1);
-        if index < self.model_scroll {
-            self.model_scroll = index;
-        } else if index >= self.model_scroll + capacity {
-            self.model_scroll = index + 1 - capacity;
+        if position < self.model_scroll {
+            self.model_scroll = position;
+        } else if position >= self.model_scroll + capacity {
+            self.model_scroll = position + 1 - capacity;
         }
         Update::Render
     }
 
     fn scroll_models(&mut self, amount: isize, layout: &UiLayout) -> Update {
-        let capacity = layout.model_capacity().max(1);
-        let max_scroll = self.snapshot.models.len().saturating_sub(capacity);
-        self.model_scroll = if amount < 0 {
-            self.model_scroll.saturating_sub(amount.unsigned_abs())
-        } else {
-            self.model_scroll
-                .saturating_add(amount as usize)
-                .min(max_scroll)
-        };
-        Update::Render
+        self.move_model_selection(amount, layout)
     }
 
     fn scroll_logs(&mut self, amount: isize, layout: &UiLayout) -> Update {
@@ -4610,11 +5376,9 @@ impl App {
     }
 
     fn reconcile_models(&mut self) {
-        let len = self.snapshot.models.len();
-        self.selected_model = self
-            .selected_model
-            .and_then(|index| (len > 0).then(|| index.min(len - 1)));
-        self.model_scroll = self.model_scroll.min(len.saturating_sub(1));
+        let indices = self.installed_model_indices();
+        self.selected_model = self.selected_model.filter(|index| indices.contains(index));
+        self.model_scroll = self.model_scroll.min(indices.len().saturating_sub(1));
     }
 
     fn request_load(&mut self) -> Update {

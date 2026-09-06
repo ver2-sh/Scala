@@ -1,0 +1,30 @@
+   ◆  NORTED SERVER  local runtime control                                         ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+
+     Help                                                                         [ D Details ]
+     Navigate directly or use slash commands
+
+
+     NAVIGATION                                     SETTINGS AND RUNTIMES
+     Tab / Shift+Tab   change focus                 Settings          Server operations and eng
+     Left / Right      move navigation focus        ↑↓                select or scroll
+     D / Esc           details / back (scrollabl    s                 search available runtimes
+     Mouse             select rows / actions        g / Q / N         set format default
+                                                    u / Shift+U       check / install update
+     MODELS AND PROFILES                            d twice           confirm runtime removal
+     Models            Installed / Discover
+     Left / Right      change library view          COMMANDS
+     e / f / d         search, filter, download     /                 open suggestions
+     p / x             pause/resume or cancel do    ↑↓                select a suggestion
+     f / Esc           installed filter / clear     Enter / Esc       run / cancel
+     J                 focused downloads            ? / Ctrl+C        help / exit
+     l/u/e/Delete      load, unload, bind, inher    /status /models /runtimes /help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+    ›  Press / to run a command
+   ──────────────────────────────────────────────────────────────────────────────────────────────
+   Tab change focus   / commands   ? help   mouse click / hover   Ctrl+C exit
+

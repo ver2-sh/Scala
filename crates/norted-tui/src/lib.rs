@@ -2,6 +2,7 @@
 
 mod app;
 mod commands;
+mod settings_editor;
 mod terminal;
 mod theme;
 mod ui;
@@ -219,6 +220,9 @@ pub async fn run(
                 Some(Ok(Event::Paste(text))) => app.handle_paste(&text),
                 Some(Ok(Event::Resize(_, _))) => {
                     app.clear_hover();
+                    if matches!(app.screen, app::Screen::Settings | app::Screen::ModelProfiles) {
+                        app.settings_scroll = app.settings_setting_index;
+                    }
                     Update::Render
                 },
                 Some(Ok(_)) => Update::None,
@@ -722,24 +726,20 @@ async fn execute_settings_action(
                     )
                     .to_string()));
                 };
-                let schema = match runtime_packs
-                    .model_settings_schema_for_engine(model, profile.engine_id.as_str())
-                {
-                    Ok(schema) => schema,
-                    Err(error) => {
-                        return SettingsTaskResult::Stored(Err(error.to_string()));
-                    }
+                let state = match settings_store.read().await {
+                    Ok(state) => state,
+                    Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
                 };
                 let mut candidate = profile.overrides.clone();
                 candidate.0.extend(patch.0.clone());
-                if let Err(error) = schema.validate(&resolved_patch(
-                    profile.engine_id.as_str(),
-                    &profile.id,
-                    &candidate,
-                )) {
+                if let Err(error) = runtime_packs
+                    .validate_profile_settings(&state, profile, model, &candidate, &paths.data_dir)
+                    .await
+                {
                     return SettingsTaskResult::Stored(Err(error.to_string()));
                 }
             }
+
             if let SettingsScope::Runtime(engine_id) = &scope {
                 let state = match settings_store.read().await {
                     Ok(state) => state,
@@ -774,7 +774,10 @@ async fn execute_settings_action(
                     Ok(resolved) => resolved,
                     Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
                 };
-                if let Err(error) = schema.validate(&resolved) {
+                if let Err(error) = runtime_packs
+                    .validate_runtime_settings(&schema, &resolved)
+                    .await
+                {
                     return SettingsTaskResult::Stored(Err(error.to_string()));
                 }
             }
@@ -827,6 +830,42 @@ async fn execute_settings_action(
                         }
                         profile.overrides.0.extend(patch.0);
                         profile.validate()?;
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|error| error.to_string()),
+            };
+            finish_settings_write(
+                &runtime_packs,
+                paths,
+                &settings_store,
+                &profiles_store,
+                result,
+            )
+            .await
+        }
+        SettingsAction::Reset { scope } => {
+            let result = match scope {
+                SettingsScope::ModelProfile(id) => profiles_store
+                    .update(move |state| {
+                        let profile = state
+                            .profiles
+                            .get_mut(&id)
+                            .ok_or(SettingsError::ModelProfileNotFound(id))?;
+                        profile.overrides.0.clear();
+                        Ok(())
+                    })
+                    .await
+                    .map_err(|error| error.to_string()),
+                scope => settings_store
+                    .update(move |state| {
+                        match scope {
+                            SettingsScope::Server => state.server_settings.0.clear(),
+                            SettingsScope::Runtime(engine) => {
+                                state.runtime_defaults.remove(&engine);
+                            }
+                            SettingsScope::ModelProfile(_) => unreachable!(),
+                        }
                         Ok(())
                     })
                     .await
@@ -1173,8 +1212,14 @@ async fn execute_settings_action(
         }
         SettingsAction::InspectProfile { profile, model } => {
             let model_id = model.id.clone();
+            let inspected_profile = profile.clone();
             let result = async {
                 let (state, profiles) = read_tui_settings(&settings_store, &profiles_store).await?;
+                let profile = profiles.profiles.get(&profile.id).cloned()
+                    .ok_or_else(|| format!("Model Profile `{}` no longer exists", profile.id))?;
+                if profile.model_id != model.id {
+                    return Err("Profile model binding changed during inspection; refresh the profile".to_owned());
+                }
                 let mut resolved = state
                     .resolve(
                         &profile.id,
@@ -1187,69 +1232,59 @@ async fn execute_settings_action(
                 runtime_packs
                     .normalize_settings(profile.engine_id.as_str(), &mut resolved)
                     .map_err(|error| error.to_string())?;
+                let mut parent = state.resolve(&profile.id, profile.engine_id.as_str(), &SettingsPatch::default(), &SettingsPatch::default(), &paths.data_dir)
+                    .map_err(|error| error.to_string())?;
+                runtime_packs.normalize_settings(profile.engine_id.as_str(), &mut parent).map_err(|error| error.to_string())?;
                 let model_schema = runtime_packs
                     .model_settings_schema_for_engine(&model, profile.engine_id.as_str())
                     .map_err(|error| error.to_string())?;
-                let model_validation_error = model_schema
-                    .validate(&resolved)
-                    .err()
-                    .map(|error| error.to_string());
-                let (runtime_id, schema, validation_error) = if let Some(error) =
-                    model_validation_error
-                {
-                    (
-                        None,
-                        model_schema,
-                        Some(format!(
-                            "Model Profile `{}` contradicts capabilities proved by bound model `{}`: {error}",
-                            profile.id, model.id
-                        )),
-                    )
-                } else {
-                    runtime_packs.refresh_host_capabilities().await;
-                    match runtime_packs
-                        .settings_schema_for_model_for_engine_with_settings(
-                            &model,
-                            profile.engine_id.as_str(),
-                            None,
-                            Some(&resolved),
-                        )
-                        .await
-                    {
-                        Ok((selection, schema)) => {
-                            let validation_error = schema
-                                .materialize_runtime_configuration(&mut resolved)
-                                .and_then(|()| schema.validate(&resolved))
-                                .and_then(|()| schema.materialize_effective(&mut resolved))
-                                .err()
-                                .map(|error| error.to_string());
-                            (
-                                Some(selection.runtime.manifest.runtime_id),
-                                schema,
-                                validation_error,
-                            )
+                let (runtime_id, mut schema, mut validation_error) = match runtime_packs
+                    .resolve_for_settings(&model, profile.engine_id.as_str(), None, None).await {
+                    Ok(selection) => {
+                        let selected_id = selection.runtime.manifest.runtime_id.clone();
+                        match runtime_packs.settings_schema_for_model_for_engine_with_settings(
+                            &model, profile.engine_id.as_str(), Some(&selected_id), Some(&resolved)).await {
+                            Ok((_, schema)) => {
+                                match runtime_packs.settings_schema_for_model_for_engine_with_settings(
+                                    &model, profile.engine_id.as_str(), Some(&selected_id), Some(&parent)).await {
+                                    Ok((_, parent_schema)) => { parent_schema.materialize_effective(&mut parent).map_err(|error| error.to_string())?; }
+                                    Err(error) => { return Err(format!("Parent settings inspection for runtime `{selected_id}` failed: {error}")); }
+                                }
+                                let error = schema.validate(&resolved).err().map(|error| error.to_string())
+                                    .or(runtime_packs.validate_configuration(&selection.runtime, Some(&model), &resolved).await.err().map(|error| error.to_string()));
+                                (Some(selected_id), schema, error)
+                            }
+                            Err(error) => {
+                                let mut schema = model_schema;
+                                schema.runtime_id = Some(selected_id.clone());
+                                for definition in &mut schema.definitions {
+                                    definition.supported = false;
+                                    definition.default_preview = None;
+                                    definition.unsupported_reason = Some("Runtime metadata/probe failed".to_owned());
+                                }
+                                (Some(selected_id), schema, Some(format!("Runtime metadata/probe failed: {error}")))
+                            }
                         }
-                        Err(error) => (
-                            None,
-                            model_schema,
-                            Some(format!(
-                                "No installed runtime is compatible with Model Profile `{}` on bound engine `{}`: {error}",
-                                profile.id, profile.engine_id
-                            )),
-                        ),
                     }
+                    Err(error) => (None, model_schema, Some(format!("Runtime selection for Model Profile `{}` on engine `{}` failed: {error}", profile.id, profile.engine_id))),
                 };
+                schema.retain_override_definitions(&resolved);
+                if let Err(error) = schema.materialize_effective(&mut resolved) {
+                    validation_error = Some(error.to_string());
+                }
                 Ok(ModelSettingsInspection {
                     state,
                     profiles,
                     runtime_id,
                     schema,
                     resolved,
+                    parent,
                     validation_error,
                 })
             }
             .await;
             SettingsTaskResult::Inspected {
+                profile: *inspected_profile,
                 model_id,
                 result: Box::new(result),
             }

@@ -1,0 +1,43 @@
+
+   ◆  NORTED SERVER  local runtime control                                                                                                     ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+      Server
+                             Baseline      0.10.0 / CUDA / w12
+      llama.cpp              Applies       Next load
+                             [ / Search ]  [ o Overrides ]     [ R Reset scope ]  [ i Details ]
+      NInfer                 Setting                    Value                Source           Action     Status     Setting · i expand/close · [ ] scroll ─
+                             GENERAL                                                                               Identifier: q27.context_length
+      q27                    Context length             auto                 Runtime default  —                    Description: Explicit context window
+                             Parallel requests          1                    Runtime default  —                    requested from the selected runtime
+                             GENERATION                                                                            Effective value: auto
+                             Default response length    8192                 Runtime default  —                    Source: runtime default
+                             Min P                      0.0                  Runtime default  —                    Applies: Next load
+                             Random seed                0                    Runtime default  —                    Runtime baseline (read-only): auto
+                             Temperature                0.0                  Runtime default  —                    Parent: auto
+                             Top K                      0                    Runtime default  —                    Settings layer: absent (Inherited)
+                             Top P                      1.0                  Runtime default  —                    Inherit target: runtime
+                             REASONING                                                                             Baseline policy: q27 sizes context from
+                             Enable thinking            off                  Runtime default  —                    live free VRAM and startup reservations
+                             Reasoning budget           auto                 Runtime default  —                    after model weights load; compact KV is
+                             Reasoning effort           Unsupported          —                —          Unsup.    capped at 262144 and FP16 at 131072
+                             Per-request thinking       disabled             Runtime default  —                    Constraints: non-negative integer (at
+                             Template thinking          disabled             Runtime default  —                    least 1)
+                             Thinking                   disabled             Runtime default  —                    Runtime ID:
+                             Thinking budget            auto                 Runtime default  —                    q27-0-10-0-linux-x86-64-cuda-w12-998d20f
+                             Thinking budget fraction   0.5                  Runtime default  —                    d9c973ba9
+                             PROMPT
+                             Bare system prompt         disabled             Runtime default  —
+                             Prompt delivery            runtime_chat         Runtime default  —
+                             Template mode              runtime_default      Runtime default  —
+                             Render generation prompt   enabled              Runtime default  —
+                             Response filter            none                 Runtime default  —
+                             System prompt              None                 Runtime default  —
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    ›  Press / to run a command
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Left/Right scope   ↑↓ setting   Enter edit   Delete inherit   ? help

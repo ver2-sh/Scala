@@ -64,7 +64,7 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/settings",
-        description: "Open Server Settings and runtime defaults",
+        description: "Open Server Settings and independent engine overrides",
         action: CommandAction::Navigate(Screen::Settings),
     },
     SlashCommand {

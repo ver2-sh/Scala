@@ -1,0 +1,43 @@
+
+   ◆  NORTED SERVER  local runtime control                                                                                                     ●  API Running
+
+    Overview  Models  Model Profiles  Runtimes  Server  Logs  Settings  Help
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+      gemma-4-31b-roleplay
+                             Profile       gemma-4-31b-roleplay                             Role          Primary
+      qwen38-27b-q27-q6      Model         gemma-4-31B-it-uncensored-heretic-Q6_K
+                             Engine        llama.cpp                                        Runtime       b10786 / CUDA / managed-portable-cuda13-v2
+      zz-long-pr…tinct-tail  Configuration Next load
+                             [ Load ]  [ Model ]  [ Engine ]  [ Role ]  [ Duplicate ]  [ Delete ]          [ Refresh ]
+
+                             [ / a…erts ]  [ o Overrides ]     [ R Reset scope ]  [ i Details ]
+                             Setting                    Value                Source           Action     Status     Setting · i expand/close · [ ] scroll ─
+                             LOAD                                                                                  Identifier: llama.cpp.active_experts
+                             Number of active experts   Unsupported          —                —          Unsup.    Description: Override the
+                                                                                                                   architecture-specific GGUF
+                                                                                                                   expert_used_count metadata only when the
+                                                                                                                   selected model proves that key
+                                                                                                                   Effective value: Unsupported
+                                                                                                                   Source: the selected GGUF does not prove
+                                                                                                                   an architecture-specific
+                                                                                                                   expert_used_count override
+                                                                                                                   Applies: Next load
+                                                                                                                   Runtime baseline (read-only): not yet
+                                                                                                                   known
+                                                                                                                   Settings layer: not yet known
+                                                                                                                   Profile layer: absent (Inherited)
+                                                                                                                   Inherit target: Settings
+                                                                                                                   Constraints: non-negative integer (at
+                                                                                                                   least 1)
+                                                                                                                   Unsupported: the selected GGUF does not
+                                                                                                                   prove an architecture-specific
+                                                                                                                   expert_used_count override
+                                                                                                                   Profile: gemma-4-31b-roleplay
+                                                                                                                   Engine: llama.cpp
+
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    !  Settings saved; operational changes apply now and model settings on the next load
+   ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Left/Right profile   ↑↓ setting   Enter edit   e change engine   l load profile   u unload active   Delete inherit   ? help

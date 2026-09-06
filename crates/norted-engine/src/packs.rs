@@ -137,6 +137,7 @@ pub struct RuntimePackManager {
     catalog: RuntimeCatalog,
     installer: RuntimeInstaller,
     host: Arc<RwLock<HostCapabilities>>,
+    host_initialized: Arc<std::sync::atomic::AtomicBool>,
     operation: Arc<Mutex<()>>,
 }
 
@@ -152,6 +153,73 @@ impl RuntimePackManager {
         adapter
             .normalize_settings(settings)
             .map_err(RuntimePackError::Adapter)
+    }
+
+    pub async fn validate_configuration(
+        &self,
+        runtime: &InstalledRuntime,
+        model: Option<&norted_core::ModelArtifact>,
+        settings: &norted_core::ResolvedSettings,
+    ) -> Result<(), RuntimePackError> {
+        let adapter = self.registry.get(&settings.engine_id).ok_or_else(|| {
+            RuntimePackError::Selection(format!("unknown engine `{}`", settings.engine_id))
+        })?;
+        adapter
+            .validate_configuration(runtime, model, &self.host_capabilities().await, settings)
+            .map_err(RuntimePackError::Adapter)
+    }
+
+    pub async fn validate_runtime_settings(
+        &self,
+        schema: &norted_core::SettingsSchema,
+        settings: &norted_core::ResolvedSettings,
+    ) -> Result<(), RuntimePackError> {
+        schema
+            .validate(settings)
+            .map_err(|error| RuntimePackError::Selection(error.to_string()))?;
+        let list = self.list().await?;
+        let runtime = list
+            .installed
+            .iter()
+            .find(|status| Some(&status.runtime.manifest.runtime_id) == schema.runtime_id.as_ref())
+            .ok_or_else(|| {
+                RuntimePackError::Selection("No installed runtime selected".to_owned())
+            })?;
+        self.validate_configuration(&runtime.runtime, None, settings)
+            .await
+    }
+
+    pub async fn validate_profile_settings(
+        &self,
+        state: &SettingsState,
+        profile: &ModelProfile,
+        model: &norted_core::ModelArtifact,
+        overrides: &SettingsPatch,
+        base: &Path,
+    ) -> Result<(), RuntimePackError> {
+        let mut resolved = state
+            .resolve(
+                &profile.id,
+                profile.engine_id.as_str(),
+                overrides,
+                &SettingsPatch::default(),
+                base,
+            )
+            .map_err(|error| RuntimePackError::Selection(error.to_string()))?;
+        self.normalize_settings(profile.engine_id.as_str(), &mut resolved)?;
+        let (selection, schema) = self
+            .settings_schema_for_model_for_engine_with_settings(
+                model,
+                profile.engine_id.as_str(),
+                None,
+                Some(&resolved),
+            )
+            .await?;
+        schema
+            .validate(&resolved)
+            .map_err(|error| RuntimePackError::Selection(error.to_string()))?;
+        self.validate_configuration(&selection.runtime, Some(model), &resolved)
+            .await
     }
 
     pub fn compatible_engine_ids(&self, model: &ModelArtifact) -> Vec<String> {
@@ -181,6 +249,7 @@ impl RuntimePackManager {
             store,
             catalog,
             installer,
+            host_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             host: Arc::new(RwLock::new(
                 HostCapabilities::current_without_accelerator_probe(),
             )),
@@ -195,11 +264,36 @@ impl RuntimePackManager {
     pub async fn refresh_host_capabilities(&self) -> HostCapabilities {
         let host = detect_host_capabilities().await;
         *self.host.write().await = host.clone();
+        self.host_initialized
+            .store(true, std::sync::atomic::Ordering::Release);
         host
     }
 
     pub async fn host_capabilities(&self) -> HostCapabilities {
         self.host.read().await.clone()
+    }
+
+    /// Editors reuse host observations; load admission and explicit runtime refresh still probe afresh.
+    pub async fn resolve_for_settings(
+        &self,
+        model: &ModelArtifact,
+        engine_id: &str,
+        explicit: Option<&RuntimeId>,
+        settings: Option<&norted_core::ResolvedSettings>,
+    ) -> Result<RuntimeSelection, RuntimePackError> {
+        if !self
+            .host_initialized
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.refresh_host_capabilities().await;
+        }
+        self.resolve_from_snapshot(
+            model,
+            explicit,
+            settings,
+            Some(engine_id),
+            &self.list().await?,
+        )
     }
 
     pub async fn settings_schema_for_model(
@@ -246,7 +340,13 @@ impl RuntimePackManager {
         structured_path_base: &Path,
     ) -> Result<(BTreeMap<String, norted_core::SettingsSchema>, Vec<String>), RuntimePackError>
     {
-        let host = self.refresh_host_capabilities().await;
+        if !self
+            .host_initialized
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.refresh_host_capabilities().await;
+        }
+        let host = self.host_capabilities().await;
         let list = self.list().await?;
         let mut schemas = BTreeMap::<String, norted_core::SettingsSchema>::new();
         let mut warnings = Vec::new();
@@ -296,7 +396,8 @@ impl RuntimePackManager {
                 .runtime_settings_schema(&status.runtime, &host, Some(&settings))
                 .await
             {
-                Ok(schema) => {
+                Ok(mut schema) => {
+                    schema.retain_override_definitions(&settings);
                     let mut resolved = settings.clone();
                     if let Err(error) = schema
                         .materialize_runtime_configuration(&mut resolved)
@@ -304,12 +405,47 @@ impl RuntimePackManager {
                         .and_then(|()| schema.materialize_effective(&mut resolved))
                     {
                         warnings.push(format!("{engine_id}: {error}"));
-                    } else {
-                        schemas.insert(engine_id, schema);
                     }
+                    if let Err(error) =
+                        adapter.validate_configuration(&status.runtime, None, &host, &settings)
+                    {
+                        warnings.push(format!("{engine_id}: {error}"));
+                    }
+                    schemas.insert(engine_id, schema);
                 }
                 Err(error) => warnings.push(format!("{engine_id}: {error}")),
             }
+        }
+        for adapter in self.registry.adapters() {
+            let engine_id = adapter.identity().id;
+            if schemas.contains_key(&engine_id) {
+                continue;
+            }
+            let runtime_id = attempted.get(&engine_id).cloned();
+            let reason = if ambiguous.contains(&engine_id) {
+                "Multiple runtime selections for this engine; choose a single baseline"
+            } else if runtime_id.is_some() {
+                "Selected runtime metadata/probe failed; see runtime diagnostics"
+            } else {
+                "No runtime selected/installed for this engine"
+            };
+            let mut definitions = adapter.setting_definitions();
+            for definition in &mut definitions {
+                definition.supported = false;
+                definition.unsupported_reason = Some(reason.to_owned());
+                definition.default_preview = None;
+            }
+            let mut schema = norted_core::SettingsSchema {
+                engine_id: engine_id.clone(),
+                runtime_id,
+                definitions,
+            };
+            if let Ok(settings) =
+                settings_state.resolve_runtime_defaults(&engine_id, structured_path_base)
+            {
+                schema.retain_override_definitions(&settings);
+            }
+            schemas.insert(engine_id, schema);
         }
         Ok((schemas, warnings))
     }
@@ -331,7 +467,7 @@ impl RuntimePackManager {
         Ok(norted_core::SettingsSchema {
             engine_id: engine_id.to_owned(),
             runtime_id: None,
-            definitions: crate::configurable_setting_definitions(definitions),
+            definitions,
         })
     }
 
@@ -344,7 +480,7 @@ impl RuntimePackManager {
     ) -> Result<(norted_core::RuntimeSelection, norted_core::SettingsSchema), RuntimePackError>
     {
         let selection = self
-            .resolve_for_engine_with_settings(model, engine_id, explicit_runtime, settings)
+            .resolve_for_settings(model, engine_id, explicit_runtime, settings)
             .await?;
         let adapter = self.registry.get(engine_id).ok_or_else(|| {
             RuntimePackError::Selection(format!("bound engine `{engine_id}` is not registered"))
@@ -1133,9 +1269,7 @@ impl RuntimePackManager {
                     runtime.manifest.identity.engine_id,
                     required_engine_id.expect("mismatched runtime requires an engine")
                 )),
-                Err(error) => notices.push(format!(
-                    "model runtime selection `{runtime_id}` is unavailable ({error}); using a reported fallback"
-                )),
+                Err(error) => return Err(error),
             }
         }
         if let Some(runtime_id) = list.selections.format_defaults.get(&model.format) {
@@ -1162,10 +1296,7 @@ impl RuntimePackManager {
                     runtime.manifest.identity.engine_id,
                     required_engine_id.expect("mismatched runtime requires an engine")
                 )),
-                Err(error) => notices.push(format!(
-                    "{} default runtime `{runtime_id}` is unavailable ({error}); using a reported fallback",
-                    model.format.as_str().to_ascii_uppercase()
-                )),
+                Err(error) => return Err(error),
             }
         }
         let mut compatible = Vec::new();
@@ -1803,7 +1934,7 @@ impl RuntimePackManager {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        settings: Option<&norted_core::ResolvedSettings>,
+        _settings: Option<&norted_core::ResolvedSettings>,
     ) -> Result<RuntimeCompatibility, RuntimePackError> {
         self.validate_format_candidate(runtime, model.format, host)?;
         let adapter = self
@@ -1818,7 +1949,7 @@ impl RuntimePackManager {
         }
         Ok(combine_compatibility(
             compatibility_for_installed(runtime, host),
-            adapter.runtime_model_compatibility(runtime, model, host, settings),
+            adapter.runtime_model_compatibility(runtime, model, host, None),
         ))
     }
 

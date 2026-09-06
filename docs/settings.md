@@ -5,19 +5,25 @@ Norted Server has two separate settings domains.
 Server Settings configure the application and control plane, such as download concurrency. They are
 server-wide, but they are not inference defaults and never participate in model settings provenance.
 
-Inference settings have exactly three precedence layers:
+Inference settings have exactly four precedence layers:
 
 ```text
-Runtime default → Model Profile → Boot/invocation
+Runtime default → Settings runtime override → Model-profile override → Load/inference override
 ```
 
-The selected exact runtime is the only base. llama.cpp, q27, and NInfer own independent defaults;
-one runtime cannot inherit values from another. A runtime's authoritative baseline and persisted
-runtime customization are one user-facing `runtime default` layer.
+Runtime defaults are read-only, version/variant/context-specific baselines. Settings stores independent
+explicit overrides for llama.cpp, q27 and NInfer. No engine inherits another engine's values.
+Profiles inherit from their engine's Settings, and store only their own explicit overrides.
+Load overrides last for the session; request overrides last for one request and win over load values
+where request-time capability exists. Neither is persisted or changes an already-loaded process-only setting.
 
-Persisted settings use schema 3 with separate `server_settings` and `runtime_defaults` fields.
-Schema 2 is intentionally rejected rather than migrated because Norted is unreleased and its
-unqualified inference IDs had ambiguous ownership.
+Persisted settings retain schema 3 and the existing `server_settings` and `runtime_defaults` fields.
+The `runtime_defaults` map contains **Settings overrides**, not upstream defaults. Its existing name
+and state are retained without a migration or reset. Resolved provenance labels these values
+`settings_override`; true baselines retain `runtime_default`.
+
+Inheritance is absence: Inherit removes a key. Explicit false, zero, automatic policies, and values
+equal to the parent remain explicit until removed. Each setting resolves independently.
 
 Every setting identity belongs to exactly one domain:
 
@@ -31,43 +37,34 @@ NInfer Runtime Settings    ninfer.*
 Context length, temperature, sampling, reasoning, prompts, structured output, overflow policy, and
 other same-named human concepts are independent settings. Engine-neutral Rust constructors may
 share type/label shape, but no ID, persisted value, default, inheritance, or semantic ownership is
-shared. An unqualified runtime ID is invalid in runtime defaults, Model Profiles, and invocation
+shared. An unqualified runtime ID is invalid in Settings overrides, Model Profiles, and invocation
 patches.
 
-## Concrete values are mandatory
+## Values, sources and editing
 
-Every supported effective-setting presentation must put the actual value in the primary value
-column and annotate the winning source:
+Rows show effective values and Inherited/Overridden state. Unknown before startup is shown as
+`Default not yet known`; it is distinct from unsupported and no runtime installed/selected. Genuine
+runtime policies such as `auto` and `random` remain values. Never manufacture a scalar or an `auto`
+policy just to populate the display. Default-source annotations distinguish runtime, model-dependent,
+derived, startup, and server-owned execution policy evidence.
 
-```text
-Temperature       1.0      (runtime default)
-Temperature       0.7      (model profile)
-Context length    200000   (boot inference)
-Parallel requests 16       (runtime default)
-```
+Settings Inherit removes a Settings override and returns control to the runtime. Profile Inherit
+removes only the profile override and reveals Settings, which may itself inherit from the runtime.
+The selected-setting pane shows the read-only runtime baseline, immediate parent, local value,
+effective source, description, constraints and field diagnostics. Running observations are separate
+from next-load configuration, and changed startup values retain `requested_value` in provenance.
 
-Derivation may appear as secondary detail, for example `derived from host concurrency`. Source and
-derivation supplement the value; they never replace it. `runtime/model default`, `runtime-selected`,
-`model/thinking-mode default`, `inherited`, `default`, `automatic`, and similar prose must not stand
-in for an unknown effective result. A genuine typed policy such as seed `random` or an editable
-`auto` mode remains a real value. Showing a value never authorizes inventing or forcing a scalar:
-when the runtime intentionally defers a result until model/host/startup facts exist, the pre-startup
-effective value is `auto (runtime default)` with constraints in secondary detail. Once authoritative
-startup observation resolves that policy, the running effective value becomes the observed result
-while retaining the original winning source. Provenance stores a changed pre-start value separately
-as `requested_value`, so an explicit `fp8` remains distinguishable from `auto` that startup resolved
-to `fp8`; human-readable detail is supplementary. `SettingDefaultSource::Norted` is reserved for
-execution behavior Norted intentionally owns for a product/runtime reason, not presentation needs.
+Both editors support `/` search, `o` overrides-only, Enter to edit, Escape to cancel, Delete to
+inherit, and `R` to reset all overrides in the selected scope after typing `RESET`. Search, filter,
+reset, value and Inherit actions also support mouse clicks. Use `i` to expand/close details and `[` and `]` (or the mouse wheel over details) to scroll.
+Opening any value editor, including a toggle or choice, does not write an override. Wide terminals
+use a scope/profile sidebar and a separate detail column; narrower terminals put details below rows.
+No persistent load/request override editor exists.
 
-Clearing a Model Profile override immediately reveals `VALUE (runtime default)`. Boot overrides are
-ephemeral and display as `VALUE (boot inference)`; they are not persisted unless the user explicitly
-saves the value into a runtime or Model Profile.
-
-The Model Profile editor always presents current/next-load resolution as its primary value. If the
-same backend is already running with a different authoritative observed value, that value appears
-separately as running state and does not overwrite the editable configuration. Adapter baselines are
-not presented as the value a cleared profile override will inherit; clearing resolves the actual
-persisted runtime-default layer.
+Runtime/model/host compatibility is evaluated before configuration validation. An invalid field
+keeps the selected runtime and schema visible. Unsupported and obsolete keys can be removed without
+a successful configuration validation. Exact adapter validation still blocks unsupported execution,
+invalid ranges, conflicting options and unproved model/template capabilities at load.
 
 llama.cpp runtime-default previews require evidence from the exact selected runtime, inspected model
 metadata, an exact immutable reviewed contract, or a Norted-owned value that Norted actually applies.
@@ -132,3 +129,10 @@ the feature must never recreate a Global or shared-parent inference layer.
 
 The exact upstream coverage audit and option classifications are maintained in
 [`runtime-settings-coverage.md`](runtime-settings-coverage.md).
+
+For example, set `q27.top_k=40` in Settings and `q27.top_k=20` on a profile.
+A request with `top_k: 10` uses 10; the next omitted request returns to 20. Profile Inherit
+reveals 40; Settings Inherit leaves the field to q27. Sampler controls can remain configured
+while temperature is zero: they are inactive during greedy decoding, not incompatible.
+NInfer has its own top-k bounds (the reviewed runtime accepts at most 20); engine support
+and ranges are never copied from q27 or llama.cpp.
