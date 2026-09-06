@@ -2347,7 +2347,12 @@ fn render_model_profiles(
     render_settings_input(frame, app, theme, ui_layout);
 }
 
-fn render_settings_input(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layout: &UiLayout) {
+pub(super) fn render_settings_input(
+    frame: &mut Frame<'_>,
+    app: &App,
+    theme: &Theme,
+    ui_layout: &UiLayout,
+) {
     let Some(input) = &app.settings_input else {
         return;
     };
@@ -2375,60 +2380,238 @@ fn render_settings_input(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_lay
         }
         .to_owned()
     };
-    let prompt = if input.kind == crate::app::SettingsInputKind::SettingValue {
-        let name = app
-            .settings_definitions()
-            .get(app.settings_setting_index)
-            .map(|d| d.label.clone())
-            .unwrap_or_default();
-        let scope = if app.screen == Screen::ModelProfiles {
-            app.selected_model_profile_value()
-                .map(|profile| format!("Profile {}", profile.id))
-                .unwrap_or_else(|| "Profile".to_owned())
-        } else {
-            match app.selected_settings_scope() {
-                Some(crate::app::SettingsScope::Runtime(engine)) => format!("Settings {engine}"),
-                _ => "Server operations".to_owned(),
-            }
-        };
-        format!("{scope} / {name}")
+    let panel = if input.editor.is_some() {
+        ui_layout.settings_editor_panel
     } else {
-        prompt
+        Rect::new(
+            ui_layout.settings_scopes.x,
+            ui_layout.settings_scopes.y + 1,
+            ui_layout.settings_scopes.width,
+            ui_layout
+                .content
+                .bottom()
+                .saturating_sub(ui_layout.settings_scopes.y + 1),
+        )
     };
-    let panel = Rect::new(
-        ui_layout.settings_scopes.x,
-        ui_layout.settings_scopes.y + 1,
-        ui_layout.settings_scopes.width,
-        ui_layout
-            .content
-            .bottom()
-            .saturating_sub(ui_layout.settings_scopes.y + 1),
-    );
     frame.render_widget(Clear, panel);
     frame.render_widget(
         Paragraph::new(truncate_middle(&prompt, panel.width as usize, "…")).style(theme.hint),
         Rect::new(panel.x, panel.y, panel.width, 1),
     );
+    if let Some(editor) = &input.editor {
+        let scope = match &editor.scope {
+            crate::app::SettingsScope::Server => "Server operations".to_owned(),
+            crate::app::SettingsScope::Runtime(engine) => format!("Settings / {engine}"),
+            crate::app::SettingsScope::ModelProfile(id) => format!("Profile / {id}"),
+        };
+        let detail: Vec<_> = editor.metadata.lines().collect();
+        let parent = detail
+            .iter()
+            .find(|s| {
+                s.starts_with("Settings layer:")
+                    && matches!(editor.scope, crate::app::SettingsScope::ModelProfile(_))
+            })
+            .or_else(|| detail.iter().find(|s| s.starts_with("Parent:")))
+            .copied()
+            .unwrap_or("Parent: not yet known");
+        let local = detail
+            .iter()
+            .find(|s| {
+                s.starts_with(
+                    if matches!(editor.scope, crate::app::SettingsScope::ModelProfile(_)) {
+                        "Profile layer:"
+                    } else {
+                        "Settings layer:"
+                    },
+                )
+            })
+            .copied()
+            .unwrap_or("");
+        let timing = if matches!(editor.scope, crate::app::SettingsScope::Server) {
+            "Applies now"
+        } else {
+            "Applies on next load"
+        };
+        let guidance = match editor.definition.kind {
+            norted_core::SettingKind::OneWayFlag => {
+                "Inherit removes this flag; the parent might still enable it."
+            }
+            norted_core::SettingKind::Path => {
+                "Path input: structured file paths resolve beneath the server data directory when relative; absolute paths retain existing file validation."
+            }
+            norted_core::SettingKind::StringList => {
+                "PgUp/PgDn item; F2 Add / F3 Edit / F4 Remove / F5 Up / F6 Down; Enter finishes item"
+            }
+            norted_core::SettingKind::JsonObject => {
+                "Multiline JSON object: Enter newline; F10 Save (or Ctrl+Enter)"
+            }
+            _ => "Up/Down or click selects draft; Enter Save; Esc Cancel",
+        };
+        let constraints = if editor.definition.kind == norted_core::SettingKind::OneWayFlag {
+            "Inherit may still expose an enabled parent".to_owned()
+        } else {
+            editor.definition.kind.constraints()
+        };
+        let summary = format!(
+            "{} [{}]\n{timing} · {scope}\n{parent}\n{local}\n{} {}",
+            editor.definition.label,
+            editor.definition.id,
+            constraints,
+            editor.definition.unit.as_deref().unwrap_or("")
+        );
+        let full = format!(
+            "{}\n{}\n{scope}\n{}\n{}\n{guidance}",
+            editor.definition.label,
+            editor.definition.id,
+            editor.definition.description,
+            editor.metadata
+        );
+        let full = if let Some(error) = &app.settings_input_error {
+            format!("Validation: {error}\n{full}")
+        } else {
+            full
+        };
+        let info = Paragraph::new(full)
+            .style(theme.hint)
+            .wrap(Wrap { trim: false });
+        let pages = info.line_count(panel.width).div_ceil(5);
+        let page = editor.info_page % (pages + 1);
+        if page == 0 {
+            frame.render_widget(
+                Paragraph::new(summary).style(theme.hint),
+                Rect::new(panel.x, panel.y, panel.width, 5),
+            );
+        } else {
+            frame.render_widget(
+                info.scroll((((page - 1) * 5) as u16, 0)),
+                Rect::new(panel.x, panel.y, panel.width, 5),
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(
+                if editor.custom() && editor.definition.kind == norted_core::SettingKind::JsonObject
+                {
+                    "Tab mode · F10 save · Esc"
+                } else {
+                    "↑↓/Tab · Enter save · Esc"
+                },
+            )
+            .style(theme.hint),
+            Rect::new(panel.x, panel.y + 5, panel.width.saturating_sub(14), 1),
+        );
+        for (index, area) in &ui_layout.settings_editor_options {
+            let option = &editor.options[*index];
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "({}) {}",
+                    if *index == editor.selected {
+                        "●"
+                    } else {
+                        " "
+                    },
+                    option.label
+                ))
+                .style(if *index == editor.selected {
+                    theme.focused
+                } else {
+                    theme.hint
+                }),
+                *area,
+            );
+        }
+    }
     let field_width = ui_layout.settings_input_field.width.saturating_sub(2) as usize;
-    let field = format!(
-        "[{}]",
-        marked_input_window(&input.text, input.cursor, field_width, "_")
-    );
+    let field = if let Some(editor) = &input.editor {
+        if editor.custom() {
+            if editor.definition.kind == norted_core::SettingKind::StringList
+                && !editor.editing_item
+            {
+                if editor.items.is_empty() {
+                    "Empty item list — Add an item or select Inherit".to_owned()
+                } else {
+                    format!(
+                        "Item {}/{}: {:?}",
+                        editor.item + 1,
+                        editor.items.len(),
+                        editor.items[editor.item]
+                    )
+                }
+            } else if editor.definition.kind == norted_core::SettingKind::JsonObject {
+                let prefix: String = input.text.chars().take(input.cursor).collect();
+                let line = prefix.chars().filter(|c| *c == '\n').count();
+                let mut marked = input.text.clone();
+                let byte = input
+                    .text
+                    .char_indices()
+                    .nth(input.cursor)
+                    .map_or(input.text.len(), |(i, _)| i);
+                marked.insert(byte, '▏');
+                let column = prefix.rsplit('\n').next().unwrap_or("").chars().count();
+                let horizontal = column.saturating_sub(field_width.saturating_sub(1));
+                marked
+                    .lines()
+                    .skip(line.saturating_sub(
+                        ui_layout.settings_input_field.height.saturating_sub(1) as usize,
+                    ))
+                    .take(ui_layout.settings_input_field.height as usize)
+                    .map(|line| {
+                        line.chars()
+                            .skip(horizontal)
+                            .take(field_width)
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                format!(
+                    "[{}]",
+                    marked_input_window(&input.text, input.cursor, field_width, "_")
+                )
+            }
+        } else if editor.options.len() > 8 {
+            format!("Type to filter choices: {}_", editor.filter)
+        } else {
+            String::new()
+        }
+    } else {
+        format!(
+            "[{}]",
+            marked_input_window(&input.text, input.cursor, field_width, "_")
+        )
+    };
+    for (key, area) in &ui_layout.settings_editor_actions {
+        let label = match key {
+            1 => "[F1 More info]",
+            2 => "[Add]",
+            3 if input.editor.as_ref().is_some_and(|e| e.editing_item) => "[Done]",
+            3 => "[Edit]",
+            4 => "[Remove]",
+            5 => "[Up]",
+            6 => "[Down]",
+            7 => "[Prev]",
+            _ => "[Next]",
+        };
+        frame.render_widget(Paragraph::new(label).style(theme.focused), *area);
+    }
     let field_style = if app.hover == Some(HoverTarget::SettingsInputField) {
         theme.focused.patch(theme.hovered)
     } else {
         theme.focused
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(field, field_style))),
+        Paragraph::new(field).style(field_style),
         ui_layout.settings_input_field,
     );
-    let submit_label = match input.kind {
-        crate::app::SettingsInputKind::ProfileName => "[ Create ]",
-        crate::app::SettingsInputKind::DuplicateProfile => "[ Duplicate ]",
-        crate::app::SettingsInputKind::SettingValue => "[ Save ]",
-        crate::app::SettingsInputKind::Search => "[ Search ]",
-        crate::app::SettingsInputKind::Reset => "[ Confirm ]",
+    let submit_label = if app.settings_busy() {
+        "[ Saving… ]"
+    } else {
+        match input.kind {
+            crate::app::SettingsInputKind::ProfileName => "[ Create ]",
+            crate::app::SettingsInputKind::DuplicateProfile => "[ Duplicate ]",
+            crate::app::SettingsInputKind::SettingValue => "[F10 Save]",
+            crate::app::SettingsInputKind::Search => "[ Search ]",
+            crate::app::SettingsInputKind::Reset => "[ Confirm ]",
+        }
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(

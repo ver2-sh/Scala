@@ -331,7 +331,7 @@ pub struct SettingsInput {
     pub kind: SettingsInputKind,
     pub text: String,
     pub cursor: usize,
-    setting_id: Option<SettingId>,
+    pub editor: Option<crate::settings_editor::SettingsEditor>,
 }
 
 #[derive(Debug, Clone)]
@@ -713,12 +713,17 @@ impl App {
         }
         if self.settings_input.is_some() {
             let position = Position::new(mouse.column, mouse.row);
+            if self.settings_busy {
+                return Update::None;
+            }
             return match mouse.kind {
                 MouseEventKind::Moved => {
                     let hover = match layout.hit_test(position) {
                         target @ Some(
                             HoverTarget::SettingsInputSubmit
                             | HoverTarget::SettingsInputCancel
+                            | HoverTarget::SettingsEditorOption(_)
+                            | HoverTarget::SettingsEditorAction(_)
                             | HoverTarget::SettingsInputField,
                         ) => target,
                         _ => None,
@@ -731,11 +736,57 @@ impl App {
                     }
                 }
                 MouseEventKind::Down(MouseButton::Left) => match layout.hit_test(position) {
+                    Some(HoverTarget::SettingsEditorOption(index)) => {
+                        if let Some(editor) =
+                            self.settings_input.as_mut().and_then(|i| i.editor.as_mut())
+                        {
+                            if !editor.editing_item {
+                                editor.selected = index;
+                            }
+                        }
+                        Update::Render
+                    }
+                    Some(HoverTarget::SettingsEditorAction(key)) => self.handle_settings_input_key(
+                        KeyEvent::new(KeyCode::F(key), KeyModifiers::NONE),
+                    ),
                     Some(HoverTarget::SettingsInputSubmit) => self.submit_settings_input(),
                     Some(HoverTarget::SettingsInputCancel) => self.cancel_settings_input(),
                     Some(HoverTarget::SettingsInputField) => Update::Render,
                     _ => Update::None,
                 },
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    if layout.hit_test(position) == Some(HoverTarget::SettingsInputField)
+                        && self
+                            .settings_input
+                            .as_ref()
+                            .and_then(|i| i.editor.as_ref())
+                            .is_some_and(|e| {
+                                e.custom()
+                                    && e.definition.kind == norted_core::SettingKind::JsonObject
+                            })
+                    {
+                        return self.handle_settings_input_key(KeyEvent::new(
+                            if mouse.kind == MouseEventKind::ScrollUp {
+                                KeyCode::Up
+                            } else {
+                                KeyCode::Down
+                            },
+                            KeyModifiers::NONE,
+                        ));
+                    }
+                    if let Some(editor) =
+                        self.settings_input.as_mut().and_then(|i| i.editor.as_mut())
+                    {
+                        if !editor.editing_item {
+                            editor.move_selection(if mouse.kind == MouseEventKind::ScrollUp {
+                                -1
+                            } else {
+                                1
+                            });
+                        }
+                    }
+                    Update::Render
+                }
                 _ => Update::None,
             };
         }
@@ -760,6 +811,22 @@ impl App {
     pub fn handle_paste(&mut self, text: &str) -> Update {
         let normalized = text.replace(['\r', '\n', '\t'], " ");
         if let Some(input) = &mut self.settings_input {
+            if self.settings_busy {
+                return Update::None;
+            }
+            if let Some(editor) = &input.editor {
+                if !editor.custom()
+                    || (editor.definition.kind == norted_core::SettingKind::StringList
+                        && !editor.editing_item)
+                {
+                    return Update::None;
+                }
+            }
+            let normalized = if input.editor.is_some() {
+                text.to_owned()
+            } else {
+                normalized
+            };
             let index = byte_index(&input.text, input.cursor);
             input.text.insert_str(index, &normalized);
             input.cursor += normalized.chars().count();
@@ -1184,12 +1251,17 @@ impl App {
                             loaded.runtime_schema_warnings.join("; ")
                         )
                     });
+                    self.restore_editor_selection();
+                    self.settings_input = None;
+                    self.settings_input_error = None;
+                    self.hover = None;
                     self.reconcile_settings_selection();
                     if self.screen == Screen::ModelProfiles {
                         let _ = self.refresh_selected_model_profile();
                     }
                 }
                 Err(error) => {
+                    self.settings_input_error = Some(error.clone());
                     self.settings_validation_error = Some(error.clone());
                     self.notice = Some(error);
                 }
@@ -1488,7 +1560,18 @@ impl App {
             self.settings_parent
                 .as_ref()
                 .and_then(|parent| parent.effective.get(id))
-                .map(|setting| setting.value.clone())
+                .map(|setting| {
+                    format!(
+                        "{} ({})",
+                        setting.requested_value.as_ref().unwrap_or(&setting.value),
+                        match setting.source {
+                            norted_core::SettingSource::SettingsOverride => "Settings override",
+                            norted_core::SettingSource::RuntimeDefault => "runtime default",
+                            norted_core::SettingSource::ModelProfile { .. } => "model profile",
+                            norted_core::SettingSource::Invocation => "invocation",
+                        }
+                    )
+                })
                 .unwrap_or_else(|| "not yet known".to_owned())
         } else {
             baseline.to_owned()
@@ -2985,12 +3068,155 @@ impl App {
             kind,
             cursor: text.chars().count(),
             text,
-            setting_id: None,
+            editor: None,
         });
         Update::Render
     }
 
+    fn handle_typed_editor_key(&mut self, key: KeyEvent) -> Option<Update> {
+        let input = self.settings_input.as_mut()?;
+        let editor = input.editor.as_mut()?;
+        if key.code == KeyCode::F(1) {
+            editor.info_page = editor.info_page.saturating_add(1);
+            return Some(Update::Render);
+        }
+        if key.code == KeyCode::Esc {
+            return None;
+        }
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return None;
+        }
+        if editor.editing_item {
+            if matches!(key.code, KeyCode::Enter | KeyCode::F(3)) {
+                editor.items[editor.item] = input.text.clone();
+                editor.editing_item = false;
+                return Some(Update::Render);
+            }
+            return None;
+        }
+        if editor.custom()
+            && editor.definition.kind == norted_core::SettingKind::JsonObject
+            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+        {
+            let chars: Vec<char> = input.text.chars().collect();
+            let start = chars[..input.cursor]
+                .iter()
+                .rposition(|c| *c == '\n')
+                .map_or(0, |i| i + 1);
+            let column = input.cursor - start;
+            if key.code == KeyCode::Up && start > 0 {
+                let previous = chars[..start - 1]
+                    .iter()
+                    .rposition(|c| *c == '\n')
+                    .map_or(0, |i| i + 1);
+                input.cursor = previous + column.min(start - 1 - previous);
+            } else if key.code == KeyCode::Down {
+                if let Some(end) = chars[input.cursor..].iter().position(|c| *c == '\n') {
+                    let next = input.cursor + end + 1;
+                    let length = chars[next..]
+                        .iter()
+                        .position(|c| *c == '\n')
+                        .unwrap_or(chars.len() - next);
+                    input.cursor = next + column.min(length);
+                }
+            }
+            return Some(Update::Render);
+        }
+        match key.code {
+            KeyCode::Up => editor.move_selection(-1),
+            KeyCode::Down => editor.move_selection(1),
+            KeyCode::Tab => {
+                if editor.visible().last() == Some(&editor.selected) {
+                    editor.selected = 0;
+                } else {
+                    editor.move_selection(1);
+                }
+            }
+            KeyCode::BackTab => {
+                if editor.selected == 0 {
+                    editor.selected = *editor.visible().last().unwrap_or(&0);
+                } else {
+                    editor.move_selection(-1);
+                }
+            }
+            KeyCode::F(2)
+                if editor.custom()
+                    && editor.definition.kind == norted_core::SettingKind::StringList =>
+            {
+                editor.items.push(String::new());
+                editor.item = editor.items.len() - 1;
+                editor.editing_item = true;
+                input.text.clear();
+                input.cursor = 0;
+            }
+            KeyCode::F(3) if editor.custom() && !editor.items.is_empty() => {
+                editor.editing_item = true;
+                input.text = editor.items[editor.item].clone();
+                input.cursor = input.text.chars().count();
+            }
+            KeyCode::F(4) if editor.custom() && !editor.items.is_empty() => {
+                editor.items.remove(editor.item);
+                editor.item = editor.item.min(editor.items.len().saturating_sub(1));
+            }
+            KeyCode::F(5) if editor.item > 0 => {
+                editor.items.swap(editor.item, editor.item - 1);
+                editor.item -= 1;
+            }
+            KeyCode::F(6) if editor.item + 1 < editor.items.len() => {
+                editor.items.swap(editor.item, editor.item + 1);
+                editor.item += 1;
+            }
+            KeyCode::PageUp | KeyCode::F(7) => editor.item = editor.item.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::F(8) => {
+                editor.item = (editor.item + 1).min(editor.items.len().saturating_sub(1))
+            }
+            KeyCode::Enter
+                if editor.custom()
+                    && editor.definition.kind == norted_core::SettingKind::JsonObject =>
+            {
+                let index = byte_index(&input.text, input.cursor);
+                input.text.insert(index, '\n');
+                input.cursor += 1;
+            }
+            KeyCode::Enter => return None,
+            KeyCode::Char(c)
+                if !editor.custom()
+                    && editor.options.len() > 8
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                editor.filter.push(c);
+                editor.selected = *editor.visible().last().unwrap_or(&0);
+            }
+            KeyCode::Backspace if !editor.custom() => {
+                editor.filter.pop();
+            }
+            _ if editor.custom()
+                && editor.definition.kind != norted_core::SettingKind::StringList =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        Some(Update::Render)
+    }
+
     fn handle_settings_input_key(&mut self, key: KeyEvent) -> Update {
+        if self.settings_busy {
+            return Update::None;
+        }
+        if key.code == KeyCode::F(10)
+            && self
+                .settings_input
+                .as_ref()
+                .is_some_and(|i| i.editor.is_some())
+        {
+            return self.submit_settings_input();
+        }
+        if let Some(update) = self.handle_typed_editor_key(key) {
+            return update;
+        }
         match key.code {
             KeyCode::Esc => self.cancel_settings_input(),
             KeyCode::Enter => self.submit_settings_input(),
@@ -3050,11 +3276,34 @@ impl App {
         }
     }
 
+    fn restore_editor_selection(&mut self) {
+        let Some(editor) = self
+            .settings_input
+            .as_ref()
+            .and_then(|input| input.editor.as_ref())
+        else {
+            return;
+        };
+        let id = editor.definition.id.clone();
+        if let Some(index) = self
+            .settings_definitions()
+            .iter()
+            .position(|definition| definition.id == id)
+        {
+            self.settings_setting_index = index;
+            self.settings_scroll = self.settings_scroll.min(index);
+        }
+    }
+
     fn cancel_settings_input(&mut self) -> Update {
+        if self.settings_busy {
+            return Update::None;
+        }
         let creating_profile = self
             .settings_input
             .as_ref()
             .is_some_and(|input| input.kind == SettingsInputKind::ProfileName);
+        self.restore_editor_selection();
         self.settings_input = None;
         self.settings_input_error = None;
         self.hover = None;
@@ -3066,10 +3315,19 @@ impl App {
     }
 
     fn submit_settings_input(&mut self) -> Update {
-        let Some(input) = self.settings_input.take() else {
+        if self.settings_busy {
+            return Update::None;
+        }
+        let Some(mut input) = self.settings_input.take() else {
             return Update::None;
         };
         self.settings_input_error = None;
+        if let Some(editor) = &mut input.editor {
+            if editor.editing_item {
+                editor.items[editor.item] = input.text.clone();
+                editor.editing_item = false;
+            }
+        }
         match input.kind {
             SettingsInputKind::Search => {
                 self.settings_query = input.text;
@@ -3147,23 +3405,28 @@ impl App {
                 }
             },
             SettingsInputKind::SettingValue => {
-                let Some(id) = input.setting_id.clone() else {
+                let Some(editor) = input.editor.as_ref() else {
                     return Update::None;
                 };
-                let definition = self
-                    .settings_definitions()
-                    .into_iter()
-                    .find(|definition| definition.id == id)
-                    .cloned();
-                let Some(definition) = definition else {
-                    self.notice = Some("The selected setting is no longer available".to_owned());
-                    return Update::Render;
-                };
-                match definition.parse(&input.text) {
-                    Ok(value) => self.set_selected_setting(id, value),
+                match editor.value(&input.text) {
+                    Ok(value) => {
+                        let action = match value {
+                            Some(value) => SettingsAction::Set {
+                                scope: editor.scope.clone(),
+                                id: editor.definition.id.clone(),
+                                value,
+                                model: editor.model.clone(),
+                            },
+                            None => SettingsAction::Unset {
+                                scope: editor.scope.clone(),
+                                id: editor.definition.id.clone(),
+                            },
+                        };
+                        self.settings_input = Some(input);
+                        self.queue_settings_action(action)
+                    }
                     Err(error) => {
-                        self.notice = Some(error.to_string());
-                        self.settings_input_error = Some(error.to_string());
+                        self.settings_input_error = Some(error);
                         self.settings_input = Some(input);
                         Update::Render
                     }
@@ -3188,40 +3451,50 @@ impl App {
             ));
             return Update::Render;
         }
-        let text = self
-            .current_layer_value(&definition.id)
-            .map(|value| value.to_string())
-            .unwrap_or_default();
+        let local = self.current_layer_value(&definition.id);
+        let text = match local.as_ref() {
+            Some(
+                SettingValue::UnsignedIntegerOrChoice(
+                    norted_core::UnsignedIntegerOrChoiceValue::Choice(_),
+                )
+                | SettingValue::GpuOffload(
+                    norted_core::GpuOffload::None
+                    | norted_core::GpuOffload::Auto
+                    | norted_core::GpuOffload::All,
+                ),
+            ) => String::new(),
+            value => value.map(ToString::to_string).unwrap_or_default(),
+        };
+        let scope = if self.screen == Screen::ModelProfiles {
+            self.selected_model_profile_value()
+                .map(|p| SettingsScope::ModelProfile(p.id.clone()))
+        } else {
+            self.selected_settings_scope()
+        };
+        let Some(scope) = scope else {
+            return Update::None;
+        };
+        let metadata = self.settings_default_detail(&definition.id);
+        let model = if self.screen == Screen::ModelProfiles {
+            self.selected_profile_model().cloned().map(Box::new)
+        } else {
+            None
+        };
+        let editor = crate::settings_editor::SettingsEditor::new(
+            definition.clone(),
+            scope,
+            model,
+            metadata,
+            local.as_ref(),
+        );
+        self.settings_input_error = None;
         self.settings_input = Some(SettingsInput {
             kind: SettingsInputKind::SettingValue,
             cursor: text.chars().count(),
             text,
-            setting_id: Some(definition.id),
+            editor: Some(editor),
         });
         Update::Render
-    }
-
-    fn set_selected_setting(&mut self, id: SettingId, value: SettingValue) -> Update {
-        let (scope, model) = if self.screen == Screen::ModelProfiles {
-            let Some(profile) = self.selected_model_profile_value() else {
-                return Update::None;
-            };
-            (
-                SettingsScope::ModelProfile(profile.id.clone()),
-                self.selected_profile_model().cloned().map(Box::new),
-            )
-        } else {
-            let Some(scope) = self.selected_settings_scope() else {
-                return Update::None;
-            };
-            (scope, None)
-        };
-        self.queue_settings_action(SettingsAction::Set {
-            scope,
-            id,
-            value,
-            model,
-        })
     }
 
     fn handle_profile_engine_key(&mut self, key: KeyEvent) -> Update {
@@ -3431,7 +3704,7 @@ impl App {
             kind: SettingsInputKind::DuplicateProfile,
             text: String::new(),
             cursor: 0,
-            setting_id: None,
+            editor: None,
         });
         Update::Render
     }
@@ -3568,7 +3841,7 @@ impl App {
             kind: SettingsInputKind::ProfileName,
             text: String::new(),
             cursor: 0,
-            setting_id: None,
+            editor: None,
         });
         Update::Render
     }
@@ -3936,6 +4209,8 @@ impl App {
                 | HoverTarget::ProfileEngineApply
                 | HoverTarget::ProfileEngineCancel
                 | HoverTarget::HelpClose
+                | HoverTarget::SettingsEditorOption(_)
+                | HoverTarget::SettingsEditorAction(_)
                 | HoverTarget::SettingsInputField
                 | HoverTarget::SettingsInputSubmit
                 | HoverTarget::SettingsInputCancel,

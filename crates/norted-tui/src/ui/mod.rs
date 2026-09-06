@@ -41,6 +41,14 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) -> UiLayout {
         return layout;
     }
 
+    if app
+        .settings_input
+        .as_ref()
+        .is_some_and(|i| i.editor.is_some())
+    {
+        screens::render_settings_input(frame, app, &theme, &layout);
+        return layout;
+    }
     shell::render_header(frame, app, &theme, &glyphs, &layout);
     screens::render_screen(frame, app, &theme, &glyphs, &layout);
     shell::render_command_bar(frame, layout.command_bar, app, &theme, &glyphs);

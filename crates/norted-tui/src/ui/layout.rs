@@ -101,6 +101,8 @@ pub enum HoverTarget {
     SettingValue(usize),
     SettingInherit(usize),
     SettingsInputField,
+    SettingsEditorOption(usize),
+    SettingsEditorAction(u8),
     SettingsInputSubmit,
     SettingsInputCancel,
     ModelProfileAction(ModelProfileAction),
@@ -175,7 +177,10 @@ pub struct UiLayout {
     pub settings_columns: Vec<Rect>,
     pub setting_values: Vec<(usize, Rect)>,
     pub setting_inherit_actions: Vec<(usize, Rect)>,
+    pub settings_editor_panel: Rect,
     pub settings_input_field: Rect,
+    pub settings_editor_options: Vec<(usize, Rect)>,
+    pub settings_editor_actions: Vec<(u8, Rect)>,
     pub settings_input_submit: Rect,
     pub settings_input_cancel: Rect,
     pub model_profile_actions: Vec<(ModelProfileAction, Rect)>,
@@ -197,6 +202,63 @@ impl UiLayout {
         if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
             return Self {
                 too_small: true,
+                ..Self::default()
+            };
+        }
+
+        if let Some(editor) = app.settings_input.as_ref().and_then(|i| i.editor.as_ref()) {
+            let panel = area.inner(Margin {
+                horizontal: 1,
+                vertical: 0,
+            });
+            let bottom = panel.bottom().saturating_sub(3);
+            let field_height = if editor.custom() && area.height >= 18 {
+                if editor.definition.kind == norted_core::SettingKind::JsonObject {
+                    (area.height - 12).min(12)
+                } else {
+                    3
+                }
+            } else if editor.custom() || editor.options.len() > 8 {
+                1
+            } else {
+                0
+            };
+            let top = panel.y + 6;
+            let count = bottom.saturating_sub(top + field_height + 1).max(1) as usize;
+            let visible = editor.visible();
+            let selected = visible
+                .iter()
+                .position(|i| *i == editor.selected)
+                .unwrap_or(0);
+            let start = selected.saturating_sub(count.saturating_sub(1));
+            let options = visible
+                .into_iter()
+                .skip(start)
+                .take(count)
+                .enumerate()
+                .map(|(row, index)| (index, Rect::new(panel.x, top + row as u16, panel.width, 1)))
+                .collect();
+            let mut actions = vec![(1, Rect::new(panel.right() - 14, panel.y + 5, 14, 1))];
+            if editor.custom() && editor.definition.kind == norted_core::SettingKind::StringList {
+                for (index, label_width) in [6, 6, 8, 5, 7, 6, 6].into_iter().enumerate() {
+                    let x = panel.x + [0, 6, 12, 20, 25, 32, 38][index];
+                    actions.push((index as u8 + 2, Rect::new(x, bottom - 1, label_width, 1)));
+                }
+            }
+            return Self {
+                content: panel,
+                settings_scopes: panel,
+                settings_editor_panel: panel,
+                settings_editor_options: options,
+                settings_editor_actions: actions,
+                settings_input_field: Rect::new(
+                    panel.x,
+                    bottom - field_height - 1,
+                    panel.width,
+                    field_height,
+                ),
+                settings_input_submit: Rect::new(panel.x, bottom, 12, 1),
+                settings_input_cancel: Rect::new(panel.x + 14, bottom, 12, 1),
                 ..Self::default()
             };
         }
@@ -889,6 +951,8 @@ impl UiLayout {
         let mut setting_values = Vec::new();
         let mut setting_inherit_actions = Vec::new();
         let mut settings_input_field = Rect::default();
+        let settings_editor_options = Vec::new();
+        let settings_editor_actions = Vec::new();
         let mut settings_input_submit = Rect::default();
         let mut settings_input_cancel = Rect::default();
         let mut model_profile_actions = Vec::new();
@@ -1375,7 +1439,10 @@ impl UiLayout {
             settings_columns,
             setting_values,
             setting_inherit_actions,
+            settings_editor_panel: Rect::default(),
             settings_input_field,
+            settings_editor_options,
+            settings_editor_actions,
             settings_input_submit,
             settings_input_cancel,
             model_profile_actions,
@@ -1550,6 +1617,16 @@ impl UiLayout {
             .find(|(_, rect)| contains(*rect, position))
         {
             return Some(*target);
+        }
+        for (index, area) in &self.settings_editor_options {
+            if contains(*area, position) {
+                return Some(HoverTarget::SettingsEditorOption(*index));
+            }
+        }
+        for (key, area) in &self.settings_editor_actions {
+            if contains(*area, position) {
+                return Some(HoverTarget::SettingsEditorAction(*key));
+            }
         }
         if contains(self.settings_input_submit, position) {
             return Some(HoverTarget::SettingsInputSubmit);

@@ -2,6 +2,7 @@
 
 mod app;
 mod commands;
+mod settings_editor;
 mod terminal;
 mod theme;
 mod ui;
