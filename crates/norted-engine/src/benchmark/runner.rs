@@ -201,12 +201,15 @@ impl RuntimeManager {
             } else if result.is_some_and(|r| !bench::finished(&r.status)) {
                 if result.is_some_and(|r| r.status == "failed") {
                     "Failed"
+                } else if result.is_some_and(|r| r.status == "cancelled") {
+                    "Cancelled"
                 } else {
                     "Incomplete"
                 }
             } else if result.is_none() {
                 match h.first().map(|s| s.status.as_str()) {
                     Some("failed") => "Failed",
+                    Some("cancelled") => "Cancelled",
                     Some(_) => "Incomplete",
                     None => "Never benchmarked",
                 }

@@ -460,6 +460,8 @@ pub fn select<'a>(
             Some(attempt),
             if attempt.status == "failed" {
                 "Failed"
+            } else if attempt.status == "cancelled" {
+                "Cancelled"
             } else {
                 "Incomplete"
             },
@@ -637,7 +639,13 @@ pub fn scorecard_value(summary: &Value, field: &str) -> Option<f64> {
     if matches!(field, "intelligence" | "agentic") {
         summary[field].as_f64()
     } else {
-        summary["speed"]["combined"][field]["median"].as_f64()
+        let combined = &summary["speed"]["combined"][field];
+        // Headline TPS/latency require a complete four-probe aggregate; partial
+        // medians remain available in Details/verbose evidence only.
+        if combined["complete"] != true {
+            return None;
+        }
+        combined["median"].as_f64()
     }
 }
 
