@@ -375,8 +375,16 @@ impl RuntimeManager {
         _runtime_reservation: tokio::sync::OwnedMutexGuard<()>,
     ) {
         let hard_seconds = run.plan().expect("admitted v4 plan").hard_seconds;
-        let execution_deadline =
-            tokio::time::Instant::from_std(started + Duration::from_secs(hard_seconds - 16));
+        let execution_deadline = tokio::time::Instant::from_std(
+            started
+                + Duration::from_secs(
+                    hard_seconds
+                        - run
+                            .plan()
+                            .expect("admitted v4 plan")
+                            .cleanup_finalization_seconds,
+                ),
+        );
         let outcome = tokio::select! {
             biased;
             _ = receiver.changed() => Err("cancelled".to_owned()),
@@ -1112,7 +1120,7 @@ impl RuntimeManager {
             }
             self.verify_pinned(run).await?;
             let mut request = self
-                .request(run, &task.prompt, 384, false, Vec::new())
+                .request(run, &task.prompt, 1024, false, Vec::new())
                 .await?;
             request.tools = bench::retrieval::tools();
             let mut e = new_evidence(
@@ -1255,27 +1263,26 @@ impl RuntimeManager {
         e.request_overrides["tool_definitions"] = json!(request.tools);
         e.request_overrides["malformed_calls"] = json!(0);
         e.request_overrides["tool_calls"] = json!(0);
+        e.request_overrides["rounds"] = json!(0);
         let mut count = 0;
         let mut ids = std::collections::BTreeSet::new();
-        for round in 1..=6 {
+        for round in 1..=4 {
             if let Some(active) = self.benchmark.active.lock().await.as_mut() {
                 active.phase = format!("retrieval / {} / round {round}", e.id);
             }
             e.response.clear();
-            e.request_overrides["rounds"] = json!(round);
             let r = self.measure(request.clone(), e).await?;
-            e.tools.push(json!({"round":round,"calls":r.calls,"text":r.text,"timing":r.timing,"usage":r.usage}));
+            e.tools.push(json!({"phase":"retrieval","round":round,"calls":r.calls,"text":r.text,"timing":r.timing,"usage":r.usage}));
             if r.calls.is_empty() {
-                if model_refusal(&r.text) {
-                    e.request_overrides["model_failure"] = json!("refusal");
-                }
-                e.request_overrides["valid_completion"] = json!(r.finish == "Stop");
-                e.status = "completed".into();
-                return Ok(());
+                request
+                    .messages
+                    .push(InferenceMessage::text(InferenceRole::Assistant, r.text));
+                break;
             }
+            e.request_overrides["rounds"] = json!(round);
             count += r.calls.len();
             e.request_overrides["tool_calls"] = json!(count);
-            if count > 10 {
+            if r.calls.len() > 8 || count > 32 {
                 return Err(MeasureError::Candidate(
                     "retrieval call limit exceeded".into(),
                 ));
@@ -1308,9 +1315,27 @@ impl RuntimeManager {
             self.benchmark.store.save(run).await?;
             self.verify_pinned(run).await?;
         }
+        // Preserve all historical calls/results, but expose no callable tools.
+        request.tools.clear();
+        request.tool_choice = Some(crate::InferenceToolChoice::None);
+        request.messages.push(InferenceMessage::text(InferenceRole::User,
+            "Retrieval is finished. Return only canonical JSON {\"ranges\":[{\"path\":\"...\",\"start_line\":1,\"end_line\":2}]}. No prose or tool calls."));
+        if let Some(active) = self.benchmark.active.lock().await.as_mut() {
+            active.phase = format!("retrieval / {} / finalization", e.id);
+        }
         e.response.clear();
-        e.request_overrides["model_failure"] = json!("round_limit_without_final");
-        e.status = "failed".into();
+        e.request_overrides["finalization_tools"] = json!(request.tools);
+        e.request_overrides["finalization_tool_choice"] = json!(request.tool_choice);
+        let r = self.measure(request, e).await?;
+        e.tools.push(json!({"phase":"finalization","calls":r.calls,"text":r.text,"timing":r.timing,"usage":r.usage}));
+        e.request_overrides["valid_completion"] = json!(r.finish == "Stop" && r.calls.is_empty());
+        if !r.calls.is_empty() {
+            e.response.clear();
+            e.request_overrides["model_failure"] = json!("tools_on_finalization");
+        } else if model_refusal(&r.text) {
+            e.request_overrides["model_failure"] = json!("refusal");
+        }
+        e.status = "completed".into();
         Ok(())
     }
     async fn confirm_benchmark_request_stopped(
@@ -1335,21 +1360,28 @@ impl RuntimeManager {
                 .ok_or("backend missing during cancellation")?;
             (running.adapter.clone(), running.process.clone())
         };
-        let stopped = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if adapter
-                    .confirm_request_stopped(&process)
-                    .await
-                    .map_err(|e| e.to_string())?
-                {
-                    if !adapter.health(&process).await.map_err(|e| e.to_string())? {
-                        return Err("backend unhealthy after cancellation".to_owned());
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(
+                run.plan()
+                    .expect("admitted v4 plan")
+                    .stop_confirmation_seconds,
+            ),
+            async {
+                loop {
+                    if adapter
+                        .confirm_request_stopped(&process)
+                        .await
+                        .map_err(|e| e.to_string())?
+                    {
+                        if !adapter.health(&process).await.map_err(|e| e.to_string())? {
+                            return Err("backend unhealthy after cancellation".to_owned());
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
+            },
+        )
         .await
         .map_err(|_| {
             "Request cancellation not confirmed within 1s; stopping owned backend".to_owned()

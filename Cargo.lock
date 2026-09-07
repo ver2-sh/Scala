@@ -1496,6 +1496,7 @@ dependencies = [
  "futures-util",
  "libc",
  "norted-core",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
