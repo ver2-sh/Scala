@@ -1,5 +1,10 @@
 //! Server-owned, local per-profile benchmark evidence and shared methodology.
+pub mod context;
+pub mod plan;
+pub mod retrieval;
+mod scorecard;
 mod storage;
+pub use plan::{BenchmarkMode, BenchmarkPlan};
 pub mod suite;
 use crate::{InferenceToolCall, InferenceUsage};
 use norted_core::{ModelProfile, ModelProfileId, RuntimeProvenance};
@@ -15,12 +20,28 @@ tokio::task_local! { pub(crate) static EXECUTOR: (); }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum BenchmarkRequest {
-    Start { profile_id: ModelProfileId },
+    Start {
+        profile_id: ModelProfileId,
+        #[serde(default)]
+        mode: BenchmarkMode,
+    },
+    Plan {
+        profile_id: ModelProfileId,
+        #[serde(default)]
+        mode: BenchmarkMode,
+    },
     Status,
     Cancel,
-    History { profile_id: ModelProfileId },
-    Result { run_id: String },
-    Compare { left: String, right: String },
+    History {
+        profile_id: ModelProfileId,
+    },
+    Result {
+        run_id: String,
+    },
+    Compare {
+        left: String,
+        right: String,
+    },
 }
 
 pub(crate) struct Service {
@@ -38,6 +59,7 @@ pub(crate) struct Active {
     pub started: Instant,
     pub phase: String,
     pub done: usize,
+    pub plan: BenchmarkPlan,
     pub cancel: watch::Sender<bool>,
 }
 impl Service {
@@ -90,6 +112,7 @@ pub struct Timing {
 pub struct Run {
     pub record_version: u32,
     pub run_id: String,
+    #[serde(deserialize_with = "historical_profile")]
     pub profile: ModelProfile,
     pub profile_hash: String,
     pub started_unix_ms: u128,
@@ -114,6 +137,28 @@ pub struct Run {
     pub missing: Vec<String>,
     pub evidence: Vec<Evidence>,
 }
+/// Versioned comparison identity. Full configuration matching remains a separate key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkSignature {
+    pub version: u32,
+    pub methodology: Value,
+    pub quality_key: String,
+    pub performance_conditions: Value,
+    pub performance_key: Option<String>,
+    pub performance_identity_reason: Option<String>,
+    pub model: Value,
+    pub model_metadata: Value,
+    pub profile_id: ModelProfileId,
+    pub profile_hash: String,
+    pub file_observations: Value,
+    pub accelerator_binding: Option<norted_core::AcceleratorBinding>,
+    pub runtime: Value,
+    pub effective_settings: Value,
+    pub observed_settings: Value,
+    pub server_version: String,
+    pub source_revision: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Summary {
     pub run_id: String,
@@ -129,6 +174,12 @@ pub struct Summary {
     pub suite: String,
     pub pack_hash: String,
     pub methodology: String,
+    #[serde(default)]
+    pub mode: Option<BenchmarkMode>,
+    #[serde(default)]
+    pub scorecard: Value,
+    #[serde(default)]
+    pub signature: Value,
     pub intelligence: Option<f64>,
     pub categories: BTreeMap<String, Value>,
     pub agentic: Option<f64>,
@@ -147,6 +198,7 @@ pub fn digest(value: impl Serialize) -> String {
         Sha256::digest(serde_json::to_vec(&value).expect("serializable benchmark data"))
     )
 }
+/// Shared bundled material; run manifests use `BenchmarkPlan::manifest`.
 pub fn manifest() -> Value {
     json!({"suite":suite::SUITE,"method":suite::METHOD,"policy":suite::POLICY,
         "intelligence":suite::questions(),"single_tools":suite::single_cases(),
@@ -272,7 +324,11 @@ pub fn speed_sample(e: &Evidence) -> Value {
 }
 
 impl Run {
+    pub fn plan(&self) -> Option<BenchmarkPlan> {
+        serde_json::from_value(self.manifest["plan"].clone()).ok()
+    }
     pub fn summary(&self) -> Summary {
+        let plan = self.plan();
         let mut categories = BTreeMap::new();
         let mut means = Vec::new();
         for name in ["logic", "context", "code", "instruction"] {
@@ -283,11 +339,17 @@ impl Run {
                 .collect::<Vec<_>>();
             let scored = items.iter().filter_map(|e| e.score).collect::<Vec<_>>();
             let passed = scored.iter().filter(|s| **s == 1.0).count();
-            let complete = scored.len() == 6;
+            let required = plan.as_ref().map_or(6, |p| {
+                p.questions
+                    .iter()
+                    .filter(|id| id.starts_with(&format!("{name}-")))
+                    .count()
+            });
+            let complete = required > 0 && scored.len() == required;
             if complete {
-                means.push(scored.iter().sum::<f64>() / 6.0);
+                means.push(scored.iter().sum::<f64>() / required as f64);
             }
-            categories.insert(name.into(),json!({"passed":passed,"attempted":items.len(),"scored":scored.len(),"required":6,"score":complete.then_some(passed as f64/6.0*100.0)}));
+            categories.insert(name.into(),json!({"passed":passed,"attempted":items.len(),"scored":scored.len(),"required":required,"score":complete.then_some(passed as f64/required.max(1) as f64*100.0),"wilson_95":scorecard::wilson(passed,scored.len())}));
         }
         let single = self
             .evidence
@@ -301,8 +363,11 @@ impl Run {
             .collect::<Vec<_>>();
         let single_pass = single.iter().filter(|e| e.score == Some(1.0)).count();
         let multi_pass = multi.iter().filter(|e| e.score == Some(1.0)).count();
-        let tool_complete = single.iter().filter(|e| e.score.is_some()).count() == 8
-            && multi.iter().filter(|e| e.score.is_some()).count() == 4;
+        let tool_complete = single.iter().filter(|e| e.score.is_some()).count()
+            == plan.as_ref().map_or(8, |p| p.single.len())
+            && multi.iter().filter(|e| e.score.is_some()).count()
+                == plan.as_ref().map_or(4, |p| p.agents.len())
+            && plan.as_ref().is_none_or(|p| !p.single.is_empty());
         let agentic_unavailable = self
             .missing
             .iter()
@@ -334,14 +399,23 @@ impl Run {
                     .filter(|s| s["workload_complete"] == true)
                     .filter_map(|s| s[field].as_f64())
                     .collect::<Vec<_>>();
-                let required = if prefix.is_empty() { 4 } else { 2 };
+                let probe_ids = plan.as_ref().map(|p| p.probes.clone()).unwrap_or_else(|| {
+                    vec![
+                        "short-1".into(),
+                        "short-2".into(),
+                        "medium-1".into(),
+                        "medium-2".into(),
+                    ]
+                });
+                let required = probe_ids.iter().filter(|id| id.starts_with(prefix)).count() as u64;
                 let mut stats = distribution(values);
                 stats["required"] = json!(required);
                 stats["partial_median"] = stats["median"].clone();
                 stats["complete"] = json!(stats["count"].as_u64() == Some(required));
                 stats["missing"] = json!(
-                    ["short-1", "short-2", "medium-1", "medium-2"]
-                        .into_iter()
+                    probe_ids
+                        .iter()
+                        .map(String::as_str)
                         .filter(|id| id.starts_with(prefix))
                         .filter_map(|id| {
                             let sample = selected.iter().find(|s| s["id"] == id);
@@ -383,7 +457,11 @@ impl Run {
             "summary_method".into(),
             json!("independent-observed-metrics/3"),
         );
+        let scorecard = scorecard::build(self, &categories);
         Summary {
+            mode: plan.as_ref().map(|p| p.mode),
+            signature: self.environment["benchmark_signature"].clone(),
+            scorecard: scorecard.clone(),
             run_id: self.run_id.clone(),
             profile_id: self.profile.id.clone(),
             display_name: self.profile.display_name.clone(),
@@ -397,10 +475,18 @@ impl Run {
             suite: self.suite.clone(),
             pack_hash: self.pack_hash.clone(),
             methodology: self.methodology.clone(),
-            intelligence: (means.len() == 4).then(|| 100.0 * means.iter().sum::<f64>() / 4.0),
+            intelligence: if plan.is_some() {
+                scorecard["intelligence"]["score"].as_f64()
+            } else {
+                (means.len() == 4).then(|| 100.0 * means.iter().sum::<f64>() / 4.0)
+            },
             categories,
             agentic: tool_complete.then_some(
-                100.0 * (0.5 * single_pass as f64 / 8.0 + 0.5 * multi_pass as f64 / 4.0),
+                100.0
+                    * (0.5 * single_pass as f64
+                        / plan.as_ref().map_or(8, |p| p.single.len()).max(1) as f64
+                        + 0.5 * multi_pass as f64
+                            / plan.as_ref().map_or(4, |p| p.agents.len()).max(1) as f64),
             ),
             single_pass,
             multi_pass,
@@ -427,12 +513,14 @@ pub fn select<'a>(
     history: &'a [Summary],
     key: Option<&str>,
     pack: &str,
+    quick_pack: &str,
 ) -> (Option<&'a Summary>, &'static str) {
     if let Some(current) = history.iter().find(|s| {
         finished(&s.status)
             && key.is_some()
             && s.configuration_key.as_deref() == key
             && s.pack_hash == pack
+            && s.mode != Some(BenchmarkMode::Quick)
     }) {
         return (
             Some(current),
@@ -443,7 +531,20 @@ pub fn select<'a>(
             },
         );
     }
-    if let Some(old) = history.iter().find(|s| finished(&s.status)) {
+    if let Some(current) = history.iter().find(|s| {
+        finished(&s.status)
+            && key.is_some()
+            && s.configuration_key.as_deref() == key
+            && s.pack_hash == quick_pack
+            && s.mode == Some(BenchmarkMode::Quick)
+    }) {
+        return (Some(current), "Current Quick — lower sample confidence");
+    }
+    if let Some(old) = history
+        .iter()
+        .find(|s| finished(&s.status) && s.mode == Some(BenchmarkMode::Standard))
+        .or_else(|| history.iter().find(|s| finished(&s.status)))
+    {
         return (
             Some(old),
             if key.is_some() {
@@ -473,9 +574,42 @@ pub fn select<'a>(
 pub fn compare(left: &Run, right: &Run) -> Value {
     let a = left.summary();
     let b = right.summary();
-    let comparable = left.pack_hash == right.pack_hash && left.methodology == right.methodology;
+    let quality_comparable = a.signature["quality_key"].is_string()
+        && a.signature["quality_key"] == b.signature["quality_key"];
+    let performance_changes = value_changes(
+        &a.signature["performance_conditions"],
+        &b.signature["performance_conditions"],
+    );
+    let performance_comparable = quality_comparable
+        && a.signature["performance_key"].is_string()
+        && a.signature["performance_key"] == b.signature["performance_key"];
+    let quality_changes = value_changes(&a.signature["methodology"], &b.signature["methodology"]);
+    let comparable = quality_comparable;
+    let capability_deltas = [
+        "intelligence",
+        "coding",
+        "agentic",
+        "retrieval",
+        "context",
+        "reliability",
+    ]
+    .into_iter()
+    .map(|k| {
+        (
+            k,
+            if quality_comparable {
+                a.scorecard[k]["score"]
+                    .as_f64()
+                    .zip(b.scorecard[k]["score"].as_f64())
+                    .map(|(a, b)| b - a)
+            } else {
+                None
+            },
+        )
+    })
+    .collect::<BTreeMap<_, _>>();
     let changed=left.evidence.iter().filter_map(|e|right.evidence.iter().find(|r|r.id==e.id).filter(|r|r.score!=e.score||r.status!=e.status).map(|r|json!({"id":e.id,"left":e.status,"right":r.status,"left_score":e.score,"right_score":r.score}))).collect::<Vec<_>>();
-    json!({"left":a,"right":b,"same_methods":comparable,"same_configuration":left.configuration_key.is_some()&&left.configuration_key==right.configuration_key,
+    json!({"left":a,"right":b,"same_methods":comparable,"quality_comparable":quality_comparable,"performance_comparable":performance_comparable,"quality_differences":quality_changes,"performance_differences":performance_changes,"capability_deltas":capability_deltas,"comparison_note":if quality_comparable {"Matching frozen quality method"} else {"Mode, capabilities, plan or methodology differ, or legacy signature unavailable"},"performance_note":if performance_comparable {"Equivalent recorded deployment conditions; concurrent workloads/cache remain unverified"} else {"Deployment observations only; no strict performance delta"},"same_configuration":left.configuration_key.is_some()&&left.configuration_key==right.configuration_key,
         "changed_settings":value_changes(&json!(left.provenance.as_ref().map(|p|&p.settings)),&json!(right.provenance.as_ref().map(|p|&p.settings))),
         "changed_runtime":value_changes(&json!(left.provenance.as_ref().map(|p|&p.runtime)),&json!(right.provenance.as_ref().map(|p|&p.runtime))),
         "changed_hardware":value_changes(&left.environment["host"],&right.environment["host"]),
@@ -483,8 +617,8 @@ pub fn compare(left: &Run, right: &Run) -> Value {
         "changed_tasks":changed,"settings":{"left":left.provenance.as_ref().map(|p|&p.settings),"right":right.provenance.as_ref().map(|p|&p.settings)},
         "runtime":{"left":left.provenance.as_ref().map(|p|&p.runtime),"right":right.provenance.as_ref().map(|p|&p.runtime)},
         "hardware":{"left":left.environment,"right":right.environment},
-        "intelligence_delta":a.intelligence.zip(b.intelligence).map(|(a,b)|b-a),"agentic_delta":a.agentic.zip(b.agentic).map(|(a,b)|b-a),
-        "latency_delta_ms":a.speed["combined"]["first_visible_ms"]["median"].as_f64().zip(b.speed["combined"]["first_visible_ms"]["median"].as_f64()).filter(|_|comparable).map(|(a,b)|b-a)})
+        "intelligence_delta":a.intelligence.zip(b.intelligence).filter(|_|quality_comparable).map(|(a,b)|b-a),"agentic_delta":a.agentic.zip(b.agentic).filter(|_|quality_comparable).map(|(a,b)|b-a),
+        "latency_delta_ms":a.speed["combined"]["first_visible_ms"]["median"].as_f64().zip(b.speed["combined"]["first_visible_ms"]["median"].as_f64()).filter(|_|performance_comparable).map(|(a,b)|b-a)})
 }
 
 pub(crate) struct Response {
@@ -536,6 +670,7 @@ fn value_changes(left: &Value, right: &Value) -> Vec<Value> {
 pub fn performance_metric(speed: &Value, field: &str, units: &str) -> String {
     let combined = &speed["combined"][field];
     let count = combined["count"].as_u64().unwrap_or(0);
+    let required = combined["required"].as_u64().unwrap_or(4);
     let value = combined["median"]
         .as_f64()
         .or_else(|| combined["partial_median"].as_f64());
@@ -545,15 +680,16 @@ pub fn performance_metric(speed: &Value, field: &str, units: &str) -> String {
             .as_f64()
             .or_else(|| stats["partial_median"].as_f64());
         format!(
-            "{} {}/2{}",
+            "{} {}/{}{}",
             group,
             stats["count"].as_u64().unwrap_or(0),
+            stats["required"].as_u64().unwrap_or(2),
             value.map(|v| format!("={v:.2}")).unwrap_or_default()
         )
     };
     let mut text = format!(
-        "{}{} {units} ({count}/4; {}; {})",
-        if count > 0 && count < 4 {
+        "{}{} {units} ({count}/{required}; {}; {})",
+        if count > 0 && count < required {
             "partial "
         } else {
             ""
@@ -636,11 +772,17 @@ pub fn scorecard_value(summary: &Value, field: &str) -> Option<f64> {
     if !finished(summary["status"].as_str().unwrap_or("")) {
         return None;
     }
+    if field == "profile_quality" {
+        return summary["scorecard"][field].as_f64();
+    }
+    if summary["scorecard"][field].is_object() {
+        return summary["scorecard"][field]["score"].as_f64();
+    }
     if matches!(field, "intelligence" | "agentic") {
         summary[field].as_f64()
     } else {
         let combined = &summary["speed"]["combined"][field];
-        // Headline TPS/latency require a complete four-probe aggregate; partial
+        // Headline TPS/latency require a complete selected-probe aggregate; partial
         // medians remain available in Details/verbose evidence only.
         if combined["complete"] != true {
             return None;
@@ -680,12 +822,76 @@ pub fn status_label(summary: &Value) -> String {
 }
 
 pub fn scorecard_lines(summary: &Value) -> Vec<String> {
-    let mut lines = SCORECARD_METRICS
-        .into_iter()
-        .map(|(label, field, unit)| {
+    if summary.is_null() {
+        return vec!["Never benchmarked".into()];
+    }
+    let mut lines = Vec::new();
+    if summary["mode"].is_string() {
+        lines.push(format!(
+            "Mode             {} | {}",
+            summary["mode"].as_str().unwrap(),
+            summary["scorecard"]["confidence"].as_str().unwrap_or("")
+        ));
+        lines.push(format!(
+            "Capabilities     {}",
+            summary["scorecard"]["capabilities"]
+        ));
+        lines.push(format!(
+            "Profile quality  {} (only this capability set)",
+            scorecard_metric(summary, "profile_quality", " /100")
+        ));
+        for (label, field) in [
+            ("Intelligence", "intelligence"),
+            ("Coding", "coding"),
+            ("Agentic", "agentic"),
+            ("Retrieval", "retrieval"),
+            ("Context", "context"),
+            ("Reliability", "reliability"),
+        ] {
+            if summary["scorecard"][field].is_object() {
+                lines.push(format!(
+                    "{label:<16} {}",
+                    scorecard_metric(summary, field, " /100")
+                ));
+            }
+        }
+        if summary["scorecard"]["retrieval"].is_object() {
+            let r = &summary["scorecard"]["retrieval"];
+            lines.push(format!(
+                "Retrieval raw    grounded {} | line precision {} | pollution {}",
+                r["grounded_success_rate"],
+                r["line_precision"]["mean"],
+                r["polluting_lines"]["mean"]
+            ));
+        }
+        lines.push(format!(
+            "Useful context   {} workload characters",
+            summary["scorecard"]["context"]["useful_context"]
+        ));
+        let load = &summary["scorecard"]["cold_startup_load"];
+        lines.push(format!(
+            "Cold/startup     {}",
+            load["seconds"]
+                .as_f64()
+                .map(|n| format!("{n:.2} s"))
+                .unwrap_or_else(|| load["reason"].as_str().unwrap_or("unavailable").into())
+        ));
+        lines.push("Efficiency       process peak VRAM / TPS per GiB unavailable; hardware observations in Details".into());
+        for (label, field, unit) in &SCORECARD_METRICS[2..] {
+            lines.push(format!(
+                "Warm {label:<11} {}",
+                scorecard_metric(summary, field, unit)
+            ));
+        }
+    } else {
+        lines.push(format!(
+            "{} / legacy methodology",
+            summary["suite"].as_str().unwrap_or("Historical benchmark")
+        ));
+        lines.extend(SCORECARD_METRICS.into_iter().map(|(label, field, unit)| {
             format!("{label:<16} {}", scorecard_metric(summary, field, unit))
-        })
-        .collect::<Vec<_>>();
+        }));
+    }
     lines.push(format!("Status           {}", status_label(summary)));
     if let (Some(start), Some(end)) = (
         summary["started_unix_ms"].as_u64(),
@@ -709,12 +915,65 @@ pub fn scorecard_lines(summary: &Value) -> Vec<String> {
 
 pub fn comparison_lines(value: &Value) -> Vec<String> {
     let mut lines = vec!["Comparison: baseline (left) -> selected (right)".into()];
+    lines.push(format!(
+        "Quality comparable: {}",
+        value["quality_comparable"]
+    ));
+    lines.push(format!(
+        "Performance comparable: {}",
+        value["performance_comparable"]
+    ));
+    lines.push(
+        value["comparison_note"]
+            .as_str()
+            .unwrap_or("Legacy methodology")
+            .into(),
+    );
+    lines.push(
+        value["performance_note"]
+            .as_str()
+            .unwrap_or("Deployment observations")
+            .into(),
+    );
+    for field in [
+        "profile_quality",
+        "intelligence",
+        "coding",
+        "agentic",
+        "retrieval",
+        "context",
+        "reliability",
+    ] {
+        if value["left"]["scorecard"][field].is_null()
+            && value["right"]["scorecard"][field].is_null()
+        {
+            continue;
+        }
+        let delta = scorecard_value(&value["left"], field)
+            .zip(scorecard_value(&value["right"], field))
+            .filter(|_| value["quality_comparable"] == true)
+            .map(|(a, b)| format!("{:+.1}", b - a))
+            .unwrap_or_else(|| "not comparable".into());
+        lines.push(format!(
+            "{field}: {} -> {} (selected - baseline {delta})",
+            scorecard_metric(&value["left"], field, " /100"),
+            scorecard_metric(&value["right"], field, " /100")
+        ));
+    }
     for (label, field, unit) in SCORECARD_METRICS {
+        if value["left"]["mode"].is_string() && matches!(field, "intelligence" | "agentic") {
+            continue;
+        }
+        let allowed = if matches!(field, "intelligence" | "agentic") {
+            value["quality_comparable"] == true
+        } else {
+            value["performance_comparable"] == true
+        };
         let delta = match (
             scorecard_value(&value["left"], field),
             scorecard_value(&value["right"], field),
         ) {
-            (Some(a), Some(b)) => format!(
+            (Some(a), Some(b)) if allowed => format!(
                 "{:+.1}{}",
                 b - a,
                 if unit == " / 100" { " points" } else { unit }
@@ -727,11 +986,85 @@ pub fn comparison_lines(value: &Value) -> Vec<String> {
             scorecard_metric(&value["right"], field, unit)
         ));
     }
+    for (label, path, quality) in [
+        (
+            "Grounded retrieval success",
+            vec!["scorecard", "retrieval", "grounded_success_rate"],
+            true,
+        ),
+        (
+            "Line precision",
+            vec!["scorecard", "retrieval", "line_precision", "mean"],
+            true,
+        ),
+        (
+            "Line pollution",
+            vec!["scorecard", "retrieval", "polluting_lines", "mean"],
+            true,
+        ),
+        (
+            "Useful context (workload chars)",
+            vec!["scorecard", "context", "useful_context"],
+            true,
+        ),
+        (
+            "Cold/startup load seconds",
+            vec!["scorecard", "cold_startup_load", "seconds"],
+            false,
+        ),
+        (
+            "Peak model VRAM",
+            vec!["scorecard", "efficiency", "peak_vram"],
+            false,
+        ),
+        (
+            "TPS/GiB",
+            vec!["scorecard", "efficiency", "tps_per_gib"],
+            false,
+        ),
+    ] {
+        let a = path.iter().fold(&value["left"], |v, k| &v[*k]);
+        let b = path.iter().fold(&value["right"], |v, k| &v[*k]);
+        let comparable = value[if quality {
+            "quality_comparable"
+        } else {
+            "performance_comparable"
+        }] == true;
+        let delta = a
+            .as_f64()
+            .zip(b.as_f64())
+            .filter(|_| comparable)
+            .map(|(a, b)| format!("{:+.3}", b - a))
+            .unwrap_or_else(|| "unavailable / not comparable".into());
+        lines.push(format!("{label}: {a} -> {b} (selected - baseline {delta})"));
+    }
+    for key in ["quality_differences", "performance_differences"] {
+        if let Some(diffs) = value[key].as_array() {
+            for d in diffs {
+                lines.push(format!(
+                    "{key}: {}: {} -> {}",
+                    d["field"], d["left"], d["right"]
+                ));
+            }
+        }
+    }
     lines
 }
 
-/// Concise human output; the JSON response and protocol are unchanged.
+/// Concise human output; JSON inspection also retains the complete raw record.
 pub fn scorecard_text(value: &Value) -> String {
+    if value["plan"].is_object() {
+        return format!(
+            "Profile: {}\nMode: {}\nFrozen plan: {}\nPhase work: {} s; headroom: {} s; hard maximum: {} s\nPack: {}",
+            value["profile_id"],
+            value["plan"]["mode"],
+            serde_json::to_string_pretty(&value["plan"]).unwrap_or_default(),
+            value["manifest"]["phase_work_seconds"],
+            value["manifest"]["headroom_seconds"],
+            value["plan"]["hard_seconds"],
+            value["pack_hash"]
+        );
+    }
     if value["summary"].is_object() {
         let s = &value["summary"];
         return format!(
@@ -776,6 +1109,14 @@ pub fn scorecard_text(value: &Value) -> String {
                 s["run_id"].as_str().unwrap_or("—")
             ));
             lines.extend(scorecard_lines(s));
+            if row["latest_quick"].is_object() && row["latest_quick"]["run_id"] != s["run_id"] {
+                lines.push(format!(
+                    "Latest Quick: {} | {} | quality {}",
+                    row["latest_quick"]["run_id"],
+                    status_label(&row["latest_quick"]),
+                    scorecard_metric(&row["latest_quick"], "profile_quality", " /100")
+                ));
+            }
             if row["latest_attempt"].is_object() && row["latest_attempt"]["run_id"] != s["run_id"] {
                 lines.push(format!(
                     "Latest attempt: {}",
@@ -823,4 +1164,13 @@ pub fn inspection_text(value: &Value) -> String {
     }
     lines.push(serde_json::to_string_pretty(value).unwrap_or_default());
     lines.join("\n")
+}
+
+fn historical_profile<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ModelProfile, D::Error> {
+    let mut value = Value::deserialize(d)?;
+    if let Some(m) = value.as_object_mut() {
+        m.entry("benchmark_capabilities")
+            .or_insert_with(|| json!([]));
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }

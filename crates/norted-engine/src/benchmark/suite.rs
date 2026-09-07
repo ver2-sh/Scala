@@ -1,15 +1,15 @@
-//! Frozen, offline inputs and binary oracles for Norted Quick Bench v3.
+//! Frozen, offline inputs and binary oracles for Norted Quick Bench v4.
 use crate::{InferenceTool, InferenceToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const INTELLIGENCE: &str = include_str!("intelligence.json");
-pub const SUITE: &str = "norted-quick-bench/3";
-pub const METHOD: &str = "binary-json-fixture-independent-performance/3";
+pub const SUITE: &str = "norted-quick-bench/4";
+pub const METHOD: &str = "capability-json-fixture-retrieval-context/4";
 pub const PROBE_SECONDS: u64 = 20;
 pub const PROBE_TOKENS: u32 = 2048;
-pub const POLICY: &str = "600s monotonic admission deadline: preparation 60; warmup 10; probes 4x20 (2048 total output tokens, including reasoning); intelligence 24x10; tools 8x8; agents 4x30 (6 turns / 8 calls). Full task work ceilings; cancellation confirmation up to 1s per stopped request shares global budget. Execution ends at 584s, cleanup by 599s, finalization by 600s. Candidate deadlines/limits score zero after confirmed request stop and health; unverified cancellation or infrastructure failure interrupts suite. Insufficient metrics remain unavailable; completed sections retain fixed denominators. One attempt. Internal managed streaming boundary. Per-run nonce; cache unverified. No decode-only or first-answer estimate.";
+pub const POLICY: &str = "Frozen capability plan; one attempt per selected task; no retries or budget reallocation. Standard <=600s; Quick <=180s including preparation. Execution stops 16s before hard deadline; cleanup by hard deadline minus 1s; immutable finalization by hard deadline. Cancellation confirmation and bookkeeping share headroom. Unknown measurements remain unavailable. Internal managed streaming boundary; nonce prefix; cache unverified.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Question {

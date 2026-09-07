@@ -41,7 +41,24 @@ impl RuntimeManager {
         request: BenchmarkRequest,
     ) -> Result<Value, String> {
         match request {
-            BenchmarkRequest::Start { profile_id } => self.start_benchmark(profile_id).await,
+            BenchmarkRequest::Start { profile_id, mode } => {
+                self.start_benchmark(profile_id, mode).await
+            }
+            BenchmarkRequest::Plan { profile_id, mode } => {
+                let profiles = self
+                    .model_profiles
+                    .read()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let profile = profiles
+                    .profiles
+                    .get(&profile_id)
+                    .ok_or("Model Profile not found")?;
+                let plan = BenchmarkPlan::new(mode, profile.benchmark_capabilities.clone())?;
+                Ok(
+                    json!({"profile_id":profile_id,"plan":plan,"manifest":plan.manifest(),"pack_hash":bench::digest(plan.manifest())}),
+                )
+            }
             BenchmarkRequest::Cancel => {
                 let active = self.benchmark.active.lock().await;
                 if let Some(a) = active.as_ref() {
@@ -141,7 +158,7 @@ impl RuntimeManager {
             .map_err(|e| e.to_string())?;
         let env = self.benchmark_environment().await;
         let status = self.status().await;
-        let pack = bench::digest(bench::manifest());
+
         let running_profile = self
             .benchmark
             .active
@@ -151,6 +168,13 @@ impl RuntimeManager {
             .map(|a| a.profile_id.clone());
         let mut rows = Vec::new();
         for profile in profiles.profiles.values() {
+            let pack = bench::digest(
+                BenchmarkPlan::new(
+                    BenchmarkMode::Standard,
+                    profile.benchmark_capabilities.clone(),
+                )?
+                .manifest(),
+            );
             let saved = self.saved_benchmark_configuration(profile).await.ok();
             let backend = status.backend(&profile.id);
             let mut saved = saved;
@@ -170,7 +194,11 @@ impl RuntimeManager {
                 .filter(|s| s.profile_id == profile.id)
                 .cloned()
                 .collect::<Vec<_>>();
-            let (result, state) = bench::select(&h, key.as_deref(), &pack);
+            let quick_pack = bench::digest(
+                BenchmarkPlan::new(BenchmarkMode::Quick, profile.benchmark_capabilities.clone())?
+                    .manifest(),
+            );
+            let (result, state) = bench::select(&h, key.as_deref(), &pack, &quick_pack);
             let state = if state.starts_with("Current")
                 && result.is_some_and(|r| r.saved_equals_served_requested_settings == Some(false))
             {
@@ -219,19 +247,20 @@ impl RuntimeManager {
                 state
             };
             rows.push(json!({"profile_id":profile.id,"display_name":profile.display_name,"state":state,"configuration_notes":reasons,
-                "result":result,"last_benchmark_unix_ms":result.filter(|s|bench::finished(&s.status)).and_then(|s|s.ended_unix_ms),"latest_attempt":h.first(),
+                "result":result,"last_benchmark_unix_ms":result.filter(|s|bench::finished(&s.status)).and_then(|s|s.ended_unix_ms),"latest_attempt":h.first(),"latest_quick":h.iter().find(|s|s.mode==Some(BenchmarkMode::Quick)),
                 "identity_note":"Current requires a running observed runtime. Hardware cache and external workloads remain unverified."}));
         }
         let active = self.benchmark.active.lock().await;
         Ok(
             json!({"suite":suite::SUITE,"methodology":suite::METHOD,"rows":rows,
-            "active":active.as_ref().map(|a|json!({"run_id":a.run_id,"profile_id":a.profile_id,"phase":a.phase,"completed_tasks":a.done,"total_tasks":40,"elapsed_seconds":a.started.elapsed().as_secs_f64(),"remaining_seconds":(600.0-a.started.elapsed().as_secs_f64()).max(0.0),"cancelling":*a.cancel.borrow()})),
+            "active":active.as_ref().map(|a|json!({"run_id":a.run_id,"profile_id":a.profile_id,"phase":a.phase,"completed_tasks":a.done,"mode":a.plan.mode,"total_tasks":a.plan.total_tasks(),"elapsed_seconds":a.started.elapsed().as_secs_f64(),"remaining_seconds":(a.plan.hard_seconds as f64-a.started.elapsed().as_secs_f64()).max(0.0),"cancelling":*a.cancel.borrow()})),
             "history_summary_limit":4096,"timing_boundary":"internal managed streaming inference","speed_method":"visible Unicode characters/s after first chunk; first chunk excluded","latency_method":"time to first nonempty visible text (ms); first answer unavailable"}),
         )
     }
     async fn start_benchmark(
         self: &Arc<Self>,
         profile_id: ModelProfileId,
+        mode: BenchmarkMode,
     ) -> Result<Value, String> {
         if self.benchmark.owner.lock().await.is_none() {
             return Err("benchmark execution requires an owning private-control server".into());
@@ -275,6 +304,7 @@ impl RuntimeManager {
             .get(&profile_id)
             .cloned()
             .ok_or("Model Profile not found")?;
+        let plan = BenchmarkPlan::new(mode, profile.benchmark_capabilities.clone())?;
         // Nothing is resolved or loaded before this monotonic admission timestamp.
         let started = Instant::now();
         let started_unix_ms = bench::now_ms();
@@ -286,11 +316,12 @@ impl RuntimeManager {
             started,
             phase: "preparation".into(),
             done: 0,
+            plan: plan.clone(),
             cancel,
         });
         drop(operation);
         let run = Run {
-            record_version: 1,
+            record_version: 2,
             run_id: run_id.clone(),
             profile_hash: profile.content_hash(),
             profile,
@@ -300,10 +331,10 @@ impl RuntimeManager {
             status: "running".into(),
             diagnostic: None,
             suite: suite::SUITE.into(),
-            pack_hash: bench::digest(bench::manifest()),
+            pack_hash: bench::digest(plan.manifest()),
             methodology: suite::METHOD.into(),
             policy: suite::POLICY.into(),
-            manifest: bench::manifest(),
+            manifest: plan.manifest(),
             server_version: env!("CARGO_PKG_VERSION").into(),
             source_revision: option_env!("NORTED_SOURCE_REVISION").map(str::to_owned),
             provenance: None,
@@ -332,7 +363,7 @@ impl RuntimeManager {
             ),
         ));
         Ok(
-            json!({"run_id":run_id,"profile_id":profile_id,"status":"running","execution_budget_seconds":600,"reservation":"Normal inference and load/unload are temporarily rejected"}),
+            json!({"run_id":run_id,"profile_id":profile_id,"status":"running","mode":mode,"execution_budget_seconds":plan.hard_seconds,"reservation":"Normal inference and load/unload are temporarily rejected"}),
         )
     }
     async fn run_benchmark(
@@ -343,7 +374,9 @@ impl RuntimeManager {
         _reservation: tokio::sync::OwnedRwLockWriteGuard<()>,
         _runtime_reservation: tokio::sync::OwnedMutexGuard<()>,
     ) {
-        let execution_deadline = tokio::time::Instant::from_std(started + Duration::from_secs(584));
+        let hard_seconds = run.plan().expect("admitted v4 plan").hard_seconds;
+        let execution_deadline =
+            tokio::time::Instant::from_std(started + Duration::from_secs(hard_seconds - 16));
         let outcome = tokio::select! {
             biased;
             _ = receiver.changed() => Err("cancelled".to_owned()),
@@ -367,8 +400,9 @@ impl RuntimeManager {
             run.diagnostic = Some(reason);
             // Stream cancellation is followed by owned load cancellation and
             // managed process termination. Keep the reservation through cleanup.
-            let deadline = tokio::time::Instant::from_std(started + Duration::from_secs(599))
-                .min(tokio::time::Instant::now() + Duration::from_secs(4));
+            let deadline =
+                tokio::time::Instant::from_std(started + Duration::from_secs(hard_seconds - 1))
+                    .min(tokio::time::Instant::now() + Duration::from_secs(4));
             match tokio::time::timeout_at(deadline, self.stop_benchmark_work(&run.profile.id)).await
             {
                 Ok(Ok(())) => {}
@@ -385,8 +419,8 @@ impl RuntimeManager {
             run.status = if summary.speed["combined"]["native_end_to_end_output_tokens_per_second"]
                 ["median"]
                 .is_null()
-                || summary.intelligence.is_none()
-                || summary.agentic.is_none()
+                || (!run.profile.benchmark_capabilities.is_empty()
+                    && summary.scorecard["profile_quality"].is_null())
                 || summary.speed["combined"]["first_visible_ms"]["median"].is_null()
                 || summary.speed["combined"]["visible_delivery_characters_per_second"]["median"]
                     .is_null()
@@ -406,7 +440,7 @@ impl RuntimeManager {
         }
         run.duration_seconds = started.elapsed().as_secs_f64();
         run.ended_unix_ms = Some(bench::now_ms());
-        let final_deadline = started + Duration::from_secs(600);
+        let final_deadline = started + Duration::from_secs(hard_seconds);
         match tokio::time::timeout_at(
             tokio::time::Instant::from_std(final_deadline),
             self.benchmark.store.save_before(&run, Some(final_deadline)),
@@ -475,13 +509,16 @@ impl RuntimeManager {
         started: Instant,
     ) -> Result<(), String> {
         self.benchmark.store.save(run).await?;
+        let plan = run.plan().ok_or("missing admitted plan")?;
         let prep = Instant::now();
-        tokio::time::timeout(Duration::from_secs(60).saturating_sub(started.elapsed()),async {
+        tokio::time::timeout(Duration::from_secs(plan.preparation_seconds).saturating_sub(started.elapsed()),async {
             run.saved_configuration=self.saved_benchmark_configuration(&run.profile).await?;
             run.environment=self.benchmark_environment().await;
             let before=self.status().await;
             run.environment["resident_profiles"]=json!(before.backends.iter().filter(|b|b.lifecycle==BackendLifecycle::Running).map(|b|json!({"profile_id":b.model_profile_id,"runtime_id":b.runtime_id,"accelerator_binding":b.accelerator_binding})).collect::<Vec<_>>());
+            let load_started=Instant::now();
             self.load(run.profile.id.clone()).await.map_err(|e|e.to_string())?;
+            if !run.loaded_before {run.load_seconds=Some(load_started.elapsed().as_secs_f64());}
             let residents=run.environment["resident_profiles"].clone();
             run.environment=self.benchmark_environment().await;
             run.environment["resident_profiles"]=residents;
@@ -506,9 +543,9 @@ impl RuntimeManager {
                 }
             }
             run.provenance=Some(provenance);
-            run.load_seconds=Some(prep.elapsed().as_secs_f64());
+            run.environment["benchmark_signature"]=benchmark_signature(run, &plan);
             Ok::<_,String>(())
-        }).await.map_err(|_|"setup timeout (60 seconds, including integrity checks)")??;
+        }).await.map_err(|_|"setup deadline (including integrity checks)")??;
         run.phases
             .insert("preparation".into(), prep.elapsed().as_secs_f64());
         self.checkpoint(run, started, "warmup").await?;
@@ -520,12 +557,16 @@ impl RuntimeManager {
             "warmup",
             "Reply with the word ready.",
             Value::Null,
-            10,
+            plan.warmup_seconds,
             warm.max_output_tokens,
         );
-        self.one_request(run, &mut e, warm, 10).await?;
+        self.one_request(run, &mut e, warm, plan.warmup_seconds)
+            .await?;
         self.checkpoint(run, started, "speed").await?;
-        for (id, prompt) in suite::probes() {
+        for (id, prompt) in suite::probes()
+            .into_iter()
+            .filter(|(id, _)| plan.probes.contains(id))
+        {
             self.verify_pinned(run).await?;
             let request = self
                 .request(run, &prompt, suite::PROBE_TOKENS, false, Vec::new())
@@ -535,14 +576,17 @@ impl RuntimeManager {
                 "speed",
                 &prompt,
                 Value::Null,
-                suite::PROBE_SECONDS,
+                plan.probe_seconds,
                 request.max_output_tokens,
             );
-            self.one_request(run, &mut e, request, suite::PROBE_SECONDS)
+            self.one_request(run, &mut e, request, plan.probe_seconds)
                 .await?;
             self.checkpoint(run, started, "speed").await?;
         }
-        for q in suite::questions() {
+        for q in suite::questions()
+            .into_iter()
+            .filter(|q| plan.questions.contains(&q.id))
+        {
             self.verify_pinned(run).await?;
             let request = self
                 .request(run, &q.prompt, q.max_output_tokens, false, Vec::new())
@@ -552,122 +596,165 @@ impl RuntimeManager {
                 &q.category,
                 &q.prompt,
                 q.answer.clone(),
-                q.seconds,
+                plan.question_seconds,
                 request.max_output_tokens,
             );
-            self.one_request(run, &mut e, request, q.seconds).await?;
+            self.one_request(run, &mut e, request, plan.question_seconds)
+                .await?;
             self.checkpoint(run, started, "intelligence").await?;
         }
-        let probe_request = self
-            .request(run, &suite::single_cases()[0].prompt, 384, true, Vec::new())
-            .await?;
-        let capability = {
-            let state = self.state.read().await;
-            let running = state
-                .backends
-                .get(&run.profile.id)
-                .and_then(|b| b.running.as_ref())
-                .ok_or("backend missing")?;
-            if !running
-                .adapter
-                .capabilities()
-                .features
-                .contains(&crate::EngineFeature::ToolCalling)
-            {
-                Err("adapter does not advertise native tool calling".into())
-            } else {
-                running
+        if !plan.single.is_empty() {
+            let probe_request = self
+                .request(run, &suite::single_cases()[0].prompt, 384, true, Vec::new())
+                .await?;
+            let capability = {
+                let state = self.state.read().await;
+                let running = state
+                    .backends
+                    .get(&run.profile.id)
+                    .and_then(|b| b.running.as_ref())
+                    .ok_or("backend missing")?;
+                if !running
                     .adapter
-                    .validate_inference_request(
-                        &probe_request,
-                        &running.effective_generation_settings,
-                        &running.settings_schema,
-                    )
-                    .map_err(|e| e.to_string())
-            }
-        };
-        if let Err(reason) = capability {
-            run.missing.push(format!("Agentic unavailable: {reason}"));
-        } else {
-            for case in suite::single_cases() {
-                self.verify_pinned(run).await?;
-                let request = self
-                    .request(run, &case.prompt, 384, true, Vec::new())
+                    .capabilities()
+                    .features
+                    .contains(&crate::EngineFeature::ToolCalling)
+                {
+                    Err("adapter does not advertise native tool calling".into())
+                } else {
+                    running
+                        .adapter
+                        .validate_inference_request(
+                            &probe_request,
+                            &running.effective_generation_settings,
+                            &running.settings_schema,
+                        )
+                        .map_err(|e| e.to_string())
+                }
+            };
+            if let Err(reason) = capability {
+                run.missing.push(format!("Agentic unavailable: {reason}"));
+                for (index, case) in suite::single_cases()
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| plan.single.contains(i))
+                {
+                    let mut e = new_evidence(
+                        &case.id,
+                        "tool",
+                        &case.prompt,
+                        json!({"case":index}),
+                        plan.single_seconds,
+                        None,
+                    );
+                    e.status = "unavailable".into();
+                    e.explanation = reason.clone();
+                    run.evidence.push(e);
+                }
+                for index in &plan.agents {
+                    let mut e = new_evidence(
+                        &format!("agent-{}", index + 1),
+                        "agent",
+                        suite::AGENT_PROMPTS[*index],
+                        json!({"case":index}),
+                        plan.agent_seconds,
+                        None,
+                    );
+                    e.status = "unavailable".into();
+                    e.explanation = reason.clone();
+                    run.evidence.push(e);
+                }
+                self.checkpoint(run, started, "native tool contract unavailable")
                     .await?;
-                let mut e = new_evidence(
-                    &case.id,
-                    "tool",
-                    &case.prompt,
-                    json!(case),
-                    8,
-                    request.max_output_tokens,
-                );
-                self.one_request(run, &mut e, request, 8).await?;
-                self.checkpoint(run, started, "single-turn tools").await?;
-            }
-            for (case, prompt) in suite::AGENT_PROMPTS.iter().enumerate() {
-                self.verify_pinned(run).await?;
-                let request = self.request(run, prompt, 384, true, Vec::new()).await?;
-                let mut e = new_evidence(
-                    &format!("agent-{}", case + 1),
-                    "agent",
-                    prompt,
-                    json!({"rubric":"fixture-observed-state-v2","case":case}),
-                    30,
-                    request.max_output_tokens,
-                );
-                if let Some(active) = self.benchmark.active.lock().await.as_mut() {
-                    active.phase = format!("agent / {}", e.id);
+            } else {
+                for (index, case) in suite::single_cases().into_iter().enumerate() {
+                    if !plan.single.contains(&index) {
+                        continue;
+                    }
+                    self.verify_pinned(run).await?;
+                    let request = self
+                        .request(run, &case.prompt, 384, true, Vec::new())
+                        .await?;
+                    let mut e = new_evidence(
+                        &case.id,
+                        "tool",
+                        &case.prompt,
+                        json!(case),
+                        plan.single_seconds,
+                        request.max_output_tokens,
+                    );
+                    self.one_request(run, &mut e, request, plan.single_seconds)
+                        .await?;
+                    self.checkpoint(run, started, "single-turn tools").await?;
                 }
-                e.status = "running".into();
-                run.evidence.push(e.clone());
-                self.benchmark.store.save(run).await?;
-                let begin = Instant::now();
-                let result = tokio::time::timeout(
-                    Duration::from_secs(30),
-                    self.agent_task(run, case, request, &mut e),
-                )
-                .await;
-                run.phases
-                    .entry("agent".into())
-                    .and_modify(|v| *v += begin.elapsed().as_secs_f64())
-                    .or_insert(begin.elapsed().as_secs_f64());
-                match result {
-                    Ok(Ok(passed)) => {
-                        e.score = Some(f64::from(passed));
-                        e.status = if passed { "passed" } else { "failed" }.into();
-                        if e.explanation.is_empty() {
-                            e.explanation = "Binary rubric: used delivered observations, changed and verified final virtual state, within 6 turns / 8 calls".into();
+                for (case, prompt) in suite::AGENT_PROMPTS.iter().enumerate() {
+                    if !plan.agents.contains(&case) {
+                        continue;
+                    }
+                    self.verify_pinned(run).await?;
+                    let request = self.request(run, prompt, 384, true, Vec::new()).await?;
+                    let mut e = new_evidence(
+                        &format!("agent-{}", case + 1),
+                        "agent",
+                        prompt,
+                        json!({"rubric":"fixture-observed-state-v2","case":case}),
+                        plan.agent_seconds,
+                        request.max_output_tokens,
+                    );
+                    if let Some(active) = self.benchmark.active.lock().await.as_mut() {
+                        active.phase = format!("agent / {}", e.id);
+                    }
+                    e.status = "running".into();
+                    run.evidence.push(e.clone());
+                    self.benchmark.store.save(run).await?;
+                    let begin = Instant::now();
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(plan.agent_seconds),
+                        self.agent_task(run, case, request, &mut e),
+                    )
+                    .await;
+                    run.phases
+                        .entry("agent".into())
+                        .and_modify(|v| *v += begin.elapsed().as_secs_f64())
+                        .or_insert(begin.elapsed().as_secs_f64());
+                    match result {
+                        Ok(Ok(passed)) => {
+                            e.score = Some(f64::from(passed));
+                            e.status = if passed { "passed" } else { "failed" }.into();
+                            if e.explanation.is_empty() {
+                                e.explanation = "Binary rubric: used delivered observations, changed and verified final virtual state, within 6 turns / 8 calls".into();
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            if e.status != "failed" {
+                                e.status = "infrastructure_error".into();
+                            }
+                            e.explanation = format!("{}; {error}", e.explanation);
+                            if let Some(attempt) = run.evidence.last_mut() {
+                                *attempt = e;
+                            }
+                            return Err(error);
+                        }
+                        Err(_) => {
+                            e.status = "timeout".into();
+                            e.score = Some(0.0);
+                            e.explanation =
+                                "30-second task deadline; unsuccessful under fixed budget".into();
+                            let stopped = self.confirm_benchmark_request_stopped(run, &mut e).await;
+                            if let Some(attempt) = run.evidence.last_mut() {
+                                *attempt = e.clone();
+                            }
+                            stopped?;
                         }
                     }
-                    Ok(Err(error)) => {
-                        if e.status != "failed" {
-                            e.status = "infrastructure_error".into();
-                        }
-                        e.explanation = format!("{}; {error}", e.explanation);
-                        if let Some(attempt) = run.evidence.last_mut() {
-                            *attempt = e;
-                        }
-                        return Err(error);
+                    if let Some(attempt) = run.evidence.last_mut() {
+                        *attempt = e;
                     }
-                    Err(_) => {
-                        e.status = "timeout".into();
-                        e.score = Some(0.0);
-                        e.explanation =
-                            "30-second task deadline; unsuccessful under fixed budget".into();
-                        let stopped = self.confirm_benchmark_request_stopped(run, &mut e).await;
-                        if let Some(attempt) = run.evidence.last_mut() {
-                            *attempt = e.clone();
-                        }
-                        stopped?;
-                    }
+                    self.checkpoint(run, started, "multi-step agents").await?;
                 }
-                if let Some(attempt) = run.evidence.last_mut() {
-                    *attempt = e;
-                }
-                self.checkpoint(run, started, "multi-step agents").await?;
             }
         }
+        self.retrieval_and_context(run, started, &plan).await?;
         self.verify_pinned(run).await?;
         let summary = run.summary();
         for (field, label) in [
@@ -829,6 +916,50 @@ impl RuntimeManager {
                 } else {
                     response.calls.is_empty() && suite::grade_json(&e.response, &e.expected)
                 };
+                let terminal_valid = if e.category == "tool" {
+                    matches!(response.finish.as_str(), "Stop" | "ToolCalls")
+                } else {
+                    response.finish == "Stop"
+                };
+                let passed = passed && terminal_valid;
+                let mut ids = std::collections::BTreeSet::new();
+                let valid = matches!(response.finish.as_str(), "Stop" | "ToolCalls")
+                    && !model_refusal(&e.response)
+                    && if e.category == "tool" {
+                        if response.calls.is_empty() {
+                            !e.expected["answer"].is_null()
+                                && serde_json::from_str::<Value>(&e.response).is_ok()
+                        } else {
+                            response.calls.iter().all(|c| {
+                                !c.id.is_empty()
+                                    && ids.insert(c.id.clone())
+                                    && suite::Fixture::new(0).apply(c).is_ok()
+                            })
+                        }
+                    } else {
+                        response.calls.is_empty()
+                            && serde_json::from_str::<Value>(&e.response).is_ok_and(|v| {
+                                std::mem::discriminant(&v) == std::mem::discriminant(&e.expected)
+                            })
+                    };
+                e.request_overrides["valid_completion"] = json!(valid);
+                if model_refusal(&e.response) {
+                    e.request_overrides["model_failure"] = json!("refusal");
+                } else if !valid {
+                    e.request_overrides["model_failure"] =
+                        json!(if !terminal_valid {
+                            "output_limit_or_invalid_terminal"
+                        } else if e.category == "tool"
+                            && response.calls.iter().any(|c| c.id.is_empty()
+                                || suite::parse_arguments(&c.arguments).is_err())
+                        {
+                            "invalid_tool_serialization"
+                        } else if e.category == "tool" && !response.calls.is_empty() {
+                            "tool_argument_failure"
+                        } else {
+                            "malformed_required_output"
+                        });
+                }
                 e.status = if passed { "passed" } else { "failed" }.into();
                 if e.category != "speed" && e.category != "warmup" {
                     e.score = Some(f64::from(passed));
@@ -847,6 +978,14 @@ impl RuntimeManager {
             Ok(Err(MeasureError::Candidate(reason))) => {
                 e.status = "failed".into();
                 e.score = (!matches!(e.category.as_str(), "warmup" | "speed")).then_some(0.0);
+                e.request_overrides["model_failure"] =
+                    json!(if reason.starts_with("runtime_timeout:") {
+                        "timeout"
+                    } else if reason.starts_with("admitted_context_limit:") {
+                        "admitted_context_limit"
+                    } else {
+                        "candidate_output_limit_or_serialization"
+                    });
                 e.explanation = reason;
                 self.confirm_benchmark_request_stopped(run, e).await.err()
             }
@@ -891,12 +1030,20 @@ impl RuntimeManager {
                 Err(MeasureError::Candidate(reason)) => {
                     e.status = "failed".into();
                     e.score = Some(0.0);
+                    e.request_overrides["model_failure"] =
+                        json!(if reason.starts_with("runtime_timeout:") {
+                            "timeout"
+                        } else {
+                            "candidate_output_limit_or_serialization"
+                        });
                     e.explanation = reason;
                     self.confirm_benchmark_request_stopped(run, e).await?;
                     return Ok(false);
                 }
                 Err(MeasureError::Infrastructure(reason)) => return Err(reason),
             };
+            e.request_overrides["valid_completion"] =
+                json!(matches!(r.finish.as_str(), "Stop" | "ToolCalls"));
             if e.response.len() > 65536 {
                 return Ok(false);
             }
@@ -904,10 +1051,14 @@ impl RuntimeManager {
             e.usage = r.usage.clone();
             e.tools.push(json!({"turn":turn+1,"observations_before_response":fixture,"text":r.text,"calls":r.calls,"timing":r.timing,"usage":r.usage}));
             if r.calls.is_empty() {
+                if model_refusal(&r.text) {
+                    e.request_overrides["model_failure"] = json!("refusal");
+                }
                 break;
             }
             count += r.calls.len();
             if count > 8 {
+                e.request_overrides["model_failure"] = json!("tool_call_limit");
                 e.explanation = "Candidate exceeded 8 tool calls in this task".into();
                 return Ok(false);
             }
@@ -916,12 +1067,20 @@ impl RuntimeManager {
             request.messages.push(assistant);
             for call in r.calls {
                 if call.id.is_empty() || !ids.insert(call.id.clone()) {
+                    e.request_overrides["model_failure"] = json!("invalid_tool_serialization");
                     return Ok(false);
                 }
+                let forced_conflict =
+                    case == 2 && call.name == "update" && json!(&fixture)["conflict"] == true;
                 let result = fixture.apply(&call);
                 let payload = match result {
                     Ok(v) => json!({"ok":v}),
-                    Err(error) => json!({"error":error}),
+                    Err(error) => {
+                        if !(forced_conflict && error.contains("revision conflict")) {
+                            e.request_overrides["model_failure"] = json!("tool_argument_failure");
+                        }
+                        json!({"error":error})
+                    }
                 };
                 e.tools
                     .push(json!({"tool_call_id":call.id,"result":payload}));
@@ -940,6 +1099,219 @@ impl RuntimeManager {
             self.verify_pinned(run).await?;
         }
         Ok(fixture.solved(case))
+    }
+    async fn retrieval_and_context(
+        self: &Arc<Self>,
+        run: &mut Run,
+        started: Instant,
+        plan: &BenchmarkPlan,
+    ) -> Result<(), String> {
+        for (index, task) in bench::retrieval::tasks().into_iter().enumerate() {
+            if !plan.retrieval.contains(&index) {
+                continue;
+            }
+            self.verify_pinned(run).await?;
+            let mut request = self
+                .request(run, &task.prompt, 384, false, Vec::new())
+                .await?;
+            request.tools = bench::retrieval::tools();
+            let mut e = new_evidence(
+                &task.id,
+                "retrieval",
+                &task.prompt,
+                json!(task.targets),
+                plan.retrieval_seconds,
+                request.max_output_tokens,
+            );
+            if let Some(reason) = run
+                .missing
+                .iter()
+                .find(|r| r.starts_with("Agentic unavailable:"))
+            {
+                e.status = "unavailable".into();
+                e.explanation = format!("Retrieval native tools unavailable: {reason}");
+                run.evidence.push(e);
+                continue;
+            }
+            e.status = "running".into();
+            run.evidence.push(e.clone());
+            self.benchmark.store.save(run).await?;
+            let mut fixture = bench::retrieval::Fixture::default();
+            let result = tokio::time::timeout(
+                Duration::from_secs(plan.retrieval_seconds),
+                self.retrieval_task(run, &mut e, request, &mut fixture),
+            )
+            .await;
+            let mut fatal = None;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(MeasureError::Candidate(reason))) => {
+                    e.status = "failed".into();
+                    e.explanation = reason;
+                    e.request_overrides["model_failure"] = json!("invalid_tool_or_output_limit");
+                    fatal = self
+                        .confirm_benchmark_request_stopped(run, &mut e)
+                        .await
+                        .err();
+                }
+                Ok(Err(MeasureError::Infrastructure(reason))) => {
+                    e.status = "infrastructure_error".into();
+                    e.explanation = reason.clone();
+                    fatal = Some(reason);
+                }
+                Err(_) => {
+                    e.status = "timeout".into();
+                    e.explanation = "retrieval task deadline".into();
+                    fatal = self
+                        .confirm_benchmark_request_stopped(run, &mut e)
+                        .await
+                        .err();
+                }
+            }
+            let mut metrics = bench::retrieval::grade(&task, &e.response, &fixture.located);
+            metrics["tool_calls"] = e.request_overrides["tool_calls"].clone();
+            metrics["rounds"] = e.request_overrides["rounds"].clone();
+            metrics["malformed_calls"] = e.request_overrides["malformed_calls"].clone();
+            metrics["timeouts"] = json!(usize::from(e.status == "timeout"));
+            metrics["completion_status"] = json!(e.status);
+            let completed =
+                e.status == "completed" && e.request_overrides["valid_completion"] == true;
+            metrics["completion_valid"] = json!(completed);
+            if !completed {
+                metrics["grounded_success"] = json!(false);
+                metrics["score"] = json!(0.0);
+            }
+            if !matches!(e.status.as_str(), "infrastructure_error" | "timeout") {
+                let valid = metrics["final_format_valid"] == true
+                    && e.request_overrides["model_failure"].is_null()
+                    && e.request_overrides["valid_completion"] == true;
+                e.request_overrides["valid_completion"] = json!(valid);
+                if metrics["final_format_valid"] != true {
+                    e.request_overrides["model_failure"] = json!("malformed_final_output");
+                }
+                e.score = metrics["score"].as_f64().map(|s| s / 100.0);
+                e.status = if e.score == Some(1.0) {
+                    "passed"
+                } else {
+                    "failed"
+                }
+                .into();
+            } else if e.status == "timeout" {
+                e.score = Some(0.0);
+            }
+            e.request_overrides["retrieval_metrics"] = metrics;
+            *run.evidence.last_mut().expect("checkpointed task") = e;
+            if let Some(reason) = fatal {
+                return Err(reason);
+            }
+            self.checkpoint(run, started, "retrieval").await?;
+        }
+        for target in &plan.context_targets {
+            self.verify_pinned(run).await?;
+            let payload = bench::context::payload(
+                *target,
+                plan.capabilities
+                    .contains(&norted_core::BenchmarkCapability::Retrieval),
+            );
+            let prompt = payload["prompt"].as_str().expect("bundled payload");
+            let request = self.request(run, prompt, 384, false, Vec::new()).await?;
+            let mut e = new_evidence(
+                payload["id"].as_str().unwrap(),
+                "ladder",
+                prompt,
+                payload["answer"].clone(),
+                plan.context_seconds,
+                request.max_output_tokens,
+            );
+            e.request_overrides["target_workload_characters"] = json!(target);
+            let setting_id = format!("{}.context_length", run.profile.engine_id);
+            let limit = run
+                .provenance
+                .as_ref()
+                .and_then(|p| p.normalized_settings.get("resolved_settings"))
+                .and_then(|v| v.get(&setting_id))
+                .and_then(Value::as_u64);
+            e.request_overrides["admitted_context_limit"] = json!(limit);
+            if limit.is_none_or(|n| prompt.len() as u64 + 2048 > n) {
+                e.status = "unavailable".into();
+                e.explanation=if limit.is_none(){"Observed context limit unavailable"}else{"Workload plus conservative overhead exceeds observed context limit; not attempted"}.into();
+                run.evidence.push(e);
+            } else {
+                self.one_request(run, &mut e, request, plan.context_seconds)
+                    .await?;
+            }
+            self.checkpoint(run, started, "context ladder").await?;
+        }
+        Ok(())
+    }
+    async fn retrieval_task(
+        self: &Arc<Self>,
+        run: &mut Run,
+        e: &mut Evidence,
+        mut request: crate::InferenceRequest,
+        fixture: &mut bench::retrieval::Fixture,
+    ) -> Result<(), MeasureError> {
+        e.request_overrides["benchmark_messages_before_profile_defaults"] = json!(request.messages);
+        e.request_overrides["tool_definitions"] = json!(request.tools);
+        e.request_overrides["malformed_calls"] = json!(0);
+        e.request_overrides["tool_calls"] = json!(0);
+        let mut count = 0;
+        let mut ids = std::collections::BTreeSet::new();
+        for round in 1..=6 {
+            if let Some(active) = self.benchmark.active.lock().await.as_mut() {
+                active.phase = format!("retrieval / {} / round {round}", e.id);
+            }
+            e.response.clear();
+            e.request_overrides["rounds"] = json!(round);
+            let r = self.measure(request.clone(), e).await?;
+            e.tools.push(json!({"round":round,"calls":r.calls,"text":r.text,"timing":r.timing,"usage":r.usage}));
+            if r.calls.is_empty() {
+                if model_refusal(&r.text) {
+                    e.request_overrides["model_failure"] = json!("refusal");
+                }
+                e.request_overrides["valid_completion"] = json!(r.finish == "Stop");
+                e.status = "completed".into();
+                return Ok(());
+            }
+            count += r.calls.len();
+            e.request_overrides["tool_calls"] = json!(count);
+            if count > 10 {
+                return Err(MeasureError::Candidate(
+                    "retrieval call limit exceeded".into(),
+                ));
+            }
+            let mut assistant = InferenceMessage::text(InferenceRole::Assistant, r.text);
+            assistant.tool_calls = r.calls.clone();
+            request.messages.push(assistant);
+            for call in r.calls {
+                let result = if call.id.is_empty() || !ids.insert(call.id.clone()) {
+                    Err("empty or duplicate call ID".into())
+                } else {
+                    fixture.apply(&call)
+                };
+                if result.is_err() {
+                    let n = e.request_overrides["malformed_calls"].as_u64().unwrap_or(0);
+                    e.request_overrides["malformed_calls"] = json!(n + 1);
+                    e.request_overrides["model_failure"] = json!("tool_argument_failure");
+                }
+                let payload = match result {
+                    Ok(v) => json!({"ok":v}),
+                    Err(err) => json!({"error":err}),
+                };
+                e.tools
+                    .push(json!({"tool_call_id":call.id,"result":payload}));
+                let mut message = InferenceMessage::text(InferenceRole::Tool, payload.to_string());
+                message.tool_call_id = Some(call.id);
+                request.messages.push(message);
+            }
+            *run.evidence.last_mut().expect("checkpointed task") = e.clone();
+            self.benchmark.store.save(run).await?;
+            self.verify_pinned(run).await?;
+        }
+        e.response.clear();
+        e.request_overrides["model_failure"] = json!("round_limit_without_final");
+        e.status = "failed".into();
+        Ok(())
     }
     async fn confirm_benchmark_request_stopped(
         &self,
@@ -1005,7 +1377,9 @@ impl RuntimeManager {
         let mut stream = self
             .infer_stream(request)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|error| {
+                classify_inference_error(error.to_string(), evidence.category == "ladder")
+            })?
             .stream;
         let mut text = String::new();
         let mut calls: BTreeMap<u32, InferenceToolCall> = BTreeMap::new();
@@ -1014,7 +1388,9 @@ impl RuntimeManager {
         let mut finish = None;
         while let Some(event) = stream.next().await {
             let elapsed = begin.elapsed().as_secs_f64() * 1000.0;
-            let event = event.map_err(|e| e.to_string())?;
+            let event = event.map_err(|error| {
+                classify_inference_error(error.to_string(), evidence.category == "ladder")
+            })?;
             evidence.stream_event_observed = true;
             match event {
                 InferenceEvent::TextDelta { delta } => {
@@ -1272,5 +1648,78 @@ impl From<String> for MeasureError {
 impl From<&str> for MeasureError {
     fn from(value: &str) -> Self {
         Self::Infrastructure(value.into())
+    }
+}
+
+fn benchmark_signature(run: &Run, plan: &BenchmarkPlan) -> Value {
+    let p = run.provenance.as_ref();
+    let quality = json!({"suite":run.suite,"method":run.methodology,"mode":plan.mode,"capabilities":plan.capabilities,"plan":plan,"selected_task_ids":plan.task_ids(),"plan_hash":bench::digest(plan),"pack_hash":run.pack_hash,"rubrics":["exact-json-v1","fixture-observed-state-v2","file-line-f0.5-grounded/1","exact-json-context/1"]});
+    let settings = p.map(|p| {
+        p.settings
+            .effective
+            .iter()
+            .map(|(id, s)| (id.to_string(), s.value.clone()))
+            .collect::<BTreeMap<_, _>>()
+    });
+    let resolved = p.and_then(|p| p.normalized_settings.get("resolved_settings"));
+    let hardware = p.and_then(|p|p.accelerator_binding.as_ref()).map(|b|b.devices.iter().map(|d|json!({"accelerator":d.accelerator,"name":d.name,"total_memory_bytes":d.vram_bytes,"driver":d.driver_version,"compute_capability":d.compute_capability})).collect::<Vec<_>>());
+    let performance = semantic(
+        json!({"quality":quality,"engine":run.profile.engine_id,"runtime":p.map(|p|&p.runtime),"accelerators_in_binding_order":hardware,"os":run.environment["os"],"architecture":run.environment["architecture"],"cpu_model":run.environment["cpu_model"],"logical_cpus":run.environment["logical_cpus"],"ram_total":run.environment["ram_total"],"settings":settings,"observed_settings":resolved,"server_version":run.server_version,"source_revision":run.source_revision}),
+    );
+    let verified = p.is_some_and(|p| {
+        !p.runtime.entrypoint_sha256.is_empty()
+            && (p.runtime.identity.accelerator == "cpu"
+                || hardware.as_ref().is_some_and(|h| {
+                    !h.is_empty()
+                        && h.iter()
+                            .all(|d| d["name"].is_string() && d["total_memory_bytes"].is_u64())
+                }))
+    }) && run.environment["cpu_model"].is_string();
+    json!(BenchmarkSignature {
+        version: 1,
+        quality_key: bench::digest(&quality),
+        methodology: quality,
+        performance_key: verified.then(|| bench::digest(&performance)),
+        performance_conditions: performance,
+        performance_identity_reason: (!verified)
+            .then(|| "runtime or hardware class observations unavailable".into()),
+        model: json!(p.map(|p| &p.model)),
+        model_metadata: run.saved_configuration["model"].clone(),
+        profile_id: run.profile.id.clone(),
+        profile_hash: run.profile_hash.clone(),
+        file_observations: run.saved_configuration["files"].clone(),
+        accelerator_binding: p.and_then(|p| p.accelerator_binding.clone()),
+        runtime: json!(p.map(|p| &p.runtime)),
+        effective_settings: json!(settings),
+        observed_settings: json!(resolved),
+        server_version: run.server_version.clone(),
+        source_revision: run.source_revision.clone(),
+    })
+}
+fn model_refusal(text: &str) -> bool {
+    let text = text.trim().trim_start_matches('"').to_lowercase();
+    ["i cannot", "i can't", "i can’t", "i'm sorry", "i refuse"]
+        .iter()
+        .any(|p| text.starts_with(p))
+}
+
+fn classify_inference_error(reason: String, admitted_context: bool) -> MeasureError {
+    let lower = reason.to_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        MeasureError::Candidate(format!("runtime_timeout: {reason}"))
+    } else if admitted_context
+        && [
+            "context length exceeded",
+            "exceeds the context",
+            "exceeds context",
+            "context window exceeded",
+            "prompt is too long",
+        ]
+        .iter()
+        .any(|phrase| lower.contains(phrase))
+    {
+        MeasureError::Candidate(format!("admitted_context_limit: {reason}"))
+    } else {
+        MeasureError::Infrastructure(reason)
     }
 }

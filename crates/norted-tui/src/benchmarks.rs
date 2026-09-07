@@ -23,6 +23,7 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Run,
+    Quick,
     History,
     Details,
     Mark,
@@ -35,7 +36,8 @@ pub enum Action {
 impl Action {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Run => "[b Run]",
+            Self::Run => "[b Standard]",
+            Self::Quick => "[q Quick]",
             Self::History => "[h History]",
             Self::Details => "[d Details]",
             Self::Mark => "[Space Mark/clear]",
@@ -88,7 +90,7 @@ impl Benchmarks {
         } else if self.history.is_some() {
             vec![Back, Details, Mark, Compare, Refresh, Cancel]
         } else {
-            vec![Run, History, Details, Refresh, Cancel]
+            vec![Run, Quick, History, Details, Refresh, Cancel]
         }
     }
     pub fn enabled(&self, action: Action) -> bool {
@@ -103,7 +105,7 @@ impl Benchmarks {
             }
             Evidence => self.inspection.is_some() && !self.evidence,
             Mark => self.history.is_some() && self.row()["run_id"].is_string(),
-            Run => {
+            Run | Quick => {
                 idle && self.history.is_none()
                     && self.row()["profile_id"].is_string()
                     && !self.overview["active"].is_object()
@@ -177,13 +179,20 @@ impl Benchmarks {
                     },
                 )
             }
-            Run | History => {
+            Run | Quick | History => {
                 if let Some(id) = self.row()["profile_id"]
                     .as_str()
                     .and_then(|s| s.parse().ok())
                 {
-                    self.pending = Some(if action == Run {
-                        BenchmarkRequest::Start { profile_id: id }
+                    self.pending = Some(if matches!(action, Run | Quick) {
+                        BenchmarkRequest::Start {
+                            profile_id: id,
+                            mode: if action == Quick {
+                                norted_engine::benchmark::BenchmarkMode::Quick
+                            } else {
+                                norted_engine::benchmark::BenchmarkMode::Standard
+                            },
+                        }
                     } else {
                         BenchmarkRequest::History { profile_id: id }
                     });
@@ -234,6 +243,7 @@ impl Benchmarks {
             }
             KeyCode::Esc | KeyCode::Backspace => Back,
             KeyCode::Char('b') => Run,
+            KeyCode::Char('q') => Quick,
             KeyCode::Char('h') => History,
             KeyCode::Char('d') => Details,
             KeyCode::Char(' ') => Mark,
@@ -451,6 +461,9 @@ fn summary_lines(s: &Value) -> Vec<String> {
         "single_pass",
         "multi_pass",
         "categories",
+        "scorecard",
+        "signature",
+        "mode",
         "task_outcomes",
     ] {
         if !s[key].is_null() {
@@ -594,6 +607,16 @@ fn content_lines(state: &Benchmarks) -> Vec<String> {
     let row = state.row();
     let mut lines = scorecard_lines(state.result());
     if state.history.is_none()
+        && row["latest_quick"].is_object()
+        && row["latest_quick"]["run_id"] != state.result()["run_id"]
+    {
+        lines.push(format!(
+            "Latest Quick: {} | quality {}",
+            text(&row["latest_quick"]["run_id"]),
+            scorecard_metric(&row["latest_quick"], "profile_quality", " /100")
+        ));
+    }
+    if state.history.is_none()
         && row["latest_attempt"].is_object()
         && row["latest_attempt"]["run_id"] != state.result()["run_id"]
     {
@@ -643,7 +666,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             } else {
                 "Running"
             },
-            text(&active["phase"]),
+            format_args!("{} / {}", text(&active["mode"]), text(&active["phase"])),
             active["completed_tasks"],
             active["total_tasks"],
             number(&active["elapsed_seconds"]),
@@ -670,23 +693,26 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     let wide = l.header.width >= 120;
     let compact = l.header.width >= 58;
     let tails: &[u16] = if wide {
-        &[16, 14, 9, 12, 18, 18]
+        &[14, 10, 12, 9, 11, 17, 18]
     } else if compact {
         &[12, 11, 8, 11]
     } else {
         &[12, 11]
     };
     let columns = inventory_columns(l.header, tails, tails);
-    let mut headings = vec!["Profile / run", "Intel ↑ /100", "Agentic ↑"];
+    let mut headings = vec!["Profile / run", "Quality ↑", "Mode"];
     if l.header.width >= 120 {
-        headings[1] = "Intelligence ↑";
-        headings[2] = "Agentic ↑";
+        headings[1] = "Profile quality ↑";
+        headings[2] = "Mode";
+    }
+    if wide {
+        headings.push("Capability");
     }
     if compact {
         headings.extend(["TPS ↑", "Latency ↓"]);
     }
     if wide {
-        headings.extend(["Status", "Last benchmark"]);
+        headings.extend(["State / key", "Last benchmark"]);
     }
     let headings = headings.into_iter().map(str::to_owned).collect::<Vec<_>>();
     inventory_row(frame, l.header, &columns, &headings, theme.muted, glyphs);
@@ -715,9 +741,34 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         let status = status_label(result);
         let mut values = vec![
             name,
-            scorecard_metric(result, "intelligence", " /100"),
-            scorecard_metric(result, "agentic", " /100"),
+            scorecard_metric(result, "profile_quality", " /100"),
+            result["mode"]
+                .as_str()
+                .unwrap_or(if result["suite"].is_string() {
+                    "Legacy"
+                } else {
+                    "—"
+                })
+                .into(),
         ];
+        if wide {
+            let metric = [
+                ("retrieval", "Ret"),
+                ("coding", "Code"),
+                ("intelligence", "Intel"),
+                ("agentic", "Tool"),
+                ("context", "Ctx"),
+            ]
+            .into_iter()
+            .find(|(field, _)| result["scorecard"][*field].is_object());
+            values.push(
+                metric
+                    .map(|(field, label)| {
+                        format!("{label} {}", scorecard_metric(result, field, ""))
+                    })
+                    .unwrap_or_else(|| "—".into()),
+            );
+        }
         if compact {
             values.push(scorecard_metric(
                 result,
@@ -727,7 +778,15 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             values.push(scorecard_metric(result, "first_visible_ms", " ms"));
         }
         if wide {
-            values.push(status);
+            values.push(if state.history.is_some() {
+                let key = result["signature"]["quality_key"]
+                    .as_str()
+                    .map(|k| k.chars().take(6).collect::<String>())
+                    .unwrap_or_else(|| "legacy".into());
+                format!("{status} {key}")
+            } else {
+                row["state"].as_str().unwrap_or(&status).to_owned()
+            });
             values.push(timestamp(if state.history.is_some() {
                 &row["ended_unix_ms"]
             } else {

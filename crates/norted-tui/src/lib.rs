@@ -1227,6 +1227,30 @@ async fn execute_settings_action(
             }
             stored
         }
+        SettingsAction::SetProfileCapabilities {
+            profile_id,
+            capabilities,
+        } => {
+            let result = profiles_store
+                .update(move |state| {
+                    state
+                        .profiles
+                        .get_mut(&profile_id)
+                        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?
+                        .benchmark_capabilities = capabilities;
+                    Ok(())
+                })
+                .await
+                .map_err(|e| e.to_string());
+            finish_settings_write(
+                &runtime_packs,
+                paths,
+                &settings_store,
+                &profiles_store,
+                result,
+            )
+            .await
+        }
         SettingsAction::CycleProfileRole { profile_id } => {
             let result = profiles_store
                 .update(move |state| {

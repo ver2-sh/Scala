@@ -34,8 +34,8 @@ pub use model::{
     q27_tokenizer_candidate, select_q27_tokenizer_filename, validate_q27_tokenizer_header,
 };
 pub use model_profile::{
-    EngineId, MODEL_PROFILES_STATE_VERSION, ModelProfile, ModelProfileId, ModelProfilesState,
-    ModelProfilesStore, ModelRole, validate_engine_id,
+    BenchmarkCapability, EngineId, MODEL_PROFILES_STATE_VERSION, ModelProfile, ModelProfileId,
+    ModelProfilesState, ModelProfilesStore, ModelRole, validate_engine_id,
 };
 pub use norted_package::{
     NortedPackageAcquisitionFile, NortedPackageAcquisitionPlan, NortedPackageAcquisitionRole,

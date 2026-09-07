@@ -1,396 +1,346 @@
-# Private per-profile benchmarks
+# Private capability-aware benchmarks
 
-Norted Quick Bench v3 is an original, bundled, offline task pack. The running
-server executes it through its normal managed inference path. The TUI and CLI
-use authenticated private control; no benchmark endpoints are added to the
-public OpenAI-compatible API. No judge model, downloads, shell tools, Python
-service or external evaluation service are involved.
+Norted Quick Bench v4 is an original, bundled, offline benchmark for private
+comparison of your own local Model Profiles. The server runs normal managed
+inference through authenticated private control. There is no judge model,
+downloaded task suite, public benchmark API, automatic run, shell, host-filesystem
+tool, network service, or global multi-model session. Each admitted run belongs
+to one profile. Terminal records are immutable. New v4 records use record format version 2;
+v3 record format version 1 remains readable.
 
-Select a Model Profile and choose **Run benchmark** (`b`), or open
-`/benchmarks` through normal navigation. Each row represents one profile and
-one coherent result. `h` opens its history, Enter opens a result, Space marks a
-comparison baseline, and `c` compares the marked result with the selected one.
-The mark survives returning to the profile list, so it also supports comparing
-different profiles. Comparisons include raw task outcomes, counts, settings,
-runtime and hardware differences. They do not declare a winner from a single
-changed answer.
+## Declare intent on the Model Profile
 
-The equivalent commands use the same running server:
+Profiles store an explicit typed set: `reasoning`, `coding`, `tool_use`,
+`retrieval`, `long_context`. These are semantic intentions, independent of
+architecture, filenames, family names, model size and runtime features.
+`retrieval` requires `tool_use`. An empty set intentionally selects operational
+probes only and has no Profile Quality score. No capability is inferred.
 
 ```console
-norted-server benchmarks start PROFILE_ID
+norted-server model-profiles create coding --model MODEL_ID --engine ENGINE_ID --capabilities reasoning,coding,tool_use,long_context
+norted-server model-profiles set-capabilities coding reasoning,coding,tool_use,long_context
+norted-server model-profiles set-capabilities context-finder retrieval,tool_use,long_context
+```
+
+In the existing Model Profiles editor, **C** opens the comma-separated capability
+editor; an empty entry clears the set. Newly created profiles start with no
+quality capabilities until explicitly edited. Duplication copies the set.
+Capabilities participate in `ModelProfile.content_hash()`; display-name changes
+still do not. The profile state format is **version 3**. Unsupported state
+versions fail clearly. There is no profile migration or legacy default-capability
+pathway. Benchmark history has its own narrowly scoped v3 record reader.
+
+## Standard and Quick
+
+```console
+norted-server benchmarks start PROFILE_ID --mode standard
+norted-server benchmarks start PROFILE_ID --mode quick
+norted-server benchmarks plan PROFILE_ID --mode quick --json
 norted-server benchmarks status --json
 norted-server benchmarks cancel
 norted-server benchmarks history PROFILE_ID --json
-norted-server benchmarks result RUN_ID --json > result.json
-norted-server benchmarks compare LEFT_RUN_ID RIGHT_RUN_ID --json
+norted-server benchmarks result RUN_ID
+norted-server benchmarks result RUN_ID --verbose
+norted-server benchmarks result RUN_ID --json
+norted-server benchmarks compare BASELINE_RUN_ID SELECTED_RUN_ID --json
 ```
 
-With `--json`, result inspection contains a computed summary and the immutable
-record. Human-readable output leads with a concise scorecard. Add benchmark-specific
-`--verbose` for technical analysis and raw evidence. Run IDs identify records,
-not global multi-model sessions. Two profiles using the same artifact have
-separate histories. Starting a profile never clears another profile's results.
-There is one admitted job, no queue, and no automatic benchmark trigger.
+The default is **Standard**, the authoritative full local evaluation, with a
+**600-second hard maximum including setup/loading and finalization**. Quick is
+a smaller confidence check aimed at about two minutes, with a **180-second hard
+maximum including setup/loading and finalization**. A plan inspection performs
+no load or inference. Quick is a separate frozen selection, not Standard stopped
+early. Neither mode retries or redistributes unused task time.
 
-## Reading the scorecard
+The `/benchmarks` page uses **b Standard**, **q Quick**, **h History**, Enter or
+**d Details**, Space to mark a baseline, **c Compare**, **e Evidence**, and
+**x Cancel**. On this page with content focus, q runs Quick; it does not quit.
+Profile-page b still starts Standard. Overview prefers a current finished
+Standard result with the expected Standard pack and configuration key. A newer
+Quick does not hide it: Latest Quick, Latest attempt and independent history
+entries remain visible. If there is no finished Standard, Quick is explicitly
+labelled. Failed/cancelled attempts do not displace a finished scorecard.
 
-Overview, history, selected results and human-readable CLI output prioritize:
+The compact table shows Profile, Profile Quality and Mode, adding warm TPS,
+latency, a relevant capability score, state/signature-key prefix and timestamp
+as width permits. The selected scorecard shows
+only declared quality categories plus operational measurements. Details and
+verbose CLI include sample coverage, uncertainty, raw retrieval metrics, context
+rungs, missing reasons, signature, configuration and hardware/runtime provenance.
+Evidence/JSON retain the underlying immutable record.
 
-- **Intelligence /100 ↑**: higher is better.
-- **Agentic /100 ↑**: higher is better.
-- **TPS ↑**: higher is better. Native output tokens divided by whole-request
-  duration, not claimed decode-only speed.
-- **Latency ↓**: lower is better. Time to first visible output, in milliseconds.
+## Frozen plan and time proof
 
-Missing or partial headline measurements show **—**, without substituting
-characters/sec for missing native usage. Partial measurements and their coverage
-remain in Details. Cancelled, failed and incomplete attempts show their actual
-status and no headline scores. A newer unsuccessful attempt does not replace a
-previous finished scorecard; it appears separately as “Latest attempt”.
-There is no overall score or declared comparison winner. Comparisons lead with
-the four metrics and signed selected-minus-baseline deltas; lower latency is better.
+Suite: **`norted-quick-bench/4`**. Method:
+**`capability-json-fixture-retrieval-context/4`**.
+The manifest binds selected IDs, inputs, hidden answer keys, tool definitions,
+fixtures, rubrics, context payloads, output caps and phase ceilings. Answer keys
+and grading state are never included in model messages or tool definitions.
+The selected `BenchmarkPlan` and its digest are in the manifest; the resulting
+manifest digest remains `pack_hash`. Plan identity is repeated in the signature
+for historical comparison, not used as a replacement for `configuration_key`.
 
-In the TUI, **d Details** exposes category scores, single-turn and multi-step
-results, technical performance variants, short/medium probe coverage, missing
-reasons, configuration, methodology and outcomes. **e Evidence** exposes the raw
-response. Normal output keeps these diagnostics out of the scorecard.
-For example, `norted-server benchmarks result RUN_ID --verbose` shows the full
-CLI inspection; `--json` retains the complete machine-readable response.
+Worst case, with **every capability** declared:
 
-## Suite and scoring
+| Phase | Quick | Standard |
+|---|---:|---:|
+| Preparation, integrity and actual loading | 30 s | 60 s |
+| Unscored warm-up | 3 s | 5 s |
+| Speed probes | 2 × 12 s | 4 × 20 s |
+| Reasoning JSON tasks | 6 × 3 s | 18 × 6 s |
+| Coding JSON tasks | 2 × 3 s | 6 × 6 s |
+| Single-turn native tools | 3 × 3 s | 8 × 4 s |
+| Multi-step Agentic fixtures | 1 × 10 s | 4 × 18 s |
+| Retrieval tasks | 3 × 10 s | 8 × 12 s |
+| Context rungs | 2 × 5 s | 5 × 14 s |
+| Phase work total | **140 s** | **559 s** |
+| Shared cancellation/bookkeeping/finalization headroom | **40 s** | **41 s** |
+| Hard maximum | **180 s** | **600 s** |
 
-The complete inputs and answer keys are compiled into the binary from
-[`intelligence.json`](../crates/norted-engine/src/benchmark/intelligence.json)
-and [`suite.rs`](../crates/norted-engine/src/benchmark/suite.rs). Each record
-includes the manifest, its SHA-256, rubric/methodology versions, inputs, request
-limits, responses, native usage, timing observations and bounded tool evidence.
-Answer keys and grading state are never passed into model messages or tools.
+There are at most 19 Quick or 53 Standard tasks, excluding warm-up. Progress
+uses the selected plan, including explicit unavailable tasks. For subsets of
+capabilities, work ceilings only decrease. Plan construction verifies that work
+plus at least 16 seconds of cleanup/finalization headroom fits the hard maximum.
+Standard retains all original JSON and Agentic cases with tighter per-task
+ceilings to admit the additional packs even for all-capability profiles. These
+are frozen limits, not measured model-duration or calibration claims.
 
-**Norted Quick Intelligence** uses 24 equally weighted tasks: six each in
-logical/numerical reasoning, grounded context understanding, code reasoning and
-instruction following. Each uses the binary `exact-json-v1` rubric: parse one
-complete JSON scalar or array and compare the whole value to its answer key.
-Markdown, commentary, multiple answers, wrong types, ordering or extra items
-fail. JSON whitespace is harmless. There is no substring matching or partial
-credit. Category pass counts and six-task coverage accompany each score.
+Quick selects JSON IDs ending in `-1` and `-4` in each relevant group, native
+single cases 1/6/8, Agentic case 3 (conflict recovery), retrieval cases 1/4/7,
+short-1 and medium-1 speed probes, and workload targets 4096/16384.
+Standard selects all relevant bundled cases and context targets
+4096/16384/32768/65536/131072. Above-limit rungs are recorded as unavailable.
 
+Execution stops no later than admission + hard maximum − 16 seconds. Error
+cleanup ends by hard maximum − 1 second and each immediate stop has at most
+four seconds; durable finalization is bounded by the hard maximum. The terminal
+writer checks the monotonic deadline before publishing. OS/storage stalls can
+prevent durable finalization or stop confirmation; they cannot extend the
+successful-run contract. Recoverable active evidence remains on disk.
+
+## Quality scores
+
+All quality scores use 0–100. Irrelevant categories are absent, never zero.
+Missing declared categories are unavailable/incomplete, not reweighted.
+
+- **Intelligence / Reasoning**: 100 × mean of scored `logic`, `context` and
+  `instruction` binary outcomes (18 Standard / 6 Quick). All required outcomes
+  must be scored. Each selected group has equal sample count.
+- **Coding**: 100 × mean of scored `code` outcomes (6 Standard / 2 Quick).
+  This measures short code tracing, reasoning and debugging, not full repository
+  engineering or unrestricted code-generation correctness.
+- **Agentic**: 100 × (0.5 × single-turn pass fraction + 0.5 × multi-step solve
+  fraction). Fixed denominators are 8/4 Standard and 3/1 Quick. Correct typed
+  arguments, inspection, delivered observations, conflict recovery, mutation and
+  later verification are preserved. Multi-step cases still allow six turns and
+  eight calls in the existing in-memory revision store. The loaded adapter and
+  exact schema must support native tools. Otherwise Agentic and Retrieval are
+  unavailable with a precise reason, and Profile Quality is unavailable.
+- **Retrieval**: 100 × mean(0.5 × file F0.5 + 0.5 × line F0.5), described below.
+- **Context**: 100 × mean of scored admitted context-rung binary outcomes.
+  Every admitted rung must be scored, and every planned rung must have a recorded
+  outcome or an explicit admission exclusion. At least one rung must be admitted.
+  Always inspect tested coverage alongside this score; models admitting different
+  rungs do not have identical observed context coverage.
+
+JSON quality uses complete JSON equality, `exact-json-v1`: no commentary,
+markdown, substring matching, fuzzy oracle, judge or partial answers. Incorrect
+answers score zero; infrastructure failures are unscored and interrupt the run.
+A model task deadline scores zero only with the existing stopped-work safeguards.
+
+**Profile Quality** is the simple mean of all complete scores corresponding to
+the declared capability set. Reasoning maps to Intelligence, coding to Coding,
+tool_use to Agentic, retrieval to Retrieval, long_context to Context. Missing
+any declared score prevents Profile Quality. Empty capability sets have no
+Profile Quality. Reliability, speed and efficiency never enter it. A retrieval /
+tool / context score of 91 is not equivalent to 91 for reasoning / coding / tool /
+context. The capability set accompanies the score and is part of comparability.
+
+Binary categories store passed, attempted, scored, required, task IDs and Wilson
+95% intervals. Retrieval stores n, mean, sample standard deviation, standard
+error and min/max. Quick explicitly indicates its smaller confidence-check
+sample. There is no invented combined confidence interval or claim that tiny
+score differences are decisive.
+
+## Retrieval / Fast Context
+
+[`retrieval.rs`](../crates/norted-engine/src/benchmark/retrieval.rs) bundles an
+original virtual source repository and eight realistic retrieval requests:
+symbol location, API-to-implementation follow-up, current configuration versus
+historical documentation, worker versus UI decoys, a cross-file permission
+switch, caller/clock follow-up, adjacent export predicates, and authentication
+call/callee tracing. Quick uses three fixed representative requests.
+
+Tools are deliberately small and deterministic:
+
+- `grep`: case-sensitive literal substring, optional path prefix, sorted
+  file/line/text hits, at most 80 results.
+- `glob`: sorted paths, `*` matches any characters including slash; no other
+  wildcard syntax.
+- `read`: inclusive one-based virtual file ranges, at most 80 lines per call.
+
+They operate only on bundled strings, never real paths. This is a bounded
+Fast Context-style search/read workflow, not a promise of every production grep
+regex flag. Tasks allow six rounds and ten calls with strict argument parsing.
+Calls and returned evidence are added to the canonical assistant/tool history.
+Final answers must be one strict object:
+
+```json
+{"ranges":[{"file":"src/example.rs","start":3,"end":8}]}
 ```
-Intelligence = 100 × mean(four category means)
-```
 
-The grounded questions include aggregation, policy application, distractors,
-configuration precedence, conditional rates and insufficient causal evidence.
-Code tasks cover tracing, aliasing, recursion and concrete bug repairs. This is
-code reasoning, not full repository engineering or unrestricted code-generation
-correctness. It measures this small task pack under the declared limits; it is
-not IQ, AA, MMLU or an estimate of performance on a full public benchmark.
+At most 16 ranges, line numbers 1–512, no extra fields or duplicate object keys.
+Scoring unions ranges into unique file/line sets. Precision is intersection /
+predicted; recall is intersection / target. Empty predictions score zero.
+`F0.5 = 1.25 × precision × recall / (0.25 × precision + recall)`; a zero
+denominator gives zero. Unknown files and extraneous lines count as pollution.
+Final-format failure or timeout is an unsuccessful scored attempt.
 
-Agentic capability uses eight single-turn native tool cases and four multi-step
-fixture tasks. Single-turn success requires the correct number of calls, tool
-name and complete, correctly typed arguments, or the correct answer without a
-call when a tool is unnecessary. Duplicate argument keys, extra arguments,
-invalid lists, wrong revisions and unknown keys are rejected.
+Each task retains target/predicted files and ranges; file/line precision, recall
+and F0.5; returned and polluting line counts; calls, rounds, malformed calls,
+timeouts, completion/final-format status and raw tool evidence. **Grounded
+success** requires all canonical target lines both in the answer and actually
+located through delivered grep/read evidence. Aggregate grounded success rate,
+line precision and pollution remain visible separately from Retrieval score.
 
-The production fixture is an in-memory virtual string/revision store with
-`read`, `read_many`, `search`, `update` and `verify`. Keys are never OS paths.
-There is no host filesystem, shell, arbitrary evaluation or network access.
-Multi-step tasks require inspection before mutation and verification of the
-correct final state. They cover using discovered keys/values, recovering from a
-forced revision conflict, and discovering a service before enabling it. Calls
-in a response execute in listed order. Each task allows at most six model
-turns and eight calls; alternative valid sequences are accepted. Saying “done”
-without the required state change and verification fails.
+## Context quality and useful context
 
-```
-Agentic = 100 × (0.5 × passed single-turn cases / 8
-              + 0.5 × solved multi-step tasks / 4)
-```
+[`context.rs`](../crates/norted-engine/src/benchmark/context.rs) builds structured
+repository-style evidence. Reasoning/coding profiles get active/inactive and
+region distractors interleaved with facts requiring aggregation, a conditional
+count and maximum revision. Retrieval profiles resolve a conditional API call
+chain across four implementation files amid archived and UI-only decoys.
+This is not a repeated trivial needle-string oracle. Retrieval profiles receive
+repository evidence accumulation, represented as one deterministic text payload,
+not a claimed replay of an actual production chat or tokenized prior search.
 
-The native tool contract is checked against the actual loaded adapter/schema.
-When unavailable, the whole agentic section is unavailable with a reason;
-weights are never redistributed. Invalid model-generated arguments fail the
-rubric. These are short tool-use tasks, not evidence of long-horizon autonomy.
+Rungs are labelled by **target workload characters**, not exact tokens. They
+record actual payload UTF-8 bytes, Unicode characters, native input tokens only
+when supplied by the runtime, completion latency, score and failure/exclusion
+reason. Admission uses the observed runtime `resolved_settings` context limit:
+payload bytes plus a conservative 2048-token overhead allowance must fit. With
+unknown observed limits, rungs remain unavailable. This conservative byte-based
+screen can exclude workloads that a tokenizer would in fact admit; it never
+reports an untested high rung as useful context. Runtime templates/system
+prompts and tokenization are not exactly measured by this preflight allowance.
 
-## Timing and execution limits
+**Useful context** is the highest successfully completed tested rung scoring
+at least 80% of a **positive** low-rung baseline. With this first binary oracle,
+a passed baseline and passed rung satisfy the rule; a failed/missing baseline
+produces no useful-context claim. The exact rule and workload generation are in
+the manifest. Untested rungs are never interpolated. Inspect the full ladder,
+including non-monotonic outcomes and differing admitted coverage.
 
-One monotonic 600-second deadline starts at admission, before runtime/model
-preparation or loading. The budget ceilings are frozen:
+## Reliability and physical measurements
 
-| Phase | Ceiling |
-|---|---:|
-| Preparation, integrity checks and compatible loading | 60 s |
-| One separate unscored warm-up | 10 s |
-| Four streaming speed/latency requests | 4 × 20 s |
-| Intelligence | 24 × 10 s |
-| Single-turn native tools | 8 × 8 s |
-| Multi-step fixtures | 4 × 30 s |
-| Task work ceilings including preparation | 574 s |
-| Shared cancellation, bookkeeping and finalization headroom | 26 s |
-| Total maximum | 600 s |
+**Reliability = 100 × valid completions / model-attributable task attempts**,
+across selected quality tasks. Wrong but well-formed answers can be reliable
+completions while failing quality. Timeouts, invalid required output shape,
+malformed tool serialization/arguments, refusal and bounded-call/output failures
+are recorded as model failure classes. Explicit runtime context-limit failures
+within an admitted rung are model failures; ambiguous backend/transport failures
+remain diagnostic infrastructure errors. Unsupported/unattempted work and
+infrastructure failures do not enter the denominator. Valid/attempted counts and
+the failure breakdown remain visible, including when run-level evidence is
+incomplete. No infrastructure failure is quietly turned into a quality zero.
 
-Tasks receive the full stated work ceilings: intelligence gets 10 s, single-turn
-tools 8 s and a complete multi-step task 30 s. There is no per-task four-second
-termination deduction. Each stopped request has up to 1 s to confirm engine-side
-cancellation and health, charged to the same global budget. Preparation receives
-60 s; unused time remains global headroom, not extra task retries or inference.
-The 574 s phase ceilings leave 26 s of headroom. Cancellation and bookkeeping
-share that headroom; the global deadline still interrupts execution if it is
-exhausted, rather than extending the benchmark.
-Execution ends at 584 s, cleanup is bounded by 599 s, and finalization waits no
-later than 600 s. The terminal writer checks the monotonic deadline before
-publishing, so a delayed disk operation cannot publish a new successful record
-after an expired finalization deadline. OS/storage stalls can prevent durable
-finalization or confirmation of process cleanup; checkpoints remain recoverable,
-and unconfirmed stopped work quarantines inference.
+One warm-up precedes the fixed passage-copying probes. Standard keeps four
+probes, two short and two medium; Quick takes short-1 and medium-1. Each probe
+requests at most 2048 output tokens, including reasoning where shared. Quality
+turns request at most 384; warm-up requests 32. A stricter configured or known
+profile output cap wins. Sampling, thinking, templates, system prompt and saved
+settings remain intact. A per-run nonce avoids shared task-prefix reuse;
+backend/common-system-prefix caches and external GPU workloads remain unverified.
 
-Additional output limits are 32 tokens for warm-up, 2048 for probes and 384 for
-intelligence/tool turns, capped further by a stricter configured or known
-effective profile limit. Sampling, reasoning, templates, system prompts,
-quantization and runtime selection are preserved. Unknown runtime defaults are
-not invented. The record distinguishes the saved configuration, actual served
-requested settings, effective provenance and startup observations. Reusing a
-session with different load settings is explicitly identified.
+Raw physical metrics remain primary:
 
-A timeout records an unsuccessful attempted task (zero for a scored task).
-Candidate output/call-limit violations also fail the task. Continuation requires
-proof of stopped work and a healthy, unchanged runtime. The llama.cpp adapter
-closes its HTTP stream and polls its inference-queue `/slots` contract for idle
-slots, then checks health. This path requires an emitted inference event (proof
-of admission) and an already-enabled slots endpoint; it never changes profile
-settings. Missing admission proof, disabled/unknown slot contracts, q27/NInfer
-without an implemented stop acknowledgement, broken transport or unhealthy
-backends retain safe termination and an incomplete run. Merely dropping the
-manager's request lease is not treated as proof. There are no reloads or retries.
+- **Native end-to-end output TPS**: native output tokens / whole-request duration.
+  Never called decode-only TPS; never replaced by character speed.
+- **Visible delivery chars/s**: excludes first-chunk characters and measures the
+  span after first text; requires 400 total characters, 128 subsequent characters
+  and 50 ms of delivery.
+- **Visible end-to-end chars/s**: Unicode characters / whole-request duration.
+- **First-visible**, **first-text** and **completion latency**: distinct timestamps
+  at the internal managed streaming inference boundary. First-answer latency and
+  native decode-only speed remain unavailable.
 
-A finished evaluation with missing speed/native metrics or unsupported agentic
-capabilities is `completed_unavailable`, distinct from interruption. Fully
-covered scored sections remain usable with their fixed denominators. Both
-finished statuses participate in latest-result selection and advance Last
-benchmark; failed, cancelled and incomplete attempts preserve previous finished
-results and appear separately. Every row comes from one run. Insufficient samples
-and aggregate measurements remain unavailable, never zero or synthesized.
+Native usage must be arithmetically consistent and nonzero. Each metric has its
+own validity guard and missing reason. Successful full aggregates require all
+selected probes (4 Standard / 2 Quick), with separate short/medium coverage.
+Partial medians are explicitly partial. Token-limit and timeout evidence stays
+inspectable without filling successful-comparison denominators. The physical
+summary derivation remains `independent-observed-metrics/3`; this is independent
+of the v4 collection methodology.
 
-Loading and inference use the normal runtime manager. An admission reservation
-rejects concurrent inference/load/unload and conflicting runtime mutations;
-existing active inference or loading makes a start request busy. Other resident
-profiles are not unloaded. The selected benchmark backend is stopped on
-cancellation/error to ensure work cannot continue after dropping a stream.
-Load-task cancellation protects the supervisor-to-manager process handoff, so
-an aborted preparation cannot later publish a successful load. Navigation or
-TUI disconnection does not cancel execution. Server shutdown cancels it and
-preserves evidence.
+**Cold/startup load** is measured around actual loading only if the profile was
+not resident at admission. An already resident profile reports unavailable:
+“profile already resident.” It is never unloaded to manufacture a cold test.
+Warm TPS and request latency are separate from load time. No cold-cache claim.
 
-## Physical speed and latency measurements
+**Efficiency** reuses observed accelerator binding, device identity and total
+memory, CPU model/count and host RAM total from existing low-overhead provenance.
+Process/model peak VRAM, process RAM and TPS/GiB remain unavailable because the
+managed contract supplies no reliable process-scoped peak telemetry. Host total
+memory is not model usage. There is no estimated memory from file size or
+quantization, polling sampler, or arbitrary 0–100 Speed/Efficiency index.
 
-The four probes copy two fixed approximately 200-word passages, once with short
-context and once after medium context (48 synthetic service records or 48
-repository change records). The requested output population is identical within
-each short/medium pair. Their fixed full text, exact UTF-8 byte/Unicode character
-sizes and output limits are in the manifest. All profiles receive the same
-copy instructions, 2048-token cap and 20-second deadline. The cap includes
-reasoning where the runtime uses a shared output budget. No request disables or
-caps thinking separately. Workloads are never shortened for a profile. `input_utf8_bytes` and `input_unicode_characters` describe the fixed
-task text, not native tokens or the profile's complete rendered prompt. The
-record also includes the nonce-prefixed model-visible messages. Native usage,
-when supplied, describes the runtime's whole request including templates and
-other inputs; absent native counts remain unknown.
+## Identity, comparison and immutable history
 
-One different, small request warms the selected backend. A fresh fixed-length
-run nonce precedes benchmark user inputs to prevent reuse of cached task-pack
-prefixes across runs. Persistent cache settings are not modified. Common system
-prefix caching and backend cache state remain unverified: these are **not
-claimed to be cold-cache measurements**.
+`configuration_key` keeps its existing job: whether a saved/running configuration
+matches this result. It retains actual requested versus effective/observed
+settings, runtime/artifact/file identity and relevant host facts. Configuration
+editors continue to describe next-load settings; runtime observations do not
+become persisted overrides. A Current label requires verified observed identity.
 
-All timing starts at the **internal managed streaming inference boundary**,
-including request preparation/routing overhead, not an external HTTP client.
-Loading time is separate. Stored timestamps include request start, first
-nonempty visible output, first text, last text and completion. For tools, a
-complete validated native call is required before reporting an executable
-action. A parseable intermediate argument prefix is insufficient.
+The version-1 **benchmark signature** structurally records suite/method/mode,
+capabilities, exact plan/IDs, plan/pack identity and rubric versions; profile and
+model identity, existing content/native/package/auxiliary provenance and file
+observations; format/quantization metadata where available; exact engine/runtime
+identity/version/variant; server version/source revision; effective and observed
+settings; accelerator binding/class/count/memory and CPU/host observations.
+No Norted build internals or external repository changes are required.
 
-* Details include visible delivery speed: Unicode characters per second **after the first
-  text chunk**: `(total characters − first-chunk characters) /
-  (last-text time − first-text time)`. The first chunk is excluded from both
-  the delivered population and elapsed delivery span. At least 400 total
-  characters, 128 subsequent characters and 50 ms of delivery are required.
-* Visible Unicode characters divided by whole request duration are separately
-  labelled **text end-to-end chars/s**. A completed one-chunk response can
-  provide this rate, but cannot provide delivery speed. Whole-request rates
-  require a finite, ordered completion time of at least 50 ms. They are never
-  substituted into a delivery-speed comparison.
-* Native output tokens divided by whole request duration are labelled
-  **TPS** in the scorecard and **native end-to-end output tokens/s** in Details,
-  never decode speed. Native counts
-  must be present, with nonzero output and arithmetically consistent totals; invalid or
-  reasoning-count-inconsistent usage cannot yield a rate. Reasoning-inclusive
-  counts are never divided by a visible-only timing interval.
-* Headline latency is **time to first visible output in milliseconds**.
-  First-text and completion latency remain separate. The shared event contract
-  does not distinguish answer text from reasoning, so first-answer latency and
-  native decode-only rates are unavailable. q27 routed chat supplies separate
-  `reasoning_content`, which is not visible text; its top-level
-  `usage.reasoning_tokens` is preserved as the optional reasoning subset of
-  completion tokens. Raw completions without that counter remain unknown.
+- **Quality comparable** requires equal v4 suite/method, mode, capability set and
+  exact selected plan/pack/rubrics. Compared model artifacts may differ.
+- **Strict performance comparable** additionally requires observed materially
+  matching hardware class, ordered accelerator classes, CPU/host class, engine /
+  exact runtime, server version/revision and effective/observed settings. Keys
+  exclude model artifact identity, profile ID, setting source/profile ownership,
+  physical device UUIDs and incidental timestamps. Unknown hardware/runtime
+  identity prevents a strict performance key. Full raw identity remains evidence.
 
-Metric validity is independent. A short response or absent native usage does
-not erase first-visible latency. Insufficient delivery span does not erase a
-valid whole-request rate. A later timeout retains the observed first-visible
-and last-text timestamps with its unsuccessful outcome; without completion it
-has no whole-request rate. No output before a timeout means “no output before
-deadline,” never zero. A terminal token limit retains its measured whole-request
-rate and latency but is not a successful full performance probe.
+Comparisons report the two decisions separately and enumerate changed fields.
+Quality deltas are selected minus baseline only for matching methodology. Raw
+physical values can still be displayed across different deployments, but strict
+performance deltas are suppressed. No winner is declared. Context admitted-rung
+coverage and small sample uncertainty must still be considered within a matching
+plan; matching keys are not a claim of isolated GPU/cache conditions.
 
-Details retain every probe and its outcome, values and per-metric reasons.
-Short and medium groups have separate medians, counts and ranges. A full
-combined median requires four successful samples for that method; each context
-group requires both. Available subsets have a separate `partial_median`, labelled
-**partial**, with n/N and short/medium coverage in TUI Details and verbose CLI output. Unsuccessful
-observations remain inspectable individually and do not fill the successful
-comparison denominator. Missing native usage does not invalidate the text rate.
-No short-only or mixed-method result is presented as a full comparison. There
-is no P95 estimate or manufactured 0–100 speed/latency score. Refusal detection
-remains conservative; performance text is not quality-judged.
+Quick versus Standard and v3 versus v4 are **not directly comparable**.
+Historical v3 records and summary sidecars remain readable and labelled **legacy
+methodology**. Their original Intelligence/Agentic semantics and task evidence
+are retained; no v4 scorecard/signature/capabilities are inferred from them.
+Compatibility decoding of missing profile capabilities is confined to v3 benchmark
+records, never the profile state store. Original terminal files are not rewritten.
 
-The TUI progress heading and Details identify the reported suite. Summaries identify
-their evidence-derivation algorithm as `independent-observed-metrics/3`; this can
-expose previously hidden observations in historical records without rewriting
-those records or changing their collection suite/methodology. Version 2 and 3
-workloads remain distinct and are not comparable performance measurements.
+Records remain in the data directory's `benchmarks` folder, independent of
+profiles/settings. UUID terminal `.json` files use private permissions, locks,
+atomic persistence and fsync; terminal overwrite is rejected. Active checkpoints
+preserve completed and multi-turn evidence. Only the owning server recovers
+checkpoints as interrupted, never resumes them. History remains bounded to 4096
+cached summaries / 200 returned per profile; raw records remain inspectable by
+ID. Evidence bounds remain 64 KiB per turn and 8 MiB per record.
 
-## Storage, identity and privacy
+One admitted benchmark holds inference/load/runtime reservations. Cancel, shutdown,
+process stop acknowledgement, unchanged-runtime checks and quarantine on
+unverified stopped work retain the existing runner paths. Navigation or TUI
+disconnection does not cancel a run. There is no retry, reload or competing queue.
 
-Records live under the application's **data directory / `benchmarks`**, separate
-from `model-profiles.json` and `settings.json`. Run records use UUID filenames,
-atomic temporary-file replacement, fsync and a local file lock. Unix directory
-permissions are 0700 and record files 0600. Terminal `.json` records are
-immutable. `.active` checkpoints retain completed task and multi-turn evidence;
-a server holding the history ownership lock converts them to interrupted records
-on restart without resuming. Offline CLI runtime probes cannot recover or rewrite
-a running server's checkpoints. The restart
-observation is identified separately from an unknown actual process-stop time.
+## Validation and interpretation
 
-Tool results become observation evidence only for the next response. Independent
-reads can share a response; discovery must precede the dependent inspection,
-an observed revision must precede an update, and verification must follow the
-update in a later response. Conflict recovery needs the returned conflict and a
-fresh read before correction. The six-turn/eight-call limit accommodates the
-five-turn read → conflict → read → update → verify solution. Per-turn evidence
-includes the pre-response fixture observations, calls and returned results.
-
-Responses/tool arguments are bounded to 64 KiB per model turn; multi-step
-response text, calls and turns are bounded; records have an 8 MiB ceiling.
-Summary inspection is cached and bounded to 4096 recent records, with at most
-200 entries returned by a profile-history request. Full raw records remain
-inspectable/exportable by ID after their artifact/runtime is removed. The TUI
-never deserializes all historical transcripts to draw a row.
-
-Selection prefers the latest finished result (including `completed_unavailable`) matching the current semantic
-configuration and task-pack hash, never the highest score. Otherwise the latest
-completed result is historical, accompanied by configuration-change or
-unverified-identity reasons. The latest attempt is shown separately. If no completed result exists, its
-evidence is labelled Cancelled/Incomplete/Failed and has no Last benchmark date. Renames do
-not invalidate a result. Inherited settings, actual runtime identity/binary,
-artifact/auxiliary file observations and relevant host identity participate in
-matching. Pure display names and observation timestamps do not. A Current
-label requires an observed running runtime and sufficient identity evidence;
-unverified fallback next-load selection stays historical. File metadata checks
-are explicitly metadata observations, not fresh SHA-256 verification of every
-model on each refresh. Existing provenance retains acquisition/build evidence
-semantics and canonical Norted lineage.
-
-Configuration matching and comparison methodology are distinct. A comparison
-shows whether suite/scorer methods match and whether configuration keys match;
-cache/external workload conditions remain unverified even for matching keys.
-Raw settings/runtime/hardware differences and task outcomes accompany score
-and latency deltas. Never infer statistical significance from this small pack.
-
-Only allowlisted CPU/RAM/OS observations and the existing host accelerator
-identity/VRAM/driver observations are collected. Existing structured/redacted
-runtime provenance is reused; the private backend endpoint is redacted. Control
-tokens, authorization headers, transient backend credentials and unredacted
-environment dumps are not copied. No builder manifests, model transformations
-or Norted-Utils code are modified.
-
-## Validation limits
-
-The bundled oracles, invalid/ambiguous answers, fixture argument validation,
-final-state checks, physical-rate guards, per-profile selection, immutable
-storage and restart recovery can be validated offline. Live task difficulty,
-repeatability, output-length adequacy and score discrimination need calibration
-on safely available inference hardware. No calibrated runtime duration or
-measured model score is implied by the suite's maximum budget.
-
-## Version 2 correctness review
-
-All 24 intelligence prompts and keys were reviewed. `logic-5` now asks for all
-possible culprits, alphabetically: `["Ada", "Cy"]`. Exhaustive truth assignments
-show Bo violates the one-true-statement premise, while Ada and Cy both satisfy
-it. `context-2` explicitly requests a JSON array, and `code-3` explicitly requests
-only the option letter. Other keys retain their results. Full JSON equality
-remains the oracle; commentary, substrings and alternative shapes fail.
-
-Suite `norted-quick-bench/2` and methodology
-`binary-json-fixture-visible-delivery/2` identify the corrected pack, observation
-grading and task-failure policy. The manifest hash includes prompts, answers,
-fixture state and frozen limits. Version 1 records remain immutable and are not
-regraded or labelled comparable to version 2.
-
-## Version 3 performance correction
-
-The local v2 q27 Q6/Q6K records exhausted all 512 output tokens without visible
-text in roughly 3.5–4.7 s. Their exact installed q27 v0.10.0 source
-(`4770e053656af9aababdc49c81f280ad21b74986`, w12) uses a shared reasoning/answer
-output cap. The recorded profiles enabled thinking with an unbounded thinking
-budget. Their runtime chat path separates reasoning from visible content;
-Norted previously discarded its native reasoning-token counter. A replay of
-the original short probe through the corrected serving path confirmed 512
-completion tokens, all 512 reasoning tokens, zero visible characters and a
-`length` finish after 4.66 s. Raising the
-cap alone did not make the explanatory workload reliable in live validation:
-one request still had no visible answer at a 30 s deadline.
-
-Version 3 replaces performance-only reasoning/review prompts with fixed passage
-copying and reserves 2048 total output tokens and 20 s per probe. The scored
-intelligence and agentic packs, settings precedence, runtime/template selection,
-and 600 s ownership/cancellation deadline are unchanged. The existing delivery
-guards (400 total characters, 128 after the first chunk, 50 ms) are unchanged.
-The q27 SSE parser continues forwarding text incrementally and collecting final
-usage after the finish frame. It filters initial raw-template reasoning only
-for raw completion text, since routed chat content has already been separated
-from reasoning by the runtime. This prevents suppression of an answer when the
-optional initial-reasoning filter is selected on the chat route.
-
-## NInfer startup validation
-
-NInfer's reviewed startup log uses different names for different identity
-fields: `artifact.target` is the registry dispatch key (for example
-`qwen3_8_27b`), while `engine.context_cost.model_id` is the container's native
-model ID (`qwen3.8-27b`). Norted validates the explicit registry mapping, both
-weights IDs, and the independent public Model Profile ID. Unknown mappings and
-mismatches are rejected; punctuation is not normalized speculatively.
-
-The same distinction applies to KV settings: the CLI choices `fp8` and `int8`
-are reported as `fp8-e4m3-row256` and `int8-group64`. Validated settings use the
-canonical CLI choice, and `kv_cache_format` retains the exact native format as
-a startup observation. Sampler arguments are parsed by NInfer as 32-bit floats;
-Norted validates the exact value obtained from the same decimal argument at
-that precision, including values such as `0.6` reported as
-`0.6000000238418579`. This does not change the saved or requested setting.
-
-Previously, these valid representation differences rejected startup, and the
-health polling loop treated the rejection as retryable after its startup proof
-had already been discarded. It eventually reported a setup timeout instead of
-the cause. Startup-proof rejection now returns a permanent configuration error
-with the validation reason, so the manager stops the owned process promptly.
-Temporary lack of readiness still follows the existing polling contract.
-Artifact verification, GPU binding, profile settings and the 60 s setup / 600 s
-overall benchmark limits are unchanged.
-
-Live validation on the installed `a140e7ae82a11ed2f370a4d8f2cc16268a3790b8`
-NInfer runtime (`ninfer-serve-v2-sm120a`) completed all four performance probes
-and both scored sections without preloading the model. Temporary startup-record
-replay also checked valid target/KV mappings, float conversion and rejection of
-wrong target/model/weights, GPU, public profile, context, speculation, format and
-schema values. These checks do not establish compatibility with unreviewed
-runtime contracts.
+Run `./validate.sh` (format, workspace check, all-target clippy, workspace tests).
+No new tests or downloaded benchmarks are required. `benchmarks plan` makes
+selection and mathematical ceilings inspectable without inference. Real model
+score discrimination, stricter v4 task deadlines and repeatability still need
+hardware calibration. Small samples, conservative context admission and missing
+process memory telemetry are explicit limitations, not inferred measurements.

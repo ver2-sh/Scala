@@ -810,20 +810,21 @@ Private control status identifies the model, engine, exact runtime ID/version/va
 
 ## Per-profile benchmarks
 
-Select **Run benchmark** (`b`) in Model Profiles, or open `/benchmarks` for
-progress, cancellation, per-profile history and historical comparisons. The
-running server executes the original, offline **Norted Quick Bench v3** through
-normal managed inference, with a maximum 600-second execution budget. It
-reports Norted Quick Intelligence, short-task agentic capability, visible-text
-throughput and first-visible latency. Each profile keeps independent results;
-failed/cancelled attempts never replace its last finished result. Finished
-evaluations may have explicitly unavailable metrics; confirmed safe task
-cancellation permits later tasks, while unverified backend state interrupts the run.
+Declare a profile's benchmark capabilities in Model Profiles (**C**) or with
+`model-profiles set-capabilities PROFILE reasoning,coding,tool_use,long_context`.
+Open `/benchmarks`: **b Standard** runs the full local evaluation (600 seconds
+maximum including loading), and **q Quick** runs a smaller confidence check
+(180 seconds maximum including loading). **Norted Quick Bench v4** selects only
+the declared reasoning, coding, tool-use, retrieval and context packs. Its
+capability-specific Profile Quality stays separate from reliability, warm TPS,
+latency and physical resource observations. History is immutable; Quick and
+unsuccessful attempts do not hide the current authoritative Standard scorecard.
 
 Scriptable access uses private authenticated control:
 
 ```console
-norted-server benchmarks start PROFILE_ID
+norted-server benchmarks start PROFILE_ID --mode standard
+norted-server benchmarks start PROFILE_ID --mode quick
 norted-server benchmarks status --json
 norted-server benchmarks history PROFILE_ID --json
 norted-server benchmarks result RUN_ID --json
