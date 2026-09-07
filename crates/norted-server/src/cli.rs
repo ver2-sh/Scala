@@ -365,6 +365,9 @@ pub struct SettingsUnsetArgs {
 
 #[derive(Debug, Args)]
 pub struct BenchmarksArgs {
+    /// Include technical analysis and raw evidence in human-readable output
+    #[arg(long, global = true)]
+    pub verbose: bool,
     #[command(subcommand)]
     pub command: BenchmarksCommand,
 }
@@ -382,7 +385,7 @@ pub enum BenchmarksCommand {
     History {
         profile_id: norted_core::ModelProfileId,
     },
-    /// Inspect/export the complete local run record as JSON
+    /// Show a result scorecard; use --verbose for details or --json for the complete record
     Result { run_id: String },
     /// Compare two historical records, including two from the same profile
     Compare { left: String, right: String },

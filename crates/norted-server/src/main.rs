@@ -103,8 +103,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let response = client.benchmark(args.command.into()).await?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
-            } else {
+            } else if args.verbose {
                 println!("{}", norted_engine::benchmark::inspection_text(&response));
+            } else {
+                println!("{}", norted_engine::benchmark::scorecard_text(&response));
             }
         }
         Command::Status => output::status(core, cli.json).await?,

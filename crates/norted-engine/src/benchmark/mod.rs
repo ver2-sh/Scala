@@ -598,39 +598,221 @@ pub fn performance_lines(speed: &Value) -> Vec<String> {
     ]
     .into_iter()
     .map(|(label, field, units)| format!("{label}: {}", performance_metric(speed, field, units)))
+    .chain([
+        "TPS definition: native output tokens divided by whole-request duration; not decode-only speed.".into(),
+        "Latency definition: time from managed request start to first nonempty visible output.".into(),
+    ])
     .collect()
 }
 
-/// Shared result presentation; scoring stays in Run::summary for every client.
-pub fn inspection_text(value: &Value) -> String {
-    let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
-    let number = |v: &Value| {
-        v.as_f64()
-            .map(|n| format!("{n:.2}"))
-            .unwrap_or_else(|| "unavailable".into())
+pub fn benchmark_timestamp(value: &Value) -> String {
+    let Some(ms) = value.as_u64() else {
+        return "never".into();
     };
-    if !value["summary"].is_object() {
-        return pretty(value);
-    }
-    let s = &value["summary"];
-    let observations = s["speed"]["samples"].as_array().into_iter().flatten()
-        .map(|sample| format!("{} [{}]: first visible {} ms; delivery {} chars/s; text end-to-end {} chars/s; native end-to-end {} output tokens/s. {}",
-            sample["id"].as_str().unwrap_or("probe"), sample["outcome"].as_str().unwrap_or("unknown"),
-            number(&sample["first_visible_ms"]), number(&sample["visible_delivery_characters_per_second"]),
-            number(&sample["visible_end_to_end_characters_per_second"]), number(&sample["native_end_to_end_output_tokens_per_second"]),
-            sample["outcome_reason"].as_str().unwrap_or("")))
-        .collect::<Vec<_>>().join("\n");
+    // UTC civil date conversion, avoiding a date/time dependency for table cells.
+    let seconds = ms / 1000;
+    let z = (seconds / 86400) as i64 + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(month <= 2);
     format!(
-        "Norted Quick Intelligence: {} / 100\nAgentic: {} / 100 (single {} / 8; multi {} / 4)\n{}\nStatus: {} · Suite: {}\n\nProbe observations (outcomes retained):\n{}\n\nSummary and category counts:\n{}\n\nImmutable evidence record:\n{}",
-        number(&s["intelligence"]),
-        number(&s["agentic"]),
-        s["single_pass"],
-        s["multi_pass"],
-        performance_lines(&s["speed"]).join("\n"),
-        s["status"].as_str().unwrap_or("unknown"),
-        s["suite"].as_str().unwrap_or("unknown"),
-        observations,
-        pretty(s),
-        pretty(&value["record"])
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}Z",
+        seconds % 86400 / 3600,
+        seconds % 3600 / 60
     )
+}
+
+/// Headline values require a finished run and a full aggregate; partial evidence
+/// stays in Details. This is presentation only, not a change to summary data.
+pub fn scorecard_value(summary: &Value, field: &str) -> Option<f64> {
+    if !finished(summary["status"].as_str().unwrap_or("")) {
+        return None;
+    }
+    if matches!(field, "intelligence" | "agentic") {
+        summary[field].as_f64()
+    } else {
+        summary["speed"]["combined"][field]["median"].as_f64()
+    }
+}
+
+pub const SCORECARD_METRICS: [(&str, &str, &str); 4] = [
+    ("Intelligence ↑", "intelligence", " / 100"),
+    ("Agentic ↑", "agentic", " / 100"),
+    ("TPS ↑", "native_end_to_end_output_tokens_per_second", ""),
+    ("Latency ↓", "first_visible_ms", " ms"),
+];
+
+pub fn scorecard_metric(summary: &Value, field: &str, unit: &str) -> String {
+    scorecard_value(summary, field)
+        .map(|n| {
+            if field == "first_visible_ms" {
+                format!("{n:.0}{unit}")
+            } else {
+                format!("{n:.1}{unit}")
+            }
+        })
+        .unwrap_or_else(|| "—".into())
+}
+
+pub fn status_label(summary: &Value) -> String {
+    match summary["status"].as_str().unwrap_or("") {
+        "completed" | "completed_unavailable" => "Completed".into(),
+        "cancelled" => "Cancelled".into(),
+        "failed" => "Failed".into(),
+        "incomplete" => "Incomplete".into(),
+        "" => "Never benchmarked".into(),
+        other => other.replace('_', " "),
+    }
+}
+
+pub fn scorecard_lines(summary: &Value) -> Vec<String> {
+    let mut lines = SCORECARD_METRICS
+        .into_iter()
+        .map(|(label, field, unit)| {
+            format!("{label:<16} {}", scorecard_metric(summary, field, unit))
+        })
+        .collect::<Vec<_>>();
+    lines.push(format!("Status           {}", status_label(summary)));
+    if let (Some(start), Some(end)) = (
+        summary["started_unix_ms"].as_u64(),
+        summary["ended_unix_ms"].as_u64(),
+    ) {
+        lines.push(format!(
+            "Duration         {:.1} s",
+            end.saturating_sub(start) as f64 / 1000.0
+        ));
+    }
+    lines.push(format!(
+        "Last benchmark   {}",
+        benchmark_timestamp(if finished(summary["status"].as_str().unwrap_or("")) {
+            &summary["ended_unix_ms"]
+        } else {
+            &Value::Null
+        })
+    ));
+    lines
+}
+
+pub fn comparison_lines(value: &Value) -> Vec<String> {
+    let mut lines = vec!["Comparison: baseline (left) -> selected (right)".into()];
+    for (label, field, unit) in SCORECARD_METRICS {
+        let delta = match (
+            scorecard_value(&value["left"], field),
+            scorecard_value(&value["right"], field),
+        ) {
+            (Some(a), Some(b)) => format!(
+                "{:+.1}{}",
+                b - a,
+                if unit == " / 100" { " points" } else { unit }
+            ),
+            _ => "—".into(),
+        };
+        lines.push(format!(
+            "{label}: {} -> {} (delta {delta})",
+            scorecard_metric(&value["left"], field, unit),
+            scorecard_metric(&value["right"], field, unit)
+        ));
+    }
+    lines
+}
+
+/// Concise human output; the JSON response and protocol are unchanged.
+pub fn scorecard_text(value: &Value) -> String {
+    if value["summary"].is_object() {
+        let s = &value["summary"];
+        return format!(
+            "{} | Run: {}\n{}",
+            s["display_name"].as_str().unwrap_or("Profile"),
+            s["run_id"].as_str().unwrap_or("—"),
+            scorecard_lines(s).join("\n")
+        );
+    }
+    if value["left"].is_object() && value["right"].is_object() {
+        let mut lines = comparison_lines(value);
+        for (label, side) in [("Baseline", "left"), ("Selected", "right")] {
+            lines.push(format!(
+                "{label}: {} | Run: {}",
+                value[side]["display_name"].as_str().unwrap_or("—"),
+                value[side]["run_id"].as_str().unwrap_or("—")
+            ));
+        }
+        if let Some(warning) = value["warning"].as_str() {
+            lines.push(warning.into());
+        }
+        if value["same_methods"] != true {
+            lines
+                .push("WARNING: suite/methods differ; results are not directly comparable.".into());
+        }
+        return lines.join("\n");
+    }
+    if let Some(rows) = value["rows"]
+        .as_array()
+        .or_else(|| value["history"].as_array())
+    {
+        let mut lines = Vec::new();
+        for row in rows {
+            let s = if row["result"].is_object() {
+                &row["result"]
+            } else {
+                row
+            };
+            lines.push(format!(
+                "{} | Run: {}",
+                row["display_name"].as_str().unwrap_or("Profile"),
+                s["run_id"].as_str().unwrap_or("—")
+            ));
+            lines.extend(scorecard_lines(s));
+            if row["latest_attempt"].is_object() && row["latest_attempt"]["run_id"] != s["run_id"] {
+                lines.push(format!(
+                    "Latest attempt: {}",
+                    status_label(&row["latest_attempt"])
+                ));
+            }
+            lines.push(String::new());
+        }
+        if value["active"].is_object() {
+            let active = &value["active"];
+            lines.push(format!(
+                "Active benchmark: {} | {} | {}/{} tasks{}",
+                active["profile_id"].as_str().unwrap_or("—"),
+                active["phase"].as_str().unwrap_or("Running"),
+                active["completed_tasks"],
+                active["total_tasks"],
+                if active["cancelling"] == true {
+                    " | Cancelling"
+                } else {
+                    ""
+                }
+            ));
+        }
+        return if lines.is_empty() {
+            "No benchmark results.".into()
+        } else {
+            lines.join("\n")
+        };
+    }
+    let mut lines = vec![format!("Status: {}", status_label(value))];
+    if let Some(run) = value["run_id"].as_str() {
+        lines.push(format!("Run: {run}"));
+    }
+    if let Some(message) = value["message"].as_str() {
+        lines.push(message.into());
+    }
+    lines.join("\n")
+}
+
+/// Explicit verbose presentation retains all diagnostic and raw information.
+pub fn inspection_text(value: &Value) -> String {
+    let mut lines = vec![scorecard_text(value)];
+    if value["summary"].is_object() {
+        lines.extend(performance_lines(&value["summary"]["speed"]));
+    }
+    lines.push(serde_json::to_string_pretty(value).unwrap_or_default());
+    lines.join("\n")
 }

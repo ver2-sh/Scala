@@ -27,10 +27,36 @@ norted-server benchmarks compare LEFT_RUN_ID RIGHT_RUN_ID --json
 ```
 
 With `--json`, result inspection contains a computed summary and the immutable
-record. Human-readable inspection leads with scores, physical units and coverage. Run IDs identify records,
+record. Human-readable output leads with a concise scorecard. Add benchmark-specific
+`--verbose` for technical analysis and raw evidence. Run IDs identify records,
 not global multi-model sessions. Two profiles using the same artifact have
 separate histories. Starting a profile never clears another profile's results.
 There is one admitted job, no queue, and no automatic benchmark trigger.
+
+## Reading the scorecard
+
+Overview, history, selected results and human-readable CLI output prioritize:
+
+- **Intelligence /100 ↑**: higher is better.
+- **Agentic /100 ↑**: higher is better.
+- **TPS ↑**: higher is better. Native output tokens divided by whole-request
+  duration, not claimed decode-only speed.
+- **Latency ↓**: lower is better. Time to first visible output, in milliseconds.
+
+Missing or partial headline measurements show **—**, without substituting
+characters/sec for missing native usage. Partial measurements and their coverage
+remain in Details. Cancelled, failed and incomplete attempts show their actual
+status and no headline scores. A newer unsuccessful attempt does not replace a
+previous finished scorecard; it appears separately as “Latest attempt”.
+There is no overall score or declared comparison winner. Comparisons lead with
+the four metrics and signed selected-minus-baseline deltas; lower latency is better.
+
+In the TUI, **d Details** exposes category scores, single-turn and multi-step
+results, technical performance variants, short/medium probe coverage, missing
+reasons, configuration, methodology and outcomes. **e Evidence** exposes the raw
+response. Normal output keeps these diagnostics out of the scorecard.
+For example, `norted-server benchmarks result RUN_ID --verbose` shows the full
+CLI inspection; `--json` retains the complete machine-readable response.
 
 ## Suite and scoring
 
@@ -183,7 +209,7 @@ nonempty visible output, first text, last text and completion. For tools, a
 complete validated native call is required before reporting an executable
 action. A parseable intermediate argument prefix is insufficient.
 
-* Headline speed is Unicode characters per second delivered **after the first
+* Details include visible delivery speed: Unicode characters per second **after the first
   text chunk**: `(total characters − first-chunk characters) /
   (last-text time − first-text time)`. The first chunk is excluded from both
   the delivered population and elapsed delivery span. At least 400 total
@@ -194,7 +220,8 @@ action. A parseable intermediate argument prefix is insufficient.
   require a finite, ordered completion time of at least 50 ms. They are never
   substituted into a delivery-speed comparison.
 * Native output tokens divided by whole request duration are labelled
-  **native end-to-end output tokens/s**, never decode speed. Native counts
+  **TPS** in the scorecard and **native end-to-end output tokens/s** in Details,
+  never decode speed. Native counts
   must be present, with nonzero output and arithmetically consistent totals; invalid or
   reasoning-count-inconsistent usage cannot yield a rate. Reasoning-inclusive
   counts are never divided by a visible-only timing interval.
@@ -218,14 +245,14 @@ Details retain every probe and its outcome, values and per-metric reasons.
 Short and medium groups have separate medians, counts and ranges. A full
 combined median requires four successful samples for that method; each context
 group requires both. Available subsets have a separate `partial_median`, labelled
-**partial**, with n/N and short/medium coverage in both TUI and CLI. Unsuccessful
+**partial**, with n/N and short/medium coverage in TUI Details and verbose CLI output. Unsuccessful
 observations remain inspectable individually and do not fill the successful
 comparison denominator. Missing native usage does not invalidate the text rate.
 No short-only or mixed-method result is presented as a full comparison. There
 is no P95 estimate or manufactured 0–100 speed/latency score. Refusal detection
 remains conservative; performance text is not quality-judged.
 
-The TUI heading and each result identify the reported suite. Summaries identify
+The TUI progress heading and Details identify the reported suite. Summaries identify
 their evidence-derivation algorithm as `independent-observed-metrics/3`; this can
 expose previously hidden observations in historical records without rewriting
 those records or changing their collection suite/methodology. Version 2 and 3
@@ -262,7 +289,7 @@ Selection prefers the latest finished result (including `completed_unavailable`)
 configuration and task-pack hash, never the highest score. Otherwise the latest
 completed result is historical, accompanied by configuration-change or
 unverified-identity reasons. The latest attempt is shown separately. If no completed result exists, its
-evidence is labelled Incomplete/Failed and has no Last benchmark date. Renames do
+evidence is labelled Cancelled/Incomplete/Failed and has no Last benchmark date. Renames do
 not invalidate a result. Inherited settings, actual runtime identity/binary,
 artifact/auxiliary file observations and relevant host identity participate in
 matching. Pure display names and observation timestamps do not. A Current
