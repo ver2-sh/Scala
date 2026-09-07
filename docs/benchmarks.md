@@ -86,33 +86,41 @@ Worst case, with **every capability** declared:
 |---|---:|---:|
 | Preparation, integrity and actual loading | 30 s | 60 s |
 | Unscored warm-up | 3 s | 5 s |
-| Speed probes | 2 × 12 s | 4 × 18 s |
+| Speed probes | 2 × 11 s | 4 × 17 s |
 | Reasoning JSON tasks | 6 × 3 s | 18 × 5 s |
 | Coding JSON tasks | 2 × 3 s | 6 × 5 s |
 | Single-turn native tools | 3 × 3 s | 8 × 4 s |
-| Multi-step Agentic fixtures | 1 × 10 s | 4 × 18 s |
+| Multi-step Agentic fixtures | 1 × 9 s | 4 × 16 s |
 | Retrieval tasks | 3 × 10 s | 8 × 12 s |
 | Context rungs | 2 × 5 s | 5 × 14 s |
-| Phase work total | **140 s** | **527 s** |
+| Phase work total | **137 s** | **515 s** |
 | Stop confirmations (one second per task, plus warm-up) | **20 s** | **54 s** |
+| Execution bookkeeping allowance | **7 s** | **15 s** |
 | Cleanup/finalization allowance | **16 s** | **16 s** |
-| Unallocated margin | **4 s** | **3 s** |
+| Unallocated margin | **0 s** | **0 s** |
 | Hard maximum | **180 s** | **600 s** |
 
 There are at most 19 Quick or 53 Standard tasks, excluding warm-up. Progress
 uses the selected plan, including explicit unavailable tasks. For subsets of
 capabilities, work ceilings only decrease. Plan construction verifies that work
-plus explicit stop-confirmation and cleanup/finalization allowances fits the hard maximum.
-Standard: 60 + 5 + 72 + 120 + 32 + 72 + 96 + 70 = 527;
-527 + 54 × 1 + 16 = 597 ≤ 600 seconds.
-Quick: 30 + 3 + 24 + 24 + 9 + 10 + 30 + 10 = 140;
-140 + 20 × 1 + 16 = 176 ≤ 180 seconds.
+plus explicit stop-confirmation, execution bookkeeping and cleanup/finalization allowances fits the hard maximum.
+Standard: 60 + 5 + 68 + 120 + 32 + 64 + 96 + 70 = 515;
+515 + 54 × 1 + 15 + 16 = 600 ≤ 600 seconds.
+Quick: 30 + 3 + 22 + 24 + 9 + 9 + 30 + 10 = 137;
+137 + 20 × 1 + 7 + 16 = 180 ≤ 180 seconds.
+The fixed bookkeeping allowance covers repeated pinned-configuration verification,
+checkpoint serialization, Store writes/fsync and progress updates outside task
+ceilings. The execution deadline is hard maximum minus the 16-second cleanup
+reservation: 584 seconds Standard and 164 seconds Quick, accommodating phase
+work, stop confirmations and bookkeeping. This is a conservative frozen allowance,
+not a guarantee against arbitrarily slow host storage.
 Each probe, question, single tool task, retrieval task and admitted context rung
 can add at most one stop confirmation. Agent candidate confirmation is inside
 the task ceiling; if that ceiling expires, only its outer confirmation adds
 time beyond the ceiling. Unavailable tasks reserve their allowance conservatively.
 Unused confirmation allowance is never redistributed into inference. The manifest
-exposes phase work, confirmation allowance, cleanup allowance and hard total.
+exposes phase work, confirmation allowance, execution bookkeeping, cleanup allowance
+and hard total.
 Standard retains all original JSON and Agentic cases with tighter per-task
 ceilings to admit the additional packs even for all-capability profiles. These
 are frozen limits, not measured model-duration or calibration claims.
@@ -197,6 +205,32 @@ Tools are deliberately small and deterministic:
   lines per call. Unknown paths, invalid starts and reversed ranges are errors.
   End beyond EOF or oversized spans return the available bounded prefix with
   `truncated: true`, preserving useful evidence in that round.
+
+Model-visible results use `path-lines-json-v1`, recorded as retrieval
+`result_serialization` in the manifest and thus included in the pack digest and
+quality signature. The typed canonical evidence is serialized deterministically
+as `{"files":{"path":[[line_number,"text"]]},"truncated":false}` without an
+`ok` envelope. Glob uses the same map with empty arrays. Truncated reads add
+`"bounded":true`; source strings are JSON escaped, never interpolated into chat
+or XML framing. Errors use `{"error":"fixed diagnostic"}`; invalid arguments
+produce a fixed message rather than echoing parser input or host errors.
+
+For example, `grep(pattern="authorize|auth", path="src")` returns:
+
+```json
+{"files":{"src/api.rs":[[2,"use crate::auth::authorize;"],[4,"    authorize(&req, &cfg)?;"]],"src/auth.rs":[[1,"pub fn authorize(req: &Request, cfg: &Config) -> Result {"]]},"truncated":false}
+```
+
+`read(path="src/auth.rs", start_line=1, end_line=80)` returns:
+
+```json
+{"files":{"src/auth.rs":[[1,"pub fn authorize(req: &Request, cfg: &Config) -> Result {"],[2,"    if req.token.is_valid() { return Ok(()); }"],[3,"    if cfg.allow_guest && req.method == \"GET\" { return Ok(()); }"],[4,"    Err(Denied)"],[5,"}"]]},"truncated":true,"bounded":true}
+```
+
+`glob(pattern="src/*retry.rs")` returns
+`{"files":{"src/jobs/retry.rs":[],"src/ui/retry.rs":[]},"truncated":false}`.
+`read(path="missing", start_line=1, end_line=80)` returns
+`{"error":"unknown virtual path"}`.
 
 Tools operate only on bundled strings, never filesystem, shell or network.
 There are at most four serial retrieval rounds, up to eight independent calls
