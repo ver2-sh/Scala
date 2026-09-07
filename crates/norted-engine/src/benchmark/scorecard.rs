@@ -143,11 +143,11 @@ pub(super) fn build(run: &Run, _categories: &BTreeMap<String, Value>) -> Value {
                         .max()
                 });
                 let complete = !values.is_empty()
-                    && values.len() == eligible.len()
+                    && values.len() == plan.context_targets.len()
                     && items.len() == plan.context_targets.len();
                 (
                     "context",
-                    json!({"score":complete.then(||100.0*values.iter().sum::<f64>()/values.len() as f64),"state":if complete{"complete"}else{"unavailable"},"required":eligible.len(),"scored":values.len(),"n":values.len(),"passed":values.iter().filter(|s|**s==1.0).count(),"wilson_95":wilson(values.iter().filter(|s|**s==1.0).count(),values.len()),"useful_context":useful,"unit":"target workload characters, not tokens","rungs":items.iter().map(|e|json!({"id":e.id,"score":e.score.map(|v|v*100.0),"status":e.status,"latency_ms":e.timing.completion_ms,"native_input_tokens":e.usage.as_ref().map(|u|u.input_tokens),"utf8_bytes":e.input_utf8_bytes,"unicode_characters":e.input_unicode_characters,"reason":e.explanation,"target_workload_characters":e.request_overrides["target_workload_characters"]})).collect::<Vec<_>>()}),
+                    json!({"score":complete.then(||100.0*values.iter().sum::<f64>()/values.len() as f64),"state":if complete{"complete"}else{"unavailable"},"required":plan.context_targets.len(),"attempted":eligible.len(),"observed_quality":stats(&values.iter().map(|s|s*100.0).collect::<Vec<_>>()),"scored":values.len(),"n":values.len(),"passed":values.iter().filter(|s|**s==1.0).count(),"wilson_95":wilson(values.iter().filter(|s|**s==1.0).count(),values.len()),"useful_context":useful,"unit":"target workload characters, not tokens","rungs":items.iter().map(|e|json!({"id":e.id,"score":e.score.map(|v|v*100.0),"status":e.status,"latency_ms":e.timing.completion_ms,"native_input_tokens":e.usage.as_ref().map(|u|u.input_tokens),"utf8_bytes":e.input_utf8_bytes,"unicode_characters":e.input_unicode_characters,"reason":e.explanation,"target_workload_characters":e.request_overrides["target_workload_characters"]})).collect::<Vec<_>>()}),
                 )
             }
         };

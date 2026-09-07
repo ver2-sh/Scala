@@ -21,9 +21,9 @@ pub fn repository() -> BTreeMap<String, String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Range {
-    pub file: String,
-    pub start: usize,
-    pub end: usize,
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
@@ -41,13 +41,13 @@ pub fn tasks() -> Vec<Task> {
         ("Find which clock production cache expiry uses and where that clock is implemented.", vec![("src/cache.rs",5,5),("src/clock.rs",1,3)]),
         ("Find all source predicates excluding records from export; the relevant filters follow the export declaration.", vec![("src/export.rs",3,4)]),
         ("Find the request authorization call and the callee's token/guest/denial decision.", vec![("src/api.rs",4,4),("src/auth.rs",1,5)]),
-    ].into_iter().enumerate().map(|(i,(p,r))|Task {id:format!("retrieval-{}",i+1),prompt:format!("{p}\nUse the virtual repository tools to inspect evidence. Return only JSON {{\"ranges\":[{{\"file\":\"path\",\"start\":1,\"end\":2}}]}} with minimal inclusive 1-based source ranges. Do not include explanations."),targets:r.into_iter().map(|(f,start,end)|Range{file:f.into(),start,end}).collect()}).collect()
+    ].into_iter().enumerate().map(|(i,(p,r))|Task {id:format!("retrieval-{}",i+1),prompt:format!("{p}\nUse up to four retrieval rounds with up to eight independent calls per round. Evidence is capped at 320 source lines total. After retrieval, a separate turn with no tools will request final ranges. Use the virtual repository tools to inspect evidence. Return only JSON {{\"ranges\":[{{\"path\":\"path\",\"start_line\":1,\"end_line\":2}}]}} with minimal inclusive 1-based source ranges. Do not include explanations."),targets:r.into_iter().map(|(f,start_line,end_line)|Range{path:f.into(),start_line,end_line}).collect()}).collect()
 }
 pub fn tools() -> Vec<InferenceTool> {
     [
-        ("grep","Case-sensitive literal substring search in source lines. Optional path prefix; sorted results with file, line and text; maximum 80 hits.",json!({"pattern":{"type":"string"},"path":{"type":"string"}}),vec!["pattern"]),
+        ("grep","Case-sensitive Rust regex search (no PCRE2), pattern 1..256 bytes. Optional path and include/exclude glob filters; sorted path/line/text results, at most 80 hits.",json!({"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"},"exclude":{"type":"string"}}),vec!["pattern"]),
         ("glob","List sorted virtual paths. Pattern accepts * (any characters including /); no other wildcard syntax.",json!({"pattern":{"type":"string"}}),vec!["pattern"]),
-        ("read","Read inclusive 1-based lines from a virtual file, maximum 80 lines.",json!({"file":{"type":"string"},"start":{"type":"integer","minimum":1},"end":{"type":"integer","minimum":1}}),vec!["file","start","end"]),
+        ("read","Read inclusive 1-based lines from a virtual path, maximum 80 lines. Oversized end/span returns available bounded prefix with truncated=true; invalid path/start/order is an error.",json!({"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}}),vec!["path","start_line","end_line"]),
     ].into_iter().map(|(name,desc,properties,required)|InferenceTool{name:name.into(),description:Some(desc.into()),parameters:json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})}).collect()
 }
 #[derive(Deserialize)]
@@ -56,6 +56,10 @@ struct Search {
     pattern: String,
     #[serde(default)]
     path: Option<String>,
+    #[serde(default)]
+    include: Option<String>,
+    #[serde(default)]
+    exclude: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,6 +68,7 @@ struct Glob {
 }
 #[derive(Default)]
 pub struct Fixture {
+    evidence_lines: usize,
     pub located: BTreeSet<(String, usize)>,
 }
 impl Fixture {
@@ -76,19 +81,48 @@ impl Fixture {
                 if a.pattern.is_empty() || a.pattern.len() > 256 {
                     return Err("pattern must contain 1..256 bytes".into());
                 }
+                let regex = regex::RegexBuilder::new(&a.pattern)
+                    .size_limit(1 << 20)
+                    .dfa_size_limit(1 << 20)
+                    .build()
+                    .map_err(|_| "invalid or oversized Rust regex (no PCRE2)".to_string())?;
+                if [&a.path, &a.include, &a.exclude]
+                    .into_iter()
+                    .flatten()
+                    .any(|s| s.len() > 256)
+                {
+                    return Err("path/filter exceeds 256 bytes".into());
+                }
                 let mut hits = Vec::new();
-                for (file, text) in repo {
-                    if a.path.as_ref().is_some_and(|p| !file.starts_with(p)) {
+                let limit = 80.min(320usize.saturating_sub(self.evidence_lines));
+                let mut matched = 0;
+                for (path, text) in repo {
+                    if a.path.as_ref().is_some_and(|p| {
+                        !(p.is_empty()
+                            || p == "."
+                            || path == *p
+                            || path.starts_with(&format!("{}/", p.trim_end_matches('/'))))
+                    }) {
+                        continue;
+                    }
+                    if a.include.as_ref().is_some_and(|p| !wildcard(p, &path))
+                        || a.exclude.as_ref().is_some_and(|p| wildcard(p, &path))
+                    {
                         continue;
                     }
                     for (i, line) in text.lines().enumerate() {
-                        if line.contains(&a.pattern) && hits.len() < 80 {
-                            self.located.insert((file.clone(), i + 1));
-                            hits.push(json!({"file":file,"line":i+1,"text":line}));
+                        if regex.is_match(line) {
+                            matched += 1;
+                            if hits.len() >= limit {
+                                continue;
+                            }
+                            self.located.insert((path.clone(), i + 1));
+                            hits.push(json!({"path":path,"line":i+1,"text":line}));
                         }
                     }
                 }
-                Ok(json!(hits))
+                self.evidence_lines += hits.len();
+                Ok(json!({"hits":hits,"truncated":matched > limit}))
             }
             "glob" => {
                 let a: Glob = serde_json::from_str(&call.arguments).map_err(parse_error)?;
@@ -103,24 +137,24 @@ impl Fixture {
             }
             "read" => {
                 let a: Range = serde_json::from_str(&call.arguments).map_err(parse_error)?;
-                let text = repo.get(&a.file).ok_or("unknown virtual file")?;
-                if a.start == 0
-                    || a.end < a.start
-                    || a.end > text.lines().count()
-                    || a.end - a.start >= 80
-                {
+                let text = repo.get(&a.path).ok_or("unknown virtual path")?;
+                let eof = text.lines().count();
+                if a.start_line == 0 || a.end_line < a.start_line || a.start_line > eof {
                     return Err("invalid line range".into());
                 }
-                Ok(json!(
-                    text.lines()
-                        .enumerate()
-                        .filter(|(i, _)| *i + 1 >= a.start && *i < a.end)
-                        .map(|(i, t)| {
-                            self.located.insert((a.file.clone(), i + 1));
-                            json!({"file":a.file,"line":i+1,"text":t})
-                        })
-                        .collect::<Vec<_>>()
-                ))
+                let limit = 80.min(320usize.saturating_sub(self.evidence_lines));
+                let last = a.end_line.min(eof).min(a.start_line - 1 + limit);
+                let lines = text
+                    .lines()
+                    .enumerate()
+                    .filter(|(i, _)| *i + 1 >= a.start_line && *i < last)
+                    .map(|(i, t)| {
+                        self.located.insert((a.path.clone(), i + 1));
+                        json!({"path":a.path,"line":i+1,"text":t})
+                    })
+                    .collect::<Vec<_>>();
+                self.evidence_lines += lines.len();
+                Ok(json!({"lines":lines,"truncated":last < a.end_line,"end_line":last}))
             }
             _ => Err("unknown retrieval tool".into()),
         }
@@ -151,7 +185,7 @@ struct Answer {
 fn lines(ranges: &[Range]) -> BTreeSet<(String, usize)> {
     ranges
         .iter()
-        .flat_map(|r| (r.start..=r.end).map(|l| (r.file.clone(), l)))
+        .flat_map(|r| (r.start_line..=r.end_line).map(|l| (r.path.clone(), l)))
         .collect()
 }
 fn metrics<T: Ord>(target: &BTreeSet<T>, predicted: &BTreeSet<T>) -> (f64, f64, f64) {
@@ -176,9 +210,12 @@ fn metrics<T: Ord>(target: &BTreeSet<T>, predicted: &BTreeSet<T>) -> (f64, f64, 
 pub fn grade(task: &Task, response: &str, located: &BTreeSet<(String, usize)>) -> Value {
     let answer = serde_json::from_str::<Answer>(response).ok().filter(|a| {
         a.ranges.len() <= 16
-            && a.ranges
-                .iter()
-                .all(|r| r.start > 0 && r.end >= r.start && r.end <= 512 && r.file.len() <= 256)
+            && a.ranges.iter().all(|r| {
+                r.start_line > 0
+                    && r.end_line >= r.start_line
+                    && r.end_line <= 512
+                    && r.path.len() <= 256
+            })
     });
     let valid = answer.is_some();
     let ranges = answer.map(|a| a.ranges).unwrap_or_default();

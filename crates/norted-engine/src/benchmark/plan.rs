@@ -40,6 +40,10 @@ pub struct BenchmarkPlan {
     pub agent_seconds: u64,
     pub retrieval_seconds: u64,
     pub context_seconds: u64,
+    pub stop_confirmation_seconds: u64,
+    /// Maximum confirmations adding time outside the frozen task ceilings.
+    pub maximum_stop_confirmations: u64,
+    pub cleanup_finalization_seconds: u64,
     pub hard_seconds: u64,
 }
 impl BenchmarkPlan {
@@ -66,7 +70,7 @@ impl BenchmarkPlan {
         let tool = capabilities.contains(&ToolUse);
         let retrieval = capabilities.contains(&Retrieval);
         let context = capabilities.contains(&LongContext);
-        let plan = Self {
+        let mut plan = Self {
             mode,
             capabilities,
             questions,
@@ -109,21 +113,35 @@ impl BenchmarkPlan {
             },
             preparation_seconds: if quick { 30 } else { 60 },
             warmup_seconds: if quick { 3 } else { 5 },
-            probe_seconds: if quick { 12 } else { 20 },
-            question_seconds: if quick { 3 } else { 6 },
+            probe_seconds: if quick { 12 } else { 18 },
+            question_seconds: if quick { 3 } else { 5 },
             single_seconds: if quick { 3 } else { 4 },
             agent_seconds: if quick { 10 } else { 18 },
             retrieval_seconds: if quick { 10 } else { 12 },
             context_seconds: if quick { 5 } else { 14 },
+            stop_confirmation_seconds: 1,
+            maximum_stop_confirmations: 0,
+            cleanup_finalization_seconds: 16,
             hard_seconds: if quick { 180 } else { 600 },
         };
-        if plan.work_seconds() + 16 > plan.hard_seconds {
+        // Each task ends after its first confirmation path. Agent confirmation
+        // inside the task ceiling can race that ceiling, but only the outer
+        // timeout confirmation adds overhead beyond it. Warmup always executes.
+        plan.maximum_stop_confirmations = 1 + plan.total_tasks() as u64;
+        if plan.work_seconds()
+            + plan.stop_confirmation_budget_seconds()
+            + plan.cleanup_finalization_seconds
+            > plan.hard_seconds
+        {
             return Err(
                 "frozen phase ceilings exceed global deadline including cleanup/finalization"
                     .into(),
             );
         }
         Ok(plan)
+    }
+    pub fn stop_confirmation_budget_seconds(&self) -> u64 {
+        self.stop_confirmation_seconds * self.maximum_stop_confirmations
     }
     pub fn work_seconds(&self) -> u64 {
         self.preparation_seconds
@@ -198,8 +216,11 @@ impl BenchmarkPlan {
         v["plan_hash"] = json!(digest(self));
         v["selected_task_ids"] = json!(self.task_ids());
         v["phase_work_seconds"] = json!(self.work_seconds());
+        v["stop_confirmation_budget_seconds"] = json!(self.stop_confirmation_budget_seconds());
+        v["cleanup_finalization_seconds"] = json!(self.cleanup_finalization_seconds);
+        v["hard_seconds"] = json!(self.hard_seconds);
         v["headroom_seconds"] = json!(self.hard_seconds - self.work_seconds());
-        v["retrieval"] = json!({"tasks":super::retrieval::tasks().into_iter().enumerate().filter(|(i,_)|self.retrieval.contains(i)).map(|(_,t)|t).collect::<Vec<_>>(),"repository":super::retrieval::repository(),"tools":super::retrieval::tools(),"rubric":"file-line-f0.5-grounded/1","rounds":6,"calls":10});
+        v["retrieval"] = json!({"tasks":super::retrieval::tasks().into_iter().enumerate().filter(|(i,_)|self.retrieval.contains(i)).map(|(_,t)|t).collect::<Vec<_>>(),"repository":super::retrieval::repository(),"tools":super::retrieval::tools(),"rubric":"file-line-f0.5-grounded/1","retrieval_rounds":4,"calls_per_round":8,"total_calls":32,"evidence_lines":320,"max_output_tokens":1024,"finalization_tools":false});
         v["context_ladder"] = json!({"rubric":"exact-json-context/1","payload_version":1,"size_unit":"target Unicode characters, not native tokens","admission":"payload UTF-8 bytes plus 2048 overhead must fit observed context limit; unknown limit unavailable","useful_context_rule":"highest successfully completed rung with score >= 0.8 times positive low-rung baseline; no inference for untested rungs","tasks":self.context_targets.iter().map(|n| super::context::payload(*n,self.capabilities.contains(&BenchmarkCapability::Retrieval))).collect::<Vec<_>>()});
         v
     }

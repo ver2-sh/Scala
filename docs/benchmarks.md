@@ -86,21 +86,33 @@ Worst case, with **every capability** declared:
 |---|---:|---:|
 | Preparation, integrity and actual loading | 30 s | 60 s |
 | Unscored warm-up | 3 s | 5 s |
-| Speed probes | 2 × 12 s | 4 × 20 s |
-| Reasoning JSON tasks | 6 × 3 s | 18 × 6 s |
-| Coding JSON tasks | 2 × 3 s | 6 × 6 s |
+| Speed probes | 2 × 12 s | 4 × 18 s |
+| Reasoning JSON tasks | 6 × 3 s | 18 × 5 s |
+| Coding JSON tasks | 2 × 3 s | 6 × 5 s |
 | Single-turn native tools | 3 × 3 s | 8 × 4 s |
 | Multi-step Agentic fixtures | 1 × 10 s | 4 × 18 s |
 | Retrieval tasks | 3 × 10 s | 8 × 12 s |
 | Context rungs | 2 × 5 s | 5 × 14 s |
-| Phase work total | **140 s** | **559 s** |
-| Shared cancellation/bookkeeping/finalization headroom | **40 s** | **41 s** |
+| Phase work total | **140 s** | **527 s** |
+| Stop confirmations (one second per task, plus warm-up) | **20 s** | **54 s** |
+| Cleanup/finalization allowance | **16 s** | **16 s** |
+| Unallocated margin | **4 s** | **3 s** |
 | Hard maximum | **180 s** | **600 s** |
 
 There are at most 19 Quick or 53 Standard tasks, excluding warm-up. Progress
 uses the selected plan, including explicit unavailable tasks. For subsets of
 capabilities, work ceilings only decrease. Plan construction verifies that work
-plus at least 16 seconds of cleanup/finalization headroom fits the hard maximum.
+plus explicit stop-confirmation and cleanup/finalization allowances fits the hard maximum.
+Standard: 60 + 5 + 72 + 120 + 32 + 72 + 96 + 70 = 527;
+527 + 54 × 1 + 16 = 597 ≤ 600 seconds.
+Quick: 30 + 3 + 24 + 24 + 9 + 10 + 30 + 10 = 140;
+140 + 20 × 1 + 16 = 176 ≤ 180 seconds.
+Each probe, question, single tool task, retrieval task and admitted context rung
+can add at most one stop confirmation. Agent candidate confirmation is inside
+the task ceiling; if that ceiling expires, only its outer confirmation adds
+time beyond the ceiling. Unavailable tasks reserve their allowance conservatively.
+Unused confirmation allowance is never redistributed into inference. The manifest
+exposes phase work, confirmation allowance, cleanup allowance and hard total.
 Standard retains all original JSON and Agentic cases with tighter per-task
 ceilings to admit the additional packs even for all-capability profiles. These
 are frozen limits, not measured model-duration or calibration claims.
@@ -137,11 +149,13 @@ Missing declared categories are unavailable/incomplete, not reweighted.
   exact schema must support native tools. Otherwise Agentic and Retrieval are
   unavailable with a precise reason, and Profile Quality is unavailable.
 - **Retrieval**: 100 × mean(0.5 × file F0.5 + 0.5 × line F0.5), described below.
-- **Context**: 100 × mean of scored admitted context-rung binary outcomes.
-  Every admitted rung must be scored, and every planned rung must have a recorded
-  outcome or an explicit admission exclusion. At least one rung must be admitted.
-  Always inspect tested coverage alongside this score; models admitting different
-  rungs do not have identical observed context coverage.
+- **Context**: 100 × mean of context-rung binary outcomes only when every
+  frozen planned rung is scored. An unavailable rung makes the headline Context
+  and Profile Quality unavailable, without scoring that rung as zero. Partial
+  observed quality, attempted/scored/required coverage and useful context remain.
+  An admitted context-limit failure still counts as a model-attributable failure.
+  For a five-rung plan with only 4K admitted and passing, coverage is 1/5 and
+  useful context is 4K; neither Context nor Profile Quality has a headline score.
 
 JSON quality uses complete JSON equality, `exact-json-v1`: no commentary,
 markdown, substring matching, fuzzy oracle, judge or partial answers. Incorrect
@@ -173,21 +187,40 @@ call/callee tracing. Quick uses three fixed representative requests.
 
 Tools are deliberately small and deterministic:
 
-- `grep`: case-sensitive literal substring, optional path prefix, sorted
-  file/line/text hits, at most 80 results.
+- `grep`: case-sensitive Rust regex (no PCRE2), 1–256 pattern bytes,
+  bounded compilation (1 MiB regex and DFA limits), optional file/directory
+  `path`, `include` and `exclude` glob filters. Sorted path/line/text hits,
+  at most 80 per call; malformed regex returns a bounded tool error.
 - `glob`: sorted paths, `*` matches any characters including slash; no other
-  wildcard syntax.
-- `read`: inclusive one-based virtual file ranges, at most 80 lines per call.
+  wildcard syntax. Patterns are limited to 256 bytes.
+- `read(path, start_line, end_line)`: inclusive one-based ranges, at most 80
+  lines per call. Unknown paths, invalid starts and reversed ranges are errors.
+  End beyond EOF or oversized spans return the available bounded prefix with
+  `truncated: true`, preserving useful evidence in that round.
 
-They operate only on bundled strings, never real paths. This is a bounded
-Fast Context-style search/read workflow, not a promise of every production grep
-regex flag. Tasks allow six rounds and ten calls with strict argument parsing.
-Calls and returned evidence are added to the canonical assistant/tool history.
-Final answers must be one strict object:
+Tools operate only on bundled strings, never filesystem, shell or network.
+There are at most four serial retrieval rounds, up to eight independent calls
+per response (32 total), and 320 returned source lines across the task, including
+repeated evidence. Retrieval requests allow up to 1024 output tokens (subject
+to the existing resolved runtime/profile cap) to accommodate eight-call responses.
+The fixed ten-path repository also bounds glob output.
+Calls execute deterministically in response order; all assistant/tool history is
+preserved. After four executed retrieval rounds (or an earlier no-call response),
+a separate finalization turn has an empty callable tool list and common-interface
+`tool_choice: None`. No fifth retrieval action executes, even if emitted.
+The final response must be only:
 
 ```json
-{"ranges":[{"file":"src/example.rs","start":3,"end":8}]}
+{"ranges":[{"path":"src/example.rs","start_line":3,"end_line":8}]}
 ```
+
+Manual contract inspection: `grep(pattern="authorize|auth", path="src")`
+uses regex alternation; `read(path="src/auth.rs", start_line=1, end_line=80)`
+returns its five available lines with truncation indicated. A canonical range
+using `path`, `start_line`, `end_line` is accepted by the grader; the old
+`file`/`start`/`end` schema is rejected. Canonical targets are passed only to
+local grading/evidence and never to model messages. File and line precision,
+recall, F0.5, pollution and grounded success retain their existing formulas.
 
 At most 16 ranges, line numbers 1–512, no extra fields or duplicate object keys.
 Scoring unions ranges into unique file/line sets. Precision is intersection /
