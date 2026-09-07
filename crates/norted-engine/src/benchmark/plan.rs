@@ -43,6 +43,9 @@ pub struct BenchmarkPlan {
     pub stop_confirmation_seconds: u64,
     /// Maximum confirmations adding time outside the frozen task ceilings.
     pub maximum_stop_confirmations: u64,
+    /// Frozen allowance for verification, checkpoints, persistence and progress.
+    #[serde(default)]
+    pub execution_bookkeeping_seconds: u64,
     pub cleanup_finalization_seconds: u64,
     pub hard_seconds: u64,
 }
@@ -113,14 +116,15 @@ impl BenchmarkPlan {
             },
             preparation_seconds: if quick { 30 } else { 60 },
             warmup_seconds: if quick { 3 } else { 5 },
-            probe_seconds: if quick { 12 } else { 18 },
+            probe_seconds: if quick { 11 } else { 17 },
             question_seconds: if quick { 3 } else { 5 },
             single_seconds: if quick { 3 } else { 4 },
-            agent_seconds: if quick { 10 } else { 18 },
+            agent_seconds: if quick { 9 } else { 16 },
             retrieval_seconds: if quick { 10 } else { 12 },
             context_seconds: if quick { 5 } else { 14 },
             stop_confirmation_seconds: 1,
             maximum_stop_confirmations: 0,
+            execution_bookkeeping_seconds: if quick { 7 } else { 15 },
             cleanup_finalization_seconds: 16,
             hard_seconds: if quick { 180 } else { 600 },
         };
@@ -130,11 +134,12 @@ impl BenchmarkPlan {
         plan.maximum_stop_confirmations = 1 + plan.total_tasks() as u64;
         if plan.work_seconds()
             + plan.stop_confirmation_budget_seconds()
+            + plan.execution_bookkeeping_seconds
             + plan.cleanup_finalization_seconds
             > plan.hard_seconds
         {
             return Err(
-                "frozen phase ceilings exceed global deadline including cleanup/finalization"
+                "frozen phase ceilings exceed global deadline including stops, bookkeeping and cleanup/finalization"
                     .into(),
             );
         }
@@ -217,10 +222,11 @@ impl BenchmarkPlan {
         v["selected_task_ids"] = json!(self.task_ids());
         v["phase_work_seconds"] = json!(self.work_seconds());
         v["stop_confirmation_budget_seconds"] = json!(self.stop_confirmation_budget_seconds());
+        v["execution_bookkeeping_seconds"] = json!(self.execution_bookkeeping_seconds);
         v["cleanup_finalization_seconds"] = json!(self.cleanup_finalization_seconds);
         v["hard_seconds"] = json!(self.hard_seconds);
         v["headroom_seconds"] = json!(self.hard_seconds - self.work_seconds());
-        v["retrieval"] = json!({"tasks":super::retrieval::tasks().into_iter().enumerate().filter(|(i,_)|self.retrieval.contains(i)).map(|(_,t)|t).collect::<Vec<_>>(),"repository":super::retrieval::repository(),"tools":super::retrieval::tools(),"rubric":"file-line-f0.5-grounded/1","retrieval_rounds":4,"calls_per_round":8,"total_calls":32,"evidence_lines":320,"max_output_tokens":1024,"finalization_tools":false});
+        v["retrieval"] = json!({"tasks":super::retrieval::tasks().into_iter().enumerate().filter(|(i,_)|self.retrieval.contains(i)).map(|(_,t)|t).collect::<Vec<_>>(),"repository":super::retrieval::repository(),"tools":super::retrieval::tools(),"result_serialization":super::retrieval::RESULT_SERIALIZATION,"rubric":"file-line-f0.5-grounded/1","retrieval_rounds":4,"calls_per_round":8,"total_calls":32,"evidence_lines":320,"max_output_tokens":1024,"finalization_tools":false});
         v["context_ladder"] = json!({"rubric":"exact-json-context/1","payload_version":1,"size_unit":"target Unicode characters, not native tokens","admission":"payload UTF-8 bytes plus 2048 overhead must fit observed context limit; unknown limit unavailable","useful_context_rule":"highest successfully completed rung with score >= 0.8 times positive low-rung baseline; no inference for untested rungs","tasks":self.context_targets.iter().map(|n| super::context::payload(*n,self.capabilities.contains(&BenchmarkCapability::Retrieval))).collect::<Vec<_>>()});
         v
     }

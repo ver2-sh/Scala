@@ -375,6 +375,8 @@ impl RuntimeManager {
         _runtime_reservation: tokio::sync::OwnedMutexGuard<()>,
     ) {
         let hard_seconds = run.plan().expect("admitted v4 plan").hard_seconds;
+        // The window includes phase work, stop confirmations and explicit
+        // execution bookkeeping; cleanup retains its separate reservation.
         let execution_deadline = tokio::time::Instant::from_std(
             started
                 + Duration::from_secs(
@@ -1301,10 +1303,7 @@ impl RuntimeManager {
                     e.request_overrides["malformed_calls"] = json!(n + 1);
                     e.request_overrides["model_failure"] = json!("tool_argument_failure");
                 }
-                let payload = match result {
-                    Ok(v) => json!({"ok":v}),
-                    Err(err) => json!({"error":err}),
-                };
+                let payload = bench::retrieval::model_view(result);
                 e.tools
                     .push(json!({"tool_call_id":call.id,"result":payload}));
                 let mut message = InferenceMessage::text(InferenceRole::Tool, payload.to_string());

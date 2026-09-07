@@ -66,15 +66,38 @@ struct Search {
 struct Glob {
     pattern: String,
 }
+pub const RESULT_SERIALIZATION: &str = "path-lines-json-v1";
+
+/// Canonical evidence stays independent of the model-facing wire layout.
+pub struct ToolResult {
+    files: BTreeMap<String, Vec<(usize, String)>>,
+    truncated: bool,
+    bounded: bool,
+}
+
+/// Only this boundary renders evidence for model messages and their audit log.
+pub fn model_view(result: Result<ToolResult, String>) -> Value {
+    match result {
+        Ok(result) => {
+            let mut value = json!({"files": result.files, "truncated": result.truncated});
+            if result.bounded {
+                value["bounded"] = json!(true);
+            }
+            value
+        }
+        Err(error) => json!({"error": error}),
+    }
+}
+
 #[derive(Default)]
 pub struct Fixture {
     evidence_lines: usize,
     pub located: BTreeSet<(String, usize)>,
 }
 impl Fixture {
-    pub fn apply(&mut self, call: &InferenceToolCall) -> Result<Value, String> {
+    pub fn apply(&mut self, call: &InferenceToolCall) -> Result<ToolResult, String> {
         let repo = repository();
-        let parse_error = |e: serde_json::Error| e.to_string();
+        let parse_error = |_: serde_json::Error| "invalid tool arguments".to_string();
         match call.name.as_str() {
             "grep" => {
                 let a: Search = serde_json::from_str(&call.arguments).map_err(parse_error)?;
@@ -93,7 +116,8 @@ impl Fixture {
                 {
                     return Err("path/filter exceeds 256 bytes".into());
                 }
-                let mut hits = Vec::new();
+                let mut files: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
+                let mut returned = 0;
                 let limit = 80.min(320usize.saturating_sub(self.evidence_lines));
                 let mut matched = 0;
                 for (path, text) in repo {
@@ -113,27 +137,39 @@ impl Fixture {
                     for (i, line) in text.lines().enumerate() {
                         if regex.is_match(line) {
                             matched += 1;
-                            if hits.len() >= limit {
+                            if returned >= limit {
                                 continue;
                             }
                             self.located.insert((path.clone(), i + 1));
-                            hits.push(json!({"path":path,"line":i+1,"text":line}));
+                            files
+                                .entry(path.clone())
+                                .or_default()
+                                .push((i + 1, line.into()));
+                            returned += 1;
                         }
                     }
                 }
-                self.evidence_lines += hits.len();
-                Ok(json!({"hits":hits,"truncated":matched > limit}))
+                self.evidence_lines += returned;
+                Ok(ToolResult {
+                    files,
+                    truncated: matched > limit,
+                    bounded: false,
+                })
             }
             "glob" => {
                 let a: Glob = serde_json::from_str(&call.arguments).map_err(parse_error)?;
                 if a.pattern.len() > 256 {
                     return Err("pattern too long".into());
                 }
-                Ok(json!(
-                    repo.keys()
+                Ok(ToolResult {
+                    files: repo
+                        .keys()
                         .filter(|p| wildcard(&a.pattern, p))
-                        .collect::<Vec<_>>()
-                ))
+                        .map(|p| (p.clone(), Vec::new()))
+                        .collect(),
+                    truncated: false,
+                    bounded: false,
+                })
             }
             "read" => {
                 let a: Range = serde_json::from_str(&call.arguments).map_err(parse_error)?;
@@ -150,11 +186,15 @@ impl Fixture {
                     .filter(|(i, _)| *i + 1 >= a.start_line && *i < last)
                     .map(|(i, t)| {
                         self.located.insert((a.path.clone(), i + 1));
-                        json!({"path":a.path,"line":i+1,"text":t})
+                        (i + 1, t.to_string())
                     })
                     .collect::<Vec<_>>();
                 self.evidence_lines += lines.len();
-                Ok(json!({"lines":lines,"truncated":last < a.end_line,"end_line":last}))
+                Ok(ToolResult {
+                    files: BTreeMap::from([(a.path, lines)]),
+                    truncated: last < a.end_line,
+                    bounded: last < a.end_line,
+                })
             }
             _ => Err("unknown retrieval tool".into()),
         }
