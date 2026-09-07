@@ -270,6 +270,10 @@ pub enum SettingsAction {
         profile_id: ModelProfileId,
         model: Box<ModelArtifact>,
     },
+    SetProfileCapabilities {
+        profile_id: ModelProfileId,
+        capabilities: std::collections::BTreeSet<norted_core::BenchmarkCapability>,
+    },
     CycleProfileRole {
         profile_id: ModelProfileId,
     },
@@ -325,6 +329,7 @@ pub enum SettingsInputKind {
     Search,
     Reset,
     ProfileName,
+    ProfileCapabilities,
     DuplicateProfile,
     SettingValue,
 }
@@ -789,6 +794,12 @@ impl App {
             }
             KeyCode::Char('?') => {
                 self.overlay = Some(Overlay::Help);
+                Update::Render
+            }
+            KeyCode::Char('q')
+                if self.screen == Screen::Benchmarks && self.focus == FocusArea::Content =>
+            {
+                self.benchmarks.key(key);
                 Update::Render
             }
             KeyCode::Char('q') => Update::Quit,
@@ -3217,6 +3228,7 @@ impl App {
                     self.benchmarks.pending =
                         Some(norted_engine::benchmark::BenchmarkRequest::Start {
                             profile_id: profile.id.clone(),
+                            mode: norted_engine::benchmark::BenchmarkMode::Standard,
                         });
                     self.screen = Screen::Benchmarks;
                     self.nav_focus = Screen::Benchmarks;
@@ -3268,6 +3280,31 @@ impl App {
             KeyCode::Char('e') => self.cycle_profile_engine(),
             KeyCode::Char('r') => self.refresh_selected_model_profile(),
             KeyCode::Char('p') => self.cycle_profile_role(),
+            KeyCode::Char('C') => {
+                let current = self
+                    .selected_model_profile_value()
+                    .map(|p| {
+                        p.benchmark_capabilities
+                            .iter()
+                            .map(|c| {
+                                serde_json::to_value(c)
+                                    .unwrap()
+                                    .as_str()
+                                    .unwrap()
+                                    .to_owned()
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default();
+                let update = self.begin_settings_command(SettingsInputKind::ProfileCapabilities);
+                if let Some(input) = self.settings_input.as_mut() {
+                    input.cursor = current.chars().count();
+                    input.text = current;
+                }
+                self.notice=Some("Capabilities: reasoning,coding,tool_use,retrieval,long_context (comma separated; empty = operational only)".into());
+                update
+            }
             _ => Update::None,
         }
     }
@@ -3569,6 +3606,25 @@ impl App {
                 })
             }
 
+            SettingsInputKind::ProfileCapabilities => {
+                let capabilities = input.text.split(',').map(str::trim).filter(|s|!s.is_empty()).map(str::parse).collect::<Result<std::collections::BTreeSet<norted_core::BenchmarkCapability>,_>>();
+                match capabilities {
+                    Ok(capabilities) => {
+                        if let Some(profile) = self.selected_model_profile_value() {
+                            self.queue_settings_action(SettingsAction::SetProfileCapabilities {
+                                profile_id: profile.id.clone(),
+                                capabilities,
+                            })
+                        } else {
+                            Update::None
+                        }
+                    }
+                    Err(error) => {
+                        self.notice = Some(error);
+                        Update::Render
+                    }
+                }
+            }
             SettingsInputKind::ProfileName => match ModelProfileId::new(input.text.clone()) {
                 Ok(id) => {
                     let Some(model) = self

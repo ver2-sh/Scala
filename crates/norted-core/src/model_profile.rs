@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,33 @@ use sha2::{Digest, Sha256};
 use crate::settings::{lock_file, write_json_state};
 use crate::{AppPaths, ModelId, SettingsError, SettingsPatch, StateStoreError};
 
-pub const MODEL_PROFILES_STATE_VERSION: u32 = 2;
+pub const MODEL_PROFILES_STATE_VERSION: u32 = 3;
+
+/// Architecture-independent semantic intent, explicitly chosen by the profile owner.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkCapability {
+    Reasoning,
+    Coding,
+    ToolUse,
+    Retrieval,
+    LongContext,
+}
+impl std::str::FromStr for BenchmarkCapability {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "reasoning" => Ok(Self::Reasoning),
+            "coding" => Ok(Self::Coding),
+            "tool_use" => Ok(Self::ToolUse),
+            "retrieval" => Ok(Self::Retrieval),
+            "long_context" => Ok(Self::LongContext),
+            _ => Err(format!(
+                "Unknown capability {s}; expected reasoning,coding,tool_use,retrieval,long_context"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -137,6 +163,7 @@ pub struct ModelProfile {
     pub engine_id: EngineId,
     #[serde(default)]
     pub role: ModelRole,
+    pub benchmark_capabilities: BTreeSet<BenchmarkCapability>,
     #[serde(default)]
     pub overrides: SettingsPatch,
 }
@@ -154,6 +181,7 @@ impl ModelProfile {
             model_id,
             engine_id,
             role: ModelRole::default(),
+            benchmark_capabilities: BTreeSet::new(),
             overrides: SettingsPatch::default(),
         };
         profile.validate()?;
@@ -165,6 +193,17 @@ impl ModelProfile {
         validate_engine_id(self.engine_id.as_str())?;
         if self.display_name.trim().is_empty() || self.display_name.chars().count() > 128 {
             return Err(SettingsError::InvalidDisplayName);
+        }
+        if self
+            .benchmark_capabilities
+            .contains(&BenchmarkCapability::Retrieval)
+            && !self
+                .benchmark_capabilities
+                .contains(&BenchmarkCapability::ToolUse)
+        {
+            return Err(SettingsError::InvalidModelProfile(
+                "retrieval requires tool_use".into(),
+            ));
         }
         for id in self.overrides.0.keys() {
             if !id.applies_to_engine(self.engine_id.as_str()) {
@@ -185,6 +224,7 @@ impl ModelProfile {
             engine_id: &'a EngineId,
             role: ModelRole,
             overrides: &'a SettingsPatch,
+            benchmark_capabilities: &'a BTreeSet<BenchmarkCapability>,
         }
 
         let bytes = serde_json::to_vec(&StableContent {
@@ -193,6 +233,7 @@ impl ModelProfile {
             engine_id: &self.engine_id,
             role: self.role,
             overrides: &self.overrides,
+            benchmark_capabilities: &self.benchmark_capabilities,
         })
         .expect("Model Profile content is serializable");
         format!("{:x}", Sha256::digest(bytes))
@@ -336,6 +377,19 @@ fn read_state(path: &Path) -> Result<ModelProfilesState, StateStoreError> {
             });
         }
     };
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|source| StateStoreError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let version = envelope["version"].as_u64().unwrap_or(0);
+    if version != u64::from(MODEL_PROFILES_STATE_VERSION) {
+        return Err(SettingsError::UnsupportedStateVersion {
+            found: u32::try_from(version).unwrap_or(u32::MAX),
+            supported: MODEL_PROFILES_STATE_VERSION,
+        }
+        .into());
+    }
     let state: ModelProfilesState =
         serde_json::from_slice(&bytes).map_err(|source| StateStoreError::Parse {
             path: path.to_path_buf(),

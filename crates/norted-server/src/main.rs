@@ -546,6 +546,7 @@ async fn handle_model_profiles(
             model,
             engine,
             role,
+            capabilities,
         } => {
             let profile_id = ModelProfileId::new(profile)?;
             let model_id = ModelId(model);
@@ -563,6 +564,11 @@ async fn handle_model_profiles(
                         .get_mut(&profile_id)
                         .expect("new profile")
                         .role = role.into();
+                    state
+                        .profiles
+                        .get_mut(&profile_id)
+                        .expect("new profile")
+                        .benchmark_capabilities = capabilities.into_iter().collect();
                     Ok(state.clone())
                 })
                 .await?;
@@ -707,6 +713,33 @@ async fn handle_model_profiles(
                 .await?;
             output_model_profile_mutation(&core, "set-role", &state, &selected, json_output)
                 .await?;
+        }
+        ModelProfilesCommand::SetCapabilities {
+            profile,
+            capabilities,
+        } => {
+            let id = ModelProfileId::new(profile)?;
+            let selected = id.clone();
+            let state = store
+                .update(move |state| {
+                    state
+                        .profiles
+                        .get_mut(&id)
+                        .ok_or_else(|| {
+                            norted_core::SettingsError::ModelProfileNotFound(id.clone())
+                        })?
+                        .benchmark_capabilities = capabilities.into_iter().collect();
+                    Ok(state.clone())
+                })
+                .await?;
+            output_model_profile_mutation(
+                &core,
+                "set-capabilities",
+                &state,
+                &selected,
+                json_output,
+            )
+            .await?;
         }
         ModelProfilesCommand::Set { profile, settings } => {
             let profile_id = ModelProfileId::new(profile)?;

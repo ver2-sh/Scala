@@ -2093,6 +2093,10 @@ fn render_model_profiles(
                 ("Profile", profile.id.to_string()),
                 ("Role", format!("{:?}", profile.role)),
                 (
+                    "Capabilities (C)",
+                    serde_json::to_string(&profile.benchmark_capabilities).unwrap_or_default(),
+                ),
+                (
                     "Model",
                     model
                         .map(|m| m.display_name.clone())
@@ -2168,6 +2172,9 @@ pub(super) fn render_settings_input(
             crate::app::SettingsInputKind::Search => "Search settings (empty clears filter)",
             crate::app::SettingsInputKind::Reset => "Reset this scope: type RESET",
             crate::app::SettingsInputKind::ProfileName => "New Model Profile ID",
+            crate::app::SettingsInputKind::ProfileCapabilities => {
+                "Capabilities (comma separated; empty clears)"
+            }
             crate::app::SettingsInputKind::DuplicateProfile => "Duplicate Model Profile ID",
             crate::app::SettingsInputKind::SettingValue => "Override value",
         }
@@ -2400,6 +2407,7 @@ pub(super) fn render_settings_input(
     } else {
         match input.kind {
             crate::app::SettingsInputKind::ProfileName => "[ Create ]",
+            crate::app::SettingsInputKind::ProfileCapabilities => "[ Save capabilities ]",
             crate::app::SettingsInputKind::DuplicateProfile => "[ Duplicate ]",
             crate::app::SettingsInputKind::SettingValue => "[F10 Save]",
             crate::app::SettingsInputKind::Search => "[ Search ]",
