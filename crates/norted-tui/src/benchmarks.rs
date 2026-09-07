@@ -8,7 +8,10 @@ use crate::{
     },
 };
 use crossterm::event::{KeyCode, KeyEvent};
-use norted_engine::benchmark::{BenchmarkRequest, performance_lines};
+use norted_engine::benchmark::{
+    BenchmarkRequest, benchmark_timestamp as timestamp, comparison_lines, performance_lines,
+    scorecard_lines, scorecard_metric, status_label,
+};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -381,7 +384,7 @@ fn number(value: &Value) -> String {
     value
         .as_f64()
         .map(|n| format!("{n:.1}"))
-        .unwrap_or_else(|| "unavailable".into())
+        .unwrap_or_else(|| "—".into())
 }
 fn text(value: &Value) -> String {
     value.as_str().map(str::to_owned).unwrap_or_else(|| {
@@ -391,39 +394,6 @@ fn text(value: &Value) -> String {
             value.to_string()
         }
     })
-}
-fn timestamp(value: &Value) -> String {
-    let Some(ms) = value.as_u64() else {
-        return "never".into();
-    };
-    // UTC civil date conversion, avoiding a date/time dependency for table cells.
-    let seconds = ms / 1000;
-    let z = (seconds / 86400) as i64 + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}Z",
-        seconds % 86400 / 3600,
-        seconds % 3600 / 60
-    )
-}
-
-fn metric(result: &Value, field: &str) -> String {
-    let v = &result["speed"]["combined"][field];
-    if !v["median"].is_null() {
-        number(&v["median"])
-    } else if !v["partial_median"].is_null() {
-        format!("partial {}", number(&v["partial_median"]))
-    } else {
-        "unavailable".into()
-    }
 }
 fn fields(lines: &mut Vec<String>, label: &str, value: &Value) {
     match value {
@@ -452,40 +422,13 @@ pub fn clamp_scroll(state: &mut Benchmarks, area: Rect) {
     state.scroll = state.scroll.min(max);
 }
 
-/// Short measurement overview; coverage and reasons follow below, before Details.
-fn overview_lines(s: &Value) -> Vec<String> {
-    if s.is_null() {
-        return vec!["No selected result. Measurements unavailable until a run finishes.".into()];
-    }
-    vec![
-        format!(
-            "Intelligence: {} /100 | Agentic: {} /100",
-            number(&s["intelligence"]),
-            number(&s["agentic"])
-        ),
-        format!(
-            "Delivery: {} chars/s | First visible: {} ms",
-            metric(s, "visible_delivery_characters_per_second"),
-            metric(s, "first_visible_ms")
-        ),
-        format!(
-            "Text end-to-end: {} chars/s",
-            metric(s, "visible_end_to_end_characters_per_second")
-        ),
-        format!(
-            "Native end-to-end: {} output tokens/s",
-            metric(s, "native_end_to_end_output_tokens_per_second")
-        ),
-    ]
-}
-
 fn summary_lines(s: &Value) -> Vec<String> {
     if s.is_null() {
         return vec![
             "No selected result. Measurements are unavailable until a run finishes.".into(),
         ];
     }
-    let mut lines = overview_lines(s);
+    let mut lines = scorecard_lines(s);
     lines.extend(performance_lines(&s["speed"]).into_iter().map(|line| {
         line.split_once(": ")
             .map(|(label, value)| format!("{label:<24} {value}"))
@@ -561,9 +504,31 @@ fn content_lines(state: &Benchmarks) -> Vec<String> {
                 .collect();
         }
         if value["summary"].is_object() {
-            return summary_lines(&value["summary"]);
+            let mut lines = summary_lines(&value["summary"]);
+            for row in state.overview["rows"].as_array().into_iter().flatten() {
+                if row["result"]["run_id"] == value["summary"]["run_id"] {
+                    for key in [
+                        "state",
+                        "configuration_notes",
+                        "identity_note",
+                        "latest_attempt",
+                    ] {
+                        if !row[key].is_null() {
+                            fields(&mut lines, &key.replace('_', " "), &row[key]);
+                        }
+                    }
+                }
+            }
+            if !value["record"]["provenance"].is_null() {
+                fields(
+                    &mut lines,
+                    "Runtime / profile provenance",
+                    &value["record"]["provenance"],
+                );
+            }
+            return lines;
         }
-        let mut lines = vec!["Comparison: baseline (left) -> selected (right)".into()];
+        let mut lines = comparison_lines(value);
         for (label, side) in [("Baseline", "left"), ("Selected", "right")] {
             lines.push(format!(
                 "{label}: {} ({}) | Run: {}",
@@ -577,9 +542,6 @@ fn content_lines(state: &Benchmarks) -> Vec<String> {
             "same_configuration",
             "conditions_verified",
             "warning",
-            "intelligence_delta",
-            "agentic_delta",
-            "latency_delta_ms",
         ] {
             lines.push(format!(
                 "{:<24} {}",
@@ -590,41 +552,6 @@ fn content_lines(state: &Benchmarks) -> Vec<String> {
         if value["same_methods"] != true {
             lines
                 .push("WARNING: suite/methods differ; results are not directly comparable.".into());
-        }
-        lines.push(format!(
-            "{:<30} {:<18} {}",
-            "Metric", "Baseline", "Selected"
-        ));
-        for (label, key) in [
-            ("Intelligence (points)", "intelligence"),
-            ("Agentic (points)", "agentic"),
-        ] {
-            lines.push(format!(
-                "{label:<30} {:<18} {}",
-                number(&value["left"][key]),
-                number(&value["right"][key])
-            ));
-        }
-        for (label, key) in [
-            (
-                "Delivery (chars/s)",
-                "visible_delivery_characters_per_second",
-            ),
-            (
-                "Text end-to-end (chars/s)",
-                "visible_end_to_end_characters_per_second",
-            ),
-            (
-                "Native end-to-end (tokens/s)",
-                "native_end_to_end_output_tokens_per_second",
-            ),
-            ("First visible (ms)", "first_visible_ms"),
-        ] {
-            lines.push(format!(
-                "{label:<30} {:<18} {}",
-                metric(&value["left"], key),
-                metric(&value["right"], key)
-            ));
         }
         lines.push("Baseline".into());
         lines.extend(summary_lines(&value["left"]));
@@ -665,34 +592,15 @@ fn content_lines(state: &Benchmarks) -> Vec<String> {
         }];
     }
     let row = state.row();
-    let mut lines = overview_lines(state.result());
-    lines.push(format!(
-        "Selected: {}",
-        text(if state.history.is_some() {
-            &row["run_id"]
-        } else {
-            &row["display_name"]
-        })
-    ));
-    if state.history.is_none() {
+    let mut lines = scorecard_lines(state.result());
+    if state.history.is_none()
+        && row["latest_attempt"].is_object()
+        && row["latest_attempt"]["run_id"] != state.result()["run_id"]
+    {
         lines.push(format!(
-            "State: {} | Last finished: {}",
-            text(&row["state"]),
-            timestamp(&row["last_benchmark_unix_ms"])
+            "Latest attempt: {}",
+            status_label(&row["latest_attempt"])
         ));
-        lines.push(format!(
-            "Latest attempt (separate): {} | {}",
-            text(&row["latest_attempt"]["run_id"]),
-            text(&row["latest_attempt"]["status"])
-        ));
-        if let Some(diagnostic) = row["latest_attempt"]["diagnostic"].as_str() {
-            lines.push(format!("Latest attempt diagnostic: {diagnostic}"));
-        }
-        for key in ["configuration_notes", "identity_note"] {
-            if !row[key].is_null() {
-                lines.push(format!("{}: {}", key.replace('_', " "), text(&row[key])));
-            }
-        }
     }
     if let Some(mark) = &state.marked {
         lines.push(format!(
@@ -700,18 +608,6 @@ fn content_lines(state: &Benchmarks) -> Vec<String> {
             state.marked_profile.as_deref().unwrap_or("unknown profile")
         ));
     }
-    let result = state.result();
-    for key in ["status", "suite", "agentic_unavailable", "diagnostic"] {
-        if !result[key].is_null() {
-            fields(&mut lines, &key.replace('_', " "), &result[key]);
-        }
-    }
-    lines.push(format!(
-        "Run: {} | Finished: {}",
-        text(&result["run_id"]),
-        timestamp(&result["ended_unix_ms"])
-    ));
-    lines.extend(performance_lines(&result["speed"]));
     lines.push(
         "Details: configuration, diagnostics and probe outcomes. Evidence: raw result.".into(),
     );
@@ -771,28 +667,26 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         l.progress,
     );
     // Secondary metadata yields to measurements; use the same columns for every row.
-    let wide = l.header.width >= 140;
-    let intermediate = l.header.width >= 96;
-    let compact = l.header.width >= 64;
+    let wide = l.header.width >= 120;
+    let compact = l.header.width >= 58;
     let tails: &[u16] = if wide {
-        &[12, 11, 17, 17, 22, 17]
-    } else if intermediate {
-        &[12, 11, 17, 17]
+        &[16, 14, 9, 12, 18, 18]
     } else if compact {
-        &[12, 11, 17]
+        &[12, 11, 8, 11]
     } else {
         &[12, 11]
     };
     let columns = inventory_columns(l.header, tails, tails);
-    let mut headings = vec!["Profile / run", "Intel /100", "Agent /100"];
-    if compact {
-        headings.push("Delivery chars/s");
+    let mut headings = vec!["Profile / run", "Intel ↑ /100", "Agentic ↑"];
+    if l.header.width >= 120 {
+        headings[1] = "Intelligence ↑";
+        headings[2] = "Agentic ↑";
     }
-    if intermediate {
-        headings.push("First visible ms");
+    if compact {
+        headings.extend(["TPS ↑", "Latency ↓"]);
     }
     if wide {
-        headings.extend(["State", "Last finished UTC"]);
+        headings.extend(["Status", "Last benchmark"]);
     }
     let headings = headings.into_iter().map(str::to_owned).collect::<Vec<_>>();
     inventory_row(frame, l.header, &columns, &headings, theme.muted, glyphs);
@@ -818,21 +712,19 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
                 &row["display_name"]
             })
         );
-        let status = text(if state.history.is_some() {
-            &row["status"]
-        } else {
-            &row["state"]
-        });
+        let status = status_label(result);
         let mut values = vec![
             name,
-            number(&result["intelligence"]),
-            number(&result["agentic"]),
+            scorecard_metric(result, "intelligence", " /100"),
+            scorecard_metric(result, "agentic", " /100"),
         ];
         if compact {
-            values.push(metric(result, "visible_delivery_characters_per_second"));
-        }
-        if intermediate {
-            values.push(metric(result, "first_visible_ms"));
+            values.push(scorecard_metric(
+                result,
+                "native_end_to_end_output_tokens_per_second",
+                "",
+            ));
+            values.push(scorecard_metric(result, "first_visible_ms", " ms"));
         }
         if wide {
             values.push(status);
