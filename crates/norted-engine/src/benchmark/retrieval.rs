@@ -41,7 +41,7 @@ pub fn tasks() -> Vec<Task> {
         ("Find which clock production cache expiry uses and where that clock is implemented.", vec![("src/cache.rs",5,5),("src/clock.rs",1,3)]),
         ("Find all source predicates excluding records from export; the relevant filters follow the export declaration.", vec![("src/export.rs",3,4)]),
         ("Find the request authorization call and the callee's token/guest/denial decision.", vec![("src/api.rs",4,4),("src/auth.rs",1,5)]),
-    ].into_iter().enumerate().map(|(i,(p,r))|Task {id:format!("retrieval-{}",i+1),prompt:format!("{p}\nUse up to four retrieval rounds with up to eight independent calls per round. Evidence is capped at 320 source lines total. After retrieval, a separate turn with no tools will request final ranges. Use the virtual repository tools to inspect evidence. Return only JSON {{\"ranges\":[{{\"path\":\"path\",\"start_line\":1,\"end_line\":2}}]}} with minimal inclusive 1-based source ranges. Do not include explanations."),targets:r.into_iter().map(|(f,start_line,end_line)|Range{path:f.into(),start_line,end_line}).collect()}).collect()
+    ].into_iter().enumerate().map(|(i,(p,r))|Task {id:format!("retrieval-{}",i+1),prompt:format!("{p}\nUse up to four retrieval rounds with up to eight independent calls per round. Evidence is capped at 320 source lines total. Return final ranges immediately when ready. Only after four tool rounds, a separate turn with no tools will request final ranges. Use the virtual repository tools to inspect evidence. Return only JSON {{\"ranges\":[{{\"path\":\"path\",\"start_line\":1,\"end_line\":2}}]}} with minimal inclusive 1-based source ranges. Do not include explanations."),targets:r.into_iter().map(|(f,start_line,end_line)|Range{path:f.into(),start_line,end_line}).collect()}).collect()
 }
 pub fn tools() -> Vec<InferenceTool> {
     [
@@ -66,6 +66,37 @@ struct Search {
 struct Glob {
     pattern: String,
 }
+pub const FINALIZATION: &str = "early-final-or-no-tools-json-schema-v1";
+
+pub fn final_schema() -> Value {
+    json!({
+        "type": "object", "required": ["ranges"], "additionalProperties": false,
+        "properties": {"ranges": {"type": "array", "maxItems": 16, "items": {
+            "type": "object", "required": ["path", "start_line", "end_line"],
+            "additionalProperties": false,
+            "properties": {
+                "path": {"type": "string", "minLength": 1, "maxLength": 256},
+                "start_line": {"type": "integer", "minimum": 1, "maximum": 512},
+                "end_line": {"type": "integer", "minimum": 1, "maximum": 512}
+            }
+        }}}
+    })
+}
+
+pub fn finalize_request(request: &mut crate::InferenceRequest) {
+    request.tools.clear();
+    request.tool_choice = Some(crate::InferenceToolChoice::None);
+    request.parallel_tool_calls = Some(false);
+    request.output_format = Some(crate::OutputFormat::JsonSchema {
+        name: Some("retrieval_ranges".into()),
+        description: None,
+        schema: final_schema(),
+        strict: Some(true),
+    });
+    request.messages.push(crate::InferenceMessage::text(crate::InferenceRole::User,
+        "Retrieval is complete: all four repository tool rounds have been used. No functions are available on this turn. Earlier tool calls describe past actions only. Return only canonical JSON {\"ranges\":[{\"path\":\"...\",\"start_line\":1,\"end_line\":2}]}. Select minimal ranges from gathered evidence, or an empty ranges array if none are relevant. No prose or tool calls."));
+}
+
 pub const RESULT_SERIALIZATION: &str = "path-lines-json-v1";
 
 /// Canonical evidence stays independent of the model-facing wire layout.
@@ -85,8 +116,18 @@ pub fn model_view(result: Result<ToolResult, String>) -> Value {
             }
             value
         }
-        Err(error) => json!({"error": error}),
+        Err(error) => json!({"error": error, "truncated": false}),
     }
+}
+
+/// Exact compact, sorted JSON wire text; typed evidence remains unescaped.
+pub fn tool_text(value: &Value) -> String {
+    let mut sorted = value.clone();
+    sorted.sort_all_objects();
+    sorted
+        .to_string()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
 }
 
 #[derive(Default)]
@@ -247,16 +288,25 @@ fn metrics<T: Ord>(target: &BTreeSet<T>, predicted: &BTreeSet<T>) -> (f64, f64, 
     };
     (precision, recall, f)
 }
-pub fn grade(task: &Task, response: &str, located: &BTreeSet<(String, usize)>) -> Value {
-    let answer = serde_json::from_str::<Answer>(response).ok().filter(|a| {
+fn parse_final(response: &str) -> Option<Answer> {
+    serde_json::from_str::<Answer>(response).ok().filter(|a| {
         a.ranges.len() <= 16
             && a.ranges.iter().all(|r| {
                 r.start_line > 0
                     && r.end_line >= r.start_line
                     && r.end_line <= 512
+                    && !r.path.is_empty()
                     && r.path.len() <= 256
             })
-    });
+    })
+}
+
+pub fn valid_final(response: &str) -> bool {
+    parse_final(response).is_some()
+}
+
+pub fn grade(task: &Task, response: &str, located: &BTreeSet<(String, usize)>) -> Value {
+    let answer = parse_final(response);
     let valid = answer.is_some();
     let ranges = answer.map(|a| a.ranges).unwrap_or_default();
     let target = lines(&task.targets);

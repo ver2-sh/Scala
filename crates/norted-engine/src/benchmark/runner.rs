@@ -1125,6 +1125,7 @@ impl RuntimeManager {
                 .request(run, &task.prompt, 1024, false, Vec::new())
                 .await?;
             request.tools = bench::retrieval::tools();
+            request.parallel_tool_calls = Some(true);
             let mut e = new_evidence(
                 &task.id,
                 "retrieval",
@@ -1140,6 +1141,55 @@ impl RuntimeManager {
             {
                 e.status = "unavailable".into();
                 e.explanation = format!("Retrieval native tools unavailable: {reason}");
+                run.evidence.push(e);
+                continue;
+            }
+            let mut final_request = request.clone();
+            bench::retrieval::finalize_request(&mut final_request);
+            let capability = {
+                let state = self.state.read().await;
+                let running = state
+                    .backends
+                    .get(&run.profile.id)
+                    .and_then(|b| b.running.as_ref())
+                    .ok_or("backend missing")?;
+                if !running
+                    .adapter
+                    .capabilities()
+                    .features
+                    .contains(&crate::EngineFeature::StructuredOutput)
+                {
+                    Err("runtime does not support required structured final output".into())
+                } else {
+                    running
+                        .adapter
+                        .validate_inference_request(
+                            &final_request,
+                            &running.effective_generation_settings,
+                            &running.settings_schema,
+                        )
+                        .and_then(|()| {
+                            running.adapter.validate_inference_request(
+                                &request,
+                                &running.effective_generation_settings,
+                                &running.settings_schema,
+                            )
+                        })
+                        .map_err(|error| error.to_string())
+                }
+            };
+            if let Some(reason) = run
+                .missing
+                .iter()
+                .find(|r| r.starts_with("Retrieval unavailable:"))
+                .cloned()
+                .or_else(|| capability.err().map(retrieval_unavailable))
+            {
+                e.status = "unavailable".into();
+                e.explanation = reason.clone();
+                if !run.missing.contains(&reason) {
+                    run.missing.push(reason);
+                }
                 run.evidence.push(e);
                 continue;
             }
@@ -1177,6 +1227,14 @@ impl RuntimeManager {
                         .await
                         .err();
                 }
+            }
+            if e.status == "unavailable" {
+                if !run.missing.contains(&e.explanation) {
+                    run.missing.push(e.explanation.clone());
+                }
+                *run.evidence.last_mut().expect("checkpointed task") = e;
+                self.checkpoint(run, started, "retrieval").await?;
+                continue;
             }
             let mut metrics = bench::retrieval::grade(&task, &e.response, &fixture.located);
             metrics["tool_calls"] = e.request_overrides["tool_calls"].clone();
@@ -1263,6 +1321,7 @@ impl RuntimeManager {
     ) -> Result<(), MeasureError> {
         e.request_overrides["benchmark_messages_before_profile_defaults"] = json!(request.messages);
         e.request_overrides["tool_definitions"] = json!(request.tools);
+        e.request_overrides["parallel_tool_calls"] = json!(request.parallel_tool_calls);
         e.request_overrides["malformed_calls"] = json!(0);
         e.request_overrides["tool_calls"] = json!(0);
         e.request_overrides["rounds"] = json!(0);
@@ -1276,10 +1335,13 @@ impl RuntimeManager {
             let r = self.measure(request.clone(), e).await?;
             e.tools.push(json!({"phase":"retrieval","round":round,"calls":r.calls,"text":r.text,"timing":r.timing,"usage":r.usage}));
             if r.calls.is_empty() {
-                request
-                    .messages
-                    .push(InferenceMessage::text(InferenceRole::Assistant, r.text));
-                break;
+                e.request_overrides["valid_completion"] =
+                    json!(r.finish == "Stop" && bench::retrieval::valid_final(&r.text));
+                if !bench::retrieval::valid_final(&r.text) {
+                    e.request_overrides["model_failure"] = json!("malformed_final_output");
+                }
+                e.status = "completed".into();
+                return Ok(());
             }
             e.request_overrides["rounds"] = json!(round);
             count += r.calls.len();
@@ -1304,9 +1366,11 @@ impl RuntimeManager {
                     e.request_overrides["model_failure"] = json!("tool_argument_failure");
                 }
                 let payload = bench::retrieval::model_view(result);
-                e.tools
-                    .push(json!({"tool_call_id":call.id,"result":payload}));
-                let mut message = InferenceMessage::text(InferenceRole::Tool, payload.to_string());
+                let text = bench::retrieval::tool_text(&payload);
+                e.tools.push(
+                    json!({"tool_call_id":call.id,"result":payload,"model_visible_text":text}),
+                );
+                let mut message = InferenceMessage::text(InferenceRole::Tool, text);
                 message.tool_call_id = Some(call.id);
                 request.messages.push(message);
             }
@@ -1314,18 +1378,22 @@ impl RuntimeManager {
             self.benchmark.store.save(run).await?;
             self.verify_pinned(run).await?;
         }
-        // Preserve all historical calls/results, but expose no callable tools.
-        request.tools.clear();
-        request.tool_choice = Some(crate::InferenceToolChoice::None);
-        request.messages.push(InferenceMessage::text(InferenceRole::User,
-            "Retrieval is finished. Return only canonical JSON {\"ranges\":[{\"path\":\"...\",\"start_line\":1,\"end_line\":2}]}. No prose or tool calls."));
+        // Reached only after four actual tool rounds; early answers return above.
+        bench::retrieval::finalize_request(&mut request);
         if let Some(active) = self.benchmark.active.lock().await.as_mut() {
             active.phase = format!("retrieval / {} / finalization", e.id);
         }
         e.response.clear();
         e.request_overrides["finalization_tools"] = json!(request.tools);
         e.request_overrides["finalization_tool_choice"] = json!(request.tool_choice);
-        let r = self.measure(request, e).await?;
+        e.request_overrides["finalization_parallel_tool_calls"] =
+            json!(request.parallel_tool_calls);
+        e.request_overrides["finalization_output_format"] = json!(request.output_format);
+        let result = self.measure(request, e).await;
+        if e.status == "unavailable" {
+            return Ok(());
+        }
+        let r = result?;
         e.tools.push(json!({"phase":"finalization","calls":r.calls,"text":r.text,"timing":r.timing,"usage":r.usage}));
         e.request_overrides["valid_completion"] = json!(r.finish == "Stop" && r.calls.is_empty());
         if !r.calls.is_empty() {
@@ -1399,6 +1467,11 @@ impl RuntimeManager {
     ) -> Result<bench::Response, MeasureError> {
         evidence.stream_event_observed = false;
         let tools_requested = !request.tools.is_empty();
+        let retrieval_final = evidence.category == "retrieval"
+            && matches!(
+                request.output_format,
+                Some(crate::OutputFormat::JsonSchema { .. })
+            );
         evidence.timing = Timing {
             request_start_unix_ms: bench::now_ms(),
             ..Default::default()
@@ -1409,7 +1482,21 @@ impl RuntimeManager {
             .infer_stream(request)
             .await
             .map_err(|error| {
-                classify_inference_error(error.to_string(), evidence.category == "ladder")
+                let reason = error.to_string();
+                if retrieval_final
+                    && (matches!(
+                        error,
+                        crate::manager::RuntimeError::UnsupportedCapability
+                            | crate::manager::RuntimeError::InvalidGenerationSettings(_)
+                    ) || reason.contains("HTTP 400")
+                        || reason.contains("HTTP 422")
+                        || reason.to_ascii_lowercase().contains("schema")
+                        || reason.to_ascii_lowercase().contains("response_format"))
+                {
+                    evidence.status = "unavailable".into();
+                    evidence.explanation = retrieval_unavailable(reason.clone());
+                }
+                classify_inference_error(reason, evidence.category == "ladder")
             })?
             .stream;
         let mut text = String::new();
@@ -1664,6 +1751,17 @@ async fn setting_file_observations(settings: &norted_core::ResolvedSettings) -> 
         }
     }
     json!(files)
+}
+
+fn retrieval_unavailable(reason: String) -> String {
+    format!(
+        "Retrieval unavailable: {}",
+        reason
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(512)
+            .collect::<String>()
+    )
 }
 
 #[derive(Debug)]

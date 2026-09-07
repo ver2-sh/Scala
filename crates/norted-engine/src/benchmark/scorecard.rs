@@ -86,6 +86,14 @@ pub(super) fn build(run: &Run, _categories: &BTreeMap<String, Value>) -> Value {
                     .filter_map(|e| e.score.map(|s| s * 100.0))
                     .collect::<Vec<_>>();
                 let mut result = json!({"score":(values.len()==plan.retrieval.len()).then(||values.iter().sum::<f64>()/values.len().max(1) as f64),"state":if values.len()==plan.retrieval.len(){"complete"}else{"incomplete"},"attempted":items.iter().filter(|e|e.status!="unavailable").count(),"scored":values.len(),"required":plan.retrieval.len(),"sample":stats(&values),"tasks":items.iter().map(|e|json!({"id":e.id,"status":e.status,"metrics":e.request_overrides["retrieval_metrics"]})).collect::<Vec<_>>()});
+                result["unavailable_reason"] = json!(
+                    run.missing
+                        .iter()
+                        .find(|s| s.starts_with("Retrieval unavailable:"))
+                );
+                if !result["unavailable_reason"].is_null() {
+                    result["state"] = json!("unavailable");
+                }
                 for field in [
                     "file_precision",
                     "file_recall",
