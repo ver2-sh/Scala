@@ -21,17 +21,17 @@ norted-server benchmarks compare BASELINE_RUN_ID SELECTED_RUN_ID
 ```
 
 Every run uses the full fixed pack. There is no mode selector, capability
-configuration, retrieval pack, or context ladder.
+configuration or context ladder. Retrieval is part of the same fixed pack.
 On `/benchmarks`, **b Benchmark** starts a run, **h History** opens history,
 **d Details** opens technical analysis, Space marks a baseline, **c Compare**
 compares, **e Evidence** opens raw evidence, and **x Cancel** cancels.
 
-Default CLI and the selected-result pane show six independent headline metrics:
-Intelligence /100, Agentic /100, Coding /100, Output TPS, Prefill TPS, and Latency.
+Default CLI and the selected-result pane show seven independent headline metrics:
+Intelligence /100, Agentic /100, Coding /100, Retrieval /100, Output TPS, Prefill TPS, and Latency.
 Higher is better except Latency. There is **no overall/composite score**.
 Unavailable values are `—`. Status, duration and last benchmark follow the scores.
 The responsive table drops secondary metadata first, then Prefill, then latency
-and output speed; the selected pane always includes all six metrics.
+and output speed; the selected pane always includes all seven metrics.
 Details/`--verbose` include task outcomes, category scores, coverage and missing
 reasons, runtime/profile configuration, diagnostics and raw evidence. `--json`
 retains the complete machine-readable response.
@@ -44,21 +44,22 @@ Suite: **`norted-quick-bench/4`**. Methodology:
 
 | Phase | Ceiling |
 |---|---:|
-| Preparation, integrity checks and loading | 60 s |
-| Unscored warm-up | 10 s |
-| Performance probes (2 short, 2 medium) | 4 × 16 s = 64 s |
-| Intelligence | 24 × 8 s = 192 s |
-| Single-turn tools | 8 × 7 s = 56 s |
-| Multi-step Agentic fixtures | 4 × 21 s = 84 s |
-| Executable Coding | 6 × (8 s inference + 1 s evaluator) = 54 s |
-| **Declared work** | **520 s** |
-| Stop confirmations (46 tasks plus warm-up) | 47 × 1 s = 47 s |
+| Preparation, integrity checks and loading | 55 s |
+| Unscored warm-up | 9 s |
+| Performance probes (2 short, 2 medium) | 4 × 14 s = 56 s |
+| Intelligence | 24 × 7 s = 168 s |
+| Single-turn tools | 8 × 6 s = 48 s |
+| Multi-step Agentic fixtures | 4 × 18 s = 72 s |
+| Executable Coding | 6 × (7 s inference + 1 s evaluator) = 48 s |
+| Retrieval | 4 × 15 s = 60 s |
+| **Declared work** | **516 s** |
+| Stop confirmations (50 tasks plus warm-up) | 51 × 1 s = 51 s |
 | Execution bookkeeping | 15 s |
 | Cleanup/finalization | 16 s |
 | Unallocated margin | 2 s |
 | **Hard maximum** | **600 s** |
 
-There are **46 scored/performance tasks**, excluding warm-up. Plan construction
+There are **50 scored/performance tasks**, excluding warm-up. Plan construction
 checks the entire sum. One monotonic deadline starts at admission. Execution
 stops at 584 seconds; cleanup ends by 599 seconds and immutable finalization by
 600 seconds. Cancellation confirmation, checkpoints, progress and persistence
@@ -70,7 +71,7 @@ fixed and unfinished work stays incomplete.
 The manifest binds selected IDs, exact prompts, contracts, hidden answer/test
 vectors, rubrics, evaluator version and security limits, fixtures, output limits,
 and timing policy. Its digest is the pack hash. Hidden oracle state is never
-included in model requests; only the coding prompt and contract are sent.
+included in model requests; only task prompts/contracts and delivered fixture tool results are sent.
 
 ## Intelligence and Agentic
 
@@ -100,7 +101,7 @@ Rhai syntax and the `fn solve(x)` contract; prior familiarity is not assumed.
 **every deterministic hidden test** for its task. Otherwise that task receives
 zero, including a completed task allowance with no usable response. No partial
 credit or subjective grading. A missing/interrupted task or unfinished run cannot
-publish Coding. Each task has an 8-second inference deadline and 768-token output
+publish Coding. Each task has a 7-second inference deadline and 768-token output
 cap, followed by at most one second of bounded local evaluation.
 
 Rubric: **`norted-rhai-all-hidden/1`**; evaluator: **Rhai 1.26.0**, pinned in Cargo.
@@ -128,6 +129,119 @@ Evidence stores the original response, compile outcome, binary result, bounded
 reason, evaluator time/version, request timing/limits and rubric. A failing test
 says “hidden test failed”; interpreter internals are not dumped. Inference that
 never produces evaluable source records an unavailable compile outcome.
+
+## Retrieval /100
+
+Pack **`norted-private-lease-repository/1`** contains four newly authored queries
+against one immutable virtual repository: ten files, 52 lines, including source,
+presentation/fixture decoys and retired documentation. Tasks `grep-lease-1` through
+`grep-lease-4` cover precise function localization, caller/callee control flow,
+configuration-to-use tracing, and export predicates. Gold consists of exact
+inclusive file/line ranges; neither gold nor the repository is given to the model
+in advance. Tools access only bundled strings, never the host filesystem or a
+network. No Grep training examples, teacher trajectories or SWE-bench material
+are used. This small retrieval microbenchmark does not establish broad repository
+retrieval quality or replace Grep's qualification corpus.
+
+Repository SHA-256 (sorted compact JSON path-to-content map):
+`d72dd6d936277c9e70db0057349a0155f83597c622ff1809381f3ac9dc736ebd`.
+
+The system prompt, tool definitions, finalization instruction and final JSON
+Schema mirror Norted commit `3098fd5dd62e739c4368ae7a8f97b1353f28f91c`,
+`scripts/grep_protocol.py`; generation flow is cross-checked against
+`scripts/grep_generation.py`, model ownership against `scripts/grep_model.py`, and
+bounds against `config/grep.toml`. The protocol is:
+
+1. System prompt + user query; native `grep`, `glob`, `read`, automatic tool choice,
+   parallel calls enabled, explicit text output during search.
+2. Accept a valid ranges response immediately, including before any tools, with
+   no forced extra turn. Malformed finals end the task as model evidence.
+3. Execute at most four rounds of 1–8 independent calls. Preserve call order for
+   deterministic results; the read-only in-process calls execute sequentially
+   without dependencies or changes to repository state. A round is one assistant
+   request, regardless of call count. Calls must have unique nonempty IDs and a
+   complete terminal response; mixed prose/tool output is a protocol failure.
+4. Only after four **executed** rounds, remove all tools, set tool choice to none,
+   disable parallel calls, append the exact finalization user instruction, and
+   request one strict `JsonSchema` assistant response. No final-answer pseudo-tool.
+
+Each task has one 15-second ceiling across all turns, local work and intermediate
+checkpoints, with no retries or per-turn deadline resets. Every turn caps output
+at 1,024 tokens (an explicit lower profile limit still wins as in the existing
+benchmark). Saved sampling/thinking settings remain profile-owned; the benchmark
+never rewrites them to match training defaults. Canonical Grep messages have no
+benchmark nonce; cache isolation remains unverified and this difference from the
+performance probes is recorded. The global deadline still bounds the whole run.
+
+`path-lines-json-v1` delivers compact sorted JSON
+`{"files":{"path":[[1,"text"]]},"truncated":false}`, with `bounded:true` for
+read requests extending beyond EOF or 160 lines. Glob matches have empty arrays.
+Angle brackets are escaped to prevent repository text from injecting template
+framing. Errors are deterministic JSON. The 2,048-byte round output budget is
+shared equally as `(2048 - 2 * calls) / calls`; each result is a stable prefix.
+Each call returns at most 64 results. The 1,024-byte round call budget uses
+canonical JSON names/argument objects without transport IDs. Regex uses bounded
+Rust regex, without PCRE2; glob/include/exclude use case-sensitive fnmatch-style
+`*`, `?` and character classes, with `*` spanning `/`. Discovery has no ignore
+files in this fixture. No external ripgrep executable or general repository
+framework is added. Regex compilation has 1 MiB size/DFA bounds; tool strings are
+bounded to 2,048 UTF-8 bytes. These local implementation limits are identity-bound.
+
+The exact upstream schema permits up to 4,096 ranges, forbids extra fields and
+requires nonempty paths and positive integers. Separate semantic validation
+normalizes safe relative POSIX paths, rejects `.git`/escaping paths, checks
+start ≤ end ≤ 100,000,000 and actual file bounds, merges overlapping/adjacent
+ranges, and caps the union at 1,024 lines. This follows the distinction between
+upstream `FINAL_SCHEMA`, `ranges()` and `RepositoryTools.validate_ranges()`;
+ordering and filesystem bounds are not falsely claimed as JSON Schema constraints.
+
+For file and line sets, `P = hits / returned`, `R = hits / gold`, and
+`F0.5 = 1.25 P R / (0.25 P + R)` (zero when both are zero). Line metrics use
+interval-union counts, so overlapping predictions cannot inflate hits.
+
+**Retrieval = 100 × mean over all four tasks of min(file F0.5, line F0.5).**
+Rubric **`grep-bottleneck-f05/1`** uses the weaker granularity without subjective
+mixing weights. Pollution already lowers line precision/F0.5; no second arbitrary
+pollution penalty is applied. Malformed finals, tool/protocol errors, invalid
+completion and timeouts give zero task credit. Ordinary incomplete retrieval can
+receive objective partial credit. This is a Server benchmark rubric, not a claim
+that Norted qualification uses this headline formula. It was selected before any
+Q6/Q6K observations.
+
+Raw evidence retains file and line P/R/F0.5, polluting/returned lines, exact
+predicted/gold ranges, grounded success, success/failure, malformed final,
+tool/protocol failure, call/error counts, executed serial rounds, truncation,
+timeouts and retrieval wall time. `success` requires a clean completion, all gold
+lines retrieved and selected, and no pollution; `grounded_success` separately
+records evidence coverage. Headline partial credit remains possible without full
+success. Aggregate P/R/F0.5 are task macro means; counts/time are sums. Missing raw
+observations stay null. Partial raw observations never supply a headline.
+
+Before the first task executes, the adapter must advertise ToolCalling and
+StructuredOutput and validate the initial request, parallel tool history, and
+exact no-tools final request against the loaded settings schema. A proven
+capability rejection at inference time invalidates the **whole category**, clears
+provisional scores and prevents later retrieval tasks, while retaining raw traces.
+Unsupported tasks remain in the fixed denominator with null credit, never zero or
+redistributed weight. Genuine infrastructure faults retain the existing run-failure
+and stop/quarantine paths. Model malformed output is never capability-unavailable.
+
+Currently **none of the bundled adapters proves the whole contract**: q27 and
+NInfer reject structured output, and llama.cpp's current adapter does not advertise
+native ToolCalling (nor translate tool requests). Thus Retrieval is unavailable
+for these adapters; the executor is ready for a faithfully supported adapter.
+The exact q27 blocker and qualified template evidence are in
+[q27 Grep contract review](q27-grep-contract.md). No weaker fallback is offered.
+
+The v4 suite/method family remains unchanged; the manifest/pack hash changes.
+It binds the new repository hash/content, task IDs/queries/gold, prompts, tools,
+serialization, round/call/output/semantic limits, finalization, schema, rubric,
+timing and execution/aggregation source digests. Conservative source digests also
+invalidate comparisons for nonsemantic edits to those owners. Q6/Q6K and future
+students share the same denominator and can compare under identical pack identity;
+quality/performance retain existing configuration/deployment comparison gates.
+Earlier v4 packs and v1–v3 records remain immutable and cannot compare directly to
+this pack. No migration or capability-aware format reader is added.
 
 ## Output speed, native Prefill and latency
 
@@ -205,7 +319,7 @@ headline scores.
 
 ## Identity, comparison and immutable history
 
-Comparisons show baseline → selected and signed deltas for the six headline
+Comparisons show baseline → selected and signed deltas for the seven headline
 metrics, followed by method/configuration/runtime/hardware differences. Deltas
 require matching suite, methodology, pack and comparison signature; strict
 performance deltas additionally require equivalent recorded deployment conditions.
