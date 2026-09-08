@@ -183,12 +183,6 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> Result<T, St
         return Err("benchmark file exceeds size limit".into());
     }
     let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if value.get("record_version").is_some()
-        && value["profile"].get("benchmark_capabilities").is_none()
-        && value["suite"] != "norted-quick-bench/3"
-    {
-        return Err("Missing profile capabilities: compatibility decoding is restricted to immutable v3 benchmark records".into());
-    }
     serde_json::from_value(value).map_err(|e| e.to_string())
 }
 fn lock(path: &Path) -> Result<std::fs::File, String> {

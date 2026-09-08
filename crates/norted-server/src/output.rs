@@ -943,10 +943,6 @@ pub fn model_profile(
     }
     println!("  Engine:         {}", profile.engine_id);
     println!("  Role:           {:?}", profile.role);
-    println!(
-        "  Capabilities:   {}",
-        serde_json::to_string(&profile.benchmark_capabilities)?
-    );
     println!("  Content SHA:    {}", profile.content_hash());
     if profile.overrides.is_empty() {
         println!("  Overrides:      none (inherits from Settings)");

@@ -119,7 +119,7 @@ pub fn tasks() -> Vec<Task> {
         .collect()
 }
 pub fn manifest() -> Value {
-    json!({"tasks":tasks(),"evaluator":"rhai/1.26.0","rubric":RUBRIC,"source_bytes":8192,"operations_per_case":20000,"call_depth":8,"expression_depth":16,"variables":64,"array_items_aggregate":256,"map_items":32,"string_bytes_aggregate":2048,"evaluation_seconds":1,"capabilities":[],"packages":["ArithmeticPackage","LogicPackage","BasicStringPackage","MoreStringPackage","BasicArrayPackage","BasicIteratorPackage","BasicMathPackage"],"compile_optimization":"none","case_scope":"fresh engine and scope per hidden case"})
+    json!({"tasks":tasks(),"evaluator":"rhai/1.26.0","rubric":RUBRIC,"source_bytes":8192,"operations_per_case":20000,"call_depth":8,"expression_depth":16,"variables":64,"items_per_array":256,"map_items":32,"bytes_per_string":2048,"evaluation_seconds":1,"capabilities":[],"packages":["ArithmeticPackage","LogicPackage","BasicStringPackage","MoreStringPackage","BasicArrayPackage","BasicIteratorPackage","BasicMathPackage"],"compile_optimization":"none","case_scope":"fresh engine and scope per hidden case"})
 }
 pub fn evaluate(task: &Task, source: &str) -> Value {
     let started = Instant::now();
