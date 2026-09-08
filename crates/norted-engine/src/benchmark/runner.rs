@@ -41,20 +41,18 @@ impl RuntimeManager {
         request: BenchmarkRequest,
     ) -> Result<Value, String> {
         match request {
-            BenchmarkRequest::Start { profile_id, mode } => {
-                self.start_benchmark(profile_id, mode).await
-            }
-            BenchmarkRequest::Plan { profile_id, mode } => {
+            BenchmarkRequest::Start { profile_id } => self.start_benchmark(profile_id).await,
+            BenchmarkRequest::Plan { profile_id } => {
                 let profiles = self
                     .model_profiles
                     .read()
                     .await
                     .map_err(|e| e.to_string())?;
-                let profile = profiles
+                profiles
                     .profiles
                     .get(&profile_id)
                     .ok_or("Model Profile not found")?;
-                let plan = BenchmarkPlan::new(mode, profile.benchmark_capabilities.clone())?;
+                let plan = BenchmarkPlan::new()?;
                 Ok(
                     json!({"profile_id":profile_id,"plan":plan,"manifest":plan.manifest(),"pack_hash":bench::digest(plan.manifest())}),
                 )
@@ -168,13 +166,7 @@ impl RuntimeManager {
             .map(|a| a.profile_id.clone());
         let mut rows = Vec::new();
         for profile in profiles.profiles.values() {
-            let pack = bench::digest(
-                BenchmarkPlan::new(
-                    BenchmarkMode::Standard,
-                    profile.benchmark_capabilities.clone(),
-                )?
-                .manifest(),
-            );
+            let pack = bench::digest(BenchmarkPlan::new()?.manifest());
             let saved = self.saved_benchmark_configuration(profile).await.ok();
             let backend = status.backend(&profile.id);
             let mut saved = saved;
@@ -243,20 +235,19 @@ impl RuntimeManager {
                 state
             };
             rows.push(json!({"profile_id":profile.id,"display_name":profile.display_name,"state":state,"configuration_notes":reasons,
-                "result":result,"last_benchmark_unix_ms":result.filter(|s|bench::finished(&s.status)).and_then(|s|s.ended_unix_ms),"latest_attempt":h.first(),"latest_quick":h.iter().find(|s|s.mode==Some(BenchmarkMode::Quick)),
+                "result":result,"last_benchmark_unix_ms":result.filter(|s|bench::finished(&s.status)).and_then(|s|s.ended_unix_ms),"latest_attempt":h.first(),
                 "identity_note":"Current requires a running observed runtime. Hardware cache and external workloads remain unverified."}));
         }
         let active = self.benchmark.active.lock().await;
         Ok(
             json!({"suite":suite::SUITE,"methodology":suite::METHOD,"rows":rows,
-            "active":active.as_ref().map(|a|json!({"run_id":a.run_id,"profile_id":a.profile_id,"phase":a.phase,"completed_tasks":a.done,"mode":a.plan.mode,"total_tasks":a.plan.total_tasks(),"elapsed_seconds":a.started.elapsed().as_secs_f64(),"remaining_seconds":(a.plan.hard_seconds as f64-a.started.elapsed().as_secs_f64()).max(0.0),"cancelling":*a.cancel.borrow()})),
-            "history_summary_limit":4096,"timing_boundary":"internal managed streaming inference","speed_method":"visible Unicode characters/s after first chunk; first chunk excluded","latency_method":"time to first nonempty visible text (ms); first answer unavailable"}),
+            "active":active.as_ref().map(|a|json!({"run_id":a.run_id,"profile_id":a.profile_id,"phase":a.phase,"completed_tasks":a.done,"total_tasks":a.plan.total_tasks(),"elapsed_seconds":a.started.elapsed().as_secs_f64(),"remaining_seconds":(a.plan.hard_seconds as f64-a.started.elapsed().as_secs_f64()).max(0.0),"cancelling":*a.cancel.borrow()})),
+            "history_summary_limit":4096,"timing_boundary":"internal managed streaming inference","speed_method":"native output tokens/s over whole request; native processed prompt tokens/s over native prefill duration","latency_method":"time to first nonempty visible text (ms); first answer unavailable"}),
         )
     }
     async fn start_benchmark(
         self: &Arc<Self>,
         profile_id: ModelProfileId,
-        mode: BenchmarkMode,
     ) -> Result<Value, String> {
         if self.benchmark.owner.lock().await.is_none() {
             return Err("benchmark execution requires an owning private-control server".into());
@@ -300,7 +291,7 @@ impl RuntimeManager {
             .get(&profile_id)
             .cloned()
             .ok_or("Model Profile not found")?;
-        let plan = BenchmarkPlan::new(mode, profile.benchmark_capabilities.clone())?;
+        let plan = BenchmarkPlan::new()?;
         // Nothing is resolved or loaded before this monotonic admission timestamp.
         let started = Instant::now();
         let started_unix_ms = bench::now_ms();
@@ -359,7 +350,7 @@ impl RuntimeManager {
             ),
         ));
         Ok(
-            json!({"run_id":run_id,"profile_id":profile_id,"status":"running","mode":mode,"execution_budget_seconds":plan.hard_seconds,"reservation":"Normal inference and load/unload are temporarily rejected"}),
+            json!({"run_id":run_id,"profile_id":profile_id,"status":"running","execution_budget_seconds":plan.hard_seconds,"reservation":"Normal inference and load/unload are temporarily rejected"}),
         )
     }
     async fn run_benchmark(
@@ -763,8 +754,10 @@ impl RuntimeManager {
                         Err(_) => {
                             e.status = "timeout".into();
                             e.score = Some(0.0);
-                            e.explanation =
-                                "30-second task deadline; unsuccessful under fixed budget".into();
+                            e.explanation = format!(
+                                "{}-second task deadline; unsuccessful under fixed budget",
+                                plan.agent_seconds
+                            );
                             let stopped = self.confirm_benchmark_request_stopped(run, &mut e).await;
                             if let Some(attempt) = run.evidence.last_mut() {
                                 *attempt = e.clone();
@@ -779,7 +772,6 @@ impl RuntimeManager {
                 }
             }
         }
-        self.retrieval_and_context(run, started, &plan).await?;
         self.verify_pinned(run).await?;
         let summary = run.summary();
         for (field, label) in [
@@ -1020,8 +1012,6 @@ impl RuntimeManager {
                 e.request_overrides["model_failure"] =
                     json!(if reason.starts_with("runtime_timeout:") {
                         "timeout"
-                    } else if reason.starts_with("admitted_context_limit:") {
-                        "admitted_context_limit"
                     } else {
                         "candidate_output_limit_or_serialization"
                     });
@@ -1139,301 +1129,6 @@ impl RuntimeManager {
         }
         Ok(fixture.solved(case))
     }
-    async fn retrieval_and_context(
-        self: &Arc<Self>,
-        run: &mut Run,
-        started: Instant,
-        plan: &BenchmarkPlan,
-    ) -> Result<(), String> {
-        for (index, task) in bench::retrieval::tasks().into_iter().enumerate() {
-            if !plan.retrieval.contains(&index) {
-                continue;
-            }
-            self.verify_pinned(run).await?;
-            let mut request = self
-                .request(run, &task.prompt, 1024, false, Vec::new())
-                .await?;
-            request.tools = bench::retrieval::tools();
-            request.parallel_tool_calls = Some(true);
-            let mut e = new_evidence(
-                &task.id,
-                "retrieval",
-                &task.prompt,
-                json!(task.targets),
-                plan.retrieval_seconds,
-                request.max_output_tokens,
-            );
-            if let Some(reason) = run
-                .missing
-                .iter()
-                .find(|r| r.starts_with("Agentic unavailable:"))
-            {
-                e.status = "unavailable".into();
-                e.explanation = format!("Retrieval native tools unavailable: {reason}");
-                run.evidence.push(e);
-                continue;
-            }
-            let mut final_request = request.clone();
-            bench::retrieval::finalize_request(&mut final_request);
-            let capability = {
-                let state = self.state.read().await;
-                let running = state
-                    .backends
-                    .get(&run.profile.id)
-                    .and_then(|b| b.running.as_ref())
-                    .ok_or("backend missing")?;
-                if !running
-                    .adapter
-                    .capabilities()
-                    .features
-                    .contains(&crate::EngineFeature::StructuredOutput)
-                {
-                    Err("runtime does not support required structured final output".into())
-                } else {
-                    running
-                        .adapter
-                        .validate_inference_request(
-                            &final_request,
-                            &running.effective_generation_settings,
-                            &running.settings_schema,
-                        )
-                        .and_then(|()| {
-                            running.adapter.validate_inference_request(
-                                &request,
-                                &running.effective_generation_settings,
-                                &running.settings_schema,
-                            )
-                        })
-                        .map_err(|error| error.to_string())
-                }
-            };
-            if let Some(reason) = run
-                .missing
-                .iter()
-                .find(|r| r.starts_with("Retrieval unavailable:"))
-                .cloned()
-                .or_else(|| capability.err().map(retrieval_unavailable))
-            {
-                e.status = "unavailable".into();
-                e.explanation = reason.clone();
-                if !run.missing.contains(&reason) {
-                    run.missing.push(reason);
-                }
-                run.evidence.push(e);
-                continue;
-            }
-            e.status = "running".into();
-            run.evidence.push(e.clone());
-            self.benchmark.store.save(run).await?;
-            let mut fixture = bench::retrieval::Fixture::default();
-            let result = tokio::time::timeout(
-                Duration::from_secs(plan.retrieval_seconds),
-                self.retrieval_task(run, &mut e, request, &mut fixture),
-            )
-            .await;
-            let mut fatal = None;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(MeasureError::Candidate(reason))) => {
-                    e.status = "failed".into();
-                    e.explanation = reason;
-                    e.request_overrides["model_failure"] = json!("invalid_tool_or_output_limit");
-                    fatal = self
-                        .confirm_benchmark_request_stopped(run, &mut e)
-                        .await
-                        .err();
-                }
-                Ok(Err(MeasureError::Infrastructure(reason))) => {
-                    e.status = "infrastructure_error".into();
-                    e.explanation = reason.clone();
-                    fatal = Some(reason);
-                }
-                Err(_) => {
-                    e.status = "timeout".into();
-                    e.explanation = "retrieval task deadline".into();
-                    fatal = self
-                        .confirm_benchmark_request_stopped(run, &mut e)
-                        .await
-                        .err();
-                }
-            }
-            if e.status == "unavailable" {
-                if !run.missing.contains(&e.explanation) {
-                    run.missing.push(e.explanation.clone());
-                }
-                *run.evidence.last_mut().expect("checkpointed task") = e;
-                self.checkpoint(run, started, "retrieval").await?;
-                continue;
-            }
-            let mut metrics = bench::retrieval::grade(&task, &e.response, &fixture.located);
-            metrics["tool_calls"] = e.request_overrides["tool_calls"].clone();
-            metrics["rounds"] = e.request_overrides["rounds"].clone();
-            metrics["malformed_calls"] = e.request_overrides["malformed_calls"].clone();
-            metrics["timeouts"] = json!(usize::from(e.status == "timeout"));
-            metrics["completion_status"] = json!(e.status);
-            let completed =
-                e.status == "completed" && e.request_overrides["valid_completion"] == true;
-            metrics["completion_valid"] = json!(completed);
-            if !completed {
-                metrics["grounded_success"] = json!(false);
-                metrics["score"] = json!(0.0);
-            }
-            if !matches!(e.status.as_str(), "infrastructure_error" | "timeout") {
-                let valid = metrics["final_format_valid"] == true
-                    && e.request_overrides["model_failure"].is_null()
-                    && e.request_overrides["valid_completion"] == true;
-                e.request_overrides["valid_completion"] = json!(valid);
-                if metrics["final_format_valid"] != true {
-                    e.request_overrides["model_failure"] = json!("malformed_final_output");
-                }
-                e.score = metrics["score"].as_f64().map(|s| s / 100.0);
-                e.status = if e.score == Some(1.0) {
-                    "passed"
-                } else {
-                    "failed"
-                }
-                .into();
-            } else if e.status == "timeout" {
-                e.score = Some(0.0);
-            }
-            e.request_overrides["retrieval_metrics"] = metrics;
-            *run.evidence.last_mut().expect("checkpointed task") = e;
-            if let Some(reason) = fatal {
-                return Err(reason);
-            }
-            self.checkpoint(run, started, "retrieval").await?;
-        }
-        for target in &plan.context_targets {
-            self.verify_pinned(run).await?;
-            let payload = bench::context::payload(
-                *target,
-                plan.capabilities
-                    .contains(&norted_core::BenchmarkCapability::Retrieval),
-            );
-            let prompt = payload["prompt"].as_str().expect("bundled payload");
-            let request = self.request(run, prompt, 384, false, Vec::new()).await?;
-            let mut e = new_evidence(
-                payload["id"].as_str().unwrap(),
-                "ladder",
-                prompt,
-                payload["answer"].clone(),
-                plan.context_seconds,
-                request.max_output_tokens,
-            );
-            e.request_overrides["target_workload_characters"] = json!(target);
-            let setting_id = format!("{}.context_length", run.profile.engine_id);
-            let limit = run
-                .provenance
-                .as_ref()
-                .and_then(|p| p.normalized_settings.get("resolved_settings"))
-                .and_then(|v| v.get(&setting_id))
-                .and_then(Value::as_u64);
-            e.request_overrides["admitted_context_limit"] = json!(limit);
-            if limit.is_none_or(|n| prompt.len() as u64 + 2048 > n) {
-                e.status = "unavailable".into();
-                e.explanation=if limit.is_none(){"Observed context limit unavailable"}else{"Workload plus conservative overhead exceeds observed context limit; not attempted"}.into();
-                run.evidence.push(e);
-            } else {
-                self.one_request(run, &mut e, request, plan.context_seconds)
-                    .await?;
-            }
-            self.checkpoint(run, started, "context ladder").await?;
-        }
-        Ok(())
-    }
-    async fn retrieval_task(
-        self: &Arc<Self>,
-        run: &mut Run,
-        e: &mut Evidence,
-        mut request: crate::InferenceRequest,
-        fixture: &mut bench::retrieval::Fixture,
-    ) -> Result<(), MeasureError> {
-        e.request_overrides["benchmark_messages_before_profile_defaults"] = json!(request.messages);
-        e.request_overrides["tool_definitions"] = json!(request.tools);
-        e.request_overrides["parallel_tool_calls"] = json!(request.parallel_tool_calls);
-        e.request_overrides["malformed_calls"] = json!(0);
-        e.request_overrides["tool_calls"] = json!(0);
-        e.request_overrides["rounds"] = json!(0);
-        let mut count = 0;
-        let mut ids = std::collections::BTreeSet::new();
-        for round in 1..=4 {
-            if let Some(active) = self.benchmark.active.lock().await.as_mut() {
-                active.phase = format!("retrieval / {} / round {round}", e.id);
-            }
-            e.response.clear();
-            let r = self.measure(request.clone(), e).await?;
-            e.tools.push(json!({"phase":"retrieval","round":round,"calls":r.calls,"text":r.text,"timing":r.timing,"usage":r.usage}));
-            if r.calls.is_empty() {
-                e.request_overrides["valid_completion"] =
-                    json!(r.finish == "Stop" && bench::retrieval::valid_final(&r.text));
-                if !bench::retrieval::valid_final(&r.text) {
-                    e.request_overrides["model_failure"] = json!("malformed_final_output");
-                }
-                e.status = "completed".into();
-                return Ok(());
-            }
-            e.request_overrides["rounds"] = json!(round);
-            count += r.calls.len();
-            e.request_overrides["tool_calls"] = json!(count);
-            if r.calls.len() > 8 || count > 32 {
-                return Err(MeasureError::Candidate(
-                    "retrieval call limit exceeded".into(),
-                ));
-            }
-            let mut assistant = InferenceMessage::text(InferenceRole::Assistant, r.text);
-            assistant.tool_calls = r.calls.clone();
-            request.messages.push(assistant);
-            for call in r.calls {
-                let result = if call.id.is_empty() || !ids.insert(call.id.clone()) {
-                    Err("empty or duplicate call ID".into())
-                } else {
-                    fixture.apply(&call)
-                };
-                if result.is_err() {
-                    let n = e.request_overrides["malformed_calls"].as_u64().unwrap_or(0);
-                    e.request_overrides["malformed_calls"] = json!(n + 1);
-                    e.request_overrides["model_failure"] = json!("tool_argument_failure");
-                }
-                let payload = bench::retrieval::model_view(result);
-                let text = bench::retrieval::tool_text(&payload);
-                e.tools.push(
-                    json!({"tool_call_id":call.id,"result":payload,"model_visible_text":text}),
-                );
-                let mut message = InferenceMessage::text(InferenceRole::Tool, text);
-                message.tool_call_id = Some(call.id);
-                request.messages.push(message);
-            }
-            *run.evidence.last_mut().expect("checkpointed task") = e.clone();
-            self.benchmark.store.save(run).await?;
-            self.verify_pinned(run).await?;
-        }
-        // Reached only after four actual tool rounds; early answers return above.
-        bench::retrieval::finalize_request(&mut request);
-        if let Some(active) = self.benchmark.active.lock().await.as_mut() {
-            active.phase = format!("retrieval / {} / finalization", e.id);
-        }
-        e.response.clear();
-        e.request_overrides["finalization_tools"] = json!(request.tools);
-        e.request_overrides["finalization_tool_choice"] = json!(request.tool_choice);
-        e.request_overrides["finalization_parallel_tool_calls"] =
-            json!(request.parallel_tool_calls);
-        e.request_overrides["finalization_output_format"] = json!(request.output_format);
-        let result = self.measure(request, e).await;
-        if e.status == "unavailable" {
-            return Ok(());
-        }
-        let r = result?;
-        e.tools.push(json!({"phase":"finalization","calls":r.calls,"text":r.text,"timing":r.timing,"usage":r.usage}));
-        e.request_overrides["valid_completion"] = json!(r.finish == "Stop" && r.calls.is_empty());
-        if !r.calls.is_empty() {
-            e.response.clear();
-            e.request_overrides["model_failure"] = json!("tools_on_finalization");
-        } else if model_refusal(&r.text) {
-            e.request_overrides["model_failure"] = json!("refusal");
-        }
-        e.status = "completed".into();
-        Ok(())
-    }
     async fn confirm_benchmark_request_stopped(
         &self,
         run: &mut Run,
@@ -1496,11 +1191,6 @@ impl RuntimeManager {
     ) -> Result<bench::Response, MeasureError> {
         evidence.stream_event_observed = false;
         let tools_requested = !request.tools.is_empty();
-        let retrieval_final = evidence.category == "retrieval"
-            && matches!(
-                request.output_format,
-                Some(crate::OutputFormat::JsonSchema { .. })
-            );
         evidence.timing = Timing {
             request_start_unix_ms: bench::now_ms(),
             ..Default::default()
@@ -1512,20 +1202,7 @@ impl RuntimeManager {
             .await
             .map_err(|error| {
                 let reason = error.to_string();
-                if retrieval_final
-                    && (matches!(
-                        error,
-                        crate::manager::RuntimeError::UnsupportedCapability
-                            | crate::manager::RuntimeError::InvalidGenerationSettings(_)
-                    ) || reason.contains("HTTP 400")
-                        || reason.contains("HTTP 422")
-                        || reason.to_ascii_lowercase().contains("schema")
-                        || reason.to_ascii_lowercase().contains("response_format"))
-                {
-                    evidence.status = "unavailable".into();
-                    evidence.explanation = retrieval_unavailable(reason.clone());
-                }
-                classify_inference_error(reason, evidence.category == "ladder")
+                classify_inference_error(reason)
             })?
             .stream;
         let mut text = String::new();
@@ -1535,9 +1212,7 @@ impl RuntimeManager {
         let mut finish = None;
         while let Some(event) = stream.next().await {
             let elapsed = begin.elapsed().as_secs_f64() * 1000.0;
-            let event = event.map_err(|error| {
-                classify_inference_error(error.to_string(), evidence.category == "ladder")
-            })?;
+            let event = event.map_err(|error| classify_inference_error(error.to_string()))?;
             evidence.stream_event_observed = true;
             match event {
                 InferenceEvent::TextDelta { delta } => {
@@ -1782,17 +1457,6 @@ async fn setting_file_observations(settings: &norted_core::ResolvedSettings) -> 
     json!(files)
 }
 
-fn retrieval_unavailable(reason: String) -> String {
-    format!(
-        "Retrieval unavailable: {}",
-        reason
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(512)
-            .collect::<String>()
-    )
-}
-
 #[derive(Debug)]
 enum MeasureError {
     Candidate(String),
@@ -1811,7 +1475,7 @@ impl From<&str> for MeasureError {
 
 fn benchmark_signature(run: &Run, plan: &BenchmarkPlan) -> Value {
     let p = run.provenance.as_ref();
-    let quality = json!({"suite":run.suite,"method":run.methodology,"mode":plan.mode,"capabilities":plan.capabilities,"plan":plan,"selected_task_ids":plan.task_ids(),"plan_hash":bench::digest(plan),"pack_hash":run.pack_hash,"rubrics":["exact-json-v1","fixture-observed-state-v2",crate::benchmark::coding::RUBRIC]});
+    let quality = json!({"suite":run.suite,"method":run.methodology,"plan":plan,"selected_task_ids":plan.task_ids(),"plan_hash":bench::digest(plan),"pack_hash":run.pack_hash,"rubrics":["exact-json-v1","fixture-observed-state-v2",crate::benchmark::coding::RUBRIC]});
     let settings = p.map(|p| {
         p.settings
             .effective
@@ -1861,22 +1525,10 @@ fn model_refusal(text: &str) -> bool {
         .any(|p| text.starts_with(p))
 }
 
-fn classify_inference_error(reason: String, admitted_context: bool) -> MeasureError {
+fn classify_inference_error(reason: String) -> MeasureError {
     let lower = reason.to_lowercase();
     if lower.contains("timed out") || lower.contains("timeout") {
         MeasureError::Candidate(format!("runtime_timeout: {reason}"))
-    } else if admitted_context
-        && [
-            "context length exceeded",
-            "exceeds the context",
-            "exceeds context",
-            "context window exceeded",
-            "prompt is too long",
-        ]
-        .iter()
-        .any(|phrase| lower.contains(phrase))
-    {
-        MeasureError::Candidate(format!("admitted_context_limit: {reason}"))
     } else {
         MeasureError::Infrastructure(reason)
     }

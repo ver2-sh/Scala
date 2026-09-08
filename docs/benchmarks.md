@@ -20,10 +20,8 @@ norted-server benchmarks result RUN_ID --json
 norted-server benchmarks compare BASELINE_RUN_ID SELECTED_RUN_ID
 ```
 
-The full fixed pack is the `standard` plan. The previous capability-selected
-Quick plan is historical only; new `--mode quick` requests are rejected.
-Profile capability declarations do not remove tasks from this methodology.
-Retrieval/context-ladder tasks and Profile Quality are not part of this fixed pack.
+Every run uses the full fixed pack. There is no mode selector, capability
+configuration, retrieval pack, or context ladder.
 On `/benchmarks`, **b Benchmark** starts a run, **h History** opens history,
 **d Details** opens technical analysis, Space marks a baseline, **c Compare**
 compares, **e Evidence** opens raw evidence, and **x Cancel** cancels.
@@ -117,8 +115,8 @@ clocks or randomness. Dependencies are normal application build dependencies;
 running the benchmark itself is offline.
 
 Limits: 8,192 source bytes, 20,000 operations per hidden case, eight call levels,
-16 expression levels, 64 variables, 256 aggregate array items, 32 map items,
-and 2,048 aggregate string bytes. Optimization is disabled. Each hidden case
+16 expression levels, 64 variables, 256 items per array, 32 map items,
+and 2,048 bytes per string. Optimization is disabled. Each hidden case
 gets a fresh engine/scope; no oracle/expected value is in that scope. Operation,
 collection, expression and call bounds terminate hostile programs; a private
 elapsed-time callback provides an additional one-second evaluator ceiling.
@@ -152,16 +150,42 @@ must be positive and duration finite and positive, with plausible token accounti
 Invalid evidence becomes unavailable, never zero. Cache-reused tokens are not
 knowingly counted as newly processed tokens.
 
-The llama.cpp mapping was reviewed against **b10665**:
-[`server-common.cpp`](https://github.com/ggml-org/llama.cpp/blob/b10665/tools/server/server-common.cpp)
-maps `prompt_n` to `n_prompt_processed`, `cache_n` to `n_prompt_cached`, and
-`prompt_ms` to `t_prompt_ms()`;
-[`server-task.cpp`](https://github.com/ggml-org/llama.cpp/blob/b10665/tools/server/server-task.cpp)
-attaches final native timings to the OAI usage frame. Norted reads co-located
-final usage/timing, not intermediate progress snapshots, and computes its own
-rate instead of trusting `prompt_per_second`. Conflicting cache counters invalidate
-timing. Existing per-request streaming/timing options are retained; no runtime
-or Model Profile setting is changed to obtain this metric.
+Native llama.cpp Prefill requires proof for the **exact launched runtime**, not
+field-name presence or a reported nightly version. The adapter's small
+[`prefill.rs`](../crates/norted-engine-llama-cpp/src/prefill.rs) allowlist pins
+b10665 commit **`ca3d5a3e10d53f7ea672cb9b6178faca3e2807bc`** and tree
+`ba3e0b166abfd6f481e887e6b8d339bc220ceff9`. The complete immutable revision pins
+all semantic owners: `tools/server/server-common.cpp` maps `prompt_n`, `cache_n`
+and `prompt_ms`; `server-common.h` defines the counters and duration;
+`server-context.cpp` updates processed/cache counts and timestamps; and
+`server-task.cpp` places final timings on the OAI usage frame. See the
+[reviewed source](https://github.com/ggml-org/llama.cpp/tree/ca3d5a3e10d53f7ea672cb9b6178faca3e2807bc/tools/server).
+
+Currently qualifying identities are:
+
+- Managed-source builds from the canonical Norted source provider whose recorded
+  commit/tree exactly match that revision and whose build and installed
+  executable hashes agree.
+- Official b10665 catalog packages tied to that commit and pinned original GitHub
+  asset IDs, names and SHA-256 archive digests: Linux CPU x64/arm64/s390x,
+  Linux Vulkan x64/arm64, Windows CPU x64/arm64, Windows Vulkan x64, and Windows
+  CUDA 12.4 x64, 13.3 x64, and 13.4 arm64.
+
+Before each launch attempt, the adapter clears any previous endpoint proof and
+checks the actual executable hash. Startup activates proof only for the matching
+runtime ID and executable hash. Each request snapshots that proof before HTTP;
+both streaming and non-streaming parsers gate native prompt timing on it.
+The observed `native_prefill_contract` fact is retained separately from inference
+setting overrides. Unproved/new/custom runtimes leave both native prompt timing
+fields unavailable, show Prefill **—**, and explain “native prefill timing
+semantics are unverified for this runtime.” Inference remains available.
+
+No other revision inherits support automatically, even if its fields look the
+same; extending the allowlist requires another source review. Configured/external
+binaries do not qualify based on version strings. Norted reads co-located final
+usage/timing, not progress snapshots, and computes `prompt_n * 1000 / prompt_ms`
+itself. Conflicting cache counters invalidate timing. Existing request options
+are retained; no runtime or Model Profile setting is changed for this metric.
 
 The supported **q27 routed chat usage** (including its reviewed 0.10.0 reasoning
 counter) and **NInfer ChatUsage** contracts expose no native per-request prefill
@@ -198,9 +222,8 @@ finished result; failed/cancelled attempts do not hide a previous finished run.
 **v1/v2/v3 records remain immutable historical evidence**. No migration or rewrite
 occurs, and no Coding/Prefill observations are synthesized for them. Their original
 Intelligence/Agentic evidence remains intact. They are not directly comparable to
-v4. This checkout's earlier capability-aware v4 method also differs by methodology
-and pack hash; sharing `/4` in the suite name does not make those packs comparable.
-Existing record-format readers and private storage are retained.
+v4. The abandoned intermediate capability-aware v4 format has no compatibility
+reader or migration. Existing v1–v3 record readers and private storage are retained.
 
 Records remain in the data directory's `benchmarks` folder, independent of
 profiles/settings. UUID terminal JSON files use private permissions, locks,

@@ -183,10 +183,7 @@ impl Benchmarks {
                     .and_then(|s| s.parse().ok())
                 {
                     self.pending = Some(if matches!(action, Run) {
-                        BenchmarkRequest::Start {
-                            profile_id: id,
-                            mode: norted_engine::benchmark::BenchmarkMode::Standard,
-                        }
+                        BenchmarkRequest::Start { profile_id: id }
                     } else {
                         BenchmarkRequest::History { profile_id: id }
                     });
@@ -456,7 +453,6 @@ fn summary_lines(s: &Value) -> Vec<String> {
         "categories",
         "scorecard",
         "signature",
-        "mode",
         "task_outcomes",
     ] {
         if !s[key].is_null() {
@@ -608,16 +604,6 @@ fn content_lines(state: &Benchmarks) -> Vec<String> {
     let row = state.row();
     let mut lines = scorecard_lines(state.result());
     if state.history.is_none()
-        && row["latest_quick"].is_object()
-        && row["latest_quick"]["run_id"] != state.result()["run_id"]
-    {
-        lines.push(format!(
-            "Historical Quick: {} | Intelligence {}",
-            text(&row["latest_quick"]["run_id"]),
-            scorecard_metric(&row["latest_quick"], "intelligence", " /100")
-        ));
-    }
-    if state.history.is_none()
         && row["latest_attempt"].is_object()
         && row["latest_attempt"]["run_id"] != state.result()["run_id"]
     {
@@ -667,7 +653,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             } else {
                 "Running"
             },
-            format_args!("{} / {}", text(&active["mode"]), text(&active["phase"])),
+            format_args!("{}", text(&active["phase"])),
             active["completed_tasks"],
             active["total_tasks"],
             number(&active["elapsed_seconds"]),
@@ -698,13 +684,13 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     let wide = width >= 145;
     let mut metrics = Vec::new();
     if width >= 28 {
-        metrics.push(("Intel ↑", "intelligence", ""));
+        metrics.push(("Intel ↑ /100", "intelligence", ""));
     }
     if width >= 40 {
-        metrics.push(("Agent ↑", "agentic", ""));
+        metrics.push(("Agent ↑ /100", "agentic", ""));
     }
     if width >= 54 {
-        metrics.push(("Coding ↑", "coding", ""));
+        metrics.push(("Coding ↑ /100", "coding", ""));
     }
     if output {
         metrics.push((

@@ -824,7 +824,7 @@ hide the previous finished scorecard.
 Scriptable access uses private authenticated control:
 
 ```console
-norted-server benchmarks start PROFILE_ID --mode standard
+norted-server benchmarks start PROFILE_ID
 norted-server benchmarks status --json
 norted-server benchmarks history PROFILE_ID --json
 norted-server benchmarks result RUN_ID --json

@@ -1,38 +1,15 @@
 //! Frozen v4 selection and ceilings. Unused budgets never change another task.
 use super::{digest, suite};
-use norted_core::BenchmarkCapability;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BenchmarkMode {
-    Quick,
-    #[default]
-    Standard,
-}
-impl std::str::FromStr for BenchmarkMode {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "quick" => Ok(Self::Quick),
-            "standard" => Ok(Self::Standard),
-            _ => Err("mode must be quick or standard".into()),
-        }
-    }
-}
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BenchmarkPlan {
-    pub mode: BenchmarkMode,
-    pub capabilities: BTreeSet<BenchmarkCapability>,
     pub questions: Vec<String>,
-    #[serde(default)]
     pub coding: Vec<String>,
     pub single: Vec<usize>,
     pub agents: Vec<usize>,
-    pub retrieval: Vec<usize>,
-    pub context_targets: Vec<usize>,
     pub probes: Vec<String>,
     pub preparation_seconds: u64,
     pub warmup_seconds: u64,
@@ -40,40 +17,21 @@ pub struct BenchmarkPlan {
     pub question_seconds: u64,
     pub single_seconds: u64,
     pub agent_seconds: u64,
-    pub retrieval_seconds: u64,
-    pub context_seconds: u64,
     pub stop_confirmation_seconds: u64,
     /// Maximum confirmations adding time outside the frozen task ceilings.
     pub maximum_stop_confirmations: u64,
     /// Frozen allowance for verification, checkpoints, persistence and progress.
-    #[serde(default)]
     pub execution_bookkeeping_seconds: u64,
     pub cleanup_finalization_seconds: u64,
     pub hard_seconds: u64,
 }
 impl BenchmarkPlan {
-    pub fn new(
-        mode: BenchmarkMode,
-        capabilities: BTreeSet<BenchmarkCapability>,
-    ) -> Result<Self, String> {
-        if mode != BenchmarkMode::Standard {
-            return Err(
-                "This v4 methodology uses the full fixed task pack; select standard".into(),
-            );
-        }
-        use BenchmarkCapability::*;
-        if capabilities.contains(&Retrieval) && !capabilities.contains(&ToolUse) {
-            return Err("retrieval requires tool_use".into());
-        }
+    pub fn new() -> Result<Self, String> {
         let mut plan = Self {
-            mode,
-            capabilities,
             coding: super::coding::tasks().into_iter().map(|t| t.id).collect(),
             questions: suite::questions().into_iter().map(|q| q.id).collect(),
             single: (0..8).collect(),
             agents: (0..4).collect(),
-            retrieval: vec![],
-            context_targets: vec![],
             probes: suite::probes().into_iter().map(|(id, _)| id).collect(),
             preparation_seconds: 60,
             warmup_seconds: 10,
@@ -81,8 +39,6 @@ impl BenchmarkPlan {
             question_seconds: 8,
             single_seconds: 7,
             agent_seconds: 21,
-            retrieval_seconds: 0,
-            context_seconds: 0,
             stop_confirmation_seconds: 1,
             maximum_stop_confirmations: 0,
             execution_bookkeeping_seconds: 15,
@@ -117,8 +73,6 @@ impl BenchmarkPlan {
             + self.questions.len() as u64 * self.question_seconds
             + self.single.len() as u64 * self.single_seconds
             + self.agents.len() as u64 * self.agent_seconds
-            + self.retrieval.len() as u64 * self.retrieval_seconds
-            + self.context_targets.len() as u64 * self.context_seconds
     }
     pub fn total_tasks(&self) -> usize {
         self.coding.len()
@@ -126,8 +80,6 @@ impl BenchmarkPlan {
             + self.questions.len()
             + self.single.len()
             + self.agents.len()
-            + self.retrieval.len()
-            + self.context_targets.len()
     }
     pub fn task_ids(&self) -> Vec<String> {
         self.probes
@@ -137,12 +89,6 @@ impl BenchmarkPlan {
             .chain(self.coding.iter().cloned())
             .chain(self.single.iter().map(|i| format!("tool-{}", i + 1)))
             .chain(self.agents.iter().map(|i| format!("agent-{}", i + 1)))
-            .chain(
-                self.retrieval
-                    .iter()
-                    .map(|i| format!("retrieval-{}", i + 1)),
-            )
-            .chain(self.context_targets.iter().map(|n| format!("ladder-{n}")))
             .collect()
     }
     pub fn manifest(&self) -> Value {
@@ -190,8 +136,6 @@ impl BenchmarkPlan {
         v["cleanup_finalization_seconds"] = json!(self.cleanup_finalization_seconds);
         v["hard_seconds"] = json!(self.hard_seconds);
         v["headroom_seconds"] = json!(self.hard_seconds - self.work_seconds());
-        v["retrieval"] = json!({"tasks":super::retrieval::tasks().into_iter().enumerate().filter(|(i,_)|self.retrieval.contains(i)).map(|(_,t)|t).collect::<Vec<_>>(),"repository":super::retrieval::repository(),"tools":super::retrieval::tools(),"result_serialization":super::retrieval::RESULT_SERIALIZATION,"rubric":"file-line-f0.5-grounded/1","max_retrieval_rounds":4,"parallel_tool_calls":true,"finalization":super::retrieval::FINALIZATION,"final_schema":super::retrieval::final_schema(),"calls_per_round":8,"total_calls":32,"evidence_lines":320,"max_output_tokens":1024,"finalization_tools":false});
-        v["context_ladder"] = json!({"rubric":"exact-json-context/1","payload_version":1,"size_unit":"target Unicode characters, not native tokens","admission":"payload UTF-8 bytes plus 2048 overhead must fit observed context limit; unknown limit unavailable","useful_context_rule":"highest successfully completed rung with score >= 0.8 times positive low-rung baseline; no inference for untested rungs","tasks":self.context_targets.iter().map(|n| super::context::payload(*n,self.capabilities.contains(&BenchmarkCapability::Retrieval))).collect::<Vec<_>>()});
         v
     }
 }

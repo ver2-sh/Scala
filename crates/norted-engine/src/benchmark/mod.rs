@@ -1,11 +1,9 @@
 //! Server-owned, local per-profile benchmark evidence and shared methodology.
 pub(crate) mod coding;
-pub mod context;
 pub mod plan;
-pub mod retrieval;
 mod scorecard;
 mod storage;
-pub use plan::{BenchmarkMode, BenchmarkPlan};
+pub use plan::BenchmarkPlan;
 pub mod suite;
 use crate::{InferenceToolCall, InferenceUsage};
 use norted_core::{ModelProfile, ModelProfileId, RuntimeProvenance};
@@ -19,30 +17,15 @@ pub const CONTROL_BENCHMARK_PATH: &str = "/control/v1/benchmarks";
 tokio::task_local! { pub(crate) static EXECUTOR: (); }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BenchmarkRequest {
-    Start {
-        profile_id: ModelProfileId,
-        #[serde(default)]
-        mode: BenchmarkMode,
-    },
-    Plan {
-        profile_id: ModelProfileId,
-        #[serde(default)]
-        mode: BenchmarkMode,
-    },
+    Start { profile_id: ModelProfileId },
+    Plan { profile_id: ModelProfileId },
     Status,
     Cancel,
-    History {
-        profile_id: ModelProfileId,
-    },
-    Result {
-        run_id: String,
-    },
-    Compare {
-        left: String,
-        right: String,
-    },
+    History { profile_id: ModelProfileId },
+    Result { run_id: String },
+    Compare { left: String, right: String },
 }
 
 pub(crate) struct Service {
@@ -113,7 +96,6 @@ pub struct Timing {
 pub struct Run {
     pub record_version: u32,
     pub run_id: String,
-    #[serde(deserialize_with = "historical_profile")]
     pub profile: ModelProfile,
     pub profile_hash: String,
     pub started_unix_ms: u128,
@@ -175,8 +157,6 @@ pub struct Summary {
     pub suite: String,
     pub pack_hash: String,
     pub methodology: String,
-    #[serde(default)]
-    pub mode: Option<BenchmarkMode>,
     #[serde(default)]
     pub scorecard: Value,
     #[serde(default)]
@@ -398,7 +378,20 @@ impl Run {
             .evidence
             .iter()
             .filter(|e| e.category == "speed")
-            .map(speed_sample)
+            .map(|e| {
+                let mut sample = speed_sample(e);
+                if self.profile.engine_id.as_str() == "llama.cpp"
+                    && self.provenance.as_ref().is_none_or(|p| {
+                        !p.normalized_settings
+                            .get("native_prefill_contract")
+                            .is_some_and(Value::is_string)
+                    })
+                {
+                    sample["reasons"]["native_prefill_tokens_per_second"] =
+                        json!("native prefill timing semantics are unverified for this runtime");
+                }
+                sample
+            })
             .collect::<Vec<_>>();
         let mut groups = serde_json::Map::new();
         for prefix in ["short", "medium", ""] {
@@ -485,7 +478,6 @@ impl Run {
         );
         let scorecard = scorecard::build(self, &categories);
         Summary {
-            mode: plan.as_ref().map(|p| p.mode),
             signature: self.environment["benchmark_signature"].clone(),
             scorecard: scorecard.clone(),
             run_id: self.run_id.clone(),
@@ -548,7 +540,6 @@ pub fn select<'a>(
             && key.is_some()
             && s.configuration_key.as_deref() == key
             && s.pack_hash == pack
-            && s.mode != Some(BenchmarkMode::Quick)
     }) {
         return (
             Some(current),
@@ -559,11 +550,7 @@ pub fn select<'a>(
             },
         );
     }
-    if let Some(old) = history
-        .iter()
-        .find(|s| finished(&s.status) && s.mode == Some(BenchmarkMode::Standard))
-        .or_else(|| history.iter().find(|s| finished(&s.status)))
-    {
+    if let Some(old) = history.iter().find(|s| finished(&s.status)) {
         return (
             Some(old),
             if key.is_some() {
@@ -607,31 +594,24 @@ pub fn compare(left: &Run, right: &Run) -> Value {
         && a.signature["performance_key"] == b.signature["performance_key"];
     let quality_changes = value_changes(&a.signature["methodology"], &b.signature["methodology"]);
     let comparable = quality_comparable;
-    let capability_deltas = [
-        "intelligence",
-        "coding",
-        "agentic",
-        "retrieval",
-        "context",
-        "reliability",
-    ]
-    .into_iter()
-    .map(|k| {
-        (
-            k,
-            if quality_comparable && finished(&a.status) && finished(&b.status) {
-                a.scorecard[k]["score"]
-                    .as_f64()
-                    .zip(b.scorecard[k]["score"].as_f64())
-                    .map(|(a, b)| b - a)
-            } else {
-                None
-            },
-        )
-    })
-    .collect::<BTreeMap<_, _>>();
+    let quality_deltas = ["intelligence", "coding", "agentic"]
+        .into_iter()
+        .map(|k| {
+            (
+                k,
+                if quality_comparable && finished(&a.status) && finished(&b.status) {
+                    a.scorecard[k]["score"]
+                        .as_f64()
+                        .zip(b.scorecard[k]["score"].as_f64())
+                        .map(|(a, b)| b - a)
+                } else {
+                    None
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let changed=left.evidence.iter().filter_map(|e|right.evidence.iter().find(|r|r.id==e.id).filter(|r|r.score!=e.score||r.status!=e.status).map(|r|json!({"id":e.id,"left":e.status,"right":r.status,"left_score":e.score,"right_score":r.score}))).collect::<Vec<_>>();
-    json!({"left":a,"right":b,"same_methods":comparable,"quality_comparable":quality_comparable,"performance_comparable":performance_comparable,"quality_differences":quality_changes,"performance_differences":performance_changes,"capability_deltas":capability_deltas,"comparison_note":if quality_comparable {"Matching frozen quality method"} else {"Mode, capabilities, plan or methodology differ, or legacy signature unavailable"},"performance_note":if performance_comparable {"Equivalent recorded deployment conditions; concurrent workloads/cache remain unverified"} else {"Deployment observations only; no strict performance delta"},"same_configuration":left.configuration_key.is_some()&&left.configuration_key==right.configuration_key,
+    json!({"left":a,"right":b,"same_methods":comparable,"quality_comparable":quality_comparable,"performance_comparable":performance_comparable,"quality_differences":quality_changes,"performance_differences":performance_changes,"quality_deltas":quality_deltas,"comparison_note":if quality_comparable {"Matching frozen quality method"} else {"Plan or methodology differ, or legacy signature unavailable"},"performance_note":if performance_comparable {"Equivalent recorded deployment conditions; concurrent workloads/cache remain unverified"} else {"Deployment observations only; no strict performance delta"},"same_configuration":left.configuration_key.is_some()&&left.configuration_key==right.configuration_key,
         "changed_settings":value_changes(&json!(left.provenance.as_ref().map(|p|&p.settings)),&json!(right.provenance.as_ref().map(|p|&p.settings))),
         "changed_runtime":value_changes(&json!(left.provenance.as_ref().map(|p|&p.runtime)),&json!(right.provenance.as_ref().map(|p|&p.runtime))),
         "changed_hardware":value_changes(&left.environment["host"],&right.environment["host"]),
@@ -941,9 +921,8 @@ pub fn comparison_lines(value: &Value) -> Vec<String> {
 pub fn scorecard_text(value: &Value) -> String {
     if value["plan"].is_object() {
         return format!(
-            "Profile: {}\nMode: {}\nFrozen plan: {}\nPhase work: {} s; headroom: {} s; hard maximum: {} s\nPack: {}",
+            "Profile: {}\nFrozen plan: {}\nPhase work: {} s; headroom: {} s; hard maximum: {} s\nPack: {}",
             value["profile_id"],
-            value["plan"]["mode"],
             serde_json::to_string_pretty(&value["plan"]).unwrap_or_default(),
             value["manifest"]["phase_work_seconds"],
             value["manifest"]["headroom_seconds"],
@@ -995,14 +974,6 @@ pub fn scorecard_text(value: &Value) -> String {
                 s["run_id"].as_str().unwrap_or("—")
             ));
             lines.extend(scorecard_lines(s));
-            if row["latest_quick"].is_object() && row["latest_quick"]["run_id"] != s["run_id"] {
-                lines.push(format!(
-                    "Historical Quick: {} | {} | Intelligence {}",
-                    row["latest_quick"]["run_id"],
-                    status_label(&row["latest_quick"]),
-                    scorecard_metric(&row["latest_quick"], "intelligence", " /100")
-                ));
-            }
             if row["latest_attempt"].is_object() && row["latest_attempt"]["run_id"] != s["run_id"] {
                 lines.push(format!(
                     "Latest attempt: {}",
@@ -1050,13 +1021,4 @@ pub fn inspection_text(value: &Value) -> String {
     }
     lines.push(serde_json::to_string_pretty(value).unwrap_or_default());
     lines.join("\n")
-}
-
-fn historical_profile<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ModelProfile, D::Error> {
-    let mut value = Value::deserialize(d)?;
-    if let Some(m) = value.as_object_mut() {
-        m.entry("benchmark_capabilities")
-            .or_insert_with(|| json!([]));
-    }
-    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }

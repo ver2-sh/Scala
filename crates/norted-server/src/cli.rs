@@ -253,9 +253,6 @@ pub enum ModelProfilesCommand {
         /// Default inference role for this profile
         #[arg(long, value_enum, default_value_t)]
         role: ProfileRole,
-        /// Explicit semantic benchmark intent (comma separated); omitted means operational probes only
-        #[arg(long, value_delimiter = ',')]
-        capabilities: Vec<norted_core::BenchmarkCapability>,
     },
     /// Duplicate a Model Profile under a new ID
     Duplicate { source: String, profile: String },
@@ -267,12 +264,6 @@ pub enum ModelProfilesCommand {
     SetEngine { profile: String, engine: String },
     /// Change the default inference role
     SetRole { profile: String, role: ProfileRole },
-    /// Replace the explicit benchmark capability set (empty clears it)
-    SetCapabilities {
-        profile: String,
-        #[arg(value_delimiter = ',')]
-        capabilities: Vec<norted_core::BenchmarkCapability>,
-    },
     /// Set one or more Model Profile overrides
     Set {
         profile: String,
@@ -385,14 +376,10 @@ pub enum BenchmarksCommand {
     /// Reserve inference and start one saved Model Profile (maximum 600 seconds)
     Start {
         profile_id: norted_core::ModelProfileId,
-        #[arg(long, default_value = "standard")]
-        mode: norted_engine::benchmark::BenchmarkMode,
     },
-    /// Inspect the frozen capability plan and ceilings without loading or inference
+    /// Inspect the fixed v4 plan and ceilings without loading or inference
     Plan {
         profile_id: norted_core::ModelProfileId,
-        #[arg(long, default_value = "standard")]
-        mode: norted_engine::benchmark::BenchmarkMode,
     },
     /// Show current progress and each profile's latest applicable result
     Status,
@@ -410,8 +397,8 @@ pub enum BenchmarksCommand {
 impl From<BenchmarksCommand> for norted_engine::benchmark::BenchmarkRequest {
     fn from(command: BenchmarksCommand) -> Self {
         match command {
-            BenchmarksCommand::Start { profile_id, mode } => Self::Start { profile_id, mode },
-            BenchmarksCommand::Plan { profile_id, mode } => Self::Plan { profile_id, mode },
+            BenchmarksCommand::Start { profile_id } => Self::Start { profile_id },
+            BenchmarksCommand::Plan { profile_id } => Self::Plan { profile_id },
             BenchmarksCommand::Status => Self::Status,
             BenchmarksCommand::Cancel => Self::Cancel,
             BenchmarksCommand::History { profile_id } => Self::History { profile_id },
