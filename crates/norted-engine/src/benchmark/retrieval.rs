@@ -429,11 +429,14 @@ pub fn grade(task: &Task, response: &str, located: &BTreeSet<(String, usize)>) -
         .sum::<usize>();
     let (fp, fr, ff) = metrics(tf.intersection(&pf).count(), pf.len(), tf.len());
     let (lp, lr, lf) = metrics(hit, returned, relevant);
-    let grounded = task
+    let target_ranges_grounded = task
         .targets
         .iter()
-        .all(|r| (r.start_line..=r.end_line).all(|line| located.contains(&(r.path.clone(), line))));
-    json!({"target_files":tf,"predicted_files":pf,"file_precision":fp,"file_recall":fr,"file_f05":ff,"target_ranges":task.targets,"predicted_ranges":ranges,"line_precision":lp,"line_recall":lr,"line_f05":lf,"returned_lines":returned,"polluting_lines":returned-hit,"grounded_success":valid&&hit==relevant&&grounded,"final_format_valid":valid,"score":100.0*ff.min(lf)})
+        .filter(|r| {
+            (r.start_line..=r.end_line).any(|line| located.contains(&(r.path.clone(), line)))
+        })
+        .count();
+    json!({"target_files":tf,"predicted_files":pf,"file_precision":fp,"file_recall":fr,"file_f05":ff,"target_ranges":task.targets,"predicted_ranges":ranges,"line_precision":lp,"line_recall":lr,"line_f05":lf,"returned_lines":returned,"polluting_lines":returned-hit,"target_ranges_grounded":target_ranges_grounded,"grounded_success":target_ranges_grounded==task.targets.len(),"final_format_valid":valid,"score":100.0*ff.min(lf)})
 }
 
 /// Deterministic equal per-call output budget; read-only calls share no mutable source state.
@@ -476,7 +479,7 @@ impl Fixture {
     }
 }
 pub fn manifest() -> Value {
-    json!({"pack":"norted-private-lease-repository/1","protocol":"norted-grep/3098fd5dd62e739c4368ae7a8f97b1353f28f91c","repository":repository(),"repository_hash":super::digest(repository()),"tasks":tasks(),"system":SYSTEM,"tools":tools(),"serialization":RESULT_SERIALIZATION,"max_rounds":4,"max_calls_per_round":8,"parallel_policy":"independent read-only calls, stable request order, equal bytes per call","round_output_bytes":ROUND_BYTES,"round_call_bytes":CALL_BYTES,"max_read_lines":160,"max_results":64,"regex":"rust-regex bounded 1MiB; no PCRE2","glob":"case-sensitive fnmatch; * spans slash","finalization":FINALIZATION,"early_final":"accept valid final immediately","final_schema":final_schema(),"semantic_ranges":{"max_line":100000000,"max_union_lines":1024,"repository_relative":true},"rubric":RUBRIC,"score":"100 * mean over all four tasks of min(file_f05,line_f05); invalid completion or tool/protocol error yields zero","seconds_per_task":SECONDS,"max_output_tokens":OUTPUT_TOKENS,"implementation_hash":super::digest(include_str!("retrieval.rs")),"execution_hash":super::digest(include_str!("runner.rs")),"aggregation_hash":super::digest(include_str!("scorecard.rs"))})
+    json!({"pack":"norted-private-lease-repository/1","protocol":"norted-grep/3098fd5dd62e739c4368ae7a8f97b1353f28f91c","repository":repository(),"repository_hash":super::digest(repository()),"tasks":tasks(),"system":SYSTEM,"tools":tools(),"serialization":RESULT_SERIALIZATION,"max_rounds":4,"max_calls_per_round":8,"parallel_policy":"independent read-only calls, stable request order, equal bytes per call","round_output_bytes":ROUND_BYTES,"round_call_bytes":CALL_BYTES,"max_read_lines":160,"max_results":64,"regex":"rust-regex bounded 1MiB; no PCRE2","glob":"case-sensitive fnmatch; * spans slash","finalization":FINALIZATION,"early_final":"accept valid final immediately","final_schema":final_schema(),"semantic_ranges":{"max_line":100000000,"max_union_lines":1024,"repository_relative":true},"rubric":RUBRIC,"score":"100 * mean over all four tasks of min(file_f05,line_f05); terminal completion/generation/protocol failure yields zero; tool error payloads are recoverable","seconds_per_task":SECONDS,"max_output_tokens":OUTPUT_TOKENS,"implementation_hash":super::digest(include_str!("retrieval.rs")),"execution_hash":super::digest(include_str!("runner.rs")),"aggregation_hash":super::digest(include_str!("scorecard.rs"))})
 }
 
 /// Match canonical json_bytes: sorted JSON, UTF-8, spaces after separators, no call IDs.

@@ -1104,19 +1104,14 @@ impl RuntimeManager {
                     .get(&run.profile.id)
                     .and_then(|b| b.running.as_ref())
                     .ok_or("backend missing")?;
-                if !running
-                    .adapter
-                    .capabilities()
-                    .features
-                    .contains(&crate::EngineFeature::ToolCalling)
-                {
+                let features = running.adapter.serving_features(
+                    &running.runtime,
+                    &running.model,
+                    Some(&running.settings),
+                );
+                if !features.contains(&crate::EngineFeature::ToolCalling) {
                     Err("exact runtime does not prove native retrieval tool calling".into())
-                } else if !running
-                    .adapter
-                    .capabilities()
-                    .features
-                    .contains(&crate::EngineFeature::StructuredOutput)
-                {
+                } else if !features.contains(&crate::EngineFeature::StructuredOutput) {
                     Err("exact runtime does not prove constrained Grep finalization".into())
                 } else {
                     running
@@ -1174,9 +1169,20 @@ impl RuntimeManager {
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(MeasureError::Candidate(reason))) => {
-                    e.status = "failed".into();
+                    let failure = if reason.starts_with("runtime_timeout:") {
+                        e.status = "timeout".into();
+                        "timeout"
+                    } else if reason == "tool-call evidence limit exceeded"
+                        || reason == "tool evidence limit exceeded"
+                    {
+                        e.status = "failed".into();
+                        "invalid_tool_protocol"
+                    } else {
+                        e.status = "failed".into();
+                        "output_limit"
+                    };
                     e.explanation = reason;
-                    e.request_overrides["model_failure"] = json!("invalid_tool_or_output_limit");
+                    e.request_overrides["model_failure"] = json!(failure);
                     fatal = self
                         .confirm_benchmark_request_stopped(run, &mut e)
                         .await
@@ -1226,45 +1232,55 @@ impl RuntimeManager {
                     .filter(|v| v["result"]["truncated"] == true)
                     .count()
             );
-            metrics["tool_protocol_failure"] = json!(
-                !e.request_overrides["model_failure"].is_null()
-                    && e.request_overrides["model_failure"] != "malformed_final_output"
-            );
+            // A tool error payload is recoverable. Only an unrecovered terminal
+            // completion/generation/protocol error makes this task a failure.
+            if e.status == "completed" && e.request_overrides["model_failure"].is_null() {
+                if metrics["final_format_valid"] != true {
+                    e.request_overrides["model_failure"] = json!("malformed_final_output");
+                } else if e.request_overrides["valid_completion"] != true {
+                    e.request_overrides["model_failure"] = json!("invalid_completion");
+                }
+            }
+            metrics["tool_protocol_failure"] = json!(matches!(
+                e.request_overrides["model_failure"].as_str(),
+                Some("invalid_tool_protocol" | "tools_on_finalization")
+            ));
             metrics["malformed_final"] =
-                json!(e.status == "completed" && metrics["final_format_valid"] != true);
+                json!(e.request_overrides["model_failure"] == "malformed_final_output");
             metrics["malformed_calls"] = e.request_overrides["malformed_calls"].clone();
+            metrics["tool_errors"] = e.request_overrides["tool_errors"].clone();
             metrics["timeouts"] = json!(usize::from(e.status == "timeout"));
             metrics["completion_status"] = json!(e.status);
             let completed = e.status == "completed"
                 && e.request_overrides["valid_completion"] == true
                 && e.request_overrides["model_failure"].is_null();
+            e.request_overrides["valid_completion"] = json!(completed);
             metrics["completion_valid"] = json!(completed);
+            metrics["failure"] = json!(!completed);
+            metrics["terminal_failure_reason"] = if completed {
+                Value::Null
+            } else if !e.request_overrides["model_failure"].is_null() {
+                e.request_overrides["model_failure"].clone()
+            } else {
+                json!(e.status)
+            };
+            metrics["recovered_tool_errors"] =
+                json!(completed && e.request_overrides["tool_errors"].as_u64().unwrap_or(0) > 0);
             if !completed {
-                metrics["grounded_success"] = json!(false);
                 metrics["score"] = json!(0.0);
             }
-            if !matches!(e.status.as_str(), "infrastructure_error" | "timeout") {
-                let valid = metrics["final_format_valid"] == true
-                    && e.request_overrides["model_failure"].is_null()
-                    && e.request_overrides["valid_completion"] == true;
-                e.request_overrides["valid_completion"] = json!(valid);
-                if metrics["final_format_valid"] != true {
-                    e.request_overrides["model_failure"] = json!("malformed_final_output");
-                }
+            if e.status != "infrastructure_error" {
                 e.score = metrics["score"].as_f64().map(|s| s / 100.0);
-                e.status = if e.score == Some(1.0) {
-                    "passed"
-                } else {
-                    "failed"
+                if e.status != "timeout" {
+                    e.status = if completed { "completed" } else { "failed" }.into();
                 }
-                .into();
-            } else if e.status == "timeout" {
-                e.score = Some(0.0);
             }
-            metrics["success"] = json!(
-                completed && metrics["grounded_success"] == true && metrics["polluting_lines"] == 0
+            metrics["clean_success"] = json!(
+                completed
+                    && metrics["score"] == 100.0
+                    && metrics["grounded_success"] == true
+                    && metrics["polluting_lines"] == 0
             );
-            metrics["failure"] = json!(metrics["success"] != true);
             e.request_overrides["retrieval_metrics"] = metrics;
             *run.evidence.last_mut().expect("checkpointed task") = e;
             if let Some(reason) = fatal {
@@ -1285,6 +1301,7 @@ impl RuntimeManager {
         e.request_overrides["tool_definitions"] = json!(request.tools);
         e.request_overrides["parallel_tool_calls"] = json!(request.parallel_tool_calls);
         e.request_overrides["malformed_calls"] = json!(0);
+        e.request_overrides["tool_errors"] = json!(0);
         e.request_overrides["tool_calls"] = json!(0);
         e.request_overrides["rounds"] = json!(0);
         let mut count = 0;
@@ -1299,7 +1316,9 @@ impl RuntimeManager {
             if r.calls.is_empty() {
                 e.request_overrides["valid_completion"] =
                     json!(r.finish == "Stop" && bench::retrieval::valid_final(&r.text));
-                if !bench::retrieval::valid_final(&r.text) {
+                if model_refusal(&r.text) {
+                    e.request_overrides["model_failure"] = json!("refusal");
+                } else if !bench::retrieval::valid_final(&r.text) {
                     e.request_overrides["model_failure"] = json!("malformed_final_output");
                 }
                 e.status = "completed".into();
@@ -1312,7 +1331,7 @@ impl RuntimeManager {
                     .is_none_or(|n| n > bench::retrieval::CALL_BYTES)
                 || r.calls
                     .iter()
-                    .any(|c| c.id.is_empty() || !ids.insert(c.id.clone()))
+                    .any(|c| c.id.is_empty() || c.name.is_empty() || !ids.insert(c.id.clone()))
             {
                 e.request_overrides["model_failure"] = json!("invalid_tool_protocol");
                 e.status = "completed".into();
@@ -1329,7 +1348,7 @@ impl RuntimeManager {
                 if payload.get("error").is_some() {
                     let n = e.request_overrides["malformed_calls"].as_u64().unwrap_or(0);
                     e.request_overrides["malformed_calls"] = json!(n + 1);
-                    e.request_overrides["model_failure"] = json!("tool_argument_failure");
+                    e.request_overrides["tool_errors"] = json!(n + 1);
                 }
                 let text = bench::retrieval::tool_text(&payload);
                 e.tools.push(

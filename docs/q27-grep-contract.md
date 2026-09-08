@@ -103,17 +103,44 @@ validation, not simulated model results or a claim of live inference coverage.
 | Scenario | Result of code-path inspection |
 |---|---|
 | Existing general benchmark | Same question, single-tool, Agentic and Coding tasks/oracles; only ceilings change. Performance formulas unchanged. |
-| Supported adapter | Both feature declarations and initial/history/final request validation precede inference; all four tasks retain their denominator. No currently bundled adapter qualifies, so this path has not had a live smoke test. |
+| Supported adapter | Running adapter `serving_features(installed runtime, loaded model, resolved running settings)` and initial/history/final request validation precede inference; all four tasks retain their denominator. No currently bundled adapter qualifies, so this path has not had a live smoke test. |
 | Unsupported adapter | Four unavailable task records, null category score/raw observations, precise missing reason; other categories continue. |
 | Early final | No calls + valid terminal ranges returns immediately, before incrementing executed rounds or constructing finalization. |
 | Four-round final | Four successful read-only batches lead to exactly one fifth model request with zero tools, none choice and strict schema. |
 | Parallel calls | 1–8 calls, bounded canonical call JSON and unique IDs; independent outputs share equal bytes and retain positional order. |
+| Recoverable tool error | Invalid read/grep arguments return deterministic error payloads and increment tool error counts; a later valid final is scored normally with terminal failure false. |
+| Region grounding | Any direct tool evidence overlap grounds a gold region; every region must overlap, but every line need not be returned. |
+| Imperfect valid final | Partial F0.5/pollution remain objective quality metrics; terminal failure false and clean success false. Aggregate failures/rate count terminal errors only. |
 | Malformed final/protocol | Strict parser/semantic rejection or protocol error yields task zero; no capability-unavailable transition. |
 | Capability rejection during inference | Relevant unsupported/400/422 engine rejection marks the whole category unavailable, removes provisional task scores and skips subsequent tasks; traces remain. |
 | q27 gating/tools | Structured formats remain rejected for reviewed and unproved runtimes; existing native tool and external-template gates untouched. |
 | Q6/Q6K admission | `Qwen38Q6` and `Qwen38Q6k` inspection/tokenizer handling unchanged; 24/32 GiB static classes retained. |
 | Deadline | 516 work + 51 stops + 15 bookkeeping + 16 cleanup = 598 ≤ 600 seconds, leaving 2 seconds margin. Existing monotonic global timeout/quarantine remains. |
 | History/compare/UI | Generic evidence/scorecard persistence carries retrieval; manifest binds semantics; quality deltas and all seven shared display metrics include it. Old record files are never rewritten. |
+
+Focused correction examples (manual code-path and arithmetic review, not live
+model trajectories or new automated tests):
+
+- Admission: a future adapter may omit StructuredOutput globally yet return it
+  alongside ToolCalling for one running runtime/model/settings tuple. That tuple
+  proceeds to all three request validators. A tuple omitting either serving
+  feature remains unavailable even if both appear in static capabilities.
+- Recovery on `grep-lease-1`: a read of `src/leases.rs` lines 0–7 returns
+  `{"error":"invalid line range"}`. A later read of lines 2–7 followed by a
+  valid Stop final selecting 2–7 yields task score 100, `tool_errors: 1`,
+  `malformed_calls: 1`, `recovered_tool_errors: true`, `failure: false`.
+- Selecting lines 2–8 instead yields file F0.5 = 1, line precision = 6/7,
+  recall = 1, line F0.5 = 15/17, returned lines = 7 and pollution = 1.
+  Task credit is approximately 88.2353, `failure: false`, `clean_success: false`.
+- Direct evidence at line 3 alone overlaps this task's gold region 2–7:
+  `target_ranges_grounded: 1`, `grounded_success: true`. For multi-region
+  tasks every region needs its own overlap. This does not alter final-range F0.5.
+- A terminal `{}` fails the final parser: score 0, `failure: true`,
+  `malformed_final: true`. A tool-protocol violation remains terminal and is
+  recorded as such instead of being relabeled a malformed final.
+- One such malformed final among four observed tasks gives `failures: 1`,
+  `failure_rate: 0.25`, `malformed_final_rate: 0.25`; imperfect valid tasks do
+  not increase these rates. A headline still needs all four scored tasks.
 
 `./validate.sh` covers formatting, workspace check, all-target Clippy with warnings
 as errors, and the existing workspace tests. No model benchmark or inference

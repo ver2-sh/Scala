@@ -202,24 +202,39 @@ interval-union counts, so overlapping predictions cannot inflate hits.
 **Retrieval = 100 × mean over all four tasks of min(file F0.5, line F0.5).**
 Rubric **`grep-bottleneck-f05/1`** uses the weaker granularity without subjective
 mixing weights. Pollution already lowers line precision/F0.5; no second arbitrary
-pollution penalty is applied. Malformed finals, tool/protocol errors, invalid
-completion and timeouts give zero task credit. Ordinary incomplete retrieval can
+pollution penalty is applied. Malformed finals, terminal protocol/generation errors, invalid
+completion and timeouts give zero task credit. Recoverable tool error payloads
+are returned to the model and do not zero a later valid completion. Ordinary incomplete retrieval can
 receive objective partial credit. This is a Server benchmark rubric, not a claim
 that Norted qualification uses this headline formula. It was selected before any
 Q6/Q6K observations.
 
 Raw evidence retains file and line P/R/F0.5, polluting/returned lines, exact
-predicted/gold ranges, grounded success, success/failure, malformed final,
-tool/protocol failure, call/error counts, executed serial rounds, truncation,
-timeouts and retrieval wall time. `success` requires a clean completion, all gold
-lines retrieved and selected, and no pollution; `grounded_success` separately
-records evidence coverage. Headline partial credit remains possible without full
-success. Aggregate P/R/F0.5 are task macro means; counts/time are sums. Missing raw
+predicted/gold ranges, `target_ranges_grounded`, `grounded_success`,
+`clean_success`, terminal `failure` and its reason, malformed final,
+tool protocol failure, call/error counts, executed serial rounds, truncation,
+timeouts and retrieval wall time. `grounded_success` means direct tool evidence
+overlaps every gold region; it does not require every gold line or a correct final.
+`clean_success` requires valid completion, perfect F0.5, grounding and no pollution.
+A valid imperfect answer receives objective partial credit and `failure: false`.
+Semantic tool errors increment `tool_errors` and `malformed_calls`, remain visible
+in tool history, and permit recovery; `recovered_tool_errors` records valid
+completion after such errors. Invalid envelopes/serialization, excess calls,
+duplicate/empty IDs, forbidden prose with calls, and tools during finalization
+remain terminal. Refusal, malformed final, invalid completion, generation errors
+and timeouts also mean terminal failure; infrastructure faults still abort runs.
+Aggregate `failures` counts terminal failures and `failure_rate` divides by
+`observed_tasks` (0–1). Malformed-final and tool-protocol-failure counts and rates
+use the same denominator. Clean success and tool error counts remain separate.
+Aggregate P/R/F0.5 are task macro means; counts/time are sums. Missing raw
 observations stay null. Partial raw observations never supply a headline.
 
-Before the first task executes, the adapter must advertise ToolCalling and
-StructuredOutput and validate the initial request, parallel tool history, and
-exact no-tools final request against the loaded settings schema. A proven
+Before each task executes, the running adapter's `serving_features` must prove
+ToolCalling and StructuredOutput for the installed runtime, loaded model and
+resolved running settings. Static adapter declarations are not the admission gate.
+The admitted tuple must also validate the initial request, parallel tool history,
+and exact no-tools final request against effective generation settings and the
+loaded settings schema. A proven
 capability rejection at inference time invalidates the **whole category**, clears
 provisional scores and prevents later retrieval tasks, while retaining raw traces.
 Unsupported tasks remain in the fixed denominator with null credit, never zero or
