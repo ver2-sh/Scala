@@ -1,4 +1,5 @@
 //! Server-owned, local per-profile benchmark evidence and shared methodology.
+pub(crate) mod coding;
 pub mod context;
 pub mod plan;
 pub mod retrieval;
@@ -183,6 +184,8 @@ pub struct Summary {
     pub intelligence: Option<f64>,
     pub categories: BTreeMap<String, Value>,
     pub agentic: Option<f64>,
+    #[serde(default)]
+    pub coding: Option<f64>,
     pub single_pass: usize,
     pub multi_pass: usize,
     pub agentic_unavailable: Option<String>,
@@ -201,11 +204,11 @@ pub fn digest(value: impl Serialize) -> String {
 /// Shared bundled material; run manifests use `BenchmarkPlan::manifest`.
 pub fn manifest() -> Value {
     json!({"suite":suite::SUITE,"method":suite::METHOD,"policy":suite::POLICY,
-        "intelligence":suite::questions(),"single_tools":suite::single_cases(),
+        "coding":coding::manifest(),"intelligence":suite::questions(),"single_tools":suite::single_cases(),
         "agents":suite::AGENT_PROMPTS,"tools":suite::tools(),"fixture":(0..4).map(suite::Fixture::new).collect::<Vec<_>>(),
         "probes":suite::probes().into_iter().map(|(id,input)|json!({"id":id,"utf8_bytes":input.len(),"unicode_characters":input.chars().count(),"input":input,"seconds":suite::PROBE_SECONDS,"max_output_tokens":suite::PROBE_TOKENS})).collect::<Vec<_>>(),
         "warmup":{"input":"Reply with the word ready.","seconds":10,"max_output_tokens":32},
-        "agent_limits":{"single_seconds":8,"single_turns":1,"multi_seconds":30,"multi_turns":6,"multi_calls":8,"max_output_tokens":384},
+        "agent_limits":{"single_seconds":7,"single_turns":1,"multi_seconds":21,"multi_turns":6,"multi_calls":8,"max_output_tokens":384},
         "evidence_limit_bytes":65536,"speed_min_characters":400,"delivery_min_span_ms":50,"delivery_min_characters_after_first":128})
 }
 pub fn now_ms() -> u128 {
@@ -307,16 +310,34 @@ pub fn speed_sample(e: &Evidence) -> Value {
             } else {
                 "no valid first-visible timestamp"
             });
+    let prefill = e
+        .usage
+        .as_ref()
+        .and_then(InferenceUsage::prefill_tokens_per_second);
+    let prefill_reason = prefill.is_none().then_some(
+        if e.usage.as_ref().is_some_and(|u| {
+            u.prompt_processing_tokens.is_some() || u.prompt_processing_ms.is_some()
+        }) {
+            "native prefill timing or token accounting invalid or incomplete"
+        } else {
+            "native per-request prefill timing unavailable from this runtime"
+        },
+    );
     json!({"id":e.id,"outcome":e.status,"outcome_reason":e.explanation,
         "workload_complete":e.status == "passed" && !refusal,
         "visible_delivery_characters_per_second":delivery,
         "visible_end_to_end_characters_per_second":text_rate,
         "native_end_to_end_output_tokens_per_second":native,
+        "native_prefill_tokens_per_second":prefill,
+        "prompt_processing_tokens":e.usage.as_ref().and_then(|u|u.prompt_processing_tokens),
+        "prompt_processing_ms":e.usage.as_ref().and_then(|u|u.prompt_processing_ms),
+        "cached_input_tokens":e.usage.as_ref().and_then(|u|u.cached_input_tokens),
         "first_visible_ms":visible,"first_text_ms":first,"completion_ms":end,
         "reasons":{
             "visible_delivery_characters_per_second":delivery_reason,
             "visible_end_to_end_characters_per_second":text_reason,
             "native_end_to_end_output_tokens_per_second":native_reason,
+            "native_prefill_tokens_per_second":prefill_reason,
             "first_visible_ms":latency_reason,
             "first_text_ms":first.is_none().then_some("no valid first-text timestamp"),
             "completion_ms":end.is_none().then_some("no valid completion timestamp")},
@@ -389,6 +410,7 @@ impl Run {
             for field in [
                 "visible_delivery_characters_per_second",
                 "native_end_to_end_output_tokens_per_second",
+                "native_prefill_tokens_per_second",
                 "visible_end_to_end_characters_per_second",
                 "first_visible_ms",
                 "first_text_ms",
@@ -455,7 +477,11 @@ impl Run {
         groups.insert("samples".into(), json!(samples));
         groups.insert(
             "summary_method".into(),
-            json!("independent-observed-metrics/3"),
+            json!(if self.methodology == suite::METHOD {
+                "independent-native-prefill/4"
+            } else {
+                "independent-observed-metrics/3"
+            }),
         );
         let scorecard = scorecard::build(self, &categories);
         Summary {
@@ -475,13 +501,16 @@ impl Run {
             suite: self.suite.clone(),
             pack_hash: self.pack_hash.clone(),
             methodology: self.methodology.clone(),
-            intelligence: if plan.is_some() {
+            intelligence: if self.methodology == suite::METHOD {
                 scorecard["intelligence"]["score"].as_f64()
             } else {
                 (means.len() == 4).then(|| 100.0 * means.iter().sum::<f64>() / 4.0)
             },
+            coding: scorecard["coding"]["score"].as_f64(),
             categories,
-            agentic: tool_complete.then_some(
+            agentic: (tool_complete
+                && (self.methodology != suite::METHOD || finished(&self.status)))
+            .then_some(
                 100.0
                     * (0.5 * single_pass as f64
                         / plan.as_ref().map_or(8, |p| p.single.len()).max(1) as f64
@@ -513,7 +542,6 @@ pub fn select<'a>(
     history: &'a [Summary],
     key: Option<&str>,
     pack: &str,
-    quick_pack: &str,
 ) -> (Option<&'a Summary>, &'static str) {
     if let Some(current) = history.iter().find(|s| {
         finished(&s.status)
@@ -530,15 +558,6 @@ pub fn select<'a>(
                 "Current"
             },
         );
-    }
-    if let Some(current) = history.iter().find(|s| {
-        finished(&s.status)
-            && key.is_some()
-            && s.configuration_key.as_deref() == key
-            && s.pack_hash == quick_pack
-            && s.mode == Some(BenchmarkMode::Quick)
-    }) {
-        return (Some(current), "Current Quick — lower sample confidence");
     }
     if let Some(old) = history
         .iter()
@@ -574,7 +593,10 @@ pub fn select<'a>(
 pub fn compare(left: &Run, right: &Run) -> Value {
     let a = left.summary();
     let b = right.summary();
-    let quality_comparable = a.signature["quality_key"].is_string()
+    let quality_comparable = left.suite == right.suite
+        && left.methodology == right.methodology
+        && left.pack_hash == right.pack_hash
+        && a.signature["quality_key"].is_string()
         && a.signature["quality_key"] == b.signature["quality_key"];
     let performance_changes = value_changes(
         &a.signature["performance_conditions"],
@@ -597,7 +619,7 @@ pub fn compare(left: &Run, right: &Run) -> Value {
     .map(|k| {
         (
             k,
-            if quality_comparable {
+            if quality_comparable && finished(&a.status) && finished(&b.status) {
                 a.scorecard[k]["score"]
                     .as_f64()
                     .zip(b.scorecard[k]["score"].as_f64())
@@ -618,7 +640,10 @@ pub fn compare(left: &Run, right: &Run) -> Value {
         "runtime":{"left":left.provenance.as_ref().map(|p|&p.runtime),"right":right.provenance.as_ref().map(|p|&p.runtime)},
         "hardware":{"left":left.environment,"right":right.environment},
         "intelligence_delta":a.intelligence.zip(b.intelligence).filter(|_|quality_comparable).map(|(a,b)|b-a),"agentic_delta":a.agentic.zip(b.agentic).filter(|_|quality_comparable).map(|(a,b)|b-a),
-        "latency_delta_ms":a.speed["combined"]["first_visible_ms"]["median"].as_f64().zip(b.speed["combined"]["first_visible_ms"]["median"].as_f64()).filter(|_|performance_comparable).map(|(a,b)|b-a)})
+        "coding_delta":a.coding.zip(b.coding).filter(|_|quality_comparable).map(|(a,b)|b-a),
+        "prefill_tps_delta":a.speed["combined"]["native_prefill_tokens_per_second"]["median"].as_f64().zip(b.speed["combined"]["native_prefill_tokens_per_second"]["median"].as_f64()).filter(|_|performance_comparable&&finished(&a.status)&&finished(&b.status)).map(|(a,b)|b-a),
+        "output_tps_delta":a.speed["combined"]["native_end_to_end_output_tokens_per_second"]["median"].as_f64().zip(b.speed["combined"]["native_end_to_end_output_tokens_per_second"]["median"].as_f64()).filter(|_|performance_comparable&&finished(&a.status)&&finished(&b.status)).map(|(a,b)|b-a),
+        "latency_delta_ms":a.speed["combined"]["first_visible_ms"]["median"].as_f64().zip(b.speed["combined"]["first_visible_ms"]["median"].as_f64()).filter(|_|performance_comparable&&finished(&a.status)&&finished(&b.status)).map(|(a,b)|b-a)})
 }
 
 pub(crate) struct Response {
@@ -732,6 +757,7 @@ pub fn performance_lines(speed: &Value) -> Vec<String> {
             "native_end_to_end_output_tokens_per_second",
             "output tokens/s whole request",
         ),
+        ("Native prefill", "native_prefill_tokens_per_second", "processed prompt tokens/s"),
         ("First visible latency", "first_visible_ms", "ms"),
     ]
     .into_iter()
@@ -772,13 +798,10 @@ pub fn scorecard_value(summary: &Value, field: &str) -> Option<f64> {
     if !finished(summary["status"].as_str().unwrap_or("")) {
         return None;
     }
-    if field == "profile_quality" {
-        return summary["scorecard"][field].as_f64();
-    }
     if summary["scorecard"][field].is_object() {
         return summary["scorecard"][field]["score"].as_f64();
     }
-    if matches!(field, "intelligence" | "agentic") {
+    if matches!(field, "intelligence" | "agentic" | "coding") {
         summary[field].as_f64()
     } else {
         let combined = &summary["speed"]["combined"][field];
@@ -791,10 +814,16 @@ pub fn scorecard_value(summary: &Value, field: &str) -> Option<f64> {
     }
 }
 
-pub const SCORECARD_METRICS: [(&str, &str, &str); 4] = [
+pub const SCORECARD_METRICS: [(&str, &str, &str); 6] = [
     ("Intelligence ↑", "intelligence", " / 100"),
     ("Agentic ↑", "agentic", " / 100"),
-    ("TPS ↑", "native_end_to_end_output_tokens_per_second", ""),
+    ("Coding ↑", "coding", " / 100"),
+    (
+        "Output TPS ↑",
+        "native_end_to_end_output_tokens_per_second",
+        "",
+    ),
+    ("Prefill TPS ↑", "native_prefill_tokens_per_second", ""),
     ("Latency ↓", "first_visible_ms", " ms"),
 ];
 
@@ -826,72 +855,9 @@ pub fn scorecard_lines(summary: &Value) -> Vec<String> {
         return vec!["Never benchmarked".into()];
     }
     let mut lines = Vec::new();
-    if summary["mode"].is_string() {
-        lines.push(format!(
-            "Mode             {} | {}",
-            summary["mode"].as_str().unwrap(),
-            summary["scorecard"]["confidence"].as_str().unwrap_or("")
-        ));
-        lines.push(format!(
-            "Capabilities     {}",
-            summary["scorecard"]["capabilities"]
-        ));
-        lines.push(format!(
-            "Profile quality  {} (only this capability set)",
-            scorecard_metric(summary, "profile_quality", " /100")
-        ));
-        for (label, field) in [
-            ("Intelligence", "intelligence"),
-            ("Coding", "coding"),
-            ("Agentic", "agentic"),
-            ("Retrieval", "retrieval"),
-            ("Context", "context"),
-            ("Reliability", "reliability"),
-        ] {
-            if summary["scorecard"][field].is_object() {
-                lines.push(format!(
-                    "{label:<16} {}",
-                    scorecard_metric(summary, field, " /100")
-                ));
-            }
-        }
-        if summary["scorecard"]["retrieval"].is_object() {
-            let r = &summary["scorecard"]["retrieval"];
-            lines.push(format!(
-                "Retrieval raw    grounded {} | line precision {} | pollution {}",
-                r["grounded_success_rate"],
-                r["line_precision"]["mean"],
-                r["polluting_lines"]["mean"]
-            ));
-        }
-        lines.push(format!(
-            "Useful context   {} workload characters",
-            summary["scorecard"]["context"]["useful_context"]
-        ));
-        let load = &summary["scorecard"]["cold_startup_load"];
-        lines.push(format!(
-            "Cold/startup     {}",
-            load["seconds"]
-                .as_f64()
-                .map(|n| format!("{n:.2} s"))
-                .unwrap_or_else(|| load["reason"].as_str().unwrap_or("unavailable").into())
-        ));
-        lines.push("Efficiency       process peak VRAM / TPS per GiB unavailable; hardware observations in Details".into());
-        for (label, field, unit) in &SCORECARD_METRICS[2..] {
-            lines.push(format!(
-                "Warm {label:<11} {}",
-                scorecard_metric(summary, field, unit)
-            ));
-        }
-    } else {
-        lines.push(format!(
-            "{} / legacy methodology",
-            summary["suite"].as_str().unwrap_or("Historical benchmark")
-        ));
-        lines.extend(SCORECARD_METRICS.into_iter().map(|(label, field, unit)| {
-            format!("{label:<16} {}", scorecard_metric(summary, field, unit))
-        }));
-    }
+    lines.extend(SCORECARD_METRICS.into_iter().map(|(label, field, unit)| {
+        format!("{label:<16} {}", scorecard_metric(summary, field, unit))
+    }));
     lines.push(format!("Status           {}", status_label(summary)));
     if let (Some(start), Some(end)) = (
         summary["started_unix_ms"].as_u64(),
@@ -915,56 +881,8 @@ pub fn scorecard_lines(summary: &Value) -> Vec<String> {
 
 pub fn comparison_lines(value: &Value) -> Vec<String> {
     let mut lines = vec!["Comparison: baseline (left) -> selected (right)".into()];
-    lines.push(format!(
-        "Quality comparable: {}",
-        value["quality_comparable"]
-    ));
-    lines.push(format!(
-        "Performance comparable: {}",
-        value["performance_comparable"]
-    ));
-    lines.push(
-        value["comparison_note"]
-            .as_str()
-            .unwrap_or("Legacy methodology")
-            .into(),
-    );
-    lines.push(
-        value["performance_note"]
-            .as_str()
-            .unwrap_or("Deployment observations")
-            .into(),
-    );
-    for field in [
-        "profile_quality",
-        "intelligence",
-        "coding",
-        "agentic",
-        "retrieval",
-        "context",
-        "reliability",
-    ] {
-        if value["left"]["scorecard"][field].is_null()
-            && value["right"]["scorecard"][field].is_null()
-        {
-            continue;
-        }
-        let delta = scorecard_value(&value["left"], field)
-            .zip(scorecard_value(&value["right"], field))
-            .filter(|_| value["quality_comparable"] == true)
-            .map(|(a, b)| format!("{:+.1}", b - a))
-            .unwrap_or_else(|| "not comparable".into());
-        lines.push(format!(
-            "{field}: {} -> {} (selected - baseline {delta})",
-            scorecard_metric(&value["left"], field, " /100"),
-            scorecard_metric(&value["right"], field, " /100")
-        ));
-    }
     for (label, field, unit) in SCORECARD_METRICS {
-        if value["left"]["mode"].is_string() && matches!(field, "intelligence" | "agentic") {
-            continue;
-        }
-        let allowed = if matches!(field, "intelligence" | "agentic") {
+        let allowed = if matches!(field, "intelligence" | "agentic" | "coding") {
             value["quality_comparable"] == true
         } else {
             value["performance_comparable"] == true
@@ -986,58 +904,6 @@ pub fn comparison_lines(value: &Value) -> Vec<String> {
             scorecard_metric(&value["right"], field, unit)
         ));
     }
-    for (label, path, quality) in [
-        (
-            "Grounded retrieval success",
-            vec!["scorecard", "retrieval", "grounded_success_rate"],
-            true,
-        ),
-        (
-            "Line precision",
-            vec!["scorecard", "retrieval", "line_precision", "mean"],
-            true,
-        ),
-        (
-            "Line pollution",
-            vec!["scorecard", "retrieval", "polluting_lines", "mean"],
-            true,
-        ),
-        (
-            "Useful context (workload chars)",
-            vec!["scorecard", "context", "useful_context"],
-            true,
-        ),
-        (
-            "Cold/startup load seconds",
-            vec!["scorecard", "cold_startup_load", "seconds"],
-            false,
-        ),
-        (
-            "Peak model VRAM",
-            vec!["scorecard", "efficiency", "peak_vram"],
-            false,
-        ),
-        (
-            "TPS/GiB",
-            vec!["scorecard", "efficiency", "tps_per_gib"],
-            false,
-        ),
-    ] {
-        let a = path.iter().fold(&value["left"], |v, k| &v[*k]);
-        let b = path.iter().fold(&value["right"], |v, k| &v[*k]);
-        let comparable = value[if quality {
-            "quality_comparable"
-        } else {
-            "performance_comparable"
-        }] == true;
-        let delta = a
-            .as_f64()
-            .zip(b.as_f64())
-            .filter(|_| comparable)
-            .map(|(a, b)| format!("{:+.3}", b - a))
-            .unwrap_or_else(|| "unavailable / not comparable".into());
-        lines.push(format!("{label}: {a} -> {b} (selected - baseline {delta})"));
-    }
     for key in ["quality_differences", "performance_differences"] {
         if let Some(diffs) = value[key].as_array() {
             for d in diffs {
@@ -1048,6 +914,26 @@ pub fn comparison_lines(value: &Value) -> Vec<String> {
             }
         }
     }
+    lines.push(format!(
+        "Quality comparable: {}",
+        value["quality_comparable"]
+    ));
+    lines.push(format!(
+        "Performance comparable: {}",
+        value["performance_comparable"]
+    ));
+    lines.push(
+        value["comparison_note"]
+            .as_str()
+            .unwrap_or("Legacy methodology")
+            .into(),
+    );
+    lines.push(
+        value["performance_note"]
+            .as_str()
+            .unwrap_or("Deployment observations")
+            .into(),
+    );
     lines
 }
 
@@ -1111,10 +997,10 @@ pub fn scorecard_text(value: &Value) -> String {
             lines.extend(scorecard_lines(s));
             if row["latest_quick"].is_object() && row["latest_quick"]["run_id"] != s["run_id"] {
                 lines.push(format!(
-                    "Latest Quick: {} | {} | quality {}",
+                    "Historical Quick: {} | {} | Intelligence {}",
                     row["latest_quick"]["run_id"],
                     status_label(&row["latest_quick"]),
-                    scorecard_metric(&row["latest_quick"], "profile_quality", " /100")
+                    scorecard_metric(&row["latest_quick"], "intelligence", " /100")
                 ));
             }
             if row["latest_attempt"].is_object() && row["latest_attempt"]["run_id"] != s["run_id"] {

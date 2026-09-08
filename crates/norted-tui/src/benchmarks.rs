@@ -23,7 +23,6 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Run,
-    Quick,
     History,
     Details,
     Mark,
@@ -36,8 +35,7 @@ pub enum Action {
 impl Action {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Run => "[b Standard]",
-            Self::Quick => "[q Quick]",
+            Self::Run => "[b Benchmark]",
             Self::History => "[h History]",
             Self::Details => "[d Details]",
             Self::Mark => "[Space Mark/clear]",
@@ -90,7 +88,7 @@ impl Benchmarks {
         } else if self.history.is_some() {
             vec![Back, Details, Mark, Compare, Refresh, Cancel]
         } else {
-            vec![Run, Quick, History, Details, Refresh, Cancel]
+            vec![Run, History, Details, Refresh, Cancel]
         }
     }
     pub fn enabled(&self, action: Action) -> bool {
@@ -105,7 +103,7 @@ impl Benchmarks {
             }
             Evidence => self.inspection.is_some() && !self.evidence,
             Mark => self.history.is_some() && self.row()["run_id"].is_string(),
-            Run | Quick => {
+            Run => {
                 idle && self.history.is_none()
                     && self.row()["profile_id"].is_string()
                     && !self.overview["active"].is_object()
@@ -179,19 +177,15 @@ impl Benchmarks {
                     },
                 )
             }
-            Run | Quick | History => {
+            Run | History => {
                 if let Some(id) = self.row()["profile_id"]
                     .as_str()
                     .and_then(|s| s.parse().ok())
                 {
-                    self.pending = Some(if matches!(action, Run | Quick) {
+                    self.pending = Some(if matches!(action, Run) {
                         BenchmarkRequest::Start {
                             profile_id: id,
-                            mode: if action == Quick {
-                                norted_engine::benchmark::BenchmarkMode::Quick
-                            } else {
-                                norted_engine::benchmark::BenchmarkMode::Standard
-                            },
+                            mode: norted_engine::benchmark::BenchmarkMode::Standard,
                         }
                     } else {
                         BenchmarkRequest::History { profile_id: id }
@@ -243,7 +237,6 @@ impl Benchmarks {
             }
             KeyCode::Esc | KeyCode::Backspace => Back,
             KeyCode::Char('b') => Run,
-            KeyCode::Char('q') => Quick,
             KeyCode::Char('h') => History,
             KeyCode::Char('d') => Details,
             KeyCode::Char(' ') => Mark,
@@ -474,6 +467,7 @@ fn summary_lines(s: &Value) -> Vec<String> {
         "visible_delivery_characters_per_second",
         "visible_end_to_end_characters_per_second",
         "native_end_to_end_output_tokens_per_second",
+        "native_prefill_tokens_per_second",
         "first_visible_ms",
     ] {
         for missing in s["speed"]["combined"][field]["missing"]
@@ -496,6 +490,13 @@ fn summary_lines(s: &Value) -> Vec<String> {
             text(&sample["id"]),
             text(&sample["outcome"]),
             text(&sample["outcome_reason"])
+        ));
+        lines.push(format!(
+            "  Prefill processed {} tokens; cached {}; native time {} ms; {}",
+            text(&sample["prompt_processing_tokens"]),
+            text(&sample["cached_input_tokens"]),
+            text(&sample["prompt_processing_ms"]),
+            text(&sample["reasons"]["native_prefill_tokens_per_second"])
         ));
     }
     lines
@@ -611,9 +612,9 @@ fn content_lines(state: &Benchmarks) -> Vec<String> {
         && row["latest_quick"]["run_id"] != state.result()["run_id"]
     {
         lines.push(format!(
-            "Latest Quick: {} | quality {}",
+            "Historical Quick: {} | Intelligence {}",
             text(&row["latest_quick"]["run_id"]),
-            scorecard_metric(&row["latest_quick"], "profile_quality", " /100")
+            scorecard_metric(&row["latest_quick"], "intelligence", " /100")
         ));
     }
     if state.history.is_none()
@@ -690,29 +691,46 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         l.progress,
     );
     // Secondary metadata yields to measurements; use the same columns for every row.
-    let wide = l.header.width >= 120;
-    let compact = l.header.width >= 58;
-    let tails: &[u16] = if wide {
-        &[14, 10, 12, 9, 11, 17, 18]
-    } else if compact {
-        &[12, 11, 8, 11]
-    } else {
-        &[12, 11]
-    };
-    let columns = inventory_columns(l.header, tails, tails);
-    let mut headings = vec!["Profile / run", "Quality ↑", "Mode"];
-    if l.header.width >= 120 {
-        headings[1] = "Profile quality ↑";
-        headings[2] = "Mode";
+    let width = l.header.width;
+    let output = width >= 78;
+    let latency = width >= 92;
+    let prefill = width >= 108;
+    let wide = width >= 145;
+    let mut metrics = Vec::new();
+    if width >= 28 {
+        metrics.push(("Intel ↑", "intelligence", ""));
     }
+    if width >= 40 {
+        metrics.push(("Agent ↑", "agentic", ""));
+    }
+    if width >= 54 {
+        metrics.push(("Coding ↑", "coding", ""));
+    }
+    if output {
+        metrics.push((
+            "Output TPS ↑",
+            "native_end_to_end_output_tokens_per_second",
+            "",
+        ));
+    }
+    if prefill {
+        metrics.push(("Prefill TPS ↑", "native_prefill_tokens_per_second", ""));
+    }
+    if latency {
+        metrics.push(("Latency ↓", "first_visible_ms", " ms"));
+    }
+    let mut tails = metrics
+        .iter()
+        .map(|(label, _, _)| label.len().max(8) as u16)
+        .collect::<Vec<_>>();
     if wide {
-        headings.push("Capability");
+        tails.extend([14, 18]);
     }
-    if compact {
-        headings.extend(["TPS ↑", "Latency ↓"]);
-    }
+    let columns = inventory_columns(l.header, &tails, &tails);
+    let mut headings = vec!["Profile / run"];
+    headings.extend(metrics.iter().map(|(label, _, _)| *label));
     if wide {
-        headings.extend(["State / key", "Last benchmark"]);
+        headings.extend(["Status", "Last benchmark"]);
     }
     let headings = headings.into_iter().map(str::to_owned).collect::<Vec<_>>();
     inventory_row(frame, l.header, &columns, &headings, theme.muted, glyphs);
@@ -739,44 +757,12 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             })
         );
         let status = status_label(result);
-        let mut values = vec![
-            name,
-            scorecard_metric(result, "profile_quality", " /100"),
-            result["mode"]
-                .as_str()
-                .unwrap_or(if result["suite"].is_string() {
-                    "Legacy"
-                } else {
-                    "—"
-                })
-                .into(),
-        ];
-        if wide {
-            let metric = [
-                ("retrieval", "Ret"),
-                ("coding", "Code"),
-                ("intelligence", "Intel"),
-                ("agentic", "Tool"),
-                ("context", "Ctx"),
-            ]
-            .into_iter()
-            .find(|(field, _)| result["scorecard"][*field].is_object());
-            values.push(
-                metric
-                    .map(|(field, label)| {
-                        format!("{label} {}", scorecard_metric(result, field, ""))
-                    })
-                    .unwrap_or_else(|| "—".into()),
-            );
-        }
-        if compact {
-            values.push(scorecard_metric(
-                result,
-                "native_end_to_end_output_tokens_per_second",
-                "",
-            ));
-            values.push(scorecard_metric(result, "first_visible_ms", " ms"));
-        }
+        let mut values = vec![name];
+        values.extend(
+            metrics
+                .iter()
+                .map(|(_, field, unit)| scorecard_metric(result, field, unit)),
+        );
         if wide {
             values.push(if state.history.is_some() {
                 let key = result["signature"]["quality_key"]

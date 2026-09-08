@@ -264,7 +264,7 @@ pub fn input_window(text: &str, cursor: usize, max_width: usize) -> InputWindow 
     let before_width = UnicodeWidthStr::width(before.as_str());
     let after = display_prefix(suffix, max_width.saturating_sub(before_width));
     InputWindow {
-        text: before + &after,
+        text: before + after.as_str(),
         cursor_column: before_width as u16,
     }
 }
@@ -460,7 +460,8 @@ pub fn load_progress_compact(
         } else {
             ("#", "-")
         };
-        let bar: String = full.repeat(filled) + &empty.repeat(inner_width.saturating_sub(filled));
+        let bar: String =
+            full.repeat(filled) + empty.repeat(inner_width.saturating_sub(filled)).as_str();
         let percent = (fraction.clamp(0.0, 1.0) * 100.0).round() as u32;
         format!("{phase} {bar} {percent}%")
     } else {
@@ -473,7 +474,7 @@ pub fn load_progress_compact(
         };
         let bar: String = track.repeat(position.min(inner_width)) + head;
         let remaining = inner_width.saturating_sub(bar.chars().count());
-        let full_bar = bar + &track.repeat(remaining);
+        let full_bar = bar + track.repeat(remaining).as_str();
         format!("{phase} {full_bar}")
     }
 }

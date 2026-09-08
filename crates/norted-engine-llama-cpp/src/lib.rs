@@ -1999,6 +1999,7 @@ struct PropsGenerationParams {
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
     usage: Option<ChatUsage>,
+    timings: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -2036,8 +2037,28 @@ impl From<ChatUsage> for InferenceUsage {
                 .prompt_tokens_details
                 .and_then(|details| details.cached_tokens),
             cache_write_input_tokens: None,
+            prompt_processing_tokens: None,
+            prompt_processing_ms: None,
             reasoning_output_tokens: None,
         }
+    }
+}
+
+/// b10665 tools/server/server-common.cpp and server-task.cpp define these
+/// counters separately: processed prompt, reused prompt, native prefill time.
+fn apply_prompt_timings(usage: &mut InferenceUsage, timings: &Value) {
+    usage.prompt_processing_tokens = timings.get("prompt_n").and_then(Value::as_u64);
+    usage.prompt_processing_ms = timings.get("prompt_ms").and_then(Value::as_f64);
+    let cache = timings.get("cache_n").and_then(Value::as_u64);
+    if usage
+        .cached_input_tokens
+        .zip(cache)
+        .is_some_and(|(a, b)| a != b)
+    {
+        // Conflicting native populations cannot establish a valid rate.
+        usage.prompt_processing_ms = None;
+    } else if usage.cached_input_tokens.is_none() {
+        usage.cached_input_tokens = cache;
     }
 }
 
@@ -2179,6 +2200,16 @@ fn parse_sse_frames(state: &mut SseState) {
                     return;
                 }
             }
+        }
+        // Reviewed b10665 server-common.cpp: prompt_n is n_prompt_processed,
+        // cache_n is n_prompt_cached, prompt_ms is t_prompt_ms(). The final
+        // OAI streaming usage frame carries these stats (server-task.cpp).
+        // Accept only co-located terminal usage/timing, never progress snapshots.
+        if value.get("usage").is_some_and(|v| !v.is_null())
+            && let Some(usage) = state.usage.as_mut()
+            && let Some(timings) = value.get("timings")
+        {
+            apply_prompt_timings(usage, timings);
         }
         if let Some(finish_reason) = value
             .get("choices")
@@ -5391,7 +5422,13 @@ impl LlamaCppAdapter {
         Ok(InferenceOutput {
             text,
             tool_calls: Vec::new(),
-            usage: response.usage.map(Into::into),
+            usage: response.usage.map(|usage| {
+                let mut usage = InferenceUsage::from(usage);
+                if let Some(timings) = &response.timings {
+                    apply_prompt_timings(&mut usage, timings);
+                }
+                usage
+            }),
             finish_reason,
         })
     }
