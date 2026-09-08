@@ -813,7 +813,12 @@ Private control status identifies the model, engine, exact runtime ID/version/va
 Open `/benchmarks` and press **b Benchmark** to run **Norted Quick Bench v4**
 manually for one Model Profile (600 seconds maximum including loading and
 finalization). The scorecard shows Intelligence, Agentic, independent executable
-Coding /100, Output TPS, native Prefill TPS, and Latency, with no composite score.
+Coding /100, Grep-style Retrieval /100, Output TPS, native Prefill TPS, and Latency,
+with no composite score. Retrieval uses four original repository tasks and the
+canonical four-round grep/glob/read protocol. It requires native parallel tools
+and constrained no-tools JSON finalization; unsupported engines show unavailable.
+The exact reviewed q27 runtime only constrains tool-call bodies, so its Retrieval
+remains unavailable (see [runtime evidence](docs/q27-grep-contract.md)).
 Coding uses six original tasks and deterministic all-or-nothing hidden tests in a
 bounded, capability-free in-process Rhai evaluator; it is not a full repository
 engineering benchmark. Prefill uses actual native processed prompt tokens/time,

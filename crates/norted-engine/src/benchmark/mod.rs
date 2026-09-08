@@ -1,6 +1,7 @@
 //! Server-owned, local per-profile benchmark evidence and shared methodology.
 pub(crate) mod coding;
 pub mod plan;
+pub(crate) mod retrieval;
 mod scorecard;
 mod storage;
 pub use plan::BenchmarkPlan;
@@ -184,7 +185,7 @@ pub fn digest(value: impl Serialize) -> String {
 /// Shared bundled material; run manifests use `BenchmarkPlan::manifest`.
 pub fn manifest() -> Value {
     json!({"suite":suite::SUITE,"method":suite::METHOD,"policy":suite::POLICY,
-        "coding":coding::manifest(),"intelligence":suite::questions(),"single_tools":suite::single_cases(),
+        "retrieval":retrieval::manifest(),"coding":coding::manifest(),"intelligence":suite::questions(),"single_tools":suite::single_cases(),
         "agents":suite::AGENT_PROMPTS,"tools":suite::tools(),"fixture":(0..4).map(suite::Fixture::new).collect::<Vec<_>>(),
         "probes":suite::probes().into_iter().map(|(id,input)|json!({"id":id,"utf8_bytes":input.len(),"unicode_characters":input.chars().count(),"input":input,"seconds":suite::PROBE_SECONDS,"max_output_tokens":suite::PROBE_TOKENS})).collect::<Vec<_>>(),
         "warmup":{"input":"Reply with the word ready.","seconds":10,"max_output_tokens":32},
@@ -594,7 +595,7 @@ pub fn compare(left: &Run, right: &Run) -> Value {
         && a.signature["performance_key"] == b.signature["performance_key"];
     let quality_changes = value_changes(&a.signature["methodology"], &b.signature["methodology"]);
     let comparable = quality_comparable;
-    let quality_deltas = ["intelligence", "coding", "agentic"]
+    let quality_deltas = ["intelligence", "coding", "agentic", "retrieval"]
         .into_iter()
         .map(|k| {
             (
@@ -781,7 +782,7 @@ pub fn scorecard_value(summary: &Value, field: &str) -> Option<f64> {
     if summary["scorecard"][field].is_object() {
         return summary["scorecard"][field]["score"].as_f64();
     }
-    if matches!(field, "intelligence" | "agentic" | "coding") {
+    if matches!(field, "intelligence" | "agentic" | "coding" | "retrieval") {
         summary[field].as_f64()
     } else {
         let combined = &summary["speed"]["combined"][field];
@@ -794,10 +795,11 @@ pub fn scorecard_value(summary: &Value, field: &str) -> Option<f64> {
     }
 }
 
-pub const SCORECARD_METRICS: [(&str, &str, &str); 6] = [
+pub const SCORECARD_METRICS: [(&str, &str, &str); 7] = [
     ("Intelligence ↑", "intelligence", " / 100"),
     ("Agentic ↑", "agentic", " / 100"),
     ("Coding ↑", "coding", " / 100"),
+    ("Retrieval ↑", "retrieval", " / 100"),
     (
         "Output TPS ↑",
         "native_end_to_end_output_tokens_per_second",
@@ -862,7 +864,7 @@ pub fn scorecard_lines(summary: &Value) -> Vec<String> {
 pub fn comparison_lines(value: &Value) -> Vec<String> {
     let mut lines = vec!["Comparison: baseline (left) -> selected (right)".into()];
     for (label, field, unit) in SCORECARD_METRICS {
-        let allowed = if matches!(field, "intelligence" | "agentic" | "coding") {
+        let allowed = if matches!(field, "intelligence" | "agentic" | "coding" | "retrieval") {
             value["quality_comparable"] == true
         } else {
             value["performance_comparable"] == true

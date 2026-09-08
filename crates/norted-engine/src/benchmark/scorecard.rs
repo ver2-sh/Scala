@@ -32,5 +32,91 @@ pub(super) fn build(run: &Run, _categories: &BTreeMap<String, Value>) -> Value {
         .as_f64()
         .zip(multi["score"].as_f64())
         .map(|(a, b)| (a + b) / 2.0);
-    json!({"intelligence":intelligence,"coding":binary(run,&["coding"],6),"agentic":{"score":agentic,"single":single,"multi":multi},"methodology":suite::METHOD})
+    json!({"retrieval":retrieval(run),"intelligence":intelligence,"coding":binary(run,&["coding"],6),"agentic":{"score":agentic,"single":single,"multi":multi},"methodology":suite::METHOD})
+}
+
+fn retrieval(run: &Run) -> Value {
+    if !run.manifest["retrieval"].is_object() {
+        return Value::Null;
+    }
+    let items = run
+        .evidence
+        .iter()
+        .filter(|e| e.category == "retrieval")
+        .collect::<Vec<_>>();
+    let unavailable = items.iter().find(|e| e.status == "unavailable");
+    let complete = unavailable.is_none()
+        && items.len() == super::retrieval::tasks().len()
+        && items.iter().all(|e| e.score.is_some());
+    let mut raw = json!({});
+    for key in [
+        "file_precision",
+        "file_recall",
+        "file_f05",
+        "line_precision",
+        "line_recall",
+        "line_f05",
+    ] {
+        let values = items
+            .iter()
+            .filter_map(|e| e.request_overrides["retrieval_metrics"][key].as_f64())
+            .collect::<Vec<_>>();
+        raw[key] =
+            json!((!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64));
+    }
+    for key in [
+        "polluting_lines",
+        "returned_lines",
+        "tool_calls",
+        "tool_errors",
+        "malformed_calls",
+        "target_ranges_grounded",
+        "serial_rounds",
+        "truncated_results",
+        "retrieval_wall_seconds",
+    ] {
+        raw[key] = json!(
+            items
+                .iter()
+                .filter_map(|e| e.request_overrides["retrieval_metrics"][key].as_f64())
+                .sum::<f64>()
+        );
+    }
+    for (key, aggregate) in [
+        ("clean_success", "clean_success"),
+        ("grounded_success", "grounded_success"),
+        ("recovered_tool_errors", "recovered_tool_errors"),
+        ("failure", "failures"),
+        ("malformed_final", "malformed_final"),
+        ("tool_protocol_failure", "tool_protocol_failure"),
+    ] {
+        raw[aggregate] = json!(
+            items
+                .iter()
+                .filter(|e| e.request_overrides["retrieval_metrics"][key] == true)
+                .count()
+        );
+    }
+    let observed = items
+        .iter()
+        .filter(|e| e.request_overrides["retrieval_metrics"].is_object())
+        .count();
+    if observed == 0 {
+        raw = Value::Null;
+    } else {
+        raw["observed_tasks"] = json!(observed);
+        for (count, rate) in [
+            ("failures", "failure_rate"),
+            ("malformed_final", "malformed_final_rate"),
+            ("tool_protocol_failure", "tool_protocol_failure_rate"),
+        ] {
+            raw[rate] = json!(raw[count].as_u64().unwrap_or(0) as f64 / observed as f64);
+        }
+    }
+    if observed > 0 {
+        raw["aggregation"] = json!(
+            "task macro means for P/R/F0.5; sums for counts/time; partial evidence never supplies a headline"
+        );
+    }
+    json!({"score":(finished(&run.status)&&complete).then(||100.0*items.iter().filter_map(|e|e.score).sum::<f64>()/super::retrieval::tasks().len() as f64),"state":if unavailable.is_some(){"unavailable"}else if complete{"complete"}else{"incomplete"},"reason":unavailable.map(|e|&e.explanation),"required":super::retrieval::tasks().len(),"scored":items.iter().filter(|e|e.score.is_some()).count(),"raw":raw,"tasks":items.iter().map(|e|json!({"id":e.id,"status":e.status,"score":e.score.map(|v|100.0*v),"reason":e.explanation,"raw":e.request_overrides["retrieval_metrics"]})).collect::<Vec<_>>()})
 }

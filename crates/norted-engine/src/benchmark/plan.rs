@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 pub struct BenchmarkPlan {
     pub questions: Vec<String>,
     pub coding: Vec<String>,
+    pub retrieval: Vec<String>,
     pub single: Vec<usize>,
     pub agents: Vec<usize>,
     pub probes: Vec<String>,
@@ -28,17 +29,21 @@ pub struct BenchmarkPlan {
 impl BenchmarkPlan {
     pub fn new() -> Result<Self, String> {
         let mut plan = Self {
+            retrieval: super::retrieval::tasks()
+                .into_iter()
+                .map(|t| t.id)
+                .collect(),
             coding: super::coding::tasks().into_iter().map(|t| t.id).collect(),
             questions: suite::questions().into_iter().map(|q| q.id).collect(),
             single: (0..8).collect(),
             agents: (0..4).collect(),
             probes: suite::probes().into_iter().map(|(id, _)| id).collect(),
-            preparation_seconds: 60,
-            warmup_seconds: 10,
-            probe_seconds: 16,
-            question_seconds: 8,
-            single_seconds: 7,
-            agent_seconds: 21,
+            preparation_seconds: 55,
+            warmup_seconds: 9,
+            probe_seconds: 14,
+            question_seconds: 7,
+            single_seconds: 6,
+            agent_seconds: 18,
             stop_confirmation_seconds: 1,
             maximum_stop_confirmations: 0,
             execution_bookkeeping_seconds: 15,
@@ -66,7 +71,8 @@ impl BenchmarkPlan {
         self.stop_confirmation_seconds * self.maximum_stop_confirmations
     }
     pub fn work_seconds(&self) -> u64 {
-        self.coding.len() as u64 * 9
+        self.coding.len() as u64 * (super::coding::SECONDS + 1)
+            + self.retrieval.len() as u64 * super::retrieval::SECONDS
             + self.preparation_seconds
             + self.warmup_seconds
             + self.probes.len() as u64 * self.probe_seconds
@@ -76,6 +82,7 @@ impl BenchmarkPlan {
     }
     pub fn total_tasks(&self) -> usize {
         self.coding.len()
+            + self.retrieval.len()
             + self.probes.len()
             + self.questions.len()
             + self.single.len()
@@ -89,6 +96,7 @@ impl BenchmarkPlan {
             .chain(self.coding.iter().cloned())
             .chain(self.single.iter().map(|i| format!("tool-{}", i + 1)))
             .chain(self.agents.iter().map(|i| format!("agent-{}", i + 1)))
+            .chain(self.retrieval.iter().cloned())
             .collect()
     }
     pub fn manifest(&self) -> Value {
