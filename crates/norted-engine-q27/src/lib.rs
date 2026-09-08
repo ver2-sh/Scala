@@ -59,6 +59,11 @@ const SOURCE_RUNTIME_ONLY_RECIPE_VERSION: &str = "q27-upstream-make-v2-runtime-o
 // exact commit/tree and Makefile digest, and the resulting facts persist in
 // RuntimeSourceBuildProvenance. A new upstream tree must receive a new audited
 // contract before it can gain exact-runtime capabilities.
+// Grep audit: this tree's api_common.h + tools/test_template_golden.cpp bind
+// Qwen3.8 native tool rendering. src/toolconstrain.h/toolgram.h only constrain
+// tool bodies after their opener, not a no-tools ranges response. server.cu
+// has no response_format/schema/grammar request route. See docs/q27-grep-contract.md.
+// StructuredOutput must remain absent even for this exact reviewed tree.
 const PACKAGE_SOURCE_COMMIT: &str = "4770e053656af9aababdc49c81f280ad21b74986";
 const PACKAGE_SOURCE_TREE: &str = "ff712f78fd17b5fe12149679114b6def003f16a6";
 const PACKAGE_MAKEFILE_SHA256: &str =
@@ -2595,7 +2600,7 @@ impl EngineAdapter for Q27Adapter {
             Some(OutputFormat::JsonObject | OutputFormat::JsonSchema { .. })
         ) {
             return Err(EngineError::InvalidGenerationSettings(
-                "q27 does not support structured output".to_owned(),
+                "q27 does not support structured output: exact reviewed runtime only constrains tool-call bodies, not no-tools JSON finalization".to_owned(),
             ));
         }
         Ok(())

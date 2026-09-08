@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::time::Instant;
 
 pub const RUBRIC: &str = "norted-rhai-all-hidden/1";
-pub const SECONDS: u64 = 8;
+pub const SECONDS: u64 = 7;
 pub const OUTPUT_TOKENS: u32 = 768;
 const SYNTAX: &str = "Return only Rhai source defining fn solve(x) { ... }, no markdown. Rhai uses let v = 0; assignment v += 1; if condition { } else { }; for v in array { }; while condition { }; return value;. Arrays: [], a.len(), a[i], a.push(v); strings: s.len(), s[i] (character), s.split(\";\"), s.trim(), parse_int(s). Integer arithmetic and comparisons work normally; booleans true/false; no imports, IO, clocks, randomness or eval. x is the input described below. Return the specified value, not JSON text. All inputs are small (at most 64 elements, integer magnitudes below 10000).";
 #[derive(Clone, Serialize, Deserialize)]

@@ -678,10 +678,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     );
     // Secondary metadata yields to measurements; use the same columns for every row.
     let width = l.header.width;
-    let output = width >= 78;
-    let latency = width >= 92;
-    let prefill = width >= 108;
-    let wide = width >= 145;
+    let output = width >= 94;
+    let latency = width >= 108;
+    let prefill = width >= 124;
+    let wide = width >= 161;
     let mut metrics = Vec::new();
     if width >= 28 {
         metrics.push(("Intel ↑ /100", "intelligence", ""));
@@ -691,6 +691,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     }
     if width >= 54 {
         metrics.push(("Coding ↑ /100", "coding", ""));
+    }
+    if width >= 70 {
+        metrics.push(("Retrieval ↑ /100", "retrieval", ""));
     }
     if output {
         metrics.push((
