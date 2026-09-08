@@ -420,6 +420,7 @@ impl RuntimeManager {
                 || summary.intelligence.is_none()
                 || summary.agentic.is_none()
                 || summary.coding.is_none()
+                || summary.scorecard["retrieval"]["score"].is_null()
                 || summary.speed["combined"]["native_prefill_tokens_per_second"]["median"].is_null()
                 || summary.speed["combined"]["first_visible_ms"]["median"].is_null()
                 || summary.speed["combined"]["visible_delivery_characters_per_second"]["median"]
@@ -772,6 +773,7 @@ impl RuntimeManager {
                 }
             }
         }
+        self.retrieval_phase(run, started).await?;
         self.verify_pinned(run).await?;
         let summary = run.summary();
         for (field, label) in [
@@ -1039,6 +1041,334 @@ impl RuntimeManager {
         } else {
             Ok(())
         }
+    }
+    async fn retrieval_phase(
+        self: &Arc<Self>,
+        run: &mut Run,
+        started: Instant,
+    ) -> Result<(), String> {
+        for task in bench::retrieval::tasks() {
+            self.verify_pinned(run).await?;
+            let mut request = self
+                .request(
+                    run,
+                    &task.prompt,
+                    bench::retrieval::OUTPUT_TOKENS,
+                    false,
+                    vec![
+                        InferenceMessage::text(InferenceRole::System, bench::retrieval::SYSTEM),
+                        InferenceMessage::text(InferenceRole::User, &task.prompt),
+                    ],
+                )
+                .await?;
+            request.tools = bench::retrieval::tools();
+            request.parallel_tool_calls = Some(true);
+            request.tool_choice = Some(crate::InferenceToolChoice::Auto);
+            request.output_format = Some(crate::OutputFormat::Text);
+            let mut e = new_evidence(
+                &task.id,
+                "retrieval",
+                &task.prompt,
+                json!(task.targets),
+                bench::retrieval::SECONDS,
+                request.max_output_tokens,
+            );
+            e.request_overrides["tools"] = json!(true);
+            e.request_overrides["output_format"] = json!(request.output_format);
+            e.request_overrides["cache_policy"] =
+                json!("canonical Grep messages; no nonce; backend cache isolation unverified");
+            let mut final_request = request.clone();
+            let mut history = InferenceMessage::text(InferenceRole::Assistant, "");
+            history.tool_calls = (0..2)
+                .map(|i| InferenceToolCall {
+                    id: format!("prevalidate-{i}"),
+                    name: "glob".into(),
+                    arguments: r#"{"pattern":"*"}"#.into(),
+                })
+                .collect();
+            final_request.messages.push(history);
+            for i in 0..2 {
+                let mut result = InferenceMessage::text(
+                    InferenceRole::Tool,
+                    r#"{"files":{},"truncated":false}"#,
+                );
+                result.tool_call_id = Some(format!("prevalidate-{i}"));
+                final_request.messages.push(result);
+            }
+            let history_request = final_request.clone();
+            bench::retrieval::finalize_request(&mut final_request);
+            let capability = {
+                let state = self.state.read().await;
+                let running = state
+                    .backends
+                    .get(&run.profile.id)
+                    .and_then(|b| b.running.as_ref())
+                    .ok_or("backend missing")?;
+                if !running
+                    .adapter
+                    .capabilities()
+                    .features
+                    .contains(&crate::EngineFeature::ToolCalling)
+                {
+                    Err("exact runtime does not prove native retrieval tool calling".into())
+                } else if !running
+                    .adapter
+                    .capabilities()
+                    .features
+                    .contains(&crate::EngineFeature::StructuredOutput)
+                {
+                    Err("exact runtime does not prove constrained Grep finalization".into())
+                } else {
+                    running
+                        .adapter
+                        .validate_inference_request(
+                            &final_request,
+                            &running.effective_generation_settings,
+                            &running.settings_schema,
+                        )
+                        .and_then(|()| {
+                            running.adapter.validate_inference_request(
+                                &history_request,
+                                &running.effective_generation_settings,
+                                &running.settings_schema,
+                            )
+                        })
+                        .and_then(|()| {
+                            running.adapter.validate_inference_request(
+                                &request,
+                                &running.effective_generation_settings,
+                                &running.settings_schema,
+                            )
+                        })
+                        .map_err(|error| error.to_string())
+                }
+            };
+            if let Some(reason) = run
+                .missing
+                .iter()
+                .find(|r| r.starts_with("Retrieval unavailable:"))
+                .cloned()
+                .or_else(|| capability.err().map(retrieval_unavailable))
+            {
+                e.status = "unavailable".into();
+                e.explanation = reason.clone();
+                if !run.missing.contains(&reason) {
+                    run.missing.push(reason);
+                }
+                run.evidence.push(e);
+                continue;
+            }
+            e.status = "running".into();
+            run.evidence.push(e.clone());
+            self.benchmark.store.save(run).await?;
+            let mut fixture = bench::retrieval::Fixture::default();
+            let begin = Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(bench::retrieval::SECONDS),
+                self.retrieval_task(run, &mut e, request, &mut fixture),
+            )
+            .await;
+            let wall = begin.elapsed().as_secs_f64();
+            *run.phases.entry("retrieval".into()).or_default() += wall;
+            let mut fatal = None;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(MeasureError::Candidate(reason))) => {
+                    e.status = "failed".into();
+                    e.explanation = reason;
+                    e.request_overrides["model_failure"] = json!("invalid_tool_or_output_limit");
+                    fatal = self
+                        .confirm_benchmark_request_stopped(run, &mut e)
+                        .await
+                        .err();
+                }
+                Ok(Err(MeasureError::Infrastructure(reason))) => {
+                    if retrieval_capability_error(&reason) {
+                        e.status = "unavailable".into();
+                        e.explanation = retrieval_unavailable(reason);
+                    } else {
+                        e.status = "infrastructure_error".into();
+                        e.explanation = reason.clone();
+                        fatal = Some(reason);
+                    }
+                }
+                Err(_) => {
+                    e.status = "timeout".into();
+                    e.explanation = "retrieval task deadline".into();
+                    fatal = self
+                        .confirm_benchmark_request_stopped(run, &mut e)
+                        .await
+                        .err();
+                }
+            }
+            if e.status == "unavailable" {
+                if !run.missing.contains(&e.explanation) {
+                    run.missing.push(e.explanation.clone());
+                }
+                *run.evidence.last_mut().expect("checkpointed task") = e;
+                for previous in run
+                    .evidence
+                    .iter_mut()
+                    .filter(|e| e.category == "retrieval")
+                {
+                    previous.score = None;
+                }
+                self.checkpoint(run, started, "retrieval").await?;
+                continue;
+            }
+            let mut metrics = bench::retrieval::grade(&task, &e.response, &fixture.located);
+            metrics["tool_calls"] = e.request_overrides["tool_calls"].clone();
+            metrics["serial_rounds"] = e.request_overrides["rounds"].clone();
+            metrics["retrieval_wall_seconds"] = json!(wall);
+            metrics["truncated_results"] = json!(
+                e.tools
+                    .iter()
+                    .filter(|v| v["result"]["truncated"] == true)
+                    .count()
+            );
+            metrics["tool_protocol_failure"] = json!(
+                !e.request_overrides["model_failure"].is_null()
+                    && e.request_overrides["model_failure"] != "malformed_final_output"
+            );
+            metrics["malformed_final"] =
+                json!(e.status == "completed" && metrics["final_format_valid"] != true);
+            metrics["malformed_calls"] = e.request_overrides["malformed_calls"].clone();
+            metrics["timeouts"] = json!(usize::from(e.status == "timeout"));
+            metrics["completion_status"] = json!(e.status);
+            let completed = e.status == "completed"
+                && e.request_overrides["valid_completion"] == true
+                && e.request_overrides["model_failure"].is_null();
+            metrics["completion_valid"] = json!(completed);
+            if !completed {
+                metrics["grounded_success"] = json!(false);
+                metrics["score"] = json!(0.0);
+            }
+            if !matches!(e.status.as_str(), "infrastructure_error" | "timeout") {
+                let valid = metrics["final_format_valid"] == true
+                    && e.request_overrides["model_failure"].is_null()
+                    && e.request_overrides["valid_completion"] == true;
+                e.request_overrides["valid_completion"] = json!(valid);
+                if metrics["final_format_valid"] != true {
+                    e.request_overrides["model_failure"] = json!("malformed_final_output");
+                }
+                e.score = metrics["score"].as_f64().map(|s| s / 100.0);
+                e.status = if e.score == Some(1.0) {
+                    "passed"
+                } else {
+                    "failed"
+                }
+                .into();
+            } else if e.status == "timeout" {
+                e.score = Some(0.0);
+            }
+            metrics["success"] = json!(
+                completed && metrics["grounded_success"] == true && metrics["polluting_lines"] == 0
+            );
+            metrics["failure"] = json!(metrics["success"] != true);
+            e.request_overrides["retrieval_metrics"] = metrics;
+            *run.evidence.last_mut().expect("checkpointed task") = e;
+            if let Some(reason) = fatal {
+                return Err(reason);
+            }
+            self.checkpoint(run, started, "retrieval").await?;
+        }
+        Ok(())
+    }
+    async fn retrieval_task(
+        self: &Arc<Self>,
+        run: &mut Run,
+        e: &mut Evidence,
+        mut request: crate::InferenceRequest,
+        fixture: &mut bench::retrieval::Fixture,
+    ) -> Result<(), MeasureError> {
+        e.request_overrides["benchmark_messages_before_profile_defaults"] = json!(request.messages);
+        e.request_overrides["tool_definitions"] = json!(request.tools);
+        e.request_overrides["parallel_tool_calls"] = json!(request.parallel_tool_calls);
+        e.request_overrides["malformed_calls"] = json!(0);
+        e.request_overrides["tool_calls"] = json!(0);
+        e.request_overrides["rounds"] = json!(0);
+        let mut count = 0;
+        let mut ids = std::collections::BTreeSet::new();
+        for round in 1..=4 {
+            if let Some(active) = self.benchmark.active.lock().await.as_mut() {
+                active.phase = format!("retrieval / {} / round {round}", e.id);
+            }
+            e.response.clear();
+            let r = self.measure(request.clone(), e).await?;
+            e.tools.push(json!({"phase":"retrieval","round":round,"calls":r.calls,"text":r.text,"timing":r.timing,"usage":r.usage}));
+            if r.calls.is_empty() {
+                e.request_overrides["valid_completion"] =
+                    json!(r.finish == "Stop" && bench::retrieval::valid_final(&r.text));
+                if !bench::retrieval::valid_final(&r.text) {
+                    e.request_overrides["model_failure"] = json!("malformed_final_output");
+                }
+                e.status = "completed".into();
+                return Ok(());
+            }
+            if r.calls.len() > 8
+                || !matches!(r.finish.as_str(), "Stop" | "ToolCalls")
+                || !r.text.trim().is_empty()
+                || bench::retrieval::call_bytes(&r.calls)
+                    .is_none_or(|n| n > bench::retrieval::CALL_BYTES)
+                || r.calls
+                    .iter()
+                    .any(|c| c.id.is_empty() || !ids.insert(c.id.clone()))
+            {
+                e.request_overrides["model_failure"] = json!("invalid_tool_protocol");
+                e.status = "completed".into();
+                return Ok(());
+            }
+            let results = fixture.round(&r.calls);
+            count += r.calls.len();
+            e.request_overrides["rounds"] = json!(round);
+            e.request_overrides["tool_calls"] = json!(count);
+            let mut assistant = InferenceMessage::text(InferenceRole::Assistant, r.text);
+            assistant.tool_calls = r.calls.clone();
+            request.messages.push(assistant);
+            for (call, payload) in r.calls.into_iter().zip(results) {
+                if payload.get("error").is_some() {
+                    let n = e.request_overrides["malformed_calls"].as_u64().unwrap_or(0);
+                    e.request_overrides["malformed_calls"] = json!(n + 1);
+                    e.request_overrides["model_failure"] = json!("tool_argument_failure");
+                }
+                let text = bench::retrieval::tool_text(&payload);
+                e.tools.push(
+                    json!({"tool_call_id":call.id,"result":payload,"model_visible_text":text}),
+                );
+                let mut message = InferenceMessage::text(InferenceRole::Tool, text);
+                message.tool_call_id = Some(call.id);
+                request.messages.push(message);
+            }
+            *run.evidence.last_mut().expect("checkpointed task") = e.clone();
+            self.benchmark.store.save(run).await?;
+            self.verify_pinned(run).await?;
+        }
+        // Reached only after four actual tool rounds; early answers return above.
+        bench::retrieval::finalize_request(&mut request);
+        if let Some(active) = self.benchmark.active.lock().await.as_mut() {
+            active.phase = format!("retrieval / {} / finalization", e.id);
+        }
+        e.response.clear();
+        e.request_overrides["finalization_tools"] = json!(request.tools);
+        e.request_overrides["finalization_tool_choice"] = json!(request.tool_choice);
+        e.request_overrides["finalization_parallel_tool_calls"] =
+            json!(request.parallel_tool_calls);
+        e.request_overrides["finalization_output_format"] = json!(request.output_format);
+        let result = self.measure(request, e).await;
+        if e.status == "unavailable" {
+            return Ok(());
+        }
+        let r = result?;
+        e.tools.push(json!({"phase":"finalization","calls":r.calls,"text":r.text,"timing":r.timing,"usage":r.usage}));
+        e.request_overrides["valid_completion"] = json!(r.finish == "Stop" && r.calls.is_empty());
+        if !r.calls.is_empty() {
+            e.response.clear();
+            e.request_overrides["model_failure"] = json!("tools_on_finalization");
+        } else if model_refusal(&r.text) {
+            e.request_overrides["model_failure"] = json!("refusal");
+        }
+        e.status = "completed".into();
+        Ok(())
     }
     async fn agent_task(
         self: &Arc<Self>,
@@ -1475,7 +1805,7 @@ impl From<&str> for MeasureError {
 
 fn benchmark_signature(run: &Run, plan: &BenchmarkPlan) -> Value {
     let p = run.provenance.as_ref();
-    let quality = json!({"suite":run.suite,"method":run.methodology,"plan":plan,"selected_task_ids":plan.task_ids(),"plan_hash":bench::digest(plan),"pack_hash":run.pack_hash,"rubrics":["exact-json-v1","fixture-observed-state-v2",crate::benchmark::coding::RUBRIC]});
+    let quality = json!({"suite":run.suite,"method":run.methodology,"plan":plan,"selected_task_ids":plan.task_ids(),"plan_hash":bench::digest(plan),"pack_hash":run.pack_hash,"rubrics":["exact-json-v1","fixture-observed-state-v2",crate::benchmark::coding::RUBRIC,bench::retrieval::RUBRIC]});
     let settings = p.map(|p| {
         p.settings
             .effective
@@ -1532,4 +1862,33 @@ fn classify_inference_error(reason: String) -> MeasureError {
     } else {
         MeasureError::Infrastructure(reason)
     }
+}
+
+fn retrieval_unavailable(reason: String) -> String {
+    format!(
+        "Retrieval unavailable: {}",
+        reason
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(512)
+            .collect::<String>()
+    )
+}
+/// Only capability-specific rejections qualify; malformed model output never reaches this path.
+fn retrieval_capability_error(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    let relevant = [
+        "schema",
+        "structured output",
+        "response_format",
+        "tool",
+        "parallel",
+    ]
+    .iter()
+    .any(|s| r.contains(s));
+    relevant
+        && (r.contains("400")
+            || r.contains("422")
+            || r.contains("unsupported")
+            || r.contains("not support"))
 }
