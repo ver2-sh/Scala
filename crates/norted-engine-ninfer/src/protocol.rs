@@ -376,6 +376,8 @@ impl From<ChatUsage> for InferenceUsage {
                 .prompt_tokens_details
                 .and_then(|details| details.cached_tokens),
             cache_write_input_tokens: None,
+            prompt_processing_tokens: None,
+            prompt_processing_ms: None,
             reasoning_output_tokens: usage
                 .completion_tokens_details
                 .and_then(|details| details.reasoning_tokens),

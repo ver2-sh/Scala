@@ -791,6 +791,12 @@ impl App {
                 self.overlay = Some(Overlay::Help);
                 Update::Render
             }
+            KeyCode::Char('q')
+                if self.screen == Screen::Benchmarks && self.focus == FocusArea::Content =>
+            {
+                self.benchmarks.key(key);
+                Update::Render
+            }
             KeyCode::Char('q') => Update::Quit,
             KeyCode::Tab => {
                 self.model_search_editing = false;

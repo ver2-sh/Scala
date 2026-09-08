@@ -182,7 +182,8 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path, limit: u64) -> Result<T, St
     if bytes.len() as u64 > limit {
         return Err("benchmark file exceeds size limit".into());
     }
-    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    serde_json::from_value(value).map_err(|e| e.to_string())
 }
 fn lock(path: &Path) -> Result<std::fs::File, String> {
     std::fs::create_dir_all(path).map_err(|e| e.to_string())?;

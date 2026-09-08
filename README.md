@@ -810,15 +810,16 @@ Private control status identifies the model, engine, exact runtime ID/version/va
 
 ## Per-profile benchmarks
 
-Select **Run benchmark** (`b`) in Model Profiles, or open `/benchmarks` for
-progress, cancellation, per-profile history and historical comparisons. The
-running server executes the original, offline **Norted Quick Bench v3** through
-normal managed inference, with a maximum 600-second execution budget. It
-reports Norted Quick Intelligence, short-task agentic capability, visible-text
-throughput and first-visible latency. Each profile keeps independent results;
-failed/cancelled attempts never replace its last finished result. Finished
-evaluations may have explicitly unavailable metrics; confirmed safe task
-cancellation permits later tasks, while unverified backend state interrupts the run.
+Open `/benchmarks` and press **b Benchmark** to run **Norted Quick Bench v4**
+manually for one Model Profile (600 seconds maximum including loading and
+finalization). The scorecard shows Intelligence, Agentic, independent executable
+Coding /100, Output TPS, native Prefill TPS, and Latency, with no composite score.
+Coding uses six original tasks and deterministic all-or-nothing hidden tests in a
+bounded, capability-free in-process Rhai evaluator; it is not a full repository
+engineering benchmark. Prefill uses actual native processed prompt tokens/time,
+never TTFT; insufficient evidence stays unavailable and partial coverage stays
+in Details. Historical results are immutable, and unsuccessful attempts do not
+hide the previous finished scorecard.
 
 Scriptable access uses private authenticated control:
 
