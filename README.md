@@ -810,21 +810,21 @@ Private control status identifies the model, engine, exact runtime ID/version/va
 
 ## Per-profile benchmarks
 
-Declare a profile's benchmark capabilities in Model Profiles (**C**) or with
-`model-profiles set-capabilities PROFILE reasoning,coding,tool_use,long_context`.
-Open `/benchmarks`: **b Standard** runs the full local evaluation (600 seconds
-maximum including loading), and **q Quick** runs a smaller confidence check
-(180 seconds maximum including loading). **Norted Quick Bench v4** selects only
-the declared reasoning, coding, tool-use, retrieval and context packs. Its
-capability-specific Profile Quality stays separate from reliability, warm TPS,
-latency and physical resource observations. History is immutable; Quick and
-unsuccessful attempts do not hide the current authoritative Standard scorecard.
+Open `/benchmarks` and press **b Benchmark** to run **Norted Quick Bench v4**
+manually for one Model Profile (600 seconds maximum including loading and
+finalization). The scorecard shows Intelligence, Agentic, independent executable
+Coding /100, Output TPS, native Prefill TPS, and Latency, with no composite score.
+Coding uses six original tasks and deterministic all-or-nothing hidden tests in a
+bounded, capability-free in-process Rhai evaluator; it is not a full repository
+engineering benchmark. Prefill uses actual native processed prompt tokens/time,
+never TTFT; insufficient evidence stays unavailable and partial coverage stays
+in Details. Historical results are immutable, and unsuccessful attempts do not
+hide the previous finished scorecard.
 
 Scriptable access uses private authenticated control:
 
 ```console
 norted-server benchmarks start PROFILE_ID --mode standard
-norted-server benchmarks start PROFILE_ID --mode quick
 norted-server benchmarks status --json
 norted-server benchmarks history PROFILE_ID --json
 norted-server benchmarks result RUN_ID --json

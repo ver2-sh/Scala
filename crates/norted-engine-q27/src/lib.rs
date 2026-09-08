@@ -4181,6 +4181,8 @@ impl From<ChatUsage> for InferenceUsage {
             total_tokens: usage.total_tokens,
             cached_input_tokens: None,
             cache_write_input_tokens: None,
+            prompt_processing_tokens: None,
+            prompt_processing_ms: None,
             reasoning_output_tokens: usage.reasoning_tokens,
         }
     }

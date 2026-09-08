@@ -23,6 +23,7 @@ tracing.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
 zip.workspace = true
+rhai = { version = "=1.26.0", features = ["sync", "serde", "no_module", "no_time", "no_float", "no_closure", "no_custom_syntax", "only_i64"] }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

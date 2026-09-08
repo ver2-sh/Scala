@@ -194,11 +194,7 @@ impl RuntimeManager {
                 .filter(|s| s.profile_id == profile.id)
                 .cloned()
                 .collect::<Vec<_>>();
-            let quick_pack = bench::digest(
-                BenchmarkPlan::new(BenchmarkMode::Quick, profile.benchmark_capabilities.clone())?
-                    .manifest(),
-            );
-            let (result, state) = bench::select(&h, key.as_deref(), &pack, &quick_pack);
+            let (result, state) = bench::select(&h, key.as_deref(), &pack);
             let state = if state.starts_with("Current")
                 && result.is_some_and(|r| r.saved_equals_served_requested_settings == Some(false))
             {
@@ -425,12 +421,15 @@ impl RuntimeManager {
                 }
             }
         } else {
+            run.status = "completed".into();
             let summary = run.summary();
             run.status = if summary.speed["combined"]["native_end_to_end_output_tokens_per_second"]
                 ["median"]
                 .is_null()
-                || (!run.profile.benchmark_capabilities.is_empty()
-                    && summary.scorecard["profile_quality"].is_null())
+                || summary.intelligence.is_none()
+                || summary.agentic.is_none()
+                || summary.coding.is_none()
+                || summary.speed["combined"]["native_prefill_tokens_per_second"]["median"].is_null()
                 || summary.speed["combined"]["first_visible_ms"]["median"].is_null()
                 || summary.speed["combined"]["visible_delivery_characters_per_second"]["median"]
                     .is_null()
@@ -613,6 +612,22 @@ impl RuntimeManager {
                 .await?;
             self.checkpoint(run, started, "intelligence").await?;
         }
+        for task in crate::benchmark::coding::tasks() {
+            self.verify_pinned(run).await?;
+            let request = self
+                .request(run, &task.prompt, task.max_output_tokens, false, Vec::new())
+                .await?;
+            let mut e = new_evidence(
+                &task.id,
+                "coding",
+                &task.prompt,
+                json!(task),
+                task.seconds,
+                request.max_output_tokens,
+            );
+            self.one_request(run, &mut e, request, task.seconds).await?;
+            self.checkpoint(run, started, "coding").await?;
+        }
         if !plan.single.is_empty() {
             let probe_request = self
                 .request(run, &suite::single_cases()[0].prompt, 384, true, Vec::new())
@@ -773,6 +788,7 @@ impl RuntimeManager {
                 "native_end_to_end_output_tokens_per_second",
                 "Native end-to-end speed",
             ),
+            ("native_prefill_tokens_per_second", "Native prefill"),
             ("first_visible_ms", "First visible latency"),
         ] {
             if summary.speed["combined"][field]["median"].is_null() {
@@ -896,6 +912,9 @@ impl RuntimeManager {
             active.phase = format!("{} / {}", e.category, e.id);
         }
         e.status = "running".into();
+        if e.category == "coding" {
+            e.request_overrides["coding_evaluation"] = json!({"compiled":null,"passed":false,"reason":"inference did not yield evaluable source","rubric":crate::benchmark::coding::RUBRIC,"evaluator":"rhai/1.26.0"});
+        }
         e.request_overrides["benchmark_messages_before_profile_defaults"] = json!(request.messages);
         e.request_overrides["tool_definitions"] = json!(request.tools);
         run.evidence.push(e.clone());
@@ -913,7 +932,14 @@ impl RuntimeManager {
                 e.timing = response.timing;
                 e.usage = response.usage;
                 e.tools = response.calls.iter().map(|c| json!({"call":c})).collect();
-                let passed = if e.category == "tool" {
+                let passed = if e.category == "coding" {
+                    let task: crate::benchmark::coding::Task =
+                        serde_json::from_value(e.expected.clone()).map_err(|e| e.to_string())?;
+                    let result = crate::benchmark::coding::evaluate(&task, &e.response);
+                    let passed = result["passed"] == true && response.calls.is_empty();
+                    e.request_overrides["coding_evaluation"] = result;
+                    passed
+                } else if e.category == "tool" {
                     let case: suite::ToolCase =
                         serde_json::from_value(e.expected.clone()).map_err(|e| e.to_string())?;
                     suite::grade_single(&case, &e.response, &response.calls)
@@ -946,6 +972,9 @@ impl RuntimeManager {
                                     && suite::Fixture::new(0).apply(c).is_ok()
                             })
                         }
+                    } else if e.category == "coding" {
+                        response.calls.is_empty()
+                            && e.request_overrides["coding_evaluation"]["compiled"] == true
                     } else {
                         response.calls.is_empty()
                             && serde_json::from_str::<Value>(&e.response).is_ok_and(|v| {
@@ -1782,7 +1811,7 @@ impl From<&str> for MeasureError {
 
 fn benchmark_signature(run: &Run, plan: &BenchmarkPlan) -> Value {
     let p = run.provenance.as_ref();
-    let quality = json!({"suite":run.suite,"method":run.methodology,"mode":plan.mode,"capabilities":plan.capabilities,"plan":plan,"selected_task_ids":plan.task_ids(),"plan_hash":bench::digest(plan),"pack_hash":run.pack_hash,"rubrics":["exact-json-v1","fixture-observed-state-v2","file-line-f0.5-grounded/1","exact-json-context/1"]});
+    let quality = json!({"suite":run.suite,"method":run.methodology,"mode":plan.mode,"capabilities":plan.capabilities,"plan":plan,"selected_task_ids":plan.task_ids(),"plan_hash":bench::digest(plan),"pack_hash":run.pack_hash,"rubrics":["exact-json-v1","fixture-observed-state-v2",crate::benchmark::coding::RUBRIC]});
     let settings = p.map(|p| {
         p.settings
             .effective

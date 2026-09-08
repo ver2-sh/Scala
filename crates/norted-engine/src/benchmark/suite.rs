@@ -6,10 +6,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const INTELLIGENCE: &str = include_str!("intelligence.json");
 pub const SUITE: &str = "norted-quick-bench/4";
-pub const METHOD: &str = "capability-json-fixture-retrieval-context/4";
-pub const PROBE_SECONDS: u64 = 20;
+pub const METHOD: &str = "json-fixture-executable-native-prefill/4";
+pub const PROBE_SECONDS: u64 = 16;
 pub const PROBE_TOKENS: u32 = 2048;
-pub const POLICY: &str = "Frozen capability plan; one attempt per selected task; no retries or budget reallocation. Standard <=600s; Quick <=180s including preparation. Execution stops 16s before hard deadline; cleanup by hard deadline minus 1s; immutable finalization by hard deadline. Cancellation confirmation and bookkeeping share headroom. Unknown measurements remain unavailable. Internal managed streaming boundary; nonce prefix; cache unverified.";
+pub const POLICY: &str = "Frozen fixed-denominator plan; one attempt per task; no retries or budget reallocation. Fixed full task pack <=600s including preparation. Coding: 8s inference plus 1s evaluation per task. Execution stops 16s before hard deadline; cleanup by hard deadline minus 1s; immutable finalization by hard deadline. Cancellation confirmation and bookkeeping share headroom. Unknown measurements remain unavailable. Internal managed streaming boundary; nonce prefix; cache unverified.";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Question {

@@ -27,6 +27,8 @@ pub struct BenchmarkPlan {
     pub mode: BenchmarkMode,
     pub capabilities: BTreeSet<BenchmarkCapability>,
     pub questions: Vec<String>,
+    #[serde(default)]
+    pub coding: Vec<String>,
     pub single: Vec<usize>,
     pub agents: Vec<usize>,
     pub retrieval: Vec<usize>,
@@ -54,79 +56,38 @@ impl BenchmarkPlan {
         mode: BenchmarkMode,
         capabilities: BTreeSet<BenchmarkCapability>,
     ) -> Result<Self, String> {
+        if mode != BenchmarkMode::Standard {
+            return Err(
+                "This v4 methodology uses the full fixed task pack; select standard".into(),
+            );
+        }
         use BenchmarkCapability::*;
         if capabilities.contains(&Retrieval) && !capabilities.contains(&ToolUse) {
             return Err("retrieval requires tool_use".into());
         }
-        let quick = mode == BenchmarkMode::Quick;
-        let questions = suite::questions()
-            .into_iter()
-            .filter(|q| {
-                capabilities.contains(&if q.category == "code" {
-                    Coding
-                } else {
-                    Reasoning
-                }) && (!quick || q.id.ends_with("-1") || q.id.ends_with("-4"))
-            })
-            .map(|q| q.id)
-            .collect();
-        let tool = capabilities.contains(&ToolUse);
-        let retrieval = capabilities.contains(&Retrieval);
-        let context = capabilities.contains(&LongContext);
         let mut plan = Self {
             mode,
             capabilities,
-            questions,
-            single: if tool {
-                if quick {
-                    vec![0, 5, 7]
-                } else {
-                    (0..8).collect()
-                }
-            } else {
-                vec![]
-            },
-            agents: if tool {
-                if quick { vec![2] } else { (0..4).collect() }
-            } else {
-                vec![]
-            },
-            retrieval: if retrieval {
-                if quick {
-                    vec![0, 3, 6]
-                } else {
-                    (0..8).collect()
-                }
-            } else {
-                vec![]
-            },
-            context_targets: if context {
-                if quick {
-                    vec![4096, 16384]
-                } else {
-                    vec![4096, 16384, 32768, 65536, 131072]
-                }
-            } else {
-                vec![]
-            },
-            probes: if quick {
-                vec!["short-1".into(), "medium-1".into()]
-            } else {
-                suite::probes().into_iter().map(|(id, _)| id).collect()
-            },
-            preparation_seconds: if quick { 30 } else { 60 },
-            warmup_seconds: if quick { 3 } else { 5 },
-            probe_seconds: if quick { 11 } else { 17 },
-            question_seconds: if quick { 3 } else { 5 },
-            single_seconds: if quick { 3 } else { 4 },
-            agent_seconds: if quick { 9 } else { 16 },
-            retrieval_seconds: if quick { 10 } else { 12 },
-            context_seconds: if quick { 5 } else { 14 },
+            coding: super::coding::tasks().into_iter().map(|t| t.id).collect(),
+            questions: suite::questions().into_iter().map(|q| q.id).collect(),
+            single: (0..8).collect(),
+            agents: (0..4).collect(),
+            retrieval: vec![],
+            context_targets: vec![],
+            probes: suite::probes().into_iter().map(|(id, _)| id).collect(),
+            preparation_seconds: 60,
+            warmup_seconds: 10,
+            probe_seconds: 16,
+            question_seconds: 8,
+            single_seconds: 7,
+            agent_seconds: 21,
+            retrieval_seconds: 0,
+            context_seconds: 0,
             stop_confirmation_seconds: 1,
             maximum_stop_confirmations: 0,
-            execution_bookkeeping_seconds: if quick { 7 } else { 15 },
+            execution_bookkeeping_seconds: 15,
             cleanup_finalization_seconds: 16,
-            hard_seconds: if quick { 180 } else { 600 },
+            hard_seconds: 600,
         };
         // Each task ends after its first confirmation path. Agent confirmation
         // inside the task ceiling can race that ceiling, but only the outer
@@ -149,7 +110,8 @@ impl BenchmarkPlan {
         self.stop_confirmation_seconds * self.maximum_stop_confirmations
     }
     pub fn work_seconds(&self) -> u64 {
-        self.preparation_seconds
+        self.coding.len() as u64 * 9
+            + self.preparation_seconds
             + self.warmup_seconds
             + self.probes.len() as u64 * self.probe_seconds
             + self.questions.len() as u64 * self.question_seconds
@@ -159,7 +121,8 @@ impl BenchmarkPlan {
             + self.context_targets.len() as u64 * self.context_seconds
     }
     pub fn total_tasks(&self) -> usize {
-        self.probes.len()
+        self.coding.len()
+            + self.probes.len()
             + self.questions.len()
             + self.single.len()
             + self.agents.len()
@@ -171,6 +134,7 @@ impl BenchmarkPlan {
             .iter()
             .cloned()
             .chain(self.questions.iter().cloned())
+            .chain(self.coding.iter().cloned())
             .chain(self.single.iter().map(|i| format!("tool-{}", i + 1)))
             .chain(self.agents.iter().map(|i| format!("agent-{}", i + 1)))
             .chain(
