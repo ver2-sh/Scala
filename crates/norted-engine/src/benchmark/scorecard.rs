@@ -68,6 +68,9 @@ fn retrieval(run: &Run) -> Value {
         "polluting_lines",
         "returned_lines",
         "tool_calls",
+        "tool_errors",
+        "malformed_calls",
+        "target_ranges_grounded",
         "serial_rounds",
         "truncated_results",
         "retrieval_wall_seconds",
@@ -79,13 +82,15 @@ fn retrieval(run: &Run) -> Value {
                 .sum::<f64>()
         );
     }
-    for key in [
-        "success",
-        "failure",
-        "malformed_final",
-        "tool_protocol_failure",
+    for (key, aggregate) in [
+        ("clean_success", "clean_success"),
+        ("grounded_success", "grounded_success"),
+        ("recovered_tool_errors", "recovered_tool_errors"),
+        ("failure", "failures"),
+        ("malformed_final", "malformed_final"),
+        ("tool_protocol_failure", "tool_protocol_failure"),
     ] {
-        raw[key] = json!(
+        raw[aggregate] = json!(
             items
                 .iter()
                 .filter(|e| e.request_overrides["retrieval_metrics"][key] == true)
@@ -100,6 +105,13 @@ fn retrieval(run: &Run) -> Value {
         raw = Value::Null;
     } else {
         raw["observed_tasks"] = json!(observed);
+        for (count, rate) in [
+            ("failures", "failure_rate"),
+            ("malformed_final", "malformed_final_rate"),
+            ("tool_protocol_failure", "tool_protocol_failure_rate"),
+        ] {
+            raw[rate] = json!(raw[count].as_u64().unwrap_or(0) as f64 / observed as f64);
+        }
     }
     if observed > 0 {
         raw["aggregation"] = json!(

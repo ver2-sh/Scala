@@ -373,6 +373,8 @@ pub enum RuntimeError {
 }
 
 struct RunningBackend {
+    runtime: crate::InstalledRuntime,
+    model: norted_core::ModelArtifact,
     adapter: Arc<dyn EngineAdapter>,
     process: ProcessDescriptor,
     endpoint: String,
@@ -1201,7 +1203,14 @@ impl RuntimeManager {
             return Err(RuntimeError::Operation(detail));
         }
         let mut context_attempts = Vec::new();
-        let (process, endpoint, exit, mut startup_observation, effective_generation_settings) = loop {
+        let (
+            process,
+            endpoint,
+            exit,
+            mut startup_observation,
+            effective_generation_settings,
+            runtime,
+        ) = loop {
             let launch_spec = launch_attempts
                 .pop_front()
                 .expect("launch attempts were checked as non-empty");
@@ -1469,7 +1478,14 @@ impl RuntimeManager {
                             .await;
                         return Err(RuntimeError::StartupFailed(detail));
                     }
-                    break (process, endpoint, exit, observation, settings);
+                    break (
+                        process,
+                        endpoint,
+                        exit,
+                        observation,
+                        settings,
+                        selected_runtime,
+                    );
                 }
                 StartupObservation::RetryContextCapacity {
                     kv_mode,
@@ -1599,6 +1615,8 @@ impl RuntimeManager {
                 .take()
                 .expect("a loading runtime must retain its store lease");
             backend.running = Some(RunningBackend {
+                runtime,
+                model,
                 adapter,
                 process: process.clone(),
                 endpoint,
