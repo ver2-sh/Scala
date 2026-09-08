@@ -35,7 +35,7 @@ pub enum Action {
 impl Action {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Run => "[b Run]",
+            Self::Run => "[b Benchmark]",
             Self::History => "[h History]",
             Self::Details => "[d Details]",
             Self::Mark => "[Space Mark/clear]",
@@ -182,7 +182,7 @@ impl Benchmarks {
                     .as_str()
                     .and_then(|s| s.parse().ok())
                 {
-                    self.pending = Some(if action == Run {
+                    self.pending = Some(if matches!(action, Run) {
                         BenchmarkRequest::Start { profile_id: id }
                     } else {
                         BenchmarkRequest::History { profile_id: id }
@@ -451,6 +451,8 @@ fn summary_lines(s: &Value) -> Vec<String> {
         "single_pass",
         "multi_pass",
         "categories",
+        "scorecard",
+        "signature",
         "task_outcomes",
     ] {
         if !s[key].is_null() {
@@ -461,6 +463,7 @@ fn summary_lines(s: &Value) -> Vec<String> {
         "visible_delivery_characters_per_second",
         "visible_end_to_end_characters_per_second",
         "native_end_to_end_output_tokens_per_second",
+        "native_prefill_tokens_per_second",
         "first_visible_ms",
     ] {
         for missing in s["speed"]["combined"][field]["missing"]
@@ -483,6 +486,13 @@ fn summary_lines(s: &Value) -> Vec<String> {
             text(&sample["id"]),
             text(&sample["outcome"]),
             text(&sample["outcome_reason"])
+        ));
+        lines.push(format!(
+            "  Prefill processed {} tokens; cached {}; native time {} ms; {}",
+            text(&sample["prompt_processing_tokens"]),
+            text(&sample["cached_input_tokens"]),
+            text(&sample["prompt_processing_ms"]),
+            text(&sample["reasons"]["native_prefill_tokens_per_second"])
         ));
     }
     lines
@@ -643,7 +653,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             } else {
                 "Running"
             },
-            text(&active["phase"]),
+            format_args!("{}", text(&active["phase"])),
             active["completed_tasks"],
             active["total_tasks"],
             number(&active["elapsed_seconds"]),
@@ -667,24 +677,44 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         l.progress,
     );
     // Secondary metadata yields to measurements; use the same columns for every row.
-    let wide = l.header.width >= 120;
-    let compact = l.header.width >= 58;
-    let tails: &[u16] = if wide {
-        &[16, 14, 9, 12, 18, 18]
-    } else if compact {
-        &[12, 11, 8, 11]
-    } else {
-        &[12, 11]
-    };
-    let columns = inventory_columns(l.header, tails, tails);
-    let mut headings = vec!["Profile / run", "Intel ↑ /100", "Agentic ↑"];
-    if l.header.width >= 120 {
-        headings[1] = "Intelligence ↑";
-        headings[2] = "Agentic ↑";
+    let width = l.header.width;
+    let output = width >= 78;
+    let latency = width >= 92;
+    let prefill = width >= 108;
+    let wide = width >= 145;
+    let mut metrics = Vec::new();
+    if width >= 28 {
+        metrics.push(("Intel ↑ /100", "intelligence", ""));
     }
-    if compact {
-        headings.extend(["TPS ↑", "Latency ↓"]);
+    if width >= 40 {
+        metrics.push(("Agent ↑ /100", "agentic", ""));
     }
+    if width >= 54 {
+        metrics.push(("Coding ↑ /100", "coding", ""));
+    }
+    if output {
+        metrics.push((
+            "Output TPS ↑",
+            "native_end_to_end_output_tokens_per_second",
+            "",
+        ));
+    }
+    if prefill {
+        metrics.push(("Prefill TPS ↑", "native_prefill_tokens_per_second", ""));
+    }
+    if latency {
+        metrics.push(("Latency ↓", "first_visible_ms", " ms"));
+    }
+    let mut tails = metrics
+        .iter()
+        .map(|(label, _, _)| label.len().max(8) as u16)
+        .collect::<Vec<_>>();
+    if wide {
+        tails.extend([14, 18]);
+    }
+    let columns = inventory_columns(l.header, &tails, &tails);
+    let mut headings = vec!["Profile / run"];
+    headings.extend(metrics.iter().map(|(label, _, _)| *label));
     if wide {
         headings.extend(["Status", "Last benchmark"]);
     }
@@ -713,21 +743,22 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             })
         );
         let status = status_label(result);
-        let mut values = vec![
-            name,
-            scorecard_metric(result, "intelligence", " /100"),
-            scorecard_metric(result, "agentic", " /100"),
-        ];
-        if compact {
-            values.push(scorecard_metric(
-                result,
-                "native_end_to_end_output_tokens_per_second",
-                "",
-            ));
-            values.push(scorecard_metric(result, "first_visible_ms", " ms"));
-        }
+        let mut values = vec![name];
+        values.extend(
+            metrics
+                .iter()
+                .map(|(_, field, unit)| scorecard_metric(result, field, unit)),
+        );
         if wide {
-            values.push(status);
+            values.push(if state.history.is_some() {
+                let key = result["signature"]["quality_key"]
+                    .as_str()
+                    .map(|k| k.chars().take(6).collect::<String>())
+                    .unwrap_or_else(|| "legacy".into());
+                format!("{status} {key}")
+            } else {
+                row["state"].as_str().unwrap_or(&status).to_owned()
+            });
             values.push(timestamp(if state.history.is_some() {
                 &row["ended_unix_ms"]
             } else {

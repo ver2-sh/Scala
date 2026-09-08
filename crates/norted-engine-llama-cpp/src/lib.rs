@@ -1,6 +1,7 @@
 //! llama.cpp-specific launch, probe, health, and inference translation.
 
 mod catalog;
+mod prefill;
 mod source_catalog;
 
 pub use catalog::{LLAMA_CPP_RUNTIME_PROVIDER_ID, LlamaCppRuntimeCatalogProvider};
@@ -321,6 +322,8 @@ pub struct LlamaCppAdapter {
     configuration_error: Option<String>,
     client: reqwest::Client,
     capability_cache: tokio::sync::RwLock<BTreeMap<String, String>>,
+    /// Replaced before every launch attempt; activated only for its matching process.
+    prompt_timing: tokio::sync::RwLock<BTreeMap<String, PromptTimingLaunch>>,
 }
 
 impl LlamaCppAdapter {
@@ -425,6 +428,7 @@ impl LlamaCppAdapter {
             configuration_error,
             client: reqwest::Client::new(),
             capability_cache: tokio::sync::RwLock::new(BTreeMap::new()),
+            prompt_timing: tokio::sync::RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -1422,6 +1426,7 @@ impl EngineAdapter for LlamaCppAdapter {
     }
 
     async fn prepare_launch_attempt(&self, spec: &LaunchSpec) -> Result<(), EngineError> {
+        self.prepare_prompt_timing(spec).await;
         revalidate_norted_package_before_launch(&spec.model).await
     }
 
@@ -1430,6 +1435,7 @@ impl EngineAdapter for LlamaCppAdapter {
         spec: &LaunchSpec,
         progress: LoadProgressReporter,
     ) -> Result<(), EngineError> {
+        self.prepare_prompt_timing(spec).await;
         revalidate_norted_package_before_launch_with_progress(&spec.model, &progress).await
     }
 
@@ -1498,6 +1504,15 @@ impl EngineAdapter for LlamaCppAdapter {
         let endpoint = process.endpoint.as_deref().ok_or_else(|| {
             EngineError::Operation("llama.cpp process has no backend endpoint".to_owned())
         })?;
+        let native_prefill_verified = {
+            let mut launches = self.prompt_timing.write().await;
+            launches.get_mut(endpoint).is_some_and(|launch| {
+                launch.ready = launch.reviewed
+                    && launch.runtime_id == process.runtime_id
+                    && launch.executable_sha256 == process.runtime_executable_sha256;
+                launch.ready
+            })
+        };
         let properties = self.startup_properties(endpoint).await?;
         let mut resolved_settings = serde_json::Map::from_iter([(
             "llama.cpp.context_length".to_owned(),
@@ -1509,10 +1524,16 @@ impl EngineAdapter for LlamaCppAdapter {
                 json!(parallel_requests),
             );
         }
-        Ok(StartupObservation::Ready(BTreeMap::from([(
-            "resolved_settings".to_owned(),
-            Value::Object(resolved_settings),
-        )])))
+        Ok(StartupObservation::Ready(BTreeMap::from([
+            (
+                "resolved_settings".to_owned(),
+                Value::Object(resolved_settings),
+            ),
+            (
+                "native_prefill_contract".to_owned(),
+                json!(native_prefill_verified.then_some(prefill::CONTRACT)),
+            ),
+        ])))
     }
 
     fn startup_progress(&self, stderr_tail: &[String]) -> Option<BackendLoadProgress> {
@@ -1999,6 +2020,7 @@ struct PropsGenerationParams {
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
     usage: Option<ChatUsage>,
+    timings: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -2036,12 +2058,70 @@ impl From<ChatUsage> for InferenceUsage {
                 .prompt_tokens_details
                 .and_then(|details| details.cached_tokens),
             cache_write_input_tokens: None,
+            prompt_processing_tokens: None,
+            prompt_processing_ms: None,
             reasoning_output_tokens: None,
         }
     }
 }
 
+/// b10665 tools/server/server-common.cpp and server-task.cpp define these
+/// counters separately: processed prompt, reused prompt, native prefill time.
+fn apply_prompt_timings(usage: &mut InferenceUsage, timings: &Value) {
+    usage.prompt_processing_tokens = timings.get("prompt_n").and_then(Value::as_u64);
+    usage.prompt_processing_ms = timings.get("prompt_ms").and_then(Value::as_f64);
+    let cache = timings.get("cache_n").and_then(Value::as_u64);
+    if usage
+        .cached_input_tokens
+        .zip(cache)
+        .is_some_and(|(a, b)| a != b)
+    {
+        // Conflicting native populations cannot establish a valid rate.
+        usage.prompt_processing_ms = None;
+    } else if usage.cached_input_tokens.is_none() {
+        usage.cached_input_tokens = cache;
+    }
+}
+
+struct PromptTimingLaunch {
+    runtime_id: RuntimeId,
+    executable_sha256: String,
+    reviewed: bool,
+    ready: bool,
+}
+
+impl LlamaCppAdapter {
+    async fn prepare_prompt_timing(&self, spec: &LaunchSpec) {
+        let Some(endpoint) = spec.endpoint.as_ref() else {
+            return;
+        };
+        // Clear old endpoint proof before verification, including failed/retried loads.
+        self.prompt_timing.write().await.remove(endpoint);
+        let reviewed = prefill::reviewed(&spec.runtime)
+            && hash_file(&spec.executable).await.ok().as_deref()
+                == Some(spec.runtime.manifest.entrypoint_sha256.as_str());
+        self.prompt_timing.write().await.insert(
+            endpoint.clone(),
+            PromptTimingLaunch {
+                runtime_id: spec.runtime.manifest.runtime_id.clone(),
+                executable_sha256: spec.runtime.manifest.entrypoint_sha256.clone(),
+                reviewed,
+                ready: false,
+            },
+        );
+    }
+
+    async fn native_prefill_verified(&self, endpoint: &str) -> bool {
+        self.prompt_timing
+            .read()
+            .await
+            .get(endpoint)
+            .is_some_and(|launch| launch.ready)
+    }
+}
+
 struct SseState {
+    native_prefill_verified: bool,
     source: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     buffer: Vec<u8>,
     queued: VecDeque<Result<InferenceEvent, EngineError>>,
@@ -2052,10 +2132,12 @@ struct SseState {
 }
 
 fn llama_sse_stream(
+    native_prefill_verified: bool,
     source: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     activity: InferenceActivityReporter,
 ) -> InferenceStream {
     let state = SseState {
+        native_prefill_verified,
         source,
         buffer: Vec::new(),
         queued: VecDeque::new(),
@@ -2179,6 +2261,17 @@ fn parse_sse_frames(state: &mut SseState) {
                     return;
                 }
             }
+        }
+        // Reviewed b10665 server-common.cpp: prompt_n is n_prompt_processed,
+        // cache_n is n_prompt_cached, prompt_ms is t_prompt_ms(). The final
+        // OAI streaming usage frame carries these stats (server-task.cpp).
+        // Accept only co-located terminal usage/timing, never progress snapshots.
+        if state.native_prefill_verified
+            && value.get("usage").is_some_and(|v| !v.is_null())
+            && let Some(usage) = state.usage.as_mut()
+            && let Some(timings) = value.get("timings")
+        {
+            apply_prompt_timings(usage, timings);
         }
         if let Some(finish_reason) = value
             .get("choices")
@@ -5351,6 +5444,7 @@ impl LlamaCppAdapter {
         route: &str,
         body: Value,
     ) -> Result<InferenceOutput, EngineError> {
+        let native_prefill_verified = self.native_prefill_verified(endpoint).await;
         let response = self
             .client
             .post(format!("{endpoint}{route}"))
@@ -5391,7 +5485,13 @@ impl LlamaCppAdapter {
         Ok(InferenceOutput {
             text,
             tool_calls: Vec::new(),
-            usage: response.usage.map(Into::into),
+            usage: response.usage.map(|usage| {
+                let mut usage = InferenceUsage::from(usage);
+                if native_prefill_verified && let Some(timings) = &response.timings {
+                    apply_prompt_timings(&mut usage, timings);
+                }
+                usage
+            }),
             finish_reason,
         })
     }
@@ -5403,6 +5503,7 @@ impl LlamaCppAdapter {
         body: Value,
         activity: InferenceActivityReporter,
     ) -> Result<InferenceStream, EngineError> {
+        let native_prefill_verified = self.native_prefill_verified(endpoint).await;
         let response = self
             .client
             .post(format!("{endpoint}{route}"))
@@ -5419,7 +5520,11 @@ impl LlamaCppAdapter {
                 .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
             return Err(backend_http_error(status, &body));
         }
-        Ok(llama_sse_stream(response.bytes_stream().boxed(), activity))
+        Ok(llama_sse_stream(
+            native_prefill_verified,
+            response.bytes_stream().boxed(),
+            activity,
+        ))
     }
 }
 

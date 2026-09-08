@@ -230,6 +230,7 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
                 hint(glyphs.up_down, "setting", theme),
                 hint("Enter", "edit", theme),
                 hint("e", "change engine", theme),
+                hint("C", "capabilities", theme),
                 hint("l", "load profile", theme),
                 hint("u", "unload active", theme),
                 hint("Delete", "inherit", theme),

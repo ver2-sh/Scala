@@ -1317,6 +1317,36 @@ pub struct InferenceUsage {
     pub cached_input_tokens: Option<u64>,
     pub cache_write_input_tokens: Option<u64>,
     pub reasoning_output_tokens: Option<u64>,
+    /// Native tokens actually processed in prefill, excluding cache reuse.
+    #[serde(default)]
+    pub prompt_processing_tokens: Option<u64>,
+    /// Native per-request prefill duration; never first-visible latency.
+    #[serde(default)]
+    pub prompt_processing_ms: Option<f64>,
+}
+
+impl InferenceUsage {
+    /// A rate requires both native observations. Total input and cache counters
+    /// are accounting checks, never substitutes for processed-token evidence.
+    pub fn prefill_tokens_per_second(&self) -> Option<f64> {
+        let tokens = self.prompt_processing_tokens?;
+        let ms = self.prompt_processing_ms?;
+        if tokens == 0
+            || !ms.is_finite()
+            || ms <= 0.0
+            || tokens > self.input_tokens
+            || Some(self.total_tokens) != self.input_tokens.checked_add(self.output_tokens)
+            || self.cached_input_tokens.is_some_and(|cached| {
+                tokens
+                    .checked_add(cached)
+                    .is_none_or(|n| n > self.input_tokens)
+            })
+        {
+            return None;
+        }
+        let rate = tokens as f64 * 1000.0 / ms;
+        (rate.is_finite() && rate > 0.0).then_some(rate)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

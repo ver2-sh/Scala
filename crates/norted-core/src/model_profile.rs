@@ -336,6 +336,19 @@ fn read_state(path: &Path) -> Result<ModelProfilesState, StateStoreError> {
             });
         }
     };
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|source| StateStoreError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let version = envelope["version"].as_u64().unwrap_or(0);
+    if version != u64::from(MODEL_PROFILES_STATE_VERSION) {
+        return Err(SettingsError::UnsupportedStateVersion {
+            found: u32::try_from(version).unwrap_or(u32::MAX),
+            supported: MODEL_PROFILES_STATE_VERSION,
+        }
+        .into());
+    }
     let state: ModelProfilesState =
         serde_json::from_slice(&bytes).map_err(|source| StateStoreError::Parse {
             path: path.to_path_buf(),

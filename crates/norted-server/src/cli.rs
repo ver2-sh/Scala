@@ -377,6 +377,10 @@ pub enum BenchmarksCommand {
     Start {
         profile_id: norted_core::ModelProfileId,
     },
+    /// Inspect the fixed v4 plan and ceilings without loading or inference
+    Plan {
+        profile_id: norted_core::ModelProfileId,
+    },
     /// Show current progress and each profile's latest applicable result
     Status,
     /// Cancel the active attempt and stop its managed inference
@@ -394,6 +398,7 @@ impl From<BenchmarksCommand> for norted_engine::benchmark::BenchmarkRequest {
     fn from(command: BenchmarksCommand) -> Self {
         match command {
             BenchmarksCommand::Start { profile_id } => Self::Start { profile_id },
+            BenchmarksCommand::Plan { profile_id } => Self::Plan { profile_id },
             BenchmarksCommand::Status => Self::Status,
             BenchmarksCommand::Cancel => Self::Cancel,
             BenchmarksCommand::History { profile_id } => Self::History { profile_id },
