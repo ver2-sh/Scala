@@ -1,6 +1,7 @@
 //! llama.cpp-specific launch, probe, health, and inference translation.
 
 mod catalog;
+mod chat;
 mod prefill;
 mod source_catalog;
 
@@ -32,13 +33,14 @@ use norted_engine::{
     EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError, EngineFeature,
     EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceActivityReporter,
     InferenceActivityUpdate, InferenceEvent, InferenceFinishReason, InferenceMessage,
-    InferenceOutput, InferenceRequest, InferenceRole, InferenceStream, InferenceUsage,
-    InstallationState, LaunchRequest, LaunchSpec, LoadProgressReporter, NativeOption, OutputFormat,
-    PreparedModelInput, ProcessDescriptor, RuntimeVariantUpdateIdentity, StartupObservation,
-    UpdateState, capture_command, common_setting_definitions_for, compatibility_for,
-    isolated_cuda_environment_for_binding, prepare_norted_package_input,
-    prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
-    revalidate_norted_package_before_launch_with_progress, visible_nvidia_device_set,
+    InferenceOutput, InferenceRequest, InferenceRole, InferenceStream, InferenceToolCall,
+    InferenceToolChoice, InferenceUsage, InstallationState, LaunchRequest, LaunchSpec,
+    LoadProgressReporter, NativeOption, OutputFormat, PreparedModelInput, ProcessDescriptor,
+    RuntimeVariantUpdateIdentity, StartupObservation, UpdateState, capture_command,
+    common_setting_definitions_for, compatibility_for, isolated_cuda_environment_for_binding,
+    prepare_norted_package_input, prepare_norted_package_input_with_progress,
+    revalidate_norted_package_before_launch, revalidate_norted_package_before_launch_with_progress,
+    visible_nvidia_device_set,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -82,6 +84,10 @@ fn managed_llama_variant_update_identity(
         "managed-portable-exact-stop-v1" => ("managed-linux-x86_64-cuda12-portable-exact-stop", 1),
         "managed-portable-cuda13-exact-stop-v1" => {
             ("managed-linux-x86_64-cuda13-portable-exact-stop", 1)
+        }
+        "managed-portable-exact-stop-v2" => ("managed-linux-x86_64-cuda12-portable-exact-stop", 2),
+        "managed-portable-cuda13-exact-stop-v2" => {
+            ("managed-linux-x86_64-cuda13-portable-exact-stop", 2)
         }
         "managed-portable-v4" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 4),
         "managed-portable-cuda13-v1" => (MANAGED_CUDA13_FUNCTIONAL_VARIANT, 1),
@@ -325,6 +331,7 @@ pub struct LlamaCppAdapter {
     environment: BTreeMap<String, String>,
     configuration_error: Option<String>,
     client: reqwest::Client,
+    chat_proofs: std::sync::RwLock<BTreeMap<String, chat::LaunchProof>>,
     capability_cache: tokio::sync::RwLock<BTreeMap<String, String>>,
     /// Replaced before every launch attempt; activated only for its matching process.
     prompt_timing: tokio::sync::RwLock<BTreeMap<String, PromptTimingLaunch>>,
@@ -431,6 +438,7 @@ impl LlamaCppAdapter {
             environment,
             configuration_error,
             client: reqwest::Client::new(),
+            chat_proofs: std::sync::RwLock::new(BTreeMap::new()),
             capability_cache: tokio::sync::RwLock::new(BTreeMap::new()),
             prompt_timing: tokio::sync::RwLock::new(BTreeMap::new()),
         }
@@ -602,6 +610,7 @@ impl LlamaCppAdapter {
             "messages": messages,
             "stream": stream,
         });
+        chat::request_fields(&mut body, request);
         if let Some(maximum) = request.max_output_tokens {
             body["max_completion_tokens"] = json!(maximum);
         }
@@ -635,7 +644,9 @@ impl LlamaCppAdapter {
         if let Some(output_format) = &request.output_format {
             body["response_format"] = match output_format {
                 OutputFormat::Text => json!({ "type": "text" }),
-                OutputFormat::JsonObject => json!({ "type": "json_object" }),
+                OutputFormat::JsonObject => {
+                    json!({ "type": "json_object", "schema": {"type": "object"} })
+                }
                 OutputFormat::JsonSchema {
                     name,
                     description,
@@ -714,20 +725,24 @@ impl EngineAdapter for LlamaCppAdapter {
                 ApiCapability::Completions,
                 ApiCapability::Embeddings,
             ],
-            features: vec![EngineFeature::TextGeneration],
+            features: vec![
+                EngineFeature::TextGeneration,
+                EngineFeature::ToolCalling,
+                EngineFeature::StructuredOutput,
+            ],
         }
     }
 
     fn serving_features(
         &self,
-        _runtime: &InstalledRuntime,
+        runtime: &InstalledRuntime,
         model: &ModelArtifact,
-        _settings: Option<&norted_core::ResolvedSettings>,
+        settings: Option<&norted_core::ResolvedSettings>,
     ) -> Vec<EngineFeature> {
         if pooled_embedding_model(model) {
             Vec::new()
         } else {
-            self.capabilities().features
+            self.chat_serving_features(runtime, model, settings)
         }
     }
 
@@ -815,6 +830,7 @@ impl EngineAdapter for LlamaCppAdapter {
         settings_schema: &SettingsSchema,
     ) -> Result<(), EngineError> {
         self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
+        chat::validate_request(request)?;
         let required = [
             (
                 request.generation_settings.stop_token_ids.is_some(),
@@ -1512,6 +1528,16 @@ impl EngineAdapter for LlamaCppAdapter {
         }))
     }
 
+    async fn clear_launch_state(&self, endpoint: Option<&str>) {
+        if let Some(endpoint) = endpoint {
+            self.chat_proofs
+                .write()
+                .expect("chat proof lock")
+                .remove(endpoint);
+            self.prompt_timing.write().await.remove(endpoint);
+        }
+    }
+
     async fn health(&self, process: &ProcessDescriptor) -> Result<bool, EngineError> {
         let endpoint = process.endpoint.as_deref().ok_or_else(|| {
             EngineError::Operation("llama.cpp process has no backend endpoint".to_owned())
@@ -1556,6 +1582,7 @@ impl EngineAdapter for LlamaCppAdapter {
                 launch.ready
             })
         };
+        self.observe_chat(process).await;
         let properties = self.startup_properties(endpoint).await?;
         let mut resolved_settings = serde_json::Map::from_iter([(
             "llama.cpp.context_length".to_owned(),
@@ -1568,6 +1595,7 @@ impl EngineAdapter for LlamaCppAdapter {
             );
         }
         Ok(StartupObservation::Ready(BTreeMap::from([
+            ("chat_contract".to_owned(), self.chat_observation(endpoint)),
             (
                 "resolved_settings".to_owned(),
                 Value::Object(resolved_settings),
@@ -1720,6 +1748,7 @@ impl EngineAdapter for LlamaCppAdapter {
         endpoint: &str,
         request: InferenceRequest,
     ) -> Result<InferenceOutput, EngineError> {
+        self.validate_chat_endpoint(endpoint, &request)?;
         self.send_completion(
             endpoint,
             "/v1/chat/completions",
@@ -1734,6 +1763,7 @@ impl EngineAdapter for LlamaCppAdapter {
         request: InferenceRequest,
         activity: InferenceActivityReporter,
     ) -> Result<InferenceStream, EngineError> {
+        self.validate_chat_endpoint(endpoint, &request)?;
         self.send_completion_stream(
             endpoint,
             "/v1/chat/completions",
@@ -2078,6 +2108,8 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatMessage {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<chat::WireToolCall>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2140,6 +2172,7 @@ impl LlamaCppAdapter {
         let Some(endpoint) = spec.endpoint.as_ref() else {
             return;
         };
+        self.prepare_chat(spec).await;
         // Clear old endpoint proof before verification, including failed/retried loads.
         self.prompt_timing.write().await.remove(endpoint);
         let reviewed = prefill::reviewed(&spec.runtime)
@@ -2166,6 +2199,7 @@ impl LlamaCppAdapter {
 }
 
 struct SseState {
+    tool_calls: chat::StreamCalls,
     native_prefill_verified: bool,
     source: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     buffer: Vec<u8>,
@@ -2182,6 +2216,7 @@ fn llama_sse_stream(
     activity: InferenceActivityReporter,
 ) -> InferenceStream {
     let state = SseState {
+        tool_calls: chat::StreamCalls::default(),
         native_prefill_verified,
         source,
         buffer: Vec::new(),
@@ -2246,6 +2281,11 @@ fn parse_sse_frames(state: &mut SseState) {
         if data == "[DONE]" {
             match state.finish_reason.take() {
                 Some(finish_reason) => {
+                    if let Err(error) = state.tool_calls.finish(&finish_reason) {
+                        state.queued.push_back(Err(error));
+                        state.finished = true;
+                        return;
+                    }
                     state.queued.push_back(Ok(InferenceEvent::Completed {
                         usage: state.usage.take(),
                         finish_reason,
@@ -2317,6 +2357,14 @@ fn parse_sse_frames(state: &mut SseState) {
             && let Some(timings) = value.get("timings")
         {
             apply_prompt_timings(usage, timings);
+        }
+        match state.tool_calls.deltas(&value) {
+            Ok(events) => state.queued.extend(events.into_iter().map(Ok)),
+            Err(error) => {
+                state.queued.push_back(Err(error));
+                state.finished = true;
+                return;
+            }
         }
         if let Some(finish_reason) = value
             .get("choices")
@@ -2395,7 +2443,10 @@ fn backend_messages(messages: &[InferenceMessage]) -> Vec<Value> {
         messages
             .iter()
             .filter(|message| {
-                matches!(message.role, InferenceRole::User | InferenceRole::Assistant)
+                matches!(
+                    message.role,
+                    InferenceRole::User | InferenceRole::Assistant | InferenceRole::Tool
+                )
             })
             .map(message_json),
     );
@@ -2403,7 +2454,7 @@ fn backend_messages(messages: &[InferenceMessage]) -> Vec<Value> {
 }
 
 fn message_json(message: &InferenceMessage) -> Value {
-    json!({
+    let mut value = json!({
         "role": match message.role {
             InferenceRole::User => "user",
             InferenceRole::Assistant => "assistant",
@@ -2411,7 +2462,20 @@ fn message_json(message: &InferenceMessage) -> Value {
             InferenceRole::Tool => "tool",
         },
         "content": message.text_only().unwrap_or_default(),
-    })
+    });
+    if !message.tool_calls.is_empty() {
+        value["tool_calls"] = Value::Array(
+            message
+                .tool_calls
+                .iter()
+                .map(chat::tool_call_json)
+                .collect(),
+        );
+    }
+    if let Some(id) = &message.tool_call_id {
+        value["tool_call_id"] = json!(id);
+    }
+    value
 }
 
 fn invalid_probe(reason: String) -> EngineProbe {
@@ -5506,6 +5570,7 @@ impl LlamaCppAdapter {
         route: &str,
         body: Value,
     ) -> Result<InferenceOutput, EngineError> {
+        let constraint = chat::OutputConstraint::from_body(&body)?;
         let native_prefill_verified = self.native_prefill_verified(endpoint).await;
         let response = self
             .client
@@ -5526,6 +5591,11 @@ impl LlamaCppAdapter {
         let response: ChatCompletionResponse = serde_json::from_slice(&body).map_err(|error| {
             EngineError::Operation(format!("invalid llama.cpp completion response: {error}"))
         })?;
+        if response.choices.len() > 1 {
+            return Err(EngineError::Operation(
+                "llama.cpp returned multiple completion choices".into(),
+            ));
+        }
         let choice = response.choices.into_iter().next().ok_or_else(|| {
             EngineError::Operation("llama.cpp response contained no completion choice".to_owned())
         })?;
@@ -5538,15 +5608,27 @@ impl LlamaCppAdapter {
         }
 
         let finish_reason = map_finish_reason(choice.finish_reason.as_deref())?;
+        let (content, calls) = choice
+            .message
+            .map(|m| (m.content, m.tool_calls))
+            .unwrap_or_default();
+        let tool_calls = chat::parse_calls(calls)?;
+        chat::validate_call_finish(&tool_calls, &finish_reason)?;
         let text = choice
             .text
-            .or_else(|| choice.message.and_then(|message| message.content))
+            .or(content)
+            .or_else(|| (!tool_calls.is_empty()).then(String::new))
             .ok_or_else(|| {
-                EngineError::Operation("llama.cpp response contained no assistant text".to_owned())
+                EngineError::Operation(
+                    "llama.cpp response contained no assistant text or tool calls".to_owned(),
+                )
             })?;
+        if let Some(constraint) = constraint {
+            constraint.validate(&text, &tool_calls, &finish_reason)?;
+        }
         Ok(InferenceOutput {
             text,
-            tool_calls: Vec::new(),
+            tool_calls,
             usage: response.usage.map(|usage| {
                 let mut usage = InferenceUsage::from(usage);
                 if native_prefill_verified && let Some(timings) = &response.timings {
@@ -5565,6 +5647,7 @@ impl LlamaCppAdapter {
         body: Value,
         activity: InferenceActivityReporter,
     ) -> Result<InferenceStream, EngineError> {
+        let constraint = chat::OutputConstraint::from_body(&body)?;
         let native_prefill_verified = self.native_prefill_verified(endpoint).await;
         let response = self
             .client
@@ -5582,11 +5665,12 @@ impl LlamaCppAdapter {
                 .map_err(|error| EngineError::BackendUnavailable(error.to_string()))?;
             return Err(backend_http_error(status, &body));
         }
-        Ok(llama_sse_stream(
+        let stream = llama_sse_stream(
             native_prefill_verified,
             response.bytes_stream().boxed(),
             activity,
-        ))
+        );
+        Ok(chat::validate_stream(stream, constraint))
     }
 }
 
@@ -5893,6 +5977,7 @@ fn parse_version(output: &str) -> (Option<String>, Option<String>) {
 
 fn map_finish_reason(reason: Option<&str>) -> Result<InferenceFinishReason, EngineError> {
     match reason {
+        Some("tool_calls") => Ok(InferenceFinishReason::ToolCalls),
         Some("stop") => Ok(InferenceFinishReason::Stop),
         Some("length") => Ok(InferenceFinishReason::MaxOutputTokens),
         Some(reason) => Err(EngineError::Operation(format!(

@@ -51,12 +51,12 @@ const MANAGED_CUDA_RECIPES: [ManagedCudaRecipe; 2] = [CUDA12_RECIPE, CUDA13_RECI
 
 const EXACT_STOP_RECIPES: [ManagedCudaRecipe; 2] = [
     ManagedCudaRecipe {
-        variant: "managed-portable-exact-stop-v1",
+        variant: "managed-portable-exact-stop-v2",
         display_name: "llama.cpp CUDA exact token stops (reviewed source)",
         ..CUDA12_RECIPE
     },
     ManagedCudaRecipe {
-        variant: "managed-portable-cuda13-exact-stop-v1",
+        variant: "managed-portable-cuda13-exact-stop-v2",
         display_name: "llama.cpp CUDA 13 exact token stops (reviewed source)",
         ..CUDA13_RECIPE
     },
@@ -67,6 +67,16 @@ impl ManagedCudaRecipe {
         MANAGED_CUDA_RECIPES
             .into_iter()
             .chain(EXACT_STOP_RECIPES)
+            .chain([
+                ManagedCudaRecipe {
+                    variant: "managed-portable-exact-stop-v1",
+                    ..EXACT_STOP_RECIPES[0]
+                },
+                ManagedCudaRecipe {
+                    variant: "managed-portable-cuda13-exact-stop-v1",
+                    ..EXACT_STOP_RECIPES[1]
+                },
+            ])
             .find(|recipe| recipe.variant == variant)
     }
 }
