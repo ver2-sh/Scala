@@ -59,7 +59,7 @@ HF's EOS configuration supports scalar/list token IDs; see the
 
 | Runtime | Exact source/variant | Support |
 | --- | --- | --- |
-| llama.cpp | `b10786`, `de8656bd94f1163188125542534e4bcbc9f9fb1f`; `managed-portable-exact-stop-v1` and `managed-portable-cuda13-exact-stop-v1` | Norted source overlay |
+| llama.cpp | `b10786`, `de8656bd94f1163188125542534e4bcbc9f9fb1f`; `managed-portable-exact-stop-v2` and `managed-portable-cuda13-exact-stop-v2` (V1 remains supported for exact stops) | Norted source overlay |
 | NInfer | `863aa8a5f1e866db74f29f8999b83b4021398dee`; `ninfer-serve-exact-stop-v1-sm120a` | Norted source overlay, speculation off |
 | q27 | reviewed `0.10.0`, `4770e053656af9aababdc49c81f280ad21b74986` | Unsupported; blocker below |
 | Official/unpatched binaries | no matching reviewed overlay provenance | Unsupported |
@@ -100,7 +100,8 @@ update stream and may also use an otherwise compatible exact-stop runtime.
 
 Overlay SHA256:
 
-* llama.cpp: `b6eb1527b0ee0305d0bc3b6cde7f3e45c580564c934e1fe39e86f78e0b18720e`
+* llama.cpp V1 (unchanged): `b6eb1527b0ee0305d0bc3b6cde7f3e45c580564c934e1fe39e86f78e0b18720e`
+* llama.cpp V2: `f1a579cb1e2484bd8bf29f987a7fe9a79ddae015f04733521a445d776bdfa873`
 * NInfer: `5bf963935fbb1ce853a76f2759771d0f8c947071c82f92865435e69378b4a868`
 
 ### llama.cpp
@@ -109,15 +110,18 @@ The reviewed upstream server has text stops and native EOS/EOG but no arbitrary
 request token-stop array. The overlay validates every integer against the loaded
 vocabulary and stores the list in task/slot generation state. It compares the
 newly sampled token before publishing its decoded text, ends the slot, and
-reports Stop. The sampled terminal contributes one completion token, matching
-native EOS accounting. A distinct native `stop_type: "token_id"` permits exact
+reports Stop for text, or ToolCalls for a decoded tool turn in V2. The sampled
+terminal contributes one completion token, matching native EOS accounting. A distinct native `stop_type: "token_id"` permits exact
 manual verification, including when the selected token is also native EOS.
 
 Explicit token-stop requests disable per-slot speculative sampling: the runtime
 must not sample later tokens and trim them afterward. Text stops, native EOG,
 structured output, and tool decoding retain their independent paths. Explicit
-token termination reports Stop even after tool content. `ignore_eos` cannot turn
-off the explicit token comparison. Because native-EOS suppression masks EOG
+token termination in V1 reports Stop even after tool content. V2 corrects the two
+OpenAI chat terminal classifiers to retain ToolCalls when calls are present;
+the sampled-token comparison and exclusion are unchanged. See the
+[chat capability contract and real-model evidence](llama-retrieval-capabilities.md).
+`ignore_eos` cannot turn off the explicit token comparison. Because native-EOS suppression masks EOG
 tokens during sampling, combining `ignore_eos` with an explicit native EOG ID
 is rejected before generation. Other explicit IDs remain enforceable.
 
