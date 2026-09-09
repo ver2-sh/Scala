@@ -50,6 +50,7 @@ const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
     "presence_penalty",
     "frequency_penalty",
     "stop",
+    "stop_token_ids",
     "top_k",
     "min_p",
     "text",
@@ -1572,6 +1573,8 @@ mod tests {
             tool_choice: None,
             parallel_tool_calls: false,
             effective_generation_settings: EffectiveGenerationSettings {
+                stop_token_ids: None,
+                required_stop_token_ids: Vec::new(),
                 temperature: 0.7,
                 top_p: 0.95,
             },

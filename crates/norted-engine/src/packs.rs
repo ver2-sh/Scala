@@ -2805,6 +2805,7 @@ mod tests {
             native_identity: None,
             auxiliary_artifacts: Vec::new(),
             norted_package: None,
+            generation_contract: Default::default(),
         };
 
         let (selection, schema) = manager
@@ -3206,6 +3207,7 @@ mod tests {
                 recipe_version: legacy.recipe_version.clone(),
                 build_system: RuntimeSourceBuildSystem::Cmake,
                 build_definition_sha256: None,
+                source_overlay_sha256: None,
                 cmake_configuration_arguments: Vec::new(),
                 build_target: legacy.build_target.clone(),
                 entrypoint: PathBuf::from("build/fixture"),
@@ -3278,6 +3280,7 @@ mod tests {
                     recipe_version: "fixture-v1".to_owned(),
                     build_system: RuntimeSourceBuildSystem::Cmake,
                     build_definition_sha256: None,
+                    source_overlay_sha256: None,
                     cmake_configuration_arguments: Vec::new(),
                     effective_cmake_configuration_arguments: None,
                     build_target: "fixture".to_owned(),

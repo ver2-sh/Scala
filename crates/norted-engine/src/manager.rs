@@ -1084,6 +1084,16 @@ impl RuntimeManager {
                 return Err(RuntimeError::StartupFailed(error.to_string()));
             }
         };
+        if !model.generation_contract.required_stop_token_ids.is_empty() {
+            let required = crate::GenerationSettingsPatch {
+                stop_token_ids: Some(model.generation_contract.required_stop_token_ids.clone()),
+                ..Default::default()
+            };
+            if let Err(error) = validate_token_stop_support(&settings_schema, &required) {
+                self.fail_loading(generation, error.to_string(), None).await;
+                return Err(RuntimeError::StartupFailed(error.to_string()));
+            }
+        }
         if let Err(error) = settings_schema
             .materialize_runtime_configuration(&mut resolved_settings)
             .and_then(|()| settings_schema.validate(&resolved_settings))
@@ -1449,7 +1459,7 @@ impl RuntimeManager {
             };
             match observation {
                 StartupObservation::Ready(mut observation) => {
-                    let settings = match adapter.effective_generation_settings(&process).await {
+                    let mut settings = match adapter.effective_generation_settings(&process).await {
                         Ok(settings) => settings,
                         Err(error) => {
                             cleanup_pending_launch_files(&launch_attempts).await;
@@ -1463,10 +1473,12 @@ impl RuntimeManager {
                             return Err(RuntimeError::StartupFailed(detail));
                         }
                     };
+                    settings.required_stop_token_ids =
+                        model.generation_contract.required_stop_token_ids.clone();
                     if let Err(error) = merge_effective_generation_settings(
                         &mut observation,
                         &resolved_settings.engine_id,
-                        settings,
+                        settings.clone(),
                     ) {
                         cleanup_pending_launch_files(&launch_attempts).await;
                         let detail = format!(
@@ -1856,6 +1868,15 @@ impl RuntimeManager {
         )
         .await
         .map_err(map_inference_error)?;
+        let effective_generation_settings = target
+            .generation_settings
+            .merged(&request.generation_settings);
+        target
+            .generation_settings
+            .resolve_stop_token_ids(&mut request.generation_settings)
+            .map_err(map_inference_error)?;
+        validate_token_stop_support(&target.settings_schema, &request.generation_settings)
+            .map_err(map_inference_error)?;
         target
             .adapter
             .validate_inference_request(
@@ -1864,9 +1885,6 @@ impl RuntimeManager {
                 &target.settings_schema,
             )
             .map_err(map_inference_error)?;
-        let effective_generation_settings = target
-            .generation_settings
-            .merged(&request.generation_settings);
         let effective_output_format = request.output_format.clone();
         let output = target
             .adapter
@@ -1909,6 +1927,15 @@ impl RuntimeManager {
         )
         .await
         .map_err(map_inference_error)?;
+        let effective_generation_settings = target
+            .generation_settings
+            .merged(&request.generation_settings);
+        target
+            .generation_settings
+            .resolve_stop_token_ids(&mut request.generation_settings)
+            .map_err(map_inference_error)?;
+        validate_token_stop_support(&target.settings_schema, &request.generation_settings)
+            .map_err(map_inference_error)?;
         target
             .adapter
             .validate_inference_request(
@@ -1917,9 +1944,6 @@ impl RuntimeManager {
                 &target.settings_schema,
             )
             .map_err(map_inference_error)?;
-        let effective_generation_settings = target
-            .generation_settings
-            .merged(&request.generation_settings);
         let effective_output_format = request.output_format.clone();
         target.lease.mark_processing_prompt();
         let activity = target.lease.activity_reporter();
@@ -2402,7 +2426,7 @@ impl RuntimeManager {
         Ok(InferenceTarget {
             adapter: Arc::clone(&active.adapter),
             endpoint: active.endpoint.clone(),
-            generation_settings: active.effective_generation_settings,
+            generation_settings: active.effective_generation_settings.clone(),
             settings: active.settings.clone(),
             settings_schema: active.settings_schema.clone(),
             lease,
@@ -2451,7 +2475,7 @@ impl RuntimeManager {
         Some(InferenceTarget {
             adapter: Arc::clone(&active.adapter),
             endpoint: active.endpoint.clone(),
-            generation_settings: active.effective_generation_settings,
+            generation_settings: active.effective_generation_settings.clone(),
             settings: active.settings.clone(),
             settings_schema: active.settings_schema.clone(),
             lease,
@@ -2800,6 +2824,16 @@ fn prepare_generation_patch(
     {
         patch.frequency_penalty = Some(*value);
     }
+    if patch.stop_token_ids.is_none()
+        && let Some(norted_core::SettingValue::UnsignedIntegerList(ids)) =
+            settings.runtime_value("stop_token_ids")
+    {
+        patch.stop_token_ids = Some(
+            ids.iter()
+                .map(|id| u32::try_from(*id).expect("validated token ID setting"))
+                .collect(),
+        );
+    }
     if patch.stop.is_none()
         && let Some(norted_core::SettingValue::StringList(value)) =
             settings.runtime_value("stop_strings")
@@ -2819,6 +2853,12 @@ fn prepare_completion_request(
     {
         request.max_output_tokens = u32::try_from(*value).ok();
     }
+    target
+        .generation_settings
+        .resolve_stop_token_ids(&mut request.generation_settings)
+        .map_err(map_inference_error)?;
+    validate_token_stop_support(&target.settings_schema, &request.generation_settings)
+        .map_err(map_inference_error)?;
     target
         .adapter
         .validate_generation_settings(&request.generation_settings, &target.generation_settings)
@@ -3184,6 +3224,25 @@ fn retry_context_capacity_message(
     format!(
         "KV mode {kv_mode} served {observed_context} of the required {minimum_context} context tokens; retrying with the next configured automatic KV mode"
     )
+}
+
+fn validate_token_stop_support(
+    schema: &norted_core::SettingsSchema,
+    patch: &crate::GenerationSettingsPatch,
+) -> Result<(), EngineError> {
+    patch.validate_stop_token_ids()?;
+    if patch.stop_token_ids.is_some()
+        && !schema
+            .definitions
+            .iter()
+            .any(|d| d.id.as_str() == format!("{}.stop_token_ids", schema.engine_id) && d.supported)
+    {
+        return Err(EngineError::InvalidGenerationSettings(format!(
+            "{} runtime cannot enforce required/configured exact stop token IDs",
+            schema.engine_id
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

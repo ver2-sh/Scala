@@ -297,6 +297,9 @@ pub struct RuntimeSourceBuildRecipe {
     /// definition admitted during catalog discovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_definition_sha256: Option<String>,
+    /// Complete SHA256 of the Norted-owned patch applied to the immutable source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_overlay_sha256: Option<String>,
     pub cmake_configuration_arguments: Vec<String>,
     pub build_target: String,
     pub entrypoint: PathBuf,
@@ -406,6 +409,9 @@ pub struct RuntimeSourceBuildProvenance {
     pub build_system: RuntimeSourceBuildSystem,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_definition_sha256: Option<String>,
+    /// Complete SHA256 of the Norted-owned patch applied to the immutable source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_overlay_sha256: Option<String>,
     /// Provider-owned recipe arguments. Historical schema-2 manifests record
     /// only this field and remain truthful about what their provider declared.
     pub cmake_configuration_arguments: Vec<String>,
@@ -987,6 +993,9 @@ fn validate_source_build_plan(
         ));
     }
     let recipe = &plan.recipe;
+    if let Some(digest) = &recipe.source_overlay_sha256 {
+        RuntimeDigest::sha256(digest.clone())?;
+    }
     effective_cmake_configuration_arguments(plan)
         .map_err(|error| RuntimeManifestError::InvalidSourceBuild(error.to_string()))?;
     if recipe.recipe_version.trim().is_empty()
@@ -1091,6 +1100,9 @@ fn validate_source_build_provenance(
     manifest: &RuntimeManifest,
 ) -> Result<(), RuntimeManifestError> {
     validate_source_snapshot(&provenance.source)?;
+    if let Some(digest) = &provenance.source_overlay_sha256 {
+        RuntimeDigest::sha256(digest.clone())?;
+    }
     RuntimeDigest::sha256(provenance.entrypoint_sha256.clone())?;
     if let Some(digest) = &provenance.build_definition_sha256 {
         RuntimeDigest::sha256(digest.clone())?;
@@ -1344,6 +1356,7 @@ mod tests {
                 recipe_version: "ninfer-serve-v1".to_owned(),
                 build_system: RuntimeSourceBuildSystem::Cmake,
                 build_definition_sha256: None,
+                source_overlay_sha256: None,
                 cmake_configuration_arguments: vec!["-G".to_owned(), "Ninja".to_owned()],
                 effective_cmake_configuration_arguments: None,
                 build_target: "ninfer-serve".to_owned(),

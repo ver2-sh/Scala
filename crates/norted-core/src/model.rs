@@ -8,9 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
-use crate::norted_package::{
-    PackageDirectory, discover_package_directory, norted_package_manifest_name,
-};
+use crate::norted_package::{PackageDirectory, discover_package_directory};
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -74,6 +72,8 @@ pub struct GgufArtifactIdentity {
     #[serde(default)]
     pub chat_template_sha256: Option<String>,
     pub tokenizer_metadata_sha256: Option<String>,
+    #[serde(default)]
+    pub native_eos_token_id: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +122,8 @@ pub struct ModelArtifactProvenance {
     /// Stable identity shared by every primary member of one atomic managed
     /// acquisition.
     pub acquisition_id: String,
+    #[serde(default)]
+    pub generation_contract: ModelGenerationContract,
     /// Acquisition mechanism (`huggingface` or `local_import`).
     pub provider: String,
     pub repository: Option<String>,
@@ -171,6 +173,8 @@ pub struct ModelArtifact {
     pub auxiliary_artifacts: Vec<AuxiliaryArtifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub norted_package: Option<crate::NortedPackageBinding>,
+    #[serde(default)]
+    pub generation_contract: ModelGenerationContract,
 }
 
 impl std::fmt::Display for ArtifactFormat {
@@ -356,6 +360,38 @@ impl ModelRegistry {
                         let logical_identity = provenance
                             .as_ref()
                             .and_then(|value| value.logical_id.as_deref());
+                        let mut generation_contract = match ModelGenerationContract::inspect(
+                            &canonical_path,
+                            native_identity.as_ref(),
+                        ) {
+                            Ok(contract) => contract,
+                            Err(error) => {
+                                registry.warnings.push(format!(
+                                    "invalid generation contract for {}: {error}",
+                                    canonical_path.display()
+                                ));
+                                continue;
+                            }
+                        };
+                        if let Some(member) = &package_member
+                            && let Err(error) = generation_contract
+                                .include_package(&canonical_path, &member.binding)
+                        {
+                            registry
+                                .warnings
+                                .push(format!("invalid package termination metadata: {error}"));
+                            continue;
+                        }
+                        if let Some(receipt) = &provenance {
+                            for id in &receipt.generation_contract.required_stop_token_ids {
+                                if !generation_contract.required_stop_token_ids.contains(id) {
+                                    generation_contract.required_stop_token_ids.push(*id);
+                                }
+                            }
+                            generation_contract
+                                .metadata_sha256
+                                .extend(receipt.generation_contract.metadata_sha256.clone());
+                        }
                         registry.artifacts.push(ModelArtifact {
                             id: model_id(path, format, &identity, logical_identity),
                             display_name: path
@@ -377,6 +413,7 @@ impl ModelRegistry {
                             native_identity,
                             auxiliary_artifacts,
                             norted_package: package_member.map(|member| member.binding),
+                            generation_contract,
                         });
                     }
                     Err(error) => registry
@@ -413,10 +450,7 @@ fn discover_package_for_artifact(
     let search_root = search_root.canonicalize().ok()?;
     let mut directory = artifact.parent()?;
     while directory.starts_with(&search_root) {
-        if directory
-            .join(norted_package_manifest_name(format))
-            .exists()
-        {
+        if crate::norted_package::local_norted_package_manifest(directory, format).exists() {
             let package = cache
                 .entry((directory.to_path_buf(), format))
                 .or_insert_with(|| discover_package_directory(directory, format))
@@ -483,6 +517,7 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
     let mut chat_template_sha256 = None;
     let mut tokenizer = Sha256::new();
     let mut tokenizer_fields = 0_u64;
+    let mut native_eos_token_id = None;
 
     for _ in 0..metadata_count {
         let key = reader.string(None)?;
@@ -491,7 +526,21 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
             tokenizer.update((key.len() as u64).to_le_bytes());
             tokenizer.update(key.as_bytes());
             tokenizer.update(value_type.to_le_bytes());
-            reader.value(value_type, None, Some(&mut tokenizer))?;
+            let value = reader.value(
+                value_type,
+                (key == "tokenizer.ggml.eos_token_id").then_some(key.as_str()),
+                Some(&mut tokenizer),
+            )?;
+            if key == "tokenizer.ggml.eos_token_id" {
+                native_eos_token_id = Some(
+                    value
+                        .and_then(GgufScalar::into_u64)
+                        .and_then(|id| u32::try_from(id).ok())
+                        .ok_or_else(|| {
+                            GgufMetadataError::Malformed("invalid native EOS token ID".to_owned())
+                        })?,
+                );
+            }
             tokenizer_fields += 1;
             continue;
         }
@@ -567,6 +616,7 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
         rope_scaling_factor,
         rope_scaling_factor_key,
         chat_template_sha256,
+        native_eos_token_id,
         tokenizer_metadata_sha256: (tokenizer_fields > 0)
             .then(|| format!("{:x}", tokenizer.finalize())),
     })
@@ -1250,6 +1300,248 @@ fn artifact_timestamp(metadata: &Metadata) -> i64 {
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
         .unwrap_or(0)
+}
+
+/// Mandatory model semantics are separate from persisted user generation controls.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelGenerationContract {
+    pub required_stop_token_ids: Vec<u32>,
+    pub native_eos_token_ids: Vec<u32>,
+    pub manifest_sha256: Option<String>,
+    #[serde(default)]
+    pub metadata_sha256: std::collections::BTreeMap<String, String>,
+}
+
+impl ModelGenerationContract {
+    fn include_package(
+        &mut self,
+        path: &Path,
+        package: &crate::NortedPackageBinding,
+    ) -> Result<(), String> {
+        if self.manifest_sha256.as_deref() == Some(package.manifest_sha256.as_str()) {
+            return Ok(());
+        }
+        if package
+            .manifest_path
+            .metadata()
+            .map_err(|e| e.to_string())?
+            .len()
+            > 16 * 1024 * 1024
+        {
+            return Err("package manifest exceeds size bound".to_owned());
+        }
+        let bytes = std::fs::read(&package.manifest_path).map_err(|e| e.to_string())?;
+        if format!("{:x}", Sha256::digest(&bytes)) != package.manifest_sha256 {
+            return Err("package manifest changed".to_owned());
+        }
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if let Some(value) = value.pointer("/serving/required_stop_token_ids") {
+            let ids = parse_terminal_token_ids(value, false)?;
+            if path.metadata().map_err(|e| e.to_string())?.len() != package.expected_primary_size
+                || crate::norted_package::sha256_file(path)? != package.expected_primary_sha256
+            {
+                return Err("package payload does not match termination provenance".to_owned());
+            }
+            for id in ids {
+                if !self.required_stop_token_ids.contains(&id) {
+                    self.required_stop_token_ids.push(id);
+                }
+            }
+            self.manifest_sha256 = Some(package.manifest_sha256.clone());
+        }
+        Ok(())
+    }
+
+    pub fn inspect(path: &Path, identity: Option<&ArtifactNativeIdentity>) -> Result<Self, String> {
+        let mut contract = Self::default();
+        if let Some(ArtifactNativeIdentity::Gguf(gguf)) = identity {
+            contract
+                .native_eos_token_ids
+                .extend(gguf.native_eos_token_id);
+        }
+        // Only an explicitly recognized, sealed deployment manifest may own a
+        // sibling payload. A random sibling JSON file is not provenance.
+        let Some(parent) = path.parent() else {
+            return Ok(contract);
+        };
+        let manifest = parent.join("manifest.json");
+        if !manifest.is_file() {
+            return Ok(contract);
+        }
+        if manifest.metadata().map_err(|e| e.to_string())?.len() > 16 * 1024 * 1024 {
+            return Ok(contract);
+        }
+        let bytes = std::fs::read(&manifest).map_err(|e| e.to_string())?;
+        let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => return Ok(contract),
+        };
+        if value.get("schema").and_then(serde_json::Value::as_str)
+            != Some("norted.grep-student-gguf.v1")
+        {
+            return Ok(contract);
+        }
+        let Some(targets) = value.get("targets").and_then(serde_json::Value::as_object) else {
+            return Err("missing deployment targets".to_owned());
+        };
+        let Some(target) = targets.values().find(|target| {
+            target.get("filename").and_then(serde_json::Value::as_str)
+                == path.file_name().and_then(|name| name.to_str())
+        }) else {
+            return Ok(contract);
+        };
+        validate_deployment_seal(&value, "artifact_id")?;
+        validate_deployment_seal(target, "target_id")?;
+        let conversion = value
+            .get("conversion")
+            .ok_or("missing conversion lineage")?;
+        validate_deployment_seal(conversion, "conversion_id")?;
+        if target.pointer("/recipe/conversion_id") != conversion.get("conversion_id")
+            || target.pointer("/recipe/high_precision") != conversion.get("output")
+        {
+            return Err("deployment target conversion lineage mismatch".to_owned());
+        }
+        let parent_id = value
+            .pointer("/parent/artifact_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("missing parent lineage")?;
+        if parent_id.len() != 64
+            || !parent_id.bytes().all(|c| c.is_ascii_hexdigit())
+            || value.pointer("/conversion/recipe/parent") != value.get("parent")
+        {
+            return Err("invalid deployment parent lineage".to_owned());
+        }
+        let output = target
+            .get("output")
+            .ok_or("missing target payload identity")?;
+        if output.get("size").and_then(serde_json::Value::as_u64)
+            != Some(path.metadata().map_err(|e| e.to_string())?.len())
+        {
+            return Err("deployment target size mismatch".to_owned());
+        }
+        let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0; 1024 * 1024];
+        loop {
+            let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            digest.update(&buffer[..n]);
+        }
+        if output.get("sha256").and_then(serde_json::Value::as_str)
+            != Some(format!("{:x}", digest.finalize()).as_str())
+        {
+            return Err("deployment target SHA256 mismatch".to_owned());
+        }
+        if let Some(ids) = value.pointer("/serving/required_stop_token_ids") {
+            contract.required_stop_token_ids = parse_terminal_token_ids(ids, false)?;
+            contract.manifest_sha256 = Some(format!("{:x}", Sha256::digest(&bytes)));
+        }
+        Ok(contract)
+    }
+}
+
+pub(crate) fn validate_deployment_seal(value: &serde_json::Value, key: &str) -> Result<(), String> {
+    let mut unsigned = value.clone();
+    let object = unsigned
+        .as_object_mut()
+        .ok_or("deployment record must be an object")?;
+    let claimed = object.remove(key).ok_or_else(|| format!("missing {key}"))?;
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(deployment_canonical_json(&unsigned)?)
+    );
+    if claimed.as_str() != Some(digest.as_str()) {
+        return Err(format!("deployment {key} seal mismatch"));
+    }
+    Ok(())
+}
+
+/// Explicit EOS metadata only. Special-token names never imply termination.
+pub fn parse_terminal_token_ids(
+    value: &serde_json::Value,
+    allow_scalar: bool,
+) -> Result<Vec<u32>, String> {
+    let ids: Vec<u32> = if allow_scalar && value.is_number() {
+        vec![serde_json::from_value(value.clone()).map_err(|_| "invalid unsigned EOS token ID")?]
+    } else {
+        serde_json::from_value(value.clone()).map_err(|_| "expected unsigned token ID array")?
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    if ids.is_empty() || ids.iter().any(|id| !seen.insert(*id)) {
+        return Err("terminal token IDs must be non-empty and distinct".to_owned());
+    }
+    Ok(ids)
+}
+
+/// HF generation configuration owns a non-null EOS value; otherwise model
+/// configuration supplies the fallback. Both scalar and list EOS are admitted.
+pub fn hugging_face_eos_token_ids(
+    generation: Option<&serde_json::Value>,
+    config: Option<&serde_json::Value>,
+) -> Result<Vec<u32>, String> {
+    let eos = generation
+        .and_then(|v| v.get("eos_token_id"))
+        .filter(|v| !v.is_null())
+        .or_else(|| {
+            config
+                .and_then(|v| v.get("eos_token_id"))
+                .filter(|v| !v.is_null())
+        });
+    eos.map(|v| parse_terminal_token_ids(v, true))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+// Norted deployment seals use Python JSON canonicalization: UTF-8 strings,
+// sorted keys, compact separators and shortest round-trip floats with signed,
+// two-digit exponents. Ordinary serde_json exponent spelling differs.
+fn deployment_canonical_json(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    fn render(value: &serde_json::Value) -> Result<String, String> {
+        use serde_json::Value;
+        Ok(match value {
+            Value::Array(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(render)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(",")
+            ),
+            Value::Object(values) => {
+                let mut entries = values.iter().collect::<Vec<_>>();
+                entries.sort_by_key(|(key, _)| *key);
+                format!(
+                    "{{{}}}",
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| Ok(format!(
+                            "{}:{}",
+                            serde_json::to_string(key).map_err(|e| e.to_string())?,
+                            render(value)?
+                        )))
+                        .collect::<Result<Vec<_>, String>>()?
+                        .join(",")
+                )
+            }
+            Value::Number(n) if n.is_f64() => {
+                let text = format!("{:?}", n.as_f64().ok_or("invalid canonical float")?);
+                if let Some((mantissa, exponent)) = text.split_once('e') {
+                    let exponent: i32 = exponent.parse().map_err(|_| "invalid float exponent")?;
+                    format!(
+                        "{mantissa}e{}{abs:02}",
+                        if exponent < 0 { "-" } else { "+" },
+                        abs = exponent.unsigned_abs()
+                    )
+                } else {
+                    text
+                }
+            }
+            _ => serde_json::to_string(value).map_err(|e| e.to_string())?,
+        })
+    }
+    render(value).map(String::into_bytes)
 }
 
 #[cfg(test)]

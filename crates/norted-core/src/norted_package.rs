@@ -455,6 +455,11 @@ fn plan_ninfer(value: &serde_json::Value) -> Result<NortedPackageAcquisitionPlan
 }
 
 fn plan_gguf(value: &serde_json::Value) -> Result<NortedPackageAcquisitionPlan, String> {
+    if value.get("schema").and_then(serde_json::Value::as_str)
+        == Some("norted.grep-student-gguf.v1")
+    {
+        return plan_deployment(value);
+    }
     let version = value
         .get("schema")
         .and_then(serde_json::Value::as_u64)
@@ -626,8 +631,7 @@ pub(crate) fn discover_package_directory(
     root: &Path,
     format: ArtifactFormat,
 ) -> Option<PackageDirectory> {
-    let manifest_name = norted_package_manifest_name(format);
-    let manifest = root.join(manifest_name);
+    let manifest = local_norted_package_manifest(root, format);
     if !manifest.exists() {
         return None;
     }
@@ -871,6 +875,13 @@ fn discover_gguf(root: &Path, manifest_path: &Path) -> Result<PackageDirectory, 
     let manifest_path = canonical_manifest(&root, manifest_path)?;
     let (manifest_value, manifest_sha): (serde_json::Value, _) = read_json(&manifest_path)?;
     let _ = plan_gguf(&manifest_value)?;
+    if manifest_value
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        == Some("norted.grep-student-gguf.v1")
+    {
+        return discover_deployment(&root, &manifest_path, &manifest_value, &manifest_sha);
+    }
     let manifest_file = package_file_from_observed(&manifest_path, &manifest_sha)?;
     let observed_schema = manifest_value
         .get("schema")
@@ -1315,4 +1326,141 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 
 fn io_string(error: std::io::Error) -> String {
     error.to_string()
+}
+
+/// Recognize only declared Norted deployment metadata as an alternate local
+/// manifest. Other sibling manifest.json files do not acquire trust.
+pub fn local_norted_package_manifest(root: &Path, format: ArtifactFormat) -> PathBuf {
+    let conventional = root.join(norted_package_manifest_name(format));
+    if conventional.exists() || format != ArtifactFormat::Gguf {
+        return conventional;
+    }
+    let alternate = root.join("manifest.json");
+    if alternate
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.len() <= MAX_PACKAGE_JSON_BYTES)
+        && std::fs::read(&alternate)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|v| {
+                v.get("schema").and_then(serde_json::Value::as_str)
+                    == Some("norted.grep-student-gguf.v1")
+            })
+    {
+        alternate
+    } else {
+        conventional
+    }
+}
+
+fn plan_deployment(value: &serde_json::Value) -> Result<NortedPackageAcquisitionPlan, String> {
+    crate::model::validate_deployment_seal(value, "artifact_id")?;
+    let targets = value
+        .get("targets")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("missing deployment targets")?;
+    let mut files = vec![NortedPackageAcquisitionFile {
+        path: "manifest.json".into(),
+        role: NortedPackageAcquisitionRole::Manifest,
+        output_key: None,
+        size_bytes: None,
+        sha256: None,
+    }];
+    for (key, target) in targets {
+        crate::model::validate_deployment_seal(target, "target_id")?;
+        let filename = target
+            .get("filename")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("missing target filename")?;
+        let path = package_relative_path(filename)?;
+        if ArtifactFormat::from_path(&path) != Some(ArtifactFormat::Gguf) {
+            return Err("deployment target is not GGUF".to_owned());
+        }
+        let sha = target
+            .pointer("/output/sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("missing target SHA256")?;
+        validate_sha(sha, "deployment payload")?;
+        let size = target
+            .pointer("/output/size")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("missing target size")?;
+        files.push(NortedPackageAcquisitionFile {
+            path,
+            role: NortedPackageAcquisitionRole::Primary,
+            output_key: Some(key.clone()),
+            size_bytes: Some(size),
+            sha256: Some(sha.to_owned()),
+        });
+    }
+    Ok(NortedPackageAcquisitionPlan {
+        kind: NortedPackageKind::Gguf,
+        manifest_name: "manifest.json".to_owned(),
+        manifest_schema: "norted.grep-student-gguf.v1".to_owned(),
+        manifest_version: 1,
+        files,
+    })
+}
+
+fn discover_deployment(
+    root: &Path,
+    manifest: &Path,
+    value: &serde_json::Value,
+    manifest_sha: &str,
+) -> Result<PackageDirectory, String> {
+    let plan = plan_deployment(value)?;
+    let mut members = HashMap::new();
+    for file in plan.primary_files() {
+        let primary = resolve_file(
+            root,
+            file.path.to_str().ok_or("invalid filename")?,
+            file.size_bytes,
+            file.sha256.as_deref().ok_or("missing payload hash")?,
+            false,
+        )?;
+        // This verifies payload hash/size, seals and source lineage before any
+        // serving.required_stop_token_ids can be attributed to this payload.
+        crate::ModelGenerationContract::inspect(&primary.path, None)?;
+        let binding = NortedPackageBinding {
+            kind: NortedPackageKind::Gguf,
+            manifest_schema: plan.manifest_schema.clone(),
+            manifest_version: 1,
+            package_root: root.to_path_buf(),
+            manifest_path: manifest.to_path_buf(),
+            manifest_sha256: manifest_sha.to_owned(),
+            output_key: file.output_key.clone().ok_or("missing target key")?,
+            expected_primary_size: primary.size_bytes,
+            expected_primary_sha256: primary.sha256,
+            build_key: value
+                .get("artifact_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            master_id: None,
+            quant_recipe_key: None,
+            canonical_source_lineage_key: value
+                .pointer("/parent/artifact_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            sharp: None,
+            sharp_revision: None,
+            sharp_version: None,
+            tokenizer: None,
+            projector: None,
+        };
+        members.insert(
+            primary.path,
+            PackageMember {
+                binding,
+                auxiliary: vec![as_auxiliary(
+                    &package_file_from_observed(manifest, manifest_sha)?,
+                    AuxiliaryArtifactRole::Manifest,
+                )],
+                native_identity: None,
+            },
+        );
+    }
+    Ok(PackageDirectory::Valid {
+        members,
+        suppressed: HashSet::new(),
+    })
 }
