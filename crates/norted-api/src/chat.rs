@@ -49,6 +49,7 @@ const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
     "seed",
     "service_tier",
     "stop",
+    "stop_token_ids",
     "store",
     "stream",
     "stream_options",

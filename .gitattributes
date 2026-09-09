@@ -1,0 +1,2 @@
+# Unified diff context prefixes are part of the hash-bound source overlays.
+crates/norted-engine-*/overlays/*.patch whitespace=-blank-at-eol,-blank-at-eof

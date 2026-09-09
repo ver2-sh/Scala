@@ -667,6 +667,7 @@ fn q27_source_build_plan(
             recipe_version: recipe_version.to_owned(),
             build_system: RuntimeSourceBuildSystem::Make,
             build_definition_sha256: Some(source.makefile_sha256.clone()),
+            source_overlay_sha256: None,
             cmake_configuration_arguments: Vec::new(),
             build_target: variant.build_target.to_owned(),
             entrypoint: variant.build_target.into(),
@@ -2512,6 +2513,12 @@ impl EngineAdapter for Q27Adapter {
         settings: &GenerationSettingsPatch,
         _backend_defaults: &EffectiveGenerationSettings,
     ) -> Result<(), EngineError> {
+        settings.validate_stop_token_ids()?;
+        if settings.stop_token_ids.is_some() {
+            return Err(EngineError::InvalidGenerationSettings(
+                "this runtime has no reviewed exact token-stop request contract".to_owned(),
+            ));
+        }
         if settings.repeat_penalty.is_some()
             || settings.presence_penalty.is_some()
             || settings.frequency_penalty.is_some()
@@ -2636,6 +2643,9 @@ impl EngineAdapter for Q27Adapter {
     }
 
     fn compatibility(&self, model: &ModelArtifact) -> CompatibilityDecision {
+        if !model.generation_contract.required_stop_token_ids.is_empty() {
+            return CompatibilityDecision::Unsupported { reason: "artifact requires exact token stops; q27 block generation does not prove this contract".to_owned() };
+        }
         if let CompatibilityDecision::Unsupported { reason } =
             self.runtime_management_compatibility()
         {
@@ -3467,10 +3477,14 @@ impl EngineAdapter for Q27Adapter {
         };
         Ok(configured.map_or(
             EffectiveGenerationSettings {
+                stop_token_ids: None,
+                required_stop_token_ids: Vec::new(),
                 temperature: 0.0,
                 top_p: 1.0,
             },
             |execution| EffectiveGenerationSettings {
+                stop_token_ids: None,
+                required_stop_token_ids: Vec::new(),
                 temperature: setting_float(&execution.settings, "q27.temperature")
                     .or_else(|| {
                         setting_float(&execution.settings, "q27.force_temperature")
@@ -4693,11 +4707,19 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
         "q27.min_p",
         "q27.seed",
         "q27.max_output_tokens",
+        "q27.stop_token_ids",
         "q27.system_prompt",
         "q27.reasoning",
         "q27.reasoning_budget",
     ];
     let mut definitions = common_setting_definitions_for(ENGINE_ID, COMMON_SETTINGS);
+    if let Some(d) = definitions
+        .iter_mut()
+        .find(|d| d.id.as_str() == "q27.stop_token_ids")
+    {
+        d.supported = false;
+        d.unsupported_reason = Some("q27 samples and commits blocks before its EOS emission check; exact per-token termination is not proven".to_owned());
+    }
     definitions.extend([
         q27_definition(
             "q27.reasoning_effort",

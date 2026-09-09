@@ -19,6 +19,7 @@ const NINFER_COMMON_SETTINGS: &[&str] = &[
     "ninfer.presence_penalty",
     "ninfer.frequency_penalty",
     "ninfer.max_output_tokens",
+    "ninfer.stop_token_ids",
     "ninfer.stop_strings",
     "ninfer.system_prompt",
     "ninfer.reasoning",
@@ -757,6 +758,7 @@ pub(crate) fn execution_path_for_setting(id: &str) -> SettingExecutionPath {
         "ninfer.reasoning_budget" => LaunchOption("--default-thinking-budget"),
         "ninfer.reasoning_effort"
         | "ninfer.reasoning"
+        | "ninfer.stop_token_ids"
         | "ninfer.stop_strings"
         | "ninfer.system_prompt" => NortedRequestDefault,
         "ninfer.kv_dtype" => LaunchOption("--kv-dtype"),
@@ -1143,6 +1145,7 @@ mod tests {
             })),
             auxiliary_artifacts: Vec::new(),
             norted_package: None,
+            generation_contract: Default::default(),
         }
     }
 

@@ -155,6 +155,9 @@ pub(crate) fn backend_request(
     if let Some(penalty) = request.generation_settings.frequency_penalty {
         body["frequency_penalty"] = json!(penalty);
     }
+    if let Some(ids) = request.generation_settings.stop_token_ids.as_ref() {
+        body["stop_token_ids"] = serde_json::json!(ids);
+    }
     if let Some(stop) = request.generation_settings.stop.as_ref() {
         body["stop"] = json!(stop);
     }

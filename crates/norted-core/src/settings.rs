@@ -81,6 +81,7 @@ pub enum SettingValue {
     Float(f64),
     String(String),
     StringList(Vec<String>),
+    UnsignedIntegerList(Vec<u64>),
     Json(serde_json::Value),
     Choice(String),
     Path(PathBuf),
@@ -118,6 +119,9 @@ impl std::fmt::Display for SettingValue {
             }
             Self::Float(value) => value.fmt(formatter),
             Self::String(value) | Self::Choice(value) => value.fmt(formatter),
+            Self::UnsignedIntegerList(value) => serde_json::to_string(value)
+                .expect("integer lists serialize")
+                .fmt(formatter),
             Self::StringList(value) => serde_json::to_string(value)
                 .unwrap_or_else(|_| "[]".to_owned())
                 .fmt(formatter),
@@ -163,6 +167,10 @@ pub enum SettingKind {
     },
     String,
     StringList,
+    UnsignedIntegerList {
+        minimum: Option<u64>,
+        maximum: Option<u64>,
+    },
     JsonObject,
     Choice {
         choices: Vec<String>,
@@ -203,6 +211,10 @@ impl SettingKind {
                 format!("finite number{}", bounds(minimum, maximum))
             }
             Self::String => "non-empty text".to_owned(),
+            Self::UnsignedIntegerList { minimum, maximum } => format!(
+                "non-empty JSON array of distinct non-negative integers{}",
+                bounds(minimum, maximum)
+            ),
             Self::StringList => "JSON array of non-empty strings".to_owned(),
             Self::JsonObject => "JSON object".to_owned(),
             Self::Choice { choices } if choices.is_empty() => "non-empty choice".to_owned(),
@@ -278,6 +290,21 @@ impl SettingKind {
             Self::String => (!raw.is_empty() && !raw.contains('\0'))
                 .then(|| SettingValue::String(raw.to_owned()))
                 .ok_or_else(|| invalid("expected a non-empty string without NUL bytes".to_owned())),
+            Self::UnsignedIntegerList { minimum, maximum } => {
+                let values: Vec<u64> = serde_json::from_str(raw).map_err(|_| {
+                    invalid("expected a JSON array of unsigned integers".to_owned())
+                })?;
+                let mut seen = std::collections::BTreeSet::new();
+                if values.is_empty() || values.iter().any(|value| !seen.insert(*value)) {
+                    return Err(invalid(
+                        "expected a non-empty list without duplicates; unset to inherit".to_owned(),
+                    ));
+                }
+                for value in &values {
+                    validate_bounds(id, raw, *value, *minimum, *maximum)?;
+                }
+                Ok(SettingValue::UnsignedIntegerList(values))
+            }
             Self::StringList => {
                 let values = serde_json::from_str::<Vec<String>>(raw).map_err(|_| {
                     invalid("expected a JSON array of non-empty strings".to_owned())
@@ -337,6 +364,10 @@ impl SettingKind {
                 Self::String,
                 SettingValue::String(_),
                 SettingValue::String(_)
+            ) | (
+                Self::UnsignedIntegerList { .. },
+                SettingValue::UnsignedIntegerList(_),
+                SettingValue::UnsignedIntegerList(_)
             ) | (
                 Self::StringList,
                 SettingValue::StringList(_),
@@ -461,6 +492,7 @@ pub enum SettingScope {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SettingDefaultSource {
+    Artifact,
     Norted,
     Runtime,
     Model,
@@ -471,6 +503,7 @@ pub enum SettingDefaultSource {
 impl std::fmt::Display for SettingDefaultSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::Artifact => "Artifact",
             Self::Norted => "server execution policy",
             Self::Runtime => "runtime default",
             Self::Model => "model-dependent runtime default",
@@ -1001,6 +1034,7 @@ impl SettingsSchema {
                 || matches!(
                     definition.kind,
                     SettingKind::String
+                        | SettingKind::UnsignedIntegerList { .. }
                         | SettingKind::StringList
                         | SettingKind::JsonObject
                         | SettingKind::Path

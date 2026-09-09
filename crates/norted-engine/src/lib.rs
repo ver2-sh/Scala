@@ -367,6 +367,17 @@ fn common_setting_definition_library(engine_id: &str) -> Vec<SettingDefinition> 
             engine_id,
         ),
         common_definition(
+            "stop_token_ids",
+            "Stop token IDs",
+            "Exact generated token IDs that terminate generation, distinct from textual stop strings",
+            norted_core::SettingKind::UnsignedIntegerList {
+                minimum: Some(0),
+                maximum: Some(u64::from(u32::MAX)),
+            },
+            norted_core::SettingCategory::Generation,
+            engine_id,
+        ),
+        common_definition(
             "stop_strings",
             "Stop strings",
             "One or more configured generation stop strings as a JSON string array",
@@ -1016,8 +1027,10 @@ pub enum StartupObservation {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EffectiveGenerationSettings {
+    pub stop_token_ids: Option<Vec<u32>>,
+    pub required_stop_token_ids: Vec<u32>,
     pub temperature: f64,
     pub top_p: f64,
 }
@@ -1070,8 +1083,36 @@ fn norted_package_summary(model: &ModelArtifact) -> Option<NortedPackageSummary>
 }
 
 impl EffectiveGenerationSettings {
-    pub fn merged(self, patch: &GenerationSettingsPatch) -> Self {
+    pub fn resolve_stop_token_ids(
+        &self,
+        patch: &mut GenerationSettingsPatch,
+    ) -> Result<(), EngineError> {
+        patch.validate_stop_token_ids()?;
+        let configured = patch
+            .stop_token_ids
+            .as_ref()
+            .or(self.stop_token_ids.as_ref());
+        let mut ids = self.required_stop_token_ids.clone();
+        let mut seen = ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        for id in configured.into_iter().flatten() {
+            if seen.insert(*id) {
+                ids.push(*id);
+            }
+        }
+        patch.stop_token_ids = (!ids.is_empty()).then_some(ids);
+        Ok(())
+    }
+
+    pub fn merged(&self, patch: &GenerationSettingsPatch) -> Self {
         Self {
+            stop_token_ids: patch
+                .stop_token_ids
+                .clone()
+                .or_else(|| self.stop_token_ids.clone()),
+            required_stop_token_ids: self.required_stop_token_ids.clone(),
             temperature: patch.temperature.unwrap_or(self.temperature),
             top_p: patch.top_p.unwrap_or(self.top_p),
         }
@@ -1214,12 +1255,27 @@ pub struct GenerationSettingsPatch {
     pub presence_penalty: Option<f64>,
     pub frequency_penalty: Option<f64>,
     pub stop: Option<Vec<String>>,
+    /// Exact generated-token termination, independent of decoded stop strings.
+    pub stop_token_ids: Option<Vec<u32>>,
     pub reasoning_enabled: Option<bool>,
     pub reasoning_budget: Option<i64>,
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl GenerationSettingsPatch {
+    pub fn validate_stop_token_ids(&self) -> Result<(), EngineError> {
+        if let Some(ids) = &self.stop_token_ids {
+            let mut seen = std::collections::BTreeSet::new();
+            if ids.is_empty() || ids.iter().any(|id| !seen.insert(*id)) {
+                return Err(EngineError::InvalidGenerationSettings(
+                    "stop_token_ids must be non-empty and contain distinct unsigned token IDs"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.temperature.is_none()
             && self.top_p.is_none()
@@ -1230,6 +1286,7 @@ impl GenerationSettingsPatch {
             && self.presence_penalty.is_none()
             && self.frequency_penalty.is_none()
             && self.stop.is_none()
+            && self.stop_token_ids.is_none()
             && self.reasoning_enabled.is_none()
             && self.reasoning_budget.is_none()
             && self.reasoning_effort.is_none()
@@ -1973,6 +2030,55 @@ impl EngineRegistry {
     }
 }
 
+pub const LLAMA_TOKEN_STOP_REVISION: &str = "de8656bd94f1163188125542534e4bcbc9f9fb1f";
+pub const NINFER_TOKEN_STOP_REVISION: &str = "863aa8a5f1e866db74f29f8999b83b4021398dee";
+
+/// Exact source material owned by Norted; upstream commit/tree remain unchanged.
+pub fn managed_source_overlay(engine: &str, recipe: &str) -> Option<&'static [u8]> {
+    match (engine, recipe) {
+        ("ninfer", "ninfer-serve-exact-stop-v1") => Some(include_bytes!(
+            "../../norted-engine-ninfer/overlays/exact-stop-token-ids.patch"
+        )),
+        (
+            "llama.cpp",
+            "managed-portable-exact-stop-v1" | "managed-portable-cuda13-exact-stop-v1",
+        ) => Some(include_bytes!(
+            "../../norted-engine-llama-cpp/overlays/exact-stop-token-ids.patch"
+        )),
+        _ => None,
+    }
+}
+
+pub fn managed_source_overlay_sha256(engine: &str, recipe: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    managed_source_overlay(engine, recipe).map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Preview mandatory artifact semantics without inserting a persisted override.
+pub fn apply_artifact_stop_token_preview(
+    definitions: &mut [SettingDefinition],
+    model: &ModelArtifact,
+) {
+    if model.generation_contract.required_stop_token_ids.is_empty() {
+        return;
+    }
+    if let Some(definition) = definitions
+        .iter_mut()
+        .find(|d| d.id.as_str().ends_with(".stop_token_ids"))
+    {
+        definition.default_preview = Some(
+            SettingDefaultPreview::new(
+                serde_json::to_string(&model.generation_contract.required_stop_token_ids)
+                    .expect("token IDs serialize"),
+                SettingDefaultSource::Artifact,
+            )
+            .with_detail(
+                "Mandatory artifact terminal IDs are always unioned with configured/request IDs",
+            ),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -2009,6 +2115,8 @@ mod tests {
     #[test]
     fn effective_generation_settings_merge_without_changing_backend_defaults() {
         let backend_defaults = EffectiveGenerationSettings {
+            stop_token_ids: None,
+            required_stop_token_ids: Vec::new(),
             temperature: 0.7,
             top_p: 0.9,
         };
@@ -2024,6 +2132,8 @@ mod tests {
         assert_eq!(
             backend_defaults.merged(&override_temperature),
             EffectiveGenerationSettings {
+                stop_token_ids: None,
+                required_stop_token_ids: Vec::new(),
                 temperature: 0.2,
                 top_p: 0.9,
             }
@@ -2290,6 +2400,7 @@ mod tests {
             native_identity: None,
             auxiliary_artifacts: Vec::new(),
             norted_package: None,
+            generation_contract: Default::default(),
         };
         let compatible = registry.compatible_with(&model);
 
@@ -2318,6 +2429,8 @@ mod tests {
                 .validate_generation_settings(
                     &GenerationSettingsPatch::default(),
                     &EffectiveGenerationSettings {
+                        stop_token_ids: None,
+                        required_stop_token_ids: Vec::new(),
                         temperature: 0.0,
                         top_p: 1.0,
                     },
@@ -2331,6 +2444,8 @@ mod tests {
                     ..Default::default()
                 },
                 &EffectiveGenerationSettings {
+                    stop_token_ids: None,
+                    required_stop_token_ids: Vec::new(),
                     temperature: 0.0,
                     top_p: 1.0,
                 },
@@ -2384,6 +2499,7 @@ mod tests {
             native_identity: None,
             auxiliary_artifacts: Vec::new(),
             norted_package: None,
+            generation_contract: Default::default(),
         };
 
         let capabilities = manager
@@ -2424,6 +2540,7 @@ mod tests {
             native_identity: None,
             auxiliary_artifacts: Vec::new(),
             norted_package: None,
+            generation_contract: Default::default(),
         };
         let identity = RuntimeIdentity {
             engine_id: "second-q27-engine".to_owned(),
@@ -2494,6 +2611,7 @@ mod tests {
                 native_identity: None,
                 auxiliary_artifacts: Vec::new(),
                 norted_package: None,
+                generation_contract: Default::default(),
             },
             auxiliary: vec![PreparedAuxiliaryArtifact {
                 role: AuxiliaryArtifactRole::Tokenizer,

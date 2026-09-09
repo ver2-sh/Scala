@@ -49,10 +49,24 @@ const CUDA13_RECIPE: ManagedCudaRecipe = ManagedCudaRecipe {
 };
 const MANAGED_CUDA_RECIPES: [ManagedCudaRecipe; 2] = [CUDA12_RECIPE, CUDA13_RECIPE];
 
+const EXACT_STOP_RECIPES: [ManagedCudaRecipe; 2] = [
+    ManagedCudaRecipe {
+        variant: "managed-portable-exact-stop-v1",
+        display_name: "llama.cpp CUDA exact token stops (reviewed source)",
+        ..CUDA12_RECIPE
+    },
+    ManagedCudaRecipe {
+        variant: "managed-portable-cuda13-exact-stop-v1",
+        display_name: "llama.cpp CUDA 13 exact token stops (reviewed source)",
+        ..CUDA13_RECIPE
+    },
+];
+
 impl ManagedCudaRecipe {
     fn from_variant(variant: &str) -> Option<Self> {
         MANAGED_CUDA_RECIPES
             .into_iter()
+            .chain(EXACT_STOP_RECIPES)
             .find(|recipe| recipe.variant == variant)
     }
 }
@@ -87,6 +101,7 @@ impl RuntimeCatalogProvider for LlamaCppSourceRuntimeCatalogProvider {
         github: &GitHubReleaseClient,
     ) -> Result<Vec<AvailableRuntime>, CatalogError> {
         verify_repository(github).await?;
+        let mut ordinary = None;
         let mut releases = github
             .releases(GITHUB_REPOSITORY)
             .await?
@@ -97,12 +112,27 @@ impl RuntimeCatalogProvider for LlamaCppSourceRuntimeCatalogProvider {
         releases.sort_by_key(|(build, _)| std::cmp::Reverse(*build));
         for (_, release) in releases {
             if let Some(commit) = admit_source_revision(github, &release).await? {
-                return source_runtimes(&release, &commit);
+                ordinary = Some(source_runtimes(&release, &commit)?);
+                break;
             }
         }
-        Err(provider_error(
-            "no upstream nightly release satisfies the managed llama.cpp source contract",
-        ))
+        let mut runtimes = ordinary.ok_or_else(|| {
+            provider_error(
+                "no upstream nightly release satisfies the managed llama.cpp source contract",
+            )
+        })?;
+        let release = github
+            .release_by_tag(GITHUB_REPOSITORY, "b10786")
+            .await?
+            .filter(|release| !release.draft)
+            .ok_or_else(|| provider_error("reviewed llama.cpp source release is unavailable"))?;
+        let commit = admit_source_revision(github, &release)
+            .await?
+            .ok_or_else(|| provider_error("reviewed llama.cpp source contract changed"))?;
+        for recipe in EXACT_STOP_RECIPES {
+            runtimes.push(source_runtime(&release, &commit, recipe)?);
+        }
+        Ok(runtimes)
     }
 
     async fn fetch_reference(
@@ -123,7 +153,13 @@ impl RuntimeCatalogProvider for LlamaCppSourceRuntimeCatalogProvider {
         let Some(commit) = admit_source_revision(github, &release).await? else {
             return Ok(Vec::new());
         };
-        source_runtimes(&release, &commit)
+        let mut runtimes = source_runtimes(&release, &commit)?;
+        if commit.sha == norted_engine::LLAMA_TOKEN_STOP_REVISION {
+            for recipe in EXACT_STOP_RECIPES {
+                runtimes.push(source_runtime(&release, &commit, recipe)?);
+            }
+        }
+        Ok(runtimes)
     }
 
     async fn verify_candidate(
@@ -448,6 +484,13 @@ fn source_runtime(
     commit: &GitHubCommit,
     recipe: ManagedCudaRecipe,
 ) -> Result<AvailableRuntime, CatalogError> {
+    if norted_engine::managed_source_overlay(ENGINE_ID, recipe.variant).is_some()
+        && commit.sha != norted_engine::LLAMA_TOKEN_STOP_REVISION
+    {
+        return Err(provider_error(
+            "exact token stops require the reviewed upstream revision",
+        ));
+    }
     let build = nightly_number(&release.tag_name)
         .ok_or_else(|| provider_error("source release is not a valid nightly build"))?;
     let timestamp = parse_github_timestamp(&commit.commit.committer.date)
@@ -500,6 +543,10 @@ fn source_runtime(
                 recipe_version: recipe.variant.to_owned(),
                 build_system: RuntimeSourceBuildSystem::Cmake,
                 build_definition_sha256: None,
+                source_overlay_sha256: norted_engine::managed_source_overlay_sha256(
+                    ENGINE_ID,
+                    recipe.variant,
+                ),
                 cmake_configuration_arguments: vec![
                     "-G".to_owned(),
                     "Ninja".to_owned(),
@@ -608,8 +655,11 @@ fn managed_cuda_advisories(recipe: ManagedCudaRecipe) -> Vec<String> {
         "NVIDIA documents Linux driver 580.65.06 as the CUDA 13.0 GA driver floor"
     };
     vec![
-        "Norted builds this runtime from the exact official llama.cpp source revision; it is not an upstream CUDA binary"
-            .to_owned(),
+        if norted_engine::managed_source_overlay(ENGINE_ID, recipe.variant).is_some() {
+            "Norted builds the reviewed upstream revision with its hash-bound exact-token-stop overlay"
+        } else {
+            "Norted builds this runtime from the exact official llama.cpp source revision; it is not an upstream CUDA binary"
+        }.to_owned(),
         "The managed build contains fixed real-code CUDA targets for compute capabilities 7.5, 8.0, 8.6, 8.9, 9.0, and 12.0"
             .to_owned(),
         toolkit.to_owned(),
