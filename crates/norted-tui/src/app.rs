@@ -5753,6 +5753,7 @@ mod tests {
             native_identity: None,
             auxiliary_artifacts: Vec::new(),
             norted_package: None,
+            generation_contract: Default::default(),
         };
         app.handle_settings_task_result(SettingsTaskResult::ChooseProfileEngine(
             ProfileEngineSelection {

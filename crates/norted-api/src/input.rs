@@ -190,6 +190,26 @@ pub(crate) fn generation_settings(
         presence_penalty: optional_f64(object, "presence_penalty", -2.0, 2.0)?,
         frequency_penalty: optional_f64(object, "frequency_penalty", -2.0, 2.0)?,
         stop: optional_stop(object.get("stop"), "stop")?,
+        stop_token_ids: match object.get("stop_token_ids") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let ids: Vec<u32> = serde_json::from_value(value.clone()).map_err(|_| {
+                    OpenAiError::invalid(
+                        "`stop_token_ids` must be an array of unsigned 32-bit integers.",
+                        Some("stop_token_ids"),
+                        "invalid_type",
+                    )
+                })?;
+                let patch = GenerationSettingsPatch {
+                    stop_token_ids: Some(ids),
+                    ..Default::default()
+                };
+                patch.validate_stop_token_ids().map_err(|error| {
+                    OpenAiError::invalid(error.to_string(), Some("stop_token_ids"), "invalid_value")
+                })?;
+                patch.stop_token_ids
+            }
+        },
         reasoning_enabled: None,
         reasoning_budget: None,
         reasoning_effort: None,

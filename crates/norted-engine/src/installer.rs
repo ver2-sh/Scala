@@ -523,6 +523,58 @@ impl RuntimeInstaller {
             .await
             .map_err(|error| RuntimeInstallError::Task(error.to_string()))??;
             let supported_native_identities = adapter.source_native_identities(&source_root)?;
+            // Audit pristine upstream material first. Only this installation's private
+            // staging checkout is patched; no shared source/cache is mutated.
+            let overlay = crate::managed_source_overlay(
+                &available.identity.engine_id,
+                &plan.recipe.recipe_version,
+            );
+            if crate::managed_source_overlay_sha256(
+                &available.identity.engine_id,
+                &plan.recipe.recipe_version,
+            ) != plan.recipe.source_overlay_sha256
+            {
+                return Err(RuntimeInstallError::SourceBuild(
+                    "source overlay identity mismatch".to_owned(),
+                ));
+            }
+            if let Some(bytes) = overlay {
+                let reviewed_revision = match available.identity.engine_id.as_str() {
+                    "llama.cpp" => crate::LLAMA_TOKEN_STOP_REVISION,
+                    "ninfer" => crate::NINFER_TOKEN_STOP_REVISION,
+                    _ => {
+                        return Err(RuntimeInstallError::SourceBuild(
+                            "unreviewed source overlay".to_owned(),
+                        ));
+                    }
+                };
+                if plan.source.commit_sha != reviewed_revision {
+                    return Err(RuntimeInstallError::SourceBuild(
+                        "source overlay requires its exact reviewed upstream revision".to_owned(),
+                    ));
+                }
+                let patch_path = staging.join("norted-source.patch");
+                tokio::fs::write(&patch_path, bytes)
+                    .await
+                    .map_err(|error| RuntimeInstallError::SourceBuild(error.to_string()))?;
+                let patch = patch_path.to_string_lossy();
+                run_source_command(
+                    "check Norted source overlay",
+                    "git",
+                    &["apply", "--check", &patch],
+                    Some(&source_root),
+                    &[],
+                )
+                .await?;
+                run_source_command(
+                    "apply Norted source overlay",
+                    "git",
+                    &["apply", &patch],
+                    Some(&source_root),
+                    &[],
+                )
+                .await?;
+            }
 
             let rejected_environment = plan
                 .recipe
@@ -645,6 +697,7 @@ impl RuntimeInstaller {
                 recipe_version: plan.recipe.recipe_version.clone(),
                 build_system: plan.recipe.build_system,
                 build_definition_sha256: plan.recipe.build_definition_sha256.clone(),
+                source_overlay_sha256: plan.recipe.source_overlay_sha256.clone(),
                 cmake_configuration_arguments: plan.recipe.cmake_configuration_arguments.clone(),
                 effective_cmake_configuration_arguments,
                 build_target: plan.recipe.build_target.clone(),
@@ -2469,6 +2522,7 @@ mod tests {
                 recipe_version: "fixture-v1".to_owned(),
                 build_system: RuntimeSourceBuildSystem::Cmake,
                 build_definition_sha256: None,
+                source_overlay_sha256: None,
                 cmake_configuration_arguments: vec![
                     "-DCMAKE_CUDA_ARCHITECTURES=75-real".to_owned(),
                 ],

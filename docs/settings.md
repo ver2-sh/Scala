@@ -136,3 +136,6 @@ reveals 40; Settings Inherit leaves the field to q27. Sampler controls can remai
 while temperature is zero: they are inactive during greedy decoding, not incompatible.
 NInfer has its own top-k bounds (the reviewed runtime accepts at most 20); engine support
 and ranges are never copied from q27 or llama.cpp.
+
+Exact numeric terminal controls and mandatory artifact semantics are described in
+[Stop token IDs](stop-token-ids.md). Text stop strings remain independent.
