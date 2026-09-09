@@ -1,0 +1,2416 @@
+{
+  "validation_date_utc": "2026-09-09",
+  "starting_master": "753d0a1db06a5e68086834e627d0e2559fcbd40e",
+  "implementation_commit": "e58567b8d93b301b65107d332ba689e4f40f1d06",
+  "branch": "feat/llama-retrieval-capabilities",
+  "runtime": {
+    "schema_version": 2,
+    "runtime_id": "llama-cpp-b10786-linux-x86-64-cuda-managed-portable-cuda13-exact-stop-v2-3d7babe5ecd4f911",
+    "identity": {
+      "engine_id": "llama.cpp",
+      "package_family": "llama-cpp-managed-source",
+      "version": "b10786",
+      "upstream_revision": "de8656bd94f1163188125542534e4bcbc9f9fb1f",
+      "platform": "linux",
+      "architecture": "x86_64",
+      "accelerator": "cuda",
+      "variant": "managed-portable-cuda13-exact-stop-v2",
+      "package": {
+        "provider_id": "llama-cpp-managed-source-github",
+        "repository": "ggml-org/llama.cpp",
+        "release_tag": "b10786",
+        "asset_id": null,
+        "asset_name": null,
+        "additional_assets": []
+      }
+    },
+    "supported_formats": [
+      "gguf"
+    ],
+    "requirements": {
+      "requires_nvidia_gpu": true,
+      "minimum_nvidia_driver": "580.65.06",
+      "minimum_vram_bytes": null,
+      "minimum_vram_class_gib": null,
+      "minimum_vram_exclusive_class_gib": null,
+      "supported_cuda_compute_capabilities": [
+        {
+          "major": 7,
+          "minor": 5
+        },
+        {
+          "major": 8,
+          "minor": 0
+        },
+        {
+          "major": 8,
+          "minor": 6
+        },
+        {
+          "major": 8,
+          "minor": 9
+        },
+        {
+          "major": 9,
+          "minor": 0
+        },
+        {
+          "major": 12,
+          "minor": 0
+        }
+      ],
+      "required_nvidia_device_names": [],
+      "notes": [],
+      "advisories": [
+        "Norted builds this runtime from the exact official llama.cpp source revision; it is not an upstream CUDA binary",
+        "The managed build contains fixed real-code CUDA targets for compute capabilities 7.5, 8.0, 8.6, 8.9, 9.0, and 12.0",
+        "CUDA Toolkit 13.0 through 13.x is required; this is an intentional parallel variant and does not replace the immutable CUDA-12 V3 recipe",
+        "NVIDIA documents Linux driver 580.65.06 as the CUDA 13.0 GA driver floor"
+      ],
+      "unverified_requirements": []
+    },
+    "acquisition_method": "source_build",
+    "source_url": "https://github.com/ggml-org/llama.cpp/commit/de8656bd94f1163188125542534e4bcbc9f9fb1f",
+    "downloaded_archive_sha256": null,
+    "additional_downloaded_archive_sha256": [],
+    "source_build": {
+      "source": {
+        "repository": "ggml-org/llama.cpp",
+        "repository_url": "https://github.com/ggml-org/llama.cpp.git",
+        "source_branch": "b10786",
+        "commit_sha": "de8656bd94f1163188125542534e4bcbc9f9fb1f",
+        "tree_sha": "ef599001012ff8bee837a832decde4c564702cc4",
+        "commit_timestamp_unix": 1788433030,
+        "source_provider": "llama-cpp-managed-source-github"
+      },
+      "recipe_version": "managed-portable-cuda13-exact-stop-v2",
+      "build_system": "cmake",
+      "cmake_configuration_arguments": [
+        "-G",
+        "Ninja",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DBUILD_SHARED_LIBS=ON",
+        "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON",
+        "-DCMAKE_SKIP_RPATH=OFF",
+        "-DCMAKE_SKIP_BUILD_RPATH=OFF",
+        "-DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF",
+        "-DLLAMA_BUILD_NUMBER=10786",
+        "-DLLAMA_BUILD_COMMIT=de8656bd94f1163188125542534e4bcbc9f9fb1f",
+        "-DGGML_CUDA=ON",
+        "-DGGML_NATIVE=OFF",
+        "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;120a-real",
+        "-DGGML_CUDA_NCCL=OFF",
+        "-DLLAMA_BUILD_COMMON=ON",
+        "-DLLAMA_BUILD_SERVER=ON",
+        "-DLLAMA_BUILD_TOOLS=ON",
+        "-DLLAMA_BUILD_TESTS=OFF",
+        "-DLLAMA_BUILD_EXAMPLES=OFF",
+        "-DLLAMA_BUILD_APP=OFF",
+        "-DLLAMA_BUILD_UI=OFF",
+        "-DLLAMA_USE_PREBUILT_UI=OFF",
+        "-DLLAMA_LLGUIDANCE=OFF",
+        "-DLLAMA_OPENSSL=OFF",
+        "-DLLAMA_SUBPROCESS=OFF",
+        "-DGGML_CUDA_CUB_3DOT2=OFF",
+        "-DGGML_CPU_KLEIDIAI=OFF",
+        "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
+        "-DFETCHCONTENT_UPDATES_DISCONNECTED=ON"
+      ],
+      "effective_cmake_configuration_arguments": [
+        "-G",
+        "Ninja",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DBUILD_SHARED_LIBS=ON",
+        "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON",
+        "-DCMAKE_SKIP_RPATH=OFF",
+        "-DCMAKE_SKIP_BUILD_RPATH=OFF",
+        "-DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF",
+        "-DLLAMA_BUILD_NUMBER=10786",
+        "-DLLAMA_BUILD_COMMIT=de8656bd94f1163188125542534e4bcbc9f9fb1f",
+        "-DGGML_CUDA=ON",
+        "-DGGML_NATIVE=OFF",
+        "-DCMAKE_CUDA_ARCHITECTURES=75-real;80-real;86-real;89-real;90-real;120a-real",
+        "-DGGML_CUDA_NCCL=OFF",
+        "-DLLAMA_BUILD_COMMON=ON",
+        "-DLLAMA_BUILD_SERVER=ON",
+        "-DLLAMA_BUILD_TOOLS=ON",
+        "-DLLAMA_BUILD_TESTS=OFF",
+        "-DLLAMA_BUILD_EXAMPLES=OFF",
+        "-DLLAMA_BUILD_APP=OFF",
+        "-DLLAMA_BUILD_UI=OFF",
+        "-DLLAMA_USE_PREBUILT_UI=OFF",
+        "-DLLAMA_LLGUIDANCE=OFF",
+        "-DLLAMA_OPENSSL=OFF",
+        "-DLLAMA_SUBPROCESS=OFF",
+        "-DGGML_CUDA_CUB_3DOT2=OFF",
+        "-DGGML_CPU_KLEIDIAI=OFF",
+        "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
+        "-DFETCHCONTENT_UPDATES_DISCONNECTED=ON",
+        "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc"
+      ],
+      "build_target": "llama-server",
+      "toolchain": {
+        "cmake_version": "4.2.3",
+        "ninja_version": "1.13.2",
+        "make_version": "not required",
+        "cpp_compiler": "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0 Copyright (C) 2025 Free Software Foundation, Inc. This is free software; see the source for copying conditions. There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.",
+        "nvcc_version": "13.3",
+        "pkg_config_version": "not required",
+        "system_dependencies": {}
+      },
+      "build_platform": "linux",
+      "build_architecture": "x86_64",
+      "accelerator_target": "sm_75+sm_80+sm_86+sm_89+sm_90+sm_120a",
+      "built_at_unix": 1788992876,
+      "entrypoint": "source/build/bin/llama-server",
+      "entrypoint_sha256": "4dbd83f77938ac25f4f8bdd4b300b07264c94ba36210b8d4edc3de5580332754",
+      "source_overlay_sha256": "f1a579cb1e2484bd8bf29f987a7fe9a79ddae015f04733521a445d776bdfa873"
+    },
+    "entrypoint": "source/build/bin/llama-server",
+    "entrypoint_sha256": "4dbd83f77938ac25f4f8bdd4b300b07264c94ba36210b8d4edc3de5580332754",
+    "installed_at_unix": 1788992876,
+    "probe": {
+      "compatible": true,
+      "observed_engine_id": "llama.cpp",
+      "observed_version": "0.3.0-dev",
+      "observed_revision": "de8656bd94f1163188125542534e4bcbc9f9fb1f",
+      "detail": "version: 0.3.0-dev (build 10786, commit de8656bd94f1163188125542534e4bcbc9f9fb1f)",
+      "observed_at_unix": 1788979490
+    }
+  },
+  "native_source_verification": "git apply --reverse --check exact-stop-token-ids-v2.patch succeeded against the tested de8656 source checkout",
+  "validation_setup": "Isolated XDG directories; side-by-side runtime pack assembled from the existing managed-recipe CMake build, rebuilt with V2 overlay. Norted validates the manifest and executable and owns launch/lifecycle. No installer/network-download claim.",
+  "artifact_and_methodology_changes": false,
+  "benchmark_source_sha256": {
+    "crates/norted-engine/src/benchmark/retrieval.rs": "58a55ee329be1a2fb06fdfebdd51f71b01009abdfb358c42a0da0d123a9ce8fb",
+    "crates/norted-engine/src/benchmark/runner.rs": "baede07493d687050241fa51e012c0ae5c1df9040bb7645903c32bc7a8e35991"
+  },
+  "cargo": {
+    "fmt_all_check": "passed",
+    "check_workspace": "passed",
+    "clippy_workspace_all_targets_all_features_deny_warnings": "passed",
+    "test_workspace": {
+      "passed": 214,
+      "failed": 0,
+      "ignored": 1
+    }
+  },
+  "models": {
+    "4b": {
+      "profile": {
+        "display_name": "norted-grep-qwen3-5-4b-q4-k-m",
+        "engine_id": "llama.cpp",
+        "id": "norted-grep-qwen3-5-4b-q4-k-m",
+        "model_id": "norted-grep-qwen3-5-4b-q4-k-m-2113e8449e1a",
+        "overrides": {
+          "llama.cpp.context_length": {
+            "kind": "unsigned_integer",
+            "value": 16384
+          },
+          "llama.cpp.flash_attention": {
+            "kind": "choice",
+            "value": "on"
+          },
+          "llama.cpp.gpu_offload": {
+            "kind": "gpu_offload",
+            "value": {
+              "mode": "all"
+            }
+          },
+          "llama.cpp.jinja": {
+            "kind": "toggle",
+            "value": true
+          },
+          "llama.cpp.kv_cache_gpu_offload": {
+            "kind": "toggle",
+            "value": true
+          },
+          "llama.cpp.kv_cache_k": {
+            "kind": "choice",
+            "value": "bf16"
+          },
+          "llama.cpp.kv_cache_v": {
+            "kind": "choice",
+            "value": "bf16"
+          },
+          "llama.cpp.max_output_tokens": {
+            "kind": "unsigned_integer",
+            "value": 1024
+          },
+          "llama.cpp.min_p": {
+            "kind": "float",
+            "value": 0.0
+          },
+          "llama.cpp.reasoning": {
+            "kind": "choice",
+            "value": "off"
+          },
+          "llama.cpp.temperature": {
+            "kind": "float",
+            "value": 0.0
+          },
+          "llama.cpp.top_k": {
+            "kind": "unsigned_integer",
+            "value": 0
+          },
+          "llama.cpp.top_p": {
+            "kind": "float",
+            "value": 1.0
+          }
+        },
+        "role": "primary"
+      },
+      "saved_configuration": {
+        "files": [
+          {
+            "observation": {
+              "evidence": "metadata observation, not a fresh content digest",
+              "identity": {
+                "ctime": 1788972177,
+                "ctime_nsec": 748062785,
+                "device": 2065,
+                "inode": 32677549
+              },
+              "modified_unix_ns": 1788972167463030265,
+              "size": 2783446400
+            },
+            "path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/4b/Norted-Grep-Qwen3.5-4B-Q4_K_M.gguf"
+          },
+          {
+            "observation": {
+              "evidence": "metadata observation, not a fresh content digest",
+              "identity": {
+                "ctime": 1788972177,
+                "ctime_nsec": 750062792,
+                "device": 2065,
+                "inode": 32677553
+              },
+              "modified_unix_ns": 1788972177749062788,
+              "size": 122004
+            },
+            "path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/4b/manifest.json"
+          }
+        ],
+        "format_runtime_selection": null,
+        "inherited_settings": null,
+        "model": {
+          "architecture": "qwen35",
+          "auxiliary_artifacts": [
+            {
+              "hash": "b5e808d0e842f7f46040f2ae94cea08836925f1a6441c9d17d9be67fcfe382e2",
+              "path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/4b/manifest.json",
+              "role": {
+                "role": "manifest"
+              },
+              "size_bytes": 122004
+            }
+          ],
+          "context_length": 262144,
+          "created": 1788972167,
+          "format": "gguf",
+          "generation_contract": {
+            "manifest_sha256": "b5e808d0e842f7f46040f2ae94cea08836925f1a6441c9d17d9be67fcfe382e2",
+            "metadata_sha256": {},
+            "native_eos_token_ids": [
+              248046
+            ],
+            "required_stop_token_ids": [
+              248044,
+              248046
+            ]
+          },
+          "hash": null,
+          "id": "norted-grep-qwen3-5-4b-q4-k-m-2113e8449e1a",
+          "native_identity": {
+            "format": "gguf",
+            "identity": {
+              "architecture": "qwen35",
+              "chat_template_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+              "context_length": 262144,
+              "expert_count": null,
+              "expert_used_count": null,
+              "native_eos_token_id": 248046,
+              "pooling_type": null,
+              "rope_frequency_base": "10000000",
+              "rope_scaling_factor": null,
+              "rope_scaling_factor_key": null,
+              "tokenizer_metadata_sha256": "4182f668ba04e6540121979d00e368c1fd5aa5cd4b44874d1e8c66e1f5648e3a",
+              "version": 3
+            }
+          },
+          "norted_package": {
+            "build_key": "e0ff5c5b9f5dd22916b44a1f1f56fa34bd2c46c9e04e61b3e47d14d9ea8e0a07",
+            "canonical_source_lineage_key": "f814d894162bbc6747118be46d9a4a746b0218e3c9f81a7e93b806dad635c8d0",
+            "expected_primary_sha256": "aff8ac41d95fd53343abfb28015752c0c1fb912f14e79044050828ece1bc81f0",
+            "expected_primary_size": 2783446400,
+            "kind": "gguf",
+            "manifest_path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/4b/manifest.json",
+            "manifest_schema": "norted.grep-student-gguf.v1",
+            "manifest_sha256": "b5e808d0e842f7f46040f2ae94cea08836925f1a6441c9d17d9be67fcfe382e2",
+            "manifest_version": 1,
+            "master_id": null,
+            "output_key": "Q4_K_M",
+            "package_root": "/srv/norted/repos/Norted/dist/grep-variants/gguf/4b",
+            "projector": null,
+            "quant_recipe_key": null,
+            "sharp": null,
+            "sharp_revision": null,
+            "sharp_version": null,
+            "tokenizer": null
+          },
+          "path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/4b/Norted-Grep-Qwen3.5-4B-Q4_K_M.gguf",
+          "provenance": null,
+          "size_bytes": 2783446400
+        },
+        "model_runtime_selection": null,
+        "profile_hash": "6d20357862798702ae13bdd9e0177eb25e16677413187cbbe510494ccf2e12d2",
+        "served_files": [
+          {
+            "observation": {
+              "evidence": "metadata observation, not a fresh content digest",
+              "identity": {
+                "ctime": 1788992876,
+                "ctime_nsec": 12743987,
+                "device": 2065,
+                "inode": 32687406
+              },
+              "modified_unix_ns": 1788992810600233829,
+              "size": 17904
+            },
+            "path": "/srv/norted/scratch/llama-retrieval-validation/data/nortedserver/runtimes/llama.cpp/linux-x86_64-cuda-managed-portable-cuda13-exact-stop-v2/b10786/llama-cpp-b10786-linux-x86-64-cuda-managed-portable-cuda13-exact-stop-v2-3d7babe5ecd4f911/source/build/bin/llama-server"
+          },
+          {
+            "observation": {
+              "evidence": "metadata observation, not a fresh content digest",
+              "identity": {
+                "ctime": 1788972177,
+                "ctime_nsec": 748062785,
+                "device": 2065,
+                "inode": 32677549
+              },
+              "modified_unix_ns": 1788972167463030265,
+              "size": 2783446400
+            },
+            "path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/4b/Norted-Grep-Qwen3.5-4B-Q4_K_M.gguf"
+          },
+          {
+            "observation": {
+              "evidence": "metadata observation, not a fresh content digest",
+              "identity": {
+                "ctime": 1788972177,
+                "ctime_nsec": 750062792,
+                "device": 2065,
+                "inode": 32677553
+              },
+              "modified_unix_ns": 1788972177749062788,
+              "size": 122004
+            },
+            "path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/4b/manifest.json"
+          }
+        ],
+        "served_setting_files": [],
+        "setting_files": []
+      },
+      "runtime_chat_properties": {
+        "chat_template_caps": {
+          "supports_object_arguments": true,
+          "supports_parallel_tool_calls": true,
+          "supports_preserve_reasoning": false,
+          "supports_reasoning_effort": false,
+          "supports_string_content": true,
+          "supports_system_role": true,
+          "supports_tool_calls": true,
+          "supports_tools": true,
+          "supports_typed_content": false
+        },
+        "chat_template_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+      },
+      "manual": {
+        "aggregate": {
+          "choices": [
+            {
+              "finish_reason": "tool_calls",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": null,
+                "refusal": null,
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"pattern\":\"src/*.rs\"}",
+                      "name": "glob"
+                    },
+                    "id": "1TNBmwrUYxfpmvHRhT5rTzRb6IKxYjiZ",
+                    "type": "function"
+                  },
+                  {
+                    "function": {
+                      "arguments": "{\"pattern\":\"claim\"}",
+                      "name": "grep"
+                    },
+                    "id": "8hCSCG38Hr8ZbJvw6TDCMe8hmdLZEnTE",
+                    "type": "function"
+                  }
+                ]
+              }
+            }
+          ],
+          "created": 1788993452,
+          "id": "chatcmpl_c29cd37769c948dea5e4d0a62da209c5",
+          "model": "norted-grep-qwen3-5-4b-q4-k-m",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 54,
+            "prompt_tokens": 466,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 520
+          }
+        },
+        "aggregate_continuation": {
+          "choices": [
+            {
+              "finish_reason": "tool_calls",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": null,
+                "refusal": null,
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"path\":\"src/leases.rs\",\"start_line\":1,\"end_line\":7}",
+                      "name": "read"
+                    },
+                    "id": "Z2BYJvxJ8qn7pl3rT5F3piQqM4mZcDnZ",
+                    "type": "function"
+                  }
+                ]
+              }
+            }
+          ],
+          "created": 1788993452,
+          "id": "chatcmpl_5df1e90f26be443ab323796aa0e144d2",
+          "model": "norted-grep-qwen3-5-4b-q4-k-m",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 51,
+            "prompt_tokens": 485,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 536
+          }
+        },
+        "aggregate_strict_finalization": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": "{\"ranges\": [{\"end_line\": 7, \"path\": \"src/leases.rs\", \"start_line\": 2}]}",
+                "refusal": null,
+                "role": "assistant"
+              }
+            }
+          ],
+          "created": 1788993452,
+          "id": "chatcmpl_cd912740740b4721becff36fad7238b1",
+          "model": "norted-grep-qwen3-5-4b-q4-k-m",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 28,
+            "prompt_tokens": 209,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 237
+          }
+        },
+        "stream_assembled": {
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                  {
+                    "id": "NKMAyyIhOOQkDx6Z5YDvC1uzdZPEOwmQ",
+                    "type": "function",
+                    "function": {
+                      "name": "glob",
+                      "arguments": "{\"pattern\":\"src/*.rs\"}"
+                    }
+                  },
+                  {
+                    "id": "HfgmzrqjZycYYsZersQKuDx0CMx1rua6",
+                    "type": "function",
+                    "function": {
+                      "name": "grep",
+                      "arguments": "{\"pattern\":\"claim\"}"
+                    }
+                  }
+                ]
+              },
+              "finish_reason": "tool_calls"
+            }
+          ]
+        },
+        "stream_continuation": {
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                  {
+                    "id": "tlNY7174YZUTpx03HMCzspqyNNKTIDJl",
+                    "type": "function",
+                    "function": {
+                      "name": "read",
+                      "arguments": "{\"path\":\"src/leases.rs\",\"start_line\":1,\"end_line\":7}"
+                    }
+                  }
+                ]
+              },
+              "finish_reason": "tool_calls"
+            }
+          ]
+        },
+        "stream_strict_finalization": {
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "{\"ranges\": [{\"end_line\": 7, \"path\": \"src/leases.rs\", \"start_line\": 2}]}",
+                "tool_calls": []
+              },
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        "tool_delta_event_count": 12,
+        "first_tool_delta": {
+          "seconds": 0.16605753800831735,
+          "event": {
+            "choices": [
+              {
+                "delta": {
+                  "tool_calls": [
+                    {
+                      "function": {
+                        "arguments": "{",
+                        "name": "glob"
+                      },
+                      "id": "NKMAyyIhOOQkDx6Z5YDvC1uzdZPEOwmQ",
+                      "index": 0,
+                      "type": "function"
+                    }
+                  ]
+                },
+                "finish_reason": null,
+                "index": 0,
+                "logprobs": null
+              }
+            ],
+            "created": 1788993453,
+            "id": "chatcmpl_b039f1e54fc243958078f54c8dfbe17a",
+            "model": "norted-grep-qwen3-5-4b-q4-k-m",
+            "object": "chat.completion.chunk"
+          }
+        },
+        "completion_event": {
+          "seconds": 0.37571948900585994,
+          "event": {
+            "choices": [
+              {
+                "delta": {},
+                "finish_reason": "tool_calls",
+                "index": 0,
+                "logprobs": null
+              }
+            ],
+            "created": 1788993453,
+            "id": "chatcmpl_b039f1e54fc243958078f54c8dfbe17a",
+            "model": "norted-grep-qwen3-5-4b-q4-k-m",
+            "object": "chat.completion.chunk"
+          }
+        },
+        "text_aggregate": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": "ready",
+                "refusal": null,
+                "role": "assistant"
+              }
+            }
+          ],
+          "created": 1788993454,
+          "id": "chatcmpl_c0cd5ac03e6f41b0b5e7b3852ccd37c9",
+          "model": "norted-grep-qwen3-5-4b-q4-k-m",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 2,
+            "prompt_tokens": 18,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 20
+          }
+        },
+        "text_stream": {
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "ready",
+                "tool_calls": []
+              },
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        "json_object_aggregate": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": "{\n  \"ready\": true\n}",
+                "refusal": null,
+                "role": "assistant"
+              }
+            }
+          ],
+          "created": 1788993454,
+          "id": "chatcmpl_6b04d1d406cb456da6fb184c838f60bc",
+          "model": "norted-grep-qwen3-5-4b-q4-k-m",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 10,
+            "prompt_tokens": 23,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 33
+          }
+        },
+        "json_object_stream": {
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "{\n  \"ready\": true\n}",
+                "tool_calls": []
+              },
+              "finish_reason": "stop"
+            }
+          ]
+        }
+      },
+      "benchmark": {
+        "run_id": "31512119-0edb-444d-9c91-3caaadd52463",
+        "whole_suite_status": "completed_unavailable",
+        "duration_seconds": 27.819694139,
+        "methodology": "json-fixture-executable-native-prefill/4",
+        "suite": "norted-quick-bench/4",
+        "pack_hash": "67d25940d37954d054f8ab526c36a0efdbd0c8501e40790c65f7e7413da18e75",
+        "missing_measurements": [
+          "Native decode rate and first-answer latency unavailable: shared event contract does not separate reasoning",
+          "External workloads, cache occupancy and cold-cache conditions unverified",
+          "Source revision unavailable unless NORTED_SOURCE_REVISION was set at build time",
+          "Resource peaks are unavailable; accelerator identity and total VRAM are host observations",
+          "Current configuration equivalence unverified: missing identity, file observation, accelerator binding or fallback next-load runtime selection",
+          "Native prefill incomplete: unavailable  (0/4; short 0/2; medium 0/2); short-1: native prefill timing semantics are unverified for this runtime"
+        ],
+        "retrieval": {
+          "raw": {
+            "aggregation": "task macro means for P/R/F0.5; sums for counts/time; partial evidence never supplies a headline",
+            "clean_success": 0,
+            "failure_rate": 1.0,
+            "failures": 4,
+            "file_f05": 0.0,
+            "file_precision": 0.0,
+            "file_recall": 0.0,
+            "grounded_success": 3,
+            "line_f05": 0.0,
+            "line_precision": 0.0,
+            "line_recall": 0.0,
+            "malformed_calls": 0.0,
+            "malformed_final": 4,
+            "malformed_final_rate": 1.0,
+            "observed_tasks": 4,
+            "polluting_lines": 0.0,
+            "recovered_tool_errors": 0,
+            "retrieval_wall_seconds": 8.243552130000001,
+            "returned_lines": 0.0,
+            "serial_rounds": 15.0,
+            "target_ranges_grounded": 6.0,
+            "tool_calls": 26.0,
+            "tool_errors": 0.0,
+            "tool_protocol_failure": 0,
+            "tool_protocol_failure_rate": 0.0,
+            "truncated_results": 9.0
+          },
+          "reason": null,
+          "required": 4,
+          "score": 0.0,
+          "scored": 4,
+          "state": "complete",
+          "tasks": [
+            {
+              "id": "grep-lease-1",
+              "raw": {
+                "clean_success": false,
+                "completion_status": "completed",
+                "completion_valid": false,
+                "failure": true,
+                "file_f05": 0.0,
+                "file_precision": 0.0,
+                "file_recall": 0.0,
+                "final_format_valid": false,
+                "grounded_success": false,
+                "line_f05": 0.0,
+                "line_precision": 0.0,
+                "line_recall": 0.0,
+                "malformed_calls": 0,
+                "malformed_final": true,
+                "polluting_lines": 0,
+                "predicted_files": [],
+                "predicted_ranges": [],
+                "recovered_tool_errors": false,
+                "retrieval_wall_seconds": 1.918783707,
+                "returned_lines": 0,
+                "score": 0.0,
+                "serial_rounds": 4,
+                "target_files": [
+                  "src/leases.rs"
+                ],
+                "target_ranges": [
+                  {
+                    "end_line": 7,
+                    "path": "src/leases.rs",
+                    "start_line": 2
+                  }
+                ],
+                "target_ranges_grounded": 0,
+                "terminal_failure_reason": "malformed_final_output",
+                "timeouts": 0,
+                "tool_calls": 8,
+                "tool_errors": 0,
+                "tool_protocol_failure": false,
+                "truncated_results": 0
+              },
+              "reason": "",
+              "score": 0.0,
+              "status": "failed"
+            },
+            {
+              "id": "grep-lease-2",
+              "raw": {
+                "clean_success": false,
+                "completion_status": "completed",
+                "completion_valid": false,
+                "failure": true,
+                "file_f05": 0.0,
+                "file_precision": 0.0,
+                "file_recall": 0.0,
+                "final_format_valid": false,
+                "grounded_success": true,
+                "line_f05": 0.0,
+                "line_precision": 0.0,
+                "line_recall": 0.0,
+                "malformed_calls": 0,
+                "malformed_final": true,
+                "polluting_lines": 0,
+                "predicted_files": [],
+                "predicted_ranges": [],
+                "recovered_tool_errors": false,
+                "retrieval_wall_seconds": 2.377642731,
+                "returned_lines": 0,
+                "score": 0.0,
+                "serial_rounds": 4,
+                "target_files": [
+                  "src/dispatch.rs",
+                  "src/leases.rs"
+                ],
+                "target_ranges": [
+                  {
+                    "end_line": 6,
+                    "path": "src/dispatch.rs",
+                    "start_line": 3
+                  },
+                  {
+                    "end_line": 7,
+                    "path": "src/leases.rs",
+                    "start_line": 2
+                  }
+                ],
+                "target_ranges_grounded": 2,
+                "terminal_failure_reason": "malformed_final_output",
+                "timeouts": 0,
+                "tool_calls": 7,
+                "tool_errors": 0,
+                "tool_protocol_failure": false,
+                "truncated_results": 3
+              },
+              "reason": "",
+              "score": 0.0,
+              "status": "failed"
+            },
+            {
+              "id": "grep-lease-3",
+              "raw": {
+                "clean_success": false,
+                "completion_status": "completed",
+                "completion_valid": false,
+                "failure": true,
+                "file_f05": 0.0,
+                "file_precision": 0.0,
+                "file_recall": 0.0,
+                "final_format_valid": false,
+                "grounded_success": true,
+                "line_f05": 0.0,
+                "line_precision": 0.0,
+                "line_recall": 0.0,
+                "malformed_calls": 0,
+                "malformed_final": true,
+                "polluting_lines": 0,
+                "predicted_files": [],
+                "predicted_ranges": [],
+                "recovered_tool_errors": false,
+                "retrieval_wall_seconds": 2.247517998,
+                "returned_lines": 0,
+                "score": 0.0,
+                "serial_rounds": 4,
+                "target_files": [
+                  "src/config.rs",
+                  "src/leases.rs"
+                ],
+                "target_ranges": [
+                  {
+                    "end_line": 3,
+                    "path": "src/config.rs",
+                    "start_line": 3
+                  },
+                  {
+                    "end_line": 5,
+                    "path": "src/leases.rs",
+                    "start_line": 5
+                  }
+                ],
+                "target_ranges_grounded": 2,
+                "terminal_failure_reason": "malformed_final_output",
+                "timeouts": 0,
+                "tool_calls": 6,
+                "tool_errors": 0,
+                "tool_protocol_failure": false,
+                "truncated_results": 3
+              },
+              "reason": "",
+              "score": 0.0,
+              "status": "failed"
+            },
+            {
+              "id": "grep-lease-4",
+              "raw": {
+                "clean_success": false,
+                "completion_status": "completed",
+                "completion_valid": false,
+                "failure": true,
+                "file_f05": 0.0,
+                "file_precision": 0.0,
+                "file_recall": 0.0,
+                "final_format_valid": false,
+                "grounded_success": true,
+                "line_f05": 0.0,
+                "line_precision": 0.0,
+                "line_recall": 0.0,
+                "malformed_calls": 0,
+                "malformed_final": true,
+                "polluting_lines": 0,
+                "predicted_files": [],
+                "predicted_ranges": [],
+                "recovered_tool_errors": false,
+                "retrieval_wall_seconds": 1.699607694,
+                "returned_lines": 0,
+                "score": 0.0,
+                "serial_rounds": 3,
+                "target_files": [
+                  "src/archive.rs",
+                  "src/config.rs"
+                ],
+                "target_ranges": [
+                  {
+                    "end_line": 4,
+                    "path": "src/archive.rs",
+                    "start_line": 3
+                  },
+                  {
+                    "end_line": 5,
+                    "path": "src/config.rs",
+                    "start_line": 5
+                  }
+                ],
+                "target_ranges_grounded": 2,
+                "terminal_failure_reason": "malformed_final_output",
+                "timeouts": 0,
+                "tool_calls": 5,
+                "tool_errors": 0,
+                "tool_protocol_failure": false,
+                "truncated_results": 3
+              },
+              "reason": "",
+              "score": 0.0,
+              "status": "failed"
+            }
+          ]
+        },
+        "final_responses": [
+          {
+            "id": "grep-lease-1",
+            "response": "{\"ranges\": [{\"end_line\": 124, \"path\": \"contracts/Lease.sol\", \"start_line\": 84}]}",
+            "status": "failed",
+            "model_failure": "malformed_final_output",
+            "strict_finalization_used": true,
+            "tool_rounds": [
+              {
+                "round": 1,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"active_owner\"}",
+                    "id": "6XpC8WjZ9GvHtP6o8R60QhWyBvzUcSOi",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"lease_claim\"}",
+                    "id": "2GGBbEcFKPXychr317ANvoShqvCdJ87f",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 2,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"active_owner\"}",
+                    "id": "XCplSYfk5KTOzlCCN5JZO1hF1ZSSE5JX",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"lease_claim\"}",
+                    "id": "BUfOEy0hhxxSDaETxU4wynodNsgroumb",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 3,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"active_owner\"}",
+                    "id": "ratOV8dvSo81bkqFjqkKWcPUx3QZeI4m",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"lease_claim\"}",
+                    "id": "NEeW7XT89ozabz8IuFQdJWkbZPhiNy76",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 4,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"active_owner\"}",
+                    "id": "xMJKxP5ayUw8vxW9VchX6xwPqah3A33Q",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"lease_claim\"}",
+                    "id": "eUlhjy4xjB9guNoJ4Dm3kROKgtPlU2le",
+                    "name": "grep"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "grep-lease-2",
+            "response": "{\"ranges\": [{\"end_line\": 10, \"path\": \"src/dispatch.rs\", \"start_line\": 1}, {\"end_line\": 10, \"path\": \"src/leases.rs\", \"start_line\": 1}]}",
+            "status": "failed",
+            "model_failure": "malformed_final_output",
+            "strict_finalization_used": true,
+            "tool_rounds": [
+              {
+                "round": 1,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"paused|leased\",\"include\":\"dispatcher\"}",
+                    "id": "cOqKzDjZ2myIRXfH4vEleiezhNF3tA3p",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"claim\",\"include\":\"dispatcher\"}",
+                    "id": "DEPl6XPPF9JqTa0zYoYnf6901dbqY1o9",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 2,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"paused|leased\"}",
+                    "id": "Kdrs1ziwYLNunITq0FeOanSHHAvVBcDl",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"claim\"}",
+                    "id": "EbECoMSqKknhPCVyF21jshN5cDwIDaUy",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 3,
+                "calls": [
+                  {
+                    "arguments": "{\"path\":\"src/dispatch.rs\",\"start_line\":1,\"end_line\":20}",
+                    "id": "qWcDaVOPM9zZgASp1zM058zbIZc19o4q",
+                    "name": "read"
+                  },
+                  {
+                    "arguments": "{\"path\":\"src/leases.rs\",\"start_line\":1,\"end_line\":30}",
+                    "id": "oIa8izmgwgn3U68rC3P8S18RGrsIaC5E",
+                    "name": "read"
+                  }
+                ]
+              },
+              {
+                "round": 4,
+                "calls": [
+                  {
+                    "arguments": "{\"path\":\"src/dispatch.rs\",\"start_line\":1,\"end_line\":15}",
+                    "id": "6JE2ePdmkQDy1I3eBEk1hi4oeItByQLT",
+                    "name": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "grep-lease-3",
+            "response": "{\"ranges\": [{\"end_line\": 12, \"path\": \"src/config.rs\", \"start_line\": 1}, {\"end_line\": 12, \"path\": \"src/leases.rs\", \"start_line\": 1}]}",
+            "status": "failed",
+            "model_failure": "malformed_final_output",
+            "strict_finalization_used": true,
+            "tool_rounds": [
+              {
+                "round": 1,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"lease.*duration|expiry|expires\",\"include\":\"*.rs\"}",
+                    "id": "CdP6PYC5b9tEN82Sq1508LyC5PHb9mt0",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"lease.*duration|expiry|expires\",\"include\":\"*.toml\"}",
+                    "id": "Enrt8pSDNmNdohrJ0XJWvNHQIe8yF4gO",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 2,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"lease|duration|expiry\"}",
+                    "id": "bTR8c85fOPHOZBTnQxMGg6KUmlt2g6Pk",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 3,
+                "calls": [
+                  {
+                    "arguments": "{\"path\":\"src/config.rs\",\"start_line\":1,\"end_line\":20}",
+                    "id": "bPzPiwPYRs7lJutSnYjtCQuEY0Kv5ECR",
+                    "name": "read"
+                  },
+                  {
+                    "arguments": "{\"path\":\"src/dispatch.rs\",\"start_line\":1,\"end_line\":20}",
+                    "id": "HaEUuP4B6iZGTSJg7elznAyHqMULT24a",
+                    "name": "read"
+                  }
+                ]
+              },
+              {
+                "round": 4,
+                "calls": [
+                  {
+                    "arguments": "{\"path\":\"src/leases.rs\",\"start_line\":1,\"end_line\":50}",
+                    "id": "ANpZb6Wgc9WUgOSylqGkfqA1bK83yFES",
+                    "name": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "grep-lease-4",
+            "response": "{\"ranges\": [{\"end_line\": 10, \"path\": \"src/archive.rs\", \"start_line\": 1}, {\"end_line\": 15, \"path\": \"src/config.rs\", \"start_line\": 1}]}",
+            "status": "failed",
+            "model_failure": "malformed_final_output",
+            "strict_finalization_used": false,
+            "tool_rounds": [
+              {
+                "round": 1,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"archive.*export|export.*archive\"}",
+                    "id": "wq8LVmGsOdkdmhPjjqgflTiIySXD1zu5",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"is_archived|archived\"}",
+                    "id": "tGnCgzbGVhkO6VPWqN6CVn5SMCJH3Xs1",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 2,
+                "calls": [
+                  {
+                    "arguments": "{\"path\":\"src/archive.rs\",\"start_line\":1,\"end_line\":20}",
+                    "id": "19BGz0j8w0YF2PP6dO09R3GKCkdnQiNn",
+                    "name": "read"
+                  },
+                  {
+                    "arguments": "{\"path\":\"src/config.rs\",\"start_line\":1,\"end_line\":15}",
+                    "id": "r4GSLyWlvaN3N4u2PqltII4kI3Q4yeUh",
+                    "name": "read"
+                  }
+                ]
+              },
+              {
+                "round": 3,
+                "calls": [
+                  {
+                    "arguments": "{\"path\":\"src/import.rs\",\"start_line\":1,\"end_line\":10}",
+                    "id": "7ihb93j8tR036Q89EIviOCmmCzm1LSZe",
+                    "name": "read"
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "all_final_payloads_satisfy_json_schema": true
+      }
+    },
+    "9b": {
+      "profile": {
+        "display_name": "norted-grep-qwen3-5-9b-q4-k-m",
+        "engine_id": "llama.cpp",
+        "id": "norted-grep-qwen3-5-9b-q4-k-m",
+        "model_id": "norted-grep-qwen3-5-9b-q4-k-m-7c8be7defb25",
+        "overrides": {
+          "llama.cpp.context_length": {
+            "kind": "unsigned_integer",
+            "value": 16384
+          },
+          "llama.cpp.flash_attention": {
+            "kind": "choice",
+            "value": "on"
+          },
+          "llama.cpp.gpu_offload": {
+            "kind": "gpu_offload",
+            "value": {
+              "mode": "all"
+            }
+          },
+          "llama.cpp.jinja": {
+            "kind": "toggle",
+            "value": true
+          },
+          "llama.cpp.kv_cache_gpu_offload": {
+            "kind": "toggle",
+            "value": true
+          },
+          "llama.cpp.kv_cache_k": {
+            "kind": "choice",
+            "value": "bf16"
+          },
+          "llama.cpp.kv_cache_v": {
+            "kind": "choice",
+            "value": "bf16"
+          },
+          "llama.cpp.max_output_tokens": {
+            "kind": "unsigned_integer",
+            "value": 1024
+          },
+          "llama.cpp.min_p": {
+            "kind": "float",
+            "value": 0.0
+          },
+          "llama.cpp.reasoning": {
+            "kind": "choice",
+            "value": "off"
+          },
+          "llama.cpp.temperature": {
+            "kind": "float",
+            "value": 0.0
+          },
+          "llama.cpp.top_k": {
+            "kind": "unsigned_integer",
+            "value": 0
+          },
+          "llama.cpp.top_p": {
+            "kind": "float",
+            "value": 1.0
+          }
+        },
+        "role": "primary"
+      },
+      "saved_configuration": {
+        "files": [
+          {
+            "observation": {
+              "evidence": "metadata observation, not a fresh content digest",
+              "identity": {
+                "ctime": 1788972416,
+                "ctime_nsec": 15812397,
+                "device": 2065,
+                "inode": 32677561
+              },
+              "modified_unix_ns": 1788972404377776607,
+              "size": 5780090208
+            },
+            "path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/9b/Norted-Grep-Qwen3.5-9B-Q4_K_M.gguf"
+          },
+          {
+            "observation": {
+              "evidence": "metadata observation, not a fresh content digest",
+              "identity": {
+                "ctime": 1788972416,
+                "ctime_nsec": 34812455,
+                "device": 2065,
+                "inode": 32677564
+              },
+              "modified_unix_ns": 1788972416033812452,
+              "size": 123592
+            },
+            "path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/9b/manifest.json"
+          }
+        ],
+        "format_runtime_selection": null,
+        "inherited_settings": null,
+        "model": {
+          "architecture": "qwen35",
+          "auxiliary_artifacts": [
+            {
+              "hash": "73a96214889efd0daa8ea8cb5aea6d177447335e027d6bacc4dcfab14ebd7b06",
+              "path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/9b/manifest.json",
+              "role": {
+                "role": "manifest"
+              },
+              "size_bytes": 123592
+            }
+          ],
+          "context_length": 262144,
+          "created": 1788972404,
+          "format": "gguf",
+          "generation_contract": {
+            "manifest_sha256": "73a96214889efd0daa8ea8cb5aea6d177447335e027d6bacc4dcfab14ebd7b06",
+            "metadata_sha256": {},
+            "native_eos_token_ids": [
+              248046
+            ],
+            "required_stop_token_ids": [
+              248044,
+              248046
+            ]
+          },
+          "hash": null,
+          "id": "norted-grep-qwen3-5-9b-q4-k-m-7c8be7defb25",
+          "native_identity": {
+            "format": "gguf",
+            "identity": {
+              "architecture": "qwen35",
+              "chat_template_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+              "context_length": 262144,
+              "expert_count": null,
+              "expert_used_count": null,
+              "native_eos_token_id": 248046,
+              "pooling_type": null,
+              "rope_frequency_base": "10000000",
+              "rope_scaling_factor": null,
+              "rope_scaling_factor_key": null,
+              "tokenizer_metadata_sha256": "4182f668ba04e6540121979d00e368c1fd5aa5cd4b44874d1e8c66e1f5648e3a",
+              "version": 3
+            }
+          },
+          "norted_package": {
+            "build_key": "b8f62df573a8f7decd0b01803b2a935535326949780befb7b0b26dba0619ba84",
+            "canonical_source_lineage_key": "1a2e583fe5d514e42580428e436c4c9bf5fc732ec1da89651761185c56c81864",
+            "expected_primary_sha256": "34d3850328d11a3d25c26fa7ee0b58e840668c8584e46854c78ceebec5186f2d",
+            "expected_primary_size": 5780090208,
+            "kind": "gguf",
+            "manifest_path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/9b/manifest.json",
+            "manifest_schema": "norted.grep-student-gguf.v1",
+            "manifest_sha256": "73a96214889efd0daa8ea8cb5aea6d177447335e027d6bacc4dcfab14ebd7b06",
+            "manifest_version": 1,
+            "master_id": null,
+            "output_key": "Q4_K_M",
+            "package_root": "/srv/norted/repos/Norted/dist/grep-variants/gguf/9b",
+            "projector": null,
+            "quant_recipe_key": null,
+            "sharp": null,
+            "sharp_revision": null,
+            "sharp_version": null,
+            "tokenizer": null
+          },
+          "path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/9b/Norted-Grep-Qwen3.5-9B-Q4_K_M.gguf",
+          "provenance": null,
+          "size_bytes": 5780090208
+        },
+        "model_runtime_selection": null,
+        "profile_hash": "9739eca752dd62360d2c35c212fe5b7ebe2ef1e6b162f857ef9b52754496a0bd",
+        "served_files": [
+          {
+            "observation": {
+              "evidence": "metadata observation, not a fresh content digest",
+              "identity": {
+                "ctime": 1788992876,
+                "ctime_nsec": 12743987,
+                "device": 2065,
+                "inode": 32687406
+              },
+              "modified_unix_ns": 1788992810600233829,
+              "size": 17904
+            },
+            "path": "/srv/norted/scratch/llama-retrieval-validation/data/nortedserver/runtimes/llama.cpp/linux-x86_64-cuda-managed-portable-cuda13-exact-stop-v2/b10786/llama-cpp-b10786-linux-x86-64-cuda-managed-portable-cuda13-exact-stop-v2-3d7babe5ecd4f911/source/build/bin/llama-server"
+          },
+          {
+            "observation": {
+              "evidence": "metadata observation, not a fresh content digest",
+              "identity": {
+                "ctime": 1788972416,
+                "ctime_nsec": 15812397,
+                "device": 2065,
+                "inode": 32677561
+              },
+              "modified_unix_ns": 1788972404377776607,
+              "size": 5780090208
+            },
+            "path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/9b/Norted-Grep-Qwen3.5-9B-Q4_K_M.gguf"
+          },
+          {
+            "observation": {
+              "evidence": "metadata observation, not a fresh content digest",
+              "identity": {
+                "ctime": 1788972416,
+                "ctime_nsec": 34812455,
+                "device": 2065,
+                "inode": 32677564
+              },
+              "modified_unix_ns": 1788972416033812452,
+              "size": 123592
+            },
+            "path": "/srv/norted/repos/Norted/dist/grep-variants/gguf/9b/manifest.json"
+          }
+        ],
+        "served_setting_files": [],
+        "setting_files": []
+      },
+      "runtime_chat_properties": {
+        "chat_template_caps": {
+          "supports_object_arguments": true,
+          "supports_parallel_tool_calls": true,
+          "supports_preserve_reasoning": false,
+          "supports_reasoning_effort": false,
+          "supports_string_content": true,
+          "supports_system_role": true,
+          "supports_tool_calls": true,
+          "supports_tools": true,
+          "supports_typed_content": false
+        },
+        "chat_template_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+      },
+      "manual": {
+        "aggregate": {
+          "choices": [
+            {
+              "finish_reason": "tool_calls",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": null,
+                "refusal": null,
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"pattern\":\"src/*.rs\"}",
+                      "name": "glob"
+                    },
+                    "id": "iaOyCzbIR8n0wrq76nnit19bXWTsqURE",
+                    "type": "function"
+                  },
+                  {
+                    "function": {
+                      "arguments": "{\"pattern\":\"claim\"}",
+                      "name": "grep"
+                    },
+                    "id": "VxgqiKp4NSJblSuGdCQQkLPlmpZzLycn",
+                    "type": "function"
+                  }
+                ]
+              }
+            }
+          ],
+          "created": 1788993552,
+          "id": "chatcmpl_44b222741cfd440597ca0c26a746de90",
+          "model": "norted-grep-qwen3-5-9b-q4-k-m",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 54,
+            "prompt_tokens": 466,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 520
+          }
+        },
+        "aggregate_continuation": {
+          "choices": [
+            {
+              "finish_reason": "tool_calls",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": null,
+                "refusal": null,
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"path\":\"src/leases.rs\",\"start_line\":1,\"end_line\":7}",
+                      "name": "read"
+                    },
+                    "id": "z9eKcofSbmnqc9HeBlZXkhCE3I36jVRl",
+                    "type": "function"
+                  }
+                ]
+              }
+            }
+          ],
+          "created": 1788993552,
+          "id": "chatcmpl_88efda0e0f4443a2988fd0abe3f80e62",
+          "model": "norted-grep-qwen3-5-9b-q4-k-m",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 51,
+            "prompt_tokens": 485,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 536
+          }
+        },
+        "aggregate_strict_finalization": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": "{\"ranges\": [{\"end_line\": 7, \"path\": \"src/leases.rs\", \"start_line\": 2}]}",
+                "refusal": null,
+                "role": "assistant"
+              }
+            }
+          ],
+          "created": 1788993552,
+          "id": "chatcmpl_23b3569ad7ef43a8af6c3b5838cdd271",
+          "model": "norted-grep-qwen3-5-9b-q4-k-m",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 28,
+            "prompt_tokens": 209,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 237
+          }
+        },
+        "stream_assembled": {
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                  {
+                    "id": "qy7l8UOu1KjUYzRXJe8J320z0klj8q5c",
+                    "type": "function",
+                    "function": {
+                      "name": "glob",
+                      "arguments": "{\"pattern\":\"src/*.rs\"}"
+                    }
+                  },
+                  {
+                    "id": "FaV2KhXmCcjYkAjevinrGnoEei9ZXrVh",
+                    "type": "function",
+                    "function": {
+                      "name": "grep",
+                      "arguments": "{\"pattern\":\"claim\"}"
+                    }
+                  }
+                ]
+              },
+              "finish_reason": "tool_calls"
+            }
+          ]
+        },
+        "stream_continuation": {
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                  {
+                    "id": "gr7Vla8YtVC3ZdLYtF0UunJ9lSAeVXjR",
+                    "type": "function",
+                    "function": {
+                      "name": "read",
+                      "arguments": "{\"path\":\"src/leases.rs\",\"start_line\":1,\"end_line\":7}"
+                    }
+                  }
+                ]
+              },
+              "finish_reason": "tool_calls"
+            }
+          ]
+        },
+        "stream_strict_finalization": {
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "{\"ranges\": [{\"end_line\": 7, \"path\": \"src/leases.rs\", \"start_line\": 2}]}",
+                "tool_calls": []
+              },
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        "tool_delta_event_count": 12,
+        "first_tool_delta": {
+          "seconds": 0.17904059300781228,
+          "event": {
+            "choices": [
+              {
+                "delta": {
+                  "tool_calls": [
+                    {
+                      "function": {
+                        "arguments": "{",
+                        "name": "glob"
+                      },
+                      "id": "qy7l8UOu1KjUYzRXJe8J320z0klj8q5c",
+                      "index": 0,
+                      "type": "function"
+                    }
+                  ]
+                },
+                "finish_reason": null,
+                "index": 0,
+                "logprobs": null
+              }
+            ],
+            "created": 1788993553,
+            "id": "chatcmpl_7bd46b1dd9924e6a8e785dec94cd6fef",
+            "model": "norted-grep-qwen3-5-9b-q4-k-m",
+            "object": "chat.completion.chunk"
+          }
+        },
+        "completion_event": {
+          "seconds": 0.4529416260047583,
+          "event": {
+            "choices": [
+              {
+                "delta": {},
+                "finish_reason": "tool_calls",
+                "index": 0,
+                "logprobs": null
+              }
+            ],
+            "created": 1788993553,
+            "id": "chatcmpl_7bd46b1dd9924e6a8e785dec94cd6fef",
+            "model": "norted-grep-qwen3-5-9b-q4-k-m",
+            "object": "chat.completion.chunk"
+          }
+        },
+        "text_aggregate": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": "ready",
+                "refusal": null,
+                "role": "assistant"
+              }
+            }
+          ],
+          "created": 1788993554,
+          "id": "chatcmpl_274afc9bcb7d4132a6d02f74a8889d4c",
+          "model": "norted-grep-qwen3-5-9b-q4-k-m",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 2,
+            "prompt_tokens": 18,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 20
+          }
+        },
+        "text_stream": {
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "ready",
+                "tool_calls": []
+              },
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        "json_object_aggregate": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": "{\"ready\": true}",
+                "refusal": null,
+                "role": "assistant"
+              }
+            }
+          ],
+          "created": 1788993554,
+          "id": "chatcmpl_c9cd7bb9ebf245a5b317f9d6265cb7e5",
+          "model": "norted-grep-qwen3-5-9b-q4-k-m",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 6,
+            "prompt_tokens": 23,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 29
+          }
+        },
+        "json_object_stream": {
+          "choices": [
+            {
+              "message": {
+                "role": "assistant",
+                "content": "{\"ready\": true}",
+                "tool_calls": []
+              },
+              "finish_reason": "stop"
+            }
+          ]
+        }
+      },
+      "benchmark": {
+        "run_id": "4196b6f3-fdf8-4d43-8e46-60a55e43aadb",
+        "whole_suite_status": "completed_unavailable",
+        "duration_seconds": 31.75293625,
+        "methodology": "json-fixture-executable-native-prefill/4",
+        "suite": "norted-quick-bench/4",
+        "pack_hash": "67d25940d37954d054f8ab526c36a0efdbd0c8501e40790c65f7e7413da18e75",
+        "missing_measurements": [
+          "Native decode rate and first-answer latency unavailable: shared event contract does not separate reasoning",
+          "External workloads, cache occupancy and cold-cache conditions unverified",
+          "Source revision unavailable unless NORTED_SOURCE_REVISION was set at build time",
+          "Resource peaks are unavailable; accelerator identity and total VRAM are host observations",
+          "Current configuration equivalence unverified: missing identity, file observation, accelerator binding or fallback next-load runtime selection",
+          "Native prefill incomplete: unavailable  (0/4; short 0/2; medium 0/2); short-1: native prefill timing semantics are unverified for this runtime"
+        ],
+        "retrieval": {
+          "raw": {
+            "aggregation": "task macro means for P/R/F0.5; sums for counts/time; partial evidence never supplies a headline",
+            "clean_success": 0,
+            "failure_rate": 1.0,
+            "failures": 4,
+            "file_f05": 0.0,
+            "file_precision": 0.0,
+            "file_recall": 0.0,
+            "grounded_success": 2,
+            "line_f05": 0.0,
+            "line_precision": 0.0,
+            "line_recall": 0.0,
+            "malformed_calls": 0.0,
+            "malformed_final": 4,
+            "malformed_final_rate": 1.0,
+            "observed_tasks": 4,
+            "polluting_lines": 0.0,
+            "recovered_tool_errors": 0,
+            "retrieval_wall_seconds": 8.819130279,
+            "returned_lines": 0.0,
+            "serial_rounds": 14.0,
+            "target_ranges_grounded": 3.0,
+            "tool_calls": 23.0,
+            "tool_errors": 0.0,
+            "tool_protocol_failure": 0,
+            "tool_protocol_failure_rate": 0.0,
+            "truncated_results": 4.0
+          },
+          "reason": null,
+          "required": 4,
+          "score": 0.0,
+          "scored": 4,
+          "state": "complete",
+          "tasks": [
+            {
+              "id": "grep-lease-1",
+              "raw": {
+                "clean_success": false,
+                "completion_status": "completed",
+                "completion_valid": false,
+                "failure": true,
+                "file_f05": 0.0,
+                "file_precision": 0.0,
+                "file_recall": 0.0,
+                "final_format_valid": false,
+                "grounded_success": true,
+                "line_f05": 0.0,
+                "line_precision": 0.0,
+                "line_recall": 0.0,
+                "malformed_calls": 0,
+                "malformed_final": true,
+                "polluting_lines": 0,
+                "predicted_files": [],
+                "predicted_ranges": [],
+                "recovered_tool_errors": false,
+                "retrieval_wall_seconds": 2.877167525,
+                "returned_lines": 0,
+                "score": 0.0,
+                "serial_rounds": 4,
+                "target_files": [
+                  "src/leases.rs"
+                ],
+                "target_ranges": [
+                  {
+                    "end_line": 7,
+                    "path": "src/leases.rs",
+                    "start_line": 2
+                  }
+                ],
+                "target_ranges_grounded": 1,
+                "terminal_failure_reason": "malformed_final_output",
+                "timeouts": 0,
+                "tool_calls": 7,
+                "tool_errors": 0,
+                "tool_protocol_failure": false,
+                "truncated_results": 2
+              },
+              "reason": "",
+              "score": 0.0,
+              "status": "failed"
+            },
+            {
+              "id": "grep-lease-2",
+              "raw": {
+                "clean_success": false,
+                "completion_status": "completed",
+                "completion_valid": false,
+                "failure": true,
+                "file_f05": 0.0,
+                "file_precision": 0.0,
+                "file_recall": 0.0,
+                "final_format_valid": false,
+                "grounded_success": false,
+                "line_f05": 0.0,
+                "line_precision": 0.0,
+                "line_recall": 0.0,
+                "malformed_calls": 0,
+                "malformed_final": true,
+                "polluting_lines": 0,
+                "predicted_files": [],
+                "predicted_ranges": [],
+                "recovered_tool_errors": false,
+                "retrieval_wall_seconds": 2.273808231,
+                "returned_lines": 0,
+                "score": 0.0,
+                "serial_rounds": 4,
+                "target_files": [
+                  "src/dispatch.rs",
+                  "src/leases.rs"
+                ],
+                "target_ranges": [
+                  {
+                    "end_line": 6,
+                    "path": "src/dispatch.rs",
+                    "start_line": 3
+                  },
+                  {
+                    "end_line": 7,
+                    "path": "src/leases.rs",
+                    "start_line": 2
+                  }
+                ],
+                "target_ranges_grounded": 0,
+                "terminal_failure_reason": "malformed_final_output",
+                "timeouts": 0,
+                "tool_calls": 6,
+                "tool_errors": 0,
+                "tool_protocol_failure": false,
+                "truncated_results": 0
+              },
+              "reason": "",
+              "score": 0.0,
+              "status": "failed"
+            },
+            {
+              "id": "grep-lease-3",
+              "raw": {
+                "clean_success": false,
+                "completion_status": "completed",
+                "completion_valid": false,
+                "failure": true,
+                "file_f05": 0.0,
+                "file_precision": 0.0,
+                "file_recall": 0.0,
+                "final_format_valid": false,
+                "grounded_success": false,
+                "line_f05": 0.0,
+                "line_precision": 0.0,
+                "line_recall": 0.0,
+                "malformed_calls": 0,
+                "malformed_final": true,
+                "polluting_lines": 0,
+                "predicted_files": [],
+                "predicted_ranges": [],
+                "recovered_tool_errors": false,
+                "retrieval_wall_seconds": 1.958547697,
+                "returned_lines": 0,
+                "score": 0.0,
+                "serial_rounds": 4,
+                "target_files": [
+                  "src/config.rs",
+                  "src/leases.rs"
+                ],
+                "target_ranges": [
+                  {
+                    "end_line": 3,
+                    "path": "src/config.rs",
+                    "start_line": 3
+                  },
+                  {
+                    "end_line": 5,
+                    "path": "src/leases.rs",
+                    "start_line": 5
+                  }
+                ],
+                "target_ranges_grounded": 0,
+                "terminal_failure_reason": "malformed_final_output",
+                "timeouts": 0,
+                "tool_calls": 6,
+                "tool_errors": 0,
+                "tool_protocol_failure": false,
+                "truncated_results": 0
+              },
+              "reason": "",
+              "score": 0.0,
+              "status": "failed"
+            },
+            {
+              "id": "grep-lease-4",
+              "raw": {
+                "clean_success": false,
+                "completion_status": "completed",
+                "completion_valid": false,
+                "failure": true,
+                "file_f05": 0.0,
+                "file_precision": 0.0,
+                "file_recall": 0.0,
+                "final_format_valid": false,
+                "grounded_success": true,
+                "line_f05": 0.0,
+                "line_precision": 0.0,
+                "line_recall": 0.0,
+                "malformed_calls": 0,
+                "malformed_final": true,
+                "polluting_lines": 0,
+                "predicted_files": [],
+                "predicted_ranges": [],
+                "recovered_tool_errors": false,
+                "retrieval_wall_seconds": 1.709606826,
+                "returned_lines": 0,
+                "score": 0.0,
+                "serial_rounds": 2,
+                "target_files": [
+                  "src/archive.rs",
+                  "src/config.rs"
+                ],
+                "target_ranges": [
+                  {
+                    "end_line": 4,
+                    "path": "src/archive.rs",
+                    "start_line": 3
+                  },
+                  {
+                    "end_line": 5,
+                    "path": "src/config.rs",
+                    "start_line": 5
+                  }
+                ],
+                "target_ranges_grounded": 2,
+                "terminal_failure_reason": "malformed_final_output",
+                "timeouts": 0,
+                "tool_calls": 4,
+                "tool_errors": 0,
+                "tool_protocol_failure": false,
+                "truncated_results": 2
+              },
+              "reason": "",
+              "score": 0.0,
+              "status": "failed"
+            }
+          ]
+        },
+        "final_responses": [
+          {
+            "id": "grep-lease-1",
+            "response": "{\"ranges\": [{\"end_line\": 11, \"path\": \"src/leases.rs\", \"start_line\": 1}]}",
+            "status": "failed",
+            "model_failure": "malformed_final_output",
+            "strict_finalization_used": true,
+            "tool_rounds": [
+              {
+                "round": 1,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"lease.*claim|claim.*lease\",\"include\":\"*.rs\"}",
+                    "id": "R99FxSCYMa6u4VyoSTEoTeCzA6hchw0Q",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"active.*owner|owner.*active\",\"include\":\"*.rs\"}",
+                    "id": "9m1wZewGa7xtWXuS4VjC0DVW16uvTM7b",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"expiry.*calculation|calculation.*expiry\",\"include\":\"*.rs\"}",
+                    "id": "A4N8QoHTiDsoxNdNftd6E2ZJSmygM6EX",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 2,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"fn claim\",\"include\":\"*.rs\"}",
+                    "id": "v2MvJfBUACRPgDq2XcXCibP7VShUKZSt",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"active_owner|active_owner_\",\"include\":\"*.rs\"}",
+                    "id": "o56Jk5A0kFUZqC2Zx3bgrlohDOL02A1E",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 3,
+                "calls": [
+                  {
+                    "arguments": "{\"path\":\"src/leases.rs\",\"start_line\":1,\"end_line\":100}",
+                    "id": "YO2PBbEVKT66dcaXoV9JkfR7e5qEVvBa",
+                    "name": "read"
+                  }
+                ]
+              },
+              {
+                "round": 4,
+                "calls": [
+                  {
+                    "arguments": "{\"path\":\"src/leases.rs\",\"start_line\":1,\"end_line\":100}",
+                    "id": "bd89NOXeGWxf9gHpXeyqeBgmPboztThM",
+                    "name": "read"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "grep-lease-2",
+            "response": "{\"ranges\": [{\"end_line\": 104, \"path\": \"docs/leases.md\", \"start_line\": 74}]}",
+            "status": "failed",
+            "model_failure": "malformed_final_output",
+            "strict_finalization_used": true,
+            "tool_rounds": [
+              {
+                "round": 1,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"skip.*paused|paused.*skip|skip.*leased|leased.*skip\"}",
+                    "id": "tet848MrG0uhVECbDb68Rw6M3Q5ifbYk",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"is_paused|is_leased|paused|leased\",\"include\":\"*dispatcher*\"}",
+                    "id": "NJ7Vv0Ebhm7pdUbdW1pKnvklzuHHCX7T",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 2,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"paused|leased\",\"include\":\"*dispatcher*\"}",
+                    "id": "qVR5K8aPFPVIrtMPoHhYGrPrwx1sFEAM",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"skip\",\"include\":\"*dispatcher*\"}",
+                    "id": "YaU5rsbe4VfHR9aYzLsLlt7JWIX5r3or",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 3,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"*dispatcher*\"}",
+                    "id": "53ObYmgLlBqcx8hOHzfnwzEAQtFE7T0D",
+                    "name": "glob"
+                  }
+                ]
+              },
+              {
+                "round": 4,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"dispatcher\"}",
+                    "id": "fvg1RMrBH7fvGMDJRoeG3I9d2OS4nX52",
+                    "name": "grep"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "grep-lease-3",
+            "response": "{\"ranges\": [{\"end_line\": 114, \"path\": \"src/lease.rs\", \"start_line\": 84}]}",
+            "status": "failed",
+            "model_failure": "malformed_final_output",
+            "strict_finalization_used": true,
+            "tool_rounds": [
+              {
+                "round": 1,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"lease.*duration|lease_duration|lease_duration_default\"}",
+                    "id": "W945YNuydAuB4kGwOdu8fP2uDSVVR1nP",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"expiry|expir|lease.*expiry\"}",
+                    "id": "1gCC20RODQBaSzx1YErzVZMy9KFazo09",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 2,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"lease_duration\"}",
+                    "id": "nrw8zFVEskvDNJVPCjgOjrjrLzVGiVjX",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"expiry\"}",
+                    "id": "tx3FCTzVieDuPtTNAAker5rSMeqqJLoa",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 3,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"lease_duration|expiry\"}",
+                    "id": "jlR41VDIcxZxvf9A9rSuCqSvnUHL4hwV",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 4,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"lease_duration|expiry\"}",
+                    "id": "2itZo6goisfiAcelYUGKZzgnhuqYLlQD",
+                    "name": "grep"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "grep-lease-4",
+            "response": "{\"ranges\": [{\"end_line\": 10, \"path\": \"src/archive.rs\", \"start_line\": 1}, {\"end_line\": 10, \"path\": \"src/config.rs\", \"start_line\": 1}]}",
+            "status": "failed",
+            "model_failure": "malformed_final_output",
+            "strict_finalization_used": false,
+            "tool_rounds": [
+              {
+                "round": 1,
+                "calls": [
+                  {
+                    "arguments": "{\"pattern\":\"archive.*export|export.*archive\"}",
+                    "id": "fgZyy0dnaX4woBTThXtX5HKKuB4X1KaG",
+                    "name": "grep"
+                  },
+                  {
+                    "arguments": "{\"pattern\":\"is_archived|archived\"}",
+                    "id": "r5opPQmsnswQIlsahZwCOvXfCbRBGOhm",
+                    "name": "grep"
+                  }
+                ]
+              },
+              {
+                "round": 2,
+                "calls": [
+                  {
+                    "arguments": "{\"path\":\"src/archive.rs\",\"start_line\":1,\"end_line\":20}",
+                    "id": "hOE2RecuwDOLh0WlUaz18Sv0SaGCNZVg",
+                    "name": "read"
+                  },
+                  {
+                    "arguments": "{\"path\":\"src/config.rs\",\"start_line\":1,\"end_line\":20}",
+                    "id": "T4wINPJqKEwtv3XBBPqZEcNGbMeJsq2U",
+                    "name": "read"
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "all_final_payloads_satisfy_json_schema": true
+      }
+    }
+  },
+  "malformed_backend_observations": [
+    "bad-type aggregate Err(Operation(\"invalid llama.cpp chat response: tool calls require unique nonempty IDs, function type and name\"))",
+    "bad-type stream rejected: engine operation failed: invalid llama.cpp chat response: non-function tool delta",
+    "missing-id aggregate Err(Operation(\"invalid llama.cpp completion response: missing field `id` at line 1 column 179\"))",
+    "missing-id stream rejected: engine operation failed: invalid llama.cpp chat response: tool calls require unique nonempty IDs, function type and name",
+    "empty-name aggregate Err(Operation(\"invalid llama.cpp chat response: tool calls require unique nonempty IDs, function type and name\"))",
+    "empty-name stream rejected: engine operation failed: invalid llama.cpp chat response: empty or conflicting tool delta header",
+    "object-arguments aggregate Err(Operation(\"invalid llama.cpp completion response: invalid type: map, expected a string at line 1 column 162\"))",
+    "object-arguments stream rejected: engine operation failed: invalid llama.cpp chat response: non-string tool delta field",
+    "invalid-json-arguments aggregate Err(Operation(\"invalid llama.cpp chat response: key must be a string at line 1 column 2\"))",
+    "invalid-json-arguments stream rejected: engine operation failed: invalid llama.cpp chat response: key must be a string at line 1 column 2",
+    "duplicate-id aggregate Err(Operation(\"invalid llama.cpp chat response: tool calls require unique nonempty IDs, function type and name\"))",
+    "duplicate-id stream rejected: engine operation failed: invalid llama.cpp chat response: tool calls require unique nonempty IDs, function type and name",
+    "finish-without-call aggregate Err(Operation(\"invalid llama.cpp chat response: tool calls and terminal finish reason disagree\"))",
+    "finish-without-call stream rejected: engine operation failed: invalid llama.cpp chat response: tool calls and terminal finish reason disagree",
+    "call-with-stop aggregate Err(Operation(\"invalid llama.cpp chat response: tool calls and terminal finish reason disagree\"))",
+    "call-with-stop stream rejected: engine operation failed: invalid llama.cpp chat response: tool calls and terminal finish reason disagree",
+    "multiple-choices aggregate Err(Operation(\"llama.cpp returned multiple completion choices\"))",
+    "multiple-choices stream rejected: engine operation failed: invalid llama.cpp chat response: multiple completion choices are unsupported",
+    "valid-encoded-arguments aggregate Ok(InferenceOutput { text: \"\", tool_calls: [InferenceToolCall { id: \"backend-id\", name: \"read\", arguments: \"{ \\\"path\\\" : \\\"a.rs\\\", \\\"n\\\": 1 }\" }], usage: None, finish_reason: ToolCalls })",
+    "valid-encoded-arguments stream completed",
+    "schema-extra-property aggregate Err(Operation(\"invalid llama.cpp chat response: output violates response schema: Additional properties are not allowed ('extra' was unexpected)\"))",
+    "schema-extra-property stream rejected: engine operation failed: invalid llama.cpp chat response: output violates response schema: Additional properties are not allowed ('extra' was unexpected)",
+    "schema-prose aggregate Err(Operation(\"invalid llama.cpp chat response: expected value at line 1 column 1\"))",
+    "schema-prose stream rejected: engine operation failed: invalid llama.cpp chat response: expected value at line 1 column 1",
+    "schema-minimum aggregate Err(Operation(\"invalid llama.cpp chat response: output violates response schema: 0 is less than the minimum of 1\"))",
+    "schema-minimum stream rejected: engine operation failed: invalid llama.cpp chat response: output violates response schema: 0 is less than the minimum of 1"
+  ],
+  "earlier_incomplete_attempt": {
+    "run_id": "28037327-4e1a-4b0e-bff8-93fbfdedda0f",
+    "reason": "Discovery/prepared package hash representation differed in the new capability key; corrected before final runs. No score used from this attempt."
+  },
+  "full_local_evidence_directory": "/srv/norted/scratch/llama-retrieval-validation/evidence",
+  "exact_stop_probes": {
+    "248044-False": {
+      "stop_type": "token_id",
+      "tokens_predicted": 1,
+      "visible_content": "",
+      "requested_stop_token_ids": [
+        248044,
+        248046,
+        42
+      ],
+      "coexisting_stop_strings": [
+        "unused-text-stop"
+      ]
+    },
+    "248044-True": {
+      "stop_type": "token_id",
+      "tokens_predicted": 1,
+      "visible_content": "",
+      "requested_stop_token_ids": [
+        248044,
+        248046,
+        42
+      ],
+      "coexisting_stop_strings": [
+        "unused-text-stop"
+      ]
+    },
+    "248046-False": {
+      "stop_type": "token_id",
+      "tokens_predicted": 1,
+      "visible_content": "",
+      "requested_stop_token_ids": [
+        248044,
+        248046,
+        42
+      ],
+      "coexisting_stop_strings": [
+        "unused-text-stop"
+      ]
+    },
+    "248046-True": {
+      "stop_type": "token_id",
+      "tokens_predicted": 1,
+      "visible_content": "",
+      "requested_stop_token_ids": [
+        248044,
+        248046,
+        42
+      ],
+      "coexisting_stop_strings": [
+        "unused-text-stop"
+      ]
+    },
+    "42-False": {
+      "stop_type": "token_id",
+      "tokens_predicted": 1,
+      "visible_content": "",
+      "requested_stop_token_ids": [
+        248044,
+        248046,
+        42
+      ],
+      "coexisting_stop_strings": [
+        "unused-text-stop"
+      ]
+    },
+    "42-True": {
+      "stop_type": "token_id",
+      "tokens_predicted": 1,
+      "visible_content": "",
+      "requested_stop_token_ids": [
+        248044,
+        248046,
+        42
+      ],
+      "coexisting_stop_strings": [
+        "unused-text-stop"
+      ]
+    }
+  },
+  "public_stop_string": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "logprobs": null,
+        "message": {
+          "content": "",
+          "refusal": null,
+          "role": "assistant"
+        }
+      }
+    ],
+    "created": 1788993454,
+    "id": "chatcmpl_2008ea8b71b649dfa656e789d9519ce8",
+    "model": "norted-grep-qwen3-5-4b-q4-k-m",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 1,
+      "prompt_tokens": 17,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "total_tokens": 18
+    }
+  },
+  "wire_checks": {
+    "required_stop_token_ids_present": true,
+    "assistant_and_tool_result_ids_present": true,
+    "tool_call_ids": [
+      "iaOyCzbIR8n0wrq76nnit19bXWTsqURE",
+      "VxgqiKp4NSJblSuGdCQQkLPlmpZzLycn"
+    ],
+    "capture_sha256": "dd2d61d829dcb07cbef62dafcd19b3d2fdd03c4264c469aac74b2f521a48f01e"
+  },
+  "retrieval_final_schema": {
+    "type": "object",
+    "required": [
+      "ranges"
+    ],
+    "additionalProperties": false,
+    "properties": {
+      "ranges": {
+        "type": "array",
+        "maxItems": 4096,
+        "items": {
+          "type": "object",
+          "required": [
+            "path",
+            "start_line",
+            "end_line"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "start_line": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "end_line": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
+    }
+  }
+}
