@@ -168,5 +168,247 @@
     "variant": "managed-portable-cuda13-v2",
     "result": "rejected before launch",
     "reason": "artifact requires exact token stops; this llama.cpp runtime lacks the reviewed Norted source overlay"
+  },
+  "catalog_selection_correction": {
+    "date": "2026-09-09",
+    "starting_audited_head": "5a76ea69876648ca259e9ed8df0bcb63f894ecdb",
+    "method": "Standalone scratch executable called both live providers, verified every candidate through its provider, and exercised InstalledRuntime and AvailableRuntime compatibility with resolved settings. No repository tests added; no runtime installed or launched.",
+    "local_evidence": "/srv/norted/scratch/catalog-correction",
+    "ordinary_discovery": {
+      "llama.cpp": "Current nightly releases sorted descending; first ordinary managed-source contract admission, restored from starting master. Live result b10883.",
+      "ninfer": "Canonical repository default-branch HEAD; live branch master at b88c0f6fc7e999f13eb2fcf7fc9105ed79a91868."
+    },
+    "candidates": [
+      {
+        "identity": {
+          "accelerator": "cuda",
+          "architecture": "x86_64",
+          "engine_id": "llama.cpp",
+          "package": {
+            "additional_assets": [],
+            "asset_id": null,
+            "asset_name": null,
+            "provider_id": "llama-cpp-managed-source-github",
+            "release_tag": "b10883",
+            "repository": "ggml-org/llama.cpp"
+          },
+          "package_family": "llama-cpp-managed-source",
+          "platform": "linux",
+          "upstream_revision": "91f6a6cf361385700bbe15981f0f39909df77498",
+          "variant": "managed-portable-v4",
+          "version": "b10883"
+        },
+        "source": {
+          "commit_sha": "91f6a6cf361385700bbe15981f0f39909df77498",
+          "commit_timestamp_unix": 1788972819,
+          "repository": "ggml-org/llama.cpp",
+          "repository_url": "https://github.com/ggml-org/llama.cpp.git",
+          "source_branch": "b10883",
+          "source_provider": "llama-cpp-managed-source-github",
+          "tree_sha": "01a4d9581e69ab391d5c8e50ae33aaf7aab4fb97"
+        },
+        "source_overlay_sha256": null,
+        "update_identity": "RuntimeVariantUpdateIdentity { functional_variant: \"managed-linux-x86_64-cuda12-portable\", source_recipe_generation: Some(4) }"
+      },
+      {
+        "identity": {
+          "accelerator": "cuda",
+          "architecture": "x86_64",
+          "engine_id": "llama.cpp",
+          "package": {
+            "additional_assets": [],
+            "asset_id": null,
+            "asset_name": null,
+            "provider_id": "llama-cpp-managed-source-github",
+            "release_tag": "b10883",
+            "repository": "ggml-org/llama.cpp"
+          },
+          "package_family": "llama-cpp-managed-source",
+          "platform": "linux",
+          "upstream_revision": "91f6a6cf361385700bbe15981f0f39909df77498",
+          "variant": "managed-portable-cuda13-v2",
+          "version": "b10883"
+        },
+        "source": {
+          "commit_sha": "91f6a6cf361385700bbe15981f0f39909df77498",
+          "commit_timestamp_unix": 1788972819,
+          "repository": "ggml-org/llama.cpp",
+          "repository_url": "https://github.com/ggml-org/llama.cpp.git",
+          "source_branch": "b10883",
+          "source_provider": "llama-cpp-managed-source-github",
+          "tree_sha": "01a4d9581e69ab391d5c8e50ae33aaf7aab4fb97"
+        },
+        "source_overlay_sha256": null,
+        "update_identity": "RuntimeVariantUpdateIdentity { functional_variant: \"managed-linux-x86_64-cuda13-portable\", source_recipe_generation: Some(2) }"
+      },
+      {
+        "identity": {
+          "accelerator": "cuda",
+          "architecture": "x86_64",
+          "engine_id": "llama.cpp",
+          "package": {
+            "additional_assets": [],
+            "asset_id": null,
+            "asset_name": null,
+            "provider_id": "llama-cpp-managed-source-github",
+            "release_tag": "b10786",
+            "repository": "ggml-org/llama.cpp"
+          },
+          "package_family": "llama-cpp-managed-source",
+          "platform": "linux",
+          "upstream_revision": "de8656bd94f1163188125542534e4bcbc9f9fb1f",
+          "variant": "managed-portable-exact-stop-v1",
+          "version": "b10786"
+        },
+        "source": {
+          "commit_sha": "de8656bd94f1163188125542534e4bcbc9f9fb1f",
+          "commit_timestamp_unix": 1788433030,
+          "repository": "ggml-org/llama.cpp",
+          "repository_url": "https://github.com/ggml-org/llama.cpp.git",
+          "source_branch": "b10786",
+          "source_provider": "llama-cpp-managed-source-github",
+          "tree_sha": "ef599001012ff8bee837a832decde4c564702cc4"
+        },
+        "source_overlay_sha256": "b6eb1527b0ee0305d0bc3b6cde7f3e45c580564c934e1fe39e86f78e0b18720e",
+        "update_identity": "RuntimeVariantUpdateIdentity { functional_variant: \"managed-linux-x86_64-cuda12-portable-exact-stop\", source_recipe_generation: Some(1) }"
+      },
+      {
+        "identity": {
+          "accelerator": "cuda",
+          "architecture": "x86_64",
+          "engine_id": "llama.cpp",
+          "package": {
+            "additional_assets": [],
+            "asset_id": null,
+            "asset_name": null,
+            "provider_id": "llama-cpp-managed-source-github",
+            "release_tag": "b10786",
+            "repository": "ggml-org/llama.cpp"
+          },
+          "package_family": "llama-cpp-managed-source",
+          "platform": "linux",
+          "upstream_revision": "de8656bd94f1163188125542534e4bcbc9f9fb1f",
+          "variant": "managed-portable-cuda13-exact-stop-v1",
+          "version": "b10786"
+        },
+        "source": {
+          "commit_sha": "de8656bd94f1163188125542534e4bcbc9f9fb1f",
+          "commit_timestamp_unix": 1788433030,
+          "repository": "ggml-org/llama.cpp",
+          "repository_url": "https://github.com/ggml-org/llama.cpp.git",
+          "source_branch": "b10786",
+          "source_provider": "llama-cpp-managed-source-github",
+          "tree_sha": "ef599001012ff8bee837a832decde4c564702cc4"
+        },
+        "source_overlay_sha256": "b6eb1527b0ee0305d0bc3b6cde7f3e45c580564c934e1fe39e86f78e0b18720e",
+        "update_identity": "RuntimeVariantUpdateIdentity { functional_variant: \"managed-linux-x86_64-cuda13-portable-exact-stop\", source_recipe_generation: Some(1) }"
+      },
+      {
+        "identity": {
+          "accelerator": "cuda",
+          "architecture": "x86_64",
+          "engine_id": "ninfer",
+          "package": {
+            "additional_assets": [],
+            "asset_id": null,
+            "asset_name": null,
+            "provider_id": "ninfer-official-source",
+            "release_tag": null,
+            "repository": "Neroued/ninfer"
+          },
+          "package_family": "ninfer-source",
+          "platform": "linux",
+          "upstream_revision": "b88c0f6fc7e999f13eb2fcf7fc9105ed79a91868",
+          "variant": "ninfer-serve-v2-sm120a",
+          "version": "git-20260908-b88c0f6f"
+        },
+        "source": {
+          "commit_sha": "b88c0f6fc7e999f13eb2fcf7fc9105ed79a91868",
+          "commit_timestamp_unix": 1788885348,
+          "repository": "Neroued/ninfer",
+          "repository_url": "https://github.com/Neroued/ninfer.git",
+          "source_branch": "master",
+          "source_provider": "ninfer-official-source",
+          "tree_sha": "ad14a9d2cc0db29c8454aa1882ec2ae9ea0c7865"
+        },
+        "source_overlay_sha256": null,
+        "update_identity": "RuntimeVariantUpdateIdentity { functional_variant: \"managed-linux-x86_64-cuda-sm120a\", source_recipe_generation: Some(2) }"
+      },
+      {
+        "identity": {
+          "accelerator": "cuda",
+          "architecture": "x86_64",
+          "engine_id": "ninfer",
+          "package": {
+            "additional_assets": [],
+            "asset_id": null,
+            "asset_name": null,
+            "provider_id": "ninfer-official-source",
+            "release_tag": null,
+            "repository": "Neroued/ninfer"
+          },
+          "package_family": "ninfer-source",
+          "platform": "linux",
+          "upstream_revision": "863aa8a5f1e866db74f29f8999b83b4021398dee",
+          "variant": "ninfer-serve-exact-stop-v1-sm120a",
+          "version": "git-20260904-863aa8a5"
+        },
+        "source": {
+          "commit_sha": "863aa8a5f1e866db74f29f8999b83b4021398dee",
+          "commit_timestamp_unix": 1788512046,
+          "repository": "Neroued/ninfer",
+          "repository_url": "https://github.com/Neroued/ninfer.git",
+          "source_branch": "863aa8a5f1e866db74f29f8999b83b4021398dee",
+          "source_provider": "ninfer-official-source",
+          "tree_sha": "5368f514bafbcab89ce1272df3a13d9d9af55820"
+        },
+        "source_overlay_sha256": "5bf963935fbb1ce853a76f2759771d0f8c947071c82f92865435e69378b4a868",
+        "update_identity": "RuntimeVariantUpdateIdentity { functional_variant: \"managed-linux-x86_64-cuda-sm120a-exact-stop\", source_recipe_generation: Some(1) }"
+      }
+    ],
+    "selection_matrix": {
+      "paths": [
+        "InstalledRuntime",
+        "AvailableRuntime"
+      ],
+      "cases": [
+        "no token stops",
+        "mandatory artifact IDs",
+        "Model Profile override",
+        "Settings override",
+        "explicit empty Model Profile list"
+      ],
+      "ordinary": "No-stops case passes token-stop gate; all mandatory/configured cases are Incompatible before installation/load.",
+      "exact_stop": "All five cases pass token-stop gate with speculation off.",
+      "ninfer_speculation": "Configured token stops are Incompatible with either speculation=true or speculative_backend=mtp, for both installed and available candidates.",
+      "scope": "Positive cases retain unrelated NeedsAttention for unprobed GPU/target registry in synthetic installed fixtures; this validates capability selection, not installation or model execution."
+    },
+    "update_identity": {
+      "result": "Ordinary and exact-stop functional variants differ, including for a simulated future ordinary source. Existing ordinary recipe generations remain in their original family with increasing generations; each exact-stop family starts at generation 1.",
+      "implementation_proof": "packs.rs same_runtime_update_line requires equal functional_variant before any upgrade; source_recipe_ordering returns Equal across different families. Recipe generations compare within a family only.",
+      "existing_tests_passed": [
+        "managed_source_recipe_generations_share_the_ninfer_update_line",
+        "newer_recipe_generation_updates_an_identical_source_revision",
+        "recipe_update_lines_are_explicit_and_never_offer_a_downgrade",
+        "installed_recipe_generations_rank_with_engine_owned_update_identity"
+      ],
+      "future_review": "A future reviewed overlay/source recipe must explicitly map its new generation to the same exact-stop functional family."
+    },
+    "overlays_unchanged_from_audited_head": true,
+    "llama_exactness_evidence": "Reused existing token-level evidence above; its variant field records the historical validation installation, not a current catalog identity. C++ bytes and upstream source are unchanged; no Grep rebuild/rerun.",
+    "ninfer_reviewed_source_blobs_unchanged": true,
+    "q27": "Unchanged: stop_token_ids visible but unsupported; MTP/block-generation exactness blocker remains.",
+    "validation": {
+      "cargo fmt --all --check": "passed",
+      "cargo check --workspace": "passed",
+      "cargo clippy --workspace --all-targets --all-features -- -D warnings": "passed",
+      "cargo test --workspace": {
+        "passed": 214,
+        "failed": 0,
+        "ignored": 1,
+        "new_tests": 0
+      }
+    },
+    "remaining_blocking_or_material_findings": []
   }
 }

@@ -79,8 +79,10 @@ fn managed_llama_variant_update_identity(
         "managed-portable-v1" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 1),
         "managed-portable-v2" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 2),
         "managed-portable-v3" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 3),
-        "managed-portable-v5" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 5),
-        "managed-portable-cuda13-v3" => (MANAGED_CUDA13_FUNCTIONAL_VARIANT, 3),
+        "managed-portable-exact-stop-v1" => ("managed-linux-x86_64-cuda12-portable-exact-stop", 1),
+        "managed-portable-cuda13-exact-stop-v1" => {
+            ("managed-linux-x86_64-cuda13-portable-exact-stop", 1)
+        }
         "managed-portable-v4" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 4),
         "managed-portable-cuda13-v1" => (MANAGED_CUDA13_FUNCTIONAL_VARIANT, 1),
         "managed-portable-cuda13-v2" => (MANAGED_CUDA13_FUNCTIONAL_VARIANT, 2),
@@ -962,16 +964,18 @@ impl EngineAdapter for LlamaCppAdapter {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        _settings: Option<&norted_core::ResolvedSettings>,
+        settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
-        if !model.generation_contract.required_stop_token_ids.is_empty() {
+        if !model.generation_contract.required_stop_token_ids.is_empty()
+            || settings.is_some_and(|s| s.value("llama.cpp.stop_token_ids").is_some())
+        {
             let mut definitions = self.setting_definitions();
             apply_stop_token_contract(&mut definitions, runtime);
             if !definitions
                 .iter()
                 .any(|d| d.id.as_str() == "llama.cpp.stop_token_ids" && d.supported)
             {
-                return RuntimeCompatibility::Incompatible("artifact requires exact token stops; this llama.cpp runtime lacks the reviewed Norted source overlay".to_owned());
+                return RuntimeCompatibility::Incompatible("profile requires exact token stops; this llama.cpp runtime lacks the reviewed Norted source overlay".to_owned());
             }
         }
         let model_compatibility = llama_model_compatibility(self.compatibility(model));
@@ -997,15 +1001,23 @@ impl EngineAdapter for LlamaCppAdapter {
         runtime: &AvailableRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        _settings: Option<&norted_core::ResolvedSettings>,
+        settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
-        if !model.generation_contract.required_stop_token_ids.is_empty() {
+        if !model.generation_contract.required_stop_token_ids.is_empty()
+            || settings.is_some_and(|s| s.value("llama.cpp.stop_token_ids").is_some())
+        {
             let expected =
                 norted_engine::managed_source_overlay_sha256(ENGINE_ID, &runtime.identity.variant);
             let supported = expected.is_some()
-                && matches!(&runtime.acquisition, norted_core::RuntimeAcquisitionPlan::SourceBuild(plan) if plan.source.commit_sha == norted_engine::LLAMA_TOKEN_STOP_REVISION && plan.recipe.source_overlay_sha256 == expected);
+                && is_managed_llama_linux_cuda(&runtime.identity)
+                && runtime.identity.upstream_revision.as_deref()
+                    == Some(norted_engine::LLAMA_TOKEN_STOP_REVISION)
+                && matches!(&runtime.acquisition, norted_core::RuntimeAcquisitionPlan::SourceBuild(plan) if plan.source.commit_sha == norted_engine::LLAMA_TOKEN_STOP_REVISION && plan.recipe.recipe_version == runtime.identity.variant && plan.recipe.source_overlay_sha256 == expected);
             if !supported {
-                return RuntimeCompatibility::Incompatible("artifact requires exact token stops; select the reviewed Norted source variant".to_owned());
+                return RuntimeCompatibility::Incompatible(
+                    "profile requires exact token stops; select the reviewed Norted source variant"
+                        .to_owned(),
+                );
             }
         }
         let model_compatibility = llama_model_compatibility(self.compatibility(model));

@@ -2036,12 +2036,15 @@ pub const NINFER_TOKEN_STOP_REVISION: &str = "863aa8a5f1e866db74f29f8999b83b4021
 /// Exact source material owned by Norted; upstream commit/tree remain unchanged.
 pub fn managed_source_overlay(engine: &str, recipe: &str) -> Option<&'static [u8]> {
     match (engine, recipe) {
-        ("ninfer", "ninfer-serve-v3") => Some(include_bytes!(
+        ("ninfer", "ninfer-serve-exact-stop-v1") => Some(include_bytes!(
             "../../norted-engine-ninfer/overlays/exact-stop-token-ids.patch"
         )),
-        ("llama.cpp", "managed-portable-v5" | "managed-portable-cuda13-v3") => Some(
-            include_bytes!("../../norted-engine-llama-cpp/overlays/exact-stop-token-ids.patch"),
-        ),
+        (
+            "llama.cpp",
+            "managed-portable-exact-stop-v1" | "managed-portable-cuda13-exact-stop-v1",
+        ) => Some(include_bytes!(
+            "../../norted-engine-llama-cpp/overlays/exact-stop-token-ids.patch"
+        )),
         _ => None,
     }
 }
