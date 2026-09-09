@@ -2045,6 +2045,12 @@ pub fn managed_source_overlay(engine: &str, recipe: &str) -> Option<&'static [u8
         ) => Some(include_bytes!(
             "../../norted-engine-llama-cpp/overlays/exact-stop-token-ids.patch"
         )),
+        (
+            "llama.cpp",
+            "managed-portable-exact-stop-v2" | "managed-portable-cuda13-exact-stop-v2",
+        ) => Some(include_bytes!(
+            "../../norted-engine-llama-cpp/overlays/exact-stop-token-ids-v2.patch"
+        )),
         _ => None,
     }
 }
