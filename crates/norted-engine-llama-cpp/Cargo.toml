@@ -8,6 +8,7 @@ rust-version.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
+jsonschema = { version = "0.55.1", default-features = false }
 norted-core = { path = "../norted-core" }
 norted-engine = { path = "../norted-engine" }
 reqwest.workspace = true
