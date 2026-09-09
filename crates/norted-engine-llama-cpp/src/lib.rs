@@ -79,6 +79,8 @@ fn managed_llama_variant_update_identity(
         "managed-portable-v1" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 1),
         "managed-portable-v2" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 2),
         "managed-portable-v3" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 3),
+        "managed-portable-v5" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 5),
+        "managed-portable-cuda13-v3" => (MANAGED_CUDA13_FUNCTIONAL_VARIANT, 3),
         "managed-portable-v4" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 4),
         "managed-portable-cuda13-v1" => (MANAGED_CUDA13_FUNCTIONAL_VARIANT, 1),
         "managed-portable-cuda13-v2" => (MANAGED_CUDA13_FUNCTIONAL_VARIANT, 2),
@@ -619,6 +621,9 @@ impl LlamaCppAdapter {
         if let Some(frequency_penalty) = request.generation_settings.frequency_penalty {
             body["frequency_penalty"] = json!(frequency_penalty);
         }
+        if let Some(ids) = &request.generation_settings.stop_token_ids {
+            body["stop_token_ids"] = json!(ids);
+        }
         if let Some(stop) = &request.generation_settings.stop {
             body["stop"] = json!(stop);
         }
@@ -747,6 +752,7 @@ impl EngineAdapter for LlamaCppAdapter {
         settings: &GenerationSettingsPatch,
         _backend_defaults: &EffectiveGenerationSettings,
     ) -> Result<(), EngineError> {
+        settings.validate_stop_token_ids()?;
         if let Some(temperature) = settings.temperature
             && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
         {
@@ -808,6 +814,10 @@ impl EngineAdapter for LlamaCppAdapter {
     ) -> Result<(), EngineError> {
         self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
         let required = [
+            (
+                request.generation_settings.stop_token_ids.is_some(),
+                "llama.cpp.stop_token_ids",
+            ),
             (request.generation_settings.seed.is_some(), "llama.cpp.seed"),
             (
                 request.generation_settings.repeat_penalty.is_some(),
@@ -954,6 +964,16 @@ impl EngineAdapter for LlamaCppAdapter {
         host: &HostCapabilities,
         _settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
+        if !model.generation_contract.required_stop_token_ids.is_empty() {
+            let mut definitions = self.setting_definitions();
+            apply_stop_token_contract(&mut definitions, runtime);
+            if !definitions
+                .iter()
+                .any(|d| d.id.as_str() == "llama.cpp.stop_token_ids" && d.supported)
+            {
+                return RuntimeCompatibility::Incompatible("artifact requires exact token stops; this llama.cpp runtime lacks the reviewed Norted source overlay".to_owned());
+            }
+        }
         let model_compatibility = llama_model_compatibility(self.compatibility(model));
         if matches!(model_compatibility, RuntimeCompatibility::Incompatible(_)) {
             return model_compatibility;
@@ -979,6 +999,15 @@ impl EngineAdapter for LlamaCppAdapter {
         host: &HostCapabilities,
         _settings: Option<&norted_core::ResolvedSettings>,
     ) -> RuntimeCompatibility {
+        if !model.generation_contract.required_stop_token_ids.is_empty() {
+            let expected =
+                norted_engine::managed_source_overlay_sha256(ENGINE_ID, &runtime.identity.variant);
+            let supported = expected.is_some()
+                && matches!(&runtime.acquisition, norted_core::RuntimeAcquisitionPlan::SourceBuild(plan) if plan.source.commit_sha == norted_engine::LLAMA_TOKEN_STOP_REVISION && plan.recipe.source_overlay_sha256 == expected);
+            if !supported {
+                return RuntimeCompatibility::Incompatible("artifact requires exact token stops; select the reviewed Norted source variant".to_owned());
+            }
+        }
         let model_compatibility = llama_model_compatibility(self.compatibility(model));
         if matches!(model_compatibility, RuntimeCompatibility::Incompatible(_)) {
             return model_compatibility;
@@ -1010,7 +1039,7 @@ impl EngineAdapter for LlamaCppAdapter {
             .ok()
             .and_then(|cache| cache.get(&Self::capability_key(runtime)).cloned());
         if let RuntimeCompatibility::Incompatible(reason) =
-            llama_configured_runtime_compatibility(settings, model, help.as_deref())
+            llama_configured_runtime_compatibility(settings, model, help.as_deref(), Some(runtime))
         {
             return Err(EngineError::InvalidConfiguration(reason));
         }
@@ -1119,6 +1148,7 @@ impl EngineAdapter for LlamaCppAdapter {
         let help = self.cached_runtime_help(runtime).await?;
         let mut definitions = self.setting_definitions();
         apply_llama_exact_help_contract(&mut definitions, &help);
+        apply_stop_token_contract(&mut definitions, runtime);
         if let Some(definition) = definitions
             .iter_mut()
             .find(|definition| definition.id.as_str() == "llama.cpp.active_experts")
@@ -1146,6 +1176,7 @@ impl EngineAdapter for LlamaCppAdapter {
         let help = self.cached_runtime_help(runtime).await?;
         let mut definitions = self.model_setting_definitions(model)?;
         apply_llama_exact_help_contract(&mut definitions, &help);
+        apply_stop_token_contract(&mut definitions, runtime);
         Ok(SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -1578,6 +1609,8 @@ impl EngineAdapter for LlamaCppAdapter {
             ));
         }
         Ok(EffectiveGenerationSettings {
+            stop_token_ids: None,
+            required_stop_token_ids: Vec::new(),
             temperature: params.temperature,
             top_p: params.top_p,
         })
@@ -2393,6 +2426,7 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
         "llama.cpp.presence_penalty",
         "llama.cpp.frequency_penalty",
         "llama.cpp.max_output_tokens",
+        "llama.cpp.stop_token_ids",
         "llama.cpp.stop_strings",
         "llama.cpp.system_prompt",
         "llama.cpp.reasoning",
@@ -2403,6 +2437,13 @@ fn llama_setting_definitions() -> Vec<SettingDefinition> {
         "llama.cpp.context_overflow",
     ];
     let mut definitions = common_setting_definitions_for(ENGINE_ID, COMMON_SETTINGS);
+    if let Some(d) = definitions
+        .iter_mut()
+        .find(|d| d.id.as_str() == "llama.cpp.stop_token_ids")
+    {
+        d.supported = false;
+        d.unsupported_reason = Some("requires exact managed source overlay proof".to_owned());
+    }
     definitions.extend([
         llama_definition(
             "llama.cpp.threads",
@@ -3485,6 +3526,9 @@ fn llama_extended_setting_definitions() -> Vec<SettingDefinition> {
 
 fn llama_model_setting_definitions(model: Option<&ModelArtifact>) -> Vec<SettingDefinition> {
     let mut definitions = llama_setting_definitions();
+    if let Some(model) = model {
+        norted_engine::apply_artifact_stop_token_preview(&mut definitions, model);
+    }
     if let Some(temperature) = definitions
         .iter_mut()
         .find(|definition| definition.id.as_str() == "llama.cpp.temperature")
@@ -4197,6 +4241,7 @@ fn llama_setting_has_execution_path(id: &str) -> bool {
                 | "llama.cpp.presence_penalty"
                 | "llama.cpp.frequency_penalty"
                 | "llama.cpp.max_output_tokens"
+                | "llama.cpp.stop_token_ids"
                 | "llama.cpp.stop_strings"
                 | "llama.cpp.system_prompt"
                 | "llama.cpp.reasoning"
@@ -4539,6 +4584,7 @@ fn llama_configured_runtime_compatibility(
     settings: &norted_core::ResolvedSettings,
     model: Option<&ModelArtifact>,
     exact_help: Option<&str>,
+    runtime: Option<&InstalledRuntime>,
 ) -> RuntimeCompatibility {
     let configured = settings
         .configured
@@ -4567,6 +4613,9 @@ fn llama_configured_runtime_compatibility(
     };
     let mut definitions = llama_model_setting_definitions(model);
     apply_llama_exact_help_contract(&mut definitions, help);
+    if let Some(runtime) = runtime {
+        apply_stop_token_contract(&mut definitions, runtime);
+    }
     let schema = SettingsSchema {
         engine_id: ENGINE_ID.to_owned(),
         runtime_id: None,
@@ -5207,6 +5256,7 @@ fn translate_llama_settings_for_model(
             ("llama.cpp.max_output_tokens", SettingValue::UnsignedInteger(value)) => {
                 push_value_argument(&mut arguments, "--predict", *value);
             }
+            ("llama.cpp.stop_token_ids", SettingValue::UnsignedIntegerList(_)) => {}
             ("llama.cpp.stop_strings", SettingValue::StringList(values)) => {
                 for value in values {
                     push_value_argument(&mut arguments, "--reverse-prompt", value);
@@ -5966,6 +6016,29 @@ fn unix_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
+fn apply_stop_token_contract(definitions: &mut [SettingDefinition], runtime: &InstalledRuntime) {
+    let expected =
+        norted_engine::managed_source_overlay_sha256(ENGINE_ID, &runtime.manifest.identity.variant);
+    let supported = is_managed_llama_linux_cuda(&runtime.manifest.identity)
+        && runtime.manifest.acquisition_method
+            == norted_core::RuntimeAcquisitionMethod::SourceBuild
+        && runtime.manifest.identity.upstream_revision.as_deref()
+            == Some(norted_engine::LLAMA_TOKEN_STOP_REVISION)
+        && expected.is_some()
+        && runtime.manifest.source_build.as_ref().is_some_and(|build| {
+            build.source_overlay_sha256 == expected
+                && build.source.commit_sha == norted_engine::LLAMA_TOKEN_STOP_REVISION
+                && build.recipe_version == runtime.manifest.identity.variant
+        });
+    if let Some(definition) = definitions
+        .iter_mut()
+        .find(|d| d.id.as_str() == "llama.cpp.stop_token_ids")
+    {
+        definition.supported = supported;
+        definition.unsupported_reason = (!supported).then(|| "exact token stops require the Norted managed source overlay; unpatched binaries do not prove support".to_owned());
+    }
+}
+
 #[cfg(test)]
 mod recipe_update_tests {
     use norted_core::{
@@ -6130,7 +6203,7 @@ mod recipe_update_tests {
     fn unknown_generations_and_other_accelerators_do_not_cross_update() {
         let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
         for runtime in [
-            identity("managed-portable-v5", "cuda"),
+            identity("managed-portable-v99", "cuda"),
             identity("managed-portable-v3", "vulkan"),
         ] {
             assert_eq!(
@@ -6247,6 +6320,8 @@ mod generation_settings_tests {
                         ..Default::default()
                     },
                     &EffectiveGenerationSettings {
+                        stop_token_ids: None,
+                        required_stop_token_ids: Vec::new(),
                         temperature: 0.8,
                         top_p: 0.95,
                     },
@@ -6275,6 +6350,8 @@ mod generation_settings_tests {
                 adapter.validate_generation_settings(
                     &invalid,
                     &EffectiveGenerationSettings {
+                        stop_token_ids: None,
+                        required_stop_token_ids: Vec::new(),
                         temperature: 0.8,
                         top_p: 0.95,
                     },
@@ -6289,6 +6366,8 @@ mod generation_settings_tests {
                     ..Default::default()
                 },
                 &EffectiveGenerationSettings {
+                    stop_token_ids: None,
+                    required_stop_token_ids: Vec::new(),
                     temperature: 0.8,
                     top_p: 0.95,
                 },
@@ -6447,19 +6526,25 @@ mod settings_tests {
     fn exact_generation_and_reasoning_controls_are_help_gated() {
         let configured = resolved(&[("llama.cpp.temperature", SettingValue::Float(0.7))]);
         assert!(matches!(
-            llama_configured_runtime_compatibility(&configured, None, None),
+            llama_configured_runtime_compatibility(&configured, None, None, None),
             RuntimeCompatibility::NeedsAttention(_)
         ));
         assert!(matches!(
             llama_configured_runtime_compatibility(
                 &configured,
                 None,
-                Some("  --temp N  temperature")
+                Some("  --temp N  temperature"),
+                None
             ),
             RuntimeCompatibility::Compatible
         ));
         assert!(matches!(
-            llama_configured_runtime_compatibility(&configured, None, Some("  --top-p N  top p")),
+            llama_configured_runtime_compatibility(
+                &configured,
+                None,
+                Some("  --top-p N  top p"),
+                None
+            ),
             RuntimeCompatibility::Incompatible(_)
         ));
 
@@ -6472,7 +6557,12 @@ mod settings_tests {
         let generation_help =
             "  --temp N  temperature\n  --top-p N  top p\n  --top-k N  top k\n  --min-p N  min p";
         assert!(matches!(
-            llama_configured_runtime_compatibility(&all_generation, None, Some(generation_help)),
+            llama_configured_runtime_compatibility(
+                &all_generation,
+                None,
+                Some(generation_help),
+                None
+            ),
             RuntimeCompatibility::Compatible
         ));
         let mut definitions = llama_model_setting_definitions(None);

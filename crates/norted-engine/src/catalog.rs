@@ -1878,6 +1878,7 @@ mod tests {
                     recipe_version: "recipe-v1".to_owned(),
                     build_system: RuntimeSourceBuildSystem::Cmake,
                     build_definition_sha256: None,
+                    source_overlay_sha256: None,
                     cmake_configuration_arguments: vec!["-G".to_owned(), "Ninja".to_owned()],
                     build_target: "server".to_owned(),
                     entrypoint: "build/server".into(),

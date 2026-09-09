@@ -490,6 +490,7 @@ fn managed_ninfer_variant_update_identity(
     let generation = match identity.variant.as_str() {
         "ninfer-serve-v1-sm120a" => 1,
         "ninfer-serve-v2-sm120a" => 2,
+        "ninfer-serve-v3-sm120a" => 3,
         _ => return None,
     };
     Some(RuntimeVariantUpdateIdentity {
@@ -820,14 +821,20 @@ fn ninfer_runtime_capabilities_for_installed(
     let managed_source = runtime.manifest.acquisition_method
         == RuntimeAcquisitionMethod::SourceBuild
         && runtime.manifest.identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
-        && runtime.manifest.identity.variant == format!("{}-sm120a", catalog::RECIPE_VERSION);
+        && matches!(
+            runtime.manifest.identity.variant.as_str(),
+            "ninfer-serve-v2-sm120a" | "ninfer-serve-v3-sm120a"
+        );
     let exact_current = managed_source
         && runtime.manifest.identity.upstream_revision.as_deref()
             == Some(CURRENT_PACKAGE_CAPABILITY_REVISION)
         && runtime.manifest.source_build.as_ref().is_some_and(|build| {
             build.source.commit_sha == CURRENT_PACKAGE_CAPABILITY_REVISION
                 && build.source.tree_sha == CURRENT_PACKAGE_CAPABILITY_TREE
-                && build.recipe_version == catalog::RECIPE_VERSION
+                && matches!(
+                    build.recipe_version.as_str(),
+                    "ninfer-serve-v2" | "ninfer-serve-v3"
+                )
         });
     let exact_legacy = managed_source
         && runtime.manifest.identity.upstream_revision.as_deref()
@@ -835,7 +842,10 @@ fn ninfer_runtime_capabilities_for_installed(
         && runtime.manifest.source_build.as_ref().is_some_and(|build| {
             build.source.commit_sha == LEGACY_PACKAGE_CAPABILITY_REVISION
                 && build.source.tree_sha == LEGACY_PACKAGE_CAPABILITY_TREE
-                && build.recipe_version == catalog::RECIPE_VERSION
+                && matches!(
+                    build.recipe_version.as_str(),
+                    "ninfer-serve-v2" | "ninfer-serve-v3"
+                )
         });
     let blobs = managed_source
         .then(|| installed_source_blobs(runtime))
@@ -916,7 +926,10 @@ fn ninfer_reviewed_capabilities(
 
 fn installed_source_blobs(runtime: &InstalledRuntime) -> Option<BTreeMap<String, String>> {
     let source = runtime.manifest.source_build.as_ref()?;
-    if source.recipe_version != catalog::RECIPE_VERSION {
+    if !matches!(
+        source.recipe_version.as_str(),
+        "ninfer-serve-v2" | "ninfer-serve-v3"
+    ) {
         return None;
     }
     let source_root = runtime.installation_root.join("source");
@@ -1524,6 +1537,16 @@ impl EngineAdapter for NinferAdapter {
         host: &HostCapabilities,
         _settings: Option<&ResolvedSettings>,
     ) -> RuntimeCompatibility {
+        if !model.generation_contract.required_stop_token_ids.is_empty() {
+            let mut definitions = settings::definitions();
+            apply_ninfer_stop_token_contract(&mut definitions, runtime, _settings);
+            if !definitions
+                .iter()
+                .any(|d| d.id.as_str() == "ninfer.stop_token_ids" && d.supported)
+            {
+                return RuntimeCompatibility::Incompatible("artifact requires exact token stops; this NInfer runtime needs the reviewed Norted overlay and speculation off".to_owned());
+            }
+        }
         if let CompatibilityDecision::Unsupported { reason } = self.compatibility(model) {
             return RuntimeCompatibility::Incompatible(reason);
         }
@@ -1787,6 +1810,7 @@ impl EngineAdapter for NinferAdapter {
             settings::apply_reviewed_runtime_defaults(&mut definitions, settings);
         }
         apply_ninfer_runtime_contract(&mut definitions, &help, capabilities);
+        apply_ninfer_stop_token_contract(&mut definitions, runtime, settings);
         Ok(norted_core::SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -1812,6 +1836,7 @@ impl EngineAdapter for NinferAdapter {
                 EngineError::Operation("NInfer help observation was not cached".to_owned())
             })?;
         let mut definitions = settings::definitions();
+        norted_engine::apply_artifact_stop_token_preview(&mut definitions, model);
         settings::apply_runtime_bounds(&mut definitions);
         let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
         settings::apply_model_capabilities(
@@ -1827,6 +1852,7 @@ impl EngineAdapter for NinferAdapter {
             settings::apply_model_sampler_defaults(&mut definitions, model, settings);
         }
         apply_ninfer_runtime_contract(&mut definitions, &help, capabilities);
+        apply_ninfer_stop_token_contract(&mut definitions, runtime, settings);
         Ok(norted_core::SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -2306,7 +2332,7 @@ impl EngineAdapter for NinferAdapter {
             .read()
             .await
             .get(endpoint)
-            .map(|observed| observed.generation_settings)
+            .map(|observed| observed.generation_settings.clone())
             .ok_or_else(|| {
                 EngineError::Operation(
                     "NInfer effective sampler defaults were not validated at startup".to_owned(),
@@ -2319,6 +2345,8 @@ impl EngineAdapter for NinferAdapter {
         settings: &GenerationSettingsPatch,
         _backend_defaults: &EffectiveGenerationSettings,
     ) -> Result<(), EngineError> {
+        settings.validate_stop_token_ids()?;
+
         if settings.repeat_penalty.is_some_and(|value| value != 1.0) {
             return Err(EngineError::InvalidGenerationSettings(
                 "NInfer supports only the neutral repetition penalty 1.0".to_owned(),
@@ -2903,6 +2931,8 @@ async fn read_and_validate_startup_log(
         startup.sampling_defaults.non_thinking
     };
     let defaults = EffectiveGenerationSettings {
+        stop_token_ids: None,
+        required_stop_token_ids: Vec::new(),
         temperature: if startup.sampling_defaults.greedy {
             0.0
         } else {
@@ -3620,6 +3650,35 @@ fn unix_timestamp() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn apply_ninfer_stop_token_contract(
+    definitions: &mut [norted_core::SettingDefinition],
+    runtime: &InstalledRuntime,
+    settings: Option<&ResolvedSettings>,
+) {
+    let expected = norted_engine::managed_source_overlay_sha256(ENGINE_ID, "ninfer-serve-v3");
+    let speculation = settings.is_some_and(|s| matches!(s.value("ninfer.speculation"), Some(SettingValue::Toggle(true))) || matches!(s.value("ninfer.speculative_backend"), Some(SettingValue::Choice(value)) if value != "off"));
+    let supported = ninfer_runtime_capabilities_for_installed(runtime).trustworthy_identity
+        && runtime.manifest.identity.variant == "ninfer-serve-v3-sm120a"
+        && runtime.manifest.identity.upstream_revision.as_deref()
+            == Some(norted_engine::NINFER_TOKEN_STOP_REVISION)
+        && !speculation
+        && runtime.manifest.source_build.as_ref().is_some_and(|build| {
+            build.recipe_version == "ninfer-serve-v3"
+                && build.source.commit_sha == norted_engine::NINFER_TOKEN_STOP_REVISION
+                && build.source_overlay_sha256 == expected
+        });
+    if let Some(definition) = definitions
+        .iter_mut()
+        .find(|d| d.id.as_str() == "ninfer.stop_token_ids")
+    {
+        definition.supported = supported;
+        definition.unsupported_reason = (!supported).then(|| {
+            "exact token stops require the Norted source overlay and speculation disabled"
+                .to_owned()
+        });
+    }
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ use norted_engine::{CatalogError, GitHubCommit, GitHubReleaseClient, RuntimeCata
 use crate::{ENGINE_ID, GITHUB_REPOSITORY, PROVIDER_ID, UPSTREAM_REPOSITORY};
 
 pub const PACKAGE_FAMILY: &str = "ninfer-source";
-pub const RECIPE_VERSION: &str = "ninfer-serve-v2";
+pub const RECIPE_VERSION: &str = "ninfer-serve-v3";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NinferRuntimeCatalogProvider;
@@ -51,16 +51,19 @@ impl RuntimeCatalogProvider for NinferRuntimeCatalogProvider {
             ));
         }
         let commit = github
-            .commit(GITHUB_REPOSITORY, &repository.default_branch)
+            .commit(GITHUB_REPOSITORY, norted_engine::NINFER_TOKEN_STOP_REVISION)
             .await?;
         if !norted_core::is_full_git_sha(&commit.sha)
             || !norted_core::is_full_git_sha(&commit.commit.tree.sha)
         {
             return Err(provider_error(
-                "default-branch HEAD did not resolve to full commit and tree SHAs",
+                "reviewed source did not resolve to full commit and tree SHAs",
             ));
         }
-        Ok(vec![source_runtime(repository.default_branch, commit)?])
+        Ok(vec![source_runtime(
+            norted_engine::NINFER_TOKEN_STOP_REVISION.to_owned(),
+            commit,
+        )?])
     }
 
     async fn verify_candidate(
@@ -161,6 +164,7 @@ fn source_runtime(
                 recipe_version: RECIPE_VERSION.to_owned(),
                 build_system: RuntimeSourceBuildSystem::Cmake,
                 build_definition_sha256: None,
+                source_overlay_sha256: norted_engine::managed_source_overlay_sha256(crate::ENGINE_ID, RECIPE_VERSION),
                 cmake_configuration_arguments: vec![
                     "-G".to_owned(),
                     "Ninja".to_owned(),

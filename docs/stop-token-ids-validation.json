@@ -1,0 +1,172 @@
+{
+  "date": "2026-09-09",
+  "starting_master": "50e261b9d58f8851242a24bcffec01c9ecbe225b",
+  "llama_revision": "de8656bd94f1163188125542534e4bcbc9f9fb1f",
+  "variant": "managed-portable-cuda13-v3",
+  "overlay_sha256": "b6eb1527b0ee0305d0bc3b6cde7f3e45c580564c934e1fe39e86f78e0b18720e",
+  "model_sha256": "aff8ac41d95fd53343abfb28015752c0c1fb912f14e79044050828ece1bc81f0",
+  "manifest_sha256": "b5e808d0e842f7f46040f2ae94cea08836925f1a6441c9d17d9be67fcfe382e2",
+  "required_ids": [
+    248044,
+    248046
+  ],
+  "cases": [
+    {
+      "forced_token_id": 248044,
+      "stop_token_ids": [
+        248044,
+        248046
+      ],
+      "stream": false,
+      "native_stop_type": "token_id",
+      "completion_tokens": 1,
+      "content": "",
+      "openai_finish_reason": "stop",
+      "clean_stream_end": false
+    },
+    {
+      "forced_token_id": 248044,
+      "stop_token_ids": [
+        248044,
+        248046
+      ],
+      "stream": true,
+      "native_stop_type": "token_id",
+      "completion_tokens": 1,
+      "content": "",
+      "openai_finish_reason": "stop",
+      "clean_stream_end": true
+    },
+    {
+      "forced_token_id": 248046,
+      "stop_token_ids": [
+        248044,
+        248046
+      ],
+      "stream": false,
+      "native_stop_type": "token_id",
+      "completion_tokens": 1,
+      "content": "",
+      "openai_finish_reason": "stop",
+      "clean_stream_end": false
+    },
+    {
+      "forced_token_id": 248046,
+      "stop_token_ids": [
+        248044,
+        248046
+      ],
+      "stream": true,
+      "native_stop_type": "token_id",
+      "completion_tokens": 1,
+      "content": "",
+      "openai_finish_reason": "stop",
+      "clean_stream_end": true
+    },
+    {
+      "forced_token_id": 42,
+      "stop_token_ids": [
+        248044,
+        248046,
+        42
+      ],
+      "stream": false,
+      "native_stop_type": "token_id",
+      "completion_tokens": 1,
+      "content": "",
+      "openai_finish_reason": "stop",
+      "clean_stream_end": false
+    },
+    {
+      "forced_token_id": 42,
+      "stop_token_ids": [
+        248044,
+        248046,
+        42
+      ],
+      "stream": true,
+      "native_stop_type": "token_id",
+      "completion_tokens": 1,
+      "content": "",
+      "openai_finish_reason": "stop",
+      "clean_stream_end": true
+    }
+  ],
+  "controls": {
+    "without_third_id": {
+      "content": "KKK",
+      "finish_reason": "length",
+      "completion_tokens": 3
+    },
+    "text_stop_K": [
+      "streaming passed",
+      "non-streaming passed"
+    ],
+    "ignore_eos_with_explicit_id": "passed",
+    "invalid_lists": "HTTP 400",
+    "detailed_local_evidence": "/srv/norted/scratch/multi-stop-evidence",
+    "ignore_eos_with_native_eog_in_explicit_list": "HTTP 400 before generation",
+    "text_and_token_stops_coexist": "both independent stop conditions passed, streaming and non-streaming"
+  },
+  "profile": {
+    "profile_id": "exact-stops",
+    "imported_model_id": "norted-grep-qwen3-5-4b-q4-k-m-ba7ae94abb67",
+    "configured_token_ids": [
+      248044,
+      248046
+    ],
+    "generation_defaults": {
+      "temperature": 0,
+      "top_p": 1,
+      "top_k": 0,
+      "min_p": 0,
+      "reasoning": "off",
+      "max_output_tokens": 1024,
+      "context_length": 23552
+    },
+    "explicit_profile_load": "passed",
+    "inherited_profile_load": "passed with stop_token_ids unset",
+    "wire_after_request_override": [
+      248044,
+      248046,
+      11
+    ],
+    "wire_with_request_omission": [
+      248044,
+      248046
+    ],
+    "gateway_stop_id": 11,
+    "gateway_completion_tokens": 1,
+    "gateway_modes": [
+      "streaming",
+      "non-streaming"
+    ],
+    "api_surfaces": [
+      "Completions",
+      "Chat Completions",
+      "Responses"
+    ],
+    "invalid_gateway_lists": "HTTP 400"
+  },
+  "rust_validation": {
+    "fmt": "passed",
+    "check_workspace": "passed",
+    "clippy_all_targets_all_features_deny_warnings": "passed",
+    "test_workspace": {
+      "passed": 214,
+      "failed": 0,
+      "ignored": 1,
+      "new_tests": 0
+    }
+  },
+  "ninfer_source_validation": {
+    "revision": "863aa8a5f1e866db74f29f8999b83b4021398dee",
+    "modified_cpp_units_syntax_check": "4 passed",
+    "model_execution": "not performed"
+  },
+  "unsupported_binary_validation": {
+    "variant": "managed-portable-cuda13-v2",
+    "result": "rejected before launch",
+    "reason": "artifact requires exact token stops; this llama.cpp runtime lacks the reviewed Norted source overlay"
+  }
+}
