@@ -490,11 +490,16 @@ fn managed_ninfer_variant_update_identity(
     let generation = match identity.variant.as_str() {
         "ninfer-serve-v1-sm120a" => 1,
         "ninfer-serve-v2-sm120a" => 2,
-        "ninfer-serve-v3-sm120a" => 3,
+        "ninfer-serve-exact-stop-v1-sm120a" => 1,
         _ => return None,
     };
     Some(RuntimeVariantUpdateIdentity {
-        functional_variant: MANAGED_NINFER_FUNCTIONAL_VARIANT.to_owned(),
+        functional_variant: if identity.variant == "ninfer-serve-exact-stop-v1-sm120a" {
+            "managed-linux-x86_64-cuda-sm120a-exact-stop"
+        } else {
+            MANAGED_NINFER_FUNCTIONAL_VARIANT
+        }
+        .to_owned(),
         source_recipe_generation: Some(generation),
     })
 }
@@ -823,7 +828,7 @@ fn ninfer_runtime_capabilities_for_installed(
         && runtime.manifest.identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
         && matches!(
             runtime.manifest.identity.variant.as_str(),
-            "ninfer-serve-v2-sm120a" | "ninfer-serve-v3-sm120a"
+            "ninfer-serve-v2-sm120a" | "ninfer-serve-exact-stop-v1-sm120a"
         );
     let exact_current = managed_source
         && runtime.manifest.identity.upstream_revision.as_deref()
@@ -833,7 +838,7 @@ fn ninfer_runtime_capabilities_for_installed(
                 && build.source.tree_sha == CURRENT_PACKAGE_CAPABILITY_TREE
                 && matches!(
                     build.recipe_version.as_str(),
-                    "ninfer-serve-v2" | "ninfer-serve-v3"
+                    "ninfer-serve-v2" | "ninfer-serve-exact-stop-v1"
                 )
         });
     let exact_legacy = managed_source
@@ -844,7 +849,7 @@ fn ninfer_runtime_capabilities_for_installed(
                 && build.source.tree_sha == LEGACY_PACKAGE_CAPABILITY_TREE
                 && matches!(
                     build.recipe_version.as_str(),
-                    "ninfer-serve-v2" | "ninfer-serve-v3"
+                    "ninfer-serve-v2" | "ninfer-serve-exact-stop-v1"
                 )
         });
     let blobs = managed_source
@@ -885,7 +890,10 @@ fn ninfer_runtime_capabilities_for_available(
     };
     let managed_source = source.is_some()
         && runtime.identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
-        && runtime.identity.variant == format!("{}-sm120a", catalog::RECIPE_VERSION);
+        && matches!(
+            runtime.identity.variant.as_str(),
+            "ninfer-serve-v2-sm120a" | "ninfer-serve-exact-stop-v1-sm120a"
+        );
     let current = managed_source
         && runtime.identity.upstream_revision.as_deref()
             == Some(CURRENT_PACKAGE_CAPABILITY_REVISION)
@@ -928,7 +936,7 @@ fn installed_source_blobs(runtime: &InstalledRuntime) -> Option<BTreeMap<String,
     let source = runtime.manifest.source_build.as_ref()?;
     if !matches!(
         source.recipe_version.as_str(),
-        "ninfer-serve-v2" | "ninfer-serve-v3"
+        "ninfer-serve-v2" | "ninfer-serve-exact-stop-v1"
     ) {
         return None;
     }
@@ -1535,16 +1543,18 @@ impl EngineAdapter for NinferAdapter {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        _settings: Option<&ResolvedSettings>,
+        settings: Option<&ResolvedSettings>,
     ) -> RuntimeCompatibility {
-        if !model.generation_contract.required_stop_token_ids.is_empty() {
+        if !model.generation_contract.required_stop_token_ids.is_empty()
+            || settings.is_some_and(|s| s.value("ninfer.stop_token_ids").is_some())
+        {
             let mut definitions = settings::definitions();
-            apply_ninfer_stop_token_contract(&mut definitions, runtime, _settings);
+            apply_ninfer_stop_token_contract(&mut definitions, runtime, settings);
             if !definitions
                 .iter()
                 .any(|d| d.id.as_str() == "ninfer.stop_token_ids" && d.supported)
             {
-                return RuntimeCompatibility::Incompatible("artifact requires exact token stops; this NInfer runtime needs the reviewed Norted overlay and speculation off".to_owned());
+                return RuntimeCompatibility::Incompatible("profile requires exact token stops; this NInfer runtime needs the reviewed Norted overlay and speculation off".to_owned());
             }
         }
         if let CompatibilityDecision::Unsupported { reason } = self.compatibility(model) {
@@ -1593,8 +1603,28 @@ impl EngineAdapter for NinferAdapter {
         runtime: &AvailableRuntime,
         model: &ModelArtifact,
         host: &HostCapabilities,
-        _settings: Option<&ResolvedSettings>,
+        settings: Option<&ResolvedSettings>,
     ) -> RuntimeCompatibility {
+        if !model.generation_contract.required_stop_token_ids.is_empty()
+            || settings.is_some_and(|s| s.value("ninfer.stop_token_ids").is_some())
+        {
+            let expected = norted_engine::managed_source_overlay_sha256(
+                ENGINE_ID,
+                catalog::EXACT_STOP_RECIPE_VERSION,
+            );
+            let supported = managed_ninfer_variant_update_identity(&runtime.identity).is_some()
+                && runtime.identity.variant == "ninfer-serve-exact-stop-v1-sm120a"
+                && runtime.identity.upstream_revision.as_deref()
+                    == Some(norted_engine::NINFER_TOKEN_STOP_REVISION)
+                && !ninfer_speculation_enabled(settings)
+                && matches!(&runtime.acquisition, norted_core::RuntimeAcquisitionPlan::SourceBuild(plan)
+                    if plan.recipe.recipe_version == catalog::EXACT_STOP_RECIPE_VERSION
+                    && plan.source.commit_sha == norted_engine::NINFER_TOKEN_STOP_REVISION
+                    && plan.recipe.source_overlay_sha256 == expected);
+            if !supported {
+                return RuntimeCompatibility::Incompatible("profile requires exact token stops; select the reviewed Norted overlay with speculation off".to_owned());
+            }
+        }
         if let CompatibilityDecision::Unsupported { reason } = self.compatibility(model) {
             return RuntimeCompatibility::Incompatible(reason);
         }
@@ -3652,20 +3682,26 @@ fn unix_timestamp() -> i64 {
         .as_secs() as i64
 }
 
+fn ninfer_speculation_enabled(settings: Option<&ResolvedSettings>) -> bool {
+    settings.is_some_and(|s| matches!(s.value("ninfer.speculation"), Some(SettingValue::Toggle(true))) || matches!(s.value("ninfer.speculative_backend"), Some(SettingValue::Choice(value)) if value != "off"))
+}
+
 fn apply_ninfer_stop_token_contract(
     definitions: &mut [norted_core::SettingDefinition],
     runtime: &InstalledRuntime,
     settings: Option<&ResolvedSettings>,
 ) {
-    let expected = norted_engine::managed_source_overlay_sha256(ENGINE_ID, "ninfer-serve-v3");
-    let speculation = settings.is_some_and(|s| matches!(s.value("ninfer.speculation"), Some(SettingValue::Toggle(true))) || matches!(s.value("ninfer.speculative_backend"), Some(SettingValue::Choice(value)) if value != "off"));
-    let supported = ninfer_runtime_capabilities_for_installed(runtime).trustworthy_identity
-        && runtime.manifest.identity.variant == "ninfer-serve-v3-sm120a"
+    let expected =
+        norted_engine::managed_source_overlay_sha256(ENGINE_ID, "ninfer-serve-exact-stop-v1");
+    let speculation = ninfer_speculation_enabled(settings);
+    let supported = managed_ninfer_variant_update_identity(&runtime.manifest.identity).is_some()
+        && ninfer_runtime_capabilities_for_installed(runtime).trustworthy_identity
+        && runtime.manifest.identity.variant == "ninfer-serve-exact-stop-v1-sm120a"
         && runtime.manifest.identity.upstream_revision.as_deref()
             == Some(norted_engine::NINFER_TOKEN_STOP_REVISION)
         && !speculation
         && runtime.manifest.source_build.as_ref().is_some_and(|build| {
-            build.recipe_version == "ninfer-serve-v3"
+            build.recipe_version == "ninfer-serve-exact-stop-v1"
                 && build.source.commit_sha == norted_engine::NINFER_TOKEN_STOP_REVISION
                 && build.source_overlay_sha256 == expected
         });

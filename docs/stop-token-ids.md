@@ -59,8 +59,8 @@ HF's EOS configuration supports scalar/list token IDs; see the
 
 | Runtime | Exact source/variant | Support |
 | --- | --- | --- |
-| llama.cpp | `b10786`, `de8656bd94f1163188125542534e4bcbc9f9fb1f`; `managed-portable-v5` and `managed-portable-cuda13-v3` | Norted source overlay |
-| NInfer | `863aa8a5f1e866db74f29f8999b83b4021398dee`; `ninfer-serve-v3-sm120a` | Norted source overlay, speculation off |
+| llama.cpp | `b10786`, `de8656bd94f1163188125542534e4bcbc9f9fb1f`; `managed-portable-exact-stop-v1` and `managed-portable-cuda13-exact-stop-v1` | Norted source overlay |
+| NInfer | `863aa8a5f1e866db74f29f8999b83b4021398dee`; `ninfer-serve-exact-stop-v1-sm120a` | Norted source overlay, speculation off |
 | q27 | reviewed `0.10.0`, `4770e053656af9aababdc49c81f280ad21b74986` | Unsupported; blocker below |
 | Official/unpatched binaries | no matching reviewed overlay provenance | Unsupported |
 
@@ -68,9 +68,35 @@ The installer verifies immutable upstream commit/tree and original build/source
 contracts before applying the owned patch in its private staging checkout.
 There is no mutation of a shared pristine checkout. The complete patch digest is
 in both source recipe and build provenance (`source_overlay_sha256`). Recipe
-and functional variant generations distinguish patched and unpatched runtimes.
+generations are compared only within a functional variant. Patched and unpatched
+runtimes have distinct functional variants.
 Changing the overlay requires a new recipe generation and a fresh source review.
-The supporting recipes are pinned to their reviewed source revisions.
+The exact-stop recipes are pinned to their reviewed source revisions; they are
+capability choices, not claims of globally latest upstream source.
+
+Ordinary moving source runtimes remain available through the same providers:
+
+* llama.cpp `managed-portable-v4` (CUDA 12) and
+  `managed-portable-cuda13-v2` (CUDA 13) inspect current nightly releases and
+  select the newest source admitted by the ordinary managed-source contract.
+* NInfer `ninfer-serve-v2-sm120a` follows the canonical repository's
+  default-branch HEAD.
+
+Ordinary recipes have `source_overlay_sha256 = None` and do not advertise exact
+token stops. Exact-stop recipes carry the owned overlay digest. Their functional
+update families append `-exact-stop` to the ordinary family (NInfer uses
+`managed-linux-x86_64-cuda-sm120a-exact-stop`) and start at recipe generation 1.
+An exact-stop candidate cannot be a generic update for an ordinary installation,
+even when the ordinary source is newer. Future reviewed source/overlay changes
+receive a new recipe generation within the exact-stop functional variant.
+
+Both installed and available runtime compatibility inspect mandatory artifact
+IDs and the resolved Settings/Model Profile `stop_token_ids` key, including an
+explicit empty list. Such profiles reject ordinary runtimes before installation
+or load. They accept the reviewed exact-stop variant subject to other runtime
+compatibility requirements; NInfer additionally rejects enabled speculation or
+an enabled speculative backend. Profiles without token stops retain the ordinary
+update stream and may also use an otherwise compatible exact-stop runtime.
 
 Overlay SHA256:
 
