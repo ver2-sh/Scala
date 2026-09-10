@@ -1,7 +1,6 @@
-//! Reviewed chat wire contract. Observations are process-local, never settings.
+//! Native chat wire contract. Observations are process-local, never settings.
 use super::*;
 
-const REVIEWED_TREE: &str = "ef599001012ff8bee837a832decde4c564702cc4";
 const RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
 
 fn invalid(detail: impl std::fmt::Display) -> EngineError {
@@ -319,50 +318,22 @@ pub(super) fn validate_stream(
     ))
 }
 
-fn reviewed(runtime: &InstalledRuntime) -> bool {
-    let m = &runtime.manifest;
-    let i = &m.identity;
-    let expected = norted_engine::managed_source_overlay_sha256(ENGINE_ID, &i.variant);
-    m.validate().is_ok()
-        && is_managed_llama_linux_cuda(i)
-        && m.acquisition_method == RuntimeAcquisitionMethod::SourceBuild
-        && i.upstream_revision.as_deref() == Some(norted_engine::LLAMA_TOKEN_STOP_REVISION)
-        && matches!(
-            i.variant.as_str(),
-            "managed-portable-v4"
-                | "managed-portable-cuda13-v2"
-                | "managed-portable-exact-stop-v2"
-                | "managed-portable-cuda13-exact-stop-v2"
-        )
-        && m.source_build.as_ref().is_some_and(|b| {
-            b.source.commit_sha == norted_engine::LLAMA_TOKEN_STOP_REVISION
-                && b.source.tree_sha == REVIEWED_TREE
-                && b.source.repository == MANAGED_LLAMA_REPOSITORY
-                && b.source.repository_url == format!("{UPSTREAM_REPOSITORY}.git")
-                && b.source.source_provider == LLAMA_CPP_SOURCE_RUNTIME_PROVIDER_ID
-                && b.recipe_version == i.variant
-                && b.source_overlay_sha256 == expected
-                && b.entrypoint_sha256 == m.entrypoint_sha256
-        })
-}
-
 fn tuple_key(
     runtime: &InstalledRuntime,
     model: &ModelArtifact,
     settings: Option<&norted_core::ResolvedSettings>,
 ) -> String {
-    // Package preparation fills hash from the verified manifest. Discovery and
-    // running-model views must address the same declared artifact identity.
-    let mut model = model.clone();
-    if let Some(package) = &model.norted_package {
-        model.hash = Some(package.expected_primary_sha256.clone());
-    }
     let configured = settings.map(|s| &s.configured);
     format!(
         "{:x}",
         Sha256::digest(
-            serde_json::to_vec(&(LlamaCppAdapter::capability_key(runtime), model, configured))
-                .expect("serializable tuple")
+            serde_json::to_vec(&(
+                LlamaCppAdapter::capability_key(runtime),
+                &model.id,
+                &model.path,
+                configured
+            ))
+            .expect("serializable tuple")
         )
     )
 }
@@ -373,8 +344,8 @@ pub(super) struct LaunchProof {
     executable_sha256: String,
     model_id: norted_core::ModelId,
     template_sha256: Option<String>,
-    reviewed: bool,
-    jinja: bool,
+    executable_verified: bool,
+    structured: bool,
     ready: bool,
     tools: bool,
     parallel: bool,
@@ -390,14 +361,8 @@ impl LlamaCppAdapter {
             .write()
             .expect("chat proof lock")
             .retain(|address, proof| address != endpoint && proof.key != key);
-        let reviewed = reviewed(&spec.runtime)
-            && hash_file(&spec.executable).await.ok().as_deref()
-                == Some(spec.runtime.manifest.entrypoint_sha256.as_str());
-        // Explicit typed Jinja is required for tool serving; no inferred override.
-        let jinja =
-            spec.settings.configured.iter().any(|(k, v)| {
-                k.as_str() == "llama.cpp.jinja" && v.value == SettingValue::Toggle(true)
-            });
+        let executable_verified = hash_file(&spec.executable).await.ok().as_deref()
+            == Some(spec.runtime.manifest.entrypoint_sha256.as_str());
         self.chat_proofs.write().expect("chat proof lock").insert(
             endpoint.clone(),
             LaunchProof {
@@ -406,8 +371,8 @@ impl LlamaCppAdapter {
                 executable_sha256: spec.runtime.manifest.entrypoint_sha256.clone(),
                 model_id: spec.model.primary.id.clone(),
                 template_sha256: None,
-                reviewed,
-                jinja,
+                executable_verified,
+                structured: false,
                 ready: false,
                 tools: false,
                 parallel: false,
@@ -425,7 +390,7 @@ impl LlamaCppAdapter {
             .expect("chat proof lock")
             .get(endpoint)
             .is_some_and(|p| {
-                p.reviewed
+                p.executable_verified
                     && p.runtime_id == process.runtime_id
                     && p.executable_sha256 == process.runtime_executable_sha256
                     && p.model_id == process.model_id
@@ -454,10 +419,45 @@ impl LlamaCppAdapter {
                     rendered = ["norted_probe_user", "norted_probe_function", "norted_probe_definition", "norted_probe_argument", "norted_probe_result", "norted_probe_continue"].iter().all(|s| prompt.contains(s));
                 }
             }
+            // Introspection and rendering establish template support. Also require
+            // the running server to honor the native forced-tool request contract.
+            if rendered {
+                let body = json!({"messages":[{"role":"user","content":"Call capability_probe with value ok."}],
+                    "tools":[{"type":"function","function":{"name":"capability_probe","parameters":{
+                        "type":"object","properties":{"value":{"const":"ok"}},"required":["value"],"additionalProperties":false}}}],
+                    "tool_choice":"required","parallel_tool_calls":false,"max_tokens":128,"temperature":0,
+                    "chat_template_kwargs":{"enable_thinking":false}});
+                rendered = if let Ok(response) = self.client.post(format!("{endpoint}/v1/chat/completions"))
+                    .timeout(Duration::from_secs(30)).json(&body).send().await
+                    && response.status().is_success()
+                    && let Ok(value) = response.json::<Value>().await
+                    && let Some(calls) = value.pointer("/choices/0/message/tool_calls")
+                    && let Ok(calls) = serde_json::from_value::<Vec<WireToolCall>>(calls.clone())
+                    && let Ok(calls) = parse_calls(calls) {
+                    value.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("tool_calls")
+                        && calls.len() == 1 && calls[0].name == "capability_probe"
+                        && serde_json::from_str::<Value>(&calls[0].arguments).ok() == Some(json!({"value":"ok"}))
+                } else { false };
+            }
             let template_sha256 = props.get("chat_template").and_then(Value::as_str).map(|s| format!("{:x}", Sha256::digest(s.as_bytes())));
-            Some((tools && rendered, parallel, template_sha256))
+            // Prove constrained generation through the running engine, independent
+            // of its source provider or the model's producer. A const schema makes
+            // mere request acceptance insufficient evidence.
+            let schema = json!({"type":"object","properties":{"proof":{"const":"native_schema_probe"}},"required":["proof"],"additionalProperties":false});
+            let body = json!({"messages":[{"role":"user","content":"Return a JSON object."}],
+                "response_format":{"type":"json_schema","json_schema":{"name":"capability_probe","schema":schema}},
+                "max_tokens":64,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}});
+            let structured = if let Ok(response) = self.client.post(format!("{endpoint}/v1/chat/completions"))
+                .timeout(Duration::from_secs(30)).json(&body).send().await
+                && response.status().is_success()
+                && let Ok(value) = response.json::<Value>().await {
+                value.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("stop")
+                    && value.pointer("/choices/0/message/content").and_then(Value::as_str)
+                        .and_then(|text| serde_json::from_str::<Value>(text).ok()) == Some(json!({"proof":"native_schema_probe"}))
+            } else { false };
+            Some((tools && rendered, parallel, template_sha256, structured))
         }.await;
-        if let Some((tools, parallel, template_sha256)) = result
+        if let Some((tools, parallel, template_sha256, structured)) = result
             && let Some(p) = self
                 .chat_proofs
                 .write()
@@ -469,7 +469,8 @@ impl LlamaCppAdapter {
         {
             p.template_sha256 = template_sha256;
             p.ready = true;
-            p.tools = tools && p.jinja;
+            p.structured = structured;
+            p.tools = tools;
             p.parallel = parallel && p.tools;
         }
     }
@@ -478,13 +479,12 @@ impl LlamaCppAdapter {
         let proofs = self.chat_proofs.read().expect("chat proof lock");
         match proofs.get(endpoint) {
             Some(p) => json!({
-                "reviewed_runtime": p.reviewed,
+                "executable_verified": p.executable_verified,
                 "startup_verified": p.ready,
-                "explicit_jinja": p.jinja,
                 "template_sha256": p.template_sha256,
                 "tool_calling": p.ready && p.tools,
                 "parallel_tool_calls": p.ready && p.parallel,
-                "structured_output": p.reviewed && p.ready,
+                "structured_output": p.ready && p.structured,
             }),
             None => Value::Null,
         }
@@ -501,9 +501,11 @@ impl LlamaCppAdapter {
         let mut features = vec![EngineFeature::TextGeneration];
         if let Some(p) = proofs
             .values()
-            .find(|p| p.key == key && p.reviewed && p.ready)
+            .find(|p| p.key == key && p.executable_verified && p.ready)
         {
-            features.push(EngineFeature::StructuredOutput);
+            if p.structured {
+                features.push(EngineFeature::StructuredOutput);
+            }
             if p.tools {
                 features.push(EngineFeature::ToolCalling);
             }
@@ -528,7 +530,7 @@ impl LlamaCppAdapter {
         let proofs = self.chat_proofs.read().expect("chat proof lock");
         let proof = proofs
             .get(endpoint)
-            .filter(|p| p.reviewed && p.ready && p.tools)
+            .filter(|p| p.executable_verified && p.ready && p.tools)
             .ok_or_else(|| {
                 EngineError::Unsupported(
                     "exact llama.cpp runtime/template/Jinja tuple has not proved tool calling"

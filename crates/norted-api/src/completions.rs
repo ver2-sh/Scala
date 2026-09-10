@@ -42,7 +42,6 @@ pub(super) async fn create(
             "top_k",
             "min_p",
             "stop",
-            "stop_token_ids",
             "seed",
             "frequency_penalty",
             "presence_penalty",
