@@ -94,7 +94,6 @@ impl SettingsEditor {
                 SettingKind::GpuOffload => "Exact layer count",
                 SettingKind::UnsignedIntegerOrChoice { .. } => "Custom number",
                 SettingKind::StringList => "Item list",
-                SettingKind::UnsignedIntegerList { .. } => "JSON integer array",
                 SettingKind::JsonObject => "JSON object",
                 SettingKind::Path => "Path",
                 SettingKind::Choice { .. } => "Text value (open-ended choice)",

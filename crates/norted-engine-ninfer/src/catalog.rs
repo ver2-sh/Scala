@@ -13,7 +13,6 @@ use crate::{ENGINE_ID, GITHUB_REPOSITORY, PROVIDER_ID, UPSTREAM_REPOSITORY};
 
 pub const PACKAGE_FAMILY: &str = "ninfer-source";
 pub const RECIPE_VERSION: &str = "ninfer-serve-v2";
-pub const EXACT_STOP_RECIPE_VERSION: &str = "ninfer-serve-exact-stop-v1";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NinferRuntimeCatalogProvider;
@@ -58,21 +57,10 @@ impl RuntimeCatalogProvider for NinferRuntimeCatalogProvider {
             || !norted_core::is_full_git_sha(&commit.commit.tree.sha)
         {
             return Err(provider_error(
-                "default branch did not resolve to full commit and tree SHAs",
+                "default-branch HEAD did not resolve to full commit and tree SHAs",
             ));
         }
-        let ordinary = source_runtime(repository.default_branch, commit)?;
-        let exact = github
-            .commit(GITHUB_REPOSITORY, norted_engine::NINFER_TOKEN_STOP_REVISION)
-            .await?;
-        Ok(vec![
-            ordinary,
-            source_runtime_with_recipe(
-                norted_engine::NINFER_TOKEN_STOP_REVISION.to_owned(),
-                exact,
-                EXACT_STOP_RECIPE_VERSION,
-            )?,
-        ])
+        Ok(vec![source_runtime(repository.default_branch, commit)?])
     }
 
     async fn verify_candidate(
@@ -109,11 +97,7 @@ impl RuntimeCatalogProvider for NinferRuntimeCatalogProvider {
                 "selected source commit/tree metadata differs from the live canonical repository",
             ));
         }
-        let live = source_runtime_with_recipe(
-            plan.source.source_branch.clone(),
-            commit,
-            &plan.recipe.recipe_version,
-        )?;
+        let live = source_runtime(plan.source.source_branch.clone(), commit)?;
         if &live != candidate {
             return Err(provider_error(
                 "selected source runtime contract differs from the canonical Norted build recipe",
@@ -127,22 +111,6 @@ fn source_runtime(
     source_branch: String,
     commit: GitHubCommit,
 ) -> Result<AvailableRuntime, CatalogError> {
-    source_runtime_with_recipe(source_branch, commit, RECIPE_VERSION)
-}
-
-fn source_runtime_with_recipe(
-    source_branch: String,
-    commit: GitHubCommit,
-    recipe: &str,
-) -> Result<AvailableRuntime, CatalogError> {
-    if !matches!(recipe, RECIPE_VERSION | EXACT_STOP_RECIPE_VERSION)
-        || !norted_core::is_full_git_sha(&commit.sha)
-        || !norted_core::is_full_git_sha(&commit.commit.tree.sha)
-        || (recipe == EXACT_STOP_RECIPE_VERSION
-            && commit.sha != norted_engine::NINFER_TOKEN_STOP_REVISION)
-    {
-        return Err(provider_error("invalid source identity for managed recipe"));
-    }
     let timestamp = parse_github_timestamp(&commit.commit.committer.date)
         .ok_or_else(|| provider_error("source commit has an invalid timestamp"))?;
     let date = commit
@@ -160,7 +128,7 @@ fn source_runtime_with_recipe(
         platform: "linux".to_owned(),
         architecture: "x86_64".to_owned(),
         accelerator: "cuda".to_owned(),
-        variant: format!("{recipe}-sm120a"),
+        variant: format!("{RECIPE_VERSION}-sm120a"),
         package: RuntimePackageIdentity {
             provider_id: PROVIDER_ID.to_owned(),
             repository: Some(GITHUB_REPOSITORY.to_owned()),
@@ -173,7 +141,7 @@ fn source_runtime_with_recipe(
     let runtime = AvailableRuntime {
         runtime_id: RuntimeId::from_identity(&identity),
         identity,
-        display_name: format!("NInfer source snapshot {} ({recipe})", &commit.sha[..8]),
+        display_name: format!("NInfer source snapshot {}", &commit.sha[..8]),
         supported_formats: vec![ArtifactFormat::Ninfer],
         source_url: commit.html_url,
         published_at_unix: Some(timestamp),
@@ -190,10 +158,9 @@ fn source_runtime_with_recipe(
                 source_provider: PROVIDER_ID.to_owned(),
             },
             recipe: RuntimeSourceBuildRecipe {
-                recipe_version: recipe.to_owned(),
+                recipe_version: RECIPE_VERSION.to_owned(),
                 build_system: RuntimeSourceBuildSystem::Cmake,
                 build_definition_sha256: None,
-                source_overlay_sha256: norted_engine::managed_source_overlay_sha256(crate::ENGINE_ID, recipe),
                 cmake_configuration_arguments: vec![
                     "-G".to_owned(),
                     "Ninja".to_owned(),

@@ -1,4 +1,5 @@
 {
+  "historical_notice": "Pre-correction patched-runtime experiment. Not a current capability requirement or portability proof. Scores are preserved; stop-extension conclusions are superseded.",
   "validation_date_utc": "2026-09-09",
   "starting_master": "753d0a1db06a5e68086834e627d0e2559fcbd40e",
   "implementation_commit": "e58567b8d93b301b65107d332ba689e4f40f1d06",

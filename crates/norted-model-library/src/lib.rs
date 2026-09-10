@@ -1,6 +1,6 @@
 //! Managed model acquisition without model transformation or runtime ownership.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
@@ -114,7 +114,6 @@ pub struct ResolvedFile {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedArtifact {
-    pub generation_contract: norted_core::ModelGenerationContract,
     pub provider: String,
     pub repository: String,
     pub revision: String,
@@ -547,7 +546,6 @@ impl ModelLibrary {
                 let provenance = ModelArtifactProvenance {
                     acquisition_id: acquisition_id.clone(),
                     provider: "local_import".to_owned(),
-                    generation_contract: artifact.generation_contract.clone(),
                     repository: None,
                     logical_id: Some(format!("{acquisition_id}:{}", slash_path(&relative))),
                     source: Some(source_path.display().to_string()),
@@ -582,7 +580,6 @@ impl ModelLibrary {
             let provenance = ModelArtifactProvenance {
                 acquisition_id: acquisition_id.clone(),
                 provider: "local_import".to_owned(),
-                generation_contract: discovered_source.generation_contract.clone(),
                 repository: None,
                 logical_id: Some(logical),
                 source: Some(source.display().to_string()),
@@ -1604,39 +1601,7 @@ impl ModelCatalogProvider for HuggingFaceCatalogProvider {
                 Vec::new(),
             )
         };
-        // Metadata is fetched from the selected immutable HF revision and the
-        // primary's own directory. No special-token-name inference is used.
-        let mut metadata = BTreeMap::new();
-        let mut generation_contract = norted_core::ModelGenerationContract::default();
-        for name in ["generation_config.json", "config.json"] {
-            if let Some(file) = repository.siblings.iter().find(|file| {
-                Path::new(&file.rfilename)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    == Some(name)
-                    && same_remote_directory(&file.rfilename, &parsed.filename)
-            }) {
-                let resolved = file.resolved(&self.api_base, &parsed.repository, &revision)?;
-                let bytes = self.manifest_bytes(resolved.url).await?;
-                let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
-                    ModelLibraryError::InvalidCatalog(format!(
-                        "invalid HF generation metadata: {e}"
-                    ))
-                })?;
-                generation_contract.metadata_sha256.insert(
-                    file.rfilename.clone(),
-                    format!("{:x}", Sha256::digest(&bytes)),
-                );
-                metadata.insert(name, value);
-            }
-        }
-        generation_contract.required_stop_token_ids = norted_core::hugging_face_eos_token_ids(
-            metadata.get("generation_config.json"),
-            metadata.get("config.json"),
-        )
-        .map_err(ModelLibraryError::InvalidCatalog)?;
         Ok(ResolvedArtifact {
-            generation_contract,
             provider: self.id().to_owned(),
             repository: parsed.repository.clone(),
             revision: revision.clone(),
@@ -2140,7 +2105,6 @@ fn remote_provenance(
     ModelArtifactProvenance {
         acquisition_id: acquisition_id.to_owned(),
         provider: resolved.provider.clone(),
-        generation_contract: resolved.generation_contract.clone(),
         repository: Some(resolved.repository.clone()),
         logical_id: Some(format!(
             "{}:{}@{}:{}",

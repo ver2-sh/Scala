@@ -1476,27 +1476,7 @@ impl RuntimePackManager {
                 adapter.serving_features(&selection.runtime, model, settings)
             })
             .unwrap_or_default();
-        let structured_output = if let Some(selection) = selected.as_ref()
-            && let Some(adapter) = selected_adapter.as_ref()
-        {
-            adapter
-                .settings_schema(&selection.runtime, model, &list.host, settings)
-                .await
-                .ok()
-                .and_then(|schema| {
-                    let id = norted_core::SettingId::new(format!(
-                        "{}.structured_output_schema",
-                        selection.runtime.manifest.identity.engine_id
-                    ))
-                    .ok()?;
-                    schema
-                        .definition(&id)
-                        .map(|definition| definition.supported)
-                })
-                .unwrap_or(false)
-        } else {
-            false
-        };
+        let structured_output = selected_features.contains(&EngineFeature::StructuredOutput);
 
         let text_generation = !self.registry.compatible_with(model).iter().any(|adapter| {
             adapter.supports_model_capability(model, crate::ApiCapability::Embeddings)
@@ -2805,7 +2785,6 @@ mod tests {
             native_identity: None,
             auxiliary_artifacts: Vec::new(),
             norted_package: None,
-            generation_contract: Default::default(),
         };
 
         let (selection, schema) = manager
@@ -3207,7 +3186,6 @@ mod tests {
                 recipe_version: legacy.recipe_version.clone(),
                 build_system: RuntimeSourceBuildSystem::Cmake,
                 build_definition_sha256: None,
-                source_overlay_sha256: None,
                 cmake_configuration_arguments: Vec::new(),
                 build_target: legacy.build_target.clone(),
                 entrypoint: PathBuf::from("build/fixture"),
@@ -3280,7 +3258,6 @@ mod tests {
                     recipe_version: "fixture-v1".to_owned(),
                     build_system: RuntimeSourceBuildSystem::Cmake,
                     build_definition_sha256: None,
-                    source_overlay_sha256: None,
                     cmake_configuration_arguments: Vec::new(),
                     effective_cmake_configuration_arguments: None,
                     build_target: "fixture".to_owned(),
