@@ -1,0 +1,1920 @@
+{
+  "date": "2026-09-10",
+  "starting_commits": {
+    "Norted-Server": "0d545d969c32a543d7d6b6de5124d786bbecb57e",
+    "Norted": "6b05f0cf32a001c17ccf8e25a84b846afc262dd2"
+  },
+  "stock_runtime": {
+    "repository": "https://github.com/ggml-org/llama.cpp",
+    "revision": "434ddbbc0e30522e897670681e503b797c12b7c1",
+    "source_dirty": false,
+    "build": "CMake Release, GGML_CUDA=ON, CUDA_ARCHITECTURES=120a, target llama-server",
+    "source_patch": null
+  },
+  "standalone": {
+    "sha256": "aff8ac41d95fd53343abfb28015752c0c1fb912f14e79044050828ece1bc81f0",
+    "size": 2783446400,
+    "matches_published_payload": true,
+    "directory_entries": [
+      "Norted-Grep-Qwen3.5-4B-Q4_K_M.gguf"
+    ]
+  },
+  "native_eog": {
+    "248044": {
+      "request": {
+        "prompt": "Hello",
+        "n_predict": 16,
+        "temperature": 0,
+        "logit_bias": [
+          [
+            248044,
+            1000
+          ]
+        ],
+        "return_tokens": true
+      },
+      "response": {
+        "index": 0,
+        "content": "",
+        "tokens": [
+          248044
+        ],
+        "id_slot": 0,
+        "stop": true,
+        "model": "/srv/norted/scratch/native-portability/standalone/Norted-Grep-Qwen3.5-4B-Q4_K_M.gguf",
+        "tokens_predicted": 1,
+        "tokens_evaluated": 1,
+        "generation_settings": {
+          "seed": 4294967295,
+          "temperature": 0.0,
+          "dynatemp_range": 0.0,
+          "dynatemp_exponent": 1.0,
+          "top_k": 40,
+          "top_p": 0.949999988079071,
+          "min_p": 0.05000000074505806,
+          "top_n_sigma": -1.0,
+          "xtc_probability": 0.0,
+          "xtc_threshold": 0.10000000149011612,
+          "typical_p": 1.0,
+          "repeat_last_n": 64,
+          "repeat_penalty": 1.0,
+          "presence_penalty": 0.0,
+          "frequency_penalty": 0.0,
+          "dry_multiplier": 0.0,
+          "dry_base": 1.75,
+          "dry_allowed_length": 2,
+          "dry_penalty_last_n": 64,
+          "dry_sequence_breakers": [
+            "\n",
+            ":",
+            "\"",
+            "*"
+          ],
+          "mirostat": 0,
+          "mirostat_tau": 5.0,
+          "mirostat_eta": 0.10000000149011612,
+          "adaptive_target": -1.0,
+          "adaptive_decay": 0.8999999761581421,
+          "stop": [],
+          "max_tokens": 16,
+          "n_predict": 16,
+          "n_keep": 0,
+          "n_discard": 0,
+          "ignore_eos": false,
+          "stream": false,
+          "logit_bias": [
+            {
+              "bias": 1000.0,
+              "token": 248044
+            }
+          ],
+          "n_probs": 0,
+          "min_keep": 0,
+          "grammar": "",
+          "grammar_lazy": false,
+          "grammar_triggers": [],
+          "preserved_tokens": [],
+          "chat_format": "Content-only",
+          "reasoning_format": "deepseek",
+          "reasoning_in_content": false,
+          "generation_prompt": "",
+          "samplers": [
+            "penalties",
+            "dry",
+            "top_n_sigma",
+            "top_k",
+            "typ_p",
+            "top_p",
+            "min_p",
+            "xtc",
+            "temperature"
+          ],
+          "speculative.types": "none",
+          "timings_per_token": false,
+          "post_sampling_probs": false,
+          "backend_sampling": false,
+          "lora": []
+        },
+        "prompt": "Hello",
+        "has_new_line": false,
+        "truncated": false,
+        "stop_type": "eos",
+        "stopping_word": "",
+        "tokens_cached": 1,
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 1,
+          "prompt_ms": 17.339,
+          "prompt_per_token_ms": 17.339,
+          "prompt_per_second": 57.6734529096257,
+          "predicted_n": 1,
+          "predicted_ms": 0.001,
+          "predicted_per_token_ms": 0.0,
+          "predicted_per_second": 0.0
+        }
+      }
+    },
+    "248046": {
+      "request": {
+        "prompt": "Hello",
+        "n_predict": 16,
+        "temperature": 0,
+        "logit_bias": [
+          [
+            248046,
+            1000
+          ]
+        ],
+        "return_tokens": true
+      },
+      "response": {
+        "index": 0,
+        "content": "",
+        "tokens": [
+          248046
+        ],
+        "id_slot": 0,
+        "stop": true,
+        "model": "/srv/norted/scratch/native-portability/standalone/Norted-Grep-Qwen3.5-4B-Q4_K_M.gguf",
+        "tokens_predicted": 1,
+        "tokens_evaluated": 1,
+        "generation_settings": {
+          "seed": 4294967295,
+          "temperature": 0.0,
+          "dynatemp_range": 0.0,
+          "dynatemp_exponent": 1.0,
+          "top_k": 40,
+          "top_p": 0.949999988079071,
+          "min_p": 0.05000000074505806,
+          "top_n_sigma": -1.0,
+          "xtc_probability": 0.0,
+          "xtc_threshold": 0.10000000149011612,
+          "typical_p": 1.0,
+          "repeat_last_n": 64,
+          "repeat_penalty": 1.0,
+          "presence_penalty": 0.0,
+          "frequency_penalty": 0.0,
+          "dry_multiplier": 0.0,
+          "dry_base": 1.75,
+          "dry_allowed_length": 2,
+          "dry_penalty_last_n": 64,
+          "dry_sequence_breakers": [
+            "\n",
+            ":",
+            "\"",
+            "*"
+          ],
+          "mirostat": 0,
+          "mirostat_tau": 5.0,
+          "mirostat_eta": 0.10000000149011612,
+          "adaptive_target": -1.0,
+          "adaptive_decay": 0.8999999761581421,
+          "stop": [],
+          "max_tokens": 16,
+          "n_predict": 16,
+          "n_keep": 0,
+          "n_discard": 0,
+          "ignore_eos": false,
+          "stream": false,
+          "logit_bias": [
+            {
+              "bias": 1000.0,
+              "token": 248046
+            }
+          ],
+          "n_probs": 0,
+          "min_keep": 0,
+          "grammar": "",
+          "grammar_lazy": false,
+          "grammar_triggers": [],
+          "preserved_tokens": [],
+          "chat_format": "Content-only",
+          "reasoning_format": "deepseek",
+          "reasoning_in_content": false,
+          "generation_prompt": "",
+          "samplers": [
+            "penalties",
+            "dry",
+            "top_n_sigma",
+            "top_k",
+            "typ_p",
+            "top_p",
+            "min_p",
+            "xtc",
+            "temperature"
+          ],
+          "speculative.types": "none",
+          "timings_per_token": false,
+          "post_sampling_probs": false,
+          "backend_sampling": false,
+          "lora": []
+        },
+        "prompt": "Hello",
+        "has_new_line": false,
+        "truncated": false,
+        "stop_type": "eos",
+        "stopping_word": "",
+        "tokens_cached": 1,
+        "timings": {
+          "cache_n": 0,
+          "prompt_n": 1,
+          "prompt_ms": 9.665,
+          "prompt_per_token_ms": 9.665,
+          "prompt_per_second": 103.46611484738749,
+          "predicted_n": 1,
+          "predicted_ms": 0.001,
+          "predicted_per_token_ms": 0.0,
+          "predicted_per_second": 0.0
+        }
+      }
+    }
+  },
+  "native_template": {
+    "sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    "caps": {
+      "supports_object_arguments": true,
+      "supports_parallel_tool_calls": true,
+      "supports_preserve_reasoning": false,
+      "supports_reasoning_effort": false,
+      "supports_string_content": true,
+      "supports_system_role": true,
+      "supports_tool_calls": true,
+      "supports_tools": true,
+      "supports_typed_content": true
+    }
+  },
+  "normal_chat": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "Hello! How can I help you today?"
+        }
+      }
+    ],
+    "created": 1788999600,
+    "model": "/srv/norted/scratch/native-portability/standalone/Norted-Grep-Qwen3.5-4B-Q4_K_M.gguf",
+    "system_fingerprint": "b1-434ddbb",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 10,
+      "prompt_tokens": 15,
+      "total_tokens": 25,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "id": "chatcmpl-NeY4UhoCvaTxOsawADc7CltogxFssa37",
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 15,
+      "prompt_ms": 60.32,
+      "prompt_per_token_ms": 4.021333333333334,
+      "prompt_per_second": 248.6737400530504,
+      "predicted_n": 10,
+      "predicted_ms": 36.982,
+      "predicted_per_token_ms": 4.109111111111111,
+      "predicted_per_second": 243.36163539018983
+    }
+  },
+  "native_tool_schema_requests": {
+    "tool_request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call capability_probe with value ok."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "capability_probe",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "const": "ok"
+                }
+              },
+              "required": [
+                "value"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "tool_choice": "required",
+      "parallel_tool_calls": false,
+      "max_tokens": 128,
+      "temperature": 0,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "tool_response": {
+      "choices": [
+        {
+          "finish_reason": "tool_calls",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "capability_probe",
+                  "arguments": "{\"value\":\"ok\"}"
+                },
+                "id": "lhFqpbddm6Fw42ZrTxEaNCtocIKI4rYH"
+              }
+            ]
+          }
+        }
+      ],
+      "created": 1788999805,
+      "model": "/srv/norted/scratch/native-portability/standalone/Norted-Grep-Qwen3.5-4B-Q4_K_M.gguf",
+      "system_fingerprint": "b1-434ddbb",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 26,
+        "prompt_tokens": 275,
+        "total_tokens": 301,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-GqKD2p6g0tEJwIzp7H50RLT1M9tSmjl9",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 275,
+        "prompt_ms": 59.472,
+        "prompt_per_token_ms": 0.2162618181818182,
+        "prompt_per_second": 4624.0247511433945,
+        "predicted_n": 26,
+        "predicted_ms": 83.048,
+        "predicted_per_token_ms": 3.32192,
+        "predicted_per_second": 301.0307292168385
+      }
+    },
+    "schema_request": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Return a JSON object."
+        }
+      ],
+      "response_format": {
+        "type": "json_schema",
+        "json_schema": {
+          "name": "capability_probe",
+          "schema": {
+            "type": "object",
+            "properties": {
+              "proof": {
+                "const": "native_schema_probe"
+              }
+            },
+            "required": [
+              "proof"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "max_tokens": 64,
+      "temperature": 0,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "schema_response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\n  \"proof\": \"native_schema_probe\"\n}"
+          }
+        }
+      ],
+      "created": 1788999805,
+      "model": "/srv/norted/scratch/native-portability/standalone/Norted-Grep-Qwen3.5-4B-Q4_K_M.gguf",
+      "system_fingerprint": "b1-434ddbb",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 17,
+        "prompt_tokens": 17,
+        "total_tokens": 34,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-9EqN5yxHrZP0OXIEYvZcGt2pnn1WCamO",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 17,
+        "prompt_ms": 64.292,
+        "prompt_per_token_ms": 3.7818823529411767,
+        "prompt_per_second": 264.4185901822933,
+        "predicted_n": 17,
+        "predicted_ms": 141.305,
+        "predicted_per_token_ms": 8.8315625,
+        "predicted_per_second": 113.23024662963094
+      }
+    }
+  },
+  "running_capabilities": {
+    "grep": {
+      "executable_verified": true,
+      "parallel_tool_calls": true,
+      "startup_verified": true,
+      "structured_output": true,
+      "template_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+      "tool_calling": true
+    },
+    "non-norted": {
+      "executable_verified": true,
+      "parallel_tool_calls": true,
+      "startup_verified": true,
+      "structured_output": true,
+      "template_sha256": "1d35a24a2a63cc600c0cab43628a6df4cd3318e959b03307cf5f9f7e29ecf783",
+      "tool_calling": true
+    },
+    "package": {
+      "executable_verified": true,
+      "parallel_tool_calls": true,
+      "startup_verified": true,
+      "structured_output": true,
+      "template_sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+      "tool_calling": true
+    }
+  },
+  "gateway_requests": {
+    "standalone_grep": {
+      "tool_False": {
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call capability_probe with value ok."
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "capability_probe",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "value": {
+                      "const": "ok"
+                    }
+                  },
+                  "required": [
+                    "value"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          ],
+          "tool_choice": "required",
+          "parallel_tool_calls": false,
+          "max_tokens": 128,
+          "temperature": 0,
+          "model": "grep-stock",
+          "stream": false
+        },
+        "response": "{\"choices\":[{\"finish_reason\":\"tool_calls\",\"index\":0,\"logprobs\":null,\"message\":{\"content\":null,\"refusal\":null,\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"value\\\":\\\"ok\\\"}\",\"name\":\"capability_probe\"},\"id\":\"JskAasjQ0oxGJUmuVbTPclVbzohPbpM1\",\"type\":\"function\"}]}}],\"created\":1788999925,\"id\":\"chatcmpl_71485d4fd0ca45499bbbaa042c7ef254\",\"model\":\"grep-stock\",\"object\":\"chat.completion\",\"usage\":{\"completion_tokens\":26,\"prompt_tokens\":276,\"prompt_tokens_details\":{\"cached_tokens\":272},\"total_tokens\":302}}"
+      },
+      "tool_True": {
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call capability_probe with value ok."
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "capability_probe",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "value": {
+                      "const": "ok"
+                    }
+                  },
+                  "required": [
+                    "value"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          ],
+          "tool_choice": "required",
+          "parallel_tool_calls": false,
+          "max_tokens": 128,
+          "temperature": 0,
+          "model": "grep-stock",
+          "stream": true
+        },
+        "response": "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999925,\"id\":\"chatcmpl_08ba5ae98f3742258fece892e1126110\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\",\"name\":\"capability_probe\"},\"id\":\"CiINwB7ELPr4ujZUom3ZbW7crBPTnbZc\",\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999925,\"id\":\"chatcmpl_08ba5ae98f3742258fece892e1126110\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"value\\\":\\\"\"},\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999925,\"id\":\"chatcmpl_08ba5ae98f3742258fece892e1126110\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"ok\"},\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999925,\"id\":\"chatcmpl_08ba5ae98f3742258fece892e1126110\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"\"},\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999925,\"id\":\"chatcmpl_08ba5ae98f3742258fece892e1126110\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"}\"},\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999925,\"id\":\"chatcmpl_08ba5ae98f3742258fece892e1126110\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\",\"index\":0,\"logprobs\":null}],\"created\":1788999925,\"id\":\"chatcmpl_08ba5ae98f3742258fece892e1126110\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: [DONE]\n\n"
+      },
+      "schema_False": {
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Return a JSON object."
+            }
+          ],
+          "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+              "name": "capability_probe",
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "proof": {
+                    "const": "native_schema_probe"
+                  }
+                },
+                "required": [
+                  "proof"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "max_tokens": 64,
+          "temperature": 0,
+          "model": "grep-stock",
+          "stream": false
+        },
+        "response": "{\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"logprobs\":null,\"message\":{\"content\":\"{\\n  \\\"proof\\\": \\\"native_schema_probe\\\"\\n}\",\"refusal\":null,\"role\":\"assistant\"}}],\"created\":1788999926,\"id\":\"chatcmpl_18373812e7b5404c8c232bae7e259cf1\",\"model\":\"grep-stock\",\"object\":\"chat.completion\",\"usage\":{\"completion_tokens\":17,\"prompt_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":13},\"total_tokens\":34}}"
+      },
+      "schema_True": {
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Return a JSON object."
+            }
+          ],
+          "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+              "name": "capability_probe",
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "proof": {
+                    "const": "native_schema_probe"
+                  }
+                },
+                "required": [
+                  "proof"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "max_tokens": 64,
+          "temperature": 0,
+          "model": "grep-stock",
+          "stream": true
+        },
+        "response": "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"{\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\n\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" \"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" \\\"\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"proof\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\\":\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" \\\"\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"n\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ative\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"_\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"schema\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"_\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"probe\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\\"\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\n\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"}\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0,\"logprobs\":null}],\"created\":1788999926,\"id\":\"chatcmpl_de4f115672cd47fbb50a079afc603dfb\",\"model\":\"grep-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: [DONE]\n\n"
+      }
+    },
+    "non_norted_gemma": {
+      "tool_False": {
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call capability_probe with value ok."
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "capability_probe",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "value": {
+                      "const": "ok"
+                    }
+                  },
+                  "required": [
+                    "value"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          ],
+          "tool_choice": "required",
+          "parallel_tool_calls": false,
+          "max_tokens": 128,
+          "temperature": 0,
+          "model": "non-norted-stock",
+          "stream": false
+        },
+        "response": "{\"choices\":[{\"finish_reason\":\"tool_calls\",\"index\":0,\"logprobs\":null,\"message\":{\"content\":null,\"refusal\":null,\"role\":\"assistant\",\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"value\\\":\\\"ok\\\"}\",\"name\":\"capability_probe\"},\"id\":\"bL0McpOS1maxdrcfG2LUDEJuLgly88IC\",\"type\":\"function\"}]}}],\"created\":1789000004,\"id\":\"chatcmpl_1e765fede50d4b2dadc966c717f313b4\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion\",\"usage\":{\"completion_tokens\":15,\"prompt_tokens\":62,\"prompt_tokens_details\":{\"cached_tokens\":57},\"total_tokens\":77}}"
+      },
+      "tool_True": {
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call capability_probe with value ok."
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "capability_probe",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "value": {
+                      "const": "ok"
+                    }
+                  },
+                  "required": [
+                    "value"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          ],
+          "tool_choice": "required",
+          "parallel_tool_calls": false,
+          "max_tokens": 128,
+          "temperature": 0,
+          "model": "non-norted-stock",
+          "stream": true
+        },
+        "response": "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000004,\"id\":\"chatcmpl_ccf572c3713244ea802fac4807b27cec\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\",\"name\":\"capability_probe\"},\"id\":\"ex4qlmTZIhMUsnvG18CQwP3DeLnr50V6\",\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000004,\"id\":\"chatcmpl_ccf572c3713244ea802fac4807b27cec\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"value\"},\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000004,\"id\":\"chatcmpl_ccf572c3713244ea802fac4807b27cec\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\":\"},\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000004,\"id\":\"chatcmpl_ccf572c3713244ea802fac4807b27cec\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"\"},\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000004,\"id\":\"chatcmpl_ccf572c3713244ea802fac4807b27cec\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"ok\"},\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000004,\"id\":\"chatcmpl_ccf572c3713244ea802fac4807b27cec\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"\"},\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000004,\"id\":\"chatcmpl_ccf572c3713244ea802fac4807b27cec\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"}\"},\"index\":0,\"type\":\"function\"}]},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000004,\"id\":\"chatcmpl_ccf572c3713244ea802fac4807b27cec\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\",\"index\":0,\"logprobs\":null}],\"created\":1789000004,\"id\":\"chatcmpl_ccf572c3713244ea802fac4807b27cec\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: [DONE]\n\n"
+      },
+      "schema_False": {
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Return a JSON object."
+            }
+          ],
+          "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+              "name": "capability_probe",
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "proof": {
+                    "const": "native_schema_probe"
+                  }
+                },
+                "required": [
+                  "proof"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "max_tokens": 64,
+          "temperature": 0,
+          "model": "non-norted-stock",
+          "stream": false
+        },
+        "response": "{\"choices\":[{\"finish_reason\":\"stop\",\"index\":0,\"logprobs\":null,\"message\":{\"content\":\"{\\n  \\\"proof\\\": \\\"native_schema_probe\\\"\\n}\",\"refusal\":null,\"role\":\"assistant\"}}],\"created\":1789000005,\"id\":\"chatcmpl_975695bb7b334e33ba2e3e2faee1760d\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion\",\"usage\":{\"completion_tokens\":27,\"prompt_tokens\":18,\"prompt_tokens_details\":{\"cached_tokens\":13},\"total_tokens\":45}}"
+      },
+      "schema_True": {
+        "request": {
+          "messages": [
+            {
+              "role": "user",
+              "content": "Return a JSON object."
+            }
+          ],
+          "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+              "name": "capability_probe",
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "proof": {
+                    "const": "native_schema_probe"
+                  }
+                },
+                "required": [
+                  "proof"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "max_tokens": 64,
+          "temperature": 0,
+          "model": "non-norted-stock",
+          "stream": true
+        },
+        "response": "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"{\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\n\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"  \"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\\"\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"p\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"roof\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\\":\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\" \\\"\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"n\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ativ\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"e\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"_\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"s\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"chema\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"_\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"p\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"r\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"obe\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\\"\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\n\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"}\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0,\"logprobs\":null}],\"created\":1789000005,\"id\":\"chatcmpl_38b95d64779a49bab37db808e8f619b5\",\"model\":\"non-norted-stock\",\"object\":\"chat.completion.chunk\"}\n\ndata: [DONE]\n\n"
+      }
+    }
+  },
+  "history_and_retrieval_schema": {
+    "grep-stock": {
+      "named": {
+        "request": {
+          "model": "grep-stock",
+          "max_tokens": 256,
+          "temperature": 0,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call glob with pattern src/*.rs."
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "glob",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "pattern": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "grep",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "pattern": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          ],
+          "tool_choice": {
+            "type": "function",
+            "function": {
+              "name": "glob"
+            }
+          },
+          "parallel_tool_calls": false
+        },
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "tool_calls",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": null,
+                "refusal": null,
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"pattern\":\"src/*.rs\"}",
+                      "name": "glob"
+                    },
+                    "id": "kumPSS1fCIomJ7cZ7Jf1BSywZV8eu6em",
+                    "type": "function"
+                  }
+                ]
+              }
+            }
+          ],
+          "created": 1789000418,
+          "id": "chatcmpl_00fbfc37b2a748d8bb84ba0aa8bac597",
+          "model": "grep-stock",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 28,
+            "prompt_tokens": 276,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 304
+          }
+        }
+      },
+      "history": {
+        "request": {
+          "model": "grep-stock",
+          "max_tokens": 256,
+          "temperature": 0,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call glob with pattern src/*.rs."
+            },
+            {
+              "content": null,
+              "refusal": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"pattern\":\"src/*.rs\"}",
+                    "name": "glob"
+                  },
+                  "id": "kumPSS1fCIomJ7cZ7Jf1BSywZV8eu6em",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "tool_call_id": "kumPSS1fCIomJ7cZ7Jf1BSywZV8eu6em",
+              "content": "{\"files\":{\"src/lib.rs\":[[1,\"pub fn example() {}\"]]},\"truncated\":false}"
+            },
+            {
+              "role": "user",
+              "content": "Now call grep for example."
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "glob",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "pattern": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "grep",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "pattern": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          ],
+          "tool_choice": {
+            "type": "function",
+            "function": {
+              "name": "grep"
+            }
+          },
+          "parallel_tool_calls": false
+        },
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "tool_calls",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": null,
+                "refusal": null,
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"pattern\":\"example\"}",
+                      "name": "grep"
+                    },
+                    "id": "juVOVmfmnSyCivoNFsYAC76kwg2SJnbE",
+                    "type": "function"
+                  }
+                ]
+              }
+            }
+          ],
+          "created": 1789000418,
+          "id": "chatcmpl_ca20baa6d06d4c1e89bb3afc824bd4c7",
+          "model": "grep-stock",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 26,
+            "prompt_tokens": 351,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 377
+          }
+        }
+      },
+      "retrieval_finalization": {
+        "request": {
+          "model": "grep-stock",
+          "max_tokens": 256,
+          "temperature": 0,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call glob with pattern src/*.rs."
+            },
+            {
+              "content": null,
+              "refusal": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"pattern\":\"src/*.rs\"}",
+                    "name": "glob"
+                  },
+                  "id": "kumPSS1fCIomJ7cZ7Jf1BSywZV8eu6em",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "tool_call_id": "kumPSS1fCIomJ7cZ7Jf1BSywZV8eu6em",
+              "content": "{\"files\":{\"src/lib.rs\":[[1,\"pub fn example() {}\"]]},\"truncated\":false}"
+            },
+            {
+              "role": "user",
+              "content": "Return ranges for src/lib.rs line 1."
+            }
+          ],
+          "tools": [],
+          "tool_choice": "none",
+          "parallel_tool_calls": false,
+          "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+              "name": "retrieval_ranges",
+              "schema": {
+                "type": "object",
+                "required": [
+                  "ranges"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "ranges": {
+                    "type": "array",
+                    "maxItems": 4096,
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "path",
+                        "start_line",
+                        "end_line"
+                      ],
+                      "additionalProperties": false,
+                      "properties": {
+                        "path": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "start_line": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "end_line": {
+                          "type": "integer",
+                          "minimum": 1
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "strict": true
+            }
+          }
+        },
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": "{\"ranges\": [{\"end_line\": 1, \"path\": \"src/lib.rs\", \"start_line\": 1}]}",
+                "refusal": null,
+                "role": "assistant"
+              }
+            }
+          ],
+          "created": 1789000418,
+          "id": "chatcmpl_2480ebdb967e4edb899c7497b69d1c99",
+          "model": "grep-stock",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 27,
+            "prompt_tokens": 99,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 126
+          }
+        }
+      }
+    },
+    "non-norted-stock": {
+      "named": {
+        "request": {
+          "model": "non-norted-stock",
+          "max_tokens": 256,
+          "temperature": 0,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call glob with pattern src/*.rs."
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "glob",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "pattern": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "grep",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "pattern": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          ],
+          "tool_choice": {
+            "type": "function",
+            "function": {
+              "name": "glob"
+            }
+          },
+          "parallel_tool_calls": false
+        },
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "tool_calls",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": null,
+                "refusal": null,
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"pattern\":\"src/*.rs\"}",
+                      "name": "glob"
+                    },
+                    "id": "jDs10TiwCc60wsoJZfVkGpg2cIlxS7fo",
+                    "type": "function"
+                  }
+                ]
+              }
+            }
+          ],
+          "created": 1789000595,
+          "id": "chatcmpl_71c80df2db164a2295f27a645384c2cc",
+          "model": "non-norted-stock",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 15,
+            "prompt_tokens": 61,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 76
+          }
+        }
+      },
+      "history": {
+        "request": {
+          "model": "non-norted-stock",
+          "max_tokens": 256,
+          "temperature": 0,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call glob with pattern src/*.rs."
+            },
+            {
+              "content": null,
+              "refusal": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"pattern\":\"src/*.rs\"}",
+                    "name": "glob"
+                  },
+                  "id": "jDs10TiwCc60wsoJZfVkGpg2cIlxS7fo",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "tool_call_id": "jDs10TiwCc60wsoJZfVkGpg2cIlxS7fo",
+              "content": "{\"files\":{\"src/lib.rs\":[[1,\"pub fn example() {}\"]]},\"truncated\":false}"
+            },
+            {
+              "role": "user",
+              "content": "Now call grep for example."
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "glob",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "pattern": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "grep",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "pattern": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          ],
+          "tool_choice": {
+            "type": "function",
+            "function": {
+              "name": "grep"
+            }
+          },
+          "parallel_tool_calls": false
+        },
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "tool_calls",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": null,
+                "refusal": null,
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"pattern\":\"example\"}",
+                      "name": "grep"
+                    },
+                    "id": "yhBCZ1xCI3CHk0V0ngMocZY9uiJViHMQ",
+                    "type": "function"
+                  }
+                ]
+              }
+            }
+          ],
+          "created": 1789000595,
+          "id": "chatcmpl_1985a8787e51447ea5042a709d4c422b",
+          "model": "non-norted-stock",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 13,
+            "prompt_tokens": 124,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 137
+          }
+        }
+      },
+      "retrieval_finalization": {
+        "request": {
+          "model": "non-norted-stock",
+          "max_tokens": 256,
+          "temperature": 0,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call glob with pattern src/*.rs."
+            },
+            {
+              "content": null,
+              "refusal": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"pattern\":\"src/*.rs\"}",
+                    "name": "glob"
+                  },
+                  "id": "jDs10TiwCc60wsoJZfVkGpg2cIlxS7fo",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "tool_call_id": "jDs10TiwCc60wsoJZfVkGpg2cIlxS7fo",
+              "content": "{\"files\":{\"src/lib.rs\":[[1,\"pub fn example() {}\"]]},\"truncated\":false}"
+            },
+            {
+              "role": "user",
+              "content": "Return ranges for src/lib.rs line 1."
+            }
+          ],
+          "tools": [],
+          "tool_choice": "none",
+          "parallel_tool_calls": false,
+          "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+              "name": "retrieval_ranges",
+              "schema": {
+                "type": "object",
+                "required": [
+                  "ranges"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "ranges": {
+                    "type": "array",
+                    "maxItems": 4096,
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "path",
+                        "start_line",
+                        "end_line"
+                      ],
+                      "additionalProperties": false,
+                      "properties": {
+                        "path": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "start_line": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "end_line": {
+                          "type": "integer",
+                          "minimum": 1
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "strict": true
+            }
+          }
+        },
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": "{\n  \"ranges\": [\n    {\n      \"end_line\": 1,\n      \"path\": \"src/lib.rs\",\n      \"start_line\": 1\n    }\n  ]\n}",
+                "refusal": null,
+                "role": "assistant"
+              }
+            }
+          ],
+          "created": 1789000596,
+          "id": "chatcmpl_aa04bbe146dc499fbadda48097233075",
+          "model": "non-norted-stock",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 58,
+            "prompt_tokens": 90,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 148
+          }
+        }
+      }
+    },
+    "grep-package": {
+      "named": {
+        "request": {
+          "model": "grep-package",
+          "max_tokens": 256,
+          "temperature": 0,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call glob with pattern src/*.rs."
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "glob",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "pattern": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "grep",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "pattern": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          ],
+          "tool_choice": {
+            "type": "function",
+            "function": {
+              "name": "glob"
+            }
+          },
+          "parallel_tool_calls": false
+        },
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "tool_calls",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": null,
+                "refusal": null,
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"pattern\":\"src/*.rs\"}",
+                      "name": "glob"
+                    },
+                    "id": "IQIGsDRw39fWZIsn3CZcBTRQfjINxMT9",
+                    "type": "function"
+                  }
+                ]
+              }
+            }
+          ],
+          "created": 1789000425,
+          "id": "chatcmpl_57a1cb2ed21c470a9869f19b17de7d06",
+          "model": "grep-package",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 28,
+            "prompt_tokens": 276,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 304
+          }
+        }
+      },
+      "history": {
+        "request": {
+          "model": "grep-package",
+          "max_tokens": 256,
+          "temperature": 0,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call glob with pattern src/*.rs."
+            },
+            {
+              "content": null,
+              "refusal": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"pattern\":\"src/*.rs\"}",
+                    "name": "glob"
+                  },
+                  "id": "IQIGsDRw39fWZIsn3CZcBTRQfjINxMT9",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "tool_call_id": "IQIGsDRw39fWZIsn3CZcBTRQfjINxMT9",
+              "content": "{\"files\":{\"src/lib.rs\":[[1,\"pub fn example() {}\"]]},\"truncated\":false}"
+            },
+            {
+              "role": "user",
+              "content": "Now call grep for example."
+            }
+          ],
+          "tools": [
+            {
+              "type": "function",
+              "function": {
+                "name": "glob",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "pattern": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            {
+              "type": "function",
+              "function": {
+                "name": "grep",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "pattern": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "pattern"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          ],
+          "tool_choice": {
+            "type": "function",
+            "function": {
+              "name": "grep"
+            }
+          },
+          "parallel_tool_calls": false
+        },
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "tool_calls",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": null,
+                "refusal": null,
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"pattern\":\"example\"}",
+                      "name": "grep"
+                    },
+                    "id": "qAanZHGA9nT1OCcPGCfnPuLpgRLxlzwZ",
+                    "type": "function"
+                  }
+                ]
+              }
+            }
+          ],
+          "created": 1789000425,
+          "id": "chatcmpl_429281daf759429faef2553aaca4339d",
+          "model": "grep-package",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 26,
+            "prompt_tokens": 351,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 377
+          }
+        }
+      },
+      "retrieval_finalization": {
+        "request": {
+          "model": "grep-package",
+          "max_tokens": 256,
+          "temperature": 0,
+          "messages": [
+            {
+              "role": "user",
+              "content": "Call glob with pattern src/*.rs."
+            },
+            {
+              "content": null,
+              "refusal": null,
+              "role": "assistant",
+              "tool_calls": [
+                {
+                  "function": {
+                    "arguments": "{\"pattern\":\"src/*.rs\"}",
+                    "name": "glob"
+                  },
+                  "id": "IQIGsDRw39fWZIsn3CZcBTRQfjINxMT9",
+                  "type": "function"
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "tool_call_id": "IQIGsDRw39fWZIsn3CZcBTRQfjINxMT9",
+              "content": "{\"files\":{\"src/lib.rs\":[[1,\"pub fn example() {}\"]]},\"truncated\":false}"
+            },
+            {
+              "role": "user",
+              "content": "Return ranges for src/lib.rs line 1."
+            }
+          ],
+          "tools": [],
+          "tool_choice": "none",
+          "parallel_tool_calls": false,
+          "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+              "name": "retrieval_ranges",
+              "schema": {
+                "type": "object",
+                "required": [
+                  "ranges"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "ranges": {
+                    "type": "array",
+                    "maxItems": 4096,
+                    "items": {
+                      "type": "object",
+                      "required": [
+                        "path",
+                        "start_line",
+                        "end_line"
+                      ],
+                      "additionalProperties": false,
+                      "properties": {
+                        "path": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "start_line": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "end_line": {
+                          "type": "integer",
+                          "minimum": 1
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "strict": true
+            }
+          }
+        },
+        "response": {
+          "choices": [
+            {
+              "finish_reason": "stop",
+              "index": 0,
+              "logprobs": null,
+              "message": {
+                "content": "{\"ranges\": [{\"end_line\": 1, \"path\": \"src/lib.rs\", \"start_line\": 1}]}",
+                "refusal": null,
+                "role": "assistant"
+              }
+            }
+          ],
+          "created": 1789000425,
+          "id": "chatcmpl_219060abc4af41f49847fa69082aad72",
+          "model": "grep-package",
+          "object": "chat.completion",
+          "usage": {
+            "completion_tokens": 27,
+            "prompt_tokens": 99,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            },
+            "total_tokens": 126
+          }
+        }
+      }
+    }
+  },
+  "runtime_catalog": {
+    "provider_errors": [],
+    "streams": [
+      {
+        "identity": {
+          "engine_id": "llama.cpp",
+          "package_family": "llama-cpp-official-release",
+          "version": "b10883",
+          "upstream_revision": "91f6a6cf361385700bbe15981f0f39909df77498",
+          "platform": "linux",
+          "architecture": "x86_64",
+          "accelerator": "cpu",
+          "variant": "default",
+          "package": {
+            "provider_id": "llama-cpp-official-github",
+            "repository": "ggml-org/llama.cpp",
+            "release_tag": "b10883",
+            "asset_id": "553242589",
+            "asset_name": "llama-b10883-bin-ubuntu-x64.tar.gz",
+            "additional_assets": []
+          }
+        },
+        "channels": [
+          "latest",
+          "prerelease"
+        ],
+        "acquisition_method": "release_asset"
+      },
+      {
+        "identity": {
+          "engine_id": "llama.cpp",
+          "package_family": "llama-cpp-managed-source",
+          "version": "b10883",
+          "upstream_revision": "91f6a6cf361385700bbe15981f0f39909df77498",
+          "platform": "linux",
+          "architecture": "x86_64",
+          "accelerator": "cuda",
+          "variant": "managed-portable-cuda13-v2",
+          "package": {
+            "provider_id": "llama-cpp-managed-source-github",
+            "repository": "ggml-org/llama.cpp",
+            "release_tag": "b10883",
+            "asset_id": null,
+            "asset_name": null,
+            "additional_assets": []
+          }
+        },
+        "channels": [
+          "latest",
+          "prerelease"
+        ],
+        "acquisition_method": "source_build"
+      },
+      {
+        "identity": {
+          "engine_id": "llama.cpp",
+          "package_family": "llama-cpp-managed-source",
+          "version": "b10883",
+          "upstream_revision": "91f6a6cf361385700bbe15981f0f39909df77498",
+          "platform": "linux",
+          "architecture": "x86_64",
+          "accelerator": "cuda",
+          "variant": "managed-portable-v4",
+          "package": {
+            "provider_id": "llama-cpp-managed-source-github",
+            "repository": "ggml-org/llama.cpp",
+            "release_tag": "b10883",
+            "asset_id": null,
+            "asset_name": null,
+            "additional_assets": []
+          }
+        },
+        "channels": [
+          "latest",
+          "prerelease"
+        ],
+        "acquisition_method": "source_build"
+      },
+      {
+        "identity": {
+          "engine_id": "ninfer",
+          "package_family": "ninfer-source",
+          "version": "git-20260908-b88c0f6f",
+          "upstream_revision": "b88c0f6fc7e999f13eb2fcf7fc9105ed79a91868",
+          "platform": "linux",
+          "architecture": "x86_64",
+          "accelerator": "cuda",
+          "variant": "ninfer-serve-v2-sm120a",
+          "package": {
+            "provider_id": "ninfer-official-source",
+            "repository": "Neroued/ninfer",
+            "release_tag": null,
+            "asset_id": null,
+            "asset_name": null,
+            "additional_assets": []
+          }
+        },
+        "channels": [
+          "latest"
+        ],
+        "acquisition_method": "source_build"
+      },
+      {
+        "identity": {
+          "engine_id": "llama.cpp",
+          "package_family": "llama-cpp-official-release",
+          "version": "b10883",
+          "upstream_revision": "91f6a6cf361385700bbe15981f0f39909df77498",
+          "platform": "linux",
+          "architecture": "aarch64",
+          "accelerator": "cpu",
+          "variant": "default",
+          "package": {
+            "provider_id": "llama-cpp-official-github",
+            "repository": "ggml-org/llama.cpp",
+            "release_tag": "b10883",
+            "asset_id": "553241655",
+            "asset_name": "llama-b10883-bin-ubuntu-arm64.tar.gz",
+            "additional_assets": []
+          }
+        },
+        "channels": [
+          "latest",
+          "prerelease"
+        ],
+        "acquisition_method": "release_asset"
+      },
+      {
+        "identity": {
+          "engine_id": "llama.cpp",
+          "package_family": "llama-cpp-official-release",
+          "version": "b10883",
+          "upstream_revision": "91f6a6cf361385700bbe15981f0f39909df77498",
+          "platform": "linux",
+          "architecture": "s390x",
+          "accelerator": "cpu",
+          "variant": "default",
+          "package": {
+            "provider_id": "llama-cpp-official-github",
+            "repository": "ggml-org/llama.cpp",
+            "release_tag": "b10883",
+            "asset_id": "553242157",
+            "asset_name": "llama-b10883-bin-ubuntu-s390x.tar.gz",
+            "additional_assets": []
+          }
+        },
+        "channels": [
+          "latest",
+          "prerelease"
+        ],
+        "acquisition_method": "release_asset"
+      }
+    ]
+  },
+  "retrieval_protocol_changed": false,
+  "retrieval_score_rerun": false,
+  "norted_correction_commit": "afb2f09a430ce9c1aa9beb52611862160ba95818",
+  "validation": {
+    "cargo_fmt_all_check": "passed",
+    "cargo_check_workspace": "passed",
+    "cargo_clippy_workspace_all_targets_all_features_deny_warnings": "passed",
+    "cargo_test_workspace": {
+      "passed": 214,
+      "ignored": 1,
+      "failed": 0
+    },
+    "norted_unittest": {
+      "passed": 91,
+      "failed": 0
+    },
+    "norted_compileall": "passed",
+    "git_diff_check_both_repositories": "passed",
+    "norted_deep_offline_student_gguf_verification": {
+      "exit_code": 0,
+      "student_sizes": [
+        "4b",
+        "9b"
+      ],
+      "quantizations": [
+        "Q6_K",
+        "Q4_K_M"
+      ],
+      "immutable_artifacts_unchanged": true
+    }
+  }
+}

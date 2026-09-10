@@ -1354,7 +1354,19 @@ pub fn local_norted_package_manifest(root: &Path, format: ArtifactFormat) -> Pat
 }
 
 fn plan_deployment(value: &serde_json::Value) -> Result<NortedPackageAcquisitionPlan, String> {
-    crate::model::validate_deployment_seal(value, "artifact_id")?;
+    validate_deployment_seal(value, "artifact_id")?;
+    let conversion = value
+        .get("conversion")
+        .ok_or("missing conversion lineage")?;
+    validate_deployment_seal(conversion, "conversion_id")?;
+    let parent = value
+        .pointer("/parent/artifact_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing parent lineage")?;
+    validate_sha(parent, "deployment parent")?;
+    if conversion.pointer("/recipe/parent") != value.get("parent") {
+        return Err("deployment conversion parent mismatch".to_owned());
+    }
     let targets = value
         .get("targets")
         .and_then(serde_json::Value::as_object)
@@ -1367,7 +1379,12 @@ fn plan_deployment(value: &serde_json::Value) -> Result<NortedPackageAcquisition
         sha256: None,
     }];
     for (key, target) in targets {
-        crate::model::validate_deployment_seal(target, "target_id")?;
+        validate_deployment_seal(target, "target_id")?;
+        if target.pointer("/recipe/conversion_id") != conversion.get("conversion_id")
+            || target.pointer("/recipe/high_precision") != conversion.get("output")
+        {
+            return Err("deployment target conversion lineage mismatch".to_owned());
+        }
         let filename = target
             .get("filename")
             .and_then(serde_json::Value::as_str)
@@ -1418,9 +1435,7 @@ fn discover_deployment(
             file.sha256.as_deref().ok_or("missing payload hash")?,
             false,
         )?;
-        // This verifies payload hash/size, seals and source lineage before any
-        // serving.required_stop_token_ids can be attributed to this payload.
-        crate::ModelGenerationContract::inspect(&primary.path, None)?;
+        // Package metadata supplies integrity and lineage only.
         let binding = NortedPackageBinding {
             kind: NortedPackageKind::Gguf,
             manifest_schema: plan.manifest_schema.clone(),
@@ -1463,4 +1478,70 @@ fn discover_deployment(
         members,
         suppressed: HashSet::new(),
     })
+}
+
+pub(crate) fn validate_deployment_seal(value: &serde_json::Value, key: &str) -> Result<(), String> {
+    let mut unsigned = value.clone();
+    let object = unsigned
+        .as_object_mut()
+        .ok_or("deployment record must be an object")?;
+    let claimed = object.remove(key).ok_or_else(|| format!("missing {key}"))?;
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(deployment_canonical_json(&unsigned)?)
+    );
+    if claimed.as_str() != Some(digest.as_str()) {
+        return Err(format!("deployment {key} seal mismatch"));
+    }
+    Ok(())
+}
+
+// Norted deployment seals use Python JSON canonicalization: UTF-8 strings,
+// sorted keys, compact separators and shortest round-trip floats with signed,
+// two-digit exponents. Ordinary serde_json exponent spelling differs.
+fn deployment_canonical_json(value: &serde_json::Value) -> Result<Vec<u8>, String> {
+    fn render(value: &serde_json::Value) -> Result<String, String> {
+        use serde_json::Value;
+        Ok(match value {
+            Value::Array(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(render)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(",")
+            ),
+            Value::Object(values) => {
+                let mut entries = values.iter().collect::<Vec<_>>();
+                entries.sort_by_key(|(key, _)| *key);
+                format!(
+                    "{{{}}}",
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| Ok(format!(
+                            "{}:{}",
+                            serde_json::to_string(key).map_err(|e| e.to_string())?,
+                            render(value)?
+                        )))
+                        .collect::<Result<Vec<_>, String>>()?
+                        .join(",")
+                )
+            }
+            Value::Number(n) if n.is_f64() => {
+                let text = format!("{:?}", n.as_f64().ok_or("invalid canonical float")?);
+                if let Some((mantissa, exponent)) = text.split_once('e') {
+                    let exponent: i32 = exponent.parse().map_err(|_| "invalid float exponent")?;
+                    format!(
+                        "{mantissa}e{}{abs:02}",
+                        if exponent < 0 { "-" } else { "+" },
+                        abs = exponent.unsigned_abs()
+                    )
+                } else {
+                    text
+                }
+            }
+            _ => serde_json::to_string(value).map_err(|e| e.to_string())?,
+        })
+    }
+    render(value).map(String::into_bytes)
 }

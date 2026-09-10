@@ -28,10 +28,9 @@ pub use event::{AppEvent, LogLevel};
 pub use model::{
     ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifact, AuxiliaryArtifactRole,
     GgufArtifactIdentity, GgufMetadataError, MODEL_LIBRARY_RECEIPT_FILENAME, ModelArtifact,
-    ModelArtifactProvenance, ModelGenerationContract, ModelId, ModelLibraryReceipt,
-    ModelLibraryReceiptMember, ModelRegistry, NinferArtifactIdentity, NinferContainerError,
-    NinferContainerMetadata, hugging_face_eos_token_ids, inspect_gguf_metadata,
-    inspect_ninfer_container, model_library_receipt_path, parse_terminal_token_ids,
+    ModelArtifactProvenance, ModelId, ModelLibraryReceipt, ModelLibraryReceiptMember,
+    ModelRegistry, NinferArtifactIdentity, NinferContainerError, NinferContainerMetadata,
+    inspect_gguf_metadata, inspect_ninfer_container, model_library_receipt_path,
     q27_tokenizer_candidate, select_q27_tokenizer_filename, validate_q27_tokenizer_header,
 };
 pub use model_profile::{
