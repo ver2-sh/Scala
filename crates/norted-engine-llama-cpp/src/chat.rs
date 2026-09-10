@@ -533,7 +533,7 @@ impl LlamaCppAdapter {
             .filter(|p| p.executable_verified && p.ready && p.tools)
             .ok_or_else(|| {
                 EngineError::Unsupported(
-                    "exact llama.cpp runtime/template/Jinja tuple has not proved tool calling"
+                    "llama.cpp runtime/model/template configuration has not proved tool calling"
                         .into(),
                 )
             })?;
