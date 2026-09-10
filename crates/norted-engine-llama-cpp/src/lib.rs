@@ -172,7 +172,7 @@ const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "-h",
     "--help",
     "--usage",
-    // Log transport is operational, not an inference setting.
+    // Preserve textual stderr used by startup progress and diagnostic parsing.
     "--log-jsonl",
     "--no-log-jsonl",
     "--version",
@@ -1254,18 +1254,7 @@ impl EngineAdapter for LlamaCppAdapter {
             )));
         }
         let help = self.cached_runtime_help(runtime).await?;
-        if let Some(option) = unclassified_llama_help_option(&help) {
-            return Err(EngineError::InvalidConfiguration(format!(
-                "exact llama-server advertises unclassified option `{option}`; this runtime requires an updated Norted adapter audit"
-            )));
-        }
-        for required in ["--model", "--alias", "--host", "--port"] {
-            if !help.contains(required) {
-                return Err(EngineError::InvalidConfiguration(format!(
-                    "runtime entrypoint does not advertise required llama-server flag `{required}`"
-                )));
-            }
-        }
+        validate_llama_launch_help(&help)?;
         let entrypoint_sha256 = hash_file(&binary_path).await.map_err(|error| {
             EngineError::Operation(format!("could not hash entrypoint: {error}"))
         })?;
@@ -4685,32 +4674,17 @@ fn help_has_option(help: &str, option: &str) -> bool {
         .any(|line| help_line_has_option_header(line, option))
 }
 
-fn unclassified_llama_help_option(help: &str) -> Option<String> {
-    let classified = MANAGED_NATIVE_ARGUMENTS
-        .iter()
-        .copied()
-        .chain(structured_llama_argument_aliases())
-        .map(|option| option.to_ascii_lowercase().replace('_', "-"))
-        .collect::<BTreeSet<_>>();
-    help.lines()
-        .filter(|line| {
-            line.starts_with("--")
-                || line
-                    .as_bytes()
-                    .get(1)
-                    .is_some_and(|byte| !byte.is_ascii_whitespace())
-        })
-        .flat_map(|line| {
-            line.split_ascii_whitespace()
-                .take_while(|token| token.starts_with('-'))
-                .map(|token| token.trim_end_matches(',').to_owned())
-                .filter(|token| token.bytes().any(|byte| byte.is_ascii_alphanumeric()))
-                .collect::<Vec<_>>()
-        })
-        .find(|option| {
-            let normalized = option.to_ascii_lowercase().replace('_', "-");
-            !classified.contains(&normalized)
-        })
+// Extra upstream controls are deliberately ignored; only owned launch controls
+// are required here. Configured settings have their own help contracts.
+fn validate_llama_launch_help(help: &str) -> Result<(), EngineError> {
+    for required in ["--model", "--alias", "--host", "--port"] {
+        if !help_has_option(help, required) {
+            return Err(EngineError::InvalidConfiguration(format!(
+                "runtime entrypoint does not advertise required llama-server flag `{required}`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn help_line_has_option_header(line: &str, option: &str) -> bool {
@@ -6741,9 +6715,26 @@ mod settings_tests {
         assert!(!conflicts_with_managed_environment(
             "ORDINARY_APPLICATION_VALUE"
         ));
+        let help = "--model FILE\n--alias NAME\n--host HOST\n--port PORT\n";
+        validate_llama_launch_help(help).expect("required launch controls");
+        let extended_help = format!("{help}--brand-new-control VALUE\n");
+        validate_llama_launch_help(&extended_help).expect("unknown controls are ignored");
+        for required in ["--model", "--alias", "--host", "--port"] {
+            let missing = extended_help.replace(required, &format!("{required}-unrelated"));
+            assert!(validate_llama_launch_help(&missing).is_err(), "{required}");
+        }
+        let mut definitions = llama_model_setting_definitions(None);
+        let known_ids = definitions
+            .iter()
+            .map(|definition| definition.id.clone())
+            .collect::<Vec<_>>();
+        apply_llama_exact_help_contract(&mut definitions, &extended_help);
         assert_eq!(
-            unclassified_llama_help_option("--model FILE\n--brand-new-control VALUE\n"),
-            Some("--brand-new-control".to_owned())
+            definitions
+                .iter()
+                .map(|definition| definition.id.clone())
+                .collect::<Vec<_>>(),
+            known_ids
         );
 
         let raw: EngineConfig = serde_json::from_value(json!({

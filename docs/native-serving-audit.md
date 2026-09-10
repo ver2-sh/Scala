@@ -112,8 +112,8 @@ features rather than the mere presence of a configurable setting. Configuration
 views remain distinct from running observations.
 
 The current upstream `--log-jsonl` / `--no-log-jsonl` options were classified as
-operational controls; their environment alias is isolated. This lets current
-stock runtime admission work without changing inference settings.
+operational controls; their environment alias is isolated to preserve textual
+stderr for startup progress and diagnostics. They are not admission requirements.
 
 Live catalog refresh returned no provider errors: ordinary official and managed
 llama.cpp candidates follow b10883 (`91f6a6cf361385700bbe15981f0f39909df77498`),
@@ -151,3 +151,55 @@ bounded (30 seconds per generation probe); an engine/template that cannot prove
 support within those bounds remains unadvertised. These observations establish
 technical serving support, not Retrieval quality, complete support for every
 possible JSON Schema keyword, or a new scientific evaluation score.
+
+## Forward-compatible help admission follow-up — 2026-09-10
+
+Starting branch `fix/native-runtime-serving`, head
+`e0510c92aec34317f9c2914ca66b42d90349eee7`.
+
+Removed the fatal `unclassified_llama_help_option` gate and its exhaustive
+classification helper. Unknown upstream options are ignored, never added to
+setting definitions or forwarded as native arguments. Required `--model`,
+`--alias`, `--host`, and `--port` controls still gate admission, now using the
+existing option-header boundary matcher rather than substring matching.
+Configured settings still require their individual advertised controls and
+semantics; unsupported features remain unadvertised without live proof.
+
+Updated the existing ownership test, without adding tests, to exercise normal
+help, the same help plus `--brand-new-control VALUE`, missing required flags
+(including misleading longer option names), unchanged setting IDs, and rejection
+of arbitrary native arguments. Existing setting-contract tests retain rejection
+of configured temperature when `--temp` is absent. Argument/environment guards,
+identity/hash checks, model compatibility and managed source provenance remain.
+
+Reviewed `MANAGED_NATIVE_ARGUMENTS`: no entries removed. The entries still guard
+operational controls and collisions; the list no longer classifies runtime help.
+In particular, stock `--log-jsonl` moves logging to JSONL on stdout, affecting the
+adapter's stderr progress/diagnostic consumer. Its guards and environment
+isolation remain for that operational reason, with the comment clarified.
+Removed stale “exact runtime/template/Jinja tuple” capability rejection wording.
+
+Validation: all four requested cargo commands passed; workspace tests report
+214 passed, zero failed, one pre-existing ignored. Test/build logs include
+incremental-cache cleanup warnings; the requested clippy run with `-D warnings`
+passed. Logs: `/tmp/norted-admission-{check,clippy,test,build}.log`.
+
+The rebuilt server loaded standalone Grep with clean, unpatched stock llama.cpp
+`434ddbbc0e30522e897670681e503b797c12b7c1` (the branch's existing current-stock
+build). The existing bounded history probe passed named tool choice, assistant
+call/tool-result history, and constrained JSON finalization. Load evidence:
+`/tmp/norted-admission-grep-load.json`; request/response evidence:
+`/srv/norted/scratch/native-portability/grep-stock-history.json`.
+
+Managed source discovery still scans moving upstream nightly releases. No
+source-discovery, patches, runtime variants, stop-token-ID abstractions,
+producer-specific serving paths, Retrieval protocol/tasks/scoring, or Norted
+files changed. No Retrieval score rerun. No push or merge.
+
+The same rebuilt adapter and stock executable also loaded non-Norted Gemma and
+passed the same named-tool/history/StructuredOutput probes. Evidence:
+`/tmp/norted-admission-gemma-load.json` and
+`/srv/norted/scratch/native-portability/non-norted-stock-history.json`.
+ToolCalling and StructuredOutput qualification remains runtime/model/template
+behavior-based, independent of producer or package provenance. No remaining
+Blocking or Material finding was identified in this scoped follow-up.
