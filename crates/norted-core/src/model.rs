@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -96,6 +96,9 @@ pub struct NinferArtifactIdentity {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct NinferContainerMetadata {
     pub identity: NinferArtifactIdentity,
+    /// Complete native optional suffix, established only from the object directory.
+    pub dflash2: bool,
+    pub(crate) resources: Vec<(String, u64, u64)>,
     pub metadata_bytes_read: u64,
 }
 
@@ -771,8 +774,23 @@ fn inspect_ninfer_reader(
     let value: serde_json::Value = serde_json::from_slice(&directory)
         .map_err(|error| NinferContainerError::InvalidDirectory(error.to_string()))?;
     let identity = validate_ninfer_directory(&value, file_bytes - payload_offset)?;
+    let dflash2 = validate_dflash2_inventory(&value)?;
     Ok(NinferContainerMetadata {
         identity,
+        dflash2,
+        resources: value["objects"]
+            .as_array()
+            .expect("validated directory")
+            .iter()
+            .filter(|o| o["kind"] == "resource")
+            .map(|o| {
+                (
+                    o["name"].as_str().unwrap().to_owned(),
+                    payload_offset + o["offset"].as_u64().unwrap(),
+                    o["bytes"].as_u64().unwrap(),
+                )
+            })
+            .collect(),
         metadata_bytes_read: NINFER_PREFIX_BYTES + json_bytes,
     })
 }
@@ -876,6 +894,124 @@ fn validate_ninfer_directory(
         model_id,
         weights_id,
     })
+}
+
+pub(crate) fn ninfer_frontend_hashes(
+    path: &Path,
+    metadata: &NinferContainerMetadata,
+) -> Result<std::collections::BTreeMap<String, (u64, String)>, NinferContainerError> {
+    let mut file = std::fs::File::open(path)?;
+    let mut result = std::collections::BTreeMap::new();
+    let total: u64 = metadata.resources.iter().map(|(_, _, bytes)| *bytes).sum();
+    if total > 64 * 1024 * 1024 {
+        return Err(invalid_ninfer_directory(
+            "frontend resources exceed inspection bound",
+        ));
+    }
+    for (name, offset, bytes) in &metadata.resources {
+        file.seek(SeekFrom::Start(*offset))?;
+        let mut hash = Sha256::new();
+        let mut remaining = *bytes;
+        let mut buffer = [0u8; 65536];
+        while remaining > 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            file.read_exact(&mut buffer[..count])?;
+            hash.update(&buffer[..count]);
+            remaining -= count as u64;
+        }
+        result.insert(name.clone(), (*bytes, format!("{:x}", hash.finalize())));
+    }
+    Ok(result)
+}
+
+fn validate_dflash2_inventory(value: &serde_json::Value) -> Result<bool, NinferContainerError> {
+    let objects = value["objects"].as_array().expect("validated directory");
+    let actual: Vec<_> = objects
+        .iter()
+        .filter(|o| {
+            o["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("dflash2/"))
+        })
+        .collect();
+    if actual.is_empty() {
+        return Ok(false);
+    }
+    if !matches!(
+        value["identity"]["model_id"].as_str(),
+        Some("qwen3.6-27b" | "qwen3.8-27b")
+    ) || !matches!(
+        value["identity"]["weights_id"].as_str(),
+        Some("groupwise-int" | "nvfp4")
+    ) {
+        return Err(invalid_ninfer_directory(
+            "DFlash2 is not registered for this native target",
+        ));
+    }
+    // Mirrors the reviewed native dflash2_inventory.py, including layout and
+    // encoded size. No producer, filename, or sidecar can grant this capability.
+    let mut expected: Vec<(String, Vec<u64>, bool)> = vec![
+        ("dflash2/feature_projection".into(), vec![5120, 25600], true),
+        ("dflash2/context_norm".into(), vec![5120], false),
+    ];
+    for layer in 0..5 {
+        for (name, shape, w8) in [
+            ("input_norm", vec![5120], false),
+            ("attention_conv/base_kernel", vec![2, 2, 5120], false),
+            ("attention_conv/kernel_projection", vec![1280, 5120], false),
+            ("attention/query_key_value", vec![6144, 5120], true),
+            ("attention/query_norm", vec![128], false),
+            ("attention/key_norm", vec![128], false),
+            ("attention/output", vec![5120, 4096], true),
+            ("post_attention_norm", vec![5120], false),
+            ("mlp_conv/base_kernel", vec![2, 2, 5120], false),
+            ("mlp_conv/kernel_projection", vec![1280, 5120], false),
+            ("mlp/gate_up", vec![34816, 5120], true),
+            ("mlp/down", vec![5120, 17408], true),
+        ] {
+            expected.push((format!("dflash2/layers/{layer}/{name}"), shape, w8));
+        }
+    }
+    for (name, shape) in [
+        ("final_norm", vec![5120]),
+        ("candidate_selector/hidden_projection", vec![256, 5120]),
+        ("candidate_selector/predecessor_codebook", vec![248320, 256]),
+        ("candidate_selector/successor_codebook", vec![248320, 256]),
+    ] {
+        expected.push((format!("dflash2/{name}"), shape, false));
+    }
+    if actual.len() != expected.len() {
+        return Err(invalid_ninfer_directory(
+            "incomplete/conflicting native DFlash2 inventory",
+        ));
+    }
+    for (name, shape, w8) in expected {
+        let object = actual.iter().find(|o| o["name"] == name).ok_or_else(|| {
+            invalid_ninfer_directory(format!("missing native DFlash2 tensor {name}"))
+        })?;
+        let elements: u64 = shape.iter().product();
+        let size = if w8 { elements / 32 * 34 } else { elements * 2 };
+        if object["kind"] != "tensor"
+            || object["name"] != name
+            || object["shape"] != serde_json::json!(shape)
+            || object["format"] != if w8 { "W8G32_F16S" } else { "BF16" }
+            || object["layout"]
+                != if w8 {
+                    "row-split-k128-v1"
+                } else {
+                    "contiguous-le-v1"
+                }
+            || object["bytes"].as_u64() != Some(size)
+            || object["offset"]
+                .as_u64()
+                .is_none_or(|offset| offset % 256 != 0)
+        {
+            return Err(invalid_ninfer_directory(format!(
+                "malformed native DFlash2 tensor {name}"
+            )));
+        }
+    }
+    Ok(true)
 }
 
 fn require_exact_keys(
@@ -1536,7 +1672,7 @@ mod tests {
         });
         let temporary = tempfile::tempdir().expect("temporary NInfer fixture directory");
         let path = temporary.path().join("misleading-filename.ninfer");
-        write_ninfer_fixture(&path, &directory, 4 * 1024 * 1024 * 1024);
+        write_ninfer_fixture(&path, &directory, 16384);
 
         let metadata = inspect_ninfer_container(&path).expect("valid NInfer metadata");
         assert_eq!(metadata.identity.container_version, 2);
@@ -1552,6 +1688,103 @@ mod tests {
                 if identity.model_id == "native/model-from-container"
                     && identity.weights_id == "native-weights"
         ));
+        // A current one-target package binds embedded resources, never Sharp.
+        let mut package_directory = directory.clone();
+        package_directory["identity"] =
+            serde_json::json!({"model_id":"qwen3.8-27b","weights_id":"nvfp4"});
+        let resources = [
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "generation_config.json",
+            "preprocessor_config.json",
+            "video_preprocessor_config.json",
+        ];
+        package_directory["objects"] = serde_json::json!(resources.iter().enumerate().map(|(i,name)| serde_json::json!({"name":format!("frontend/{name}"),"kind":"resource","encoding":"raw-bytes-v1","offset":i*256,"bytes":1})).collect::<Vec<_>>());
+        std::fs::remove_file(&path).expect("replace initial admission fixture");
+        write_ninfer_fixture(&path, &package_directory, 16384);
+        let package_size = std::fs::metadata(&path).unwrap().len();
+        let mut source = serde_json::json!({"master_id":"synthetic"});
+        let source_key = format!("{:x}", Sha256::digest(serde_json::to_vec(&source).unwrap()));
+        source["key"] = serde_json::json!(source_key);
+        let frontends: serde_json::Map<String, serde_json::Value> = resources
+            .iter()
+            .map(|name| {
+                (
+                    format!("frontend/{name}"),
+                    serde_json::json!({"size":1,"sha256":format!("{:x}",Sha256::digest([0u8]))}),
+                )
+            })
+            .collect();
+        let mut manifest = serde_json::json!({"schema":"norted.ninfer-manifest","schema_version":7,
+            "model_identity":{"model_id":"qwen3.8-27b","weights_ids":["nvfp4"]},
+            "canonical_source_lineage_key":source_key,"outputs":{"nvfp4":{
+                "source_lineage":source,"draft":null,"artifact":{"filename":path.file_name().unwrap().to_str().unwrap(),"model_id":"qwen3.8-27b","weights_id":"nvfp4","container_version":2,
+                    "size":package_size,"sha256":format!("{:x}",Sha256::digest(std::fs::read(&path).unwrap())),"validation":{"frontends":frontends}}}}});
+        let manifest_path = temporary.path().join("NINFER-MANIFEST.json");
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let packaged = ModelRegistry::discover(&[temporary.path().to_path_buf()]);
+        assert_eq!(packaged.artifacts().len(), 1, "{:?}", packaged.warnings());
+        let binding = packaged.artifacts()[0].norted_package.as_ref().unwrap();
+        assert_eq!(binding.manifest_version, 7);
+        assert!(binding.sharp.is_none());
+        manifest["outputs"]["nvfp4"]["artifact"]["validation"]["frontends"]["frontend/chat_template.jinja"]
+            ["sha256"] = serde_json::json!("f".repeat(64));
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(
+            ModelRegistry::discover(&[temporary.path().to_path_buf()])
+                .artifacts()
+                .is_empty()
+        );
+
+        // Captured native inventory; virtual file length keeps this entirely
+        // metadata-only and avoids creating production-sized test artifacts.
+        let mut draft: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../testdata/ninfer-dflash2.json")).unwrap();
+        let mut span = 0u64;
+        for item in &mut draft {
+            let elements: u64 = item["shape"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .product();
+            let bytes = if item["format"] == "BF16" {
+                elements * 2
+            } else {
+                elements / 32 * 34
+            };
+            span = span.div_ceil(256) * 256;
+            item["kind"] = serde_json::json!("tensor");
+            item["offset"] = serde_json::json!(span);
+            item["bytes"] = serde_json::json!(bytes);
+            span += bytes;
+        }
+        let inspect = |objects: &[serde_json::Value], model: &str, weights: &str| {
+            let value = serde_json::json!({"identity":{"model_id":model,"weights_id":weights},"objects":objects});
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let mut prefix = b"NINFER\0\x02".to_vec();
+            prefix.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            prefix.extend_from_slice(&bytes);
+            super::inspect_ninfer_reader(&mut std::io::Cursor::new(prefix), span + 65536)
+        };
+        for model in ["qwen3.6-27b", "qwen3.8-27b"] {
+            for weights in ["groupwise-int", "nvfp4"] {
+                assert!(inspect(&draft, model, weights).unwrap().dflash2);
+            }
+        }
+        assert!(inspect(&draft[..65], "qwen3.8-27b", "nvfp4").is_err());
+        for (key, bad) in [
+            ("shape", serde_json::json!([5120, 12800])),
+            ("format", serde_json::json!("BF16")),
+            ("layout", serde_json::json!("contiguous-le-v1")),
+            ("bytes", serde_json::json!(1)),
+        ] {
+            let mut malformed = draft.clone();
+            malformed[0][key] = bad;
+            assert!(inspect(&malformed, "qwen3.8-27b", "nvfp4").is_err());
+        }
+        assert!(!metadata.dflash2);
     }
 
     #[test]

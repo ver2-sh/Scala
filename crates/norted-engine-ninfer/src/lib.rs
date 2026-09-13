@@ -42,10 +42,8 @@ pub const ENGINE_ID: &str = "ninfer";
 pub const UPSTREAM_REPOSITORY: &str = "https://github.com/Neroued/ninfer";
 pub const GITHUB_REPOSITORY: &str = "Neroued/ninfer";
 pub const PROVIDER_ID: &str = "ninfer-official-source";
-const CURRENT_PACKAGE_CAPABILITY_REVISION: &str = "863aa8a5f1e866db74f29f8999b83b4021398dee";
-const CURRENT_PACKAGE_CAPABILITY_TREE: &str = "5368f514bafbcab89ce1272df3a13d9d9af55820";
-const LEGACY_PACKAGE_CAPABILITY_REVISION: &str = "a140e7ae82a11ed2f370a4d8f2cc16268a3790b8";
-const LEGACY_PACKAGE_CAPABILITY_TREE: &str = "1474697c790de8df18ed07a469f560bb33e8f324";
+const CURRENT_PACKAGE_CAPABILITY_REVISION: &str = "d49296868dcc17bd478ec185f0d3a801bcc0bf56";
+const CURRENT_PACKAGE_CAPABILITY_TREE: &str = "8e2f0275fc533cf11fe05a4ac3ac85f00eb91c72";
 const CURRENT_REQUEST_LOG_SCHEMA: u32 = 20;
 const MANAGED_NINFER_FUNCTIONAL_VARIANT: &str = "managed-linux-x86_64-cuda-sm120a";
 
@@ -54,17 +52,17 @@ const MANAGED_NINFER_FUNCTIONAL_VARIANT: &str = "managed-linux-x86_64-cuda-sm120
 // files that own that capability are byte-for-byte unchanged.
 #[rustfmt::skip]
 const REVIEWED_SOURCE_BLOBS: &[(&str, &str)] = &[
-    ("apps/cli/options.cpp", "f1c134cbef222c5c949bae5a368c31f17fbf4614"),
-    ("include/ninfer/types.h", "d8398774a89c25126a0aae830340d946911c4df3"),
+    ("apps/cli/options.cpp", "e118801088e7728dd66a4de05386243f167182a3"),
+    ("include/ninfer/types.h", "ac608e2ac6469929b16963f113a0cbe047d408a5"),
     ("src/product/media_acquire/acquire.cpp", "24644492e21122f225abcd7e2fc19718d1827d2c"),
     ("src/product/media_acquire/acquire.h", "91be5a244a0ff45e92acf498ce35afc404a07c89"),
     ("src/product/media_acquire/source.h", "8f9ed1c4ccb13b33a75bf7825f1002c61e4dcfb2"),
-    ("src/product/speculative_options.h", "a50ea5fc8263e0f65f96861148a5276514cd4564"),
+    ("src/product/speculative_options.h", "aa307d21b6172af2c134c5b7e0fcf755f2a5c717"),
     ("src/runtime/contract/sampling.cpp", "495963c88468f215f63132ae901a7cbf455c1164"),
     ("src/runtime/contract/sampling.h", "8770f7f39208bf26da731ecd6e60b33ba8fe8a1e"),
     ("src/runtime/engine/engine.cpp", "ee15cf8ab8c961677bc8f8e27f0fab559f5b2f22"),
-    ("src/runtime/engine/engine_core.h", "d4d9b2d678f21b0033009b873d2448e7c9d0b365"),
-    ("src/runtime/engine/resource_manager.h", "f14837e23ea29ecb89541e1ebd916f1b60f788b2"),
+    ("src/runtime/engine/engine_core.h", "90586c5e7c0aef72a81af67eac5008c74f41d97a"),
+    ("src/runtime/engine/resource_manager.h", "8f162db8f255cdfd82851f7aecb45297d030a644"),
     ("src/serve/generation_service.cpp", "686992f1017c73cc52a0043980ea4d52bea05d3e"),
     ("src/serve/generation_service.h", "8540d6ddc0b65b556d8c674167c10a63cf784e04"),
     ("src/serve/http_server.cpp", "e1c12dcd32881149656a894ef11319d4bc011d5e"),
@@ -80,12 +78,12 @@ const REVIEWED_SOURCE_BLOBS: &[(&str, &str)] = &[
     ("src/serve/openai_responses_store.cpp", "6fa1605b838cc5909902f3bb6a9d172f59b97595"),
     ("src/serve/openai_responses_store.h", "d8f68c3453b6b2e00b0dcddf45a591f379773469"),
     ("src/serve/request.h", "cf87d3621f573876cd47610ee4aceb8645785d0b"),
-    ("src/serve/request_log.cpp", "b0dba5f2840e7cebc70cd868f57b66a89eaf38fa"),
+    ("src/serve/request_log.cpp", "ca246bb6bccdaeaab2d17c18b5cb5d1eda312917"),
     ("src/serve/request_log.h", "8e0f062394a3cb7a5d26097bcfcadc8128d11d41"),
     ("src/serve/request_json.h", "c61d5a1b1c8def6bac2a4f63a67febd451703121"),
     ("src/serve/request_validation.cpp", "9401ec3f136ce22e2c054ed16619703587ccd669"),
     ("src/serve/request_validation.h", "a5daabdaa99961573801fdeb8dd3cd58d91e496f"),
-    ("src/serve/serve_options.cpp", "73c43a55a1102825d054c38730edcc2575489537"),
+    ("src/serve/serve_options.cpp", "de873cb754b5c178cdd7c884767ed1726ff4e355"),
     ("src/serve/serve_options.h", "e147539590041b064cb1161e16c21e59749c1e76"),
     ("src/serve/translate.cpp", "c2effe323b25b5c1f8538ad43f4bc744984fcddc"),
     ("src/serve/translate.h", "5d56431f2d271a5a9beb69a87ab5141868b9dfb4"),
@@ -109,40 +107,48 @@ const REVIEWED_SOURCE_BLOBS: &[(&str, &str)] = &[
     ("src/runtime/engine/context_portfolio_value.h", "ddac06c7ce9e3a60f09c34906379b608da614973"),
     ("src/runtime/engine/kv_capacity.cpp", "4870e77523bded9243f3624ed0b4eafddc76dcb6"),
     ("src/runtime/engine/kv_capacity.h", "65c5be7b788e1bdc4f8356602544877251ac106d"),
-    ("src/runtime/engine/materialization_planner.h", "74e10a2a71c467371acb9222c74290d4779359fb"),
+    ("src/runtime/engine/materialization_planner.h", "64c47ee271cb280429c1edb2c2abf23d8ac50bcc"),
     ("src/runtime/engine/request_record.h", "4def8a6733dfd34ca188a8bbc25719bd6e92c1dd"),
     ("src/runtime/engine/resource_search.h", "08b14447dc9eebf1a5fbd3b2c3fe5737a5166938"),
     ("src/runtime/engine/scheduler.h", "38f2ab99da6151f510f4e1952b481b6b39a5bcb9"),
     ("src/runtime/engine/shared_capture_planner.h", "ade4f69d4e4df0f5b34bb7fed47af0a0809024dc"),
-    ("src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h", "c969ce32c6f41d28fd1f6982de6a4ecab72d0dbf"),
-    ("src/targets/qwen3_6/impl/runtime/dflash_context.h", "ecb1dd47ce69275fe36d785657511b984d85d9cf"),
-    ("src/targets/qwen3_6/impl/runtime/dflash_context_impl.h", "18b1935d4241227f2b706954ea5880c3244c8d7a"),
-    ("src/targets/qwen3_6/impl/runtime/dflash_impl.h", "bce35899c9ade3cd2a92fe72907ed1a52e5dc347"),
+    ("src/targets/qwen3_6/export/ninfer/targets/qwen3_6/round_state.h", "eb2bbf2f861d4b5841e2259bfe5d8ce00c8fb7cb"),
+    ("src/targets/qwen3_6/impl/runtime/dflash_context.h", "802cab92e5c576284d3d34f36d33c1ec5f78a0fe"),
+    ("src/targets/qwen3_6/impl/runtime/dflash_context_impl.h", "62c3185994ccf67c0a4885f7f9686eb0563282e9"),
+    ("src/targets/qwen3_6/impl/runtime/dflash_impl.h", "921299d0a80b29a6a1cef28f7c1ee6f2dd35a291"),
     ("src/targets/qwen3_6/impl/runtime/host_kv_extent_store.h", "d3a90981d0ae959235da0887db231f6cff970c9b"),
-    ("src/targets/qwen3_6/impl/runtime/layouts.h", "d72dbebf531a18bac97a58fa09951e014ce00d6f"),
-    ("src/targets/qwen3_6/impl/runtime/layouts_impl.h", "b70437e3ec6d81a79beafa31707b53862b144d1c"),
-    ("src/targets/qwen3_6/impl/runtime/logical_kv_store.h", "bfba64a9aa71c8558853c28c72f6e3431b632337"),
+    ("src/targets/qwen3_6/impl/runtime/layouts.h", "6b2596d75aee80a182b9489f0337691a4e076151"),
+    ("src/targets/qwen3_6/impl/runtime/layouts_impl.h", "a6afe01e636ffbf9636929363511bdf6ed5d3463"),
+    ("src/targets/qwen3_6/impl/runtime/logical_kv_store.h", "095c904f3dabdd36329d6de6d94940b868724d46"),
     ("src/targets/qwen3_6/impl/runtime/mtp_impl.h", "987e23ef828bb6078dd065ff9e2fe03792b3a035"),
-    ("src/targets/qwen3_6/impl/runtime/pressure_planner.h", "729c25aaf22001adc9f8cc59b3e9fcb68cc632fd"),
-    ("src/targets/qwen3_6/impl/runtime/program.h", "0ff969a3e4389994c7f7f6de0477597323e73387"),
-    ("src/targets/qwen3_6/impl/runtime/program_impl.h", "9ef417b283a40dc1317c763ddf645c4f3b6cfa68"),
+    ("src/targets/qwen3_6/impl/runtime/pressure_planner.h", "b2cc79db41d714be221f696cbdc63b245a634a29"),
+    ("src/targets/qwen3_6/impl/runtime/program.h", "daf47b3861c76de41cd842962646f450794f05b0"),
+    ("src/targets/qwen3_6/impl/runtime/program_impl.h", "b406f5f431fcff6765435f5b9a51e220a24d17c7"),
     ("src/targets/qwen3_6/impl/runtime/rebuild_work.h", "6f01b2e2f99e6a31ecde5954a90d6e0937a4a2b0"),
-    ("src/targets/qwen3_6/impl/runtime/request_plan_impl.h", "5b7fe83b080530dc787c957e55ceac0f3c43d2b8"),
+    ("src/targets/qwen3_6/impl/runtime/request_plan_impl.h", "d57b44f891d2dc509bbf7d6a1ff4b05528bcaff5"),
     ("src/targets/qwen3_6/impl/runtime/resource_projection.h", "86e3091ffe3d024ea0dd85b4088bccb608a20360"),
-    ("src/targets/qwen3_6/impl/runtime/schedule.h", "c9dc6eebecdc945dfece1a154539169ab4f5e602"),
+    ("src/targets/qwen3_6/impl/runtime/schedule.h", "93f7529e8f89770d53636c7188ea0a6f8d1348e6"),
     ("src/targets/qwen3_6/impl/runtime/state_image_store.h", "a5b691307547b25dd50aa24240d3632158ca2109"),
-    ("src/targets/qwen3_6/impl/runtime/text_context.h", "3b4deda322438d29a76e6d039e761c05553ca138"),
-    ("src/targets/qwen3_6/impl/runtime/text_context_impl.h", "872c13531a95db62adf83e7047c821b5bd671ad3"),
+    ("src/targets/qwen3_6/impl/runtime/text_context.h", "42e5f17b9efd6e68f9de00ccaedbc9004e7c3eae"),
+    ("src/targets/qwen3_6/impl/runtime/text_context_impl.h", "8cdef782a18acdbf56be740e71fdd43249cdd597"),
     ("src/targets/qwen3_6/impl/runtime/text_prefill_impl.h", "3716872fc6e30a4ad0093aadef38140a9cffbe05"),
     ("src/targets/qwen3_6/impl/runtime/vision_context.h", "2e11abcfd96a2681b6f2bc2c52cf2b753a434fbf"),
     ("src/targets/qwen3_6/impl/runtime/vision_context_impl.h", "fd8214efb0962ae79f362ccd08a8365aa4c06ec8"),
     ("src/targets/qwen3_6/impl/runtime/vision_prefill.h", "3cb791af026b1a48d93b5eb06a87be835a76e65e"),
-    ("src/targets/qwen3_6/impl/runtime/workspace_recipe.h", "576d049439020f040ea85766b2af0e3ff8edf75a"),
+    ("src/targets/qwen3_6/impl/runtime/workspace_recipe.h", "2fc08972976987a37d25279ca739d7dcfde41311"),
     ("src/targets/qwen3_6/impl/state/decoder_state.cpp", "cf9f9b3710caa78f5648176eb93922989f16d795"),
-    ("src/targets/qwen3_6/impl/state/round_state.cpp", "eae86cbef5326af83919f4ad8fac944b016aaa8a"),
+    ("src/targets/qwen3_6/impl/state/round_state.cpp", "6d87ae6faa5b69efcc3a7939b14e5eab1f785625"),
     ("src/targets/qwen3_6/impl/state/state_image.cpp", "91eabd0e102fc8dcd4eb5e352efae5ced8b0287d"),
     ("src/targets/qwen3_6_27b/impl/package.cpp", "c844d21eda2d5e93649247291491ac5deb32c4c8"),
     ("src/targets/qwen3_6_35b_a3b/impl/package.cpp", "15e55730e0296a1158e78db243ff94d1960040ef"),
+    ("src/targets/qwen3_6_27b/impl/config.h", "f9b3f4e9bc8908c3a34ffbfac308e50084bb85d6"),
+    ("src/targets/qwen3_6_27b/impl/variant.h", "d871054e065bf6b5876301649ea1afb46f2d04af"),
+    ("src/targets/qwen3_6_27b/impl/variant.cpp", "66d5c957eb94e4905d14860047ff2f6e8270944f"),
+    ("src/targets/qwen3_6_27b/impl/load/bindings.cpp", "a4f8d2f9d79a3dc9112da321e6af6e82ea206231"),
+    ("src/targets/qwen3_6/export/ninfer/targets/qwen3_6/startup_features.h", "55d598221bb252cdd411458bbfc7de486c039418"),
+    ("src/targets/qwen3_6/impl/runtime/speculative_target_impl.h", "35d0a11466b34ff48266e607ce3b639a3f637265"),
+    ("src/ops/wrapper/speculative_round.cpp", "e4055c27dfed2dd6178e0142cc03b404298c4042"),
+    ("src/ops/kernel/speculative_round.cuh", "9cf696a622f788caf391c21074b112b9ce52e362"),
 ];
 
 const CORE_PROCESS_FILES: &[&str] = &[
@@ -225,6 +231,14 @@ const SPECULATION_FILES: &[&str] = &[
     "src/targets/qwen3_6/impl/state/round_state.cpp",
     "src/targets/qwen3_6_27b/impl/package.cpp",
     "src/targets/qwen3_6_35b_a3b/impl/package.cpp",
+    "src/targets/qwen3_6_27b/impl/config.h",
+    "src/targets/qwen3_6_27b/impl/variant.h",
+    "src/targets/qwen3_6_27b/impl/variant.cpp",
+    "src/targets/qwen3_6_27b/impl/load/bindings.cpp",
+    "src/targets/qwen3_6/export/ninfer/targets/qwen3_6/startup_features.h",
+    "src/targets/qwen3_6/impl/runtime/speculative_target_impl.h",
+    "src/ops/wrapper/speculative_round.cpp",
+    "src/ops/kernel/speculative_round.cuh",
 ];
 const SERVING_LIMIT_FILES: &[&str] = &[
     "include/ninfer/types.h",
@@ -439,6 +453,14 @@ const DFLASH_VISION_FILES: &[&str] = &[
     "src/targets/qwen3_6/impl/runtime/vision_prefill.h",
     "src/targets/qwen3_6/impl/state/round_state.cpp",
     "src/targets/qwen3_6_35b_a3b/impl/package.cpp",
+    "src/targets/qwen3_6_27b/impl/config.h",
+    "src/targets/qwen3_6_27b/impl/variant.h",
+    "src/targets/qwen3_6_27b/impl/variant.cpp",
+    "src/targets/qwen3_6_27b/impl/load/bindings.cpp",
+    "src/targets/qwen3_6/export/ninfer/targets/qwen3_6/startup_features.h",
+    "src/targets/qwen3_6/impl/runtime/speculative_target_impl.h",
+    "src/ops/wrapper/speculative_round.cpp",
+    "src/ops/kernel/speculative_round.cuh",
 ];
 const MEDIA_REQUEST_FILES: &[&str] = &[
     "include/ninfer/types.h",
@@ -829,39 +851,30 @@ fn ninfer_runtime_capabilities_for_installed(
                 && build.source.tree_sha == CURRENT_PACKAGE_CAPABILITY_TREE
                 && build.recipe_version == catalog::RECIPE_VERSION
         });
-    let exact_legacy = managed_source
-        && runtime.manifest.identity.upstream_revision.as_deref()
-            == Some(LEGACY_PACKAGE_CAPABILITY_REVISION)
-        && runtime.manifest.source_build.as_ref().is_some_and(|build| {
-            build.source.commit_sha == LEGACY_PACKAGE_CAPABILITY_REVISION
-                && build.source.tree_sha == LEGACY_PACKAGE_CAPABILITY_TREE
-                && build.recipe_version == catalog::RECIPE_VERSION
-        });
     let blobs = managed_source
         .then(|| installed_source_blobs(runtime))
         .flatten();
     let reviewed = |files| exact_current || source_domain_matches(blobs.as_ref(), files);
-    let legacy_or_reviewed = |files| exact_legacy || reviewed(files);
     ninfer_reviewed_capabilities(
         managed_source,
         NinferReviewedDomains {
-            core_process_controls: legacy_or_reviewed(CORE_PROCESS_FILES),
-            context_cache_controls: legacy_or_reviewed(CONTEXT_CACHE_FILES),
-            speculation_controls: legacy_or_reviewed(SPECULATION_FILES),
-            serving_limit_controls: legacy_or_reviewed(SERVING_LIMIT_FILES),
-            responses_store_controls: legacy_or_reviewed(RESPONSES_STORE_FILES),
-            request_default_controls: legacy_or_reviewed(REQUEST_DEFAULT_FILES),
-            process_sampler_controls: legacy_or_reviewed(PROCESS_SAMPLER_FILES),
-            model_sampler_defaults: legacy_or_reviewed(MODEL_SAMPLER_DEFAULT_FILES),
-            request_sampler_semantics: legacy_or_reviewed(REQUEST_SAMPLER_FILES),
-            request_protocol_semantics: legacy_or_reviewed(REQUEST_PROTOCOL_FILES),
-            request_log: legacy_or_reviewed(REQUEST_LOG_FILES),
-            thinking_process_controls: legacy_or_reviewed(THINKING_PROCESS_FILES),
-            thinking_request_semantics: legacy_or_reviewed(THINKING_REQUEST_FILES),
-            tool_calling: legacy_or_reviewed(TOOL_CALLING_FILES),
-            vision_process_controls: legacy_or_reviewed(VISION_PROCESS_FILES),
+            core_process_controls: reviewed(CORE_PROCESS_FILES),
+            context_cache_controls: reviewed(CONTEXT_CACHE_FILES),
+            speculation_controls: reviewed(SPECULATION_FILES),
+            serving_limit_controls: reviewed(SERVING_LIMIT_FILES),
+            responses_store_controls: reviewed(RESPONSES_STORE_FILES),
+            request_default_controls: reviewed(REQUEST_DEFAULT_FILES),
+            process_sampler_controls: reviewed(PROCESS_SAMPLER_FILES),
+            model_sampler_defaults: reviewed(MODEL_SAMPLER_DEFAULT_FILES),
+            request_sampler_semantics: reviewed(REQUEST_SAMPLER_FILES),
+            request_protocol_semantics: reviewed(REQUEST_PROTOCOL_FILES),
+            request_log: reviewed(REQUEST_LOG_FILES),
+            thinking_process_controls: reviewed(THINKING_PROCESS_FILES),
+            thinking_request_semantics: reviewed(THINKING_REQUEST_FILES),
+            tool_calling: reviewed(TOOL_CALLING_FILES),
+            vision_process_controls: reviewed(VISION_PROCESS_FILES),
             dflash_vision: reviewed(DFLASH_VISION_FILES),
-            media_request_semantics: legacy_or_reviewed(MEDIA_REQUEST_FILES),
+            media_request_semantics: reviewed(MEDIA_REQUEST_FILES),
         },
     )
 }
@@ -3716,19 +3729,21 @@ mod tests {
         assert_eq!(off.speculative_backend.as_deref(), Some("none"));
         assert_eq!(off.speculative_draft_window, Some(0));
 
-        let on = ninfer_startup_requirements(&resolved(&[
-            ("ninfer.speculation", SettingValue::Toggle(true)),
-            (
-                "ninfer.speculative_backend",
-                SettingValue::Choice("mtp".to_owned()),
-            ),
-            ("ninfer.draft_tokens", SettingValue::UnsignedInteger(3)),
-            ("ninfer.lm_head_draft", SettingValue::Toggle(true)),
-        ]))
-        .expect("direct MTP settings");
-        assert_eq!(on.speculative_backend.as_deref(), Some("mtp"));
-        assert_eq!(on.speculative_draft_window, Some(3));
-        assert_eq!(on.proposal_head.as_deref(), Some("optimized"));
+        for backend in ["mtp", "dflash", "dflash2"] {
+            let on = ninfer_startup_requirements(&resolved(&[
+                ("ninfer.speculation", SettingValue::Toggle(true)),
+                (
+                    "ninfer.speculative_backend",
+                    SettingValue::Choice(backend.to_owned()),
+                ),
+                ("ninfer.draft_tokens", SettingValue::UnsignedInteger(3)),
+                ("ninfer.lm_head_draft", SettingValue::Toggle(true)),
+            ]))
+            .expect("direct native speculation settings");
+            assert_eq!(on.speculative_backend.as_deref(), Some(backend));
+            assert_eq!(on.speculative_draft_window, Some(3));
+            assert_eq!(on.proposal_head.as_deref(), Some("optimized"));
+        }
     }
 
     #[test]

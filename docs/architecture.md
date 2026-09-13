@@ -131,7 +131,7 @@ Staging preserves the repository/package directory tree, rejects absolute, paren
 collision, and containment escapes, creates exact parent directories, and verifies all declared
 members before activation. GGUF packages retain the manifest and declared projector; q27 packages
 retain the exact manifest-bound tokenizer, Sharp, all outputs, and lineage; NInfer packages retain
-Sharp, all outputs, native identity, and lineage. The complete staged directory is rediscovered and
+the declared selected outputs, native identity, embedded frontend hashes, optional draft provenance, and lineage. The complete staged directory is rediscovered and
 validated before one rename to:
 
 ```text
@@ -461,14 +461,15 @@ ninfer-serve <canonical-model.ninfer>
 The positional artifact, binding, alias, device, auth/CORS surface, typed load/cache/media/store
 controls, sampler/greedy controls, and startup log are reserved. `/health` alone is insufficient for
 readiness. Norted selects the bounded schema-20 `server_start` record reviewed at source commit
-`863aa8a...`, validates public alias, artifact target/weights and context-cost identity, selected GPU
+`d4929686...`, validates public alias, artifact target/weights and context-cost identity, selected GPU
 identity, context/KV/cache/CUDA/speculation state, queue and media limits, thinking state, greedy
 state, and configured sampler defaults, then records the runtime-resolved effective values. The file
 is unlinked before requests are served; failure and cancellation paths remove it as well.
 
-The current contract admits DFlash plus Vision only for exact
-`qwen3.6-35b-a3b`/`groupwise-int`; older reviewed `a140e7ae...` runtimes retain the previous
-rejection. MTP and DFlash remain one exclusive backend choice. Capability retention fingerprints
+The current contract admits DFlash plus Vision for exact
+`qwen3.6-35b-a3b`/`groupwise-int`, and DFlash2 plus Vision for registered 27B targets
+with a complete native companion. MTP and DFlash/DFlash2 are exclusive backend choices.
+Capability retention fingerprints
 the admission/resource scheduler, context/KV and checkpoint stores, target program/layout/request
 plan/resource projection, speculation, Vision residency/prefill, state, and request owners in
 addition to immutable commit/tree identity. The structured context-cost preset is canonicalized and

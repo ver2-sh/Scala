@@ -108,7 +108,7 @@ misrepresented as a freshly computed current-file hash. Model payloads are not m
 Norted `BUILD-MANIFEST.json`, `Q27-MANIFEST.json`, and `NINFER-MANIFEST.json` packages are resolved
 relative to the directory containing that exact manifest. Downloads and imports reproduce only the
 manifest-required closure, preserving safe nested relative paths, all primary outputs, the q27
-tokenizer and Sharp companion, the NInfer Sharp companion, and a declared GGUF projector. Builder
+tokenizer and Sharp companion, embedded NInfer resources, and a declared GGUF projector. Builder
 build keys, master IDs, quant-recipe identity, native identity, canonical source lineage, projector
 binding, and manifest identity remain authoritative and unmodified. Multiple package primaries are
 activated and owned as one acquisition while remaining separate models in the registry and Model
@@ -138,8 +138,8 @@ architecture, tier, native-identity, and runtime restrictions are never inferred
 
 ## Norted Builder packages
 
-Model paths are served in place. Current q27 and NInfer Builder packages require manifest schema 6;
-schema 5 fails closed with rebuild guidance. GGUF package format is unchanged. Discovery binds
+Model paths are served in place. Current q27 Builder packages use schema 6; NInfer uses schema 7
+with selected targets, actual embedded frontend hashes and optional draft provenance. Discovery binds
 genuine artifact members and provenance—primary hashes, tokenizer, projector, Sharp companion,
 lineage, and build facts—and performs the existing complete pre-prepare and final pre-spawn
 integrity verification.
@@ -207,9 +207,10 @@ reuse, thinking, speculation/backend/draft/proposal head, samplers and greedy mo
 request/statistics limits, Vision residency and media budgets/workers, Responses-store bounds, and
 advanced cache controls. There is no nested named speculation abstraction. The exact source
 commit/tree, executable help, native container v2 identity, revision-specific startup schema,
-DFlash/Vision capability, and observed startup state remain authoritative. DFlash remains limited
-to exact `qwen3.6-35b-a3b`/`groupwise-int`; current reviewed runtimes allow it with Vision, while the
-older reviewed contract retains its rejection. The audited current source advertises `bf16`,
+draft/Vision capability, and observed startup state remain authoritative. DFlash remains limited
+to exact `qwen3.6-35b-a3b`/`groupwise-int`. DFlash2 requires the complete native 66-tensor companion
+on supported 27B targets. MTP 1–5 and DFlash/DFlash2 1–15 are exclusive backend choices;
+the qualified runtime supports drafting with Vision. A plain MTP artifact cannot enable DFlash2. The audited current source advertises `bf16`,
 `int8`, `fp8`, `nvfp4`, and `k8v4`; older executable help narrows the choice list instead of
 inheriting newer formats. `ninfer.context_cost_presets` is first-class and binds its canonical path
 and SHA-256 immediately before launch; raw `--context-cost-presets` is rejected. NInfer
@@ -304,9 +305,8 @@ For a q27 source build, discovery resolves the release tag to a full Git commit/
 NInfer publishes source rather than an installable release binary. Its provider resolves the canonical `Neroued/ninfer` default-branch HEAD into one `Latest` source snapshot containing the full commit and Git-tree SHAs. It deliberately exposes no `Stable` channel and no fake release asset. Revalidation targets the selected commit itself, so a normal later HEAD does not substitute new source; bounded historical source descriptors retained from explicit searches keep that exact selection addressable after a refresh. Update checks use Git ancestry: identical is current, a descendant is an available update, and backward or diverged history is a provider warning rather than an implicit downgrade. Installed snapshots and selections remain side by side and unchanged until explicitly updated/selected.
 
 The currently reviewed NInfer request/startup authority is commit
-`863aa8a5f1e866db74f29f8999b83b4021398dee`, tree
-`5368f514bafbcab89ce1272df3a13d9d9af55820`, with request-log schema 20. The exact older
-`a140e7ae...` contract remains recognized without inheriting the current DFlash+Vision capability.
+`d49296868dcc17bd478ec185f0d3a801bcc0bf56`, tree
+`8e2f0275fc533cf11fe05a4ac3ac85f00eb91c72`, with request-log schema 20.
 NInfer admission is capability-domain based: exact process/launch and sampler controls use the
 observed executable help plus reviewed default-owning source blobs, while request semantics,
 request-log/startup proof, thinking, tools, and Vision/media use their own reviewed source-blob

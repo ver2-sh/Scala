@@ -12,3 +12,22 @@
 - Configuration editors show next-load configuration. Running observations are separate facts; preserve requested and observed values structurally without changing their winning source.
 - Runtime observations and derived execution facts never enter persisted override maps.
 - `SettingDefaultSource::Norted` is reserved for execution behavior Norted intentionally owns, never for satisfying presentation requirements.
+
+
+## NInfer integration boundary
+
+Norted-Server owns native runtime qualification, bounded artifact capabilities,
+settings precedence, launch/request behavior and startup observations. Norted owns
+model/master lineage, preparation and optional companion assembly/publication.
+Bare native artifacts and equivalent manifest-bound artifacts receive identical
+inference controls regardless of origin. Schema-7 NInfer manifests bind only
+present targets, actual embedded resource hashes and optional draft provenance;
+there is no mandatory Sharp sidecar or sidecar-granted inference capability.
+
+DFlash2 admission requires the complete native 66-tensor inventory and qualified
+runtime source owners; native dispatch ID alone proves neither draft presence nor
+HF lineage. Keep MTP 1–5, DFlash/DFlash2 1–15 and the old DFlash 35B-A3B restriction.
+Do not infer benchmark defaults, run inference for development validation, modify
+experimental evidence, or activate a production profile/service. No GitHub Actions
+or hosted validation is authorized. Use existing local contracts and workspace
+checks; keep tests synthetic and cheap. See [native integration](docs/ninfer.md).
