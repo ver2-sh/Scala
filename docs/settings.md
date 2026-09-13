@@ -136,3 +136,13 @@ reveals 40; Settings Inherit leaves the field to q27. Sampler controls can remai
 while temperature is zero: they are inactive during greedy decoding, not incompatible.
 NInfer has its own top-k bounds (the reviewed runtime accepts at most 20); engine support
 and ranges are never copied from q27 or llama.cpp.
+
+
+NInfer's `ninfer.speculative_backend` supports `mtp`, `dflash`, and `dflash2` under
+the exact qualified runtime. `ninfer.draft_tokens` accepts 1–5 for MTP and 1–15 for
+either DFlash backend; `ninfer.lm_head_draft` selects the optional optimized head.
+DFlash2 requires the complete native companion in the selected artifact. MTP and
+DFlash2 can use one augmented file as runtime alternatives. Vision inclusion is
+separate from `ninfer.vision` residency, and Host/Device caches are independent
+context-retention controls. Nothing selects K7, greedy, a 256-token thinking budget,
+Vision on or disabled caches automatically. See [NInfer](ninfer.md).

@@ -137,11 +137,9 @@ ordinary settings.
 ## NInfer
 
 The reviewed/current upstream capability revision is commit
-`863aa8a5f1e866db74f29f8999b83b4021398dee`, tree
-`5368f514bafbcab89ce1272df3a13d9d9af55820`. The prior exact revision
-`a140e7ae82a11ed2f370a4d8f2cc16268a3790b8`, tree
-`1474697c790de8df18ed07a469f560bb33e8f324`, remains an immutable legacy contract. Capability domains are
-separately fingerprinted so future source snapshots retain only unchanged reviewed domains.
+`d49296868dcc17bd478ec185f0d3a801bcc0bf56`, tree
+`8e2f0275fc533cf11fe05a4ac3ac85f00eb91c72`. Capability domains are separately fingerprinted so future source snapshots
+retain only unchanged reviewed domains.
 
 ### FIRST_CLASS_CONFIGURABLE
 
@@ -151,9 +149,11 @@ separately fingerprinted so future source snapshots retain only unchanged review
 - Speculative backend, draft tokens, LM-head draft, default output/thinking budgets, thinking and preservation,
   CUDA Graph, Vision/media budgets/threads, response-store limits, CORS, log level, context-cost preset file,
   sampling overrides, seed and greedy mode.
-- DFlash remains limited to exact `qwen3.6-35b-a3b`/`groupwise-int` artifacts. MTP and DFlash are one mutually
-  exclusive backend selection. Current revision `863aa8a...` admits DFlash with Vision; the legacy reviewed
-  revision retains its DFlash+Vision rejection, and exact runtime/model schemas filter the combination.
+- DFlash remains limited to exact `qwen3.6-35b-a3b`/`groupwise-int` artifacts.
+  DFlash2 requires complete native companion tensors on the registered Qwen3.6/3.8
+  27B groupwise/NVFP4 targets. MTP 1–5 and DFlash/DFlash2 1–15 are one exclusive
+  backend selection; full/optimized proposal heads and Vision are native controls.
+  Absence of the draft removes DFlash2 from artifact settings and rejects it at launch.
 
 ### NORTED_MANAGED
 
@@ -171,6 +171,6 @@ separately fingerprinted so future source snapshots retain only unchanged review
 The capability-domain fingerprints include the target-runtime implementation owners, not only the serving
 front end: admission/scheduling and resource search; context cost, KV capacity, materialization, Host/Device
 checkpoint state and prefix reuse; target layouts/program/request plans/resource projections/state images;
-MTP/DFlash contexts and schedules; Vision/text residency and prefill; and request/log/protocol owners. Commit
+MTP/DFlash/DFlash2 contexts and schedules; Vision/text residency and prefill; and request/log/protocol owners. Commit
 and tree identity remain alongside these focused blob sets. `ninfer.context_cost_presets` is structured-only;
 its canonical path and SHA-256 are bound immediately before launch.

@@ -71,7 +71,7 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "Speculative backend",
             "Explicit NInfer speculative backend; unset preserves exact runtime behavior",
             SettingKind::Choice {
-                choices: choices(&["mtp", "dflash"]),
+                choices: choices(&["mtp", "dflash", "dflash2"]),
             },
             Some("exact runtime default"),
         ),
@@ -616,15 +616,16 @@ pub(crate) fn apply_model_capabilities(
             Some(SettingValue::Toggle(true))
         )
     });
-    if dflash_target(model) && (!vision_requested || dflash_vision_supported) {
-        return;
-    }
     if let Some(definition) = definitions
         .iter_mut()
         .find(|definition| definition.id.as_str() == "ninfer.speculative_backend")
         && let SettingKind::Choice { choices } = &mut definition.kind
     {
-        choices.retain(|choice| choice != "dflash");
+        choices.retain(|choice| match choice.as_str() {
+            "dflash" => dflash_target(model) && (!vision_requested || dflash_vision_supported),
+            "dflash2" => dflash2_target(model) && dflash_vision_supported,
+            _ => true,
+        });
     }
 }
 
@@ -648,7 +649,20 @@ pub(crate) fn validate_model_settings(
             return Err("this exact NInfer runtime does not support DFlash with Vision".to_owned());
         }
     }
+    if choice_value(settings, "ninfer.speculative_backend").map_err(|error| error.to_string())?
+        == Some("dflash2")
+        && (!dflash2_target(model) || !dflash_vision_supported)
+    {
+        return Err(
+            "NInfer DFlash2 requires a complete native companion and a qualified runtime"
+                .to_owned(),
+        );
+    }
     Ok(())
+}
+
+fn dflash2_target(model: &ModelArtifact) -> bool {
+    norted_core::inspect_ninfer_container(&model.path).is_ok_and(|metadata| metadata.dflash2)
 }
 
 fn dflash_target(model: &ModelArtifact) -> bool {
@@ -874,7 +888,7 @@ pub(crate) fn translate(
         ));
     }
     if toggle_value(settings, "ninfer.vision")? == Some(true)
-        && speculative == Some("dflash")
+        && matches!(speculative, Some("dflash" | "dflash2"))
         && !dflash_vision_supported
     {
         return Err(EngineError::InvalidConfiguration(
@@ -929,6 +943,19 @@ pub(crate) fn translate(
             if !dflash_target(model) {
                 return Err(EngineError::InvalidConfiguration(
                     "NInfer DFlash is supported only for the exact qwen3.6-35b-a3b/groupwise-int target"
+                        .to_owned(),
+                ));
+            }
+        }
+        (true, Some("dflash2")) => {
+            if draft_tokens.is_none_or(|value| !(1..=15).contains(&value)) {
+                return Err(EngineError::InvalidConfiguration(
+                    "NInfer DFlash2 requires ninfer.draft_tokens in 1..=15".to_owned(),
+                ));
+            }
+            if !dflash2_target(model) || !dflash_vision_supported {
+                return Err(EngineError::InvalidConfiguration(
+                    "NInfer DFlash2 requires a complete native companion and a qualified runtime"
                         .to_owned(),
                 ));
             }
@@ -1297,6 +1324,14 @@ mod tests {
             ),
             ("ninfer.draft_tokens", SettingValue::UnsignedInteger(7)),
         ]);
+        let dflash2 = settings(&[
+            (
+                "ninfer.speculative_backend",
+                SettingValue::Choice("dflash2".to_owned()),
+            ),
+            ("ninfer.draft_tokens", SettingValue::UnsignedInteger(7)),
+        ]);
+        assert!(translate(&dflash2, &model("qwen3.8-27b"), &[], true).is_err());
         assert!(translate(&dflash, &model("qwen3.6-27b"), &[], true).is_err());
         assert!(translate(&dflash, &model("qwen3.6-35b-a3b"), &[], true).is_ok());
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -161,30 +161,33 @@ struct NinferManifest {
     schema: String,
     canonical_source_lineage_key: String,
     outputs: BTreeMap<String, NinferOutput>,
-    sharp: NinferSharp,
 }
 
 #[derive(Debug, Deserialize)]
 struct NinferOutput {
     artifact: NinferArtifact,
     source_lineage: SourceLineage,
+    draft: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
-struct NinferArtifact {
-    filename: String,
-    model_id: String,
-    weights_id: String,
-    container_version: u32,
+struct NinferValidation {
+    frontends: BTreeMap<String, NinferResource>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NinferResource {
     size: u64,
     sha256: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct NinferSharp {
+struct NinferArtifact {
+    validation: NinferValidation,
     filename: String,
-    revision: String,
-    version: String,
+    model_id: String,
+    weights_id: String,
+    container_version: u32,
     size: u64,
     sha256: String,
 }
@@ -401,17 +404,33 @@ fn plan_ninfer(value: &serde_json::Value) -> Result<NortedPackageAcquisitionPlan
     if value.get("schema").and_then(serde_json::Value::as_str) != Some("norted.ninfer-manifest") {
         return Err("unsupported Norted NInfer manifest identity; rebuild this artifact with the current Norted Builder".to_owned());
     }
-    if version != 6 {
+    if version != 7 {
         return Err(format!(
             "unsupported Norted NInfer package schema v{version}; rebuild this artifact with the current Norted Builder"
         ));
     }
     let manifest: NinferManifest = serde_json::from_value(value.clone())
-        .map_err(|error| format!("invalid NINFER-MANIFEST v6: {error}"))?;
+        .map_err(|error| format!("invalid NINFER-MANIFEST v7: {error}"))?;
     validate_sha(
         &manifest.canonical_source_lineage_key,
         "NInfer canonical source lineage key",
     )?;
+    let declared = value["model_identity"]["weights_ids"]
+        .as_array()
+        .ok_or_else(|| "NInfer model identity requires selected weight IDs".to_owned())?;
+    let selected: BTreeSet<_> = declared
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    if selected.len() != declared.len()
+        || selected.is_empty()
+        || selected != manifest.outputs.keys().map(String::as_str).collect()
+        || selected
+            .iter()
+            .any(|id| !matches!(*id, "groupwise-int" | "nvfp4"))
+    {
+        return Err("NInfer selected output map differs from model identity".to_owned());
+    }
     let mut files = vec![acquisition_file(
         "NINFER-MANIFEST.json",
         NortedPackageAcquisitionRole::Manifest,
@@ -419,14 +438,52 @@ fn plan_ninfer(value: &serde_json::Value) -> Result<NortedPackageAcquisitionPlan
         None,
         None,
     )?];
-    files.push(acquisition_file(
-        &manifest.sharp.filename,
-        NortedPackageAcquisitionRole::Sharp,
-        None,
-        Some(manifest.sharp.size),
-        Some(&manifest.sharp.sha256),
-    )?);
     for (key, output) in &manifest.outputs {
+        if value["model_identity"]["model_id"].as_str() != Some(output.artifact.model_id.as_str()) {
+            return Err("NInfer output native ID differs from package model identity".to_owned());
+        }
+        validate_lineage_value(
+            &value["outputs"][key]["source_lineage"],
+            "NInfer source lineage",
+        )?;
+        let resources = &output.artifact.validation.frontends;
+        let expected = [
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "chat_template.jinja",
+            "generation_config.json",
+            "preprocessor_config.json",
+            "video_preprocessor_config.json",
+        ];
+        if resources.len() != expected.len()
+            || expected
+                .iter()
+                .any(|name| !resources.contains_key(&format!("frontend/{name}")))
+        {
+            return Err("NInfer manifest requires six embedded frontend identities".to_owned());
+        }
+        for resource in resources.values() {
+            validate_sha(&resource.sha256, "NInfer embedded frontend")?;
+            if resource.size == 0 || resource.size > 32 * 1024 * 1024 {
+                return Err("invalid frontend resource size".to_owned());
+            }
+        }
+        if let Some(draft) = &output.draft {
+            if let Some(identity) = draft.get("identity") {
+                validate_lineage_value(identity, "NInfer draft assembly identity")?;
+                if identity.get("source_lineage") != Some(&value["outputs"][key]["source_lineage"])
+                {
+                    return Err("NInfer draft assembly lineage differs from target".to_owned());
+                }
+            } else if draft
+                .get("reused_input")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+                || !draft["source"].is_object()
+            {
+                return Err("invalid NInfer reused draft provenance".to_owned());
+            }
+        }
         if output.source_lineage.key != manifest.canonical_source_lineage_key
             || output.artifact.weights_id != *key
         {
@@ -449,7 +506,7 @@ fn plan_ninfer(value: &serde_json::Value) -> Result<NortedPackageAcquisitionPlan
         NortedPackageKind::Ninfer,
         "NINFER-MANIFEST.json",
         &manifest.schema,
-        6,
+        7,
         files,
     )
 }
@@ -772,26 +829,18 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
     if value.get("schema").and_then(serde_json::Value::as_str) != Some("norted.ninfer-manifest") {
         return Err("unsupported Norted NInfer manifest identity; rebuild this artifact with the current Norted Builder".to_owned());
     }
-    if version != 6 {
+    if version != 7 {
         return Err(format!(
             "unsupported Norted NInfer package schema v{version}; rebuild this artifact with the current Norted Builder"
         ));
     }
     let manifest: NinferManifest = serde_json::from_value(value)
-        .map_err(|error| format!("invalid NINFER-MANIFEST v6: {error}"))?;
+        .map_err(|error| format!("invalid NINFER-MANIFEST v7: {error}"))?;
     validate_sha(
         &manifest.canonical_source_lineage_key,
         "NInfer canonical source lineage key",
     )?;
     let manifest_file = package_file_from_observed(&manifest_path, &manifest_sha)?;
-    let sharp = resolve_file(
-        &root,
-        &manifest.sharp.filename,
-        Some(manifest.sharp.size),
-        &manifest.sharp.sha256,
-        true,
-    )?;
-    require_distinct_files(&[("Sharp", &sharp.path)])?;
     let mut members = HashMap::new();
     let mut bound = HashSet::new();
     for (key, output) in &manifest.outputs {
@@ -812,7 +861,7 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
             &output.artifact.sha256,
             false,
         )?;
-        if primary.path == sharp.path || !bound.insert(primary.path.clone()) {
+        if !bound.insert(primary.path.clone()) {
             return Err(format!("NInfer output `{key}` is ambiguously bound"));
         }
         let native = inspect_ninfer_container(&primary.path).map_err(|reason| {
@@ -828,10 +877,27 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
                 "NInfer output `{key}` native identity disagrees with manifest"
             ));
         }
+        let resources = crate::model::ninfer_frontend_hashes(&primary.path, &native)
+            .map_err(|e| e.to_string())?;
+        if resources.len() != output.artifact.validation.frontends.len()
+            || output
+                .artifact
+                .validation
+                .frontends
+                .iter()
+                .any(|(name, r)| resources.get(name) != Some(&(r.size, r.sha256.clone())))
+        {
+            return Err("NInfer embedded frontend differs from manifest evidence".to_owned());
+        }
+        if native.dflash2 != output.draft.is_some() {
+            return Err(
+                "NInfer optional draft inventory differs from manifest provenance".to_owned(),
+            );
+        }
         let binding = NortedPackageBinding {
             kind: NortedPackageKind::Ninfer,
             manifest_schema: manifest.schema.clone(),
-            manifest_version: 6,
+            manifest_version: 7,
             package_root: root.clone(),
             manifest_path: manifest_path.clone(),
             manifest_sha256: manifest_sha.clone(),
@@ -842,16 +908,16 @@ fn discover_ninfer(root: &Path, manifest_path: &Path) -> Result<PackageDirectory
             master_id: None,
             quant_recipe_key: None,
             canonical_source_lineage_key: Some(manifest.canonical_source_lineage_key.clone()),
-            sharp: Some(sharp.clone()),
-            sharp_revision: Some(manifest.sharp.revision.clone()),
-            sharp_version: Some(manifest.sharp.version.clone()),
+            sharp: None,
+            sharp_revision: None,
+            sharp_version: None,
             tokenizer: None,
             projector: None,
         };
-        let auxiliary = vec![
-            as_auxiliary(&sharp, AuxiliaryArtifactRole::Sharp),
-            as_auxiliary(&manifest_file, AuxiliaryArtifactRole::Manifest),
-        ];
+        let auxiliary = vec![as_auxiliary(
+            &manifest_file,
+            AuxiliaryArtifactRole::Manifest,
+        )];
         members.insert(
             primary.path,
             PackageMember {
