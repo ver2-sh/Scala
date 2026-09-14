@@ -42,8 +42,7 @@ benchmark summaries. These observations never configure the receiving host.
    enabled = true
    ```
 
-3. Start Norted. Wayfinder and Norted must run under the same Linux OS account
-   and runtime environment. Norted automatically discovers the generic local
+3. Start Norted. Norted automatically discovers the generic local
    application socket and registers `norted.link.v1`. No address, credential,
    capability file or application setup in Wayfinder is needed.
 
@@ -91,11 +90,29 @@ semantics: equivalent artifacts pass through the same adapters and validation.
 
 ## Discovery and freshness
 
-Norted connects to `$XDG_RUNTIME_DIR/wayfinder/app.sock`, falling back to
-`/run/user/<uid>/wayfinder/app.sock` when that directory exists, otherwise
-`/tmp/wayfinder-<uid>/wayfinder/app.sock`. It reads no Wayfinder private state or
-control descriptor. Linux Unix socket permissions and peer credentials authorize
-the local application session. Dynamic transport is unsupported on Windows/macOS.
+Norted connects to the generic `/run/wayfinder/app.sock` endpoint. Wayfinder and
+Norted may run under separate Linux service accounts. The service installers
+provision the generic `wayfinder-apps` group; Norted's unit receives it through
+`SupplementaryGroups`. Install/update the Wayfinder service to provision its
+protected runtime directory, and install/update the Norted service to provision
+application access. The installers retain their respective repository owners as
+service accounts; provision the checkouts for distinct accounts when isolation
+is required. No service name is configured inside Wayfinder.
+
+For manual application accounts, an administrator grants generic local Wayfinder
+application access with `sudo usermod -aG wayfinder-apps APP_USER`, then starts a
+new login/session. The group must exist first. This is one-time OS provisioning,
+not a Link setting. Source-development instances can explicitly share
+`XDG_RUNTIME_DIR` with a provisioned `wayfinder` subdirectory; an ordinary
+login runtime directory alone does not override the machine endpoint. See Wayfinder's generic local application documentation for
+protected directory provisioning. Norted has no socket, group, UID or credential
+configuration field.
+
+Norted reads no Wayfinder private state or control descriptor. Linux socket
+permissions authorize the application; Norted verifies endpoint permissions and
+checks the daemon peer UID against the protected directory owner. Access to the
+socket grants no access to Wayfinder identity/config/state/control files, MCP or
+administration. Dynamic transport is unsupported on Windows/macOS.
 
 Norted keeps a registration session open and binds an ephemeral authenticated
 loopback listener for incoming streams. Its randomly generated registration
