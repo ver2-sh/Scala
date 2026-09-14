@@ -110,7 +110,7 @@ impl Link {
         runtime: Arc<RuntimeManager>,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            dir: wayfinder::data_dir(&core.config.link)?,
+            dir: wayfinder::capability_path(&core.config.link)?,
             core,
             runtime,
             credential: format!(
@@ -283,12 +283,12 @@ impl Link {
         }
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
-        let _ = wayfinder::control(&self.http, &self.dir, json!({"op":"unregister_service", "service":LINK_SERVICE, "credential":self.credential})).await;
+        let _ = wayfinder::call(&self.http, &self.dir, json!({"op":"unregister_service", "service":LINK_SERVICE, "credential":self.credential})).await;
         Ok(())
     }
     async fn refresh(&self, address: std::net::SocketAddr) -> Result<()> {
         let status: wayfinder::Status = serde_json::from_value(
-            wayfinder::control(&self.http, &self.dir, json!({"op":"status"})).await?,
+            wayfinder::call(&self.http, &self.dir, json!({"op":"status"})).await?,
         )
         .map_err(|e| e.to_string())?;
         let local = status
@@ -310,7 +310,7 @@ impl Link {
         if status.conflict {
             return Err("Wayfinder membership conflict; federation unavailable".into());
         }
-        wayfinder::control(&self.http, &self.dir, json!({"op":"register_service", "service":LINK_SERVICE, "address":address, "credential":self.credential})).await?;
+        wayfinder::call(&self.http, &self.dir, json!({"op":"register_service", "service":LINK_SERVICE, "address":address, "credential":self.credential})).await?;
         self.snapshot.write().await.error = None;
         let refresh = stream::iter(status.nodes.into_iter().filter(|n| !n.local).map(
             |node| async move {

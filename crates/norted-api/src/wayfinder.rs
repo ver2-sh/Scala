@@ -15,8 +15,10 @@ pub type Result<T> = std::result::Result<T, String>;
 pub const HEADER_LIMIT: usize = 16384;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Descriptor {
     version: u32,
+    service: String,
     address: SocketAddr,
     service_address: SocketAddr,
     credential: String,
@@ -34,47 +36,45 @@ pub struct Status {
     pub conflict: bool,
 }
 
-pub fn data_dir(config: &norted_core::LinkConfig) -> Result<PathBuf> {
+pub fn capability_path(config: &norted_core::LinkConfig) -> Result<PathBuf> {
     config
-        .wayfinder_data_dir
+        .wayfinder_peer_service
         .clone()
-        .or_else(|| {
-            directories::ProjectDirs::from("org", "Wayfinder", "Wayfinder")
-                .map(|d| d.data_local_dir().to_owned())
-        })
-        .ok_or_else(|| "Cannot locate Wayfinder data directory".into())
+        .ok_or_else(|| "Link requires wayfinder_peer_service capability path".into())
 }
 pub async fn descriptor(dir: &Path) -> Result<Descriptor> {
-    let path = dir.join("control.json");
+    let path = dir;
     let metadata = tokio::fs::symlink_metadata(&path)
         .await
-        .map_err(|_| "Wayfinder is unavailable: private control descriptor missing".to_owned())?;
+        .map_err(|_| "Wayfinder is unavailable: peer-service capability missing".to_owned())?;
     if !metadata.is_file() || metadata.len() > HEADER_LIMIT as u64 {
-        return Err("Invalid Wayfinder control descriptor".into());
+        return Err("Invalid Wayfinder peer-service descriptor".into());
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o077 != 0 {
-            return Err("Wayfinder control descriptor must be private (0600)".into());
+            return Err("Wayfinder peer-service descriptor must be private (0600)".into());
         }
     }
     let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
     let d: Descriptor = serde_json::from_slice(&bytes)
         .map_err(|_| "Wayfinder peer service v1 support is required".to_owned())?;
     if d.version != 1
+        || d.service != "norted.link.v1"
         || !d.address.ip().is_loopback()
         || !d.service_address.ip().is_loopback()
         || d.credential.len() != 64
+        || !d.credential.bytes().all(|b| b.is_ascii_hexdigit())
     {
-        return Err("Invalid Wayfinder control descriptor".into());
+        return Err("Invalid Wayfinder peer-service descriptor".into());
     }
     Ok(d)
 }
-pub async fn control(http: &reqwest::Client, dir: &Path, operation: Value) -> Result<Value> {
+pub async fn call(http: &reqwest::Client, dir: &Path, operation: Value) -> Result<Value> {
     let d = descriptor(dir).await?;
     let mut response = http
-        .post(format!("http://{}/control", d.address))
+        .post(format!("http://{}/peer-service", d.address))
         .bearer_auth(d.credential)
         .json(&operation)
         .timeout(Duration::from_secs(4))
@@ -86,7 +86,7 @@ pub async fn control(http: &reqwest::Client, dir: &Path, operation: Value) -> Re
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
         if bytes.len() + chunk.len() > 128 * 1024 {
-            return Err("Wayfinder control response too large".into());
+            return Err("Wayfinder peer-service response too large".into());
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -97,7 +97,7 @@ pub async fn control(http: &reqwest::Client, dir: &Path, operation: Value) -> Re
     reply
         .get("value")
         .cloned()
-        .ok_or_else(|| "Invalid Wayfinder control reply".into())
+        .ok_or_else(|| "Invalid Wayfinder peer-service reply".into())
 }
 pub async fn open(dir: &Path, target: &str, service: &str) -> Result<TcpStream> {
     let d = descriptor(dir).await?;
