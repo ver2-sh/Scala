@@ -8,10 +8,15 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[cfg(target_os = "linux")]
-use tokio::net::UnixStream;
+use tokio::net::UnixStream as ApplicationStream;
 // Unsupported platforms retain local serving; no local transport is opened.
-#[cfg(not(target_os = "linux"))]
-use tokio::io::DuplexStream as UnixStream;
+#[cfg(not(any(target_os = "linux", windows)))]
+use tokio::io::DuplexStream as ApplicationStream;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::NamedPipeClient as ApplicationStream;
+
+#[cfg(windows)]
+mod windows;
 
 pub type Result<T> = std::result::Result<T, String>;
 pub const HEADER_LIMIT: usize = 16384;
@@ -29,6 +34,7 @@ pub struct Status {
     pub conflict: bool,
 }
 
+#[cfg(not(windows))]
 pub fn socket_path() -> Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -41,8 +47,37 @@ pub fn socket_path() -> Result<PathBuf> {
     }
     Ok(runtime.join("wayfinder/app.sock"))
 }
+#[cfg(windows)]
+pub fn socket_path() -> Result<PathBuf> {
+    Ok(PathBuf::from(r"\\.\pipe\wayfinder-app-v1"))
+}
+#[cfg(windows)]
+async fn connect(path: &Path) -> Result<ApplicationStream> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    // Retry only pipe admission, never a dispatched application operation.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match ClientOptions::new().open(path) {
+                Ok(stream) => {
+                    windows::verify_owner(&stream)?;
+                    return Ok(stream);
+                }
+                Err(error) if error.raw_os_error() == Some(231) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Wayfinder: local application pipe unavailable: {error}"
+                    ));
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| "Wayfinder application pipe busy".to_owned())?
+}
 #[cfg(target_os = "linux")]
-async fn connect(path: &Path) -> Result<UnixStream> {
+async fn connect(path: &Path) -> Result<ApplicationStream> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     // The protected directory is the trust anchor, not the application's UID.
     // Authorized applications may connect but cannot replace the daemon socket.
@@ -62,7 +97,7 @@ async fn connect(path: &Path) -> Result<UnixStream> {
     {
         return Err("Untrusted Wayfinder application endpoint permissions".into());
     }
-    let stream = UnixStream::connect(path)
+    let stream = ApplicationStream::connect(path)
         .await
         .map_err(|_| "Wayfinder: not detected or local application access denied".to_owned())?;
     if stream.peer_cred().map_err(|e| e.to_string())?.uid() != directory.uid() {
@@ -70,13 +105,13 @@ async fn connect(path: &Path) -> Result<UnixStream> {
     }
     Ok(stream)
 }
-#[cfg(not(target_os = "linux"))]
-async fn connect(_path: &Path) -> Result<UnixStream> {
-    Err("Wayfinder local applications require Linux".into())
+#[cfg(not(any(target_os = "linux", windows)))]
+async fn connect(_path: &Path) -> Result<ApplicationStream> {
+    Err("Wayfinder local applications require Linux or Windows".into())
 }
 #[derive(Default)]
 pub struct Session {
-    stream: tokio::sync::Mutex<Option<UnixStream>>,
+    stream: tokio::sync::Mutex<Option<ApplicationStream>>,
 }
 impl Session {
     pub async fn call(&self, path: &Path, operation: Value) -> Result<Value> {
@@ -107,7 +142,7 @@ impl Session {
         *self.stream.lock().await = None;
     }
 }
-pub async fn open(path: &Path, target: &str, service: &str) -> Result<UnixStream> {
+pub async fn open(path: &Path, target: &str, service: &str) -> Result<ApplicationStream> {
     let mut stream = connect(path).await?;
     write_json(
         &mut stream,

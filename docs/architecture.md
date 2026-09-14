@@ -12,6 +12,11 @@ executes remote load/unload through its existing management path. The TUI merges
 observations only in its presentation model; runtime management and persistent
 profile/model stores remain local. There is no model/runtime copying or replicated
 Norted database. Wayfinder alone owns identity, membership and peer connectivity.
+The local application boundary uses a protected Unix socket on Linux and a
+protected same-account named pipe on native Windows 11. Only that stream adapter
+varies: Ubuntu ↔ Windows uses the same Norted Link and Wayfinder TCP/Noise
+protocols, without WSL. Managed runtime compatibility remains owner-local;
+Windows llama.cpp support does not imply Windows managed NInfer or q27 support.
 
 An `EngineAdapter` represents implementation knowledge: identity, supported artifact formats and capabilities, model compatibility, runtime probing, launch semantics, readiness, effective settings, and request/event translation. It never implies that only one executable exists.
 
