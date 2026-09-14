@@ -71,6 +71,39 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Command::Tui => {
             run_tui(core, cli.json).await?;
         }
+        Command::Link { command } => match command {
+            cli::LinkCommand::Status => {
+                let observed = match ControlClient::discover(&core.paths).await {
+                    Ok(client) => client.link_status().await.map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "configured": core.config.link, "observed": observed,
+                        "setup": "Configure norted.link.v1 in Wayfinder, then use link enable --capability PATH. Changes apply when Norted restarts."
+                    }))?
+                );
+            }
+            cli::LinkCommand::Enable { capability } => {
+                let config = norted_core::LinkConfig {
+                    enabled: true,
+                    wayfinder_peer_service: Some(capability),
+                };
+                config
+                    .save(&core.paths)
+                    .map_err(|e| color_eyre::eyre::eyre!(e))?;
+                println!("Norted Link enabled in configuration. Restart Norted to connect.");
+            }
+            cli::LinkCommand::Disable => {
+                let mut config = core.config.link.clone();
+                config.enabled = false;
+                config
+                    .save(&core.paths)
+                    .map_err(|e| color_eyre::eyre::eyre!(e))?;
+                println!("Norted Link disabled in configuration. Restart Norted to disconnect.");
+            }
+        },
         Command::Serve => {
             let services = composition::ApplicationServices::new(&core)?;
             let startup_guard = composition::ServerStartupGuard::acquire(&core.paths).await?;

@@ -2101,7 +2101,7 @@ impl UiLayout {
                     }
                 }
                 Screen::Server => {}
-                Screen::Logs | Screen::Help | Screen::Benchmarks => {}
+                Screen::Logs | Screen::Help | Screen::Benchmarks | Screen::Link => {}
             },
         }
 

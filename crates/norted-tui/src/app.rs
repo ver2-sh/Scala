@@ -37,19 +37,21 @@ pub enum Screen {
     Benchmarks,
     Runtimes,
     Server,
+    Link,
     Logs,
     Settings,
     Help,
 }
 
 impl Screen {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Overview,
         Self::Models,
         Self::ModelProfiles,
         Self::Benchmarks,
         Self::Runtimes,
         Self::Server,
+        Self::Link,
         Self::Logs,
         Self::Settings,
         Self::Help,
@@ -63,6 +65,7 @@ impl Screen {
             Self::Benchmarks => "Benchmarks",
             Self::Runtimes => "Runtimes",
             Self::Server => "Server",
+            Self::Link => "Norted Link",
             Self::Logs => "Logs",
             Self::Settings => "Settings",
             Self::Help => "Help",
@@ -416,6 +419,9 @@ pub struct App {
     pub settings_state: Option<SettingsState>,
     pub model_profiles: Option<ModelProfilesState>,
     pub link: norted_engine::link::LinkSnapshot,
+    pub link_config: norted_core::LinkConfig,
+    pub link_input: Option<String>,
+    pub pending_link_config: Option<norted_core::LinkConfig>,
     remote_profiles: Vec<(String, ModelProfile)>,
     remote_backends: Vec<BackendStatus>,
     remote_models: BTreeMap<ModelId, (String, ModelId)>,
@@ -556,6 +562,9 @@ impl App {
             settings_state: None,
             model_profiles: None,
             link: Default::default(),
+            link_config: Default::default(),
+            link_input: None,
+            pending_link_config: None,
             remote_profiles: Vec::new(),
             remote_backends: Vec::new(),
             remote_models: BTreeMap::new(),
@@ -614,6 +623,49 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Update::Quit;
+        }
+        if let Some(input) = &mut self.link_input {
+            match key.code {
+                KeyCode::Esc => self.link_input = None,
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c) if !c.is_control() && input.len() < 4096 => input.push(c),
+                KeyCode::Enter => {
+                    self.pending_link_config = Some(norted_core::LinkConfig {
+                        enabled: true,
+                        wayfinder_peer_service: Some(std::path::PathBuf::from(input.trim())),
+                    });
+                    self.link_input = None;
+                }
+                _ => {}
+            }
+            return Update::Render;
+        }
+        if self.screen == Screen::Link
+            && self.focus == FocusArea::Content
+            && self.overlay.is_none()
+            && self.detail_text.is_none()
+        {
+            match key.code {
+                KeyCode::Char('e') => {
+                    self.link_input = Some(
+                        self.link_config
+                            .wayfinder_peer_service
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                    );
+                    return Update::Render;
+                }
+                KeyCode::Char('x') => {
+                    let mut config = self.link_config.clone();
+                    config.enabled = false;
+                    self.pending_link_config = Some(config);
+                    return Update::Render;
+                }
+                _ => {}
+            }
         }
         if self.detail_text.is_some() {
             match key.code {
@@ -768,6 +820,7 @@ impl App {
                     | Screen::Runtimes
                     | Screen::Overview
                     | Screen::Server
+                    | Screen::Link
                     | Screen::Logs
                     | Screen::Help
             )
@@ -1000,6 +1053,14 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> Update {
+        if let Some(input) = &mut self.link_input {
+            input.extend(
+                text.chars()
+                    .filter(|c| !c.is_control())
+                    .take(4096 - input.len().min(4096)),
+            );
+            return Update::Render;
+        }
         let normalized = text.replace(['\r', '\n', '\t'], " ");
         if self.detail_text.is_some() {
             return Update::None;

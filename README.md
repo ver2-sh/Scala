@@ -857,8 +857,8 @@ Focused tests cover bounded NInfer admission, typed identity, source manifests a
 ## Norted Link
 
 [Norted Link](docs/norted-link.md) makes linked Norted servers available from
-either machine through Wayfinder's authenticated peer services. Enable `[link]`
-`enabled = true` in each local `config.toml` after linking Wayfinder. The normal
+either machine through Wayfinder's authenticated peer services. Use the Norted Link screen or `norted-server link enable --capability PATH`
+after configuring the generic Wayfinder service on each machine. The normal
 Models, Model Profiles and Overview views show owner/host labels, inventories,
 loaded state and owner-reported runtime identity. Load/unload executes on the
 selected owner through its normal manager.

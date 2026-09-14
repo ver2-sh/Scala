@@ -107,6 +107,49 @@ pub struct LinkConfig {
     pub wayfinder_peer_service: Option<PathBuf>,
 }
 
+impl LinkConfig {
+    /// Edit only the Link table; runtime/model configuration remains owner-managed.
+    pub fn save(&self, paths: &AppPaths) -> std::result::Result<(), String> {
+        use std::io::Write;
+        if self.enabled
+            && !self
+                .wayfinder_peer_service
+                .as_ref()
+                .is_some_and(|p| p.is_absolute())
+        {
+            return Err(
+                "Select an absolute Wayfinder application capability path before enabling Link"
+                    .into(),
+            );
+        }
+        let save = || -> std::result::Result<(), Box<dyn std::error::Error>> {
+            fs::create_dir_all(&paths.config_dir)?;
+            let lock = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(paths.config_dir.join(".link-config.lock"))?;
+            fs2::FileExt::lock_exclusive(&lock)?;
+            let text = match fs::read_to_string(&paths.config_file) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(e.into()),
+            };
+            let mut document: toml::Table = toml::from_str(&text)?;
+            document.insert("link".into(), toml::Value::try_from(self)?);
+            let text = toml::to_string_pretty(&document)?;
+            let config: AppConfig = toml::from_str(&text)?;
+            config.validate()?;
+            let mut file = tempfile::NamedTempFile::new_in(&paths.config_dir)?;
+            file.write_all(text.as_bytes())?;
+            file.as_file().sync_all()?;
+            file.persist(&paths.config_file)?;
+            Ok(())
+        };
+        save().map_err(|e| e.to_string())
+    }
+}
+
 impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         if self.version != SUPPORTED_CONFIG_VERSION {

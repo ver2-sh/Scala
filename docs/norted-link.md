@@ -5,30 +5,67 @@ Both directions are equivalent: each server discovers the other server's models,
 profiles and loaded state, can load/unload an owned profile there, and can serve
 its hosted profile through the local OpenAI-compatible API. There is no main node.
 
+The product boundary is:
+
+```text
+TCP/network
+  ↓
+Wayfinder: identity / membership / encrypted application service transport
+  ↓
+Norted Link: models / GPUs / profiles / inference / remote load state
+  ↓
+Local Norted runtime: NInfer / llama.cpp / q27 / etc.
+```
+
+Wayfinder discovers generic nodes. Norted independently opens `norted.link.v1`
+on reachable nodes and accepts compatible owner reports. Nodes without that
+service are normal and remain absent from Norted's peer list. Wayfinder maintains
+no application classification or central application registry.
+
+Owner hardware reports include OS/architecture, detected accelerator names and
+reported total VRAM (unknown stays unknown). Total VRAM helps identify hosts; it
+is not live free-memory telemetry or a scheduling decision. Norted also reports
+model metadata/provenance, profiles and roles, loaded lifecycle, runtime
+identity/version/variant, effective context and parallelism, activity and existing
+benchmark summaries. These observations never configure the receiving host.
+
 ## Connect two machines
 
 1. Build the Wayfinder version containing peer services v1 on each machine and
    link their distinct Wayfinder identities using its normal invitation workflow.
    Both advertised peer endpoints must be reachable. Norted does not add IP
    configuration, NAT traversal or a second network.
-2. Build Norted-Server on each machine. In each local `config.toml`, enable:
+2. Configure a generic Wayfinder service on each machine:
 
-   ```toml
-   [link]
-   enabled = true
-   wayfinder_peer_service = "/run/wayfinder-app/norted.json"
+   ```sh
+   wayfinder services add norted.link.v1 --capability /var/lib/wayfinder-app/link.json
+   wayfinder daemon
+   # wayfinder tui loads the same configured services when it starts a daemon.
    ```
 
-   Start Wayfinder with
-   `wayfinder daemon --peer-service norted.link.v1=/run/wayfinder-app/norted.json`.
-   Create the parent directory first. Grant Norted read access only to the generated
-   descriptor (0600; transfer ownership to the dedicated application account).
-   Reapply this grant after Wayfinder restarts. A relative capability path resolves
-   against the Norted configuration directory. Norted needs no access to Wayfinder's
-   private state directory. The capability can observe sanitized members and
-   register/renew/unregister/open only `norted.link.v1`; it cannot administer
-   Wayfinder or authorize MCP. TUI/CLI administration remains separate.
-   Never share identity directories or copy credentials to the other machine.
+   Create the parent outside Wayfinder's private directory, writable only by its
+   administrator. For a separate Norted account use `--group GID` with a dedicated
+   application group and grant directory traversal. Wayfinder reapplies mode 0640
+   and that group each restart; without a group the descriptor is 0600.
+   Configure services before startup, or restart Wayfinder to apply changes.
+
+   In Norted's **Norted Link** screen, press `e`, enter that absolute capability
+   path and press Enter to enable. Press `x` to disable. Alternatively:
+
+   ```sh
+   norted-server link enable --capability /var/lib/wayfinder-app/link.json
+   norted-server link status
+   norted-server link disable
+   ```
+
+   The screen distinguishes configured settings from the running Link state and
+   shows Wayfinder availability, full local node ID, online/stale peers and setup
+   errors. Selection is explicit: Norted never searches Wayfinder private files.
+   This saves `[link]` in Norted configuration; manual TOML editing is unnecessary.
+   Credentials rotate safely because Norted rereads the selected descriptor.
+   The capability permits only sanitized node discovery and `norted.link.v1`
+   registration/open, never Wayfinder administration or MCP. Never share identity
+   directories or copy credentials between machines.
 3. Restart each Norted server after changing configuration. Use each machine's
    normal local runtime and model/profile setup, then load a profile. The TUI's
    Overview, Models and Model Profiles show host labels and owner-reported state.
