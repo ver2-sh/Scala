@@ -3,6 +3,60 @@ use super::*;
 use norted_engine::link::{LinkAction, LinkControlRequest, LinkPeer, LinkProfile, LinkSnapshot};
 
 impl App {
+    pub fn link_detail(&self) -> String {
+        let mut text = format!(
+            "Norted Link: {}\nWayfinder: {}\nLocal node: {}\nNode ID: {}\nNorted peers: {} online / {} known\n\nSetup (applies after Norted restart)\nConfigured: {}\nService: norted.link.v1\nCapability: {}\n\nWayfinder provides secure service streams. Configure norted.link.v1 with Wayfinder services add, then select its capability here.\ne Select capability and enable · x Disable · D Scrollable details\n",
+            if self.link.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            if !self.link.enabled {
+                "not connected (Link disabled)"
+            } else if self.link.error.is_some() {
+                "unavailable / setup error"
+            } else if self.link.node_id.is_some() {
+                "available"
+            } else {
+                "connecting"
+            },
+            self.link.node_name.as_deref().unwrap_or("not observed"),
+            self.link.node_id.as_deref().unwrap_or("not observed"),
+            self.link.peers.iter().filter(|p| p.reachable).count(),
+            self.link.peers.len(),
+            if self.link_config.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            self.link_config
+                .wayfinder_peer_service
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not selected".into())
+        );
+        if let Some(input) = &self.link_input {
+            text.insert_str(
+                0,
+                &format!("Capability path (Enter saves, Esc cancels):\n{input}\n\n"),
+            );
+        }
+        if let Some(error) = &self.link.error {
+            text.insert_str(0, &format!("Action needed: {error}\n\n"));
+        }
+        for peer in &self.link.peers {
+            text.push_str(&format!(
+                "\n{} · {}\n{}\n{}\n",
+                peer.name,
+                if peer.reachable { "online" } else { "stale" },
+                peer.node_id,
+                peer.error
+                    .as_deref()
+                    .unwrap_or("Compatible Norted Link peer")
+            ));
+        }
+        text
+    }
     pub fn replace_link(&mut self, result: Result<LinkSnapshot, String>) {
         match result {
             Ok(snapshot) => self.link = snapshot,
@@ -173,7 +227,7 @@ impl App {
     }
     pub fn link_summary(&self) -> String {
         if !self.link.enabled {
-            return "Your local model runtime, from artifacts to API".into();
+            return "Norted Link disabled · Open Norted Link to set up peer connectivity".into();
         }
         let mut hosts = vec![self.local_host_label()];
         hosts.extend(self.link.peers.iter().map(|peer| {

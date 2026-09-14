@@ -18,6 +18,11 @@ pub struct SlashCommand {
 
 pub const COMMANDS: &[SlashCommand] = &[
     SlashCommand {
+        name: "/link",
+        description: "Set up Norted Link and inspect peer connectivity",
+        action: CommandAction::Navigate(Screen::Link),
+    },
+    SlashCommand {
         name: "/benchmarks",
         description: "Run and inspect per-profile benchmarks",
         action: CommandAction::Navigate(Screen::Benchmarks),

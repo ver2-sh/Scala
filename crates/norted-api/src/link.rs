@@ -110,7 +110,7 @@ impl Link {
         runtime: Arc<RuntimeManager>,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            dir: wayfinder::capability_path(&core.config.link)?,
+            dir: wayfinder::capability_path(&core.config.link).unwrap_or_default(),
             core,
             runtime,
             credential: format!(
@@ -251,7 +251,14 @@ impl Link {
                 host.architecture,
                 host.accelerators
                     .iter()
-                    .filter_map(|gpu| gpu.name.clone())
+                    .map(|gpu| format!(
+                        "{} · VRAM {}",
+                        gpu.name.as_deref().unwrap_or("Unnamed accelerator"),
+                        gpu.vram_bytes.map_or_else(
+                            || "unknown".into(),
+                            |bytes| format!("{:.1} GiB", bytes as f64 / 1073741824.0)
+                        )
+                    ))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -287,6 +294,9 @@ impl Link {
         Ok(())
     }
     async fn refresh(&self, address: std::net::SocketAddr) -> Result<()> {
+        if self.dir.as_os_str().is_empty() {
+            return Err("Select a capability in Norted Link setup, then restart Norted".into());
+        }
         let status: wayfinder::Status = serde_json::from_value(
             wayfinder::call(&self.http, &self.dir, json!({"op":"status"})).await?,
         )
@@ -347,17 +357,6 @@ impl Link {
                         if let Some(index) = known {
                             snapshot.peers[index].reachable = false;
                             snapshot.peers[index].error = Some(error);
-                        } else if error.contains("protocol version")
-                            || error.contains("owner inventory")
-                        {
-                            snapshot.peers.push(LinkPeer {
-                                node_id: node.id,
-                                name: node.name,
-                                reachable: false,
-                                last_seen: 0,
-                                error: Some(error),
-                                state: None,
-                            });
                         }
                     }
                 }

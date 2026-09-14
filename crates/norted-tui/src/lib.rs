@@ -126,6 +126,7 @@ pub async fn run(
 
     core.start_model_discovery().await;
     let mut terminal_events = EventStream::new();
+    app.link_config = core.config.link.clone();
     let (link_results, mut link_result_receiver) = tokio::sync::mpsc::channel(2);
     let (control_updates, mut control_update_receiver) = tokio::sync::mpsc::channel(2);
     let (control_results, mut control_result_receiver) =
@@ -393,6 +394,15 @@ pub async fn run(
                     };
                     let _ = results.send((request, result)).await;
                 });
+            }
+        }
+        if let Some(config) = app.pending_link_config.take() {
+            match config.save(&core.paths) {
+                Ok(()) => {
+                    app.link_config = config;
+                    app.notice = Some("Link configuration saved. Restart Norted to apply.".into());
+                }
+                Err(error) => app.notice = Some(error),
             }
         }
         if let Some(action) = app.take_link_action() {

@@ -36,6 +36,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Configure Norted Link and inspect discovered peers
+    Link {
+        #[command(subcommand)]
+        command: LinkCommand,
+    },
     /// Run and inspect private, server-owned per-profile benchmarks
     Benchmarks(BenchmarksArgs),
     /// Reclaim unused managed storage; --all resets generated/heavy artifacts
@@ -406,4 +411,16 @@ impl From<BenchmarksCommand> for norted_engine::benchmark::BenchmarkRequest {
             BenchmarksCommand::Compare { left, right } => Self::Compare { left, right },
         }
     }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LinkCommand {
+    Status,
+    /// Select the scoped norted.link.v1 capability and enable on next server start
+    Enable {
+        #[arg(long)]
+        capability: std::path::PathBuf,
+    },
+    /// Disable Link on next server start
+    Disable,
 }

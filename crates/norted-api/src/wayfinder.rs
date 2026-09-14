@@ -40,21 +40,21 @@ pub fn capability_path(config: &norted_core::LinkConfig) -> Result<PathBuf> {
     config
         .wayfinder_peer_service
         .clone()
-        .ok_or_else(|| "Link requires wayfinder_peer_service capability path".into())
+        .ok_or_else(|| "Select a Wayfinder capability in Norted Link setup".into())
 }
 pub async fn descriptor(dir: &Path) -> Result<Descriptor> {
     let path = dir;
     let metadata = tokio::fs::symlink_metadata(&path)
         .await
-        .map_err(|_| "Wayfinder is unavailable: peer-service capability missing".to_owned())?;
+        .map_err(|_| "Wayfinder capability is missing or unreadable: start Wayfinder and check the selected path/application group".to_owned())?;
     if !metadata.is_file() || metadata.len() > HEADER_LIMIT as u64 {
         return Err("Invalid Wayfinder peer-service descriptor".into());
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err("Wayfinder peer-service descriptor must be private (0600)".into());
+        if metadata.permissions().mode() & 0o027 != 0 {
+            return Err("Wayfinder peer-service descriptor must be owner-only (0600) or application-group readable (0640)".into());
         }
     }
     let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;

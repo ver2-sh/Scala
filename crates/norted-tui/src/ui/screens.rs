@@ -39,6 +39,12 @@ pub fn render_screen(
         Screen::ModelProfiles => render_model_profiles(frame, area, app, theme, ui_layout),
         Screen::Benchmarks => crate::benchmarks::render(frame, app, theme, glyphs, ui_layout),
         Screen::Runtimes => render_runtimes(frame, area, app, theme, glyphs, ui_layout),
+        Screen::Link => frame.render_widget(
+            Paragraph::new(app.link_detail())
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title("Norted Link")),
+            area,
+        ),
         Screen::Server => render_server(frame, area, app, theme, glyphs, ui_layout),
         Screen::Logs => render_logs(frame, area, app, theme, ui_layout),
         Screen::Settings => render_settings(frame, area, app, theme, ui_layout),
@@ -3325,6 +3331,7 @@ fn inspection_body(app: &App) -> Option<String> {
                 });
         }
         Screen::Server => return Some(server_text(app)),
+        Screen::Link => return Some(app.link_detail()),
         Screen::Logs => {
             let end = app.logs.len().saturating_sub(app.log_scroll);
             return Some(
