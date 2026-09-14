@@ -58,14 +58,7 @@ fn render_overview(
     if area.height < 10 {
         title.height = 2;
     }
-    frame.render_widget(
-        section_title(
-            "Overview",
-            "Your local model runtime, from artifacts to API",
-            theme,
-        ),
-        title,
-    );
+    frame.render_widget(section_title("Overview", &app.link_summary(), theme), title);
     render_metrics(
         frame,
         ui_layout.overview_metrics,
@@ -198,9 +191,9 @@ fn render_backend_card(
     let mut lines = vec![Line::from(Span::styled(status, status_style))];
 
     let profile = app
-        .model_profiles
-        .as_ref()
-        .and_then(|profiles| profiles.profiles.get(&backend.model_profile_id));
+        .model_profile_values()
+        .into_iter()
+        .find(|p| p.id == backend.model_profile_id && p.model_id == backend.model_id);
     let model = app
         .snapshot
         .models
@@ -218,8 +211,10 @@ fn render_backend_card(
     lines.push(Line::from(Span::styled(
         truncate_middle(
             &format!(
-                "Profile: {profile_name} | {:?} / {:?}",
-                backend.role, backend.residency
+                "[{}] Profile: {profile_name} | {:?} / {:?}",
+                app.model_host_label(&backend.model_id),
+                backend.role,
+                backend.residency
             ),
             inner.width as usize,
             glyphs.ellipsis,
@@ -419,18 +414,19 @@ fn render_metrics(
                 "Unavailable".to_owned()
             }
         },
-        |control| {
-            if control.backends.is_empty() {
+        |_| {
+            let count = app.resident_backends().len();
+            if count == 0 {
                 "None".to_owned()
             } else {
-                format!("{} resident", control.backends.len())
+                format!("{count} resident")
             }
         },
     );
     let values = [
         ("SERVER", app.snapshot.server.label().to_owned()),
         ("MODELS", model_value),
-        ("RUNTIMES", runtime_value),
+        ("RUNTIMES (LOCAL)", runtime_value),
         ("ACTIVE MODEL", active_model),
     ];
     if compact {
@@ -720,10 +716,23 @@ fn render_models(
                     })
                 })
                 .map_or_else(|| "Installed".to_owned(), |b| format!("{:?}", b.lifecycle));
+        let usage = if let Some(peer) = app.model_peer(&model.id) {
+            if !peer.reachable {
+                "Stale".to_owned()
+            } else {
+                app.resident_backends()
+                    .iter()
+                    .find(|b| b.model_id == model.id)
+                    .map_or_else(|| "Installed".to_owned(), |b| format!("{:?}", b.lifecycle))
+            }
+        } else {
+            usage
+        };
         let mut values = vec![
             format!(
-                "{} {}",
+                "{} [{}] {}",
                 if selected { ">" } else { " " },
+                app.model_host_label(&model.id),
                 model.display_name
             ),
             model.format.to_string(),
@@ -742,7 +751,7 @@ fn render_models(
         render_empty(
             frame,
             ui_layout.model_list,
-            "No matching local models",
+            "No matching models",
             "f: edit filter | Esc: clear filter",
             theme,
         );
@@ -774,6 +783,17 @@ fn render_installed_model_actions(
     else {
         return;
     };
+    if app.selected_model_is_remote() {
+        frame.render_widget(
+            Paragraph::new("Open Model Profiles to load/unload on this host").style(theme.hint),
+            ui_layout
+                .installed_model_actions
+                .first()
+                .map(|(_, r)| *r)
+                .unwrap_or_default(),
+        );
+        return;
+    }
     for (action, area) in &ui_layout.installed_model_actions {
         let active = app.selected_model_is_active();
         let (label, state) = match action {
@@ -1298,7 +1318,14 @@ fn render_runtimes(
     } else {
         "Installed packs, persisted format defaults, and upstream runtimes"
     };
-    frame.render_widget(section_title("Runtimes", subtitle, theme), layout[0]);
+    frame.render_widget(
+        section_title(
+            &format!("Runtimes · {}", app.local_host_label()),
+            subtitle,
+            theme,
+        ),
+        layout[0],
+    );
 
     let summary = [
         ArtifactFormat::Gguf,
@@ -2056,7 +2083,7 @@ fn render_model_profiles(
                 " › ".to_owned()
             }
         } else {
-            format!(" {} ", profile.id)
+            format!(" {} ", app.profile_label(*index))
         };
         let style = if app.selected_model_profile == Some(*index) {
             theme.selected
@@ -2084,13 +2111,35 @@ fn render_model_profiles(
     {
         if let Some(profile) = app.selected_model_profile_value() {
             let model = app.selected_profile_model();
-            let runtime = app
-                .settings_runtime_id
-                .as_ref()
-                .map(|id| runtime_summary(app, id))
-                .unwrap_or_else(|| "Unresolved / missing runtime".to_owned());
+            let runtime = if let Some((_, profile)) = app.selected_remote_profile() {
+                profile.backend.as_ref().map_or_else(
+                    || "Resolved on owner at load".into(),
+                    |b| {
+                        format!(
+                            "{} {}",
+                            b.runtime_id
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_default(),
+                            b.runtime_version.as_deref().unwrap_or("")
+                        )
+                    },
+                )
+            } else {
+                app.settings_runtime_id
+                    .as_ref()
+                    .map(|id| runtime_summary(app, id))
+                    .unwrap_or_else(|| "Unresolved / missing runtime".to_owned())
+            };
             let fields = [
-                ("Profile", profile.id.to_string()),
+                (
+                    "Profile",
+                    format!(
+                        "{} · {}",
+                        app.model_host_label(&profile.model_id),
+                        profile.id
+                    ),
+                ),
                 ("Role", format!("{:?}", profile.role)),
                 (
                     "Model",
@@ -2102,7 +2151,9 @@ fn render_model_profiles(
                 ("Runtime", runtime),
                 (
                     "Configuration",
-                    if app.settings_validation_error.is_some() {
+                    if app.selected_remote_profile().is_some() {
+                        "Owner report · read only".to_owned()
+                    } else if app.settings_validation_error.is_some() {
                         "Next load · invalid (see details)".to_owned()
                     } else {
                         "Next load".to_owned()
@@ -2132,6 +2183,16 @@ fn render_model_profiles(
         }
     }
     render_model_profile_actions(frame, app, theme, ui_layout);
+    if let Some(detail) = app.remote_profile_detail() {
+        frame.render_widget(
+            Paragraph::new(detail)
+                .style(theme.text)
+                .wrap(Wrap { trim: false })
+                .scroll((app.settings_detail_scroll, 0)),
+            ui_layout.settings_list,
+        );
+        return;
+    }
     if app.selected_model_profile_value().is_none() {
         render_settings_input(frame, app, theme, ui_layout);
         return;
@@ -2454,6 +2515,14 @@ fn render_model_profile_actions(
     let has_model = app.selected_profile_model().is_some();
     let active = app.selected_profile_is_active();
     for (action, area) in &ui_layout.model_profile_actions {
+        if app.selected_remote_profile().is_some()
+            && !matches!(
+                action,
+                ModelProfileAction::Load | ModelProfileAction::Unload | ModelProfileAction::Refresh
+            )
+        {
+            continue;
+        }
         let (label, state) = match action {
             ModelProfileAction::Benchmark => (
                 "[ b Run benchmark ]",
@@ -3061,11 +3130,32 @@ fn inspection_body(app: &App) -> Option<String> {
             .or_else(|| app.model_download_jobs.first());
         return Some(job.map_or_else(|| "No download jobs".to_owned(), |job| format!("Job: {}\nReference: {}\nPhase: {:?}\nTransferred: {}\nTotal: {}\nProgress: {}\nRate: {}\nETA: {}\nMessage: {}\n", job.id, job.model_ref, job.phase, format_bytes(job.downloaded_bytes), job.total_bytes.map(format_bytes).unwrap_or_else(|| "Unknown".to_owned()), job.progress_percent.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "Unknown".to_owned()), job.transfer_bytes_per_second.map(|v| format!("{}/s", format_bytes(v as u64))).unwrap_or_else(|| "Unknown".to_owned()), job.estimated_remaining.map(friendly_remaining).unwrap_or_else(|| "Unknown".to_owned()), job.message)));
     }
+    if app.screen == Screen::ModelProfiles
+        && let Some(detail) = app.remote_profile_detail()
+    {
+        return Some(detail);
+    }
     let mut fields: Vec<(&str, String)> = Vec::new();
     match app.screen {
         Screen::Models if app.model_library_view == ModelLibraryView::Installed => {
             let model = app.snapshot.models.get(app.selected_model?)?;
+            if let Some(peer) = app.model_peer(&model.id) {
+                let state = peer.state.as_ref()?;
+                let source = state
+                    .models
+                    .iter()
+                    .find(|m| model.id.0 == format!("{}@{}", m.id, peer.node_id))?;
+                return Some(format!(
+                    "Host: {} ({})\nNode: {}\nModel: {}\nOwner inventory:\n{:#?}\n\nUse Model Profiles to load/unload on the owner. Runtime management stays on its host.",
+                    peer.name,
+                    if peer.reachable { "online" } else { "stale" },
+                    peer.node_id,
+                    source.display_name,
+                    source
+                ));
+            }
             fields.extend([
+                ("Host", app.local_host_label()),
                 ("Model", model.display_name.clone()),
                 ("Artifact ID", model.id.to_string()),
                 ("Path", model.path.display().to_string()),
@@ -3226,7 +3316,13 @@ fn inspection_body(app: &App) -> Option<String> {
             return app
                 .resident_backends()
                 .get(app.overview_selected.unwrap_or_default())
-                .map(|backend| backend_detail(backend));
+                .map(|backend| {
+                    format!(
+                        "Host: {}\n{}",
+                        app.model_host_label(&backend.model_id),
+                        backend_detail(backend)
+                    )
+                });
         }
         Screen::Server => return Some(server_text(app)),
         Screen::Logs => {

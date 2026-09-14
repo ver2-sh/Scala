@@ -142,6 +142,42 @@ impl ControlClient {
         .map(|(_, value)| value)
     }
 
+    pub async fn link_status(&self) -> Result<crate::link::LinkSnapshot, ControlClientError> {
+        self.send(
+            self.client
+                .get(format!(
+                    "{}{}",
+                    self.endpoint,
+                    crate::link::CONTROL_LINK_PATH
+                ))
+                .timeout(STATUS_TIMEOUT),
+            "Link status",
+            STATUS_TIMEOUT,
+        )
+        .await
+        .map(|(_, value)| value)
+    }
+
+    pub async fn link_control(
+        &self,
+        request: crate::link::LinkControlRequest,
+    ) -> Result<crate::link::NodeInventory, ControlClientError> {
+        self.send(
+            self.client
+                .post(format!(
+                    "{}{}",
+                    self.endpoint,
+                    crate::link::CONTROL_LINK_PATH
+                ))
+                .json(&request)
+                .timeout(UNLOAD_TIMEOUT),
+            "Link control (outcome may be unknown after dispatch; inspect owner before retry)",
+            UNLOAD_TIMEOUT,
+        )
+        .await
+        .map(|(_, value)| value)
+    }
+
     pub async fn status(&self) -> Result<ControlStatus, ControlClientError> {
         self.send(
             self.client

@@ -81,6 +81,7 @@ pub struct AppConfig {
     pub server: ServerConfig,
     pub models: ModelConfig,
     pub tui: TuiConfig,
+    pub link: LinkConfig,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub engine: BTreeMap<String, EngineConfig>,
 }
@@ -92,9 +93,18 @@ impl Default for AppConfig {
             server: ServerConfig::default(),
             models: ModelConfig::default(),
             tui: TuiConfig::default(),
+            link: LinkConfig::default(),
             engine: BTreeMap::new(),
         }
     }
+}
+
+/// Optional local Wayfinder integration; no peer state is persisted here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LinkConfig {
+    pub enabled: bool,
+    pub wayfinder_data_dir: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -110,6 +120,11 @@ impl AppConfig {
     }
 
     pub fn resolve_model_paths(&mut self, config_dir: &Path) {
+        if let Some(path) = &mut self.link.wayfinder_data_dir
+            && path.is_relative()
+        {
+            *path = config_dir.join(&*path);
+        }
         for path in &mut self.models.paths {
             if path.is_relative() {
                 *path = config_dir.join(&*path);

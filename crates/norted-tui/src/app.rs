@@ -1,3 +1,5 @@
+#[path = "federation.rs"]
+mod federation;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crossterm::event::{
@@ -413,6 +415,12 @@ pub struct App {
     pub runtime_picker_error: Option<String>,
     pub settings_state: Option<SettingsState>,
     pub model_profiles: Option<ModelProfilesState>,
+    pub link: norted_engine::link::LinkSnapshot,
+    remote_profiles: Vec<(String, ModelProfile)>,
+    remote_backends: Vec<BackendStatus>,
+    remote_models: BTreeMap<ModelId, (String, ModelId)>,
+    pending_link_action: Option<norted_engine::link::LinkControlRequest>,
+    link_control_busy: bool,
     pub settings_error: Option<String>,
     pub settings_loading: bool,
     pub setting_definitions: Vec<SettingDefinition>,
@@ -547,6 +555,12 @@ impl App {
             runtime_picker_error: None,
             settings_state: None,
             model_profiles: None,
+            link: Default::default(),
+            remote_profiles: Vec::new(),
+            remote_backends: Vec::new(),
+            remote_models: BTreeMap::new(),
+            pending_link_action: None,
+            link_control_busy: false,
             settings_error: None,
             settings_loading: true,
             setting_definitions,
@@ -777,6 +791,8 @@ impl App {
             KeyCode::Char('/')
                 if matches!(self.screen, Screen::Settings | Screen::ModelProfiles)
                     && self.focus == FocusArea::Content
+                    && (self.screen != Screen::ModelProfiles
+                        || self.selected_remote_profile().is_none())
                     && !self.settings_busy =>
             {
                 self.begin_settings_command(SettingsInputKind::Search)
@@ -1088,9 +1104,10 @@ impl App {
             .selected_model
             .and_then(|i| self.snapshot.models.get(i))
             .map(|m| m.id.clone());
-        self.selected_model =
-            selected_id.and_then(|id| snapshot.models.iter().position(|m| m.id == id));
         self.snapshot = snapshot;
+        self.project_link();
+        self.selected_model =
+            selected_id.and_then(|id| self.snapshot.models.iter().position(|m| m.id == id));
         self.reconcile_models();
     }
 
@@ -1146,6 +1163,7 @@ impl App {
             .map(|control| control.backends.iter().collect::<Vec<_>>())
             .unwrap_or_default();
         backends.sort_by_key(|backend| backend.generation);
+        backends.extend(self.remote_backends.iter());
         backends
     }
 
@@ -1387,7 +1405,7 @@ impl App {
     }
 
     pub fn control_busy(&self) -> bool {
-        self.control_busy
+        self.control_busy || self.link_control_busy
     }
 
     pub fn take_settings_action(&mut self) -> Option<SettingsAction> {
@@ -1903,9 +1921,10 @@ impl App {
 
     pub fn model_profile_values(&self) -> Vec<&ModelProfile> {
         self.model_profiles
-            .as_ref()
-            .map(|state| state.profiles.values().collect())
-            .unwrap_or_default()
+            .iter()
+            .flat_map(|state| state.profiles.values())
+            .chain(self.remote_profiles.iter().map(|(_, profile)| profile))
+            .collect()
     }
 
     pub fn selected_model_profile_value(&self) -> Option<&ModelProfile> {
@@ -1927,6 +1946,9 @@ impl App {
     }
 
     pub fn model_runtime_picker_available(&self) -> bool {
+        if self.selected_model_is_remote() {
+            return false;
+        }
         self.selected_model
             .and_then(|index| self.snapshot.models.get(index))
             .is_some()
@@ -1951,6 +1973,9 @@ impl App {
     }
 
     pub fn selected_profile_is_active(&self) -> bool {
+        if let Some((_, profile)) = self.selected_remote_profile() {
+            return profile.backend.is_some();
+        }
         self.selected_model_profile_value().is_some_and(|profile| {
             self.control
                 .as_ref()
@@ -2368,10 +2393,16 @@ impl App {
     }
 
     fn apply_control_status(&mut self, source: ControlStatusSource, status: ControlStatus) -> bool {
-        let selected_generation = self
+        let selected_identity = self
             .resident_backends()
             .get(self.overview_selected.unwrap_or_default())
-            .map(|backend| backend.generation);
+            .map(|backend| {
+                (
+                    backend.model_id.clone(),
+                    backend.model_profile_id.clone(),
+                    backend.generation,
+                )
+            });
         let target = match source {
             ControlStatusSource::ControlResult => self
                 .active_control_action
@@ -2401,11 +2432,13 @@ impl App {
             let selected = if backends.is_empty() {
                 None
             } else {
-                selected_generation
-                    .and_then(|generation| {
-                        backends
-                            .iter()
-                            .position(|backend| backend.generation == generation)
+                selected_identity
+                    .and_then(|(model, profile, generation)| {
+                        backends.iter().position(|backend| {
+                            backend.generation == generation
+                                && backend.model_id == model
+                                && backend.model_profile_id == profile
+                        })
                     })
                     .or(Some(
                         self.overview_selected
@@ -3120,6 +3153,9 @@ impl App {
     }
 
     fn request_model_removal(&mut self) -> Update {
+        if self.selected_model_is_remote() {
+            return Update::None;
+        }
         if self.model_removal_busy {
             self.notice = Some("A managed model removal is already in progress".to_owned());
             return Update::Render;
@@ -3199,6 +3235,41 @@ impl App {
     }
 
     fn handle_model_profiles_key(&mut self, key: KeyEvent, layout: &UiLayout) -> Update {
+        if self.selected_remote_profile().is_some() {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.settings_detail_scroll = self.settings_detail_scroll.saturating_sub(1);
+                    return Update::Render;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.settings_detail_scroll = self.settings_detail_scroll.saturating_add(1);
+                    return Update::Render;
+                }
+                KeyCode::PageUp => {
+                    self.settings_detail_scroll = self
+                        .settings_detail_scroll
+                        .saturating_sub(layout.settings_list.height);
+                    return Update::Render;
+                }
+                KeyCode::PageDown => {
+                    self.settings_detail_scroll = self
+                        .settings_detail_scroll
+                        .saturating_add(layout.settings_list.height);
+                    return Update::Render;
+                }
+                _ => {}
+            }
+        }
+        if self.selected_remote_profile().is_some()
+            && !matches!(
+                key.code,
+                KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Char('h' | 'l' | 'u' | 'r' | 'a' | 'i' | '[' | ']')
+            )
+        {
+            return Update::None;
+        }
         if self.settings_busy {
             return Update::None;
         }
@@ -3657,6 +3728,9 @@ impl App {
     }
 
     fn edit_selected_setting(&mut self) -> Update {
+        if self.screen == Screen::ModelProfiles && self.selected_remote_profile().is_some() {
+            return Update::None;
+        }
         let definition = self
             .settings_definitions()
             .get(self.settings_setting_index)
@@ -3781,6 +3855,9 @@ impl App {
     }
 
     fn clear_selected_setting(&mut self) -> Update {
+        if self.screen == Screen::ModelProfiles && self.selected_remote_profile().is_some() {
+            return Update::None;
+        }
         let id = self
             .settings_definitions()
             .get(self.settings_setting_index)
@@ -3829,6 +3906,9 @@ impl App {
     }
 
     fn queue_settings_action(&mut self, action: SettingsAction) -> Update {
+        if self.screen == Screen::ModelProfiles && self.selected_remote_profile().is_some() {
+            return Update::None;
+        }
         self.pending_settings_action = Some(action);
         self.settings_busy = true;
         self.notice = Some("Saving settings…".to_owned());
@@ -3888,6 +3968,9 @@ impl App {
     }
 
     fn delete_selected_profile(&mut self) -> Update {
+        if self.screen == Screen::ModelProfiles && self.selected_remote_profile().is_some() {
+            return Update::None;
+        }
         let Some(profile) = self
             .selected_model_profile_value()
             .map(|profile| profile.id.clone())
@@ -3899,6 +3982,9 @@ impl App {
     }
 
     fn request_profile_delete_from_mouse(&mut self) -> Update {
+        if self.screen == Screen::ModelProfiles && self.selected_remote_profile().is_some() {
+            return Update::None;
+        }
         let Some(profile) = self
             .selected_model_profile_value()
             .map(|profile| profile.id.clone())
@@ -3917,6 +4003,9 @@ impl App {
     }
 
     fn begin_duplicate_profile(&mut self) -> Update {
+        if self.screen == Screen::ModelProfiles && self.selected_remote_profile().is_some() {
+            return Update::None;
+        }
         if self.selected_model_profile_value().is_none() {
             self.notice = Some("Select a Model Profile to duplicate".to_owned());
             return Update::Render;
@@ -3931,35 +4020,39 @@ impl App {
     }
 
     fn cycle_profile_model(&mut self) -> Update {
+        if self.screen == Screen::ModelProfiles && self.selected_remote_profile().is_some() {
+            return Update::None;
+        }
         let Some(profile_id) = self
             .selected_model_profile_value()
             .map(|profile| profile.id.clone())
         else {
             return Update::None;
         };
-        if self.snapshot.models.is_empty() {
-            self.notice = Some("No discovered model artifacts are available".to_owned());
+        let models: Vec<_> = self
+            .snapshot
+            .models
+            .iter()
+            .filter(|m| !self.remote_models.contains_key(&m.id))
+            .collect();
+        if models.is_empty() {
+            self.notice = Some("No local model artifacts are available".into());
             return Update::Render;
         }
         let current = self
             .selected_model_profile_value()
             .map(|profile| &profile.model_id);
         let next = current
-            .and_then(|id| {
-                self.snapshot
-                    .models
-                    .iter()
-                    .position(|model| &model.id == id)
-            })
-            .map(|index| (index + 1) % self.snapshot.models.len())
-            .unwrap_or(0);
-        self.queue_settings_action(SettingsAction::SetProfileModel {
-            profile_id,
-            model: Box::new(self.snapshot.models[next].clone()),
-        })
+            .and_then(|id| models.iter().position(|m| &m.id == id))
+            .map_or(0, |index| (index + 1) % models.len());
+        let model = Box::new(models[next].clone());
+        self.queue_settings_action(SettingsAction::SetProfileModel { profile_id, model })
     }
 
     fn cycle_profile_engine(&mut self) -> Update {
+        if self.screen == Screen::ModelProfiles && self.selected_remote_profile().is_some() {
+            return Update::None;
+        }
         let Some(profile) = self.selected_model_profile_value().cloned() else {
             return Update::None;
         };
@@ -3980,6 +4073,9 @@ impl App {
     }
 
     fn cycle_profile_role(&mut self) -> Update {
+        if self.screen == Screen::ModelProfiles && self.selected_remote_profile().is_some() {
+            return Update::None;
+        }
         let Some(profile) = self.selected_model_profile_value() else {
             return Update::None;
         };
@@ -3989,6 +4085,17 @@ impl App {
     }
 
     fn refresh_selected_model_profile(&mut self) -> Update {
+        if self.selected_remote_profile().is_some() {
+            self.settings_schema = None;
+            self.settings_resolved = None;
+            self.settings_parent = None;
+            self.settings_runtime_id = None;
+            self.settings_validation_error = None;
+            self.settings_input = None;
+            self.settings_detail_scroll = 0;
+            self.profile_actions_open = false;
+            return Update::Render;
+        }
         self.profile_inspection_stale = false;
         self.settings_schema = None;
         self.settings_resolved = None;
@@ -4036,6 +4143,10 @@ impl App {
     }
 
     fn create_profile_for_selected_model(&mut self) -> Update {
+        if self.selected_model_is_remote() {
+            self.notice = Some("Profiles are owned by the model's host. Open Model Profiles to load an existing hosted profile.".into());
+            return Update::Render;
+        }
         if self.settings_loading || self.settings_busy {
             return Update::None;
         }
@@ -4611,6 +4722,9 @@ impl App {
     }
 
     fn open_model_runtime_picker(&mut self) -> Update {
+        if self.selected_model_is_remote() {
+            return Update::None;
+        }
         let Some(model) = self
             .selected_model
             .and_then(|index| self.snapshot.models.get(index))
@@ -4639,6 +4753,9 @@ impl App {
     }
 
     fn request_model_runtime_selection(&mut self) -> Update {
+        if self.selected_model_is_remote() {
+            return Update::None;
+        }
         if self.runtime_mutation_busy {
             self.notice = Some("A runtime operation is already in progress".to_owned());
             return Update::Render;
@@ -4684,6 +4801,9 @@ impl App {
     }
 
     fn request_clear_model_runtime_selection(&mut self) -> Update {
+        if self.selected_model_is_remote() {
+            return Update::None;
+        }
         if self.runtime_mutation_busy {
             self.notice = Some("A runtime operation is already in progress".to_owned());
             return Update::Render;
@@ -4916,6 +5036,9 @@ impl App {
     }
 
     fn open_runtime_search_for_selected_model(&mut self) -> Update {
+        if self.selected_model_is_remote() {
+            return Update::None;
+        }
         if self.runtime_mutation_busy || self.runtime_search_loading {
             self.notice = Some("A runtime operation is already in progress".to_owned());
             return Update::Render;
@@ -5434,6 +5557,9 @@ impl App {
     }
 
     fn request_load(&mut self) -> Update {
+        if self.selected_remote_profile().is_some() {
+            return self.request_remote_control(norted_engine::link::LinkAction::Load);
+        }
         if self.control_busy {
             self.notice = Some("A control operation is already in progress".to_owned());
             return Update::Render;
@@ -5476,6 +5602,13 @@ impl App {
     }
 
     fn request_unload(&mut self) -> Update {
+        if self.screen == Screen::Models && self.selected_model_is_remote() {
+            self.notice = Some("Select the owner's profile in Model Profiles to unload it".into());
+            return Update::Render;
+        }
+        if self.selected_remote_profile().is_some() {
+            return self.request_remote_control(norted_engine::link::LinkAction::Unload);
+        }
         if self.control_busy {
             self.notice = Some("A control operation is already in progress".to_owned());
             return Update::Render;
@@ -5539,6 +5672,23 @@ impl App {
     }
 
     fn request_overview_unload(&mut self) -> Update {
+        if let Some(backend) = self
+            .resident_backends()
+            .get(self.overview_selected.unwrap_or_default())
+            .copied()
+            && let Some((node_id, _)) = self.remote_models.get(&backend.model_id)
+        {
+            let request = norted_engine::link::LinkControlRequest {
+                node_id: node_id.clone(),
+                profile_id: backend.model_profile_id.clone(),
+                action: norted_engine::link::LinkAction::Unload,
+            };
+            if !self.link_control_busy {
+                self.pending_link_action = Some(request);
+                self.link_control_busy = true;
+            }
+            return Update::Render;
+        }
         if self.control_busy {
             self.notice = Some("A control operation is already in progress".to_owned());
             return Update::Render;

@@ -4,6 +4,15 @@ Norted Server is an engine-agnostic local inference control plane composed by th
 
 ## Engine and runtime boundaries
 
+Optional [Norted Link](norted-link.md) federates owner reports over Wayfinder peer
+services. `norted-api` owns the protocol, observational cache and exact-host API
+routing; `norted-engine::link` defines the shared observational/control contracts.
+The runtime manager enforces already-loaded admission for forwarded inference and
+executes remote load/unload through its existing management path. The TUI merges
+observations only in its presentation model; runtime management and persistent
+profile/model stores remain local. There is no model/runtime copying or replicated
+Norted database. Wayfinder alone owns identity, membership and peer connectivity.
+
 An `EngineAdapter` represents implementation knowledge: identity, supported artifact formats and capabilities, model compatibility, runtime probing, launch semantics, readiness, effective settings, and request/event translation. It never implies that only one executable exists.
 
 An `InstalledRuntime` represents one executable package and immutable provenance. Launch input is therefore:
