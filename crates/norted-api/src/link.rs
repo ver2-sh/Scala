@@ -98,7 +98,7 @@ pub(crate) struct Link {
     runtime: Arc<RuntimeManager>,
     dir: PathBuf,
     credential: String,
-    http: reqwest::Client,
+    session: wayfinder::Session,
     hardware: RwLock<String>,
     snapshot: RwLock<LinkSnapshot>,
     slots: Arc<Semaphore>,
@@ -110,7 +110,7 @@ impl Link {
         runtime: Arc<RuntimeManager>,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            dir: wayfinder::capability_path(&core.config.link).unwrap_or_default(),
+            dir: wayfinder::socket_path()?,
             core,
             runtime,
             credential: format!(
@@ -118,11 +118,7 @@ impl Link {
                 uuid::Uuid::new_v4().simple(),
                 uuid::Uuid::new_v4().simple()
             ),
-            http: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|e| e.to_string())?,
+            session: wayfinder::Session::default(),
             hardware: RwLock::new(format!(
                 "{} {}",
                 std::env::consts::OS,
@@ -290,17 +286,13 @@ impl Link {
         }
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
-        let _ = wayfinder::call(&self.http, &self.dir, json!({"op":"unregister_service", "service":LINK_SERVICE, "credential":self.credential})).await;
+        self.session.disconnect().await;
         Ok(())
     }
     async fn refresh(&self, address: std::net::SocketAddr) -> Result<()> {
-        if self.dir.as_os_str().is_empty() {
-            return Err("Select a capability in Norted Link setup, then restart Norted".into());
-        }
-        let status: wayfinder::Status = serde_json::from_value(
-            wayfinder::call(&self.http, &self.dir, json!({"op":"status"})).await?,
-        )
-        .map_err(|e| e.to_string())?;
+        let status: wayfinder::Status =
+            serde_json::from_value(self.session.call(&self.dir, json!({"op":"status"})).await?)
+                .map_err(|e| e.to_string())?;
         let local = status
             .nodes
             .iter()
@@ -320,7 +312,7 @@ impl Link {
         if status.conflict {
             return Err("Wayfinder membership conflict; federation unavailable".into());
         }
-        wayfinder::call(&self.http, &self.dir, json!({"op":"register_service", "service":LINK_SERVICE, "address":address, "credential":self.credential})).await?;
+        self.session.call(&self.dir, json!({"op":"register_service", "service":LINK_SERVICE, "address":address, "credential":self.credential})).await?;
         self.snapshot.write().await.error = None;
         let refresh = stream::iter(status.nodes.into_iter().filter(|n| !n.local).map(
             |node| async move {

@@ -5,7 +5,7 @@ use norted_engine::link::{LinkAction, LinkControlRequest, LinkPeer, LinkProfile,
 impl App {
     pub fn link_detail(&self) -> String {
         let mut text = format!(
-            "Norted Link: {}\nWayfinder: {}\nLocal node: {}\nNode ID: {}\nNorted peers: {} online / {} known\n\nSetup (applies after Norted restart)\nConfigured: {}\nService: norted.link.v1\nCapability: {}\n\nWayfinder provides secure service streams. Configure norted.link.v1 with Wayfinder services add, then select its capability here.\ne Select capability and enable · x Disable · D Scrollable details\n",
+            "Norted Link: {}\nWayfinder: {}\nLocal node: {}\nNode ID: {}\nNorted peers: {} online / {} known\n\nConfigured: {} (applies after Norted restart)\nAutomatic local registration and reconnection.\ne Enable · x Disable · D Scrollable details\n",
             if self.link.enabled {
                 "enabled"
             } else {
@@ -14,9 +14,9 @@ impl App {
             if !self.link.enabled {
                 "not connected (Link disabled)"
             } else if self.link.error.is_some() {
-                "unavailable / setup error"
+                "not detected"
             } else if self.link.node_id.is_some() {
-                "available"
+                "connected"
             } else {
                 "connecting"
             },
@@ -29,18 +29,7 @@ impl App {
             } else {
                 "disabled"
             },
-            self.link_config
-                .wayfinder_peer_service
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "not selected".into())
         );
-        if let Some(input) = &self.link_input {
-            text.insert_str(
-                0,
-                &format!("Capability path (Enter saves, Esc cancels):\n{input}\n\n"),
-            );
-        }
         if let Some(error) = &self.link.error {
             text.insert_str(0, &format!("Action needed: {error}\n\n"));
         }
@@ -54,6 +43,14 @@ impl App {
                     .as_deref()
                     .unwrap_or("Compatible Norted Link peer")
             ));
+            if let Some(state) = &peer.state {
+                text.push_str(&format!(
+                    "{}\nModels: {} · Profiles: {}\n",
+                    state.hardware,
+                    state.models.len(),
+                    state.profiles.len()
+                ));
+            }
         }
         text
     }

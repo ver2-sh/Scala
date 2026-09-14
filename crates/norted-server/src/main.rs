@@ -81,15 +81,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "configured": core.config.link, "observed": observed,
-                        "setup": "Configure norted.link.v1 in Wayfinder, then use link enable --capability PATH. Changes apply when Norted restarts."
+                        "setup": "Link machines in Wayfinder, then use link enable and start Norted. Registration and reconnection are automatic."
                     }))?
                 );
             }
-            cli::LinkCommand::Enable { capability } => {
-                let config = norted_core::LinkConfig {
-                    enabled: true,
-                    wayfinder_peer_service: Some(capability),
-                };
+            cli::LinkCommand::Enable => {
+                let config = norted_core::LinkConfig { enabled: true };
                 config
                     .save(&core.paths)
                     .map_err(|e| color_eyre::eyre::eyre!(e))?;

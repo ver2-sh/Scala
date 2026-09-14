@@ -35,46 +35,28 @@ benchmark summaries. These observations never configure the receiving host.
    link their distinct Wayfinder identities using its normal invitation workflow.
    Both advertised peer endpoints must be reachable. Norted does not add IP
    configuration, NAT traversal or a second network.
-2. Configure a generic Wayfinder service on each machine:
+2. Set only this Norted configuration (or run `norted-server link enable`):
 
-   ```sh
-   wayfinder services add norted.link.v1 --capability /var/lib/wayfinder-app/link.json
-   wayfinder daemon
-   # wayfinder tui loads the same configured services when it starts a daemon.
+   ```toml
+   [link]
+   enabled = true
    ```
 
-   Create the parent outside Wayfinder's private directory, writable only by its
-   administrator. For a separate Norted account use `--group GID` with a dedicated
-   application group and grant directory traversal. Wayfinder reapplies mode 0640
-   and that group each restart; without a group the descriptor is 0600.
-   Configure services before startup, or restart Wayfinder to apply changes.
+3. Start Norted. Wayfinder and Norted must run under the same Linux OS account
+   and runtime environment. Norted automatically discovers the generic local
+   application socket and registers `norted.link.v1`. No address, credential,
+   capability file or application setup in Wayfinder is needed.
 
-   In Norted's **Norted Link** screen, press `e`, enter that absolute capability
-   path and press Enter to enable. Press `x` to disable. Alternatively:
+The **Norted Link** screen shows connection state, full local node ID and peer
+observations. Press `e` to enable or `x` to disable; `norted-server link status`
+reports saved configuration and observed state. Saved enable/disable changes
+apply when Norted starts. Wayfinder does not need a restart.
 
-   ```sh
-   norted-server link enable --capability /var/lib/wayfinder-app/link.json
-   norted-server link status
-   norted-server link disable
-   ```
-
-   The screen distinguishes configured settings from the running Link state and
-   shows Wayfinder availability, full local node ID, online/stale peers and setup
-   errors. Selection is explicit: Norted never searches Wayfinder private files.
-   This saves `[link]` in Norted configuration; manual TOML editing is unnecessary.
-   Credentials rotate safely because Norted rereads the selected descriptor.
-   The capability permits only sanitized node discovery and `norted.link.v1`
-   registration/open, never Wayfinder administration or MCP. Never share identity
-   directories or copy credentials between machines.
-3. Restart each Norted server after changing configuration. Use each machine's
-   normal local runtime and model/profile setup, then load a profile. The TUI's
-   Overview, Models and Model Profiles show host labels and owner-reported state.
-   In Model Profiles, select the desired host's profile and use Load/Unload or
-   `l`/`u`. The host resolves its own runtime and profile settings.
-4. Query `/v1/models` on either Norted API and use an advertised model alias in
-   Chat Completions, Responses, Completions or Embeddings. Existing local API
-   authentication applies before federation routing. No remote API key is needed
-   because the private peer channel is authorized through Wayfinder membership.
+Load each owner's normal local profile, or select a remote profile in the TUI
+and use `l`/`u`. Overview, Models and Model Profiles show host labels and owner
+state; Runtime screens stay local. Query `/v1/models` and use an advertised alias
+in Chat Completions, Responses, Completions or supported Embeddings. Existing
+local API authentication applies before routing.
 
 The setting defaults to disabled. With Link disabled, local serving behaves as
 before. With Link enabled but Wayfinder unavailable, local serving remains
@@ -109,21 +91,26 @@ semantics: equivalent artifacts pass through the same adapters and validation.
 
 ## Discovery and freshness
 
-Norted reads the local Wayfinder control descriptor, observes its stable ID and
-membership, and registers `norted.link.v1` at an ephemeral authenticated loopback
-service. The application registration has a fresh random credential, distinct
-from public Norted API keys and Wayfinder's MCP token.
+Norted connects to `$XDG_RUNTIME_DIR/wayfinder/app.sock`, falling back to
+`/run/user/<uid>/wayfinder/app.sock` when that directory exists, otherwise
+`/tmp/wayfinder-<uid>/wayfinder/app.sock`. It reads no Wayfinder private state or
+control descriptor. Linux Unix socket permissions and peer credentials authorize
+the local application session. Dynamic transport is unsupported on Windows/macOS.
 
-The refresh loop renews registration and queries reachable Wayfinder members for
-Norted state. It waits three seconds between cycles, queries up to eight peers
-concurrently, limits an individual observation to four seconds and a peer sweep
-to ten seconds. A member without a responding Norted service does not appear as
-an active Norted peer. A responding incompatible inventory is shown unavailable.
-Known peer observations become stale after 15 seconds without successful refresh;
-failed observations are marked unavailable immediately. Removed Wayfinder members
-are removed from the observation cache. Reconnect discovers current state without
-restoring peer files. After an application crash its old Wayfinder registration
-may remain until the 60-second lease expires.
+Norted keeps a registration session open and binds an ephemeral authenticated
+loopback listener for incoming streams. Its randomly generated registration
+credential has no Wayfinder MCP or administration authority. Registrations are
+owned by the session, disappear on disconnect or process exit, and are never
+persisted. Norted reconnects and re-registers after Wayfinder starts or restarts.
+No operator action is required; local serving remains available during loss.
+
+The refresh loop waits three seconds between cycles, queries up to eight peers
+concurrently, limits individual observations to four seconds and a sweep to ten
+seconds. A node without a responding Norted service never becomes a Norted peer.
+Known peer observations become stale after 15 seconds; failed observations are
+marked unavailable immediately. Removed members leave the observation cache.
+Reconnection discovers current state without restoring peer files or replaying
+inference/control operations.
 
 The TUI and API read cached remote observations, so a dead peer does not block
 their local state reads. API dispatch rechecks the authoritative owner; cached
@@ -170,7 +157,7 @@ source; unrelated local clients cannot accidentally share those leases.
 ## Protocol and limits
 
 Wayfinder owns connectivity, peer authentication, membership and byte transport.
-Norted consumes only its local control/service contract, with no Rust dependency
+Norted consumes only its generic local application contract, with no Rust dependency
 on Wayfinder internals. See Wayfinder's `docs/peer-services.md`.
 
 After the authenticated Wayfinder service preface and ready reply, one Norted

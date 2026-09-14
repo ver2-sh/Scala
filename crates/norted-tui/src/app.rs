@@ -420,7 +420,6 @@ pub struct App {
     pub model_profiles: Option<ModelProfilesState>,
     pub link: norted_engine::link::LinkSnapshot,
     pub link_config: norted_core::LinkConfig,
-    pub link_input: Option<String>,
     pub pending_link_config: Option<norted_core::LinkConfig>,
     remote_profiles: Vec<(String, ModelProfile)>,
     remote_backends: Vec<BackendStatus>,
@@ -563,7 +562,6 @@ impl App {
             model_profiles: None,
             link: Default::default(),
             link_config: Default::default(),
-            link_input: None,
             pending_link_config: None,
             remote_profiles: Vec::new(),
             remote_backends: Vec::new(),
@@ -624,24 +622,6 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Update::Quit;
         }
-        if let Some(input) = &mut self.link_input {
-            match key.code {
-                KeyCode::Esc => self.link_input = None,
-                KeyCode::Backspace => {
-                    input.pop();
-                }
-                KeyCode::Char(c) if !c.is_control() && input.len() < 4096 => input.push(c),
-                KeyCode::Enter => {
-                    self.pending_link_config = Some(norted_core::LinkConfig {
-                        enabled: true,
-                        wayfinder_peer_service: Some(std::path::PathBuf::from(input.trim())),
-                    });
-                    self.link_input = None;
-                }
-                _ => {}
-            }
-            return Update::Render;
-        }
         if self.screen == Screen::Link
             && self.focus == FocusArea::Content
             && self.overlay.is_none()
@@ -649,13 +629,7 @@ impl App {
         {
             match key.code {
                 KeyCode::Char('e') => {
-                    self.link_input = Some(
-                        self.link_config
-                            .wayfinder_peer_service
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_default(),
-                    );
+                    self.pending_link_config = Some(norted_core::LinkConfig { enabled: true });
                     return Update::Render;
                 }
                 KeyCode::Char('x') => {
@@ -1053,14 +1027,6 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> Update {
-        if let Some(input) = &mut self.link_input {
-            input.extend(
-                text.chars()
-                    .filter(|c| !c.is_control())
-                    .take(4096 - input.len().min(4096)),
-            );
-            return Update::Render;
-        }
         let normalized = text.replace(['\r', '\n', '\t'], " ");
         if self.detail_text.is_some() {
             return Update::None;

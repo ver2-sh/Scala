@@ -2,27 +2,17 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
-    net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    net::UnixStream,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
 pub const HEADER_LIMIT: usize = 16384;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Descriptor {
-    version: u32,
-    service: String,
-    address: SocketAddr,
-    service_address: SocketAddr,
-    credential: String,
-}
 #[derive(Clone, Deserialize)]
 pub struct Node {
     pub id: String,
@@ -36,78 +26,77 @@ pub struct Status {
     pub conflict: bool,
 }
 
-pub fn capability_path(config: &norted_core::LinkConfig) -> Result<PathBuf> {
-    config
-        .wayfinder_peer_service
-        .clone()
-        .ok_or_else(|| "Select a Wayfinder capability in Norted Link setup".into())
-}
-pub async fn descriptor(dir: &Path) -> Result<Descriptor> {
-    let path = dir;
-    let metadata = tokio::fs::symlink_metadata(&path)
-        .await
-        .map_err(|_| "Wayfinder capability is missing or unreadable: start Wayfinder and check the selected path/application group".to_owned())?;
-    if !metadata.is_file() || metadata.len() > HEADER_LIMIT as u64 {
-        return Err("Invalid Wayfinder peer-service descriptor".into());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o027 != 0 {
-            return Err("Wayfinder peer-service descriptor must be owner-only (0600) or application-group readable (0640)".into());
-        }
-    }
-    let bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
-    let d: Descriptor = serde_json::from_slice(&bytes)
-        .map_err(|_| "Wayfinder peer service v1 support is required".to_owned())?;
-    if d.version != 1
-        || d.service != "norted.link.v1"
-        || !d.address.ip().is_loopback()
-        || !d.service_address.ip().is_loopback()
-        || d.credential.len() != 64
-        || !d.credential.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return Err("Invalid Wayfinder peer-service descriptor".into());
-    }
-    Ok(d)
-}
-pub async fn call(http: &reqwest::Client, dir: &Path, operation: Value) -> Result<Value> {
-    let d = descriptor(dir).await?;
-    let mut response = http
-        .post(format!("http://{}/peer-service", d.address))
-        .bearer_auth(d.credential)
-        .json(&operation)
-        .timeout(Duration::from_secs(4))
-        .send()
-        .await
+pub fn socket_path() -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/proc/self")
         .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-        if bytes.len() + chunk.len() > 128 * 1024 {
-            return Err("Wayfinder peer-service response too large".into());
-        }
-        bytes.extend_from_slice(&chunk);
+        .uid();
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let run = PathBuf::from(format!("/run/user/{uid}"));
+            if run.is_dir() {
+                run
+            } else {
+                PathBuf::from(format!("/tmp/wayfinder-{uid}"))
+            }
+        });
+    if !runtime.is_absolute() {
+        return Err("Runtime directory must be absolute".into());
     }
-    let reply: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if let Some(error) = reply["error"].as_str() {
-        return Err(error.to_owned());
-    }
-    reply
-        .get("value")
-        .cloned()
-        .ok_or_else(|| "Invalid Wayfinder peer-service reply".into())
+    Ok(runtime.join("wayfinder/app.sock"))
 }
-pub async fn open(dir: &Path, target: &str, service: &str) -> Result<TcpStream> {
-    let d = descriptor(dir).await?;
-    let mut stream = TcpStream::connect(d.service_address)
+async fn connect(path: &Path) -> Result<UnixStream> {
+    use std::os::unix::fs::MetadataExt;
+    let stream = UnixStream::connect(path)
         .await
-        .map_err(|_| "Wayfinder service transport unavailable before dispatch".to_owned())?;
-    stream.set_nodelay(true).map_err(|e| e.to_string())?;
+        .map_err(|_| "Wayfinder: not detected".to_owned())?;
+    let uid = std::fs::metadata("/proc/self")
+        .map_err(|e| e.to_string())?
+        .uid();
+    if stream.peer_cred().map_err(|e| e.to_string())?.uid() != uid {
+        return Err("Wayfinder application socket belongs to another user".into());
+    }
+    Ok(stream)
+}
+#[derive(Default)]
+pub struct Session {
+    stream: tokio::sync::Mutex<Option<UnixStream>>,
+}
+impl Session {
+    pub async fn call(&self, path: &Path, operation: Value) -> Result<Value> {
+        let mut session = self.stream.lock().await;
+        let result = tokio::time::timeout(Duration::from_secs(4), async {
+            if session.is_none() {
+                *session = Some(connect(path).await?);
+            }
+            let stream = session.as_mut().unwrap();
+            write_json(stream, &operation, HEADER_LIMIT).await?;
+            let reply: Value = read_json(stream, 128 * 1024).await?;
+            if let Some(error) = reply["error"].as_str() {
+                return Err(error.to_owned());
+            }
+            reply
+                .get("value")
+                .cloned()
+                .ok_or_else(|| "Invalid Wayfinder reply".into())
+        })
+        .await
+        .unwrap_or_else(|_| Err("Wayfinder application request timed out".into()));
+        if result.is_err() {
+            *session = None;
+        }
+        result
+    }
+    pub async fn disconnect(&self) {
+        *self.stream.lock().await = None;
+    }
+}
+pub async fn open(path: &Path, target: &str, service: &str) -> Result<UnixStream> {
+    let mut stream = connect(path).await?;
     write_json(
         &mut stream,
-        &json!({"version":1, "credential":d.credential, "target":target, "service":service}),
+        &json!({"op":"open_service", "target":target, "service":service}),
         HEADER_LIMIT,
     )
     .await?;
@@ -120,12 +109,15 @@ pub async fn open(dir: &Path, target: &str, service: &str) -> Result<TcpStream> 
     }
     Ok(stream)
 }
-pub async fn read_json<T: DeserializeOwned>(stream: &mut TcpStream, limit: usize) -> Result<T> {
+pub async fn read_json<T: DeserializeOwned>(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    limit: usize,
+) -> Result<T> {
     let bytes = read_frame(stream, limit).await?;
     serde_json::from_slice(&bytes).map_err(|_| "Malformed protocol JSON".into())
 }
 pub async fn write_json<T: Serialize>(
-    stream: &mut TcpStream,
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
     value: &T,
     limit: usize,
 ) -> Result<()> {
@@ -135,7 +127,10 @@ pub async fn write_json<T: Serialize>(
     }
     write_frame(stream, &bytes).await
 }
-pub async fn read_frame(stream: &mut TcpStream, limit: usize) -> Result<Vec<u8>> {
+pub async fn read_frame(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    limit: usize,
+) -> Result<Vec<u8>> {
     let len = stream.read_u32().await.map_err(|_| {
         "Peer disconnected before response completed; outcome may be unknown; no retry".to_owned()
     })? as usize;
@@ -149,7 +144,10 @@ pub async fn read_frame(stream: &mut TcpStream, limit: usize) -> Result<Vec<u8>>
         .map_err(|_| "Peer disconnected during response; no retry".to_owned())?;
     Ok(bytes)
 }
-pub async fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+pub async fn write_frame(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    bytes: &[u8],
+) -> Result<()> {
     stream
         .write_u32(bytes.len() as u32)
         .await

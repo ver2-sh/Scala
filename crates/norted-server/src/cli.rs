@@ -416,11 +416,8 @@ impl From<BenchmarksCommand> for norted_engine::benchmark::BenchmarkRequest {
 #[derive(Debug, Subcommand)]
 pub enum LinkCommand {
     Status,
-    /// Select the scoped norted.link.v1 capability and enable on next server start
-    Enable {
-        #[arg(long)]
-        capability: std::path::PathBuf,
-    },
+    /// Enable automatic Wayfinder integration on next server start
+    Enable,
     /// Disable Link on next server start
     Disable,
 }
