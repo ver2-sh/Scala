@@ -118,13 +118,12 @@ update_server() {
   echo
   build_server
   echo
-  "${SUDO[@]}" systemctl restart "$UNIT_NAME"
-  "${SUDO[@]}" systemctl is-active --quiet "$UNIT_NAME"
+  install_unit --built
   echo "Norted Server updated and restarted."
 }
 
 install_unit() {
-  build_server
+  if [[ "${1:-}" != --built ]]; then build_server; fi
 
   local run_user run_group home_dir tmp_unit backup_unit
   local old_unit_exists=0 old_active=0 old_enabled=0 rollback_needed=0
@@ -136,6 +135,9 @@ install_unit() {
     echo "Could not determine home directory for ${run_user}." >&2
     exit 1
   }
+
+  # Shared OS contract; membership grants application transport only.
+  getent group wayfinder-apps >/dev/null || "${SUDO[@]}" groupadd --system wayfinder-apps
 
   tmp_unit="$(mktemp)"
   backup_unit="$(mktemp)"
@@ -151,6 +153,7 @@ Wants=network-online.target
 Type=simple
 User=${run_user}
 Group=${run_group}
+SupplementaryGroups=wayfinder-apps
 WorkingDirectory=${SERVER_DIR}
 Environment=HOME=${home_dir}
 ExecStart=${BINARY} serve

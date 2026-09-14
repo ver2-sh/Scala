@@ -5,10 +5,13 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[cfg(target_os = "linux")]
+use tokio::net::UnixStream;
+// Unsupported platforms retain local serving; no local transport is opened.
+#[cfg(not(target_os = "linux"))]
+use tokio::io::DuplexStream as UnixStream;
 
 pub type Result<T> = std::result::Result<T, String>;
 pub const HEADER_LIMIT: usize = 16384;
@@ -27,37 +30,49 @@ pub struct Status {
 }
 
 pub fn socket_path() -> Result<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-    let uid = std::fs::metadata("/proc/self")
-        .map_err(|e| e.to_string())?
-        .uid();
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let run = PathBuf::from(format!("/run/user/{uid}"));
-            if run.is_dir() {
-                run
-            } else {
-                PathBuf::from(format!("/tmp/wayfinder-{uid}"))
-            }
-        });
+        // A normal login has XDG_RUNTIME_DIR even when Wayfinder is a system
+        // service. Only select a personal/development endpoint if provisioned.
+        .filter(|runtime| runtime.join("wayfinder").is_dir())
+        .unwrap_or_else(|| PathBuf::from("/run"));
     if !runtime.is_absolute() {
         return Err("Runtime directory must be absolute".into());
     }
     Ok(runtime.join("wayfinder/app.sock"))
 }
+#[cfg(target_os = "linux")]
 async fn connect(path: &Path) -> Result<UnixStream> {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    // The protected directory is the trust anchor, not the application's UID.
+    // Authorized applications may connect but cannot replace the daemon socket.
+    let dir = path.parent().ok_or("Missing application directory")?;
+    let runtime = dir.parent().ok_or("Missing runtime parent")?;
+    let parent = std::fs::symlink_metadata(runtime).map_err(|e| e.to_string())?;
+    let directory = std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
+    let socket = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if !parent.is_dir()
+        || (parent.uid() != 0 && parent.uid() != directory.uid())
+        || parent.mode() & 0o022 != 0
+        || !directory.is_dir()
+        || directory.mode() & 0o027 != 0
+        || !socket.file_type().is_socket()
+        || socket.uid() != directory.uid()
+        || socket.mode() & 0o007 != 0
+    {
+        return Err("Untrusted Wayfinder application endpoint permissions".into());
+    }
     let stream = UnixStream::connect(path)
         .await
-        .map_err(|_| "Wayfinder: not detected".to_owned())?;
-    let uid = std::fs::metadata("/proc/self")
-        .map_err(|e| e.to_string())?
-        .uid();
-    if stream.peer_cred().map_err(|e| e.to_string())?.uid() != uid {
-        return Err("Wayfinder application socket belongs to another user".into());
+        .map_err(|_| "Wayfinder: not detected or local application access denied".to_owned())?;
+    if stream.peer_cred().map_err(|e| e.to_string())?.uid() != directory.uid() {
+        return Err("Wayfinder peer does not own the protected application directory".into());
     }
     Ok(stream)
+}
+#[cfg(not(target_os = "linux"))]
+async fn connect(_path: &Path) -> Result<UnixStream> {
+    Err("Wayfinder local applications require Linux".into())
 }
 #[derive(Default)]
 pub struct Session {
@@ -153,4 +168,39 @@ pub async fn write_frame(
         .await
         .map_err(|e| e.to_string())?;
     stream.write_all(bytes).await.map_err(|e| e.to_string())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[tokio::test]
+    async fn endpoint_trust_rejects_replacement_and_exposure() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("wayfinder");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o2750)).unwrap();
+        let path = directory.join("app.sock");
+        let _listener = tokio::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(connect(&path).await.is_ok());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        assert!(
+            connect(&path).await.is_err(),
+            "applications could replace endpoint"
+        );
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o2750)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(connect(&path).await.is_err(), "world-authorized socket");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&directory, &alias).unwrap();
+        assert!(
+            connect(&alias.join("app.sock")).await.is_err(),
+            "symlink endpoint directory"
+        );
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(connect(&path).await.is_err(), "unprotected runtime parent");
+    }
 }
