@@ -1,90 +1,82 @@
-# Norted Link integration validation — 2026-09-14
+# Norted Link dynamic integration validation — 2026-09-14
 
-Inspected and fetched both clean repositories before editing: Norted-Server
-`763b315` and Wayfinder `ed6da2d` matched their upstream master branches. No changes
-were pushed. No repository tests were added.
+Inspected clean Norted-Server `e176a07` and Wayfinder `9d31fba`, fetched both
+remotes, and confirmed both matched upstream before editing. No changes pushed.
 
-## Implemented boundary and setup
+## Final setup and boundary
 
-Wayfinder persists generic local application-service records and delivers only
-service-scoped capabilities. Its CLI configures arbitrary services; its TUI shows
-configured and active access. Both daemon startup paths load the same set. Group
-read access is reapplied during atomic publication and credentials rotate at
-restart. Service configuration changes apply on the next daemon start.
+The Link configuration is exactly `LinkConfig { enabled: bool }`. Enable with
+`norted-server link enable`, the Link screen's `e`, or:
 
-Norted's Link screen and `link enable --capability PATH`, `link disable` and
-`link status` commands replace manual configuration as the normal setup flow.
-The screen distinguishes saved configuration from running state. Norted restart
-applies changes. Explicit capability selection avoids private-directory probing.
-An enabled Link with no selected capability reports an actionable error while
-local serving remains available. Group-readable descriptors are accepted only
-without group write or world access.
+```toml
+[link]
+enabled = true
+```
 
-The service/inference wire protocol is unchanged. Norted owns peer classification,
-owner hardware/model/profile/runtime reports, remote load/unload and inference.
-Only compatible responding services enter its peer list. Hardware summary now
-includes detected total VRAM, with unknown preserved. Model/runtime stores,
-provenance behavior, engines and their local execution logic were not changed.
+Start Norted beside Wayfinder under the same Linux account/runtime environment.
+Norted discovers the public Unix application socket and owns a live registration
+for `norted.link.v1`. No descriptor, private-state scan, admin token or persistent
+Wayfinder application setup is involved. Disconnection removes registration;
+Wayfinder startup/restart causes automatic reconnection and registration.
+The peer protocol, routing, runtime manager and adapter behavior are preserved.
 
-## Workspace checks
+## Checks and real integration
 
-Both `./validate.sh` scripts passed formatting, workspace check, Clippy with
+Both `./validate.sh` scripts passed formatting, workspace checking, Clippy with
 warnings denied and workspace tests. Norted: 214 passed, zero failed, one existing
-ignored. Wayfinder: no repository test cases. Norted all-feature/all-target Clippy
-also passed. Norted debug executable and Wayfinder release executable built.
-`git diff --check` and Wayfinder service-script shell syntax checks passed.
+ignored. Norted all-feature/all-target Clippy passed. Debug and release builds
+were produced. `git diff --check` passed in both repositories.
 
-## Real isolated integration
+Isolated real processes used fresh Wayfinder identities, separate Norted config,
+state and profiles, and an existing llama.cpp binary plus the existing standalone
+Grep Qwen3.5 4B GGUF. No model or runtime files were copied. This tests protocol
+behavior without changing production profiles or generating benchmark evidence.
 
-External drivers and captures live at
-`/srv/norted/scratch/norted-link-iteration`, outside both repositories. Two fresh
-Wayfinder identities and two independently configured Norted processes used the
-actual encrypted transport and an existing llama.cpp binary/GGUF on one Linux
-host. Separate profiles referenced the existing files; no model/runtime bytes
-were copied. Production services were not targeted.
+- Generic Wayfinder integration: 29 assertions, including unrelated echo service,
+  encrypted bidirectional transport, session lifetime, crash/restart recovery,
+  peer credentials and application/admin/MCP separation.
+- `smoke.py`: 42 assertions in both directions covering owner inventory,
+  qualified/unqualified routing, Chat Completions, Responses and Completions in
+  streaming and non-streaming forms, terminal/usage behavior, Embeddings capability
+  rejection, streaming/non-streaming cancellation, remote load/unload and no JIT.
+- `failures.py`: 42 assertions covering invalid source/target/hops/version,
+  forbidden protocol operations, bounded frames, exact routing, deterministic
+  duplicate aliases, removed owner profiles, interrupted streams, stale peers,
+  local inference during Wayfinder loss, reconnect, and unchanged owner stores.
+- `lifecycle.py`: 20 assertions covering enabled-only configuration, dynamic
+  registration, a third Wayfinder-only node excluded from Norted peers, abrupt
+  Norted process death, automatic re-registration after restart, and both
+  Wayfinder daemons disappearing and returning without configuration steps.
+- Private mount namespaces mask Wayfinder's entire private state directory from
+  both Norted processes. Neither can see identity/config/state/control files;
+  federation still registers, discovers and serves through the public socket.
+  The full 42-check inference smoke suite passed again with both directories hidden.
+- TUI federation: 16 action assertions covering remote profile selection,
+  load/unload, preserved local backend/profile state and local-only Runtime views.
+- Link screen: 12 assertions covering full local IDs, peers, configured/running
+  state, simple enable/disable, no path prompt, compact layout and local serving
+  while Wayfinder is absent.
+- Wayfinder TUI: four assertions for automatic application sockets in owned and
+  attached daemon flows and the generic observational Services view.
+- Cleanup: 14 assertions confirming federated captures, removal of registrations,
+  sockets and descriptors, and closure of isolated public listeners.
 
-Both Norted processes ran in private mount namespaces masking Wayfinder's
-identity/config/state/control directory. A separate Unix UID also accessed a
-service capability through its configured group while private files rejected
-reads. The application API exposes only sanitized generic nodes, not private
-identity or administration data.
+Scripts, captures and detailed logs are retained at
+`/srv/norted/scratch/norted-link-dynamic/` outside both repositories.
 
-- `security.py`: 60 assertions, including generic unrelated service registration,
-  bidirectional encrypted echo, separate credentials, admin/MCP rejection,
-  cross-service scope rejection and managed group access by a separate UID.
-- `lifecycle.py`: 18 assertions, including persistent arbitrary services, actual
-  cross-service credential rejection, ordinary restart rotation, retained group
-  permissions, crash recovery, TUI-owned/attached daemon behavior, removal on
-  restart and a third generic member absent from both Norted peer lists.
-- `smoke.py`: 42 assertions in both directions: discovery and owner inventory,
-  qualified/unqualified inference, nonstreaming and SSE Chat Completions,
-  Responses and Completions, owner embedding capability rejection, streamed and
-  nonstreamed cancellation, remote load/unload, no remote JIT and refresh.
-- `failures.py`: 44 assertions: exact target/hop/source/version validation,
-  deterministic duplicate aliases, no owner-removal fallback, interrupted stream
-  errors, stale peers, local inference during Wayfinder loss, restored federation
-  after reconnect and intact independent model/profile/runtime stores.
-- `tui.py` captures plus `tui-actions.py`: 16 action assertions confirming
-  federated Overview/Models/Profiles, remote load/unload and local-only runtime
-  management without local profile mutation.
-- `link-ui.py`: 14 assertions covering Link status and full IDs on both machines,
-  explicit capability input, enable/disable persistence, configured-versus-running
-  status, preservation of other configuration tables, 80×24 input visibility and
-  local serving with missing capability configuration.
-- `cleanup.py`: 12 assertions for federated captures and clean isolated process,
-  descriptor and listener shutdown.
+## Actual host config and limits
 
-The final daemon executable was also restarted on both nodes before repeating
-security and inference checks. An immediate smoke attempt reached a cached
-pre-restart peer observation before registration recovered; repeating after
-normal discovery renewal passed. Operations are not retried or rerouted by the
-product during that unavailable interval.
+Appended only `[link] enabled = true` to
+`/root/.config/nortedserver/config.toml`. All existing configuration bytes were
+preserved, including server/API and model paths. Runtime selections, Model
+Profiles, NInfer/DFlash2/Vision/Grep settings and benchmark files were untouched.
+Existing host services were not restarted; the new binaries are available for
+the one-time version upgrade. Normal later Norted installation/configuration
+requires no Wayfinder restart.
 
-## Limits and operational choices
-
-No second physical machine was available for this validation. LAN/firewall and
-Windows/macOS deployment remain unvalidated. Native inference used llama.cpp;
-q27/NInfer/DFlash2/vision remained covered by existing workspace contracts, not
-new hardware generations. The fixture rejects embeddings; successful embedding
-generation is not claimed. Setup changes intentionally require the relevant
-process restart; active/configured state and pending removal are explicit.
+The available host Wayfinder is standalone, with no linked physical second node;
+no server/gaming-PC physical smoke test is claimed. Windows/macOS dynamic transport
+is unsupported. Native inference exercised llama.cpp; q27, NInfer, DFlash2, Vision
+and provenance semantics remain covered by their existing workspace contracts,
+not new hardware inference runs. The fixture rejects Embeddings; successful
+embedding generation is not claimed. No blocking implementation issue was found.

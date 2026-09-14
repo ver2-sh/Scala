@@ -104,24 +104,12 @@ impl Default for AppConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct LinkConfig {
     pub enabled: bool,
-    pub wayfinder_peer_service: Option<PathBuf>,
 }
 
 impl LinkConfig {
     /// Edit only the Link table; runtime/model configuration remains owner-managed.
     pub fn save(&self, paths: &AppPaths) -> std::result::Result<(), String> {
         use std::io::Write;
-        if self.enabled
-            && !self
-                .wayfinder_peer_service
-                .as_ref()
-                .is_some_and(|p| p.is_absolute())
-        {
-            return Err(
-                "Select an absolute Wayfinder application capability path before enabling Link"
-                    .into(),
-            );
-        }
         let save = || -> std::result::Result<(), Box<dyn std::error::Error>> {
             fs::create_dir_all(&paths.config_dir)?;
             let lock = fs::OpenOptions::new()
@@ -163,11 +151,6 @@ impl AppConfig {
     }
 
     pub fn resolve_model_paths(&mut self, config_dir: &Path) {
-        if let Some(path) = &mut self.link.wayfinder_peer_service
-            && path.is_relative()
-        {
-            *path = config_dir.join(&*path);
-        }
         for path in &mut self.models.paths {
             if path.is_relative() {
                 *path = config_dir.join(&*path);
