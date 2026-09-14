@@ -104,7 +104,7 @@ impl Default for AppConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct LinkConfig {
     pub enabled: bool,
-    pub wayfinder_data_dir: Option<PathBuf>,
+    pub wayfinder_peer_service: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -120,7 +120,7 @@ impl AppConfig {
     }
 
     pub fn resolve_model_paths(&mut self, config_dir: &Path) {
-        if let Some(path) = &mut self.link.wayfinder_data_dir
+        if let Some(path) = &mut self.link.wayfinder_peer_service
             && path.is_relative()
         {
             *path = config_dir.join(&*path);

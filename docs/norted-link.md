@@ -16,12 +16,18 @@ its hosted profile through the local OpenAI-compatible API. There is no main nod
    ```toml
    [link]
    enabled = true
-   # Optional when Wayfinder uses its normal OS application-data directory:
-   # wayfinder_data_dir = "/path/to/this/machines/private/wayfinder"
+   wayfinder_peer_service = "/run/wayfinder-app/norted.json"
    ```
 
-   A relative directory resolves against the Norted configuration directory.
-   Run Norted as an account authorized to read Wayfinder's private `control.json`.
+   Start Wayfinder with
+   `wayfinder daemon --peer-service norted.link.v1=/run/wayfinder-app/norted.json`.
+   Create the parent directory first. Grant Norted read access only to the generated
+   descriptor (0600; transfer ownership to the dedicated application account).
+   Reapply this grant after Wayfinder restarts. A relative capability path resolves
+   against the Norted configuration directory. Norted needs no access to Wayfinder's
+   private state directory. The capability can observe sanitized members and
+   register/renew/unregister/open only `norted.link.v1`; it cannot administer
+   Wayfinder or authorize MCP. TUI/CLI administration remains separate.
    Never share identity directories or copy credentials to the other machine.
 3. Restart each Norted server after changing configuration. Use each machine's
    normal local runtime and model/profile setup, then load a profile. The TUI's
