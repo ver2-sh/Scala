@@ -854,6 +854,28 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 Focused tests cover bounded NInfer admission, typed identity, source manifests and current schema validation, exact commit/tree verification, CMake dependency auditing, source history, GPU selection/isolation, settings cross-validation, startup observation, bounded protocol translation, stream cancellation, archive traversal, digest verification, catalog parsing, selection, and existing adapter contracts. Runtime archives, source checkouts/build trees, extracted binaries, model/tokenizer files, caches, generated manifests/selections, logs, control credentials, and build output must not be committed.
 
+## Norted Link
+
+[Norted Link](docs/norted-link.md) makes linked Norted servers available from
+either machine through Wayfinder's authenticated peer services. Enable `[link]`
+`enabled = true` in each local `config.toml` after linking Wayfinder. The normal
+Models, Model Profiles and Overview views show owner/host labels, inventories,
+loaded state and owner-reported runtime identity. Load/unload executes on the
+selected owner through its normal manager.
+
+Reachable loaded peer profiles appear in `/v1/models` and work through Chat,
+Responses, Completions and Embeddings where the owner runtime supports them,
+including streaming and cancellation. Unique profile IDs remain simple aliases;
+collisions use `<profile-id>@<full-wayfinder-node-id>`, and ambiguous unqualified
+requests fail explicitly. There is no retry, failover, main node or scheduling.
+
+Every node owns its own model files, profiles, runtime installations, runtime
+selection/configuration and execution state. Peer reports are cached observations;
+no model files, runtime files or authoritative state stores are synchronized.
+Runtime screens remain local. Link is disabled by default, and local serving
+continues when Wayfinder or a peer is unavailable. See the [setup and protocol
+documentation](docs/norted-link.md) and [validation record](docs/norted-link-validation.md).
+
 ## Current limitations
 
 - Residency cleanup is TTL/LRU based and does not attempt speculative GPU-memory accounting; an auxiliary load that still cannot fit fails without sacrificing its parent primary.
@@ -861,7 +883,7 @@ Focused tests cover bounded NInfer admission, typed identity, source manifests a
 - Managed source builds are provider-specific: llama.cpp supports the newest exact tagged Linux x86_64 portable CUDA source recipe, q27 supports exact tagged Linux x86_64 CUDA releases whose upstream Makefile contract is recognized, and NInfer supports its exact Linux x86_64/RTX 5090/sm_120a contract. Other providers do not gain source support automatically.
 - The llama.cpp Linux managed-source provider exposes two intentional parallel CUDA variants — CUDA-12 `managed-portable-v4` (`>=12.8,<13.0`, driver `>=525.60.13`) and CUDA-13 `managed-portable-cuda13-v2` (`>=13.0,<14.0`, driver `>=580.65.06`); see the runtime documentation above for their exact toolkit, compiler, and target contracts. Norted validates the prerequisite tools but does not install system, CUDA, driver, or toolchain packages.
 - Norted does not convert or migrate `.ninfer` model artifacts. The managed Model Library can acquire validated version-2 `.ninfer` containers through the same explicit download/import/remove operations as GGUF and q27; the user may also place supported containers directly in configured model directories.
-- The public surface is Responses and Chat Completions plus health/model listing. Ordinary function tools are exact-engine gated; NInfer image/video input is exact-artifact/runtime/residency gated. Embeddings, audio, generated images, arbitrary modalities, and stateful Responses are not implemented.
+- The public surface includes Responses, Chat Completions, Completions, Embeddings and health/model listing. Function tools, retrieval and media support remain model/engine/runtime gated. Generated audio/images, arbitrary modalities and stateful Responses are not implemented.
 - There is no built-in TLS/certificate management, permissive CORS, rate-limit infrastructure, service installer, or web UI.
 
 See [docs/architecture.md](docs/architecture.md) for component boundaries and the exact runtime acquisition, resolution, and launch flow.

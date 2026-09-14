@@ -26,6 +26,7 @@ pub mod benchmark;
 mod catalog;
 mod control;
 mod installer;
+pub mod link;
 mod manager;
 mod packs;
 mod prune;

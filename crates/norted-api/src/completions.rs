@@ -15,7 +15,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::{StreamExt, stream};
-use norted_core::ModelProfileId;
 use norted_engine::{CompletionRequest, InferenceEvent, InferenceFinishReason, InferenceUsage};
 use serde_json::{Value, json};
 use std::convert::Infallible;
@@ -57,7 +56,7 @@ pub(super) async fn create(
         "Completions",
     )?;
     let model = required_string(object, "model")?;
-    let model_profile_id = ModelProfileId::new(model.clone()).map_err(|_| {
+    let model_profile_id = crate::execution_profile_id(model.clone()).map_err(|_| {
         OpenAiError::invalid("Invalid Model Profile ID.", Some("model"), "invalid_value")
     })?;
     let prompt = object

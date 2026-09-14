@@ -126,6 +126,7 @@ pub async fn run(
 
     core.start_model_discovery().await;
     let mut terminal_events = EventStream::new();
+    let (link_results, mut link_result_receiver) = tokio::sync::mpsc::channel(2);
     let (control_updates, mut control_update_receiver) = tokio::sync::mpsc::channel(2);
     let (control_results, mut control_result_receiver) =
         tokio::sync::mpsc::channel::<std::result::Result<ControlStatus, String>>(2);
@@ -246,10 +247,15 @@ pub async fn run(
             },
             observation = control_update_receiver.recv() => match observation {
                 Some(observation) => {
+                    app.replace_link(observation.link);
                     app.replace_control(observation.status, observation.error);
                     Update::Render
                 }
                 None => Update::None,
+            },
+            result = link_result_receiver.recv() => {
+                if let Some(result) = result { app.handle_link_result(result); }
+                Update::Render
             },
             result = control_result_receiver.recv() => match result {
                 Some(result) => {
@@ -388,6 +394,24 @@ pub async fn run(
                     let _ = results.send((request, result)).await;
                 });
             }
+        }
+        if let Some(action) = app.take_link_action() {
+            let paths = core.paths.clone();
+            let results = link_results.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let client = ControlClient::discover(&paths)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    client
+                        .link_control(action)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    client.link_status().await.map_err(|e| e.to_string())
+                }
+                .await;
+                let _ = results.send(result).await;
+            });
         }
         if let Some(action) = app.take_control_action() {
             if matches!(action, ControlAction::Load(_)) {
@@ -1495,25 +1519,33 @@ async fn execute_runtime_action(
 }
 
 struct ControlObservation {
+    link: Result<norted_engine::link::LinkSnapshot, String>,
     status: Option<ControlStatus>,
     error: Option<String>,
 }
 
 async fn observe_control(paths: &AppPaths) -> ControlObservation {
     match ControlClient::discover(paths).await {
-        Ok(client) => match client.status().await {
-            Ok(status) => ControlObservation {
-                status: Some(status),
-                error: None,
-            },
-            Err(error) => ControlObservation {
-                status: None,
-                error: Some(error.to_string()),
-            },
-        },
+        Ok(client) => {
+            let (status, link) = tokio::join!(client.status(), client.link_status());
+            let link = link.map_err(|e| e.to_string());
+            match status {
+                Ok(status) => ControlObservation {
+                    status: Some(status),
+                    error: None,
+                    link,
+                },
+                Err(error) => ControlObservation {
+                    status: None,
+                    error: Some(error.to_string()),
+                    link,
+                },
+            }
+        }
         Err(error) => ControlObservation {
             status: None,
             error: Some(error.to_string()),
+            link: Err(error.to_string()),
         },
     }
 }

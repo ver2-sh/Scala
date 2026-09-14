@@ -43,6 +43,20 @@ impl OpenAiError {
         }
     }
 
+    pub(crate) fn link(status: StatusCode, message: impl Into<String>, code: &'static str) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            kind: if status.is_server_error() {
+                "server_error"
+            } else {
+                "invalid_request_error"
+            },
+            parameter: Some("model".into()),
+            code,
+        }
+    }
+
     pub(crate) fn unsupported(message: impl Into<String>, parameter: impl Into<String>) -> Self {
         Self::invalid(message, Some(parameter), "unsupported_value")
     }

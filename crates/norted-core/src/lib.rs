@@ -20,8 +20,8 @@ pub use auth::{
     PublicAuthMode, PublicAuthStatus,
 };
 pub use config::{
-    AppConfig, AppPaths, ConfigSource, EngineConfig, JitConfig, LoadedConfig, ModelConfig,
-    SUPPORTED_CONFIG_VERSION, ServerConfig, TuiConfig,
+    AppConfig, AppPaths, ConfigSource, EngineConfig, JitConfig, LinkConfig, LoadedConfig,
+    ModelConfig, SUPPORTED_CONFIG_VERSION, ServerConfig, TuiConfig,
 };
 pub use error::{CoreError, Result};
 pub use event::{AppEvent, LogLevel};

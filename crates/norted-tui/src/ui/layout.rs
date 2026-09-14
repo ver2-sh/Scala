@@ -1123,7 +1123,8 @@ impl UiLayout {
             let labels = if app.screen == Screen::ModelProfiles {
                 app.model_profile_values()
                     .into_iter()
-                    .map(|profile| profile.id.to_string())
+                    .enumerate()
+                    .map(|(index, _)| app.profile_label(index))
                     .collect::<Vec<_>>()
             } else {
                 app.settings_scopes()

@@ -225,6 +225,17 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme
                 hint("/", "commands", theme),
                 hint("?", "help", theme),
             ],
+            (FocusArea::Content, crate::app::Screen::ModelProfiles)
+                if app.selected_remote_profile().is_some() =>
+            {
+                vec![
+                    hint("Left/Right", "profile", theme),
+                    hint(glyphs.up_down, "scroll", theme),
+                    hint("l", "load on host", theme),
+                    hint("u", "unload on host", theme),
+                    hint("/", "commands", theme),
+                ]
+            }
             (FocusArea::Content, crate::app::Screen::ModelProfiles) => vec![
                 hint("Left/Right", "profile", theme),
                 hint(glyphs.up_down, "setting", theme),

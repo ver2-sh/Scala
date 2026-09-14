@@ -10,7 +10,6 @@ use axum::{
     http::HeaderMap,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use norted_core::ModelProfileId;
 use norted_engine::EmbeddingRequest;
 use serde_json::{Value, json};
 
@@ -28,7 +27,7 @@ pub(super) async fn create(
         "Embeddings",
     )?;
     let model = required_string(object, "model")?;
-    let model_profile_id = ModelProfileId::new(model.clone()).map_err(|_| {
+    let model_profile_id = crate::execution_profile_id(model.clone()).map_err(|_| {
         OpenAiError::invalid("Invalid Model Profile ID.", Some("model"), "invalid_value")
     })?;
     if object.contains_key("dimensions") {

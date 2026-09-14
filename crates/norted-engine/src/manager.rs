@@ -715,6 +715,29 @@ impl RuntimeManager {
         }
     }
 
+    /// A bounded, read-only projection of existing benchmark evidence.
+    pub async fn link_benchmarks(&self) -> Result<Vec<crate::link::LinkBenchmark>, String> {
+        let mut seen = BTreeSet::new();
+        Ok(self
+            .benchmark
+            .store
+            .summaries()
+            .await?
+            .into_iter()
+            .filter(|s| seen.insert(s.profile_id.clone()))
+            .map(|s| crate::link::LinkBenchmark {
+                profile_id: s.profile_id,
+                run_id: s.run_id,
+                status: s.status,
+                started_unix_ms: s.started_unix_ms,
+                intelligence: s.intelligence,
+                agentic: s.agentic,
+                coding: s.coding,
+                speed: s.speed,
+            })
+            .collect())
+    }
+
     pub async fn status(&self) -> ControlStatus {
         let state = self.state.read().await;
         self.status_from_state(&state)
@@ -2254,6 +2277,21 @@ impl RuntimeManager {
             return Err(RuntimeError::ModelProfileNotLoaded(requested.clone()));
         }
         let mut operation = Arc::clone(&self.operation).lock_owned().await;
+        if let Ok(expected) = crate::link::REQUIRE_LOADED.try_with(Clone::clone) {
+            let state = self.state.read().await;
+            if &expected != requested
+                || !state.backends.get(requested).is_some_and(|backend| {
+                    backend.lifecycle == BackendLifecycle::Running
+                        && !backend.retiring
+                        && backend
+                            .provenance
+                            .as_ref()
+                            .is_some_and(|p| p.model_profile.content_sha256 == profile_hash)
+                })
+            {
+                return Err(RuntimeError::ModelProfileNotLoaded(requested.clone()));
+            }
+        }
 
         if role == ModelRole::Primary {
             let previous = {

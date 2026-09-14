@@ -6,6 +6,9 @@ mod completions;
 mod embeddings;
 mod error;
 mod input;
+mod link;
+mod wayfinder;
+use link::execution_profile_id;
 mod responses;
 
 use std::future::Future;
@@ -156,20 +159,41 @@ impl ApiServer {
             mut publisher,
             ..
         } = self;
+        let link = if core.config.link.enabled {
+            match link::Link::new(core.clone(), runtime.clone()) {
+                Ok(link) => Some(link),
+                Err(error) => {
+                    tracing::warn!(%error, "Norted Link unavailable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let public = public_routes(
             PublicApiState {
                 core: Arc::clone(&core),
                 runtime: Arc::clone(&runtime),
                 instance_id: publisher.instance_id().to_owned(),
+                link: link.clone(),
             },
             public_auth,
         );
         let control = control_routes(ControlApiState {
             runtime: Arc::clone(&runtime),
             token: Arc::from(control_token),
+            link: link.clone(),
         });
         let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
         let mut servers = tokio::task::JoinSet::new();
+        if let Some(link) = link {
+            match TcpListener::bind("127.0.0.1:0").await {
+                Ok(listener) => {
+                    servers.spawn(link.run(listener, shutdown_receiver.clone()));
+                }
+                Err(error) => tracing::warn!(%error, "Norted Link listener unavailable"),
+            }
+        }
         let public_shutdown = shutdown_receiver.clone();
         servers.spawn(async move {
             axum::serve(public_listener, public)
@@ -241,6 +265,7 @@ struct PublicApiState {
     core: Arc<ApplicationCore>,
     runtime: Arc<RuntimeManager>,
     instance_id: String,
+    link: Option<Arc<link::Link>>,
 }
 
 fn public_routes(state: PublicApiState, auth: PublicAuth) -> Router {
@@ -254,6 +279,7 @@ fn public_routes(state: PublicApiState, auth: PublicAuth) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(
             MAX_INFERENCE_BODY_BYTES,
         ))
+        .route_layer(middleware::from_fn_with_state(state.clone(), link::route))
         .route_layer(middleware::from_fn_with_state(
             auth,
             auth::public_auth_middleware,
@@ -298,7 +324,7 @@ struct ModelList {
 struct ApiModel {
     id: String,
     object: &'static str,
-    owned_by: &'static str,
+    owned_by: String,
     created: i64,
 }
 
@@ -308,20 +334,65 @@ async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::O
         .read()
         .await
         .map_err(|e| error::runtime_error(norted_engine::RuntimeError::Operation(e.to_string())))?;
-    Ok(profiles
+    let mut models: Vec<_> = profiles
         .profiles
         .into_values()
         .map(|profile| ApiModel {
             id: profile.id.to_string(),
             object: "model",
-            owned_by: "norted-user",
+            owned_by: "norted-user".into(),
             created: snapshot
                 .models
                 .iter()
                 .find(|model| model.id == profile.model_id)
                 .map_or(0, |model| model.created),
         })
-        .collect())
+        .collect();
+    if let Some(link) = &state.link {
+        let linked = link.snapshot().await;
+        let mut counts = std::collections::BTreeMap::<String, usize>::new();
+        for model in &models {
+            *counts.entry(model.id.clone()).or_default() += 1;
+        }
+        for peer in &linked.peers {
+            if let Some(inventory) = &peer.state {
+                for profile in &inventory.profiles {
+                    *counts.entry(profile.id.to_string()).or_default() += 1;
+                }
+            }
+        }
+        if let Some(node) = &linked.node_id {
+            for model in &mut models {
+                model.owned_by = node.clone();
+                if counts.get(&model.id).copied().unwrap_or(0) > 1 {
+                    model.id = norted_engine::link::qualified_alias(&model.id, node);
+                }
+            }
+        }
+        for peer in linked.peers.iter().filter(|p| p.reachable) {
+            if let Some(inventory) = &peer.state {
+                for profile in inventory.profiles.iter().filter(|p| p.usable()) {
+                    let name = profile.id.as_str();
+                    models.push(ApiModel {
+                        id: if counts.get(name).copied().unwrap_or(0) > 1 {
+                            norted_engine::link::qualified_alias(name, &peer.node_id)
+                        } else {
+                            name.into()
+                        },
+                        object: "model",
+                        owned_by: peer.node_id.clone(),
+                        created: inventory
+                            .models
+                            .iter()
+                            .find(|m| m.id == profile.model_id)
+                            .map_or(0, |m| m.created),
+                    });
+                }
+            }
+        }
+    }
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(models)
 }
 
 async fn models(
@@ -337,11 +408,22 @@ async fn retrieve_model(
     State(state): State<PublicApiState>,
     axum::extract::Path(model): axum::extract::Path<String>,
 ) -> Result<Json<ApiModel>, error::OpenAiError> {
-    public_models(&state)
-        .await?
+    if state.link.is_some() {
+        link::resolve(&state, &model).await?;
+    }
+    let listed = public_models(&state).await?;
+    listed
         .into_iter()
-        .find(|profile| profile.id == model)
-        .map(Json)
+        .find(|profile| {
+            profile.id == model
+                || model
+                    .split_once('@')
+                    .is_some_and(|(id, node)| profile.id == id && profile.owned_by == node)
+        })
+        .map(|mut profile| {
+            profile.id = model;
+            Json(profile)
+        })
         .ok_or_else(error::OpenAiError::model_not_found)
 }
 
@@ -349,10 +431,15 @@ async fn retrieve_model(
 struct ControlApiState {
     runtime: Arc<RuntimeManager>,
     token: Arc<str>,
+    link: Option<Arc<link::Link>>,
 }
 
 fn control_routes(state: ControlApiState) -> Router {
     Router::new()
+        .route(
+            norted_engine::link::CONTROL_LINK_PATH,
+            get(control_link_status).post(control_link_action),
+        )
         .route(CONTROL_STATUS_PATH, get(control_status))
         .route(CONTROL_LOAD_PATH, post(control_load))
         .route(CONTROL_UNLOAD_PATH, post(control_unload))
@@ -361,6 +448,45 @@ fn control_routes(state: ControlApiState) -> Router {
             post(control_benchmark),
         )
         .with_state(state)
+}
+
+async fn control_link_status(
+    State(state): State<ControlApiState>,
+    headers: HeaderMap,
+) -> Result<Json<norted_engine::link::LinkSnapshot>, ControlApiError> {
+    authorize(&headers, &state.token)?;
+    Ok(Json(match state.link {
+        Some(link) => link.snapshot().await,
+        None => Default::default(),
+    }))
+}
+
+async fn control_link_action(
+    State(state): State<ControlApiState>,
+    headers: HeaderMap,
+    payload: Result<Json<norted_engine::link::LinkControlRequest>, JsonRejection>,
+) -> Result<Json<norted_engine::link::NodeInventory>, ControlApiError> {
+    authorize(&headers, &state.token)?;
+    let Json(request) = payload.map_err(|e| ControlApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: e.body_text(),
+    })?;
+    let link = state.link.ok_or_else(|| ControlApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "Norted Link is disabled or unavailable".into(),
+    })?;
+    tokio::time::timeout(std::time::Duration::from_secs(55), link.control(request))
+        .await
+        .map_err(|_| ControlApiError {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: "Link control timed out after possible dispatch; inspect owner before retry"
+                .into(),
+        })?
+        .map(Json)
+        .map_err(|message| ControlApiError {
+            status: StatusCode::BAD_GATEWAY,
+            message,
+        })
 }
 
 async fn control_benchmark(
@@ -647,7 +773,7 @@ mod tests {
         let value = serde_json::to_value(ApiModel {
             id: "example".to_owned(),
             object: "model",
-            owned_by: "norted-local",
+            owned_by: "norted-local".into(),
             created: 1_234_567_890,
         })
         .expect("serialize API model");
@@ -702,6 +828,7 @@ mod tests {
         let router = control_routes(ControlApiState {
             runtime: Arc::clone(&runtime),
             token: Arc::from("fixture-token"),
+            link: None,
         });
         let request = ControlLoadRequest {
             model_profile_id: norted_core::ModelProfileId::new("fixture").expect("profile ID"),

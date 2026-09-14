@@ -32,6 +32,18 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) -> UiLayout {
             .settings_detail_scroll
             .min(max_scroll.min(u16::MAX as usize) as u16);
     }
+    if app.screen == crate::app::Screen::ModelProfiles
+        && let Some(detail) = app.remote_profile_detail()
+    {
+        let lines = ratatui::widgets::Paragraph::new(detail)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .line_count(layout.settings_list.width);
+        app.settings_detail_scroll = app.settings_detail_scroll.min(
+            lines
+                .saturating_sub(layout.settings_list.height as usize)
+                .min(u16::MAX as usize) as u16,
+        );
+    }
     if app.screen == crate::app::Screen::Benchmarks {
         crate::benchmarks::clamp_scroll(&mut app.benchmarks, layout.benchmarks.detail);
     }
