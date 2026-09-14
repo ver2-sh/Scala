@@ -43,7 +43,7 @@ benchmark summaries. These observations never configure the receiving host.
    ```
 
 3. Start Norted. Norted automatically discovers the generic local
-   application socket and registers `norted.link.v1`. No address, credential,
+   application endpoint and registers `norted.link.v1`. No address, credential,
    capability file or application setup in Wayfinder is needed.
 
 The **Norted Link** screen shows connection state, full local node ID and peer
@@ -90,7 +90,7 @@ semantics: equivalent artifacts pass through the same adapters and validation.
 
 ## Discovery and freshness
 
-Norted connects to the generic `/run/wayfinder/app.sock` endpoint. Wayfinder and
+On Linux, Norted connects to the generic `/run/wayfinder/app.sock` endpoint. Wayfinder and
 Norted may run under separate Linux service accounts. The service installers
 provision the generic `wayfinder-apps` group; Norted's unit receives it through
 `SupplementaryGroups`. Install/update the Wayfinder service to provision its
@@ -112,7 +112,32 @@ Norted reads no Wayfinder private state or control descriptor. Linux socket
 permissions authorize the application; Norted verifies endpoint permissions and
 checks the daemon peer UID against the protected directory owner. Access to the
 socket grants no access to Wayfinder identity/config/state/control files, MCP or
-administration. Dynamic transport is unsupported on Windows/macOS.
+administration. macOS remains unsupported for dynamic transport.
+
+On native Windows 11, Norted connects to `\\.\pipe\wayfinder-app-v1`.
+Wayfinder creates a protected pipe ACL granting only its account and LocalSystem
+access, and rejects remote pipe clients with native enforcement. Run both
+executables under the same Windows account. Norted verifies the pipe owner is
+its own account or LocalSystem before sending requests. There is no pipe-path
+setting, persistent application secret, private-state read or WSL dependency.
+Same-account execution does not provide filesystem isolation between processes;
+the application protocol grants no private-state or administration authority.
+
+For native PowerShell launch, initialize Wayfinder with its normal unique name
+and reachable peer listen/advertise addresses, then run `wayfinder.exe daemon`.
+Use `wayfinder.exe tui` to join Ubuntu's normal invitation. In another terminal
+under the same account, run `norted-server.exe link enable` once, then
+`norted-server.exe serve` (or `norted-server.exe tui`). Inspect with
+`norted-server.exe link status`. No Windows service installer is required or
+provided by this change.
+
+Ubuntu and Windows use the same `norted.link.v1` protocol over Wayfinder's existing
+Noise/TCP network. Discovery, inventory, owned-profile load/unload and compatible
+inference remain symmetric, with no model-file transfer or remote configuration
+editing. Windows can host GGUF through compatible llama.cpp runtimes, including
+the existing managed Windows x86_64 CUDA packages. Managed NInfer remains
+Linux-only; managed q27 retains its Linux x86_64 CUDA restriction. Link does not
+change runtime compatibility or artifact/provenance semantics.
 
 Norted keeps a registration session open and binds an ephemeral authenticated
 loopback listener for incoming streams. Its randomly generated registration
@@ -235,3 +260,19 @@ Failure before a response returns an actionable gateway error. Peer loss during
 SSE produces an `error` event with `link_stream_interrupted`, without fabricating a
 normal completion or final usage. Loss during a non-streaming response body fails
 the HTTP body. Reconnecting refreshes observations; it never resumes a generation.
+
+## Native transport validation
+
+Linux formatting, workspace check, Clippy (including all features/targets), and
+existing tests pass: 215 tests passed, one existing test ignored. Fresh rebuilt
+Norted and Wayfinder processes registered Link with no integration error, kept
+Norted running through Wayfinder loss, and automatically re-registered after
+restart. The current client transport also read status successfully from the
+installed `/run/wayfinder/app.sock`; the installed Norted service reports Link
+enabled with no error. No production service restart or model loading was used.
+
+Only a Linux Rust target is installed on this validation host. The Windows code
+is implemented, but Windows compilation and runtime checks have not run. Native
+Windows ACL admission/denial, restart behavior and bidirectional Ubuntu ↔ Windows
+inventory, profile control and inference still require acceptance on real Windows
+binaries. No cross-machine Windows success is claimed.
