@@ -89,15 +89,6 @@ pub struct LinkBackend {
     pub active_requests: usize,
     pub retiring: bool,
 }
-impl LinkProfile {
-    pub fn usable(&self) -> bool {
-        self.installed
-            && self
-                .backend
-                .as_ref()
-                .is_some_and(|b| b.lifecycle == BackendLifecycle::Running && !b.retiring)
-    }
-}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinkControlRequest {
@@ -117,10 +108,6 @@ pub enum LinkAction {
 pub fn qualified_alias(profile: &str, node: &str) -> String {
     format!("{profile}@{node}")
 }
-
-// Forwarded inference must acquire an already-running local backend. The scope
-// ends with request admission, and never changes runtime selection or stores.
-tokio::task_local! { pub static REQUIRE_LOADED: ModelProfileId; }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

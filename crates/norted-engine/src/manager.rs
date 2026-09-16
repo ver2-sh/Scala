@@ -2277,22 +2277,6 @@ impl RuntimeManager {
             return Err(RuntimeError::ModelProfileNotLoaded(requested.clone()));
         }
         let mut operation = Arc::clone(&self.operation).lock_owned().await;
-        if let Ok(expected) = crate::link::REQUIRE_LOADED.try_with(Clone::clone) {
-            let state = self.state.read().await;
-            if &expected != requested
-                || !state.backends.get(requested).is_some_and(|backend| {
-                    backend.lifecycle == BackendLifecycle::Running
-                        && !backend.retiring
-                        && backend
-                            .provenance
-                            .as_ref()
-                            .is_some_and(|p| p.model_profile.content_sha256 == profile_hash)
-                })
-            {
-                return Err(RuntimeError::ModelProfileNotLoaded(requested.clone()));
-            }
-        }
-
         if role == ModelRole::Primary {
             let previous = {
                 let mut state = self.state.write().await;

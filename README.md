@@ -867,11 +867,13 @@ Models, Model Profiles and Overview views show owner/host labels, inventories,
 loaded state and owner-reported runtime identity. Load/unload executes on the
 selected owner through its normal manager.
 
-Reachable loaded peer profiles appear in `/v1/models` and work through Chat,
+Reachable installed peer profiles (including unloaded profiles) appear in `/v1/models` and work through Chat,
 Responses, Completions and Embeddings where the owner runtime supports them,
 including streaming and cancellation. Unique profile IDs remain simple aliases;
 collisions use `<profile-id>@<full-wayfinder-node-id>`, and ambiguous unqualified
-requests fail explicitly. There is no retry, failover, main node or scheduling.
+requests fail explicitly. Forwarded inference can trigger the owner's normal JIT
+load using its local settings and runtime admission; explicit load/unload is optional.
+There is no retry, failover, recursive federation, main node or scheduling.
 
 Every node owns its own model files, profiles, runtime installations, runtime
 selection/configuration and execution state. Peer reports are cached observations;

@@ -371,7 +371,7 @@ async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::O
         }
         for peer in linked.peers.iter().filter(|p| p.reachable) {
             if let Some(inventory) = &peer.state {
-                for profile in inventory.profiles.iter().filter(|p| p.usable()) {
+                for profile in inventory.profiles.iter().filter(|p| p.installed) {
                     let name = profile.id.as_str();
                     models.push(ApiModel {
                         id: if counts.get(name).copied().unwrap_or(0) > 1 {
@@ -693,7 +693,12 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
-    async fn control_fixture() -> (tempfile::TempDir, Arc<RuntimeManager>, ModelId) {
+    pub(super) async fn control_fixture() -> (
+        tempfile::TempDir,
+        Arc<RuntimeManager>,
+        ModelId,
+        Arc<ApplicationCore>,
+    ) {
         let temporary = tempfile::tempdir().expect("temporary control fixture");
         let root = temporary.path();
         let model_dir = root.join("models");
@@ -758,14 +763,14 @@ mod tests {
         )
         .expect("runtime packs");
         let manager = RuntimeManager::initialize(
-            core,
+            core.clone(),
             registry,
             packs,
             Arc::new(TokioProcessSupervisor::default()),
             RuntimeManagerOptions::default(),
         )
         .await;
-        (temporary, manager, model_id)
+        (temporary, manager, model_id, core)
     }
 
     #[test]
@@ -824,7 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_load_returns_accepted_loading_and_outlives_the_response() {
-        let (_temporary, runtime, model_id) = control_fixture().await;
+        let (_temporary, runtime, model_id, _core) = control_fixture().await;
         let router = control_routes(ControlApiState {
             runtime: Arc::clone(&runtime),
             token: Arc::from("fixture-token"),

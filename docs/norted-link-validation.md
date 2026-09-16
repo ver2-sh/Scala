@@ -67,7 +67,8 @@ and exercise private administration for test setup.
   binary after restart. Covers remote model/profile/runtime inventory, stable
   qualified aliases, Chat Completions, Responses, Completions, streaming,
   terminal/usage responses, streaming and nonstream cancellation, remote
-  load/unload, rejection without remote JIT load, and Embeddings capability
+  load/unload, the then-current rejection without remote JIT load (superseded by
+  ordinary owner-side JIT admission), and Embeddings capability
   rejection for the fixture.
 - **42 failure assertions passed**: invalid source/target/hops/version, forbidden
   operations, bounded framing, exact routing, deterministic duplicate aliases,
@@ -105,3 +106,30 @@ q27, NInfer, DFlash2, Vision, local Runtime UI and provenance code was unchanged
 and covered by existing workspace checks, not new native inference/UI runs.
 Successful embedding generation was not exercised. No remaining Blocking or
 Material issue was identified in this integration audit.
+
+## JIT semantics correction — 2026-09-16
+
+Starting from Norted-Server `77cd193`, reachable installed remote profiles are now
+listed and routed without requiring a running backend. Forwarded inference uses
+the owner's ordinary RuntimeManager admission, including its local JIT policy.
+The earlier unloaded-profile rejection above records historical behavior, not the
+current intended contract. The retained external smoke script still asserts that
+old behavior and was not counted as current validation.
+
+- `./validate.sh` passed formatting, workspace check, Clippy for all targets with
+  warnings denied, and workspace tests: 216 passed, one existing ignored.
+- `cargo build -p norted-server` and `git diff --check` passed.
+- A synthetic API regression test verifies installed/unloaded remote discovery and
+  exact routing, deterministic collision aliases, and name reservations with
+  rejection/exclusion for missing owner artifacts and stale owner observations.
+- Code inspection confirms internal owner requests retain `link: None` and exact
+  `EXECUTION_PROFILE` binding across all four inference surfaces. Entry dispatch
+  still makes one request; protocol identity/hop checks and explicit load/unload
+  are unchanged. No gateway load/poll/retry path was introduced.
+- An isolated two-instance setup was attempted using a copy of the retained
+  harness under `/srv/norted/scratch/norted-link-jit/`. It stopped before starting
+  any daemons: the available Wayfinder binary rejects the harness's `init`
+  command. Wayfinder was not changed. Production services and profiles were not
+  touched. No real two-instance JIT success, backend reuse, unload/JIT reload or
+  JIT-disabled inference result is claimed for this correction. Those live checks
+  remain outstanding, as does gaming-PC validation.
