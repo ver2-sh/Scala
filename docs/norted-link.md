@@ -51,8 +51,8 @@ observations. Press `e` to enable or `x` to disable; `norted-server link status`
 reports saved configuration and observed state. Saved enable/disable changes
 apply when Norted starts. Wayfinder does not need a restart.
 
-Load each owner's normal local profile, or select a remote profile in the TUI
-and use `l`/`u`. Overview, Models and Model Profiles show host labels and owner
+Explicit preloading is optional: select a remote profile in the TUI and use
+`l`/`u` to load/unload it. Ordinary inference can trigger the owner's normal JIT load. Overview, Models and Model Profiles show host labels and owner
 state; Runtime screens stay local. Query `/v1/models` and use an advertised alias
 in Chat Completions, Responses, Completions or supported Embeddings. Existing
 local API authentication applies before routing.
@@ -162,7 +162,7 @@ loaded state is never permission to manufacture a local backend or retry elsewhe
 
 Existing local `/v1/models` behavior is preserved: it lists local Model Profiles,
 including unloaded profiles that local JIT serving can load. Link adds reachable,
-installed, running peer profiles. `owned_by` identifies the full Wayfinder node
+installed peer profiles, including stopped/unloaded profiles. `owned_by` identifies the full Wayfinder node
 ID when identity is available. Unqualified profile IDs remain usable when unique.
 
 The explicit qualified form is:
@@ -178,7 +178,7 @@ each listed entry and an unqualified request returns HTTP 409 `ambiguous_model`
 with the exact choices. Unloaded and stale known owner profiles also reserve their
 names during observation, preventing a disconnect from silently retargeting an
 unqualified request to another host. Unreachable entries are excluded from the
-usable model listing. Ownership is always shown in TUI model/profile views.
+available model listing. Ownership is always shown in TUI model/profile views.
 
 The entry gateway authenticates the client and resolves the alias once. It sends
 the original model-addressed JSON and selected session/role/correlation headers
@@ -187,9 +187,16 @@ checks, settings resolution and adapter inference paths. The requested alias is
 preserved in output. Tools, reasoning, media, structured output, usage and terminal
 events have exactly the capabilities and semantics of that owner runtime.
 
-Forwarded inference must acquire an already loaded, non-retiring backend with a
-matching profile configuration. It never invokes JIT load or another federation
-lookup. Every internal request requires version 1, matching source/destination
+Forwarded inference enters the owner's ordinary RuntimeManager admission path.
+A stopped profile can JIT-load when the owner's local JIT setting permits it;
+JIT-disabled owners reject it with the same semantics as local inference.
+Profile/model existence, provenance compatibility, runtime selection, settings,
+residency, leases, eviction, GPU constraints and startup failures remain entirely
+under the owner's authority. Explicit remote load/unload remains available but is
+not required before ordinary JIT inference. The gateway does not load, poll or
+retry inference. The internal API has Link disabled and execution is bound to the
+exact selected profile, so it cannot perform another federation lookup, owner
+reselection, failover or recursive dispatch. Every internal request requires version 1, matching source/destination
 identities and hop count 1. The source identity must match Wayfinder's authenticated
 preface, and inference aliases must match the explicit hosted profile. Invalid
 routes, unknown operations, arbitrary API paths and public `x-norted-link-*`
@@ -243,8 +250,9 @@ These routes are on Norted's private control listener, never its public listener
 
 ## Failure and cancellation semantics
 
-No inference or control request is retried or failed over. Unknown, unloaded,
-stale and unreachable targets fail explicitly. The owner re-reads its own profiles
+No inference or control request is retried or failed over; there is no scheduling.
+Unknown, uninstalled, stale and unreachable targets fail explicitly. Being unloaded
+alone is not a gateway rejection. The owner re-reads its own profiles
 and applies its normal missing-model, runtime compatibility and load checks.
 Load returns owner admission/progress; the existing server-owned load task may
 continue after the control connection closes. Observe the owner before retrying

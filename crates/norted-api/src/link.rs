@@ -692,15 +692,12 @@ impl Link {
                 };
                 let router = crate::public_routes(state, crate::PublicAuth::disabled());
                 EXECUTION_PROFILE
-                    .scope(
-                        profile_id.clone(),
-                        REQUIRE_LOADED.scope(profile_id, async {
-                            router
-                                .oneshot(request)
-                                .await
-                                .unwrap_or_else(|never| match never {})
-                        }),
-                    )
+                    .scope(profile_id, async {
+                        router
+                            .oneshot(request)
+                            .await
+                            .unwrap_or_else(|never| match never {})
+                    })
                     .await
             }
         }
@@ -956,7 +953,7 @@ pub(crate) async fn resolve(
                 .as_ref()
                 .and_then(|s| s.profiles.iter().find(|p| p.id == profile))
         {
-            candidates.push((peer.node_id.clone(), false, peer.reachable && p.usable()));
+            candidates.push((peer.node_id.clone(), false, peer.reachable && p.installed));
         }
     }
     if candidates.len() > 1 {
@@ -979,10 +976,82 @@ pub(crate) async fn resolve(
         Some((node, false, false)) => Err(link_error(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
-                "Profile `{name}` on {node} is unreachable, stale, or not loaded; inspect/load it on its owner"
+                "Profile `{name}` on {node} is unreachable, stale, or its bound model is not installed on its owner"
             ),
             "remote_profile_unavailable",
         )),
         None => Err(OpenAiError::model_not_found()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unloaded_remote_profiles_are_discoverable_without_retargeting() {
+        let (_temporary, runtime, _model, core) = crate::tests::control_fixture().await;
+        let local = "a".repeat(64);
+        let remote = "b".repeat(64);
+        let link = Arc::new(Link {
+            core: core.clone(),
+            runtime: runtime.clone(),
+            dir: PathBuf::new(),
+            credential: String::new(),
+            session: wayfinder::Session::default(),
+            hardware: RwLock::new(String::new()),
+            snapshot: RwLock::new(LinkSnapshot {
+                enabled: true,
+                node_id: Some(local.clone()),
+                node_name: Some("entry".into()),
+                ..Default::default()
+            }),
+            slots: Arc::new(Semaphore::new(16)),
+        });
+        let mut inventory = link.inventory().await.expect("owner inventory");
+        inventory.node_id = remote.clone();
+        assert!(inventory.profiles[0].installed);
+        assert!(inventory.profiles[0].backend.is_none());
+        link.snapshot.write().await.peers.push(LinkPeer {
+            node_id: remote.clone(),
+            name: "owner".into(),
+            reachable: true,
+            last_seen: crate::unix_timestamp(),
+            error: None,
+            state: Some(inventory),
+        });
+        let state = PublicApiState {
+            core,
+            runtime,
+            instance_id: local.clone(),
+            link: Some(link.clone()),
+        };
+        let alias = qualified_alias("fixture", &remote);
+        let models = crate::public_models(&state).await.expect("models");
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().any(|m| m.id == alias));
+        assert!(
+            matches!(resolve(&state, &alias).await, Ok(Target::Remote { node, profile })
+            if node == remote && profile.as_str() == "fixture")
+        );
+        assert!(resolve(&state, "fixture").await.is_err());
+
+        // Missing owner artifacts and stale owners remain name reservations,
+        // but cannot be listed or dispatched, even through an exact alias.
+        for missing in [true, false] {
+            {
+                let mut snapshot = link.snapshot.write().await;
+                let peer = &mut snapshot.peers[0];
+                peer.state.as_mut().unwrap().profiles[0].installed = !missing;
+                if !missing {
+                    peer.last_seen = crate::unix_timestamp() - STALE_SECONDS - 1;
+                }
+            }
+            let models = crate::public_models(&state).await.expect("models");
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].id, qualified_alias("fixture", &local));
+            assert!(resolve(&state, &alias).await.is_err());
+            assert!(resolve(&state, "fixture").await.is_err());
+        }
     }
 }
