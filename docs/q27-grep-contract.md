@@ -1,11 +1,11 @@
 # q27 Grep contract review
 
-Review basis: Norted-Server master
+Review basis: Scala master
 `094b2538ad9d16d8de3a160aefd289bc5d42f171`, with the existing q27 source contract
 unchanged. The reviewed upstream commit is
 [`4770e053656af9aababdc49c81f280ad21b74986`](https://github.com/signalnine/q27/tree/4770e053656af9aababdc49c81f280ad21b74986),
 tree `ff712f78fd17b5fe12149679114b6def003f16a6`.
-Norted-Server's existing provider checks commit/tree, source owners, build
+Scala's existing provider checks commit/tree, source owners, build
 provenance and installed executable identity. No newer/custom/external binary
 inherits proof from its version or model filename.
 
@@ -40,7 +40,7 @@ runtime's serving contract. None is done here.
 Retrieval is **unavailable**, not zero. Normal text and native tools remain on
 their existing paths. Enabling q27 Retrieval requires an upstream serving facility
 that constrains no-tools ranges, followed by a new immutable runtime review and
-adapter translation. No q27 source/runtime or Norted model is modified.
+adapter translation. No q27 source/runtime or Scala model is modified.
 
 ## Qwen3.8 native rendering evidence and limits
 
@@ -78,7 +78,7 @@ No new test code was added.
 This establishes the upstream native Qwen conversation semantics; it does **not**
 prove byte-identical rendering of every canonical Grep trajectory. In particular,
 q27 reconstructs argument dictionaries through sorted `nlohmann::json`, whereas
-Norted's training template preserves argument insertion order. Client JSON field
+Scala's training template preserves argument insertion order. Client JSON field
 ordering and configured thinking/effort can also change bytes. No trained-template
 claim is inferred from `general.name` alone, and no Sharp/external-template route
 is selected. External-template mode still does not gain native tool capability.

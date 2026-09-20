@@ -1,6 +1,6 @@
-# Norted Server
+# Scala
 
-Norted Server is a terminal-first local inference control plane. It discovers local model artifacts, manages separately versioned inference runtimes, owns backend processes, and exposes an authenticated OpenAI-compatible text gateway. Responses is the primary API; Chat Completions is a compatibility surface.
+Scala is a terminal-first local inference control plane. It discovers local model artifacts, manages separately versioned inference runtimes, owns backend processes, and exposes an authenticated OpenAI-compatible text gateway. Responses is the primary API; Chat Completions is a compatibility surface.
 
 The central distinction is:
 
@@ -14,9 +14,44 @@ Model Profile  = a user-owned serving target binding one artifact, one engine, r
 
 A GGUF model is not permanently tied to llama.cpp, a q27 model is not permanently tied to q27,
 and an NInfer container is not the NInfer executable itself. Model Profile creation uses registered
-engine compatibility, and exact runtime resolution remains separate from the profile. Today Norted
+engine compatibility, and exact runtime resolution remains separate from the profile. Today Scala
 ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 [q27](https://github.com/signalnine/q27), and [NInfer](https://github.com/Neroued/ninfer).
+
+## Scala releases
+
+**Scala** is the application, command (`scala`), and repository (`Yuuyuuei/Scala`).
+Its workspace crates use `scala-*` names, the systemd unit is `scala.service`, and
+machine-to-machine serving uses **Scala Link** (`scala.link.v1`). Release archives
+and installers are named `scala-*`.
+
+For source installation, `./scala-service.sh install` builds the application,
+installs the Linux service, and links the actual binary as `/usr/local/bin/scala`.
+Use `./scala-service.sh` for source-build/service maintenance. It does not replace
+the application CLI: `scala --help`, `scala status`, and `scala models list` run
+the same executable shipped in release archives.
+
+Application storage uses the platform-native Scala namespace. On Linux this is
+`~/.config/scala`, `~/.local/share/scala`, `~/.local/state/scala`, and `~/.cache/scala`;
+`scala config show` reports the resolved paths on every supported platform.
+API keys use `scala_sk_`; optional orchestration headers are `X-Scala-Session` and
+`X-Scala-Role`. The application does not provide alternate product-name commands,
+old storage-path discovery, or dual Link service registration.
+
+Norted remains the separate model builder. Its artifact schemas, immutable model
+identity domains, source lineage, and historical validation records are not product
+branding and are preserved. Equivalent standard artifacts retain equal behavior.
+
+The release pipeline targets Linux x64/ARM64, macOS Intel/Apple Silicon and
+Windows x64, with server-only archives, shell/PowerShell installers and SHA-256
+checksums. Models, GPU drivers and independently versioned inference runtimes are
+installed separately. A packaged server does not imply every runtime supports
+every platform.
+
+The repository is private and the channel is being prepared. Anonymous installer
+URLs require an explicitly approved public release. See
+[installation and release maintenance](docs/releases.md) for private downloads,
+installation/update commands, platform limits and publication gates.
 
 ## Models, Settings, Model Profiles, and Runtimes
 
@@ -87,16 +122,16 @@ download cards retain a bounded recent history and expose progress, bytes/total,
 ETA, queue state, and Pause, Resume, or Cancel controls as applicable. Search and TUI navigation
 remain independent of downloads.
 
-Managed models use the platform-native Norted data directory shown by `config show`:
+Managed models use the platform-native Scala data directory shown by `config show`:
 
 ```text
 <data>/models/
   huggingface/<publisher>/<repository>/<revision>/<artifact-key>/
     <repository-relative artifact or package tree>
-    .norted-library.json
+    .scala-library.json
   imports/<stable-import-key>/
     <copied artifact or exact package tree>
-    .norted-library.json
+    .scala-library.json
 ```
 
 The package-level receipt records one acquisition identity plus every exposed primary member. Each
@@ -168,7 +203,7 @@ Known effective settings show their value and winning source; unknown pre-start 
 for example `1.0 (runtime default)`, `0.7 (Settings override)`, `0.5 (model profile)`, or `200000 (boot inference)`.
 Source text supplements the value and never replaces it. Dynamic runtime/model/host derivations
 remain part of the runtime-default layer and carry optional secondary detail. A genuine `auto`
-policy remains automatic before startup; presenting it never causes Norted to materialize an
+policy remains automatic before startup; presenting it never causes Scala to materialize an
 invented launch value. Authoritative startup results replace that policy in the running effective
 view without changing its winning source. See
 [Settings and defaults](docs/settings.md).
@@ -214,11 +249,11 @@ the qualified runtime supports drafting with Vision. A plain MTP artifact cannot
 `int8`, `fp8`, `nvfp4`, and `k8v4`; older executable help narrows the choice list instead of
 inheriting newer formats. `ninfer.context_cost_presets` is first-class and binds its canonical path
 and SHA-256 immediately before launch; raw `--context-cost-presets` is rejected. NInfer
-host/port/key/model alias/device/CORS/request-log controls remain Norted-owned, and diagnostic,
+host/port/key/model alias/device/CORS/request-log controls remain Scala-owned, and diagnostic,
 benchmark, tracing, and kernel-development controls are not promoted into ordinary settings.
 
 Structured path values have stable semantics. Absolute paths are used directly. Relative paths
-resolve lexically beneath Norted's `<data>` directory and cannot escape it with `..`. Resolution
+resolve lexically beneath Scala's `<data>` directory and cannot escape it with `..`. Resolution
 happens before inspection, validation, adapter translation, and provenance.
 Saving `q27.template_path`, `llama.cpp.chat_template_file`, or
 `llama.cpp.speculative_draft_model` through the CLI or TUI automatically records its SHA-256;
@@ -226,42 +261,42 @@ every load rereads the bound file and rejects a content mismatch. Draft GGUFs mu
 prove identical bounded tokenizer metadata with the target; the exact llama-server load remains
 authoritative for draft architecture/tensor compatibility and is reported as needs-attention until
 that definitive load succeeds. Current upstream `draft-mtp` uses MTP heads from the main model and
-does not consume an external draft GGUF. Because Norted's bounded GGUF identity does not currently
+does not consume an external draft GGUF. Because Scala's bounded GGUF identity does not currently
 prove usable MTP heads architecture-neutrally, selecting `draft-mtp` remains needs-attention until
 the exact llama-server load proves it.
 
 All commands honor global `--json`. The scriptable management surface includes:
 
 ```console
-norted-server model-profiles list
-norted-server model-profiles show <PROFILE>
-norted-server model-profiles create <PROFILE> --model <MODEL_ID> --engine <ENGINE_ID> [--role primary|auxiliary]
-norted-server model-profiles duplicate <SOURCE> <PROFILE>
-norted-server model-profiles delete <PROFILE>
-norted-server model-profiles set-model <PROFILE> <MODEL_ID>
-norted-server model-profiles set-engine <PROFILE> <ENGINE_ID>
-norted-server model-profiles set-role <PROFILE> <primary|auxiliary>
-norted-server model-profiles set <PROFILE> <SETTING=VALUE>...
-norted-server model-profiles unset <PROFILE> <SETTING>...
-norted-server model-profiles load <PROFILE> [--runtime <RUNTIME_ID>] [--set <SETTING=VALUE>...]
-norted-server model-profiles compatibility <PROFILE> [--runtime <RUNTIME_ID>]
-norted-server load <PROFILE> [--runtime <RUNTIME_ID>] [--set <SETTING=VALUE>...]
-norted-server unload <PROFILE>
-norted-server settings show --server
-norted-server settings set --server <SETTING=VALUE>...
-norted-server settings unset --server <SETTING>...
-norted-server settings show --runtime q27
-norted-server settings set --runtime q27 <SETTING=VALUE>...
-norted-server settings unset --runtime q27 <SETTING>...
+scala model-profiles list
+scala model-profiles show <PROFILE>
+scala model-profiles create <PROFILE> --model <MODEL_ID> --engine <ENGINE_ID> [--role primary|auxiliary]
+scala model-profiles duplicate <SOURCE> <PROFILE>
+scala model-profiles delete <PROFILE>
+scala model-profiles set-model <PROFILE> <MODEL_ID>
+scala model-profiles set-engine <PROFILE> <ENGINE_ID>
+scala model-profiles set-role <PROFILE> <primary|auxiliary>
+scala model-profiles set <PROFILE> <SETTING=VALUE>...
+scala model-profiles unset <PROFILE> <SETTING>...
+scala model-profiles load <PROFILE> [--runtime <RUNTIME_ID>] [--set <SETTING=VALUE>...]
+scala model-profiles compatibility <PROFILE> [--runtime <RUNTIME_ID>]
+scala load <PROFILE> [--runtime <RUNTIME_ID>] [--set <SETTING=VALUE>...]
+scala unload <PROFILE>
+scala settings show --server
+scala settings set --server <SETTING=VALUE>...
+scala settings unset --server <SETTING>...
+scala settings show --runtime q27
+scala settings set --runtime q27 <SETTING=VALUE>...
+scala settings unset --runtime q27 <SETTING>...
 ```
 
 ## Runtime packs
 
-Norted can search authoritative upstream runtime catalogs, verify and install either release packs or fixed source-build packs, retain multiple versions side by side, select an exact runtime for an artifact format or model, and launch that exact executable. Ordinary upstream releases and compatible NInfer commits are discovered independently of Norted Server releases; a Norted update is needed only when upstream breaks a known packaging, container, build, CLI, or protocol contract.
+Scala can search authoritative upstream runtime catalogs, verify and install either release packs or fixed source-build packs, retain multiple versions side by side, select an exact runtime for an artifact format or model, and launch that exact executable. Ordinary upstream releases and compatible NInfer commits are discovered independently of Scala releases; a Scala update is needed only when upstream breaks a known packaging, container, build, CLI, or protocol contract.
 
 Installed packs are local truth. Starting the CLI, TUI, `status`, or `serve` never waits for GitHub. Network access occurs only for explicit search/update operations or after the user opens TUI search.
 
-Managed installs live under the platform-native Norted data directory printed by `norted-server config show`:
+Managed installs live under the platform-native Scala data directory printed by `scala config show`:
 
 ```text
 <data>/runtimes/
@@ -272,7 +307,7 @@ Managed installs live under the platform-native Norted data directory printed by
 <data>/runtime-selections.json
 ```
 
-Each managed `runtime.json` is an immutable schema-version-2 record; existing schema-version-1 release manifests remain valid and are not rewritten. Release manifests retain their repository/release/assets and verified archive digest semantics. Source-build manifests instead retain the canonical repository, source ref, exact commit and Git tree, commit timestamp, fixed Norted recipe and build system/arguments/target, observed toolchain/system-package versions, build target platform/architecture/accelerator, build time, entrypoint, and resulting executable SHA-256. They contain no fabricated archive digest or upstream-binary claim.
+Each managed `runtime.json` is an immutable schema-version-2 record; existing schema-version-1 release manifests remain valid and are not rewritten. Release manifests retain their repository/release/assets and verified archive digest semantics. Source-build manifests instead retain the canonical repository, source ref, exact commit and Git tree, commit timestamp, fixed Scala recipe and build system/arguments/target, observed toolchain/system-package versions, build target platform/architecture/accelerator, build time, entrypoint, and resulting executable SHA-256. They contain no fabricated archive digest or upstream-binary claim.
 
 Selections are mutable preferences and are therefore stored separately. Resolution precedence is:
 
@@ -294,11 +329,11 @@ The llama.cpp provider recognizes these official priority families where an actu
 - Windows x86_64 CPU, CUDA, and Vulkan;
 - Linux x86_64 CPU and Vulkan.
 
-Windows CUDA releases are composite packages: Norted verifies and extracts both the main llama.cpp archive and the matching official CUDA-runtime archive. The provider searches real assets across releases, so a temporarily incomplete newest build matrix does not create a broken candidate. `Latest` is the newest installable build. `Stable` follows llama.cpp's authoritative stable/nightly pointer when it resolves to a matching published build.
+Windows CUDA releases are composite packages: Scala verifies and extracts both the main llama.cpp archive and the matching official CUDA-runtime archive. The provider searches real assets across releases, so a temporarily incomplete newest build matrix does not create a broken candidate. `Latest` is the newest installable build. `Stable` follows llama.cpp's authoritative stable/nightly pointer when it resolves to a matching published build.
 
-The separate llama.cpp managed-source provider covers Linux x86_64 CUDA because upstream does not publish a comparable Ubuntu CUDA archive. One admitted exact nightly commit/tree exposes two intentional parallel source variants, neither labeled as an upstream CUDA binary: immutable CUDA-12 `managed-portable-v4` requires Toolkit `>=12.8,<13.0` and Linux driver `>=525.60.13`, while `managed-portable-cuda13-v2` requires Toolkit `>=13.0,<14.0` and driver `>=580.65.06`. Both require the stable active-toolkit compiler `/usr/local/cuda/bin/nvcc`, bind CMake to that same compiler, build only `llama-server` with fixed real-code targets `sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_90`, and `sm_120a`, origin-relative build RPATHs, and exact source/recipe/toolchain/executable provenance. Source manifests distinguish provider-owned recipe arguments from the effective CMake arguments actually executed; the latter include the generated typed compiler binding, while observed nvcc version remains toolchain identity. Historical schema-2 manifests that predate the effective list remain readable without fabricating or rewriting information they did not record. Historical CUDA-12 V1/V2/V3 and CUDA-13 V1 identities remain immutable; CUDA-12 V1 is retained for update discovery but is not an automatic serving candidate because its pre-relocatability recipe can retain stale build-tree library paths. Norted validates but never installs CUDA, the NVIDIA driver, or other toolchain packages.
+The separate llama.cpp managed-source provider covers Linux x86_64 CUDA because upstream does not publish a comparable Ubuntu CUDA archive. One admitted exact nightly commit/tree exposes two intentional parallel source variants, neither labeled as an upstream CUDA binary: immutable CUDA-12 `managed-portable-v4` requires Toolkit `>=12.8,<13.0` and Linux driver `>=525.60.13`, while `managed-portable-cuda13-v2` requires Toolkit `>=13.0,<14.0` and driver `>=580.65.06`. Both require the stable active-toolkit compiler `/usr/local/cuda/bin/nvcc`, bind CMake to that same compiler, build only `llama-server` with fixed real-code targets `sm_75`, `sm_80`, `sm_86`, `sm_89`, `sm_90`, and `sm_120a`, origin-relative build RPATHs, and exact source/recipe/toolchain/executable provenance. Source manifests distinguish provider-owned recipe arguments from the effective CMake arguments actually executed; the latter include the generated typed compiler binding, while observed nvcc version remains toolchain identity. Historical schema-2 manifests that predate the effective list remain readable without fabricating or rewriting information they did not record. Historical CUDA-12 V1/V2/V3 and CUDA-13 V1 identities remain immutable; CUDA-12 V1 is retained for update discovery but is not an automatic serving candidate because its pre-relocatability recipe can retain stale build-tree library paths. Scala validates but never installs CUDA, the NVIDIA driver, or other toolchain packages.
 
-The q27 provider exposes official Linux x86_64 CUDA releases from v0.2.0 onward. Earlier v0.1.x servers omit the terminal streaming finish reason needed for truthful Responses completion state, so they are deliberately excluded. A release is visible when it has a verified upstream archive or when its exact tagged source proves a supported q27 Makefile recipe; source-only current releases therefore remain searchable without being mislabeled as binaries. When both routes cover the same release and variant, the verified upstream binary wins. Norted creates only the W8, W12, and W16 variants whose upstream targets are present at that revision: `build/q27-server-w8`, default `build/q27-server`, and `build/q27-server-w16`. W8 is automatically preferred for a positively observed 24 GiB-class device and is also the conservative fallback when VRAM is unresolved. W12 is q27's normal/default build and is preferred only when the selected device is positively confirmed as 32 GiB-class or larger. W16 remains an explicit specialist choice and stays last automatically. Because upstream publishes no exact W16 floor, Norted records only the known fact that 24 GiB-class hardware is insufficient; a larger device remains needs-attention rather than being assigned an invented minimum. Stable/Latest follow the newest admitted semantic release, including a supported source-only release. Upstream currently provides no managed Windows q27 route, so Windows reports these entries as incompatible rather than inventing one.
+The q27 provider exposes official Linux x86_64 CUDA releases from v0.2.0 onward. Earlier v0.1.x servers omit the terminal streaming finish reason needed for truthful Responses completion state, so they are deliberately excluded. A release is visible when it has a verified upstream archive or when its exact tagged source proves a supported q27 Makefile recipe; source-only current releases therefore remain searchable without being mislabeled as binaries. When both routes cover the same release and variant, the verified upstream binary wins. Scala creates only the W8, W12, and W16 variants whose upstream targets are present at that revision: `build/q27-server-w8`, default `build/q27-server`, and `build/q27-server-w16`. W8 is automatically preferred for a positively observed 24 GiB-class device and is also the conservative fallback when VRAM is unresolved. W12 is q27's normal/default build and is preferred only when the selected device is positively confirmed as 32 GiB-class or larger. W16 remains an explicit specialist choice and stays last automatically. Because upstream publishes no exact W16 floor, Scala records only the known fact that 24 GiB-class hardware is insufficient; a larger device remains needs-attention rather than being assigned an invented minimum. Stable/Latest follow the newest admitted semantic release, including a supported source-only release. Upstream currently provides no managed Windows q27 route, so Windows reports these entries as incompatible rather than inventing one.
 
 For a q27 source build, discovery resolves the release tag to a full Git commit/tree and inspects bounded exact-revision build and runtime-contract files. Search does not clone or compile. The current v0.10.0 contract fingerprints its provider-reviewed `Makefile`, `README.md`, `src/server.cu`, and `src/engine.cuh`; that evidence proves generic q27 raw-completions, thinking/sampling, MTP/suffix/fast-head, KV-mode, startup-banner, and target-specific W_MAX capabilities. Installation revalidates the tag contract and immutable commit/tree, checks Linux x86_64, Git, Make, the source-declared CUDA floor and `/usr/local/cuda/bin/nvcc`, and the declared host C++ compiler/standard before staging. It checks out that exact commit separately from model-artifact state, requires the checked-out Makefile to match the provider-audited dependency/command closure digest, removes build-control environment overrides, and runs only `make <selected-target>`. The recipe version, Makefile digest, source commit/tree, exact target, toolchain, and built executable digest persist in the installed provenance, so launch admission does not consult mutable upstream state. The resulting executable must be regular, executable, hash-stable, and pass the q27 adapter probe before atomic activation.
 
@@ -314,18 +349,18 @@ sets. The full commit/tree remains provenance. A later source snapshot retains a
 contract-owning blobs are unchanged; an unreviewed semantic domain becomes NeedsAttention without
 erasing unrelated launch controls.
 
-The current official NInfer build contract is Linux x86_64, NVIDIA GeForce RTX 5090, numeric compute capability 12.0 with `sm_120a`, CUDA Toolkit 13.1 or newer, CMake 3.28 or newer, Ninja, a C++20 compiler, pkg-config, FFmpeg development modules, and libcurl. Product name and compute capability are independent observed checks; missing facts are needs-attention and contradictory facts are incompatible. Norted never installs host packages automatically.
+The current official NInfer build contract is Linux x86_64, NVIDIA GeForce RTX 5090, numeric compute capability 12.0 with `sm_120a`, CUDA Toolkit 13.1 or newer, CMake 3.28 or newer, Ninja, a C++20 compiler, pkg-config, FFmpeg development modules, and libcurl. Product name and compute capability are independent observed checks; missing facts are needs-attention and contradictory facts are incompatible. Scala never installs host packages automatically.
 
-Host detection uses the OS and architecture plus a bounded `nvidia-smi` query for every NVIDIA GPU's UUID, name, VRAM, driver, and numeric compute capability when supported; older tools fall back to the otherwise complete query and leave compute capability unknown. An unavailable hardware signal does not stop Norted itself and becomes a needs-attention result, while a successful probe that positively reports no NVIDIA GPU makes a CUDA requirement incompatible. Upstream phrases such as "24 GiB-class" are represented separately from exact byte floors: up to 2 GiB of reporting/ECC/reservation shortfall still counts as the nominal class (matching q27's measured 22.6 GiB A10 case), the next 1 GiB is needs-attention, and a larger shortfall is incompatible. Informational runtime notes remain visible but do not change compatibility; only explicitly unverified conditions produce needs-attention.
+Host detection uses the OS and architecture plus a bounded `nvidia-smi` query for every NVIDIA GPU's UUID, name, VRAM, driver, and numeric compute capability when supported; older tools fall back to the otherwise complete query and leave compute capability unknown. An unavailable hardware signal does not stop Scala itself and becomes a needs-attention result, while a successful probe that positively reports no NVIDIA GPU makes a CUDA requirement incompatible. Upstream phrases such as "24 GiB-class" are represented separately from exact byte floors: up to 2 GiB of reporting/ECC/reservation shortfall still counts as the nominal class (matching q27's measured 22.6 GiB A10 case), the next 1 GiB is needs-attention, and a larger shortfall is incompatible. Informational runtime notes remain visible but do not change compatibility; only explicitly unverified conditions produce needs-attention.
 
 llama.cpp uses an ordered accelerator binding. `llama.cpp.devices` contains exact NVIDIA GPU UUIDs in
 the intended upstream device order; every entry must resolve uniquely to a visible compatible device and
-duplicates fail. Norted writes those UUIDs in the same order to `CUDA_VISIBLE_DEVICES`, then passes
+duplicates fail. Scala writes those UUIDs in the same order to `CUDA_VISIBLE_DEVICES`, then passes
 `--device CUDA0,CUDA1,...` using the child-local indexes. If `llama.cpp.devices` is omitted, the existing
 automatic policy still chooses one compatible GPU. `main_gpu`, tensor-split, and per-device fit values are
 validated against the selected group under current upstream index, broadcast, and arity rules.
 
-Q27 compatibility is evaluated against one concrete observed GPU, and q27-server is launched with `CUDA_VISIBLE_DEVICES` set to that device's full NVIDIA GPU UUID. Official managed q27 fatbin targets are enforced per runtime version before VRAM ranking, so a supported lower-VRAM device beats a larger unsupported device when it meets the runtime and model floors; an unknown compute capability is needs-attention. Norted never treats an `nvidia-smi` number as a CUDA identity. A parent `CUDA_VISIBLE_DEVICES` containing one uniquely resolvable GPU UUID is honored and normalized to the full UUID; empty, numeric, multiple, unknown, or ambiguous constraints make q27 incompatible rather than allowing assessment and launch to diverge. The q27 configuration cannot set this variable because Norted owns the binding. This is single-device binding for q27, not a general GPU scheduler.
+Q27 compatibility is evaluated against one concrete observed GPU, and q27-server is launched with `CUDA_VISIBLE_DEVICES` set to that device's full NVIDIA GPU UUID. Official managed q27 fatbin targets are enforced per runtime version before VRAM ranking, so a supported lower-VRAM device beats a larger unsupported device when it meets the runtime and model floors; an unknown compute capability is needs-attention. Scala never treats an `nvidia-smi` number as a CUDA identity. A parent `CUDA_VISIBLE_DEVICES` containing one uniquely resolvable GPU UUID is honored and normalized to the full UUID; empty, numeric, multiple, unknown, or ambiguous constraints make q27 incompatible rather than allowing assessment and launch to diverge. The q27 configuration cannot set this variable because Scala owns the binding. This is single-device binding for q27, not a general GPU scheduler.
 
 NInfer reuses the same exact UUID visibility rules. A managed runtime selects a proven RTX 5090/sm_120a device even when another unsupported GPU is larger, launches with `CUDA_VISIBLE_DEVICES=<full UUID>`, and passes `--device 0`; inside the isolated child, CUDA-local device zero is therefore the selected physical UUID. The common ordered binding retains that one complete `AcceleratorDevice` in launch provenance. This remains exact single-device binding, not scheduling.
 
@@ -373,28 +408,28 @@ Updates install a new exact runtime beside the old one. They never overwrite or 
 The runtime command tree is scriptable and supports global `--json`:
 
 ```console
-cargo run -p norted-server -- models list
-cargo run -p norted-server -- models info <MODEL_ID>
-cargo run -p norted-server -- models search [QUERY] [--format gguf|q27|ninfer]
-cargo run -p norted-server -- models download <MODEL_REF>
-cargo run -p norted-server -- models import <PATH>
-cargo run -p norted-server -- models remove <MODEL_ID>
-cargo run -p norted-server -- runtimes list
-cargo run -p norted-server -- runtimes search [QUERY]
-cargo run -p norted-server -- runtimes search --refresh
-cargo run -p norted-server -- runtimes info <RUNTIME_ID>
-cargo run -p norted-server -- runtimes install <RUNTIME_ID>
-cargo run -p norted-server -- runtimes remove <RUNTIME_ID>
-cargo run -p norted-server -- runtimes check-updates
-cargo run -p norted-server -- runtimes update <RUNTIME_ID>
-cargo run -p norted-server -- runtimes select --format gguf <RUNTIME_ID>
-cargo run -p norted-server -- runtimes select --format gguf --track stable <RUNTIME_ID>
-cargo run -p norted-server -- runtimes select --format gguf --track latest <RUNTIME_ID>
-cargo run -p norted-server -- runtimes select --format q27 <RUNTIME_ID>
-cargo run -p norted-server -- runtimes select --format ninfer <RUNTIME_ID>
-cargo run -p norted-server -- runtimes select --model <MODEL_ID> <RUNTIME_ID>
-cargo run -p norted-server -- runtimes clear-selection --format gguf
-cargo run -p norted-server -- runtimes clear-selection --model <MODEL_ID>
+cargo run -p scala -- models list
+cargo run -p scala -- models info <MODEL_ID>
+cargo run -p scala -- models search [QUERY] [--format gguf|q27|ninfer]
+cargo run -p scala -- models download <MODEL_REF>
+cargo run -p scala -- models import <PATH>
+cargo run -p scala -- models remove <MODEL_ID>
+cargo run -p scala -- runtimes list
+cargo run -p scala -- runtimes search [QUERY]
+cargo run -p scala -- runtimes search --refresh
+cargo run -p scala -- runtimes info <RUNTIME_ID>
+cargo run -p scala -- runtimes install <RUNTIME_ID>
+cargo run -p scala -- runtimes remove <RUNTIME_ID>
+cargo run -p scala -- runtimes check-updates
+cargo run -p scala -- runtimes update <RUNTIME_ID>
+cargo run -p scala -- runtimes select --format gguf <RUNTIME_ID>
+cargo run -p scala -- runtimes select --format gguf --track stable <RUNTIME_ID>
+cargo run -p scala -- runtimes select --format gguf --track latest <RUNTIME_ID>
+cargo run -p scala -- runtimes select --format q27 <RUNTIME_ID>
+cargo run -p scala -- runtimes select --format ninfer <RUNTIME_ID>
+cargo run -p scala -- runtimes select --model <MODEL_ID> <RUNTIME_ID>
+cargo run -p scala -- runtimes clear-selection --format gguf
+cargo run -p scala -- runtimes clear-selection --model <MODEL_ID>
 ```
 
 Search terms match engines, formats, versions, platforms, architectures, backends, variants, and source acquisition, so queries such as `llama`, `q27`, `ninfer`, `.ninfer`, `CUDA`, `source`, `GGUF`, and `Q27` work. A runtime reference is its stable exact runtime ID, never an internal path. Search opened from the generic Runtimes page remains model-independent. Search opened from a selected model passes that model to every engine adapter and combines catalog, platform, selected-device, runtime-variant, model metadata, and model hardware compatibility before showing recommendations; another engine advertising the same format remains eligible.
@@ -404,7 +439,7 @@ Selections default to `--track pinned`. `--track stable` and `--track latest` ke
 The rest of the command tree remains:
 
 ```text
-norted-server
+scala
 ├── tui
 ├── serve
 ├── status
@@ -429,9 +464,9 @@ managed runtime integrity and selections, private control state, host/GPU
 compatibility, and relevant managed-source toolchain prerequisites.
 
 ```console
-norted-server doctor
-norted-server doctor --verbose
-norted-server --json doctor
+scala doctor
+scala doctor --verbose
+scala --json doctor
 ```
 
 The diagnostic is always offline and read-only. It does not initialize stores,
@@ -445,15 +480,15 @@ status 1. Doctor never applies repairs; follow its suggested existing commands
 explicitly. Runtime update discovery remains a separate, explicit operation:
 
 ```console
-norted-server runtimes check-updates
+scala runtimes check-updates
 ```
 
 For normal interactive use, start the TUI directly:
 
 ```console
-cargo run -p norted-server
+cargo run -p scala
 # or explicitly:
-cargo run -p norted-server -- tui
+cargo run -p scala -- tui
 ```
 
 ### Root helper scripts
@@ -482,49 +517,49 @@ running headless. Build options can be passed to the build helpers, and run opti
 after the `tui` or `serve` subcommand.
 
 Development builds optimize the SHA-256 dependency used for package verification, but production
-Norted Server builds should still use the release profile:
+Scala builds should still use the release profile:
 
 ```console
-cargo build --release -p norted-server
-./target/release/norted-server tui
+cargo build --release -p scala
+./target/release/scala tui
 ```
 
-The TUI attaches to an existing healthy Norted Server when one is already running and both its public identity and authenticated private control status can be verified. Otherwise it owns the real public gateway, private control API, runtime manager, and backend lifecycle in the same process for as long as the TUI is open. No second terminal running `serve` is normally required. Load and Unload from the TUI still cross the authenticated private loopback control API. A public-healthy descriptor whose private control status cannot be verified is treated as uncertain ownership: startup fails instead of attaching or starting a competing owner.
+The TUI attaches to an existing healthy Scala when one is already running and both its public identity and authenticated private control status can be verified. Otherwise it owns the real public gateway, private control API, runtime manager, and backend lifecycle in the same process for as long as the TUI is open. No second terminal running `serve` is normally required. Load and Unload from the TUI still cross the authenticated private loopback control API. A public-healthy descriptor whose private control status cannot be verified is treated as uncertain ownership: startup fails instead of attaching or starting a competing owner.
 
 For headless/server-only use, run:
 
 ```console
-cargo run -p norted-server -- serve
+cargo run -p scala -- serve
 ```
 
 Scriptable management commands remain clients of a running instance. With headless `serve` running, another terminal can use:
 
 ```console
-cargo run -p norted-server -- model-profiles create coding-large-context --model <MODEL_ID> --engine llama.cpp
-cargo run -p norted-server -- model-profiles set coding-large-context llama.cpp.context_length=131072 llama.cpp.kv_cache_k=q8_0
-cargo run -p norted-server -- model-profiles compatibility coding-large-context
-cargo run -p norted-server -- load coding-large-context
-cargo run -p norted-server -- load coding-large-context --set llama.cpp.parallel_requests=2
-cargo run -p norted-server -- settings show --runtime llama.cpp
-cargo run -p norted-server -- status
-cargo run -p norted-server -- unload coding-large-context
+cargo run -p scala -- model-profiles create coding-large-context --model <MODEL_ID> --engine llama.cpp
+cargo run -p scala -- model-profiles set coding-large-context llama.cpp.context_length=131072 llama.cpp.kv_cache_k=q8_0
+cargo run -p scala -- model-profiles compatibility coding-large-context
+cargo run -p scala -- load coding-large-context
+cargo run -p scala -- load coding-large-context --set llama.cpp.parallel_requests=2
+cargo run -p scala -- settings show --runtime llama.cpp
+cargo run -p scala -- status
+cargo run -p scala -- unload coding-large-context
 ```
 
 `load` contacts the already-running serving process; it does not launch a hidden second server. Explicit loads are pinned, may coexist, and are never removed by JIT cleanup. `unload <PROFILE>` drains and removes only that profile.
 
-Inference is JIT-loaded by Model Profile. With zero resident models, the first Responses or Chat Completions request resolves the profile's exact artifact, engine, runtime, settings, and provenance, waits for startup, and then runs. Requests without Norted attribution share one deterministic default logical session, so changing its primary model drains and replaces the previous unpinned JIT primary. A profile declared `auxiliary` uses the auxiliary cache policy. A request carrying `X-Norted-Role: auxiliary` routes alongside the session primary without changing the backend's Model Profile role or immutable identity.
+Inference is JIT-loaded by Model Profile. With zero resident models, the first Responses or Chat Completions request resolves the profile's exact artifact, engine, runtime, settings, and provenance, waits for startup, and then runs. Requests without Scala attribution share one deterministic default logical session, so changing its primary model drains and replaces the previous unpinned JIT primary. A profile declared `auxiliary` uses the auxiliary cache policy. A request carrying `X-Scala-Role: auxiliary` routes alongside the session primary without changing the backend's Model Profile role or immutable identity.
 
-Both inference endpoints accept two optional orchestration headers: `X-Norted-Session` is an opaque 1–128 byte visible value retained only in memory, and `X-Norted-Role` is exactly `primary` or `auxiliary`. Role overrides the profile default for that request. Session and role metadata are never forwarded to engines or included in immutable provenance. Distinct explicit sessions may retain different primary profiles, while sessions choosing the same profile share one backend. Every attributed request renews an existing session, but only primary requests create a session or change its primary. Any backend held as a live session primary is protected from JIT eviction regardless of its configured profile role.
+Both inference endpoints accept two optional orchestration headers: `X-Scala-Session` is an opaque 1–128 byte visible value retained only in memory, and `X-Scala-Role` is exactly `primary` or `auxiliary`. Role overrides the profile default for that request. Session and role metadata are never forwarded to engines or included in immutable provenance. Distinct explicit sessions may retain different primary profiles, while sessions choosing the same profile share one backend. Every attributed request renews an existing session, but only primary requests create a session or change its primary. Any backend held as a live session primary is protected from JIT eviction regardless of its configured profile role.
 
-Private `POST /control/v1/load` is a short authenticated admission request. A successful request reserves a manager generation as Loading, starts a server-owned background operation, and returns `202 Accepted`; the TUI then observes progress and the final state through private status. The scriptable `norted-server load` command preserves blocking semantics by polling that exact generation until Running or Failed. Disconnecting a CLI or attached TUI does not cancel an accepted load; unloading, server shutdown, or exiting a TUI that owns its server still uses the normal manager cancellation path.
+Private `POST /control/v1/load` is a short authenticated admission request. A successful request reserves a manager generation as Loading, starts a server-owned background operation, and returns `202 Accepted`; the TUI then observes progress and the final state through private status. The scriptable `scala load` command preserves blocking semantics by polling that exact generation until Running or Failed. Disconnecting a CLI or attached TUI does not cancel an accepted load; unloading, server shutdown, or exiting a TUI that owns its server still uses the normal manager cancellation path.
 
 ## TUI
 
 Run the TUI with no subcommand or with `tui`:
 
 ```console
-cargo run -p norted-server
-cargo run -p norted-server -- tui
+cargo run -p scala
+cargo run -p scala -- tui
 ```
 
 At startup the TUI safely chooses one of two modes: it attaches to a healthy instance discovered through the existing runtime descriptor, public identity probe, and authenticated private control `status`, or it starts and owns the same serving composition used by headless `serve`. In owned mode the configured OpenAI-compatible endpoint is live while the TUI runs. Exiting shuts down the owned listeners and all managed backends and removes the owned descriptor; exiting an attached TUI leaves the external server running.
@@ -587,18 +622,18 @@ The `[models]` table controls two distinct concerns:
 
 - `models.paths` is the list of additional directories scanned for local model
   artifacts. Use it to expose pre-existing model files that live outside
-  Norted's managed library (for example a manually maintained GGUF directory on
+  Scala's managed library (for example a manually maintained GGUF directory on
   another disk). Relative entries resolve against the directory containing
   `config.toml`.
-- `models.model_downloads_path` is the destination root for models that Norted
+- `models.model_downloads_path` is the destination root for models that Scala
   Server downloads itself. When omitted, downloads land under
-  `<Norted data_dir>/models`, preserving the historical managed library root.
+  `<Scala data_dir>/models`, preserving the historical managed library root.
   Relative paths resolve against the config directory, matching `paths`. A
   common reason to set it is to place large models on a separate mounted disk.
 
 The effective download destination is always scanned automatically; do not
 repeat it inside `models.paths`. Download staging and the download cache stay
-under Norted's own data and cache directories and are not configurable. When
+under Scala's own data and cache directories and are not configurable. When
 `model_downloads_path` is overridden, the previous `<data_dir>/models` location
 is no longer an implicit discovery root, but it can still be scanned by adding
 it to `models.paths`.
@@ -613,7 +648,7 @@ paths = [
 ]
 ```
 
-With the above, Norted downloads to `/mnt/ai/models`, automatically discovers
+With the above, Scala downloads to `/mnt/ai/models`, automatically discovers
 models there, and additionally discovers the two `paths` entries.
 
 An external q27 executable can use the same setting under `[engine.q27]`. An advanced external NInfer server uses:
@@ -628,9 +663,9 @@ binary_path = "/path/to/ninfer-serve"
 
 Relative paths resolve against the directory containing `config.toml`. Observed paths, digests, and usage/help contracts remain exact, but unproved source revisions, build flags, target registries, and hardware targets are never invented; otherwise-usable external runtimes therefore remain needs-attention. Explicit and persisted external selections are still honored when known model/device checks do not prove incompatibility. If an engine section is absent, its built-in adapter remains enabled for managed discovery; setting `enabled = false` disables it.
 
-External binaries participate in the same resolver as managed packs. Norted canonicalizes and probes the executable, records its SHA-256 and observed facts, labels acquisition as `ExternalBinary`, leaves the repository unverified, and treats updates as unmanaged. External runtime manifests are synthesized in memory and are never mistaken for Norted-owned installations.
+External binaries participate in the same resolver as managed packs. Scala canonicalizes and probes the executable, records its SHA-256 and observed facts, labels acquisition as `ExternalBinary`, leaves the repository unverified, and treats updates as unmanaged. External runtime manifests are synthesized in memory and are never mistaken for Scala-owned installations.
 
-All adapters keep native configuration engine-namespaced while rejecting flags or variables that can replace Norted-owned model inputs, identity, loopback host/port, authentication, API behavior, observation files, GPU binding, structured settings, or provable generation settings. llama.cpp and q27 raw native arguments are disabled. llama.cpp additionally requires every exact-help option to be classified and dynamically scrubs inherited llama/MTMD/GGML/LLGuidance/AIP controls; q27 rejects configured and scrubs inherited `Q27_*` controls before adding back typed values. NInfer currently admits no raw native option; its ordinary controls are structured. Unrelated ordinary process environment remains inherited, and raw environment values are never placed in provenance.
+All adapters keep native configuration engine-namespaced while rejecting flags or variables that can replace Scala-owned model inputs, identity, loopback host/port, authentication, API behavior, observation files, GPU binding, structured settings, or provable generation settings. llama.cpp and q27 raw native arguments are disabled. llama.cpp additionally requires every exact-help option to be classified and dynamically scrubs inherited llama/MTMD/GGML/LLGuidance/AIP controls; q27 rejects configured and scrubs inherited `Q27_*` controls before adding back typed values. NInfer currently admits no raw native option; its ordinary controls are structured. Unrelated ordinary process environment remains inherited, and raw environment values are never placed in provenance.
 
 ## Model artifacts and native identity
 
@@ -669,13 +704,13 @@ When authentication is effective, it applies to `/v1/models`, `/v1/models/{model
 Create and manage keys with the scriptable CLI:
 
 ```console
-norted-server auth status
-norted-server auth keys list
-norted-server auth keys create --name vscode
-norted-server auth keys revoke <KEY_ID>
+scala auth status
+scala auth keys list
+scala auth keys create --name vscode
+scala auth keys revoke <KEY_ID>
 ```
 
-The create command prints a `norted_sk_...` secret exactly once. The versioned store lives at `<data>/api-keys.json`, uses `<data>/.api-keys.lock` plus atomic replacement, and persists only a key ID, label, display prefix, SHA-256 digest, creation time, and revocation time. It never stores the full key. Every authenticated request reads this small mutable state through a blocking boundary, so revocation takes effect without a restart. `--json` is supported; list output never contains secrets or digests.
+The create command prints a `scala_sk_...` secret exactly once. The versioned store lives at `<data>/api-keys.json`, uses `<data>/.api-keys.lock` plus atomic replacement, and persists only a key ID, label, display prefix, SHA-256 digest, creation time, and revocation time. It never stores the full key. Every authenticated request reads this small mutable state through a blocking boundary, so revocation takes effect without a restart. `--json` is supported; list output never contains secrets or digests.
 
 Useful server configurations are:
 
@@ -688,7 +723,7 @@ auth = "auto"
 ```
 
 ```toml
-# Tailscale/VPN-style bind: at least one active Norted key is required.
+# Tailscale/VPN-style bind: at least one active Scala key is required.
 [server]
 host = "<TAILSCALE_OR_VPN_IP>"
 port = 8742
@@ -703,7 +738,7 @@ port = 8742
 auth = "disabled"
 ```
 
-Bearer authentication does not encrypt transport. Loopback needs no network transport layer; Tailscale or another trusted VPN can provide encrypted transport, and a reverse proxy can provide TLS. Plain HTTP on an untrusted LAN exposes bearer credentials, prompts, and outputs. Norted does not manage certificates and does not enable permissive browser CORS.
+Bearer authentication does not encrypt transport. Loopback needs no network transport layer; Tailscale or another trusted VPN can provide encrypted transport, and a reverse proxy can provide TLS. Plain HTTP on an untrusted LAN exposes bearer credentials, prompts, and outputs. Scala does not manage certificates and does not enable permissive browser CORS.
 
 Each backend and the separately authenticated private control listener use OS-assigned loopback ports. JIT is enabled by default with a 3600-second session/primary idle TTL, a 300-second auxiliary idle TTL, and at most two idle auxiliary JIT backends. Cleanup is LRU/oldest-idle, ignores pinned or active backends, and never evicts the requesting session's leased primary to launch an auxiliary. Public API keys cannot authorize control operations, and clients are never redirected to or given the private upstream server.
 
@@ -746,7 +781,7 @@ per-request budget field. System prompt, output limit, sampler, stop, penalty, t
 values otherwise act as request defaults where the exact private contract supports them, and an
 explicit request wins.
 
-`context_overflow=truncate_middle` is Norted request management, not llama.cpp context shift. It
+`context_overflow=truncate_middle` is Scala request management, not llama.cpp context shift. It
 requires a finite request/profile output allowance, reads the exact effective slot context from the
 selected backend, counts the fully rendered chat with that model's tokenizer, preserves every
 system/developer instruction and the newest conversational tail, and removes older middle messages
@@ -759,23 +794,23 @@ Example:
 
 ```console
 curl http://127.0.0.1:8742/v1/responses \
-  -H "Authorization: Bearer $NORTED_API_KEY" \
+  -H "Authorization: Bearer $SCALA_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"<MODEL_PROFILE_ID>","input":"Reply with exactly: Norted works."}'
+  -d '{"model":"<MODEL_PROFILE_ID>","input":"Reply with exactly: Scala works."}'
 ```
 
 Chat uses the same key:
 
 ```console
 curl http://127.0.0.1:8742/v1/chat/completions \
-  -H "Authorization: Bearer $NORTED_API_KEY" \
+  -H "Authorization: Bearer $SCALA_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"<MODEL_ID>","messages":[{"role":"user","content":"Say hello."}]}'
 ```
 
-Responses streaming emits the current ordered Norted-generated Responses SSE events and ends in completed, incomplete, or failed state. Chat streaming emits stable `chat.completion.chunk` IDs, assistant/text deltas, a truthful stop/length finish reason, optional known usage, and `[DONE]`. Dropping a client stream drops its owned backend stream rather than leaving detached generation.
+Responses streaming emits the current ordered Scala-generated Responses SSE events and ends in completed, incomplete, or failed state. Chat streaming emits stable `chat.completion.chunk` IDs, assistant/text deltas, a truthful stop/length finish reason, optional known usage, and `[DONE]`. Dropping a client stream drops its owned backend stream rather than leaving detached generation.
 
-For NInfer, Responses and Chat Completions pass through the canonical Norted `InferenceRequest` and private
+For NInfer, Responses and Chat Completions pass through the canonical Scala `InferenceRequest` and private
 `/v1/chat/completions` translation; they are never raw-proxied to NInfer's richer APIs. The reviewed
 source contract carries seed, top-k/min-p, penalties, stops, thinking/effort, ordinary function
 tools, tool history/results, and streaming tool deltas. NInfer supports only `auto`/`none` tool
@@ -787,20 +822,20 @@ output stays false because the audited NInfer source rejects constrained non-tex
 
 Responses remains the primary generation API; Chat Completions is the modern compatibility generation API. `/v1/completions` provides legacy **raw-prompt** compatibility, with no chat template or system-message injection. llama.cpp and exact reviewed q27 runtimes support it, including streaming; NInfer does not. Requests accept one string `prompt`, `model`, `stream`, `stream_options.include_usage`, `max_tokens`, `temperature`, `top_p`, and adapter-supported `top_k`, `min_p`, `seed`, stop strings and penalties. q27 rejects stop strings and repetition/presence/frequency penalties. Non-default `n`/`best_of`, `echo=true`, non-null `logprobs`/`suffix`, non-empty `logit_bias`, token-ID prompts and multiple prompts fail explicitly. `user` is accepted as client metadata without changing inference.
 
-`/v1/embeddings` requires an embedding-capable Model Profile/runtime. Initially only llama.cpp is supported. Bounded inspection of the actual GGUF reads `<architecture>.pooling_type`: mean (1), CLS (2), or last (3) establishes pooled embedding capability. Missing/unknown, none (0), and rank (4) do not. Raw and package-managed artifacts use the same inspection, independently of Builder provenance and filenames. Such profiles launch normally with `--embedding`, without forcing pooling. Runtime inference supplies numeric vectors; Norted formats float arrays or base64 little-endian float32 bytes, preserving input order and indexes. Token accounting is included only when supplied consistently by the runtime.
+`/v1/embeddings` requires an embedding-capable Model Profile/runtime. Initially only llama.cpp is supported. Bounded inspection of the actual GGUF reads `<architecture>.pooling_type`: mean (1), CLS (2), or last (3) establishes pooled embedding capability. Missing/unknown, none (0), and rank (4) do not. Raw and package-managed artifacts use the same inspection, independently of Builder provenance and filenames. Such profiles launch normally with `--embedding`, without forcing pooling. Runtime inference supplies numeric vectors; Scala formats float arrays or base64 little-endian float32 bytes, preserving input order and indexes. Token accounting is included only when supplied consistently by the runtime.
 
-Embeddings accepts `input` as a non-empty string or non-empty array of non-empty strings, `encoding_format` of `float` (default) or `base64`, and optional `user`. Any supplied `dimensions`, token-array inputs, or unknown fields are rejected. Unsupported model/runtime capabilities fail explicitly with sanitized OpenAI-style errors. Both new inference routes share authentication, request correlation, the 32 MiB body limit, X-Norted routing, JIT loading, and runtime leases.
+Embeddings accepts `input` as a non-empty string or non-empty array of non-empty strings, `encoding_format` of `float` (default) or `base64`, and optional `user`. Any supplied `dimensions`, token-array inputs, or unknown fields are rejected. Unsupported model/runtime capabilities fail explicitly with sanitized OpenAI-style errors. Both new inference routes share authentication, request correlation, the 32 MiB body limit, X-Scala routing, JIT loading, and runtime leases.
 
 ```sh
 curl http://127.0.0.1:8742/v1/embeddings \
-  -H "Authorization: Bearer $NORTED_API_KEY" \
+  -H "Authorization: Bearer $SCALA_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"<EMBEDDING_MODEL_PROFILE_ID>","input":["First text","Second text"],"encoding_format":"float"}'
 ```
 
 `GET /v1/models/{model}` retrieves one Model Profile ID with the same fields as the list, or returns an OpenAI-style 404.
 
-Public `/v1/models` remains the minimal OpenAI list (`id`, `object`, `created`, `owned_by`). Use the private local `norted-server models info <MODEL_ID>` command, with optional `--json`, to inspect compatible engines/runtimes, current resolution and active state, and model/engine serving capabilities without exposing them publicly.
+Public `/v1/models` remains the minimal OpenAI list (`id`, `object`, `created`, `owned_by`). Use the private local `scala models info <MODEL_ID>` command, with optional `--json`, to inspect compatible engines/runtimes, current resolution and active state, and model/engine serving capabilities without exposing them publicly.
 
 ## Lifecycle and provenance
 
@@ -810,7 +845,7 @@ Private control status identifies the model, engine, exact runtime ID/version/va
 
 ## Per-profile benchmarks
 
-Open `/benchmarks` and press **b Benchmark** to run **Norted Quick Bench v4**
+Open `/benchmarks` and press **b Benchmark** to run **Scala Quick Bench v4**
 manually for one Model Profile (600 seconds maximum including loading and
 finalization). The scorecard shows Intelligence, Agentic, independent executable
 Coding /100, Grep-style Retrieval /100, Output TPS, native Prefill TPS, and Latency,
@@ -829,12 +864,12 @@ hide the previous finished scorecard.
 Scriptable access uses private authenticated control:
 
 ```console
-norted-server benchmarks start PROFILE_ID
-norted-server benchmarks status --json
-norted-server benchmarks history PROFILE_ID --json
-norted-server benchmarks result RUN_ID --json
-norted-server benchmarks compare LEFT_RUN_ID RIGHT_RUN_ID --json
-norted-server benchmarks cancel
+scala benchmarks start PROFILE_ID
+scala benchmarks status --json
+scala benchmarks history PROFILE_ID --json
+scala benchmarks result RUN_ID --json
+scala benchmarks compare LEFT_RUN_ID RIGHT_RUN_ID --json
+scala benchmarks cancel
 ```
 
 Benchmarking temporarily reserves inference. See [benchmark methodology and
@@ -854,15 +889,15 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 Focused tests cover bounded NInfer admission, typed identity, source manifests and current schema validation, exact commit/tree verification, CMake dependency auditing, source history, GPU selection/isolation, settings cross-validation, startup observation, bounded protocol translation, stream cancellation, archive traversal, digest verification, catalog parsing, selection, and existing adapter contracts. Runtime archives, source checkouts/build trees, extracted binaries, model/tokenizer files, caches, generated manifests/selections, logs, control credentials, and build output must not be committed.
 
-## Norted Link
+## Scala Link
 
-[Norted Link](docs/norted-link.md) makes linked Norted servers available from
-either machine through Wayfinder's authenticated peer services. Link machines normally in Wayfinder, set `[link] enabled = true` in Norted
-(or run `norted-server link enable`), and start Norted. Local registration and
+[Scala Link](docs/scala-link.md) makes linked Scala instances available from
+either machine through Wayfinder's authenticated peer services. Link machines normally in Wayfinder, set `[link] enabled = true` in Scala
+(or run `scala link enable`), and start Scala. Local registration and
 reconnection are automatic; Wayfinder needs no application-specific setup. Native
 Windows 11 uses a protected same-account named pipe; Linux retains its protected
 Unix socket. Ubuntu ↔ Windows federation uses the same Link protocol without WSL.
-See the [account requirements and native launch flow](docs/norted-link.md#discovery-and-freshness). The normal
+See the [account requirements and native launch flow](docs/scala-link.md#discovery-and-freshness). The normal
 Models, Model Profiles and Overview views show owner/host labels, inventories,
 loaded state and owner-reported runtime identity. Load/unload executes on the
 selected owner through its normal manager.
@@ -880,15 +915,15 @@ selection/configuration and execution state. Peer reports are cached observation
 no model files, runtime files or authoritative state stores are synchronized.
 Runtime screens remain local. Link is disabled by default, and local serving
 continues when Wayfinder or a peer is unavailable. See the [setup and protocol
-documentation](docs/norted-link.md) and [validation record](docs/norted-link-validation.md).
+documentation](docs/scala-link.md) and [validation record](docs/scala-link-validation.md).
 
 ## Current limitations
 
 - Residency cleanup is TTL/LRU based and does not attempt speculative GPU-memory accounting; an auxiliary load that still cannot fit fails without sacrificing its parent primary.
 - Managed q27 is Linux x86_64 CUDA only because those are the currently supported upstream binary/source contracts; Windows can use only a separately supplied compatible external binary.
 - Managed source builds are provider-specific: llama.cpp supports the newest exact tagged Linux x86_64 portable CUDA source recipe, q27 supports exact tagged Linux x86_64 CUDA releases whose upstream Makefile contract is recognized, and NInfer supports its exact Linux x86_64/RTX 5090/sm_120a contract. Other providers do not gain source support automatically.
-- The llama.cpp Linux managed-source provider exposes two intentional parallel CUDA variants — CUDA-12 `managed-portable-v4` (`>=12.8,<13.0`, driver `>=525.60.13`) and CUDA-13 `managed-portable-cuda13-v2` (`>=13.0,<14.0`, driver `>=580.65.06`); see the runtime documentation above for their exact toolkit, compiler, and target contracts. Norted validates the prerequisite tools but does not install system, CUDA, driver, or toolchain packages.
-- Norted does not convert or migrate `.ninfer` model artifacts. The managed Model Library can acquire validated version-2 `.ninfer` containers through the same explicit download/import/remove operations as GGUF and q27; the user may also place supported containers directly in configured model directories.
+- The llama.cpp Linux managed-source provider exposes two intentional parallel CUDA variants — CUDA-12 `managed-portable-v4` (`>=12.8,<13.0`, driver `>=525.60.13`) and CUDA-13 `managed-portable-cuda13-v2` (`>=13.0,<14.0`, driver `>=580.65.06`); see the runtime documentation above for their exact toolkit, compiler, and target contracts. Scala validates the prerequisite tools but does not install system, CUDA, driver, or toolchain packages.
+- Scala does not convert or migrate `.ninfer` model artifacts. The managed Model Library can acquire validated version-2 `.ninfer` containers through the same explicit download/import/remove operations as GGUF and q27; the user may also place supported containers directly in configured model directories.
 - The public surface includes Responses, Chat Completions, Completions, Embeddings and health/model listing. Function tools, retrieval and media support remain model/engine/runtime gated. Generated audio/images, arbitrary modalities and stateful Responses are not implemented.
 - There is no built-in TLS/certificate management, permissive CORS, rate-limit infrastructure, service installer, or web UI.
 
@@ -896,12 +931,12 @@ See [docs/architecture.md](docs/architecture.md) for component boundaries and th
 ## Reclaiming managed storage
 
 ```sh
-norted-server prune
-norted-server prune --dry-run
-norted-server prune --all
-norted-server prune --all --dry-run
-norted-server prune --all --yes
-norted-server --json prune --dry-run
+scala prune
+scala prune --dry-run
+scala prune --all
+scala prune --all --dry-run
+scala prune --all --yes
+scala --json prune --dry-run
 ```
 
 Normal prune removes reproducible runtime download packages/provider catalogs,
@@ -948,5 +983,5 @@ files and concurrent disk activity can make this differ from logical estimates.
 
 Deletion is bounded to application-owned paths and never follows symlinks or
 Windows reparse points out of managed storage. Missing paths are harmless. Global
-caches, external files, Cargo `target/`, global Cargo caches, and Norted build
+caches, external files, Cargo `target/`, global Cargo caches, and Scala build
 storage are never part of Server pruning.

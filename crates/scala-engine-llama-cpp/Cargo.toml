@@ -1,0 +1,19 @@
+[package]
+name = "scala-engine-llama-cpp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+jsonschema = { version = "0.55.1", default-features = false }
+scala-core = { path = "../scala-core" }
+scala-engine = { path = "../scala-engine" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+toml.workspace = true

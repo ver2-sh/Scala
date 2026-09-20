@@ -1,0 +1,18 @@
+[package]
+name = "scala-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+color-eyre.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
+scala-core = { path = "../scala-core" }
+scala-engine = { path = "../scala-engine" }
+scala-model-library = { path = "../scala-model-library" }
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
+tokio.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
