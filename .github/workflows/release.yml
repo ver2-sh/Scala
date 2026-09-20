@@ -123,6 +123,11 @@ jobs:
       - name: Install verified dist
         shell: bash
         run: python3 scripts/dist-bootstrap.py
+      - name: Generate locked dependency notices and MPL sources
+        shell: bash
+        run: |
+          cargo fetch --locked
+          python3 scripts/release-legal.py
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@v8
@@ -186,6 +191,8 @@ jobs:
         shell: bash
         run: |
           dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
+          python3 scripts/dist-installers.py dist-manifest.json
+          python3 scripts/dist-installers.py --check dist-manifest.json
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
@@ -265,5 +272,6 @@ jobs:
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          sed -i "s#https://github.com/ver2-sh/Scala/releases/download/#https://ver2.sh/scala/releases/download/#g" $RUNNER_TEMP/notes.txt
 
           gh release create "${{ needs.plan.outputs.tag }}" --verify-tag --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
