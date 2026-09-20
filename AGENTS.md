@@ -16,7 +16,7 @@
 
 ## NInfer integration boundary
 
-Norted-Server owns native runtime qualification, bounded artifact capabilities,
+Scala (Norted Server) owns native runtime qualification, bounded artifact capabilities,
 settings precedence, launch/request behavior and startup observations. Norted owns
 model/master lineage, preparation and optional companion assembly/publication.
 Bare native artifacts and equivalent manifest-bound artifacts receive identical

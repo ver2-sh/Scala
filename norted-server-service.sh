@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-SERVER_DIR="${NORTED_REPOS_DIR:-/srv/norted/repos}/Norted-Server"
+SERVER_DIR="${NORTED_REPOS_DIR:-/srv/norted/repos}/Scala"
 UNIT_NAME="norted-server.service"
 UNIT_PATH="/etc/systemd/system/${UNIT_NAME}"
 GLOBAL_LINK="/usr/local/bin/norted-server"
@@ -75,7 +75,7 @@ update_server() {
   require_server
   require_cargo
 
-  echo "Fetching latest changes for Norted-Server..."
+  echo "Fetching latest changes for Scala..."
   git -C "$SERVER_DIR" fetch --prune origin
 
   local head_sha upstream_sha upstream

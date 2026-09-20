@@ -1,6 +1,7 @@
 # Scala release maintenance
 
-Scala is the release name for Norted Server. It is not a new runtime, model format,
+Scala (`Yuuyuuei/Scala`) is the repository and release name for Norted Server.
+The standard source checkout is `/srv/norted/repos/Scala`. It is not a new runtime, model format,
 executable or storage namespace. `norted-server`, all Norted configuration paths,
 Link identity, runtime qualification and model provenance remain unchanged. This
 repository owns server distribution; Norted owns model construction and lineage.
@@ -49,7 +50,7 @@ Linux/macOS:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fLsS \
-  https://github.com/Yuuyuuei/Norted-Server/releases/download/v0.1.0/norted-server-installer.sh \
+  https://github.com/Yuuyuuei/Scala/releases/download/v0.1.0/norted-server-installer.sh \
   -o norted-server-installer.sh
 # Inspect the downloaded script, then:
 sh norted-server-installer.sh
@@ -64,7 +65,7 @@ norted-server serve
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest -Uri 'https://github.com/Yuuyuuei/Norted-Server/releases/download/v0.1.0/norted-server-installer.ps1' -OutFile 'norted-server-installer.ps1'
+Invoke-WebRequest -Uri 'https://github.com/Yuuyuuei/Scala/releases/download/v0.1.0/norted-server-installer.ps1' -OutFile 'norted-server-installer.ps1'
 # Inspect the downloaded script, then:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\norted-server-installer.ps1
 # Open a fresh shell if the installer changed PATH.
@@ -87,7 +88,7 @@ While the repository is private, maintainers can retrieve release assets with
 GitHub CLI instead. For example, for Linux x64:
 
 ```sh
-gh release download v0.1.0 -R Yuuyuuei/Norted-Server \
+gh release download v0.1.0 -R Yuuyuuei/Scala \
   -p norted-server-x86_64-unknown-linux-musl.tar.xz \
   -p norted-server-x86_64-unknown-linux-musl.tar.xz.sha256
 sha256sum -c norted-server-x86_64-unknown-linux-musl.tar.xz.sha256
