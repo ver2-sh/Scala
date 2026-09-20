@@ -2,7 +2,7 @@
 
 ## 0.1.0 — Scala
 
-Planned first Scala developer release (unpublished). The application and command are
+First public Scala developer release. The application and command are
 `scala`, with Scala-native crates, storage, service, API identity and release assets.
 
 - Apache-2.0 project licensing, third-party attribution and bundled MPL sources.
@@ -25,7 +25,7 @@ Models, inference runtimes, GPU drivers and credentials are not included. A serv
 binary does not promise every inference runtime supports the same platform.
 Norted-built and equivalent ordinary artifacts retain identical serving semantics.
 
-The repository remains private. Anonymous installation requires an explicitly
-approved public release channel. Native macOS/Windows validation and signing
-readiness must be reviewed before advertising consumer readiness. See
+Public installers and versioned assets are available through `https://ver2.sh/scala/`.
+Native macOS/Windows validation and signing readiness remain outside this developer
+release's validation scope. See
 [release maintenance](docs/releases.md) for verification and publication gates.

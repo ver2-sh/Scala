@@ -57,16 +57,14 @@ installation/update is validated locally; ARM64 Linux, macOS and Windows native
 execution remain unverified. A packaged server does not imply every runtime
 supports every platform.
 
-The repository is private and the channel is being prepared. Anonymous installer
-URLs require an explicitly approved public release. See
-[installation and release maintenance](docs/releases.md) for private downloads,
+Scala is public, with v0.1.0 as the first developer release. See
+[installation and release maintenance](docs/releases.md) for public downloads,
 installation/update commands, platform limits and publication gates.
 
 ## Install and update Scala
 
-**PRIVATE / UNPUBLISHED:** these anonymous URLs are not live consumer downloads.
-They become usable only after an approved public release. `ver2.sh` is the stable
-distribution front door: its dedicated Cloudflare Worker serves installer bodies
+`ver2.sh` is the stable distribution front door: its dedicated Cloudflare Worker
+serves installer bodies
 and versioned release assets under `/scala/`, while the generated cargo-dist shell
 and PowerShell installers remain authoritative.
 
