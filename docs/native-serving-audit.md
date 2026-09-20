@@ -1,6 +1,6 @@
 # Native serving architecture audit — 2026-09-10
 
-Starting commits: Norted-Server `0d545d969c32a543d7d6b6de5124d786bbecb57e`;
+Starting commits: Scala `0d545d969c32a543d7d6b6de5124d786bbecb57e`;
 Norted `6b05f0cf32a001c17ccf8e25a84b846afc262dd2`.
 Local branches: `fix/native-runtime-serving` and
 `fix/portable-generation-semantics`. No push, merge, training or publication.
@@ -90,7 +90,7 @@ Stock `src/llama-vocab.cpp` classifies both spellings as EOG;
 `tools/server/server-context.cpp` terminates via `llama_vocab_is_eog()`.
 The probes force sampling, not a replacement termination implementation.
 
-Through Norted-Server, the external stock executable proved ToolCalling,
+Through Scala, the external stock executable proved ToolCalling,
 parallel calls and StructuredOutput for standalone Grep, packaged Grep, and
 non-Norted `llmfan46/Gemma-4-Queen-31B-it-uncensored-heretic-Q6_K.gguf`.
 The same capability algorithm applies to each. The package's historical

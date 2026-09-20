@@ -34,4 +34,4 @@ The Settings editor saved affinity `0-3` with Settings source; the profile edito
 
 Missing flags, absent adapter paths, expert metadata checks, accelerator checks, multi-argument/dependency validation and template/artifact identity checks were left intact. Models, templates and runtime binaries were not modified.
 
-`./validate.sh` passed formatting, workspace check, workspace clippy with warnings denied, and all existing workspace tests: 214 passed, 1 existing ignored. `cargo build -p norted-server` and `git diff --check` passed. No historical runtime-version matrix was run.
+`./validate.sh` passed formatting, workspace check, workspace clippy with warnings denied, and all existing workspace tests: 214 passed, 1 existing ignored. `cargo build -p scala` and `git diff --check` passed. No historical runtime-version matrix was run.

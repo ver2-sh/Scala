@@ -1,0 +1,22 @@
+[package]
+name = "scala-model-library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Managed local model library and remote model catalogs"
+
+[dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
+fs2.workspace = true
+scala-core = { path = "../scala-core" }
+scala-engine-q27 = { path = "../scala-engine-q27" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true

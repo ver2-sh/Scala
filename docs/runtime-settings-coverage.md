@@ -2,7 +2,7 @@
 
 This is the auditable classification ledger for operator-facing runtime controls. `FIRST_CLASS_CONFIGURABLE`
 means a typed, engine-qualified setting with adapter-owned translation and collision detection.
-`NORTED_MANAGED` means the process contract owns the value. `NOT_APPLICABLE / UNSUPPORTED_BY_NORTED`
+`SCALA_MANAGED` means the process contract owns the value. `NOT_APPLICABLE / UNSUPPORTED_BY_SCALA`
 means the option is deliberately unavailable and includes the reason. Native arguments/environment are not
 counted as first-class coverage.
 
@@ -36,28 +36,28 @@ proves.
   split/minimum acceptance probabilities, and all current simple/map-k/map-k4v/modified N-gram controls.
 - Prompt/reasoning: built-in or content-bound chat templates, Jinja, template arguments, reasoning policy,
   effort/budget/budget message/format/preservation, chat parsing, assistant prefill, and slot similarity.
-- Private-server operations compatible with Norted: timeout, SSE ping, HTTP workers, metrics, slots endpoint,
+- Private-server operations compatible with Scala: timeout, SSE ping, HTTP workers, metrics, slots endpoint,
   slot-save path, idle sleep, logging controls and prompt diagnostics.
 
-### NORTED_MANAGED
+### SCALA_MANAGED
 
 - Primary model/source selectors (`--model`, model URL, Docker/Hugging Face selectors and token), alias/public
   model identity, bind host/port/reuse/API prefix, and API keys/TLS are owned by acquisition, routing, private
   transport, and authentication. Raw `--device`/`LLAMA_ARG_DEVICE` are process-contract controls: the typed
   `llama.cpp.devices` setting selects ordered physical UUID identities, then launch constrains
   `CUDA_VISIBLE_DEVICES` to that ordered UUID list and emits the corresponding runtime-local
-  `--device CUDA0,CUDA1,...`. With no explicit set, Norted preserves automatic single-compatible-GPU binding.
+  `--device CUDA0,CUDA1,...`. With no explicit set, Scala preserves automatic single-compatible-GPU binding.
 - `--props` is kept off because mutable backend-global properties bypass resolved settings and provenance.
 - Help/version/list/completion/cache-list are probe or one-shot commands, not launch configuration.
 
-### NOT_APPLICABLE / UNSUPPORTED_BY_NORTED
+### NOT_APPLICABLE / UNSUPPORTED_BY_SCALA
 
 - Embedding, reranking, pooling, multimodal-projector/media/video, router/multi-model, Web UI/static/CORS,
   agent/built-in-tool/MCP, and download presets change the endpoint, trust, or single-model backend contract.
 - Removed/deprecated defrag, mmap/mlock/direct-IO, legacy draft and legacy N-gram switches are not reintroduced;
   their current replacements are used.
 - Raw grammar/logit-bias and synthetic benchmark switches remain intentionally unavailable as persistent
-  defaults: Norted's public request contract does not yet preserve their semantics or file/content identity.
+  defaults: Scala's public request contract does not yet preserve their semantics or file/content identity.
 
 All aliases in the three classifications are enforced at the raw boundary, and llama.cpp raw native
 arguments are disabled entirely. At exact-runtime probe time, every ordinary option header advertised by
@@ -104,18 +104,18 @@ disable-thinking behavior only when `q27.request_thinking=true`, and is rejected
 upstream process would ignore it. Request overrides are ephemeral and never rewrite the process default
 or the separate `q27.thinking` setting.
 
-### NORTED_MANAGED
+### SCALA_MANAGED
 
 - Positional model/tokenizer, bind host/port, API key, CUDA visibility/device selection, public identity and
   compiled W8/W12/W16 maximum draft width. Compile-time constants/macros are runtime-variant identity, not
   per-launch settings.
 
-### NOT_APPLICABLE / UNSUPPORTED_BY_NORTED
+### NOT_APPLICABLE / UNSUPPORTED_BY_SCALA
 
 - q27 runtime catalog entries are Linux CUDA only; Metal-only controls are not shown.
 - Current unreleased q27 HEAD's `--enable-metrics` is not present in the installable/reviewed v0.10.0
   server and is not claimed until an installable revision receives a new source capability contract.
-- After subtracting the typed and Norted-managed values above, the exact v0.10.0 CUDA serving runtime's
+- After subtracting the typed and Scala-managed values above, the exact v0.10.0 CUDA serving runtime's
   remaining environment inventory is deliberately unsupported:
   `Q27_ATTN_PF`, `Q27_BATCH_DBG`, `Q27_DRAFT_CEIL`, `Q27_DRAFT_CEIL1`, `Q27_DRIFT_CORPUS`,
   `Q27_DUMP_HIDDENS`, `Q27_FDMMA_NS`, `Q27_FDMMA_STAGES`, `Q27_GC_RECYCLE`,
@@ -130,7 +130,7 @@ or the separate `q27.thinking` setting.
 q27 raw native arguments are disabled, including the former alternate paths for fast-head, fp16 KV, and
 prefix caching. Configured `Q27_*` variables are rejected, every inherited `Q27_*` name is scrubbed
 dynamically (including future names), and only values generated from reviewed typed `q27.*` settings are
-added back. Norted's independently owned `CUDA_VISIBLE_DEVICES` binding is applied separately. This makes
+added back. Scala's independently owned `CUDA_VISIBLE_DEVICES` binding is applied separately. This makes
 the complete pinned v0.10.0 runtime environment inventory enforceable without promoting diagnostics into
 ordinary settings.
 
@@ -155,15 +155,15 @@ retain only unchanged reviewed domains.
   backend selection; full/optimized proposal heads and Vision are native controls.
   Absence of the draft removes DFlash2 from artifact settings and rejects it at launch.
 
-### NORTED_MANAGED
+### SCALA_MANAGED
 
 - Artifact, host/port, API key, public model ID and `--device` are owned by model identity, private transport,
   routing and exact selected-GPU isolation.
-- `--request-log-jsonl` is Norted's private authoritative schema-20 startup/request evidence channel. NInfer
+- `--request-log-jsonl` is Scala's private authoritative schema-20 startup/request evidence channel. NInfer
   supports only one such sink, so exposing another path would either duplicate the flag or destroy startup
   proof; it is therefore explicitly managed rather than presented as a user log setting.
 
-### NOT_APPLICABLE / UNSUPPORTED_BY_NORTED
+### NOT_APPLICABLE / UNSUPPORTED_BY_SCALA
 
 - None of the reviewed `ninfer-serve` normal controls are silently unclassified. Build flags and target
   constants belong to the immutable runtime variant rather than a per-run setting.
