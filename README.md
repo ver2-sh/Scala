@@ -18,6 +18,13 @@ engine compatibility, and exact runtime resolution remains separate from the pro
 ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 [q27](https://github.com/signalnine/q27), and [NInfer](https://github.com/Neroued/ninfer).
 
+## License and contributions
+
+Original Scala code is [Apache-2.0 licensed](LICENSE); see [NOTICE](NOTICE) for
+project attribution. Release archives include reproducible third-party notices
+and corresponding MPL dependency sources. Dependency and runtime licenses remain
+separate. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+
 ## Scala releases
 
 **Scala** is the application, command (`scala`), and repository (`ver2-sh/Scala`).
@@ -45,8 +52,10 @@ branding and are preserved. Equivalent standard artifacts retain equal behavior.
 The release pipeline targets Linux x64/ARM64, macOS Intel/Apple Silicon and
 Windows x64, with server-only archives, shell/PowerShell installers and SHA-256
 checksums. Models, GPU drivers and independently versioned inference runtimes are
-installed separately. A packaged server does not imply every runtime supports
-every platform.
+installed separately. These are packaging targets, not five verified native platforms. Linux x64
+installation/update is validated locally; ARM64 Linux, macOS and Windows native
+execution remain unverified. A packaged server does not imply every runtime
+supports every platform.
 
 The repository is private and the channel is being prepared. Anonymous installer
 URLs require an explicitly approved public release. See
@@ -82,10 +91,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scala-installer.ps1
 
 Organizational Group Policy still wins. For pinned versions and the Linux/macOS
 inspect-first flow, see [release installation](docs/releases.md#install-and-update).
-The shell installer verifies embedded SHA-256 archive checksums; cargo-dist 0.33.0's
-PowerShell installer **does not verify archive hashes**. Windows users requiring
-hash verification must verify an archive manually. Signing and native platform
-validation remain [release gates](docs/releases.md#trust-and-platform-gates).
+Both generated installers verify embedded SHA-256 archive checksums before
+extraction. A guarded release-generation step adds this missing check to upstream
+cargo-dist 0.33.0 PowerShell while preserving its installation, PATH and receipt
+behavior. Windows/macOS native execution, signing and notarization remain
+[platform gates](docs/releases.md#trust-and-platform-gates).
 
 ```sh
 scala update --check       # fresh stable-version discovery
