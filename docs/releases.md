@@ -21,7 +21,7 @@ pushes, pull requests and schedules do not consume Actions minutes.
 
 ## What is shipped
 
-| Archive target | Server platform | Inference support |
+| Packaging target | Intended platform | Inference support |
 | --- | --- | --- |
 | `x86_64-unknown-linux-musl` | Linux x64; includes x64 WSL | Exact runtime/host admission |
 | `aarch64-unknown-linux-musl` | Linux ARM64 | Exact runtime/host admission |
@@ -29,7 +29,8 @@ pushes, pull requests and schedules do not consume Actions minutes.
 | `x86_64-apple-darwin` | macOS Intel | Exact runtime/host admission |
 | `x86_64-pc-windows-msvc` | Windows x64 | Exact runtime/host admission |
 
-Every archive contains the `scala` binary (`.exe` on Windows). cargo-dist
+Every archive contains the `scala` binary (`.exe` on Windows), `LICENSE`, `NOTICE`,
+and `release-legal/` dependency notices, source hashes and MPL source archives. cargo-dist
 also produces shell and PowerShell installers, per-archive SHA-256 checksums,
 `sha256.sum`, and a distribution manifest. No models, runtimes, GPU drivers,
 credentials, local configuration, benchmark evidence or Rust toolchain is bundled.
@@ -185,13 +186,17 @@ rustup target add x86_64-unknown-linux-musl
 
 Preflight runs the existing workspace formatting/check/Clippy/test validation,
 a locked distribution-profile build, exact stable-version validation, full reproducible workflow
-comparison, upstream configuration/plan checks and shell syntax checks. No new
+comparison, upstream configuration/plan checks and shell syntax checks. For a
+complete five-target build, apply `python3 scripts/dist-installers.py <manifest>`
+after global generation, then pass `DIST_MANIFEST=<manifest>` to preflight to
+verify the shipping PowerShell script against its actual archives. Local preflight
+without that manifest explicitly leaves final Windows artifact verification open. No new
 model training, inference benchmark, test suite or production activation is added.
 Run in an isolated worktree when a source-built production service is live, so
 building does not replace its executable. Preserve benchmark logs and model data.
 
 `dist-workspace.toml` opts in only the server binary. Do not package local target
-or configuration directories. Never publish artifacts from `dist --artifacts=lies`:
+or configuration directories apart from the generated `target/release-legal` bundle. Never publish artifacts from `dist --artifacts=lies`:
 that mode generates intentionally fake archives. Record which native archives were
 actually built; a five-target plan alone is not five-platform build verification.
 
@@ -220,7 +225,7 @@ share one macOS runner. Linux uses native runners, not hosted cross-toolchain se
 Packaging uses pinned upstream cargo-dist, not a custom archive/installer protocol.
 `scripts/dist-workflow.py` regenerates upstream YAML and applies only the scoped
 release trigger, read-only planning, publisher permission, verified bootstrap,
-Scala title and existing-tag guard. `allow-dirty = ["ci"]` permits this upstream
+Scala title, existing-tag guard, dependency notices and installer hash check. `allow-dirty = ["ci"]` permits this upstream
 customization; preflight separately compares the complete generated workflow.
 
 `scripts/dist-bootstrap.py` verifies downloaded cargo-dist executable archives
@@ -231,23 +236,60 @@ Version and hashes must be reviewed together when upgrading.
 
 The release channel trusts HTTPS and the publisher. SHA-256 checksums detect
 corruption; they are not independent publisher signatures. The cargo-dist 0.33.0
-shell installer checks embedded archive hashes. Its PowerShell installer does
-**not** verify archive hashes: on Windows verify the downloaded archive with
-`Get-FileHash -Algorithm SHA256` against the published checksum before extracting
-when explicit hash verification is required. Do not claim automatic Windows hash
-verification, Authenticode, notarization or GitHub attestations are enabled.
+shell installer checks embedded archive hashes. Upstream PowerShell still lacks
+this capability ([upstream issue](https://github.com/axodotdev/cargo-dist/issues/2397)).
+After global generation, `scripts/dist-installers.py` embeds the selected archive's
+SHA-256 from the dist manifest, first checking it against the actual built archive.
+The generated `Get-FileHash -LiteralPath ... -Algorithm SHA256 -ErrorAction Stop`
+check throws before extraction on missing hashes, read errors or mismatches.
+Generation fails on unexpected template shapes or missing archive evidence. PATH,
+receipt, install location and replacement behavior remain cargo-dist's own.
+The workflow applies and checks this transformation before uploading artifacts.
 
-Native macOS and Windows execution and signing are not established by Linux Rust
-cross-checks. Apple Developer and Windows code-signing credentials are not present
-in this release setup; native validation and signing readiness remain explicit
-public-readiness gates. Use upstream signing support when credentials are supplied,
-not custom bypasses. Repository visibility and licensing also require owner review
-before exposing this currently private source and its history.
+Source-publication readiness is separate from binary-platform support. Licensing,
+notices, the dependency assessment and source checks support developer review;
+they do not authorize visibility changes or publication. Local Linux x64 validation
+uses actual built archives and unchanged installers/updater through a disposable
+HTTPS fixture. Fixture trust is child-process-local and fixture artifacts must
+never be distributed. This validates installation/update without a public release.
 
-Before public release, validate native Linux/macOS/Windows direct install → newer
-stable update, concurrent serving/startup refusal, spaced paths, receipt mismatch,
-JSON output, and Windows normal/managed PowerShell policy plus rename restoration.
-Verify unchanged user data and restart through the original startup method. These
-require real published artifacts and native hosts; synthetic tests and a five-target
-plan do not establish them. No release/tag, public visibility change or hosted
-validation is authorized by local implementation work.
+All five packaging targets remain configured. Linux ARM64, native macOS and
+Windows installation/execution are not validated here. Linux Rust cross-checks
+and portable PowerShell integrity exercises do not establish Windows behavior.
+Authenticode, Apple signing/notarization and GitHub attestations are not enabled.
+Before advertising a platform as supported, validate direct install, newer stable
+update, active-session refusal, spaced paths, receipt mismatch, failure recovery
+and unchanged user data on that native host. Windows also needs normal/managed
+PowerShell policy and replacement/rename-restoration validation. Signing policy
+and credentials require a separate decision; do not bypass OS security controls.
+
+## Licensing and dependency assessment
+
+Original Scala code uses Apache-2.0, matching Wayfinder's workspace licensing
+model. Attribution is in `NOTICE`; dependency owners and licenses are unchanged.
+`cargo fetch --locked` then `python3 scripts/release-legal.py` generates the
+`target/release-legal` directory from exact checksum-verified locked crate archives
+and pinned actual upstream license files in `release/legal-upstream`. Generation
+is deterministic and offline, covers all locked dependencies conservatively, and
+fails on missing information. It runs before each platform's archive build.
+
+`THIRD-PARTY-NOTICES.txt` retains upstream licenses/attribution; `DEPENDENCIES.json`
+records versions, source URLs and hashes. `mpl-sources/` contains unmodified source
+.crate archives for option-ext, smartstring and the optionally MPL-licensed termina.
+These are gzip tar archives containing the preferred source form and license
+notices. option-ext and smartstring retain MPL terms; termina is used under its
+MIT option. Preserve corresponding-source availability when redistributing and
+provide modifications to MPL-covered files under MPL, per the
+[Mozilla guidance](https://www.mozilla.org/en-US/MPL/2.0/FAQ/#q8-i-want-to-distribute-outside-my-organization-executable-programs-or-libraries-that-i-have-compiled-from-someone-elses-unchanged-mpl-licensed-source-code-either-standalone-or-part-of-a-larger-work-what-do-i-have-to-do).
+
+The 2026-09-20 assessment used official cargo-audit 0.22.2, verified against the
+upstream GitHub release asset SHA-256, and RustSec advisory database commit
+`d5c17953a895cf19e8d3ce66eaa42b6fcfe1fb16`. The only vulnerable locked package was
+rustls 0.23.43 ([RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285));
+the narrowly scoped 0.23.45 update leaves zero reported vulnerabilities.
+[RUSTSEC-2026-0249](https://rustsec.org/advisories/RUSTSEC-2026-0249) remains:
+smartstring 1.0.1 is unmaintained and is required by Rhai 1.26.0. This is a maintenance
+warning, with no patched version or reported exploit in that advisory. Track
+Rhai's migration upstream; replacing the scripting dependency here would be an
+unrelated functional change. There are no advisory suppressions. Rerun cargo-audit
+with a fresh database before an eventual release; this is a dated assessment.

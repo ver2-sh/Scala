@@ -2,15 +2,20 @@
 
 ## 0.1.0 — Scala
 
-The first packaged Scala release channel. The application and command are
+Planned first Scala developer release (unpublished). The application and command are
 `scala`, with Scala-native crates, storage, service, API identity and release assets.
 
+- Apache-2.0 project licensing, third-party attribution and bundled MPL sources.
+- rustls 0.23.45 resolves RUSTSEC-2026-0285; smartstring's upstream maintenance
+  warning remains tracked without suppression.
+- Generated PowerShell installation verifies the selected archive's embedded
+  SHA-256 before extraction, preserving cargo-dist installation semantics.
 - Terminal-first local inference server with an authenticated OpenAI-compatible API.
 - Independently installed llama.cpp, NInfer and q27 runtimes, with existing
   capability admission and Model Profile settings precedence.
 - Managed model discovery/download/import and optional Wayfinder-backed Scala Link.
 - Server-only archives for Linux x64/ARM64, macOS Intel/Apple Silicon and Windows
-  x64, shell/PowerShell installers, and published SHA-256 checksums.
+  x64, shell/PowerShell installers, and generated SHA-256 checksums.
 - Native `scala update --check` and explicitly approved `scala update` / `--yes`,
   with cargo-dist receipt ownership and active-session replacement protection.
 - Daily nonblocking TUI update checks and a `/update` command, with cached failures

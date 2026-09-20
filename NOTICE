@@ -1,0 +1,16 @@
+Scala
+https://github.com/ver2-sh/Scala
+
+Scala is developed by its contributors, whose authorship is recorded in the
+repository history. Original Scala code is licensed under Apache-2.0; see LICENSE.
+No ownership of dependencies, models, or independently installed runtimes is claimed.
+
+Release archives include release-legal/THIRD-PARTY-NOTICES.txt with upstream
+attribution and licenses, release-legal/DEPENDENCIES.json with exact source URLs
+and hashes, and release-legal/mpl-sources/ with corresponding MPL source archives.
+Dependency terms remain in force. option-ext and smartstring source is available
+under the MPL in those archives; preserve this availability when redistributing.
+
+Norted is the independent model builder and owns its authoritative artifact
+formats and lineage. Norted-Utils provides independent utilities. Neither is
+relicensed or bundled as part of the Scala application distribution.

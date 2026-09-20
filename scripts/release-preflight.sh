@@ -5,6 +5,8 @@ DIST="${DIST:-dist}"
 export DIST
 python3 scripts/release-version.py "${1:-$(python3 scripts/release-version.py)}"
 cargo metadata --locked --format-version=1 --no-deps >/dev/null
+cargo fetch --locked
+python3 scripts/release-legal.py
 ./validate.sh
 cargo build --locked --profile dist -p scala
 python3 scripts/dist-workflow.py --check
@@ -27,6 +29,12 @@ assert sum(len(row['targets']) for row in rows) == 5
 assert plan['ci']['github']['pr_run_mode'] == 'skip'
 assert len([row for row in rows if 'macos' in row['runner']]) == 1
 PY
+# A completed five-target build supplies this to check the exact shipping installer.
+if [[ -n "${DIST_MANIFEST:-}" ]]; then
+  python3 scripts/dist-installers.py --check "$DIST_MANIFEST"
+else
+  printf 'PowerShell artifact verification requires DIST_MANIFEST from a complete build.\n'
+fi
 if command -v actionlint >/dev/null 2>&1; then actionlint; fi
 for script in ./*.sh scripts/*.sh; do bash -n "$script"; done
 printf 'Local preflight passed. No tag, push, release, or hosted workflow was created.\n'

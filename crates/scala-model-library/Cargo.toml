@@ -2,6 +2,7 @@
 name = "scala-model-library"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 description = "Managed local model library and remote model catalogs"
 
