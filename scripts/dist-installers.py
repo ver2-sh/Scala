@@ -28,7 +28,11 @@ def main():
     entry = artifacts['scala-installer.ps1']
     if entry.get('checksum') or entry.get('checksums'):
         raise ValueError('Installer checksum metadata needs an upstream review')
-    installer = Path(entry['path'])
+    # Merged CI manifests omit artifact-local paths; upload_files is authoritative.
+    installers = [Path(p) for p in manifest['upload_files'] if Path(p).name == 'scala-installer.ps1']
+    if len(installers) != 1:
+        raise ValueError('Expected exactly one PowerShell installer upload')
+    installer = installers[0]
     original = installer.read_text(encoding='utf-8')
     text = original
     if BEGIN in text:
