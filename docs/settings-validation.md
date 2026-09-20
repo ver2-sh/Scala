@@ -1,6 +1,6 @@
 # Runtime settings validation (2026-09-06)
 
-Implementation branch: `fix/runtime-settings-inheritance`. All changes are in Norted-Server.
+Implementation branch: `fix/runtime-settings-inheritance`. All changes are in Scala.
 No test code, state migration, model transformation, artifact modification, or cross-repository framework was added.
 
 ## Reproduced regression
@@ -73,7 +73,7 @@ the execution paths, not a claim of GPU runtime execution or a completed live ac
 - `cargo check --workspace --all-targets`: passed.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`: passed.
 - `cargo test --workspace`: 214 passed, 0 failed, 1 existing ignored test.
-- `cargo build -p norted-server`: passed.
+- `cargo build -p scala`: passed.
 - `git diff --check`: passed.
 
 The state format remains unchanged. `settings.json` schema 3 retains the `runtime_defaults` field

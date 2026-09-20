@@ -1,12 +1,12 @@
-# Norted Link separate-account validation — 2026-09-14
+# Scala Link separate-account validation — 2026-09-14
 
-Inspected clean Norted-Server `24f315b9479a869e0825e74825549b56b136d00e`
+Inspected clean Scala `24f315b9479a869e0825e74825549b56b136d00e`
 and Wayfinder `acd7529662936057c54a7b99bf31f4b72e64f4d0` before editing.
 Changes remain local; nothing was pushed.
 
 ## Security correction
 
-Requiring the same UID granted Norted normal filesystem access to Wayfinder's
+Requiring the same UID granted Scala normal filesystem access to Wayfinder's
 private authority, regardless of application-protocol restrictions. The earlier
 mount-namespace validation did not establish ordinary separate-account isolation.
 
@@ -14,7 +14,7 @@ The installed generic endpoint is `/run/wayfinder/app.sock`. Wayfinder owns its
 2750 directory, with group `wayfinder-apps`; the socket inherits that group and
 has mode 0660. Linux authorizes connections using effective UID and supplementary
 groups. Wayfinder retains SO_PEERCRED UID in the ephemeral session owner identity.
-Applications cannot replace directory entries. Norted validates protected
+Applications cannot replace directory entries. Scala validates protected
 endpoint ownership/permissions and verifies the daemon peer UID against the
 directory owner, rather than its own UID.
 
@@ -25,25 +25,25 @@ registration/unregistration, and exact-node named-service opening. MCP,
 administration, membership mutation and shell execution remain separate.
 
 Both service installers provision the generic group, including on version
-updates. Wayfinder uses systemd RuntimeDirectory; Norted receives a supplementary
+updates. Wayfinder uses systemd RuntimeDirectory; Scala receives a supplementary
 group. Neither installer creates a service record. Manual accounts need only the
-generic OS group grant documented in the Link guide. Wayfinder has no Norted,
-AI, GPU or model semantics. Norted Link configuration remains exactly
+generic OS group grant documented in the Link guide. Wayfinder has no Scala,
+AI, GPU or model semantics. Scala Link configuration remains exactly
 `LinkConfig { enabled: bool }`.
 
 ## Checks
 
 - Both `./validate.sh` scripts passed formatting, workspace check, Clippy with
-  warnings denied and workspace tests. Norted: 215 passed, one existing ignored.
+  warnings denied and workspace tests. Scala: 215 passed, one existing ignored.
   Wayfinder has no Rust unit tests; its real-process suite is reported below.
-- Norted all-feature/all-target Clippy passed. Debug binaries were built.
-- A new Norted endpoint-trust test rejects group-writable directories,
+- Scala all-feature/all-target Clippy passed. Debug binaries were built.
+- A new Scala endpoint-trust test rejects group-writable directories,
   world-authorized sockets, directory symlinks and writable runtime parents.
 - Both shell scripts passed `bash -n`; both repositories passed `git diff --check`.
 - A transient systemd unit using an existing unprivileged account verified that
   RuntimeDirectoryMode=2750 is preserved and the socket inherits the directory
   group under UMask=0077. Production service units were not installed or restarted.
-- Removed unused direct `reqwest` and `directories` dependencies from norted-api;
+- Removed unused direct `reqwest` and `directories` dependencies from scala-api;
   other crates retain their own required dependencies.
 
 ## Actual separate-UID processes
@@ -59,8 +59,8 @@ and exercise private administration for test setup.
   invalid operation rejection, MCP/admin credential rejection, all four private
   file denials, private modes, unauthorized socket denial, registration ownership,
   crash cleanup, application restart and daemon restart/reconnection.
-- Norted A: Wayfinder UID 61101, Norted UID 61102. Norted B: Wayfinder UID 61111,
-  Norted UID 61112. Both application processes have supplementary GID 61103.
+- Scala A: Wayfinder UID 61101, Scala UID 61102. Scala B: Wayfinder UID 61111,
+  Scala UID 61112. Both application processes have supplementary GID 61103.
   Wayfinder-only C uses UID 61121. A uses the actual machine endpoint; B/C use
   protected isolated runtime directories on the same host.
 - **42 bidirectional smoke assertions passed**, then passed again on the final
@@ -76,7 +76,7 @@ and exercise private administration for test setup.
   Wayfinder loss, recovery and unchanged authoritative profile stores.
 - **45 lifecycle/filesystem assertions passed**: enabled-only configuration,
   actual process UIDs, automatic registration, private-file denial, inability to
-  replace the socket, third node excluded from Norted peers, process death and
+  replace the socket, third node excluded from Scala peers, process death and
   restart, ordinary login XDG directory falling back to the machine endpoint,
   local inference without Wayfinder, recreation of `/run/wayfinder`, automatic
   federation recovery, and no model/runtime replication.
@@ -109,7 +109,7 @@ Material issue was identified in this integration audit.
 
 ## JIT semantics correction — 2026-09-16
 
-Starting from Norted-Server `77cd193`, reachable installed remote profiles are now
+Starting from Scala `77cd193`, reachable installed remote profiles are now
 listed and routed without requiring a running backend. Forwarded inference uses
 the owner's ordinary RuntimeManager admission, including its local JIT policy.
 The earlier unloaded-profile rejection above records historical behavior, not the
@@ -118,7 +118,7 @@ old behavior and was not counted as current validation.
 
 - `./validate.sh` passed formatting, workspace check, Clippy for all targets with
   warnings denied, and workspace tests: 216 passed, one existing ignored.
-- `cargo build -p norted-server` and `git diff --check` passed.
+- `cargo build -p scala` and `git diff --check` passed.
 - A synthetic API regression test verifies installed/unloaded remote discovery and
   exact routing, deterministic collision aliases, and name reservations with
   rejection/exclusion for missing owner artifacts and stale owner observations.
