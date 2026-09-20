@@ -3,6 +3,8 @@ name = "norted-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+publish = false
 description = "Local language-model server and runtime manager"
 
 [[bin]]
@@ -32,3 +34,6 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[package.metadata.dist]
+dist = true

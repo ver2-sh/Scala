@@ -22,8 +22,8 @@ impl From<RuntimeUpdateTrack> for norted_core::RuntimeUpdatePreference {
 #[command(
     name = "norted-server",
     version,
-    about = "Local language-model server and runtime manager",
-    long_about = "Discover local model artifacts, manage independently versioned engine runtimes, and serve local text generation through the Norted gateway."
+    about = "Scala — local language-model server and runtime manager",
+    long_about = "Norted Server — Scala. Discover local model artifacts, manage independently versioned engine runtimes, and serve local text generation through the Norted gateway."
 )]
 pub struct Cli {
     /// Emit machine-readable JSON where supported
