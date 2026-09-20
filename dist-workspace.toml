@@ -14,6 +14,7 @@ targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "x86_64-pc
 install-path = "CARGO_HOME"
 checksum = "sha256"
 source-tarball = false
+include = ["LICENSE", "NOTICE", "target/release-legal"]
 merge-tasks = true
 fail-fast = true
 cache-builds = false

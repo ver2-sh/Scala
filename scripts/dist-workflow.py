@@ -71,10 +71,28 @@ try:
     assert 'permissions:\n  contents: read\n' in text
     assert '  host:\n    permissions:\n      contents: write\n' in text
     assert text.split('on:\n', 1)[1].split('\njobs:', 1)[0].strip() == "push:\n    tags:\n      - 'v[0-9]+.[0-9]+.[0-9]+'"
+    # Generate legal assets before each platform archive build. No tokens.
+    text = text.replace('      # Get the dist-manifest', """      - name: Generate locked dependency notices and MPL sources
+        shell: bash
+        run: |
+          cargo fetch --locked
+          python3 scripts/release-legal.py
+      # Get the dist-manifest""")
+    global_build = '          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json'
+    assert text.count(global_build) == 1
+    text = text.replace(global_build, global_build + """
+          python3 scripts/dist-installers.py dist-manifest.json
+          python3 scripts/dist-installers.py --check dist-manifest.json""")
     # Scala is a release name; executable and storage names remain unchanged.
     text = text.replace(
         'ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"',
         'ANNOUNCEMENT_TITLE: "Scala ${{ needs.plan.outputs.tag }}"',
+    )
+    release_notes = '          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt'
+    assert text.count(release_notes) == 1
+    text = text.replace(
+        release_notes,
+        release_notes + "\n          sed -i \"s#https://github.com/ver2-sh/Scala/releases/download/#https://ver2.sh/scala/releases/download/#g\" $RUNNER_TEMP/notes.txt",
     )
     text = text.replace(
         'gh release create "${{ needs.plan.outputs.tag }}" --target',
