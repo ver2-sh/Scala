@@ -9,15 +9,11 @@ shared host preparation. Neither acquires a Scala-specific artifact contract.
 
 ## Channel status
 
-**PRIVATE / UNPUBLISHED:** the repository is private. There is no anonymously accessible release channel yet; the installer URLs below are not live consumer URLs.
-A draft is not a published release; its presence does not make installer URLs work.
-Do not make the repository public or publish tags as a validation technique.
-The existing repository policy permits local checks, not hosted validation runs.
-Actual publication and any change of visibility require deliberate approval.
-
-The workflow will publish **Scala v0.1.0** when the matching
-reviewed version tag is intentionally pushed. It is tag-only: ordinary branch
-pushes, pull requests and schedules do not consume Actions minutes.
+The repository is public. **Scala v0.1.0** is the first public developer release,
+published by intentionally pushing the matching reviewed version tag. The workflow
+is tag-only: ordinary branch pushes, pull requests and schedules do not consume
+Actions minutes. Publication requires deliberate approval; a draft release does
+not make anonymous installer URLs work.
 
 ## What is shipped
 
@@ -44,8 +40,7 @@ separate from release-binary installation.
 
 ## Install and update
 
-These anonymous URLs become usable only after an approved public release exists.
-`ver2.sh` is Scala's stable distribution front dor. Its dedicated Cloudflare
+`ver2.sh` is Scala's stable distribution front door. Its dedicated Cloudflare
 Worker serves the installer bodies and versioned release assets under
 `https://ver2.sh/scala/`, while the Scala release workflow remains the publishing
 authority. The Worker accepts no GitHub credentials and rewrites installer archive
@@ -62,8 +57,7 @@ irm https://ver2.sh/scala/install.ps1 | iex
 ```
 
 For an inspect-first, reproducible installation, use the versioned URLs below
-instead of `latest`. `v0.1.0` is the planned version, not a claim of publication;
-replace it only with an intentionally published version.
+to select the v0.1.0 release explicitly.
 
 Linux/macOS:
 
@@ -161,23 +155,6 @@ Models, runtimes, settings, credentials, operational state and benchmark evidenc
 are not updated or deleted. Application updates are separate from inference
 runtime updates. `scala-service.sh update` remains exclusively a source-checkout
 rebuild helper; it must not wrap or overwrite a release installation.
-
-While the repository is private, maintainers can retrieve release assets with
-GitHub CLI instead. For example, for Linux x64:
-
-```sh
-gh release download v0.1.0 -R ver2-sh/Scala \
-  -p scala-x86_64-unknown-linux-musl.tar.xz \
-  -p scala-x86_64-unknown-linux-musl.tar.xz.sha256
-sha256sum -c scala-x86_64-unknown-linux-musl.tar.xz.sha256
-tar -xJf scala-x86_64-unknown-linux-musl.tar.xz
-# Copy the extracted executable into a user-owned PATH directory.
-```
-
-Private draft downloads require appropriate repository access. Generated anonymous
-installers do not inherit GitHub CLI authentication; do not embed a private token
-in an installer or send one through a distribution proxy. Never claim a private
-release is an anonymous consumer download.
 
 ## Local preflight
 
