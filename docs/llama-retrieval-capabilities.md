@@ -1,6 +1,6 @@
 # Native llama.cpp chat capabilities
 
-Norted-Server serves ordinary GGUFs using upstream llama.cpp EOS/EOG and the
+Scala serves ordinary GGUFs using upstream llama.cpp EOS/EOG and the
 model's chat template. Model producer and package provenance do not grant or
 require inference capabilities. No source overlay or exact-stop runtime exists.
 

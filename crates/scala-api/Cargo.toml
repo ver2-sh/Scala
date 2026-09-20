@@ -1,0 +1,30 @@
+[package]
+name = "scala-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64 = "0.22"
+async-trait.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+scala-core = { path = "../scala-core" }
+scala-engine = { path = "../scala-engine" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+sha2.workspace = true
+tower = { version = "0.5.2", features = ["util"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }

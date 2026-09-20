@@ -1,11 +1,11 @@
 # Scala release maintenance
 
-Scala (`Yuuyuuei/Scala`) is the repository and release name for Norted Server.
-The standard source checkout is `/srv/norted/repos/Scala`. It is not a new runtime, model format,
-executable or storage namespace. `norted-server`, all Norted configuration paths,
-Link identity, runtime qualification and model provenance remain unchanged. This
-repository owns server distribution; Norted owns model construction and lineage.
-No Norted or Norted-Utils release contract is introduced.
+Scala (`Yuuyuuei/Scala`) owns the `scala` executable, `scala-*` workspace crates,
+`scala.service`, platform-native Scala storage, and Scala Link (`scala.link.v1`).
+Its standard host checkout is `/srv/norted/repos/Scala`. The distribution contains
+only the application; models, inference runtimes and GPU drivers are separate.
+Norted owns model construction and immutable artifact lineage; Norted-Utils owns
+shared host preparation. Neither acquires a Scala-specific artifact contract.
 
 ## Channel status
 
@@ -15,7 +15,7 @@ Do not make the repository public or publish tags as a validation technique.
 The existing repository policy permits local checks, not hosted validation runs.
 Actual publication and any change of visibility require deliberate approval.
 
-The workflow will publish **Scala — Norted Server v0.1.0** when the matching
+The workflow will publish **Scala v0.1.0** when the matching
 reviewed version tag is intentionally pushed. It is tag-only: ordinary branch
 pushes, pull requests and schedules do not consume Actions minutes.
 
@@ -29,7 +29,7 @@ pushes, pull requests and schedules do not consume Actions minutes.
 | `x86_64-apple-darwin` | macOS Intel | Exact runtime/host admission |
 | `x86_64-pc-windows-msvc` | Windows x64 | Exact runtime/host admission |
 
-Every archive contains the `norted-server` binary (`.exe` on Windows). cargo-dist
+Every archive contains the `scala` binary (`.exe` on Windows). cargo-dist
 also produces shell and PowerShell installers, per-archive SHA-256 checksums,
 `sha256.sum`, and a distribution manifest. No models, runtimes, GPU drivers,
 credentials, local configuration, benchmark evidence or Rust toolchain is bundled.
@@ -50,28 +50,28 @@ Linux/macOS:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fLsS \
-  https://github.com/Yuuyuuei/Scala/releases/download/v0.1.0/norted-server-installer.sh \
-  -o norted-server-installer.sh
+  https://github.com/Yuuyuuei/Scala/releases/download/v0.1.0/scala-installer.sh \
+  -o scala-installer.sh
 # Inspect the downloaded script, then:
-sh norted-server-installer.sh
+sh scala-installer.sh
 # Open a fresh shell if the installer changed PATH.
-norted-server --version
-norted-server doctor
-norted-server tui
+scala --version
+scala doctor
+scala tui
 # For foreground headless serving instead:
-norted-server serve
+scala serve
 ```
 
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest -Uri 'https://github.com/Yuuyuuei/Scala/releases/download/v0.1.0/norted-server-installer.ps1' -OutFile 'norted-server-installer.ps1'
+Invoke-WebRequest -Uri 'https://github.com/Yuuyuuei/Scala/releases/download/v0.1.0/scala-installer.ps1' -OutFile 'scala-installer.ps1'
 # Inspect the downloaded script, then:
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\norted-server-installer.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scala-installer.ps1
 # Open a fresh shell if the installer changed PATH.
-norted-server --version
-norted-server doctor
-norted-server tui
+scala --version
+scala doctor
+scala tui
 ```
 
 The PowerShell policy is process-scoped; organizational Group Policy still wins.
@@ -80,8 +80,8 @@ Do not disable Gatekeeper, SmartScreen or managed execution policy.
 To update a direct installation, stop its serving/TUI processes and rerun the
 installer from the intended newer release. Then restart the same invocation or
 service. This replaces the binary, not models, runtimes or configuration. There is
-no native `norted-server update` command in the release binary. The repository's
-`norted-server-service.sh update` is exclusively a source-checkout rebuild helper;
+no native `scala update` command in the release binary. The repository's
+`scala-service.sh update` is exclusively a source-checkout rebuild helper;
 it must not be installed over the release executable as a command wrapper.
 
 While the repository is private, maintainers can retrieve release assets with
@@ -89,10 +89,10 @@ GitHub CLI instead. For example, for Linux x64:
 
 ```sh
 gh release download v0.1.0 -R Yuuyuuei/Scala \
-  -p norted-server-x86_64-unknown-linux-musl.tar.xz \
-  -p norted-server-x86_64-unknown-linux-musl.tar.xz.sha256
-sha256sum -c norted-server-x86_64-unknown-linux-musl.tar.xz.sha256
-tar -xJf norted-server-x86_64-unknown-linux-musl.tar.xz
+  -p scala-x86_64-unknown-linux-musl.tar.xz \
+  -p scala-x86_64-unknown-linux-musl.tar.xz.sha256
+sha256sum -c scala-x86_64-unknown-linux-musl.tar.xz.sha256
+tar -xJf scala-x86_64-unknown-linux-musl.tar.xz
 # Copy the extracted executable into a user-owned PATH directory.
 ```
 

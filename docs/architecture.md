@@ -1,12 +1,12 @@
 # Architecture
 
-Norted Server is an engine-agnostic local inference control plane composed by the `norted-server` binary. It owns model discovery, runtime acquisition and selection, process lifecycle, normalized inference, provenance, and the public protocol. Upstream executables remain separately versioned runtime packs.
+Scala is an engine-agnostic local inference control plane composed by the `scala` binary. It owns model discovery, runtime acquisition and selection, process lifecycle, normalized inference, provenance, and the public protocol. Upstream executables remain separately versioned runtime packs.
 
 ## Engine and runtime boundaries
 
-Optional [Norted Link](norted-link.md) federates owner reports over Wayfinder peer
-services. `norted-api` owns the protocol, observational cache and exact-host API
-routing; `norted-engine::link` defines the shared observational/control contracts.
+Optional [Scala Link](scala-link.md) federates owner reports over Wayfinder peer
+services. `scala-api` owns the protocol, observational cache and exact-host API
+routing; `scala-engine::link` defines the shared observational/control contracts.
 The runtime manager applies ordinary local inference admission, including owner-local
 JIT loading, to forwarded inference and executes optional remote load/unload through
 its existing management path. Reachable installed profiles are advertised even when
@@ -14,10 +14,10 @@ unloaded. Exact-profile execution uses an internal API with Link disabled: there
 no recursive federation, inference retry, failover or gateway scheduling. The TUI merges
 observations only in its presentation model; runtime management and persistent
 profile/model stores remain local. There is no model/runtime copying or replicated
-Norted database. Wayfinder alone owns identity, membership and peer connectivity.
+Scala database. Wayfinder alone owns identity, membership and peer connectivity.
 The local application boundary uses a protected Unix socket on Linux and a
 protected same-account named pipe on native Windows 11. Only that stream adapter
-varies: Ubuntu ↔ Windows uses the same Norted Link and Wayfinder TCP/Noise
+varies: Ubuntu ↔ Windows uses the same Scala Link and Wayfinder TCP/Noise
 protocols, without WSL. Managed runtime compatibility remains owner-local;
 Windows llama.cpp support does not imply Windows managed NInfer or q27 support.
 
@@ -43,7 +43,7 @@ The serving and security boundaries are:
 PUBLIC CLIENT
     │ HTTP Bearer authentication when effective
     ▼
-PUBLIC NORTED GATEWAY
+PUBLIC SCALA GATEWAY
     ├── GET  /health                 (minimal liveness, never key-authorized control)
     ├── GET  /v1/models              ┐
     ├── GET  /v1/models/{model}      │
@@ -74,15 +74,15 @@ The interactive process preserves this boundary in both lifecycle modes. The TUI
 
 ## Crate responsibilities
 
-- `norted-core` owns platform paths, schema-version-1 configuration, public-auth policy, the versioned atomic API-key store, typed serving settings and resolution, user-owned Model Profiles, model/auxiliary-artifact discovery, stable IDs, runtime identity/manifest/preferences data, host-independent provenance, application state, and process descriptors.
-- `norted-model-library` owns the provider-neutral model catalog/acquisition contract, Hugging Face API provider, bounded in-process download scheduler and authoritative job snapshots, streamed/resumable downloads, receipts, safe import, atomic activation, and managed-only removal. It performs no model transformation or runtime acquisition.
-- `norted-engine` owns `EngineAdapter`, `EngineRegistry`, the provider/catalog/cache, secure installer, runtime store and resolver, runtime/backend manager, generic process supervisor, control client, and normalized inference types.
-- `norted-engine-llama-cpp` owns official llama.cpp asset classification, the immutable managed Linux CUDA source recipe/provider, binary probes, flags/environment policy, readiness and `/props`, and Chat Completions JSON/SSE translation.
-- `norted-engine-q27` owns official q27 binary/source capability classification, exact Makefile target recipes, tokenizer requirements, usage-signature probes, flags/environment policy, readiness, provable sampler settings, and Chat Completions JSON/SSE translation.
-- `norted-engine-ninfer` owns the canonical source-snapshot catalog, exact target-registry enumeration, `.ninfer` compatibility, source/external runtime probes, settings and GPU policy, startup-log observation, and private Chat JSON/SSE translation.
-- `norted-api` owns public bearer/request middleware, the shared sanitized error contract, Responses and Chat Completions text surfaces, and the private authenticated control HTTP surface. It does not construct upstream flags or expose backend-native bytes.
-- `norted-tui` owns terminal lifecycle, responsive rendering, runtime search/install/selection interaction, the generic schema-driven load-settings editor, and normalized control observation.
-- `norted-server` is the composition root and scriptable CLI.
+- `scala-core` owns platform paths, schema-version-1 configuration, public-auth policy, the versioned atomic API-key store, typed serving settings and resolution, user-owned Model Profiles, model/auxiliary-artifact discovery, stable IDs, runtime identity/manifest/preferences data, host-independent provenance, application state, and process descriptors.
+- `scala-model-library` owns the provider-neutral model catalog/acquisition contract, Hugging Face API provider, bounded in-process download scheduler and authoritative job snapshots, streamed/resumable downloads, receipts, safe import, atomic activation, and managed-only removal. It performs no model transformation or runtime acquisition.
+- `scala-engine` owns `EngineAdapter`, `EngineRegistry`, the provider/catalog/cache, secure installer, runtime store and resolver, runtime/backend manager, generic process supervisor, control client, and normalized inference types.
+- `scala-engine-llama-cpp` owns official llama.cpp asset classification, the immutable managed Linux CUDA source recipe/provider, binary probes, flags/environment policy, readiness and `/props`, and Chat Completions JSON/SSE translation.
+- `scala-engine-q27` owns official q27 binary/source capability classification, exact Makefile target recipes, tokenizer requirements, usage-signature probes, flags/environment policy, readiness, provable sampler settings, and Chat Completions JSON/SSE translation.
+- `scala-engine-ninfer` owns the canonical source-snapshot catalog, exact target-registry enumeration, `.ninfer` compatibility, source/external runtime probes, settings and GPU policy, startup-log observation, and private Chat JSON/SSE translation.
+- `scala-api` owns public bearer/request middleware, the shared sanitized error contract, Responses and Chat Completions text surfaces, and the private authenticated control HTTP surface. It does not construct upstream flags or expose backend-native bytes.
+- `scala-tui` owns terminal lifecycle, responsive rendering, runtime search/install/selection interaction, the generic schema-driven load-settings editor, and normalized control observation.
+- `scala` is the composition root and scriptable CLI.
 
 Adapter registration and provider registration are separate. A built-in engine can be enabled even when no runtime is installed; conversely, every installed manifest still requires its corresponding registered adapter before it can launch.
 
@@ -107,7 +107,7 @@ No repository or model family is hard-coded into this generic provider.
 
 Acquisition streams each response to a cache `.part`, uses a Range request when partial data exists,
 checks authoritative size and SHA-256, then assembles all files in a registry-excluded
-`.norted-staging` directory on the managed root's filesystem. Raw q27 tokenizer selection calls the
+`.scala-staging` directory on the managed root's filesystem. Raw q27 tokenizer selection calls the
 same core selector used by local discovery, including the upstream `MODEL.q27` + sole
 `TOKENIZER.tok` layout.
 
@@ -136,7 +136,7 @@ narrow acquisition lock. Terminal history is bounded. Scheduler state is process
 ordinary TUI navigation but not restart; resumable partial cache files do survive and are reused by
 the same exact reference.
 
-Norted package acquisition planning is a pure `norted-core` interpretation of the same locally
+Norted package acquisition planning is a pure `scala-core` interpretation of the same locally
 accepted `BUILD-MANIFEST.json`, `Q27-MANIFEST.json`, and `NINFER-MANIFEST.json` schemas. A provider
 searches only exact ancestor manifest paths for the selected repository filename; filenames inside
 the manifest resolve relative to that manifest directory. It never chooses a repository-global
@@ -214,7 +214,7 @@ each applicable runtime; it must not create a shared parent layer.
 The exact adapter schema materializes every supported effective row as a concrete value, winning
 source, and optional derivation detail. Runtime/model/host calculations remain part of the runtime-
 default layer. A genuine unresolved runtime policy is represented canonically (for example `auto`),
-not replaced with a presentation-only scalar. Only deliberately Norted-owned execution defaults are
+not replaced with a presentation-only scalar. Only deliberately Scala-owned execution defaults are
 materialized into launch configuration. Startup-confirmed results supersede automatic policies in
 the running effective map without creating a new source layer; when the value changes, structured
 `requested_value` retains the pre-start policy/value. The Model Profile editor consumes current
@@ -230,7 +230,7 @@ then gate it with the exact runtime contract before validating effective setting
 requirements are consequences of selected settings. q27 retains exact source fingerprints and
 bounded context/KV/W_MAX startup proof; NInfer retains native-container identity, capability-domain
 source fingerprints, and schema-20 startup proof;
-llama.cpp uses exact help evidence for every structured launch control and keeps Norted-owned
+llama.cpp uses exact help evidence for every structured launch control and keeps Scala-owned
 system-prompt/context management separate from native launch flags.
 
 `RuntimeProvenance.model_profile` records the ID, display name, deterministic content hash, bound
@@ -287,13 +287,13 @@ The official provider classifies asset names rather than assuming a release matr
 
 Initial supported families include Windows x86_64 CPU/CUDA/Vulkan and Linux x86_64 CPU/Vulkan, plus straightforward official architecture variants recognized by the same strict grammar. Linux packages retain their internal relative library symlinks only after extractor containment validation.
 
-A separate provider supplies Linux x86_64 CUDA as managed source builds, not as fabricated release assets. It checks official nightlies newest-first and selects the newest exact revision whose bounded root, ggml/CUDA, common, tools/UI, and server CMake files still prove the Norted-owned build contract. The check covers the CUDA option and backend path, explicit-architecture override, server target/output/C++17 contract, and the flags that keep optional CCCL, NCCL, LLGuidance, UI, OpenSSL, and subprocess behavior out of the managed build. A drifted newest nightly is skipped in favor of the newest earlier admitted nightly. One admission scan produces both supported CUDA-toolkit variants from the same commit/tree; candidate revalidation uses the selected exact variant to reconstruct its recipe without substituting the parallel variant. Runtime Search never clones or compiles source.
+A separate provider supplies Linux x86_64 CUDA as managed source builds, not as fabricated release assets. It checks official nightlies newest-first and selects the newest exact revision whose bounded root, ggml/CUDA, common, tools/UI, and server CMake files still prove the Scala-owned build contract. The check covers the CUDA option and backend path, explicit-architecture override, server target/output/C++17 contract, and the flags that keep optional CCCL, NCCL, LLGuidance, UI, OpenSSL, and subprocess behavior out of the managed build. A drifted newest nightly is skipped in favor of the newest earlier admitted nightly. One admission scan produces both supported CUDA-toolkit variants from the same commit/tree; candidate revalidation uses the selected exact variant to reconstruct its recipe without substituting the parallel variant. Runtime Search never clones or compiles source.
 
 The current CUDA-12 source identity is `managed-portable-v4`; `managed-portable-v1`, `managed-portable-v2`, and `managed-portable-v3` remain immutable historical identities. V4 preserves V3's CMake/Ninja Release build, shared-library layout, and `CMAKE_BUILD_RPATH_USE_ORIGIN=ON` policy, so the executable and libraries kept together under `build/bin` use `$ORIGIN`-relative build-tree paths after staging moves into the immutable runtime store. Its only toolchain-contract change is replacing V3's PATH-selected nvcc semantics with the stable `/usr/local/cuda/bin/nvcc` activation boundary. Exact managed V1 identities are no longer serving-compatible: V1 predates the origin-relative policy and can retain staging/build-tree library paths after atomic relocation. Its manifest, RuntimeId, installation, selections, and update identity are not rewritten or deleted; V1/V2/V3 remain on the CUDA-12 update line so V4 is discoverable.
 
 The parallel CUDA-13 source identity is `managed-portable-cuda13-v2`; V1 remains its immutable historical predecessor. It deliberately is not an update generation of the CUDA-12 line because its host toolchain and driver contract differs. Both current recipes build only `llama-server` at `build/bin/llama-server` and use the same fixed CMake/RPATH behavior. Their deterministic real-code policy is `75-real;80-real;86-real;89-real;90-real;120a-real`, represented as exact compute capabilities 7.5, 8.0, 8.6, 8.9, 9.0, and 12.0 and accelerator target `sm_75+sm_80+sm_86+sm_89+sm_90+sm_120a`. CUDA 13.3 nvcc was also checked directly: all base targets are reported by its list actions and an `sm_120a` compile succeeds.
 
-CUDA-12 V4 explicitly admits Toolkit `>=12.8,<13.0` and NVIDIA Linux driver `>=525.60.13`. CUDA-13 V2 explicitly admits Toolkit `>=13.0,<14.0` and driver `>=580.65.06`, NVIDIA's exact CUDA 13.0 GA Linux floor. The exclusive ceilings keep later major families from silently changing either immutable contract. See NVIDIA's [minor-version compatibility table](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html), [CUDA 13.0 release table](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html#cuda-toolkit-and-minimum-required-driver-version-for-cuda-minor-version-compatibility), and [CUDA 13 compiler target list](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-compiler-driver-nvcc/index.html#gpu-compilation). Before checkout or compilation, the generic prerequisite probe executes the recipe's exact `/usr/local/cuda/bin/nvcc` prerequisite against the Toolkit bounds and every explicit real/virtual target. It uses `--list-gpu-code`/`--list-gpu-arch`; because CUDA 13 list output omits accepted architecture-specific suffixes, the compiler's own option enumeration supplies that exact supplemental evidence. One generic plan function constructs the effective CMake configuration: it starts from provider-owned recipe arguments, rejects any competing provider-authored `CMAKE_CUDA_COMPILER`, and appends the typed compiler binding. Prerequisite validation, the configure process, persisted effective arguments, and installed-candidate matching use that same contract. The manifest retains provider arguments separately, and observed CMake/Ninja/C++/nvcc versions remain toolchain identity. Older schema-2 source manifests omitted the effective list; they remain readable and can match their unchanged recipe without inferred data or on-read rewriting, while a present effective list must match exactly. A known driver below the relevant floor is incompatible; a wrong active Toolkit makes that variant needs-attention. Norted never installs driver, Toolkit, or toolchain packages.
+CUDA-12 V4 explicitly admits Toolkit `>=12.8,<13.0` and NVIDIA Linux driver `>=525.60.13`. CUDA-13 V2 explicitly admits Toolkit `>=13.0,<14.0` and driver `>=580.65.06`, NVIDIA's exact CUDA 13.0 GA Linux floor. The exclusive ceilings keep later major families from silently changing either immutable contract. See NVIDIA's [minor-version compatibility table](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html), [CUDA 13.0 release table](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/index.html#cuda-toolkit-and-minimum-required-driver-version-for-cuda-minor-version-compatibility), and [CUDA 13 compiler target list](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-compiler-driver-nvcc/index.html#gpu-compilation). Before checkout or compilation, the generic prerequisite probe executes the recipe's exact `/usr/local/cuda/bin/nvcc` prerequisite against the Toolkit bounds and every explicit real/virtual target. It uses `--list-gpu-code`/`--list-gpu-arch`; because CUDA 13 list output omits accepted architecture-specific suffixes, the compiler's own option enumeration supplies that exact supplemental evidence. One generic plan function constructs the effective CMake configuration: it starts from provider-owned recipe arguments, rejects any competing provider-authored `CMAKE_CUDA_COMPILER`, and appends the typed compiler binding. Prerequisite validation, the configure process, persisted effective arguments, and installed-candidate matching use that same contract. The manifest retains provider arguments separately, and observed CMake/Ninja/C++/nvcc versions remain toolchain identity. Older schema-2 source manifests omitted the effective list; they remain readable and can match their unchanged recipe without inferred data or on-read rewriting, while a present effective list must match exactly. A known driver below the relevant floor is incompatible; a wrong active Toolkit makes that variant needs-attention. Scala never installs driver, Toolkit, or toolchain packages.
 
 Update discovery and installed fallback ranking ask each engine for a logical functional variant and optional source-recipe generation. llama.cpp maps only exact managed Linux x86_64 CUDA V1, V2, and V3 identities to the CUDA-12 family ordered 1, 2, and 3; CUDA-13 V1 is a separate family. On otherwise identical source, the higher generation ranks newer before RuntimeId lexical ordering, while a genuinely newer upstream commit still wins. CPU, Vulkan, Windows CUDA, external runtimes, unknown future generations, and unrelated toolchain families retain exact variant lines. Pinned/model/format selections remain exact and are never rewritten when a side-by-side update is installed. The generic source-prerequisite memoization key is derived beside the checker from the complete immutable recipe and prerequisite structs, so the two Toolkit contracts cannot share a compatibility result accidentally.
 
@@ -338,7 +338,7 @@ ZIP and tar.gz extraction runs off the async executor and enforces entry-count a
 
 After extraction the installer requires exactly one regular file with the provider-declared entrypoint basename, hashes it, and creates a provisional `InstalledRuntime`. The matching engine adapter probes that exact entrypoint and verifies its identity/required interface. Only a successful observation is written into `runtime.json`; the directory and manifest are synced before one atomic staging-to-destination rename.
 
-Activation refuses an existing different runtime ID and also scans for a different digest under the same claimed repository/tag/assets identity. All error paths clean staging. Shared per-runtime file leases span backend loading and execution; removal requires an exclusive lease, so another Norted process cannot race an active load. Thus extraction alone never produces local truth, failed probes cannot be selected, and updates cannot damage an older installation.
+Activation refuses an existing different runtime ID and also scans for a different digest under the same claimed repository/tag/assets identity. All error paths clean staging. Shared per-runtime file leases span backend loading and execution; removal requires an exclusive lease, so another Scala process cannot race an active load. Thus extraction alone never produces local truth, failed probes cannot be selected, and updates cannot damage an older installation.
 
 Source build is a parallel generic acquisition arm, not a provider branch in the runtime manager. For q27 it is:
 
@@ -363,7 +363,7 @@ NInfer catalog provider
   → build prerequisite validation
   → transactional GitHub HTTPS checkout
   → HEAD and HEAD^{tree} verification
-  → fixed Norted CMake recipe
+  → fixed Scala CMake recipe
   → build/apps/ninfer-serve
   → SHA-256 + adapter probe
   → source-build runtime manifest
@@ -457,7 +457,7 @@ q27-server <canonical-model.q27> <canonical-tokenizer.tok>
            [explicit structured settings]
 ```
 
-Norted disables q27 raw native arguments and rejects every configured `Q27_*` variable. Before launch it dynamically scrubs every inherited `Q27_*` name, including unknown future and diagnostic controls such as `Q27_MPROBE`, then adds back only values generated by reviewed typed settings. Compatibility still requires an accelerator binding containing exactly one UUID-identified NVIDIA device and launch sets separately owned `CUDA_VISIBLE_DEVICES` to that same full UUID; numeric indexes are never correlated across CUDA and `nvidia-smi`. A single inherited UUID constraint is reconciled, while numeric, multiple, unknown, empty, or ambiguous constraints fail closed. Before launch, q27 prepares the already-discovered tokenizer as an engine-neutral auxiliary identity containing role, canonical path, size, and SHA-256. The launch spec uses that exact path and rechecks size/hash immediately before process creation; q27 never rediscovers a companion at launch. The exact v0.10 source contract forwards sampled request seed/top-k/min-p, while greedy requests reject controls upstream would ignore. Request thinking enable/budget and reasoning-effort `none` are accepted only with the explicit `--request-think` profile setting; positive request effort remains an independent trained-template override. The Qwen3.8 trained-template reasoning-effort process default is separately gated by the exact source contract plus bounded model metadata, translated to adapter-owned `Q27_REASONING_EFFORT`, and overridden only for an individual request by deliberately canonicalized q27 request semantics; Qwen3.6 receives no effort setting. Ordinary function definitions, tool choice, assistant/tool history, non-streaming calls, and streaming deltas use engine-neutral types; raw external-template delivery is text-only. Stable `Q27_BATCH` and `Q27_SAMPLED` behavior is typed, while diagnostic/checksum/trace, benchmark, kernel-development, and unstable post-release controls remain unsupported. Readiness requires `/health` status `ok`; JSON and SSE are translated through the same normalized inference types as the other adapters.
+Scala disables q27 raw native arguments and rejects every configured `Q27_*` variable. Before launch it dynamically scrubs every inherited `Q27_*` name, including unknown future and diagnostic controls such as `Q27_MPROBE`, then adds back only values generated by reviewed typed settings. Compatibility still requires an accelerator binding containing exactly one UUID-identified NVIDIA device and launch sets separately owned `CUDA_VISIBLE_DEVICES` to that same full UUID; numeric indexes are never correlated across CUDA and `nvidia-smi`. A single inherited UUID constraint is reconciled, while numeric, multiple, unknown, empty, or ambiguous constraints fail closed. Before launch, q27 prepares the already-discovered tokenizer as an engine-neutral auxiliary identity containing role, canonical path, size, and SHA-256. The launch spec uses that exact path and rechecks size/hash immediately before process creation; q27 never rediscovers a companion at launch. The exact v0.10 source contract forwards sampled request seed/top-k/min-p, while greedy requests reject controls upstream would ignore. Request thinking enable/budget and reasoning-effort `none` are accepted only with the explicit `--request-think` profile setting; positive request effort remains an independent trained-template override. The Qwen3.8 trained-template reasoning-effort process default is separately gated by the exact source contract plus bounded model metadata, translated to adapter-owned `Q27_REASONING_EFFORT`, and overridden only for an individual request by deliberately canonicalized q27 request semantics; Qwen3.6 receives no effort setting. Ordinary function definitions, tool choice, assistant/tool history, non-streaming calls, and streaming deltas use engine-neutral types; raw external-template delivery is text-only. Stable `Q27_BATCH` and `Q27_SAMPLED` behavior is typed, while diagnostic/checksum/trace, benchmark, kernel-development, and unstable post-release controls remain unsupported. Readiness requires `/health` status `ok`; JSON and SSE are translated through the same normalized inference types as the other adapters.
 
 ### NInfer
 
@@ -469,7 +469,7 @@ Launch is conceptually:
 CUDA_VISIBLE_DEVICES=<selected full GPU UUID>
 ninfer-serve <canonical-model.ninfer>
              --host 127.0.0.1 --port <dynamic>
-             --model-id <stable Norted ModelId>
+             --model-id <stable Scala ModelId>
              --device 0
              --request-log-jsonl <private restrictive temporary path>
              [explicit structured settings]
@@ -477,7 +477,7 @@ ninfer-serve <canonical-model.ninfer>
 
 The positional artifact, binding, alias, device, auth/CORS surface, typed load/cache/media/store
 controls, sampler/greedy controls, and startup log are reserved. `/health` alone is insufficient for
-readiness. Norted selects the bounded schema-20 `server_start` record reviewed at source commit
+readiness. Scala selects the bounded schema-20 `server_start` record reviewed at source commit
 `d4929686...`, validates public alias, artifact target/weights and context-cost identity, selected GPU
 identity, context/KV/cache/CUDA/speculation state, queue and media limits, thinking state, greedy
 state, and configured sampler defaults, then records the runtime-resolved effective values. The file
@@ -508,7 +508,7 @@ help- and source-blob-proven launch facts without inheriting changed, unreviewed
 
 `RuntimeManager` owns one authoritative collection keyed by Model Profile. Each managed backend independently retains role, JIT/pinned residency, lifecycle, generation, process, private endpoint, settings, exact runtime lease and provenance, request count, last use, and retirement state. Loading uses the same exact resolution and `LaunchSpec` pipeline for manual pinned and inference-triggered JIT loads. Lifecycle operations are serialized, but inference against already-running independent backends is not. Unexpected process exit fails only the matching profile/generation.
 
-Transient logical sessions hold at most one primary-profile lease. Missing attribution maps to the in-memory `default` session. A primary switch releases the old lease and drains/removes the old unpinned JIT backend only when no other session owns it; auxiliary routing never changes the primary. `X-Norted-Session` carries a validated opaque 1–128 byte value and `X-Norted-Role` carries `primary` or `auxiliary`; neither is serialized into engine requests or provenance. Every dispatch takes an atomic inference lease. Streaming wraps the engine stream with the lease guard, so EOF, error, or consumer drop releases it without awaiting a Tokio lock.
+Transient logical sessions hold at most one primary-profile lease. Missing attribution maps to the in-memory `default` session. A primary switch releases the old lease and drains/removes the old unpinned JIT backend only when no other session owns it; auxiliary routing never changes the primary. `X-Scala-Session` carries a validated opaque 1–128 byte value and `X-Scala-Role` carries `primary` or `auxiliary`; neither is serialized into engine requests or provenance. Every dispatch takes an atomic inference lease. Streaming wraps the engine stream with the lease guard, so EOF, error, or consumer drop releases it without awaiting a Tokio lock.
 
 A small reaper expires sessions and idle JIT residency, using 3600 seconds for primary/session idleness and 300 seconds for auxiliaries by default, with an LRU cap of two idle auxiliaries. It excludes pinned models, active requests, and leased primaries, and terminates with manager shutdown.
 
@@ -524,7 +524,7 @@ Cross-process CLI/TUI control uses schema-version-2 descriptors under:
 
 The serving process atomically writes its random identity, PID, public probe address, private loopback endpoint, and random bearer token. Observers prove identity through public health before sending authenticated `status`, `load`, or profile-targeted `unload` requests. Every managed backend status includes its monotonic generation for correlating an admitted load with later observations. Tokens are redacted and absent from public/status/provenance output.
 
-`norted-server serve` is the explicit headless owner. `norted-server` and `norted-server tui` first attach to an already healthy owner whose authenticated private control status also succeeds; when none exists, they construct the same registry, shared runtime-pack manager, runtime manager, public-auth policy, and `ApiServer`, then wait for the published private control API to answer before entering normal interaction. Headless composition requires completed model discovery before reporting readiness. Owned interactive composition permits the registry to remain NotScanned/Scanning so the TUI can draw first and launch `ApplicationCore::start_model_discovery`; public model enumeration and load admission use only the actual registry, so pending discovery cannot fabricate a loadable model. The owned task is coupled to the TUI lifetime: normal exit and TUI errors signal `ApiServer::run`, await its graceful listener shutdown and `RuntimeManager::shutdown`, and let the owned `RuntimePublisher` remove only its own descriptor. Attached mode creates no serving task, so TUI exit cannot stop the external process. Scriptable `load` and `unload` remain control clients and never launch a server.
+`scala serve` is the explicit headless owner. `scala` and `scala tui` first attach to an already healthy owner whose authenticated private control status also succeeds; when none exists, they construct the same registry, shared runtime-pack manager, runtime manager, public-auth policy, and `ApiServer`, then wait for the published private control API to answer before entering normal interaction. Headless composition requires completed model discovery before reporting readiness. Owned interactive composition permits the registry to remain NotScanned/Scanning so the TUI can draw first and launch `ApplicationCore::start_model_discovery`; public model enumeration and load admission use only the actual registry, so pending discovery cannot fabricate a loadable model. The owned task is coupled to the TUI lifetime: normal exit and TUI errors signal `ApiServer::run`, await its graceful listener shutdown and `RuntimeManager::shutdown`, and let the owned `RuntimePublisher` remove only its own descriptor. Attached mode creates no serving task, so TUI exit cannot stop the external process. Scriptable `load` and `unload` remain control clients and never launch a server.
 
 Private status exposes all managed backends with Model Profile/artifact identity, role, residency, lifecycle/generation, engine/runtime, ordered accelerator binding, process/endpoint, progress/failure/provenance, active request and non-sensitive primary-lease counts, last use, and retirement state. `RuntimeProvenance` remains independent per backend and retains the immutable Model Profile identity/hash/role/bindings, exact runtime manifest and selection source, every selected accelerator observation in launch order, model and auxiliary-artifact facts, source-attributed settings, sanitized native arguments and environment hashes, process identity, endpoint, and launch time. Transient session IDs and mutable pinned/JIT residency are excluded.
 
@@ -565,26 +565,26 @@ features from real compatibility and selection data. Structured output becomes t
 selected exact runtime schema and end-to-end bridge implement it. q27 tool calling requires the
 audited runtime-chat route; NInfer tools require a reviewed protocol snapshot, and NInfer Vision
 also requires a compatible registered artifact plus startup-configured residency.
-`norted-server models info <MODEL_ID>` exposes the view without expanding the public Model object.
+`scala models info <MODEL_ID>` exposes the view without expanding the public Model object.
 
 ## Public API-key state and transport
 
-`<data>/api-keys.json` schema 1 contains bounded key records with stable IDs, labels, display prefixes, SHA-256 digests, and creation/revocation timestamps. A separate inter-process lock and atomic replacement serialize writers; corruption is an error rather than an empty-store fallback. Creation draws 256 bits from the operating-system RNG and returns the `norted_sk_...` plaintext only to that one CLI invocation. Verification accepts only bounded Bearer credentials, hashes the supplied secret, compares fixed-size digests in constant time, and considers only active records. The small atomic file is reread per authenticated request so revocation is live.
+`<data>/api-keys.json` schema 1 contains bounded key records with stable IDs, labels, display prefixes, SHA-256 digests, and creation/revocation timestamps. A separate inter-process lock and atomic replacement serialize writers; corruption is an error rather than an empty-store fallback. Creation draws 256 bits from the operating-system RNG and returns the `scala_sk_...` plaintext only to that one CLI invocation. Verification accepts only bounded Bearer credentials, hashes the supplied secret, compares fixed-size digests in constant time, and considers only active records. The small atomic file is reread per authenticated request so revocation is live.
 
 The common serving composition used by headless `serve` and an owned TUI reads key state and resolves configured/effective auth before creating the public socket. Required auth with zero active keys therefore fails closed before exposure in either mode. Non-loopback `disabled` remains allowed only because it is an explicit operator choice and is labelled insecure throughout local status surfaces.
 
-Application authentication provides no confidentiality. Loopback is local; a trusted VPN such as Tailscale can encrypt remote transport; or an operator-managed reverse proxy can terminate TLS. Norted does not include certificate management, and plain HTTP over an untrusted network exposes credentials and content.
+Application authentication provides no confidentiality. Loopback is local; a trusted VPN such as Tailscale can encrypt remote transport; or an operator-managed reverse proxy can terminate TLS. Scala does not include certificate management, and plain HTTP over an untrusted network exposes credentials and content.
 
 ## TUI and network independence
 
-The CLI composition root establishes attached or owned serving mode before the TUI enters terminal mode, so bind/auth/control startup failures are reported directly instead of becoming a misleading control-unavailable screen. It does not wait for owned model discovery. Once serving ownership is established, the TUI draws its pending NotScanned frame, starts local model discovery asynchronously, and renders Scanning then Ready/Ready with warnings or Failed from the core registry state while periodic control observation and API-key refresh also run. The Server page derives configured bind/auth policy for that first frame and then observes the real server endpoint and small local key count asynchronously. Remote search begins only after a user search action, and install/update work remains off the event loop. Release acquisition reports bounded byte progress; source acquisition reports prerequisite/fetch/verify/configure/build/probe/activation phases without fake bytes. The generic format picker, model list, runtime details, and settings editor consume NInfer's domain/schema data without an engine-specific TUI. Keyboard, mouse, narrow layout, ASCII mode, and `NO_COLOR` are presentation concerns isolated in `norted-tui`.
+The CLI composition root establishes attached or owned serving mode before the TUI enters terminal mode, so bind/auth/control startup failures are reported directly instead of becoming a misleading control-unavailable screen. It does not wait for owned model discovery. Once serving ownership is established, the TUI draws its pending NotScanned frame, starts local model discovery asynchronously, and renders Scanning then Ready/Ready with warnings or Failed from the core registry state while periodic control observation and API-key refresh also run. The Server page derives configured bind/auth policy for that first frame and then observes the real server endpoint and small local key count asynchronously. Remote search begins only after a user search action, and install/update work remains off the event loop. Release acquisition reports bounded byte progress; source acquisition reports prerequisite/fetch/verify/configure/build/probe/activation phases without fake bytes. The generic format picker, model list, runtime details, and settings editor consume NInfer's domain/schema data without an engine-specific TUI. Keyboard, mouse, narrow layout, ASCII mode, and `NO_COLOR` are presentation concerns isolated in `scala-tui`.
 
 The hard invariants are:
 
 - no ordinary startup path depends on the runtime catalog network;
 - release packages require authoritative archive SHA-256 verification;
 - source builds require canonical commit/tree + fixed recipe + observed toolchain + result SHA-256 provenance;
-- extraction and removal remain contained within exact Norted-owned roots;
+- extraction and removal remain contained within exact Scala-owned roots;
 - activation happens only after an exact adapter probe;
 - runtime versions are immutable and side by side;
 - selection always names a concrete runtime and never hard-codes format-to-engine identity;

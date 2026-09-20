@@ -1,14 +1,14 @@
 [workspace]
 members = [
-    "crates/norted-api",
-    "crates/norted-core",
-    "crates/norted-engine",
-    "crates/norted-engine-llama-cpp",
-    "crates/norted-engine-ninfer",
-    "crates/norted-engine-q27",
-    "crates/norted-model-library",
-    "crates/norted-server",
-    "crates/norted-tui",
+    "crates/scala-api",
+    "crates/scala-core",
+    "crates/scala-engine",
+    "crates/scala-engine-llama-cpp",
+    "crates/scala-engine-ninfer",
+    "crates/scala-engine-q27",
+    "crates/scala-model-library",
+    "crates/scala",
+    "crates/scala-tui",
 ]
 resolver = "2"
 

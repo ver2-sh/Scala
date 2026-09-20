@@ -55,7 +55,7 @@ def main():
     url = f'https://github.com/axodotdev/cargo-dist/releases/download/v{VERSION}/cargo-dist-{target}.{extension}'
     with urllib.request.urlopen(url, timeout=120) as response:
         binary = verified_binary(response.read(), target)
-    destination = Path(os.environ['RUNNER_TEMP']) / 'norted-server-dist'
+    destination = Path(os.environ['RUNNER_TEMP']) / 'scala-dist'
     destination.mkdir(exist_ok=True)
     executable = destination / ('dist.exe' if extension == 'zip' else 'dist')
     with tempfile.NamedTemporaryFile(dir=destination, delete=False) as output:

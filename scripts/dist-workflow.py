@@ -62,7 +62,7 @@ try:
     text, count = re.subn(r'      - name: Install cached dist\n.*?      - run: chmod \+x ~/.cargo/bin/dist\n', verified, text, flags=re.S)
     assert count == 2, 'Upstream cached dist consumers changed'
     # Privileged hosting invokes the verified path explicitly, never a PATH shadow.
-    text = text.replace('          dist host ', '          "$RUNNER_TEMP/norted-server-dist/dist" host ')
+    text = text.replace('          dist host ', '          "$RUNNER_TEMP/scala-dist/dist" host ')
     assert 'cargo-dist-installer' not in text
     assert 'matrix.install_dist' not in text
     assert 'cargo-dist-cache' not in text
@@ -74,7 +74,7 @@ try:
     # Scala is a release name; executable and storage names remain unchanged.
     text = text.replace(
         'ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"',
-        'ANNOUNCEMENT_TITLE: "Scala — Norted Server ${{ needs.plan.outputs.tag }}"',
+        'ANNOUNCEMENT_TITLE: "Scala ${{ needs.plan.outputs.tag }}"',
     )
     text = text.replace(
         'gh release create "${{ needs.plan.outputs.tag }}" --target',

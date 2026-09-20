@@ -1,8 +1,9 @@
 # Settings and Model Profiles terminal review
 
+These captures are historical validation evidence and retain their original output; they are not current Scala branding.
 Follow-up: [supported controls with unknown runtime defaults](unknown-default-correction.md). The original captures below document the redesign before that adapter correction.
 
-Redesign based on `ab06f27` on `fix/runtime-settings-inheritance`. The checkout was clean at that commit before editing. Changes are confined to Norted-Server's TUI; no configuration resolver, engine adapter, model artifact, runtime selection, or user preference was changed by the implementation.
+Redesign based on `ab06f27` on `fix/runtime-settings-inheritance`. The checkout was clean at that commit before editing. Changes are confined to Scala's TUI; no configuration resolver, engine adapter, model artifact, runtime selection, or user preference was changed by the implementation.
 
 ## Layout
 
@@ -35,7 +36,7 @@ Additional captures show [validation](100x30-validation.txt), [unsupported local
 - A long q27 system prompt was entered through the value editor, saved, truncated in its table cell, and retained in details. See [long editor](100x30-long-editor.txt) and [saved value/details](100x30-long-details.txt).
 - The mouse pass found and fixed hidden toolbar hit targets intercepting Save; covered targets are now removed while an editor is open.
 
-Validation used copied configuration/profile/runtime state under `/tmp/norted-ui-review` with separate XDG directories and port 18743. Original user configuration and runtime/model files were not modified. No new test code was added.
+Validation used copied configuration/profile/runtime state under `/tmp/scala-ui-review` with separate XDG directories and port 18743. Original user configuration and runtime/model files were not modified. No new test code was added.
 
 ## Live precedence smoke
 
@@ -52,6 +53,6 @@ Both returned `hello`. Settings and profile files were byte-for-byte unchanged a
 
 - `cargo test --workspace`: 214 passed, 0 failed, 1 existing ignored test.
 - Final TUI library tests: 20 passed.
-- `cargo clippy -p norted-tui --all-targets -- -D warnings`, `cargo fmt --all --check`, `cargo build -p norted-server`, and `git diff --check`: passed.
+- `cargo clippy -p scala-tui --all-targets -- -D warnings`, `cargo fmt --all --check`, `cargo build -p scala`, and `git diff --check`: passed.
 
 The original screenshots were described in the task but were not attached as image files in this session. The described per-row column movement and paragraph header were confirmed in the audited source. No live inference claim is made for llama.cpp or ninfer, and no exhaustive matrix of historical runtime versions was run.

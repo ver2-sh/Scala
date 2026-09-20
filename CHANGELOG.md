@@ -2,13 +2,13 @@
 
 ## 0.1.0 — Scala
 
-The first packaged Norted Server release channel. Scala is the release name;
-the executable remains `norted-server` and application paths do not change.
+The first packaged Scala release channel. The application and command are
+`scala`, with Scala-native crates, storage, service, API identity and release assets.
 
 - Terminal-first local inference server with an authenticated OpenAI-compatible API.
 - Independently installed llama.cpp, NInfer and q27 runtimes, with existing
   capability admission and Model Profile settings precedence.
-- Managed model discovery/download/import and optional Wayfinder-backed Norted Link.
+- Managed model discovery/download/import and optional Wayfinder-backed Scala Link.
 - Server-only archives for Linux x64/ARM64, macOS Intel/Apple Silicon and Windows
   x64, shell/PowerShell installers, and published SHA-256 checksums.
 

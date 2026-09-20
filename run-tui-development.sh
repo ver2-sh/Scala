@@ -5,5 +5,5 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$repo_root"
 
 "$repo_root/build-development.sh"
-printf '==> Starting Norted Server TUI (development)\n'
-exec "$repo_root/target/debug/norted-server" tui "$@"
+printf '==> Starting Scala TUI (development)\n'
+exec "$repo_root/target/debug/scala" tui "$@"
