@@ -45,14 +45,20 @@ separate from release-binary installation.
 ## Install and update
 
 These anonymous URLs become usable only after an approved public release exists.
+`ver2.sh` is Scala's stable distribution front dor. Its dedicated Cloudflare
+Worker serves the installer bodies and versioned release assets under
+`https://ver2.sh/scala/`, while the Scala release workflow remains the publishing
+authority. The Worker accepts no GitHub credentials and rewrites installer archive
+downloads back through the versioned `ver2.sh` route.
+
 The generated cargo-dist installers remain authoritative. Latest stable one-liners:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://github.com/ver2-sh/Scala/releases/latest/download/scala-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://ver2.sh/scala/install.sh | sh
 ```
 
 ```powershell
-irm https://github.com/ver2-sh/Scala/releases/latest/download/scala-installer.ps1 | iex
+irm https://ver2.sh/scala/install.ps1 | iex
 ```
 
 For an inspect-first, reproducible installation, use the versioned URLs below
@@ -63,7 +69,7 @@ Linux/macOS:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fLsS \
-  https://github.com/ver2-sh/Scala/releases/download/v0.1.0/scala-installer.sh \
+  https://ver2.sh/scala/releases/download/v0.1.0/scala-installer.sh \
   -o scala-installer.sh
 # Inspect the downloaded script, then:
 sh scala-installer.sh
@@ -78,7 +84,7 @@ scala serve
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest -Uri 'https://github.com/ver2-sh/Scala/releases/download/v0.1.0/scala-installer.ps1' -OutFile 'scala-installer.ps1'
+Invoke-WebRequest -Uri 'https://ver2.sh/scala/releases/download/v0.1.0/scala-installer.ps1' -OutFile 'scala-installer.ps1'
 # Inspect the downloaded script, then:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scala-installer.ps1
 # Open a fresh shell if the installer changed PATH.

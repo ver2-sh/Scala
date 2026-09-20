@@ -65,26 +65,28 @@ installation/update commands, platform limits and publication gates.
 ## Install and update Scala
 
 **PRIVATE / UNPUBLISHED:** these anonymous URLs are not live consumer downloads.
-They become usable only after an approved public release. The existing cargo-dist
-shell and PowerShell installers are authoritative; no separate install service exists.
+They become usable only after an approved public release. `ver2.sh` is the stable
+distribution front door: its dedicated Cloudflare Worker serves installer bodies
+and versioned release assets under `/scala/`, while the generated cargo-dist shell
+and PowerShell installers remain authoritative.
 
 Latest stable, Linux/macOS:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://github.com/ver2-sh/Scala/releases/latest/download/scala-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://ver2.sh/scala/install.sh | sh
 ```
 
 Latest stable, Windows PowerShell:
 
 ```powershell
-irm https://github.com/ver2-sh/Scala/releases/latest/download/scala-installer.ps1 | iex
+irm https://ver2.sh/scala/install.ps1 | iex
 ```
 
 To inspect first, download the script and read it before executing it. On Windows,
 this alternative applies execution policy only to the child PowerShell process:
 
 ```powershell
-Invoke-WebRequest -Uri 'https://github.com/ver2-sh/Scala/releases/latest/download/scala-installer.ps1' -OutFile 'scala-installer.ps1'
+Invoke-WebRequest -Uri 'https://ver2.sh/scala/install.ps1' -OutFile 'scala-installer.ps1'
 Get-Content .\scala-installer.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scala-installer.ps1
 ```

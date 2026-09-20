@@ -88,6 +88,12 @@ try:
         'ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"',
         'ANNOUNCEMENT_TITLE: "Scala ${{ needs.plan.outputs.tag }}"',
     )
+    release_notes = '          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt'
+    assert text.count(release_notes) == 1
+    text = text.replace(
+        release_notes,
+        release_notes + "\n          sed -i \"s#https://github.com/ver2-sh/Scala/releases/download/#https://ver2.sh/scala/releases/download/#g\" $RUNNER_TEMP/notes.txt",
+    )
     text = text.replace(
         'gh release create "${{ needs.plan.outputs.tag }}" --target',
         'gh release create "${{ needs.plan.outputs.tag }}" --verify-tag --target',
