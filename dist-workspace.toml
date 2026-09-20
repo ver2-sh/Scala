@@ -7,7 +7,7 @@ display-name = "Scala"
 cargo-dist-version = "0.33.0"
 ci = ["github"]
 # Reproducible permission/cost customization checked by scripts/dist-workflow.py.
-allow-dirty = []
+allow-dirty = ["ci"]
 precise-builds = true
 installers = ["shell", "powershell"]
 targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "x86_64-pc-windows-msvc", "aarch64-apple-darwin", "x86_64-apple-darwin"]
