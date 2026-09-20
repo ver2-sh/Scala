@@ -12,6 +12,7 @@ name = "scala"
 path = "src/main.rs"
 
 [dependencies]
+scala-update = { path = "../scala-update" }
 async-trait.workspace = true
 clap.workspace = true
 color-eyre.workspace = true
@@ -37,3 +38,6 @@ libc.workspace = true
 
 [package.metadata.dist]
 dist = true
+
+[dev-dependencies]
+tempfile.workspace = true

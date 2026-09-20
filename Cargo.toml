@@ -9,6 +9,7 @@ members = [
     "crates/scala-model-library",
     "crates/scala",
     "crates/scala-tui",
+    "crates/scala-update",
 ]
 resolver = "2"
 

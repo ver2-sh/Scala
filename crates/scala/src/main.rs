@@ -3,6 +3,7 @@ mod composition;
 mod doctor;
 mod output;
 mod prune;
+mod update;
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -25,7 +26,19 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> ExitCode {
     color_eyre::install().ok();
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            if std::env::args_os().any(|arg| arg == "--json") && error.use_stderr() {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"error": {"message": error.to_string()}})
+                );
+                return ExitCode::FAILURE;
+            }
+            error.exit();
+        }
+    };
     let json_errors = cli.json;
     match run(cli).await {
         Ok(code) => code,
@@ -59,14 +72,20 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         });
     }
     let paths = AppPaths::discover()?;
+    if let Some(Command::Update(args)) = &cli.command {
+        update::run(&paths, args, cli.json).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
     if let Some(Command::Prune(args)) = &cli.command {
         prune::run(&paths, args, cli.json).await?;
         return Ok(ExitCode::SUCCESS);
     }
+    let _installation_guard = scala_update::session_guard()?;
     let core = ApplicationCore::load().await?;
     let _log_guard = init_logging(&paths);
 
     match cli.command.unwrap_or(Command::Tui) {
+        Command::Update(_) => unreachable!("update dispatches before application initialization"),
         Command::Prune(_) => unreachable!("prune dispatches before application initialization"),
         Command::Tui => {
             run_tui(core, cli.json).await?;

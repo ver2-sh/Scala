@@ -349,6 +349,8 @@ pub struct LogEntry {
 }
 
 pub struct App {
+    pub app_update: Option<scala_update::State>,
+    pub app_update_pending: bool,
     pub benchmarks: crate::benchmarks::Benchmarks,
     pub snapshot: AppSnapshot,
     pub public_auth_status: PublicAuthStatus,
@@ -491,6 +493,8 @@ impl App {
                 }),
         );
         Self {
+            app_update: None,
+            app_update_pending: false,
             snapshot,
             public_auth_status,
             public_auth_loading: true,
@@ -2743,6 +2747,11 @@ impl App {
             CommandAction::Unload => self.request_unload(),
             CommandAction::ShowHelp => {
                 self.overlay = Some(Overlay::Help);
+                Update::Render
+            }
+            CommandAction::CheckUpdate => {
+                self.app_update_pending = true;
+                self.notice = Some("Checking Scala release channel…".into());
                 Update::Render
             }
             CommandAction::Quit => Update::Quit,
@@ -5822,6 +5831,47 @@ mod tests {
             true,
             definitions,
         )
+    }
+
+    #[test]
+    fn app_update_action_and_persistent_footer_are_visible() {
+        let mut app = test_app(Vec::new());
+        assert!(
+            crate::commands::suggestions("/up")
+                .iter()
+                .any(|c| c.name == "/update")
+        );
+        app.command_input = "/update".into();
+        assert_eq!(app.submit_command(), super::Update::Render);
+        assert!(app.app_update_pending);
+        for (error, expected) in [
+            (None, "Update available /update"),
+            (Some("offline".into()), "Update check failed /update"),
+        ] {
+            app.app_update = Some(scala_update::State {
+                checked: 0,
+                latest: Some("999.0.0".into()),
+                error,
+            });
+            app.notice = Some("Unrelated inference notice".into());
+            for width in [46, 84, 120] {
+                let backend = ratatui::backend::TestBackend::new(width, 25);
+                let mut terminal = ratatui::Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|frame| {
+                        crate::ui::render(frame, &mut app);
+                    })
+                    .unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(text.contains(expected), "{text}");
+            }
+        }
     }
 
     #[test]

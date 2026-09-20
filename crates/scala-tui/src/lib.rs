@@ -111,6 +111,11 @@ pub async fn run(
         );
     }
     let mut terminal = TerminalSession::enter()?;
+    // JoinSet aborts network work on every exit/error path. No updater writes to
+    // the terminal, and checks do not share inference/control task queues.
+    let mut app_checks = tokio::task::JoinSet::new();
+    let cache = core.paths.cache_dir.clone();
+    app_checks.spawn(async move { scala_update::check(&cache, false).await });
     let mut core_events = core.subscribe();
     let snapshot = core.snapshot().await;
     let initial_auth_status = core.config.server.public_auth_status(0)?;
@@ -219,6 +224,18 @@ pub async fn run(
             terminal.draw(|frame| layout = ui::render(frame, &mut app))?;
         }
         let update = tokio::select! {
+            result = app_checks.join_next(), if !app_checks.is_empty() => {
+                let state = match result {
+                    Some(Ok(Ok(state))) => state,
+                    _ => scala_update::State {
+                        checked: 0, latest: None,
+                        error: Some("check failed; /update retries. Serving is unaffected".into()),
+                    },
+                };
+                app.notice = Some(state.message());
+                app.app_update = Some(state);
+                Update::Render
+            },
             event = terminal_events.next() => match event {
                 Some(Ok(Event::Key(key))) => app.handle_key(key, &layout),
                 Some(Ok(Event::Mouse(mouse))) => app.handle_mouse(mouse, &layout),
@@ -376,6 +393,11 @@ pub async fn run(
         };
         if update == Update::Quit {
             break;
+        }
+        if app.app_update_pending && app_checks.is_empty() {
+            app.app_update_pending = false;
+            let cache = core.paths.cache_dir.clone();
+            app_checks.spawn(async move { scala_update::check(&cache, true).await });
         }
         if !app.benchmarks.busy {
             if let Some(request) = app.benchmarks.pending.take() {

@@ -53,6 +53,64 @@ URLs require an explicitly approved public release. See
 [installation and release maintenance](docs/releases.md) for private downloads,
 installation/update commands, platform limits and publication gates.
 
+## Install and update Scala
+
+**PRIVATE / UNPUBLISHED:** these anonymous URLs are not live consumer downloads.
+They become usable only after an approved public release. The existing cargo-dist
+shell and PowerShell installers are authoritative; no separate install service exists.
+
+Latest stable, Linux/macOS:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/ver2-sh/Scala/releases/latest/download/scala-installer.sh | sh
+```
+
+Latest stable, Windows PowerShell:
+
+```powershell
+irm https://github.com/ver2-sh/Scala/releases/latest/download/scala-installer.ps1 | iex
+```
+
+To inspect first, download the script and read it before executing it. On Windows,
+this alternative applies execution policy only to the child PowerShell process:
+
+```powershell
+Invoke-WebRequest -Uri 'https://github.com/ver2-sh/Scala/releases/latest/download/scala-installer.ps1' -OutFile 'scala-installer.ps1'
+Get-Content .\scala-installer.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scala-installer.ps1
+```
+
+Organizational Group Policy still wins. For pinned versions and the Linux/macOS
+inspect-first flow, see [release installation](docs/releases.md#install-and-update).
+The shell installer verifies embedded SHA-256 archive checksums; cargo-dist 0.33.0's
+PowerShell installer **does not verify archive hashes**. Windows users requiring
+hash verification must verify an archive manually. Signing and native platform
+validation remain [release gates](docs/releases.md#trust-and-platform-gates).
+
+```sh
+scala update --check       # fresh stable-version discovery
+scala update               # report versions, then explicitly confirm replacement
+scala update --yes         # explicit unattended approval
+scala --json update --check
+scala --json update --yes
+```
+
+Interactive TUI startup checks in the background at most daily, caching errors too.
+The footer shows availability or failure; `/update` requests a fresh check. Serving
+continues if the channel is unavailable. Headless serve/status/doctor do not check,
+and no telemetry or private GitHub tokens are sent. Checks never install updates.
+Explicit checks bypass cached results; inaccessible channels fail, without stale success.
+JSON/noninteractive replacement requires `--yes`; `--check --yes` is invalid.
+
+Replacement requires a matching cargo-dist receipt and executable ownership, and
+only installs a strictly newer stable version. Stop existing serving/TUI instances
+first, then use the original invocation or service startup method afterward. Scala
+has no native user-service manager and never stops/restarts services for updates.
+Package-manager, source and manual copies must use their owning installation method.
+Models, inference runtimes, settings, credentials, state and evidence are preserved.
+Application updates are separate from `scala runtimes update` and the source-checkout
+helper `./scala-service.sh update`.
+
 ## Models, Settings, Model Profiles, and Runtimes
 
 - Models is artifact inventory: format, path, size, technical capability, and provenance.
