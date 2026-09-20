@@ -20,7 +20,7 @@ ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 
 ## Scala releases
 
-**Scala** is the application, command (`scala`), and repository (`Yuuyuuei/Scala`).
+**Scala** is the application, command (`scala`), and repository (`ver2-sh/Scala`).
 Its workspace crates use `scala-*` names, the systemd unit is `scala.service`, and
 machine-to-machine serving uses **Scala Link** (`scala.link.v1`). Release archives
 and installers are named `scala-*`.
