@@ -11,6 +11,10 @@ The first packaged Scala release channel. The application and command are
 - Managed model discovery/download/import and optional Wayfinder-backed Scala Link.
 - Server-only archives for Linux x64/ARM64, macOS Intel/Apple Silicon and Windows
   x64, shell/PowerShell installers, and published SHA-256 checksums.
+- Native `scala update --check` and explicitly approved `scala update` / `--yes`,
+  with cargo-dist receipt ownership and active-session replacement protection.
+- Daily nonblocking TUI update checks and a `/update` command, with cached failures
+  and machine-readable CLI output. Application updates preserve model/runtime data.
 
 Models, inference runtimes, GPU drivers and credentials are not included. A server
 binary does not promise every inference runtime supports the same platform.

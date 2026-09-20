@@ -36,6 +36,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Check or explicitly install a stable Scala application release
+    Update(UpdateArgs),
     /// Configure Scala Link and inspect discovered peers
     Link {
         #[command(subcommand)]
@@ -80,6 +82,16 @@ pub enum Command {
     Config(ConfigArgs),
     /// Run offline, read-only whole-system diagnostics
     Doctor(DoctorArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// Fresh stable-version discovery only; never replace the binary
+    #[arg(long, conflicts_with = "yes")]
+    pub check: bool,
+    /// Explicitly approve replacement without an interactive prompt
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -420,4 +432,29 @@ pub enum LinkCommand {
     Enable,
     /// Disable Link on next server start
     Disable,
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    #[test]
+    fn update_flags_and_global_json() {
+        for argv in [
+            vec!["scala", "--json", "update", "--check"],
+            vec!["scala", "update", "--yes", "--json"],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert!(cli.json);
+            assert!(matches!(cli.command, Some(Command::Update(_))));
+        }
+        assert!(Cli::try_parse_from(["scala", "update", "--check", "--yes"]).is_err());
+        let cli = Cli::try_parse_from(["scala", "update"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update(UpdateArgs {
+                check: false,
+                yes: false
+            }))
+        ));
+    }
 }

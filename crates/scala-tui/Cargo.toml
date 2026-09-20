@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+scala-update = { path = "../scala-update" }
 serde_json.workspace = true
 color-eyre.workspace = true
 crossterm.workspace = true

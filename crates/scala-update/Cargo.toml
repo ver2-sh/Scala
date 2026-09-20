@@ -1,0 +1,20 @@
+[package]
+name = "scala-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+axoupdater = "=0.10.2"
+semver = "1"
+update-http = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls"] }
+color-eyre.workspace = true
+directories.workspace = true
+fs2.workspace = true
+scala-core = { path = "../scala-core" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true

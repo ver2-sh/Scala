@@ -3,6 +3,7 @@ use crate::app::Screen;
 #[derive(Debug, Clone, Copy)]
 pub enum CommandAction {
     Navigate(Screen),
+    CheckUpdate,
     LoadSelected,
     Unload,
     ShowHelp,
@@ -17,6 +18,11 @@ pub struct SlashCommand {
 }
 
 pub const COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "/update",
+        description: "Check Scala application updates (install after exiting with scala update)",
+        action: CommandAction::CheckUpdate,
+    },
     SlashCommand {
         name: "/link",
         description: "Set up Scala Link and inspect peer connectivity",

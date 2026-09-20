@@ -10,6 +10,14 @@ use crate::{AppPaths, RuntimeDescriptor};
 #[derive(Debug)]
 pub struct StorageLease(#[allow(dead_code)] File);
 
+impl Drop for StorageLease {
+    fn drop(&mut self) {
+        // Release ownership even if an unrelated concurrent fork briefly holds
+        // a duplicate descriptor before exec closes it.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 impl StorageLease {
     /// Sessions hold a shared lease for their entire lifetime. Prune takes an
     /// exclusive lease, including during planning. Never unlink this lock inode.
@@ -187,6 +195,7 @@ impl PrunePlan {
                     let child = child?;
                     if child.file_name() != "model-downloads"
                         && child.file_name() != "runtime-packs"
+                        && child.file_name() != "app-update.lock"
                     {
                         self.add(&paths.cache_dir, &child.path(), "application caches")?;
                     }

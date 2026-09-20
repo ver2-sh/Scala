@@ -9,7 +9,7 @@ shared host preparation. Neither acquires a Scala-specific artifact contract.
 
 ## Channel status
 
-The repository is private. There is no anonymously accessible release channel yet.
+**PRIVATE / UNPUBLISHED:** the repository is private. There is no anonymously accessible release channel yet; the installer URLs below are not live consumer URLs.
 A draft is not a published release; its presence does not make installer URLs work.
 Do not make the repository public or publish tags as a validation technique.
 The existing repository policy permits local checks, not hosted validation runs.
@@ -44,7 +44,19 @@ separate from release-binary installation.
 ## Install and update
 
 These anonymous URLs become usable only after an approved public release exists.
-For a reproducible installation, use the versioned URLs instead of `latest`.
+The generated cargo-dist installers remain authoritative. Latest stable one-liners:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://github.com/ver2-sh/Scala/releases/latest/download/scala-installer.sh | sh
+```
+
+```powershell
+irm https://github.com/ver2-sh/Scala/releases/latest/download/scala-installer.ps1 | iex
+```
+
+For an inspect-first, reproducible installation, use the versioned URLs below
+instead of `latest`. `v0.1.0` is the planned version, not a claim of publication;
+replace it only with an intentionally published version.
 
 Linux/macOS:
 
@@ -77,12 +89,71 @@ scala tui
 The PowerShell policy is process-scoped; organizational Group Policy still wins.
 Do not disable Gatekeeper, SmartScreen or managed execution policy.
 
-To update a direct installation, stop its serving/TUI processes and rerun the
-installer from the intended newer release. Then restart the same invocation or
-service. This replaces the binary, not models, runtimes or configuration. There is
-no native `scala update` command in the release binary. The repository's
-`scala-service.sh update` is exclusively a source-checkout rebuild helper;
-it must not be installed over the release executable as a command wrapper.
+Application updates:
+
+```sh
+scala update --check
+scala update
+scala update --yes
+scala --json update --check
+scala --json update --yes
+```
+
+`--check` always attempts fresh stable discovery. `update` reports the current and
+latest stable versions and requires typing `yes` before replacement. `--yes` is
+explicit unattended approval; JSON and noninteractive execution never prompt.
+`--check --yes` is rejected. An inaccessible/private/unpublished channel returns a
+failure, never stale cached success. Only a strictly newer stable version is installed.
+
+The shared `scala-update` crate uses axoupdater **0.10.2**, semver and the same
+reqwest 0.13 rustls alias as Wayfinder. Discovery is fixed to `ver2-sh/Scala`, app
+`scala`, independently of Link, gateway or application configuration. Environment
+source/receipt overrides are rejected; no private token is requested or supplied.
+The updater dispatches before application configuration, discovery and inference.
+
+A matching cargo-dist receipt (publisher, app, installed version, binary, prefix
+and the configured cargo-home layout) plus axoupdater's executable ownership check
+are required. Missing/mismatched
+receipts, source/manual copies and package-manager installations must use their
+original installation method. No package-manager channel is provisioned here.
+The exact release discovered before approval is retained for installation through
+its generated installer; Scala adds no download protocol or updater daemon.
+
+Stop existing Scala serving/TUI and control instances before replacement, then
+restart using the original invocation/service method afterward. Unlike Wayfinder,
+Scala has no native user-service manager: the updater never stops services, kills
+processes, interrupts inference or automatically restarts anything. Cross-process
+locks serialize replacement against the executable, receipt, install prefix,
+application storage and server startup/ownership checks. Application sessions hold
+a shared executable lock before loading configuration (also locking the executable
+file to cover hard-link aliases and other OS accounts); its per-user anchor ignores
+XDG state overrides so different application directories cannot bypass it. These
+small persistent locks live in the default Scala state namespace (`~/.local/state/scala/update-locks`
+on Linux, `~/Library/Application Support/Scala/update-locks` on macOS,
+`~/AppData/Local/Scala/update-locks` on Windows). Do not delete lock files while Scala runs.
+Older processes are also guarded through existing storage leases and recorded
+server PIDs for the selected state directory. Stop any older copies using other
+state directories before updating; they predate the executable lock protocol.
+
+The interactive TUI checks asynchronously on startup, at most daily, including
+cached errors. Cache writes are atomic, networking has a 15-second check timeout,
+concurrent checks are deduplicated, and future timestamps expire after clock rollback.
+The footer retains an update/error indicator; `/update` performs a fresh check and
+shows versions/details. Exiting the UI cancels background checks. Headless
+serve/status/doctor never automatically check. No telemetry is introduced.
+
+Windows replacement uses upstream process-scoped PowerShell `-ExecutionPolicy Bypass`
+and rename/restore support. It does not change persistent execution policy;
+MachinePolicy/UserPolicy remain authoritative. Policy failures are reported,
+with upstream restoring the previous executable on installer failure. The updater
+captures installer output so JSON remains machine readable. Discovery and HTTP
+requests time out; replacement itself is not cancelled mid-rename/restore.
+Native failure/recovery validation remains a release gate.
+
+Models, runtimes, settings, credentials, operational state and benchmark evidence
+are not updated or deleted. Application updates are separate from inference
+runtime updates. `scala-service.sh update` remains exclusively a source-checkout
+rebuild helper; it must not wrap or overwrite a release installation.
 
 While the repository is private, maintainers can retrieve release assets with
 GitHub CLI instead. For example, for Linux x64:
@@ -172,3 +243,11 @@ in this release setup; native validation and signing readiness remain explicit
 public-readiness gates. Use upstream signing support when credentials are supplied,
 not custom bypasses. Repository visibility and licensing also require owner review
 before exposing this currently private source and its history.
+
+Before public release, validate native Linux/macOS/Windows direct install → newer
+stable update, concurrent serving/startup refusal, spaced paths, receipt mismatch,
+JSON output, and Windows normal/managed PowerShell policy plus rename restoration.
+Verify unchanged user data and restart through the original startup method. These
+require real published artifacts and native hosts; synthetic tests and a five-target
+plan do not establish them. No release/tag, public visibility change or hosted
+validation is authorized by local implementation work.

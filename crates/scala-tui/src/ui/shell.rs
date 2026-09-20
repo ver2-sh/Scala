@@ -172,6 +172,17 @@ pub fn render_command_bar(
 }
 
 pub fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme, glyphs: &Glyphs) {
+    // Persistent status survives notices from inference and other operations.
+    // /update exposes full version/error text in the command bar.
+    let badge = app
+        .app_update
+        .as_ref()
+        .map_or("Checking Scala updates", |state| state.badge());
+    let badge_width = (badge.len() as u16).min(area.width);
+    let regions =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(badge_width)]).split(area);
+    frame.render_widget(Paragraph::new(badge).style(theme.muted), regions[1]);
+    let area = regions[0];
     let hints = if app.overlay == Some(crate::app::Overlay::ProfileEngine) {
         vec![
             hint("Enter", "create", theme),
