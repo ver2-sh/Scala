@@ -1,6 +1,6 @@
 # Scala release maintenance
 
-Scala (`Yuuyuuei/Scala`) owns the `scala` executable, `scala-*` workspace crates,
+Scala (`ver2-sh/Scala`) owns the `scala` executable, `scala-*` workspace crates,
 `scala.service`, platform-native Scala storage, and Scala Link (`scala.link.v1`).
 Its standard host checkout is `/srv/norted/repos/Scala`. The distribution contains
 only the application; models, inference runtimes and GPU drivers are separate.
@@ -50,7 +50,7 @@ Linux/macOS:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fLsS \
-  https://github.com/Yuuyuuei/Scala/releases/download/v0.1.0/scala-installer.sh \
+  https://github.com/ver2-sh/Scala/releases/download/v0.1.0/scala-installer.sh \
   -o scala-installer.sh
 # Inspect the downloaded script, then:
 sh scala-installer.sh
@@ -65,7 +65,7 @@ scala serve
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest -Uri 'https://github.com/Yuuyuuei/Scala/releases/download/v0.1.0/scala-installer.ps1' -OutFile 'scala-installer.ps1'
+Invoke-WebRequest -Uri 'https://github.com/ver2-sh/Scala/releases/download/v0.1.0/scala-installer.ps1' -OutFile 'scala-installer.ps1'
 # Inspect the downloaded script, then:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scala-installer.ps1
 # Open a fresh shell if the installer changed PATH.
@@ -88,7 +88,7 @@ While the repository is private, maintainers can retrieve release assets with
 GitHub CLI instead. For example, for Linux x64:
 
 ```sh
-gh release download v0.1.0 -R Yuuyuuei/Scala \
+gh release download v0.1.0 -R ver2-sh/Scala \
   -p scala-x86_64-unknown-linux-musl.tar.xz \
   -p scala-x86_64-unknown-linux-musl.tar.xz.sha256
 sha256sum -c scala-x86_64-unknown-linux-musl.tar.xz.sha256
