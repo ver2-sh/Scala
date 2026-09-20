@@ -1,4 +1,4 @@
-# Norted Server
+# Norted Server — Scala
 
 Norted Server is a terminal-first local inference control plane. It discovers local model artifacts, manages separately versioned inference runtimes, owns backend processes, and exposes an authenticated OpenAI-compatible text gateway. Responses is the primary API; Chat Completions is a compatibility surface.
 
@@ -17,6 +17,23 @@ and an NInfer container is not the NInfer executable itself. Model Profile creat
 engine compatibility, and exact runtime resolution remains separate from the profile. Today Norted
 ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 [q27](https://github.com/signalnine/q27), and [NInfer](https://github.com/Neroued/ninfer).
+
+## Scala releases
+
+**Scala** names the packaged Norted Server release. The command remains
+`norted-server`; internal crate names, configuration paths, model provenance and
+Wayfinder Link identity are unchanged.
+
+The release pipeline targets Linux x64/ARM64, macOS Intel/Apple Silicon and
+Windows x64, with server-only archives, shell/PowerShell installers and SHA-256
+checksums. Models, GPU drivers and independently versioned inference runtimes are
+installed separately. A packaged server does not imply every runtime supports
+every platform.
+
+The repository is private and the channel is being prepared. Anonymous installer
+URLs require an explicitly approved public release. See
+[installation and release maintenance](docs/releases.md) for private downloads,
+installation/update commands, platform limits and publication gates.
 
 ## Models, Settings, Model Profiles, and Runtimes
 

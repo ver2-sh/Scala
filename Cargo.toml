@@ -16,6 +16,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+repository = "https://github.com/Yuuyuuei/Norted-Server"
 
 [workspace.dependencies]
 async-trait = "0.1.92"
@@ -60,3 +61,7 @@ strip = "symbols"
 # workflows, but SHA-256 itself must not run at opt-level 0.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# cargo-dist packages this profile; inherit the normal production optimizations.
+[profile.dist]
+inherits = "release"
