@@ -1631,193 +1631,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "norted-api"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64",
- "bytes",
- "futures-util",
- "norted-core",
- "norted-engine",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tower",
- "tracing",
- "uuid",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "norted-core"
-version = "0.1.0"
-dependencies = [
- "directories",
- "fs2",
- "getrandom 0.3.4",
- "libc",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "toml",
- "tracing",
- "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "norted-engine"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "flate2",
- "fs2",
- "futures-util",
- "libc",
- "norted-core",
- "regex",
- "reqwest",
- "rhai",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "uuid",
- "walkdir",
- "zip",
-]
-
-[[package]]
-name = "norted-engine-llama-cpp"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures-util",
- "jsonschema",
- "norted-core",
- "norted-engine",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "norted-engine-ninfer"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures-util",
- "norted-core",
- "norted-engine",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "walkdir",
-]
-
-[[package]]
-name = "norted-engine-q27"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "futures-util",
- "minijinja",
- "minijinja-contrib",
- "norted-core",
- "norted-engine",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "norted-model-library"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "fs2",
- "futures-util",
- "norted-core",
- "norted-engine-q27",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "norted-server"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "clap",
- "color-eyre",
- "fs2",
- "libc",
- "norted-api",
- "norted-core",
- "norted-engine",
- "norted-engine-llama-cpp",
- "norted-engine-ninfer",
- "norted-engine-q27",
- "norted-model-library",
- "norted-tui",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "norted-tui"
-version = "0.1.0"
-dependencies = [
- "color-eyre",
- "crossterm",
- "futures-util",
- "norted-core",
- "norted-engine",
- "norted-model-library",
- "ratatui",
- "serde_json",
- "tokio",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2651,6 +2464,193 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scala"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "color-eyre",
+ "fs2",
+ "libc",
+ "scala-api",
+ "scala-core",
+ "scala-engine",
+ "scala-engine-llama-cpp",
+ "scala-engine-ninfer",
+ "scala-engine-q27",
+ "scala-model-library",
+ "scala-tui",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "scala-api"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "futures-util",
+ "scala-core",
+ "scala-engine",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "scala-core"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "fs2",
+ "getrandom 0.3.4",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "scala-engine"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "flate2",
+ "fs2",
+ "futures-util",
+ "libc",
+ "regex",
+ "reqwest",
+ "rhai",
+ "scala-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "uuid",
+ "walkdir",
+ "zip",
+]
+
+[[package]]
+name = "scala-engine-llama-cpp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "jsonschema",
+ "reqwest",
+ "scala-core",
+ "scala-engine",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "scala-engine-ninfer"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "reqwest",
+ "scala-core",
+ "scala-engine",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "walkdir",
+]
+
+[[package]]
+name = "scala-engine-q27"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-util",
+ "minijinja",
+ "minijinja-contrib",
+ "reqwest",
+ "scala-core",
+ "scala-engine",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "scala-model-library"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fs2",
+ "futures-util",
+ "reqwest",
+ "scala-core",
+ "scala-engine-q27",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "scala-tui"
+version = "0.1.0"
+dependencies = [
+ "color-eyre",
+ "crossterm",
+ "futures-util",
+ "ratatui",
+ "scala-core",
+ "scala-engine",
+ "scala-model-library",
+ "serde_json",
+ "tokio",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

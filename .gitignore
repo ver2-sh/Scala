@@ -23,7 +23,7 @@ llama-server.exe
 *.tar.zst
 
 # Repository-local runtime state and configuration
-/.norted/
+/.scala/
 /.runtime/
 /runtime/
 /state/

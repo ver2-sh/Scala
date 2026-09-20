@@ -24,7 +24,7 @@ shapes, numeric formats, layouts, encoded sizes and alignment, after generic obj
 framing/range checks. Missing, partial, conflicting or malformed suffixes cannot
 advertise or accept DFlash2. The native runtime remains the final artifact-validation
 authority. A complete base artifact without a draft remains a legitimate format.
-Norted, Swift, OrcaRouter, official and third-party origins follow identical rules.
+Scala, Swift, OrcaRouter, official and third-party origins follow identical rules.
 A native ID is a dispatch/format identity, not a public alias, source lineage or
 proof of draft presence.
 

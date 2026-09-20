@@ -1,5 +1,6 @@
 # Inventory and operational-screen review
 
+These captures are historical validation evidence and retain their original output; they are not current Scala branding.
 Implemented on `fix/runtime-settings-inheritance`, starting from `2b8698ed276bca8ac7d6da4afee9ba89925bbdbc` with a clean checkout. Changes are confined to the TUI and directly related documentation. No serving adapter, persistence resolver, artifact, manifest, binary or lineage was changed.
 
 Models, Discover, installed runtimes and runtime dialogs now use shared column geometry and compact rows. Selected-item readers retain full identity, provenance and diagnostics. Installed filtering is local; Discover format filtering no longer initiates an upstream search. Downloads have a bounded summary and a focused, navigable job view. Overview retains request activity and load progress; Server associates operational fields per backend. Logs explicitly distinguish follow mode from paused history and expose complete multiline messages. Help uses aligned sections and documents the implemented keys.
@@ -42,4 +43,4 @@ cargo test --workspace --offline
 git diff --check
 ```
 
-Existing tests: **214 passed, 0 failed, 1 ignored**. The ignored test is the existing manual local-file hash-throughput benchmark. The temporary render command was `cargo run -p norted-tui --example visual_review --offline`; it completed successfully before the driver was removed.
+Existing tests: **214 passed, 0 failed, 1 ignored**. The ignored test is the existing manual local-file hash-throughput benchmark. The temporary render command was `cargo run -p scala-tui --example visual_review --offline`; it completed successfully before the driver was removed.

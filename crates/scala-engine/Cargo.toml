@@ -1,0 +1,32 @@
+[package]
+name = "scala-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+fs2.workspace = true
+scala-core = { path = "../scala-core" }
+regex = "1"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+zip.workspace = true
+rhai = { version = "=1.26.0", features = ["sync", "serde", "no_module", "no_time", "no_float", "no_closure", "no_custom_syntax", "only_i64"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,4 +1,8 @@
-# Agent instructions
+# Scala agent instructions
+
+Use Scala for the application, CLI, service, crates, API headers, storage and Link.
+Norted denotes only the independent model builder and its authoritative artifact
+formats/lineage. Never rename builder schemas or historical evidence as branding.
 
 ## Settings and defaults policy
 
@@ -11,12 +15,12 @@
 - Server operational settings are separate from inference settings and provenance.
 - Configuration editors show next-load configuration. Running observations are separate facts; preserve requested and observed values structurally without changing their winning source.
 - Runtime observations and derived execution facts never enter persisted override maps.
-- `SettingDefaultSource::Norted` is reserved for execution behavior Norted intentionally owns, never for satisfying presentation requirements.
+- `SettingDefaultSource::Scala` is reserved for execution behavior Scala intentionally owns, never for satisfying presentation requirements.
 
 
 ## NInfer integration boundary
 
-Scala (Norted Server) owns native runtime qualification, bounded artifact capabilities,
+Scala owns native runtime qualification, bounded artifact capabilities,
 settings precedence, launch/request behavior and startup observations. Norted owns
 model/master lineage, preparation and optional companion assembly/publication.
 Bare native artifacts and equivalent manifest-bound artifacts receive identical

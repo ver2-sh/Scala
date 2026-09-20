@@ -1,4 +1,4 @@
-# Norted Quick Bench v4
+# Scala Quick Bench v4
 
 A manual, private benchmark of one Model Profile, using bundled original tasks,
 normal managed inference, deterministic oracles, and a hard **600-second maximum**
@@ -9,15 +9,15 @@ private and authenticated; no public OpenAI-compatible benchmark route is added.
 ## Run and inspect
 
 ```console
-norted-server benchmarks start PROFILE_ID
-norted-server benchmarks plan PROFILE_ID --json
-norted-server benchmarks status
-norted-server benchmarks cancel
-norted-server benchmarks history PROFILE_ID
-norted-server benchmarks result RUN_ID
-norted-server benchmarks result RUN_ID --verbose
-norted-server benchmarks result RUN_ID --json
-norted-server benchmarks compare BASELINE_RUN_ID SELECTED_RUN_ID
+scala benchmarks start PROFILE_ID
+scala benchmarks plan PROFILE_ID --json
+scala benchmarks status
+scala benchmarks cancel
+scala benchmarks history PROFILE_ID
+scala benchmarks result RUN_ID
+scala benchmarks result RUN_ID --verbose
+scala benchmarks result RUN_ID --json
+scala benchmarks compare BASELINE_RUN_ID SELECTED_RUN_ID
 ```
 
 Every run uses the full fixed pack. There is no mode selector, capability
@@ -38,7 +38,7 @@ retains the complete machine-readable response.
 
 ## Frozen methodology and budget
 
-Suite: **`norted-quick-bench/4`**. Methodology:
+Suite: **`scala-quick-bench/4`**. Methodology:
 **`json-fixture-executable-native-prefill/4`**. Performance summary method:
 **`independent-native-prefill/4`**.
 
@@ -90,7 +90,7 @@ fabricated zero or redistributed weight.
 
 ## Coding /100
 
-Coding is an **original Norted executable micro-code benchmark**, not HumanEval,
+Coding is an **original Scala executable micro-code benchmark**, not HumanEval,
 SWE-bench, LiveCodeBench, or a claim about full repository engineering. Six short
 Rhai tasks cover clamped prefix balances, duplicate-aware boundary repair,
 last-occurrence collection transformation, escaped string fields, explicit
@@ -104,7 +104,7 @@ credit or subjective grading. A missing/interrupted task or unfinished run canno
 publish Coding. Each task has a 7-second inference deadline and 768-token output
 cap, followed by at most one second of bounded local evaluation.
 
-Rubric: **`norted-rhai-all-hidden/1`**; evaluator: **Rhai 1.26.0**, pinned in Cargo.
+Rubric: **`scala-rhai-all-hidden/1`**; evaluator: **Rhai 1.26.0**, pinned in Cargo.
 The evaluator is private to the benchmark. It uses a raw in-process engine with
 an explicit arithmetic/logic/string/array/iterator/math package allowlist. It
 excludes Rhai's default core package (which includes blocking sleep). No host
@@ -132,7 +132,7 @@ never produces evaluable source records an unavailable compile outcome.
 
 ## Retrieval /100
 
-Pack **`norted-private-lease-repository/1`** contains four newly authored queries
+Pack **`scala-private-lease-repository/1`** contains four newly authored queries
 against one immutable virtual repository: ten files, 52 lines, including source,
 presentation/fixture decoys and retired documentation. Tasks `grep-lease-1` through
 `grep-lease-4` cover precise function localization, caller/callee control flow,
@@ -147,7 +147,7 @@ Repository SHA-256 (sorted compact JSON path-to-content map):
 `d72dd6d936277c9e70db0057349a0155f83597c622ff1809381f3ac9dc736ebd`.
 
 The system prompt, tool definitions, finalization instruction and final JSON
-Schema mirror Norted commit `3098fd5dd62e739c4368ae7a8f97b1353f28f91c`,
+Schema mirror Scala commit `3098fd5dd62e739c4368ae7a8f97b1353f28f91c`,
 `scripts/grep_protocol.py`; generation flow is cross-checked against
 `scripts/grep_generation.py`, model ownership against `scripts/grep_model.py`, and
 bounds against `config/grep.toml`. The protocol is:
@@ -206,7 +206,7 @@ pollution penalty is applied. Malformed finals, terminal protocol/generation err
 completion and timeouts give zero task credit. Recoverable tool error payloads
 are returned to the model and do not zero a later valid completion. Ordinary incomplete retrieval can
 receive objective partial credit. This is a Server benchmark rubric, not a claim
-that Norted qualification uses this headline formula. It was selected before any
+that Scala qualification uses this headline formula. It was selected before any
 Q6/Q6K observations.
 
 Raw evidence retains file and line P/R/F0.5, polluting/returned lines, exact
@@ -281,7 +281,7 @@ knowingly counted as newly processed tokens.
 
 Native llama.cpp Prefill requires proof for the **exact launched runtime**, not
 field-name presence or a reported nightly version. The adapter's small
-[`prefill.rs`](../crates/norted-engine-llama-cpp/src/prefill.rs) allowlist pins
+[`prefill.rs`](../crates/scala-engine-llama-cpp/src/prefill.rs) allowlist pins
 b10665 commit **`ca3d5a3e10d53f7ea672cb9b6178faca3e2807bc`** and tree
 `ba3e0b166abfd6f481e887e6b8d339bc220ceff9`. The complete immutable revision pins
 all semantic owners: `tools/server/server-common.cpp` maps `prompt_n`, `cache_n`
@@ -292,7 +292,7 @@ and `prompt_ms`; `server-common.h` defines the counters and duration;
 
 Currently qualifying identities are:
 
-- Managed-source builds from the canonical Norted source provider whose recorded
+- Managed-source builds from the canonical Scala source provider whose recorded
   commit/tree exactly match that revision and whose build and installed
   executable hashes agree.
 - Official b10665 catalog packages tied to that commit and pinned original GitHub
@@ -311,7 +311,7 @@ semantics are unverified for this runtime.” Inference remains available.
 
 No other revision inherits support automatically, even if its fields look the
 same; extending the allowlist requires another source review. Configured/external
-binaries do not qualify based on version strings. Norted reads co-located final
+binaries do not qualify based on version strings. Scala reads co-located final
 usage/timing, not progress snapshots, and computes `prompt_n * 1000 / prompt_ms`
 itself. Conflicting cache counters invalidate timing. Existing request options
 are retained; no runtime or Model Profile setting is changed for this metric.

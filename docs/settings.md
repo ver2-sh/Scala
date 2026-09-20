@@ -1,6 +1,6 @@
 # Settings and defaults policy
 
-Norted Server has two separate settings domains.
+Scala has two separate settings domains.
 
 Server Settings configure the application and control plane, such as download concurrency. They are
 server-wide, but they are not inference defaults and never participate in model settings provenance.
@@ -67,12 +67,12 @@ a successful configuration validation. Exact adapter validation still blocks uns
 invalid ranges, conflicting options and unproved model/template capabilities at load.
 
 llama.cpp runtime-default previews require evidence from the exact selected runtime, inspected model
-metadata, an exact immutable reviewed contract, or a Norted-owned value that Norted actually applies.
+metadata, an exact immutable reviewed contract, or a Scala-owned value that Scala actually applies.
 Common but unversioned upstream defaults are not treated as authoritative; when exact evidence cannot
 establish an omitted default, schema resolution reports that absence instead of inventing a value.
 Generic llama.cpp definitions therefore carry type/category/semantic information but no runtime scalar
 copied from an audited snapshot. Exact executable help supplies advertised defaults, inspected GGUF metadata
-supplies model-derived values, and genuinely Norted-owned omission policies remain explicit. Exact-help
+supplies model-derived values, and genuinely Scala-owned omission policies remain explicit. Exact-help
 availability gating is applied before a definition can enter the concrete runtime/model schema.
 
 Inference-affecting file inputs are bound again immediately before launch. LoRA adapters, control vectors,
@@ -88,13 +88,13 @@ device. Each entry is the complete observed `AcceleratorDevice` fact, including 
 name, VRAM, driver, and compute capability when available; order is part of provenance.
 
 `llama.cpp.devices` is an ordered list of exact NVIDIA `GPU-...` UUIDs. An explicit list must be nonempty,
-duplicate-free, currently visible, and compatible with the selected CUDA runtime. Norted preserves the list
+duplicate-free, currently visible, and compatible with the selected CUDA runtime. Scala preserves the list
 order in `CUDA_VISIBLE_DEVICES`, then translates it to llama.cpp's post-isolation local names
 `CUDA0,CUDA1,...`. Host numeric GPU indexes are never persisted or correlated. If the setting is omitted,
 the effective policy is the concrete `auto` policy: CUDA retains the existing automatic selection of one
 compatible GPU, while non-CUDA runtimes retain their ordinary automatic device behavior. `main_gpu` is validated as an index into this ordered set; tensor-split and fit-target lists
 are checked against the selected arity while preserving upstream zero/default, broadcast, and partial-list
-behavior. `split_mode=none` remains the upstream policy rather than a Norted single-device rewrite.
+behavior. `split_mode=none` remains the upstream policy rather than a Scala single-device rewrite.
 
 q27 and NInfer deliberately require bindings of exactly one device. A plural common representation does not
 grant either adapter multi-GPU behavior. Running status and launch provenance expose the complete binding,
@@ -103,7 +103,7 @@ so load/unload and residency state retain the physical devices associated with e
 Raw llama.cpp and q27 native arguments are disabled. Engine-owned ambient controls are fail-closed as well:
 llama.cpp dynamically removes inherited llama/MTMD/GGML/LLGuidance/AIP variables, and q27 removes every
 inherited `Q27_*` variable, before each adapter adds back only values produced by its typed settings and
-Norted-owned process contract. Unrelated process environment continues to be inherited.
+Scala-owned process contract. Unrelated process environment continues to be inherited.
 
 Each runtime/model schema contains only settings configurable for that exact combination. Reusable
 definition constructors do not create shared setting identity. A stale or

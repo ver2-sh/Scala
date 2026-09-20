@@ -6,7 +6,7 @@ export DIST
 python3 scripts/release-version.py "${1:-$(python3 scripts/release-version.py)}"
 cargo metadata --locked --format-version=1 --no-deps >/dev/null
 ./validate.sh
-cargo build --locked --profile dist -p norted-server
+cargo build --locked --profile dist -p scala
 python3 scripts/dist-workflow.py --check
 "$DIST" generate --check
 mkdir -p target
@@ -20,7 +20,7 @@ assert config['cargo-dist-version'] == '0.33.0'
 assert config['cache-builds'] is False
 assert config['merge-tasks'] is True
 plan = json.loads(Path('target/release-plan.json').read_text())
-assert [release['app_name'] for release in plan['releases']] == ['norted-server']
+assert [release['app_name'] for release in plan['releases']] == ['scala']
 rows = plan['ci']['github']['artifacts_matrix']['include']
 assert {target for row in rows for target in row['targets']} == set(config['targets'])
 assert sum(len(row['targets']) for row in rows) == 5
