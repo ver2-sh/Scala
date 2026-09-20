@@ -16,7 +16,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-repository = "https://github.com/Yuuyuuei/Norted-Server"
+repository = "https://github.com/Yuuyuuei/Scala"
 
 [workspace.dependencies]
 async-trait = "0.1.92"

@@ -20,9 +20,10 @@ ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 
 ## Scala releases
 
-**Scala** names the packaged Norted Server release. The command remains
-`norted-server`; internal crate names, configuration paths, model provenance and
-Wayfinder Link identity are unchanged.
+**Scala** is the repository and packaged release name for Norted Server:
+`Yuuyuuei/Scala`, checked out locally as `/srv/norted/repos/Scala` by the host
+setup utilities. The command remains `norted-server`; internal crate names,
+configuration paths, model provenance and Wayfinder Link identity are unchanged.
 
 The release pipeline targets Linux x64/ARM64, macOS Intel/Apple Silicon and
 Windows x64, with server-only archives, shell/PowerShell installers and SHA-256
