@@ -133,3 +133,49 @@ old behavior and was not counted as current validation.
   touched. No real two-instance JIT success, backend reuse, unload/JIT reload or
   JIT-disabled inference result is claimed for this correction. Those live checks
   remain outstanding, as does gaming-PC validation.
+
+## Sync Chain service transport repair — 2026-09-24
+
+The previously validated transport was removed upstream when Wayfinder replaced
+its peer network with Sync Chain + gateway sessions; current Wayfinder master had
+no local application endpoint, so Link reported `No such file or directory`.
+This change restores a generic local application/service contract over the
+current architecture and adds automatic multi-candidate endpoint discovery.
+
+### Changes under test
+
+- Scala now tries `wayfinder/app.sock` under `$XDG_RUNTIME_DIR`, then
+  `/run/user/<effective UID>`, then the provisioned machine endpoint
+  `/run/wayfinder`, verifying each candidate's trust before use. No socket
+  path is configured. A Wayfinder agent creates its endpoint automatically.
+- `open_service` gained an internal bounded deadline; connect errors classify
+  an absent daemon separately from endpoint trust violations.
+- Wayfinder provides the endpoints (Linux socket, Windows
+  `\\.\pipe\wayfinder-app-v1`), session-owned registrations, exact-device
+  service streams through the `/service` gateway relay, and an ephemeral
+  Noise NN channel authenticated by both device certificates. The relay
+  forwards ciphertext only.
+
+### Checks actually run
+
+- `cargo fmt`, workspace `cargo check`, `cargo clippy` and `cargo test` pass in
+  both Rust workspaces. Scala API: 24 tests passed, including endpoint-trust
+  and Link peer discovery tests.
+- Wayfinder unit and integration tests pass, including a Linux end-to-end test
+  running a real Rust gateway and two agents: registration, echo round trip
+  over the relay, unknown-service rejection, reconnect/re-registration and
+  session teardown cleanup.
+- `tests/sync_chain.py` (73 checks) passed against real daemon binaries,
+  including a new section: automatic endpoint appearance per runtime
+  directory, sanitized status, loopback/name/stealing registration rules,
+  exact-device open, relay echo, half-close EOF, credential-bound preface,
+  unregistered/same-device/cross-chain refusal and session teardown.
+- Wayfinder-Cloudflare `npm run check` equivalents passed: TypeScript check,
+  bundle build, and 6 Miniflare tests including `/service` relay pairing,
+  opaque record forwarding and clean rejection.
+- `cargo check --target x86_64-pc-windows-gnu -p wayfinder-agent` compiles the
+  named-pipe implementation. Native Windows runtime admission, ACL behavior
+  and Ubuntu ↔ Windows federation remain unvalidated: no Windows host was
+  available. This is the remaining Material gap.
+- No production deployment, service restart, release or hosted smoke test was
+  performed. No inference was run; all tests are synthetic.

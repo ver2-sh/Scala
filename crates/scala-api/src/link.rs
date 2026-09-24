@@ -96,7 +96,7 @@ struct Preface {
 pub(crate) struct Link {
     core: Arc<ApplicationCore>,
     runtime: Arc<RuntimeManager>,
-    dir: PathBuf,
+    endpoints: Vec<PathBuf>,
     credential: String,
     session: wayfinder::Session,
     hardware: RwLock<String>,
@@ -110,7 +110,7 @@ impl Link {
         runtime: Arc<RuntimeManager>,
     ) -> Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            dir: wayfinder::socket_path()?,
+            endpoints: wayfinder::socket_candidates(),
             core,
             runtime,
             credential: format!(
@@ -290,9 +290,12 @@ impl Link {
         Ok(())
     }
     async fn refresh(&self, address: std::net::SocketAddr) -> Result<()> {
-        let status: wayfinder::Status =
-            serde_json::from_value(self.session.call(&self.dir, json!({"op":"status"})).await?)
-                .map_err(|e| e.to_string())?;
+        let status: wayfinder::Status = serde_json::from_value(
+            self.session
+                .call(&self.endpoints, json!({"op":"status"}))
+                .await?,
+        )
+        .map_err(|e| e.to_string())?;
         let local = status
             .nodes
             .iter()
@@ -312,7 +315,7 @@ impl Link {
         if status.conflict {
             return Err("Wayfinder membership conflict; federation unavailable".into());
         }
-        self.session.call(&self.dir, json!({"op":"register_service", "service":LINK_SERVICE, "address":address, "credential":self.credential})).await?;
+        self.session.call(&self.endpoints, json!({"op":"register_service", "service":LINK_SERVICE, "address":address, "credential":self.credential})).await?;
         self.snapshot.write().await.error = None;
         let refresh = stream::iter(status.nodes.into_iter().filter(|n| !n.local).map(
             |node| async move {
@@ -375,7 +378,7 @@ impl Link {
             .ok_or("Wayfinder identity unavailable")?;
         let mut stream = tokio::time::timeout(
             Duration::from_secs(6),
-            wayfinder::open(&self.dir, target, LINK_SERVICE),
+            wayfinder::open(&self.endpoints, target, LINK_SERVICE),
         )
         .await
         .map_err(|_| "Peer unavailable before application dispatch")??;
@@ -996,7 +999,7 @@ mod tests {
         let link = Arc::new(Link {
             core: core.clone(),
             runtime: runtime.clone(),
-            dir: PathBuf::new(),
+            endpoints: Vec::new(),
             credential: String::new(),
             session: wayfinder::Session::default(),
             hardware: RwLock::new(String::new()),

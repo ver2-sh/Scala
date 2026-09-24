@@ -34,26 +34,41 @@ pub struct Status {
     pub conflict: bool,
 }
 
+/// Local application endpoint candidates in Wayfinder's own preference order:
+/// the login runtime directory (XDG or derived from the effective UID so a
+/// system service without the variable agrees), then the provisioned machine
+/// endpoint. Nothing here is user-configured.
 #[cfg(not(windows))]
-pub fn socket_path() -> Result<PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        // A normal login has XDG_RUNTIME_DIR even when Wayfinder is a system
-        // service. Only select a personal/development endpoint if provisioned.
-        .filter(|runtime| runtime.join("wayfinder").is_dir())
-        .unwrap_or_else(|| PathBuf::from("/run"));
-    if !runtime.is_absolute() {
-        return Err("Runtime directory must be absolute".into());
+pub fn socket_candidates() -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+        && runtime.is_absolute()
+    {
+        out.push(runtime.join("wayfinder/app.sock"));
     }
-    Ok(runtime.join("wayfinder/app.sock"))
+    if let Ok(uid) = std::fs::metadata("/proc/self").map(|m| m.uid()) {
+        let derived = PathBuf::from(format!("/run/user/{uid}/wayfinder/app.sock"));
+        if !out.contains(&derived) {
+            out.push(derived);
+        }
+    }
+    let machine = PathBuf::from("/run/wayfinder/app.sock");
+    if !out.contains(&machine) {
+        out.push(machine);
+    }
+    out
 }
 #[cfg(windows)]
-pub fn socket_path() -> Result<PathBuf> {
-    Ok(PathBuf::from(r"\\.\pipe\wayfinder-app-v1"))
+pub fn socket_candidates() -> Vec<PathBuf> {
+    vec![PathBuf::from(r"\\.\pipe\wayfinder-app-v1")]
 }
 #[cfg(windows)]
-async fn connect(path: &Path) -> Result<ApplicationStream> {
+async fn connect(paths: &[PathBuf]) -> Result<ApplicationStream> {
     use tokio::net::windows::named_pipe::ClientOptions;
+    let path = paths
+        .first()
+        .ok_or("Missing Wayfinder application endpoint")?;
     // Retry only pipe admission, never a dispatched application operation.
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -76,8 +91,10 @@ async fn connect(path: &Path) -> Result<ApplicationStream> {
     .await
     .map_err(|_| "Wayfinder application pipe busy".to_owned())?
 }
+/// Reject an endpoint whose ownership or permissions would let a third party
+/// replace or expose it. Returns the owning UID the peer must prove.
 #[cfg(target_os = "linux")]
-async fn connect(path: &Path) -> Result<ApplicationStream> {
+fn verify_endpoint(path: &Path, socket: &std::fs::Metadata) -> Result<u32> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     // The protected directory is the trust anchor, not the application's UID.
     // Authorized applications may connect but cannot replace the daemon socket.
@@ -85,7 +102,6 @@ async fn connect(path: &Path) -> Result<ApplicationStream> {
     let runtime = dir.parent().ok_or("Missing runtime parent")?;
     let parent = std::fs::symlink_metadata(runtime).map_err(|e| e.to_string())?;
     let directory = std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
-    let socket = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if !parent.is_dir()
         || (parent.uid() != 0 && parent.uid() != directory.uid())
         || parent.mode() & 0o022 != 0
@@ -97,16 +113,40 @@ async fn connect(path: &Path) -> Result<ApplicationStream> {
     {
         return Err("Untrusted Wayfinder application endpoint permissions".into());
     }
-    let stream = ApplicationStream::connect(path)
-        .await
-        .map_err(|_| "Wayfinder: not detected or local application access denied".to_owned())?;
-    if stream.peer_cred().map_err(|e| e.to_string())?.uid() != directory.uid() {
-        return Err("Wayfinder peer does not own the protected application directory".into());
+    Ok(directory.uid())
+}
+#[cfg(target_os = "linux")]
+async fn connect(paths: &[PathBuf]) -> Result<ApplicationStream> {
+    let mut failure: Option<String> = None;
+    for path in paths {
+        // An absent socket means the candidate was never bound; try the next.
+        let Ok(socket) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        // Trust violations are decisive: a planted endpoint must not fall
+        // through to a weaker candidate.
+        let owner = verify_endpoint(path, &socket)?;
+        let stream = match ApplicationStream::connect(path).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                // A trusted but dead socket is a stale endpoint; keep looking.
+                failure = Some(format!(
+                    "Wayfinder: local application socket unavailable: {error}"
+                ));
+                continue;
+            }
+        };
+        if stream.peer_cred().map_err(|e| e.to_string())?.uid() != owner {
+            return Err("Wayfinder peer does not own the protected application directory".into());
+        }
+        return Ok(stream);
     }
-    Ok(stream)
+    Err(failure.unwrap_or_else(|| {
+        "Wayfinder is not running or its local application endpoint is absent".into()
+    }))
 }
 #[cfg(not(any(target_os = "linux", windows)))]
-async fn connect(_path: &Path) -> Result<ApplicationStream> {
+async fn connect(_paths: &[PathBuf]) -> Result<ApplicationStream> {
     Err("Wayfinder local applications require Linux or Windows".into())
 }
 #[derive(Default)]
@@ -114,11 +154,11 @@ pub struct Session {
     stream: tokio::sync::Mutex<Option<ApplicationStream>>,
 }
 impl Session {
-    pub async fn call(&self, path: &Path, operation: Value) -> Result<Value> {
+    pub async fn call(&self, paths: &[PathBuf], operation: Value) -> Result<Value> {
         let mut session = self.stream.lock().await;
         let result = tokio::time::timeout(Duration::from_secs(4), async {
             if session.is_none() {
-                *session = Some(connect(path).await?);
+                *session = Some(connect(paths).await?);
             }
             let stream = session.as_mut().unwrap();
             write_json(stream, &operation, HEADER_LIMIT).await?;
@@ -142,22 +182,26 @@ impl Session {
         *self.stream.lock().await = None;
     }
 }
-pub async fn open(path: &Path, target: &str, service: &str) -> Result<ApplicationStream> {
-    let mut stream = connect(path).await?;
-    write_json(
-        &mut stream,
-        &json!({"op":"open_service", "target":target, "service":service}),
-        HEADER_LIMIT,
-    )
-    .await?;
-    let reply: Value = read_json(&mut stream, HEADER_LIMIT).await?;
-    if let Some(error) = reply["error"].as_str() {
-        return Err(error.into());
-    }
-    if reply != json!({"version":1,"ready":true}) {
-        return Err("Invalid Wayfinder service admission".into());
-    }
-    Ok(stream)
+pub async fn open(paths: &[PathBuf], target: &str, service: &str) -> Result<ApplicationStream> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut stream = connect(paths).await?;
+        write_json(
+            &mut stream,
+            &json!({"op":"open_service", "target":target, "service":service}),
+            HEADER_LIMIT,
+        )
+        .await?;
+        let reply: Value = read_json(&mut stream, HEADER_LIMIT).await?;
+        if let Some(error) = reply["error"].as_str() {
+            return Err(error.into());
+        }
+        if reply != json!({"version":1,"ready":true}) {
+            return Err("Invalid Wayfinder service admission".into());
+        }
+        Ok(stream)
+    })
+    .await
+    .unwrap_or_else(|_| Err("Wayfinder service open timed out".into()))
 }
 pub async fn read_json<T: DeserializeOwned>(
     stream: &mut (impl tokio::io::AsyncRead + Unpin),
@@ -219,23 +263,33 @@ mod tests {
         let path = directory.join("app.sock");
         let _listener = tokio::net::UnixListener::bind(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
-        assert!(connect(&path).await.is_ok());
+        assert!(connect(&[path.clone()]).await.is_ok());
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o2770)).unwrap();
         assert!(
-            connect(&path).await.is_err(),
+            connect(&[path.clone()]).await.is_err(),
             "applications could replace endpoint"
         );
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o2750)).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(connect(&path).await.is_err(), "world-authorized socket");
+        assert!(
+            connect(&[path.clone()]).await.is_err(),
+            "world-authorized socket"
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
         let alias = root.path().join("alias");
         symlink(&directory, &alias).unwrap();
         assert!(
-            connect(&alias.join("app.sock")).await.is_err(),
+            connect(&[alias.join("app.sock")]).await.is_err(),
             "symlink endpoint directory"
         );
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(connect(&path).await.is_err(), "unprotected runtime parent");
+        assert!(
+            connect(&[path.clone()]).await.is_err(),
+            "unprotected runtime parent"
+        );
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        // An absent first candidate falls through to a bound second candidate.
+        let missing = root.path().join("absent/app.sock");
+        assert!(connect(&[missing, path]).await.is_ok());
     }
 }

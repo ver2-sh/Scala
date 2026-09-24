@@ -31,10 +31,11 @@ benchmark summaries. These observations never configure the receiving host.
 
 ## Connect two machines
 
-1. Build the Wayfinder version containing peer services v1 on each machine and
-   link their distinct Wayfinder identities using its normal invitation workflow.
-   Both advertised peer endpoints must be reachable. Scala does not add IP
-   configuration, NAT traversal or a second network.
+1. Install Wayfinder on each machine and enroll both devices into the same
+   Sync Chain with its normal enrollment workflow, using the same self-hosted
+   or hosted gateway. The machines need no direct reachability: agents connect
+   outward to the gateway. Scala does not add IP configuration, NAT traversal
+   or a second network.
 2. Set only this Scala configuration (or run `scala link enable`):
 
    ```toml
@@ -90,8 +91,13 @@ semantics: equivalent artifacts pass through the same adapters and validation.
 
 ## Discovery and freshness
 
-On Linux, Scala connects to the generic `/run/wayfinder/app.sock` endpoint. Wayfinder and
-Scala may run under separate Linux service accounts. The service installers
+On Linux, Scala connects to the first provisioned `wayfinder/app.sock` under
+the login runtime directory — `$XDG_RUNTIME_DIR` when set, otherwise
+`/run/user/<effective UID>` — and finally the provisioned machine endpoint
+`/run/wayfinder/app.sock`. A running Wayfinder agent creates its endpoint
+automatically; no socket path, executable path, data directory or credential
+is configured in Scala. Wayfinder and Scala may run under separate Linux
+service accounts through the machine endpoint: the service installers
 provision the generic `wayfinder-apps` group; Scala's unit receives it through
 `SupplementaryGroups`. Install/update the Wayfinder service to provision its
 protected runtime directory, and install/update the Scala service to provision
@@ -102,10 +108,7 @@ is required. No service name is configured inside Wayfinder.
 For manual application accounts, an administrator grants generic local Wayfinder
 application access with `sudo usermod -aG wayfinder-apps APP_USER`, then starts a
 new login/session. The group must exist first. This is one-time OS provisioning,
-not a Link setting. Source-development instances can explicitly share
-`XDG_RUNTIME_DIR` with a provisioned `wayfinder` subdirectory; an ordinary
-login runtime directory alone does not override the machine endpoint. See Wayfinder's generic local application documentation for
-protected directory provisioning. Scala has no socket, group, UID or credential
+not a Link setting. Scala has no socket, group, UID or credential
 configuration field.
 
 Scala reads no Wayfinder private state or control descriptor. Linux socket
@@ -124,15 +127,17 @@ Same-account execution does not provide filesystem isolation between processes;
 the application protocol grants no private-state or administration authority.
 
 For native PowerShell launch, initialize Wayfinder with its normal unique name
-and reachable peer listen/advertise addresses, then run `wayfinder.exe daemon`.
-Use `wayfinder.exe tui` to join Ubuntu's normal invitation. In another terminal
-under the same account, run `scala.exe link enable` once, then
+and enroll it into the Sync Chain, then run `wayfinder.exe daemon`. In another
+terminal under the same account, run `scala.exe link enable` once, then
 `scala.exe serve` (or `scala.exe tui`). Inspect with
 `scala.exe link status`. No Windows service installer is required or
 provided by this change.
 
-Ubuntu and Windows use the same `scala.link.v1` protocol over Wayfinder's existing
-Noise/TCP network. Discovery, inventory, owned-profile load/unload and compatible
+Ubuntu and Windows use the same `scala.link.v1` protocol over Wayfinder's
+end-to-end encrypted Sync Chain service transport: each open runs an
+authenticated Noise channel between the two agents across the configured
+gateway relay, which sees only ciphertext. Discovery, inventory, owned-profile
+load/unload and compatible
 inference remain symmetric, with no model-file transfer or remote configuration
 editing. Windows can host GGUF through compatible llama.cpp runtimes, including
 the existing managed Windows x86_64 CUDA packages. Managed NInfer remains
@@ -207,7 +212,8 @@ source; unrelated local clients cannot accidentally share those leases.
 
 Wayfinder owns connectivity, peer authentication, membership and byte transport.
 Scala consumes only its generic local application contract, with no Rust dependency
-on Wayfinder internals. See Wayfinder's `docs/peer-services.md`.
+on Wayfinder internals. See Wayfinder's `docs/architecture.md` local application
+services section.
 
 After the authenticated Wayfinder service preface and ready reply, one Scala
 request is a four-byte big-endian byte length plus UTF-8 JSON:
@@ -271,16 +277,17 @@ the HTTP body. Reconnecting refreshes observations; it never resumes a generatio
 
 ## Native transport validation
 
-Linux formatting, workspace check, Clippy (including all features/targets), and
-existing tests pass: 215 tests passed, one existing test ignored. Fresh rebuilt
-Scala and Wayfinder processes registered Link with no integration error, kept
-Scala running through Wayfinder loss, and automatically re-registered after
-restart. The current client transport also read status successfully from the
-installed `/run/wayfinder/app.sock`; the installed Scala service reports Link
-enabled with no error. No production service restart or model loading was used.
+Linux formatting, workspace checks, Clippy and tests pass in both repositories,
+and Wayfinder's `tests/sync_chain.py` (73 checks) exercises the real daemon
+binaries: automatic endpoint creation under an isolated runtime directory,
+sanitized status, session-owned registration, exact-device `open_service`,
+end-to-end echo over the gateway relay, EOF propagation, unknown/self/
+cross-chain refusal and registration teardown. Wayfinder-Cloudflare's local
+Worker suite covers `/service` relay parity. See `scala-link-validation.md`
+for the dated record; no production service restart or model loading was used.
 
-Only a Linux Rust target is installed on this validation host. The Windows code
-is implemented, but Windows compilation and runtime checks have not run. Native
-Windows ACL admission/denial, restart behavior and bidirectional Ubuntu ↔ Windows
+Only a Linux Rust target is installed on this validation host; the Windows
+agent code cross-compiles for `x86_64-pc-windows-gnu`. Native Windows ACL
+admission/denial, restart behavior and bidirectional Ubuntu ↔ Windows
 inventory, profile control and inference still require acceptance on real Windows
 binaries. No cross-machine Windows success is claimed.
