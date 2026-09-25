@@ -114,12 +114,47 @@ JSON/noninteractive replacement requires `--yes`; `--check --yes` is invalid.
 
 Replacement requires a matching cargo-dist receipt and executable ownership, and
 only installs a strictly newer stable version. Stop existing serving/TUI instances
-first, then use the original invocation or service startup method afterward. Scala
-has no native user-service manager and never stops/restarts services for updates.
-Package-manager, source and manual copies must use their owning installation method.
+first, then use the original invocation or service startup method afterward. Updates
+never start, stop, or restart services; the opt-in login-startup registration below
+is the only user-service definition Scala manages, and an in-place update at the same
+executable path leaves that registration valid. Package-manager, source and manual
+copies must use their owning installation method.
 Models, inference runtimes, settings, credentials, state and evidence are preserved.
 Application updates are separate from `scala runtimes update` and the source-checkout
 helper `./scala-service.sh update`.
+
+### Start automatically on login
+
+Installers never enable background startup. To have `scala serve` launch when you
+log in, use the TUI: **Settings → Server → APPLICATION → Start automatically on
+login — Enabled/Disabled**. The row is a live read of the operating system's
+registration, not a saved preference: deleting or altering the registration
+outside Scala is reported truthfully on the next refresh, and moving the
+executable marks the registration as moved (re-enable to rebind it). Enabling or
+disabling only affects the next login and never starts, stops, or restarts the
+running server. Mechanisms are per-user and need no administrator rights:
+
+- **Windows:** Task Scheduler logon task `dev.scala.serve` — current user,
+  `AtLogOn` trigger, Interactive logon, Limited run level — launching the exact
+  current executable with `serve`, with restart-on-failure and no execution
+  time limit.
+- **Linux:** per-user systemd unit `dev.scala.serve.service` under
+  `~/.config/systemd/user`, enabled without `--now` so nothing launches at
+  enable time. It is independent of the privileged `scala.service`
+  unit managed by `./scala-service.sh` for source checkouts.
+- **macOS:** per-user LaunchAgent `~/Library/LaunchAgents/dev.scala.serve.plist`
+  running the exact executable with `serve` (`RunAtLoad`, keep-alive on
+  unsuccessful exit).
+
+The same capability is scriptable:
+
+```text
+scala startup status     # live OS registration state
+scala startup enable     # register `scala serve` for the next login only
+scala startup disable    # remove the registration only
+```
+
+All three honor `--json`; `enable`/`disable` never touch a running server.
 
 ## Models, Settings, Model Profiles, and Runtimes
 
@@ -519,6 +554,7 @@ scala
 ├── runtimes ...
 ├── model-profiles list|show|create|duplicate|delete|set-model|set-engine|set|unset|load|compatibility
 ├── settings show|set|unset
+├── startup status|enable|disable   # per-user OS login startup for `serve`
 ├── engines list       # low-level adapter diagnostics
 ├── config show
 └── doctor
@@ -632,7 +668,7 @@ cargo run -p scala -- tui
 
 At startup the TUI safely chooses one of two modes: it attaches to a healthy instance discovered through the existing runtime descriptor, public identity probe, and authenticated private control `status`, or it starts and owns the same serving composition used by headless `serve`. In owned mode the configured OpenAI-compatible endpoint is live while the TUI runs. Exiting shuts down the owned listeners and all managed backends and removes the owned descriptor; exiting an attached TUI leaves the external server running.
 
-Its top-level pages are Overview, Models, Model Profiles, Runtimes, Server, Logs, Settings, and Help. Models is an integrated Model Library: Installed preserves the local artifact/profile/runtime workflow, while Discover provides Hugging Face query editing, format filtering, repository-qualified artifact details, compact revision and size, known companion/package-manifest status, live download bytes, and explicit managed removal. Repository columns and full selected-artifact details distinguish identical filenames and retain their exact repository-qualified download reference. Remote rows remain format candidates; full details explain that compatibility is unverified, and the existing runtime picker continues to provide proven engine/runtime/host compatibility after acquisition. Model Profiles lists, creates, duplicates, deletes, rebinds, edits, validates, and loads user serving targets; it displays missing/incompatible state, active identity, and concrete effective values with source annotations. Settings shows Server, llama.cpp, q27, and NInfer scopes; there is no Global or Common inference page. The Server view and CLI status expose each backend's ordered physical GPU UUID binding. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Incompatible candidates are hidden by default and can be revealed with the keyboard- and mouse-accessible `Show incompatible` checkbox; Recommended, Compatible, and Needs Attention results remain visible. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Full installed-runtime details retain commit/tree, recipe, Make or CMake, and CUDA provenance.
+Its top-level pages are Overview, Models, Model Profiles, Runtimes, Server, Logs, Settings, and Help. Models is an integrated Model Library: Installed preserves the local artifact/profile/runtime workflow, while Discover provides Hugging Face query editing, format filtering, repository-qualified artifact details, compact revision and size, known companion/package-manifest status, live download bytes, and explicit managed removal. Repository columns and full selected-artifact details distinguish identical filenames and retain their exact repository-qualified download reference. Remote rows remain format candidates; full details explain that compatibility is unverified, and the existing runtime picker continues to provide proven engine/runtime/host compatibility after acquisition. Model Profiles lists, creates, duplicates, deletes, rebinds, edits, validates, and loads user serving targets; it displays missing/incompatible state, active identity, and concrete effective values with source annotations. Settings shows Server, llama.cpp, q27, and NInfer scopes; there is no Global or Common inference page. The Server scope's APPLICATION category carries **Start automatically on login**, a live OS-registration toggle described under [Install and update Scala](#start-automatically-on-login). The Server view and CLI status expose each backend's ordered physical GPU UUID binding. The Runtimes page shows exact format selections and installed packs, then opens an interactive available-runtime search with keyboard filtering, arrow or `j`/`k` movement, mouse hover/click, details, and install actions. Incompatible candidates are hidden by default and can be revealed with the keyboard- and mouse-accessible `Show incompatible` checkbox; Recommended, Compatible, and Needs Attention results remain visible. Result rows and details distinguish upstream binaries from source builds. Release downloads retain real byte progress. Source installs instead expose Checking prerequisites, Fetching source, Verifying source, Configuring, Building, Probing, Installed, or Failed without inventing byte totals. Full installed-runtime details retain commit/tree, recipe, Make or CMake, and CUDA provenance.
 
 Inventory rows use aligned columns; full paths, concrete runtime IDs, provenance and diagnostics are available with **D** (Shift+d) or **[ D Details ]**. Escape returns to the same view; arrows, Page Up/Down, Home/End and the mouse wheel scroll the details. Details capture the selected identity, so a background refresh cannot replace the item being read. This shortcut applies to Overview, Models, Runtimes, Server, Logs and Help, and to runtime dialog results. Model Profiles keeps its existing **D** duplicate action and Settings/Profile editors keep **i** details.
 

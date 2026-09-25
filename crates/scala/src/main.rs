@@ -3,6 +3,7 @@ mod composition;
 mod doctor;
 mod output;
 mod prune;
+mod startup;
 mod update;
 
 use std::io::Write;
@@ -80,6 +81,10 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         prune::run(&paths, args, cli.json).await?;
         return Ok(ExitCode::SUCCESS);
     }
+    if let Some(Command::Startup(args)) = &cli.command {
+        startup::run(&args.command, cli.json)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let _installation_guard = scala_update::session_guard()?;
     let core = ApplicationCore::load().await?;
     let _log_guard = init_logging(&paths);
@@ -87,6 +92,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command.unwrap_or(Command::Tui) {
         Command::Update(_) => unreachable!("update dispatches before application initialization"),
         Command::Prune(_) => unreachable!("prune dispatches before application initialization"),
+        Command::Startup(_) => unreachable!("startup dispatches before application initialization"),
         Command::Tui => {
             run_tui(core, cli.json).await?;
         }

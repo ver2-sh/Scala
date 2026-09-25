@@ -302,6 +302,9 @@ pub struct SettingsLoad {
     pub runtime_schemas: BTreeMap<String, SettingsSchema>,
     pub runtime_schema_warnings: Vec<String>,
     pub save_notice: Option<String>,
+    /// Live OS login-startup registration, read fresh on every load. `Err` is
+    /// the native query failure itself, surfaced in the Startup row.
+    pub startup: std::result::Result<scala_core::StartupStatus, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -419,6 +422,10 @@ pub struct App {
     pub runtime_picker_loading: bool,
     pub runtime_picker_error: Option<String>,
     pub settings_state: Option<SettingsState>,
+    /// Live OS login-startup registration state; `None` until the first read.
+    /// Never persisted in `settings.json` — the OS registration is the only
+    /// source of truth for the Settings → Startup row.
+    pub startup: Option<std::result::Result<scala_core::StartupStatus, String>>,
     pub model_profiles: Option<ModelProfilesState>,
     pub link: scala_engine::link::LinkSnapshot,
     pub link_config: scala_core::LinkConfig,
@@ -476,8 +483,12 @@ impl App {
         public_auth_status: PublicAuthStatus,
         no_color: bool,
         unicode: bool,
-        setting_definitions: Vec<SettingDefinition>,
+        mut setting_definitions: Vec<SettingDefinition>,
     ) -> Self {
+        // Append the login-startup row to the Server scope. It is a UI-level
+        // control over the OS registration only — it has no `server.*`
+        // namespace, so it can never be persisted into `server_settings`.
+        setting_definitions.push(scala_core::startup::setting_definition());
         let mut logs = vec![LogEntry {
             level: LogLevel::Info,
             message: "Control core initialized".into(),
@@ -563,6 +574,7 @@ impl App {
             runtime_picker_loading: false,
             runtime_picker_error: None,
             settings_state: None,
+            startup: None,
             model_profiles: None,
             link: Default::default(),
             link_config: Default::default(),
@@ -1450,6 +1462,7 @@ impl App {
             SettingsTaskResult::Loaded(result) => match result {
                 Ok(loaded) => {
                     self.settings_state = Some(loaded.state);
+                    self.startup = Some(loaded.startup);
                     self.model_profiles = Some(loaded.profiles);
                     self.runtime_settings_schemas = loaded.runtime_schemas;
                     self.settings_validation_error = (!loaded.runtime_schema_warnings.is_empty())
@@ -1476,6 +1489,7 @@ impl App {
             SettingsTaskResult::Stored(result) => match result {
                 Ok(loaded) => {
                     self.settings_state = Some(loaded.state);
+                    self.startup = Some(loaded.startup);
                     self.model_profiles = Some(loaded.profiles);
                     self.runtime_settings_schemas = loaded.runtime_schemas;
                     self.settings_validation_error = (!loaded.runtime_schema_warnings.is_empty())
@@ -1610,7 +1624,7 @@ impl App {
             .collect::<Vec<_>>();
         let query = self.settings_query.to_lowercase();
         definitions.retain(|definition| {
-            (!self.settings_overrides_only || self.current_layer_value(&definition.id).is_some())
+            (!self.settings_overrides_only || self.has_local_value(&definition.id))
                 && (query.is_empty()
                     || format!(
                         "{} {} {} {}",
@@ -1630,7 +1644,138 @@ impl App {
         definitions
     }
 
+    /// Whether the layer this screen would persist into holds a value for
+    /// `id`. The login-startup row never persists; it counts as "set" only
+    /// while the OS registration is enabled.
+    fn has_local_value(&self, id: &SettingId) -> bool {
+        if id.as_str() == scala_core::startup::SETTING_ID {
+            return matches!(&self.startup, Some(Ok(status)) if status.enabled());
+        }
+        self.current_layer_value(id).is_some()
+    }
+
+    /// Display for the login-startup row: a live read of the OS registration,
+    /// never a persisted settings value.
+    fn startup_value_display(&self) -> SettingValueDisplay {
+        match &self.startup {
+            Some(Ok(status)) => SettingValueDisplay {
+                value: if status.stale {
+                    format!("{} (moved)", status.label())
+                } else {
+                    status.label().to_owned()
+                },
+                source: format!("OS: {}", status.mechanism),
+                state: if status.enabled() {
+                    SettingPresentationState::Override
+                } else {
+                    SettingPresentationState::Default
+                },
+                can_clear: false,
+            },
+            Some(Err(error)) => SettingValueDisplay {
+                value: "Unknown".to_owned(),
+                source: format!("OS: {error}"),
+                state: SettingPresentationState::Default,
+                can_clear: false,
+            },
+            None => SettingValueDisplay {
+                value: "loading".to_owned(),
+                source: "OS: registration".to_owned(),
+                state: SettingPresentationState::Default,
+                can_clear: false,
+            },
+        }
+    }
+
+    /// Detail text for the login-startup row: describes the live OS
+    /// registration, its binding, and that toggling never touches the
+    /// currently running server.
+    fn startup_detail(&self) -> String {
+        let mut lines = Vec::new();
+        match &self.startup {
+            Some(Ok(status)) => {
+                lines.push(format!("Effective value: {}", status.label()));
+                lines.push(format!(
+                    "Source: {} (live OS registration)",
+                    status.mechanism
+                ));
+                lines.push(format!("Registration: {}", status.identity));
+                match &status.executable {
+                    Some(executable) => {
+                        lines.push(format!("Launches: {}", executable.display()));
+                    }
+                    None => lines.push("Launches: this executable + `serve`".to_owned()),
+                }
+                if status.stale {
+                    lines.push(
+                        "Registration binds a different executable than this binary; \
+                         re-enable to rebind it."
+                            .to_owned(),
+                    );
+                }
+            }
+            Some(Err(error)) => {
+                lines.push("Effective value: unknown".to_owned());
+                lines.push(format!("OS registration query failed: {error}"));
+            }
+            None => {
+                lines.push("Effective value: loading".to_owned());
+                lines.push("Reading the OS registration…".to_owned());
+            }
+        }
+        lines.push(
+            "Applies: immediately at the OS level; takes effect at your next login.".to_owned(),
+        );
+        lines.push(
+            "Changing this registers or removes the OS startup entry only — it never \
+             starts, stops, or restarts the running server."
+                .to_owned(),
+        );
+        lines.push(
+            "State is read live from the OS and is never stored in settings.json.".to_owned(),
+        );
+        lines.join("\n")
+    }
+
+    /// Opens the Enabled/Disabled editor for the login-startup row. The choice
+    /// applies immediately to the OS registration; it is not a persisted
+    /// setting and never touches the running server.
+    fn edit_startup_setting(&mut self, definition: SettingDefinition) -> Update {
+        let enabled = match &self.startup {
+            Some(Ok(status)) if status.state != scala_core::startup::StartupState::Unsupported => {
+                status.enabled()
+            }
+            Some(Ok(_)) => {
+                self.notice =
+                    Some("Login startup is not supported on this platform/session".to_owned());
+                return Update::Render;
+            }
+            Some(Err(error)) => {
+                self.notice = Some(format!("Cannot change login startup: {error}"));
+                return Update::Render;
+            }
+            None => {
+                self.notice =
+                    Some("Login startup state is still loading; retry shortly".to_owned());
+                return Update::Render;
+            }
+        };
+        let metadata = self.startup_detail();
+        let editor = crate::settings_editor::SettingsEditor::startup(definition, metadata, enabled);
+        self.settings_input_error = None;
+        self.settings_input = Some(SettingsInput {
+            kind: SettingsInputKind::SettingValue,
+            cursor: 0,
+            text: String::new(),
+            editor: Some(editor),
+        });
+        Update::Render
+    }
+
     pub fn settings_value_display(&self, id: &SettingId) -> SettingValueDisplay {
+        if id.as_str() == scala_core::startup::SETTING_ID {
+            return self.startup_value_display();
+        }
         let Some(state) = &self.settings_state else {
             return SettingValueDisplay {
                 value: "loading".to_owned(),
@@ -1788,6 +1933,9 @@ impl App {
     }
 
     pub fn settings_default_detail(&self, id: &SettingId) -> String {
+        if id.as_str() == scala_core::startup::SETTING_ID {
+            return self.startup_detail();
+        }
         let definition = self
             .settings_definitions()
             .into_iter()
@@ -3782,6 +3930,9 @@ impl App {
             ));
             return Update::Render;
         }
+        if definition.id.as_str() == scala_core::startup::SETTING_ID {
+            return self.edit_startup_setting(definition);
+        }
         let local = self.current_layer_value(&definition.id);
         let text = match local.as_ref() {
             Some(
@@ -3907,6 +4058,30 @@ impl App {
         let (Some(scope), Some(id)) = (scope, id) else {
             return Update::None;
         };
+        if id.as_str() == scala_core::startup::SETTING_ID {
+            return match &self.startup {
+                Some(Ok(status)) => match status.state {
+                    scala_core::startup::StartupState::Enabled => {
+                        self.queue_settings_action(SettingsAction::Unset { scope, id })
+                    }
+                    scala_core::startup::StartupState::Disabled => {
+                        self.notice = Some("Login startup is already disabled".to_owned());
+                        Update::Render
+                    }
+                    scala_core::startup::StartupState::Unsupported => {
+                        self.notice = Some(
+                            "Login startup is not supported on this platform/session".to_owned(),
+                        );
+                        Update::Render
+                    }
+                },
+                Some(Err(error)) => {
+                    self.notice = Some(format!("Cannot change login startup: {error}"));
+                    Update::Render
+                }
+                None => Update::None,
+            };
+        }
         if self.current_layer_value(&id).is_none() {
             self.notice = Some("This layer already inherits from its parent".to_owned());
             return Update::Render;
@@ -3915,6 +4090,14 @@ impl App {
     }
 
     fn current_layer_value(&self, id: &SettingId) -> Option<SettingValue> {
+        if id.as_str() == scala_core::startup::SETTING_ID {
+            // The row's "local" value mirrors the live registration so the
+            // editor preselects the current OS state; nothing is persisted.
+            return match &self.startup {
+                Some(Ok(status)) => Some(SettingValue::Toggle(status.enabled())),
+                _ => None,
+            };
+        }
         if self.screen == Screen::ModelProfiles {
             return self
                 .selected_model_profile_value()?
@@ -3945,9 +4128,18 @@ impl App {
         if self.screen == Screen::ModelProfiles && self.selected_remote_profile().is_some() {
             return Update::None;
         }
+        let is_startup = matches!(
+            &action,
+            SettingsAction::Set { id, .. } | SettingsAction::Unset { id, .. }
+                if id.as_str() == scala_core::startup::SETTING_ID
+        );
         self.pending_settings_action = Some(action);
         self.settings_busy = true;
-        self.notice = Some("Saving settings…".to_owned());
+        self.notice = Some(if is_startup {
+            "Updating OS login startup…".to_owned()
+        } else {
+            "Saving settings…".to_owned()
+        });
         Update::Render
     }
 
@@ -5778,7 +5970,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        App, Overlay, ProfileEngineSelection, Screen, SettingsAction, SettingsScope,
+        App, Overlay, ProfileEngineSelection, Screen, SettingsAction, SettingsLoad, SettingsScope,
         SettingsTaskResult,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -5786,7 +5978,7 @@ mod tests {
         AppSnapshot, ArtifactFormat, EffectivePublicAuthMode, EngineId, ModelArtifact, ModelId,
         ModelProfile, ModelProfileId, ModelProfilesState, PublicAuthMode, PublicAuthStatus,
         RegistryState, ServerState, SettingCategory, SettingDefinition, SettingId, SettingKind,
-        SettingScope, SettingsSchema,
+        SettingScope, SettingValue, SettingsSchema, SettingsState,
     };
 
     fn definition(id: &str, scope: SettingScope) -> SettingDefinition {
@@ -5871,6 +6063,237 @@ mod tests {
                     .collect();
                 assert!(text.contains(expected), "{text}");
             }
+        }
+    }
+
+    fn startup_status(state: scala_core::startup::StartupState) -> scala_core::StartupStatus {
+        scala_core::StartupStatus {
+            state,
+            mechanism: "systemd --user service",
+            identity: scala_core::startup::IDENTITY,
+            executable: None,
+            stale: false,
+        }
+    }
+
+    fn startup_row_index(app: &App) -> usize {
+        app.settings_definitions()
+            .iter()
+            .position(|definition| definition.id.as_str() == scala_core::startup::SETTING_ID)
+            .expect("startup row must exist in the Server scope")
+    }
+
+    #[test]
+    fn startup_row_reflects_os_registration_not_persisted_state() {
+        let mut app = test_app(vec![definition("server.bind", SettingScope::Server)]);
+        app.screen = Screen::Settings;
+        let startup_id = scala_core::startup::setting_definition().id;
+        assert_ne!(startup_id.namespace(), Some("server"));
+
+        let index = startup_row_index(&app);
+        let definition = app.settings_definitions()[index];
+        assert_eq!(definition.label, "Start automatically on login");
+        assert_eq!(definition.scope, SettingScope::Server);
+        assert_eq!(definition.category, SettingCategory::Application);
+
+        // Unknown until the first OS read completes.
+        assert_eq!(app.settings_value_display(&startup_id).value, "loading");
+
+        for (state, expected) in [
+            (scala_core::startup::StartupState::Disabled, "Disabled"),
+            (scala_core::startup::StartupState::Enabled, "Enabled"),
+            (
+                scala_core::startup::StartupState::Unsupported,
+                "Unsupported",
+            ),
+        ] {
+            app.startup = Some(Ok(startup_status(state)));
+            let display = app.settings_value_display(&startup_id);
+            assert_eq!(display.value, expected);
+            assert!(display.source.starts_with("OS: "), "{display:?}");
+            assert!(!display.can_clear);
+        }
+
+        // A failed native query surfaces the error rather than a stale claim.
+        app.startup = Some(Err("simulated query failure".to_owned()));
+        assert_eq!(app.settings_value_display(&startup_id).value, "Unknown");
+
+        // A registration for a moved executable is reported as such.
+        let mut status = startup_status(scala_core::startup::StartupState::Enabled);
+        status.stale = true;
+        app.startup = Some(Ok(status));
+        assert!(
+            app.settings_value_display(&startup_id)
+                .value
+                .contains("moved")
+        );
+    }
+
+    #[test]
+    fn startup_refresh_follows_external_os_changes() {
+        let mut app = test_app(Vec::new());
+        app.screen = Screen::Settings;
+        let load = |startup| SettingsLoad {
+            state: SettingsState::default(),
+            profiles: ModelProfilesState::default(),
+            runtime_schemas: Default::default(),
+            runtime_schema_warnings: Vec::new(),
+            save_notice: None,
+            startup,
+        };
+        let startup_id = scala_core::startup::setting_definition().id;
+
+        // The registration was created outside the app since the last refresh.
+        app.handle_settings_task_result(SettingsTaskResult::Loaded(Ok(load(Ok(startup_status(
+            scala_core::startup::StartupState::Enabled,
+        ))))));
+        assert_eq!(app.settings_value_display(&startup_id).value, "Enabled");
+        assert!(
+            app.settings_state
+                .as_ref()
+                .expect("settings state")
+                .server_settings
+                .0
+                .is_empty()
+        );
+
+        // An external removal/corruption reverts the display on the next read.
+        app.handle_settings_task_result(SettingsTaskResult::Loaded(Ok(load(Ok(startup_status(
+            scala_core::startup::StartupState::Disabled,
+        ))))));
+        assert_eq!(app.settings_value_display(&startup_id).value, "Disabled");
+    }
+
+    #[test]
+    fn startup_editor_toggles_registration_without_persisting_or_stopping() {
+        let mut app = test_app(Vec::new());
+        app.screen = Screen::Settings;
+        app.startup = Some(Ok(startup_status(
+            scala_core::startup::StartupState::Disabled,
+        )));
+        app.settings_setting_index = startup_row_index(&app);
+
+        assert_eq!(app.edit_selected_setting(), super::Update::Render);
+        let input = app.settings_input.as_ref().expect("editor open");
+        let editor = input.editor.as_ref().expect("startup editor");
+        assert_eq!(
+            editor
+                .options
+                .iter()
+                .map(|option| option.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Enabled", "Disabled"]
+        );
+        // Disabled state preselects the Disabled option.
+        assert_eq!(editor.selected, 1);
+
+        app.settings_input
+            .as_mut()
+            .unwrap()
+            .editor
+            .as_mut()
+            .unwrap()
+            .selected = 0;
+        assert_eq!(app.submit_settings_input(), super::Update::Render);
+        match app.take_settings_action() {
+            Some(SettingsAction::Set {
+                scope: SettingsScope::Server,
+                id,
+                value: SettingValue::Toggle(true),
+                ..
+            }) => assert_eq!(id.as_str(), scala_core::startup::SETTING_ID),
+            other => panic!("expected a Server-scope startup Set action, got {other:?}"),
+        }
+        // Toggling is registration-only: it never queues a control action that
+        // would stop or restart the running server.
+        assert!(app.take_control_action().is_none());
+        assert!(app.settings_input.is_none() || app.settings_input_error.is_none());
+    }
+
+    #[test]
+    fn startup_delete_disables_only_when_enabled() {
+        let mut app = test_app(Vec::new());
+        app.screen = Screen::Settings;
+        app.settings_setting_index = startup_row_index(&app);
+
+        app.startup = Some(Ok(startup_status(
+            scala_core::startup::StartupState::Disabled,
+        )));
+        assert_eq!(app.clear_selected_setting(), super::Update::Render);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Login startup is already disabled")
+        );
+        assert!(app.take_settings_action().is_none());
+
+        app.startup = Some(Ok(startup_status(
+            scala_core::startup::StartupState::Enabled,
+        )));
+        assert_eq!(app.clear_selected_setting(), super::Update::Render);
+        match app.take_settings_action() {
+            Some(SettingsAction::Unset {
+                scope: SettingsScope::Server,
+                id,
+            }) => assert_eq!(id.as_str(), scala_core::startup::SETTING_ID),
+            other => panic!("expected a Server-scope startup Unset action, got {other:?}"),
+        }
+        assert!(app.take_control_action().is_none());
+    }
+
+    #[test]
+    fn startup_row_only_counts_as_local_when_enabled() {
+        let mut app = test_app(vec![]);
+        app.screen = Screen::Settings;
+        app.settings_overrides_only = true;
+
+        app.startup = Some(Ok(startup_status(
+            scala_core::startup::StartupState::Disabled,
+        )));
+        assert!(
+            app.settings_definitions()
+                .iter()
+                .all(|definition| definition.id.as_str() != scala_core::startup::SETTING_ID)
+        );
+
+        app.startup = Some(Ok(startup_status(
+            scala_core::startup::StartupState::Enabled,
+        )));
+        assert!(
+            app.settings_definitions()
+                .iter()
+                .any(|definition| definition.id.as_str() == scala_core::startup::SETTING_ID)
+        );
+    }
+
+    #[test]
+    fn startup_row_renders_os_state_in_settings_table() {
+        let mut app = test_app(Vec::new());
+        app.screen = Screen::Settings;
+        app.settings_loading = false;
+        for (state, expected) in [
+            (scala_core::startup::StartupState::Disabled, "Disabled"),
+            (scala_core::startup::StartupState::Enabled, "Enabled"),
+        ] {
+            app.startup = Some(Ok(startup_status(state)));
+            let backend = ratatui::backend::TestBackend::new(120, 25);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    crate::ui::render(frame, &mut app);
+                })
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(text.contains("APPLICATION"), "{text}");
+            assert!(text.contains("Start automatically on login"), "{text}");
+            assert!(text.contains(expected), "{text}");
+            // The Source column shows the OS mechanism, truncated to fit.
+            assert!(text.contains("systemd -"), "{text}");
         }
     }
 

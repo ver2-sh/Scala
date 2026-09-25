@@ -35,8 +35,10 @@ native support on every platform. Existing runtime installation and compatibilit
 checks remain authoritative; equivalent non-Norted artifacts receive equal behavior.
 
 No new background service, updater daemon, telemetry, domain, package repository,
-MSI or signing identity is provisioned. Source-service administration remains
-separate from release-binary installation.
+MSI or signing identity is provisioned, and installation never enables login
+startup: that per-user OS registration is an explicit opt-in via
+Settings → Start automatically on login or `scala startup enable`. Source-service
+administration remains separate from release-binary installation.
 
 ## Install and update
 
@@ -121,9 +123,12 @@ The exact release discovered before approval is retained for installation throug
 its generated installer; Scala adds no download protocol or updater daemon.
 
 Stop existing Scala serving/TUI and control instances before replacement, then
-restart using the original invocation/service method afterward. Unlike Wayfinder,
-Scala has no native user-service manager: the updater never stops services, kills
-processes, interrupts inference or automatically restarts anything. Cross-process
+restart using the original invocation/service method afterward. The updater never
+stops services, kills processes, interrupts inference or automatically restarts
+anything; the opt-in per-user login-startup registration (Settings → Start
+automatically on login, or `scala startup enable`) stays valid when the
+executable updates in place, and is rebound by re-enabling after a deliberate
+move. Cross-process
 locks serialize replacement against the executable, receipt, install prefix,
 application storage and server startup/ownership checks. Application sessions hold
 a shared executable lock before loading configuration (also locking the executable
