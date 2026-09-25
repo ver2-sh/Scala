@@ -134,10 +134,15 @@ executable marks the registration as moved (re-enable to rebind it). Enabling or
 disabling only affects the next login and never starts, stops, or restarts the
 running server. Mechanisms are per-user and need no administrator rights:
 
-- **Windows:** Task Scheduler logon task `dev.scala.serve` — current user,
-  `AtLogOn` trigger, Interactive logon, Limited run level — launching the exact
-  current executable with `serve`, with restart-on-failure and no execution
-  time limit.
+- **Windows:** Task Scheduler logon task `dev.scala.serve.<SID digest>` — the
+  name is derived from the current user's SID because Task Scheduler names are
+  machine-global, so each Windows user gets an independent Scala-owned task.
+  The task runs as the current user with an `AtLogOn` trigger, Interactive
+  logon, Limited run level, launching the exact current executable with
+  `serve`, with restart-on-failure and no execution time limit. Startup is
+  reported `Enabled` only while the registration is enabled and matches that
+  whole contract; a disabled or altered task is reported truthfully and
+  re-enabling re-registers it.
 - **Linux:** per-user systemd unit `dev.scala.serve.service` under
   `~/.config/systemd/user`, enabled without `--now` so nothing launches at
   enable time. It is independent of the privileged `scala.service`

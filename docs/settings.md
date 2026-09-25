@@ -40,12 +40,13 @@ share type/label shape, but no ID, persisted value, default, inheritance, or sem
 shared. An unqualified runtime ID is invalid in Settings overrides, Model Profiles, and invocation
 patches.
 
-One additional Server-scope row, `application.start_on_login` ("Start automatically on login"), is
+One additional Server-scope row, `server.start_on_login` ("Start automatically on login"), is
 deliberately outside these persisted domains. It is a live view of the operating system's per-user
 startup registration for `scala serve` — read fresh on every Settings refresh and changed by
-registering or removing the OS definition directly. It is never written to `server_settings` (the
-`application` namespace fails server-settings validation by design), it has no Inherit layer, and
-toggling it never starts, stops, or restarts the running server. See the
+registering or removing the OS definition directly. Although it is a valid Server-scoped id, it is
+special-routed to the live OS registration and is never written to `server_settings`: `scala settings
+set/unset` has no authority over it, it has no Inherit layer, and toggling it never starts, stops, or
+restarts the running server. See the
 [README](../README.md#start-automatically-on-login) for platform mechanisms and the
 `scala startup status|enable|disable` CLI.
 

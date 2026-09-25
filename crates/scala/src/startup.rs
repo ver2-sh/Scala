@@ -37,6 +37,7 @@ fn report(operation: &str, status: StartupStatus, json_output: bool) -> Result<(
                     "identity": status.identity,
                     "registered_executable": status.executable,
                     "stale_executable": status.stale,
+                    "broken_registration": status.broken,
                 }
             }))?
         );
@@ -51,6 +52,11 @@ fn report(operation: &str, status: StartupStatus, json_output: bool) -> Result<(
     if status.stale {
         println!(
             "  Warning:    the registration targets a different executable; `scala startup enable` rebinds it."
+        );
+    }
+    if status.broken {
+        println!(
+            "  Warning:    the registration is registered but not healthy (disabled or altered); `scala startup enable` re-registers the expected definition."
         );
     }
     match operation {
