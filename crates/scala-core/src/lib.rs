@@ -12,6 +12,7 @@ pub mod prune;
 mod runtime;
 mod runtime_pack;
 mod settings;
+pub mod startup;
 mod state;
 
 pub use auth::{
@@ -75,4 +76,5 @@ pub use settings::{
     SettingsSchema, SettingsState, SettingsStore, StateStoreError, UnsignedIntegerOrChoiceValue,
     bounded_setting_file_sha256,
 };
+pub use startup::{StartupError, StartupState, StartupStatus};
 pub use state::{AppSnapshot, ApplicationCore, RegistryState, ServerState};

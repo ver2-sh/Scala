@@ -141,6 +141,35 @@ impl SettingsEditor {
             editing_item: false,
         }
     }
+    /// Editor for the login-startup row: Enabled/Disabled only. There is no
+    /// Inherit option because the row is a live OS registration, not a
+    /// layered settings value.
+    pub fn startup(definition: SettingDefinition, metadata: String, enabled: bool) -> Self {
+        Self {
+            definition,
+            scope: SettingsScope::Server,
+            model: None,
+            metadata,
+            options: vec![
+                EditorOption {
+                    label: "Enabled".into(),
+                    value: Some(SettingValue::Toggle(true)),
+                    custom: false,
+                },
+                EditorOption {
+                    label: "Disabled".into(),
+                    value: Some(SettingValue::Toggle(false)),
+                    custom: false,
+                },
+            ],
+            selected: usize::from(!enabled),
+            filter: String::new(),
+            info_page: 0,
+            items: Vec::new(),
+            item: 0,
+            editing_item: false,
+        }
+    }
     pub fn custom(&self) -> bool {
         self.options[self.selected].custom
     }

@@ -421,6 +421,9 @@ where
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SettingCategory {
+    /// Application/OS lifecycle controls (for example login startup). Not
+    /// inference configuration.
+    Application,
     #[default]
     General,
     Downloads,
@@ -437,6 +440,7 @@ pub enum SettingCategory {
 impl std::fmt::Display for SettingCategory {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::Application => "Application",
             Self::General => "General",
             Self::Downloads => "Downloads",
             Self::Load => "Load",

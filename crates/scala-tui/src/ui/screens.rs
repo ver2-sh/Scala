@@ -2797,6 +2797,8 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
             }
         } else if !definition.supported {
             "—"
+        } else if let Some(mechanism) = display.source.strip_prefix("OS: ") {
+            mechanism
         } else if display.source.to_lowercase().contains("settings") {
             "Settings"
         } else if display.source.contains("server") {

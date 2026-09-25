@@ -694,12 +694,19 @@ async fn load_tui_settings(
         .selected_runtime_settings_schemas(&state, structured_path_base)
         .await
         .unwrap_or_else(|error| (Default::default(), vec![error.to_string()]));
+    // The login-startup row reflects the live OS registration. It is queried
+    // alongside (never from) the persisted settings state on every refresh.
+    let startup = tokio::task::spawn_blocking(scala_core::startup::status)
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()));
     Ok(SettingsLoad {
         state,
         profiles,
         runtime_schemas,
         runtime_schema_warnings,
         save_notice: None,
+        startup,
     })
 }
 
@@ -743,11 +750,76 @@ fn resolved_patch(
     }
 }
 
+/// Maps a Server-scope action on the login-startup row to an OS registration
+/// change: `Ok(true)` registers, `Ok(false)` unregisters, `Err` rejects an
+/// invalid value. Returns `None` when the action does not target that row.
+fn startup_change(action: &SettingsAction) -> Option<std::result::Result<bool, String>> {
+    let (scope, id, value) = match action {
+        SettingsAction::Set {
+            scope, id, value, ..
+        } => (scope, id, Some(value)),
+        SettingsAction::Unset { scope, id } => (scope, id, None),
+        _ => return None,
+    };
+    if id.as_str() != scala_core::startup::SETTING_ID || !matches!(scope, SettingsScope::Server) {
+        return None;
+    }
+    Some(match value {
+        Some(scala_core::SettingValue::Toggle(enabled)) => Ok(*enabled),
+        Some(other) => Err(format!("`{id}` expects Enabled/Disabled, not `{other}`")),
+        None => Ok(false),
+    })
+}
+
+/// Applies the login-startup change to the OS registration, then reloads
+/// settings state so the UI reflects the real post-change status. Never
+/// writes `settings.json` and never starts or stops the running server.
+async fn execute_startup_change(
+    runtime_packs: Arc<RuntimePackManager>,
+    paths: &AppPaths,
+    change: std::result::Result<bool, String>,
+) -> SettingsTaskResult {
+    let enable = match change {
+        Ok(enable) => enable,
+        Err(error) => return SettingsTaskResult::Stored(Err(error)),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        if enable {
+            scala_core::startup::enable()
+        } else {
+            scala_core::startup::disable()
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result.map_err(|error| error.to_string()));
+    let mut load = load_tui_settings(
+        &runtime_packs,
+        &SettingsStore::new(paths),
+        &ModelProfilesStore::new(paths),
+        &paths.data_dir,
+    )
+    .await;
+    if let Ok(loaded) = &mut load {
+        loaded.save_notice = Some(if enable {
+            "Login startup enabled; `scala serve` starts at your next login. The running \
+             server is unaffected."
+                .to_owned()
+        } else {
+            "Login startup disabled. The running server is unaffected.".to_owned()
+        });
+    }
+    SettingsTaskResult::Stored(result.and(load))
+}
+
 async fn execute_settings_action(
     runtime_packs: Arc<RuntimePackManager>,
     paths: &AppPaths,
     action: SettingsAction,
 ) -> SettingsTaskResult {
+    if let Some(change) = startup_change(&action) {
+        return execute_startup_change(runtime_packs, paths, change).await;
+    }
     let settings_store = SettingsStore::new(paths);
     let profiles_store = ModelProfilesStore::new(paths);
     match action {
@@ -1599,6 +1671,73 @@ async fn execute_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_row_actions_route_to_os_registration_only() {
+        let id = SettingId::new(scala_core::startup::SETTING_ID).expect("startup ID");
+        let server = SettingsScope::Server;
+        assert_eq!(
+            startup_change(&SettingsAction::Set {
+                scope: server.clone(),
+                id: id.clone(),
+                value: scala_core::SettingValue::Toggle(true),
+                model: None,
+            }),
+            Some(Ok(true))
+        );
+        assert_eq!(
+            startup_change(&SettingsAction::Set {
+                scope: server.clone(),
+                id: id.clone(),
+                value: scala_core::SettingValue::Toggle(false),
+                model: None,
+            }),
+            Some(Ok(false))
+        );
+        // Delete on the row unregisters rather than writing an override tombstone.
+        assert_eq!(
+            startup_change(&SettingsAction::Unset {
+                scope: server.clone(),
+                id: id.clone(),
+            }),
+            Some(Ok(false))
+        );
+        // A non-toggle value is rejected before any persistence can happen.
+        assert!(matches!(
+            startup_change(&SettingsAction::Set {
+                scope: server,
+                id: id.clone(),
+                value: scala_core::SettingValue::FlagEnabled,
+                model: None,
+            }),
+            Some(Err(_))
+        ));
+        // Actions on other settings or scopes pass through untouched.
+        let other = SettingId::new("server.bind").expect("server ID");
+        assert_eq!(
+            startup_change(&SettingsAction::Set {
+                scope: SettingsScope::Server,
+                id: other,
+                value: scala_core::SettingValue::Toggle(true),
+                model: None,
+            }),
+            None
+        );
+        assert_eq!(
+            startup_change(&SettingsAction::Unset {
+                scope: SettingsScope::Runtime("q27".to_owned()),
+                id,
+            }),
+            None
+        );
+        assert_eq!(startup_change(&SettingsAction::Refresh), None);
+        assert_eq!(
+            startup_change(&SettingsAction::Reset {
+                scope: SettingsScope::Server,
+            }),
+            None
+        );
+    }
 
     #[test]
     fn control_polling_starts_with_an_immediate_observation() {

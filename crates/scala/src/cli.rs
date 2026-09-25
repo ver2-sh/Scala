@@ -78,6 +78,8 @@ pub enum Command {
     ModelProfiles(ModelProfilesArgs),
     /// Manage Server Settings and independent engine overrides
     Settings(SettingsArgs),
+    /// Manage the per-user OS login-startup registration for `scala serve`
+    Startup(StartupArgs),
     /// Inspect resolved application configuration
     Config(ConfigArgs),
     /// Run offline, read-only whole-system diagnostics
@@ -323,6 +325,22 @@ impl From<ProfileRole> for scala_core::ModelRole {
             ProfileRole::Auxiliary => Self::Auxiliary,
         }
     }
+}
+
+#[derive(Debug, Args)]
+pub struct StartupArgs {
+    #[command(subcommand)]
+    pub command: StartupCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StartupCommand {
+    /// Show the live OS login-startup registration state
+    Status,
+    /// Register `scala serve` to launch at your next login; the running server is unaffected
+    Enable,
+    /// Remove the login-startup registration; the running server is unaffected
+    Disable,
 }
 
 #[derive(Debug, Args)]
