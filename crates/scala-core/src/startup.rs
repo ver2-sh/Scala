@@ -448,9 +448,21 @@ struct WindowsTriggerView {
     enabled: Option<bool>,
 }
 
+/// One Task Scheduler action as reported by the query script.
+#[cfg(any(windows, test))]
+#[derive(Debug, serde::Deserialize)]
+struct WindowsActionView {
+    #[serde(default)]
+    execute: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
 /// The Task Scheduler task as reported by the query script. Built from
 /// structured PowerShell objects (`Get-ScheduledTask` properties), never from
-/// localized human-readable `schtasks` text.
+/// localized human-readable `schtasks` text. `action_count`/`trigger_count`
+/// are explicit integers so cardinality is verifiable without depending on
+/// PowerShell scalar/array JSON shape quirks.
 #[cfg(any(windows, test))]
 #[derive(Debug, serde::Deserialize)]
 struct WindowsTaskView {
@@ -465,11 +477,13 @@ struct WindowsTaskView {
     #[serde(default)]
     run_level: Option<String>,
     #[serde(default)]
+    action_count: usize,
+    #[serde(default)]
+    actions: Vec<WindowsActionView>,
+    #[serde(default)]
+    trigger_count: usize,
+    #[serde(default)]
     triggers: Vec<WindowsTriggerView>,
-    #[serde(default)]
-    execute: Option<String>,
-    #[serde(default)]
-    arguments: Option<String>,
 }
 
 #[cfg(any(windows, test))]
@@ -502,26 +516,39 @@ fn windows_unregister_script(task: &str) -> String {
 }
 
 // Emits the registered task as structured JSON, or `{"present":false}`. Reports
-// the task enabled flag, principal semantics, triggers, and the first action's
-// executable and arguments so health is judged against the full login-start
-// contract rather than mere task existence.
+// the task enabled flag, principal semantics, the complete action and trigger
+// lists, and explicit element counts so health is judged against the full
+// owned login-start definition rather than mere task existence.
 #[cfg(any(windows, test))]
 fn windows_query_script(task: &str) -> String {
     let task = windows_ps(task);
     format!(
-        "$n={task}; $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false }} | ConvertTo-Json -Compress }} else {{ $a=@($t.Actions); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; enabled=$_.Enabled }} }}); $exe=$null; $argstr=$null; if ($a.Count -gt 0) {{ $exe=[string]$a[0].Execute; $argstr=[string]$a[0].Arguments }}; [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; user=[string]$t.Principal.UserId; logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; triggers=$tr; execute=$exe; arguments=$argstr }} | ConvertTo-Json -Compress -Depth 6 }}"
+        "$n={task}; $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false }} | ConvertTo-Json -Compress }} else {{ $a=@(@($t.Actions) | ForEach-Object {{ [pscustomobject]@{{ execute=[string]$_.Execute; arguments=[string]$_.Arguments }} }}); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; enabled=$_.Enabled }} }}); [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; user=[string]$t.Principal.UserId; logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; action_count=$a.Count; actions=$a; trigger_count=$tr.Count; triggers=$tr }} | ConvertTo-Json -Compress -Depth 6 }}"
     )
 }
 
+/// Task Scheduler may expose the same account either as `DOMAIN\name` or as
+/// its SID string; both representations identify the current user, so
+/// principal and trigger users match on either form.
+#[cfg(any(windows, test))]
+fn windows_same_account(reported: Option<&str>, name: &str, sid: &str) -> bool {
+    reported.is_some_and(|user| {
+        !user.is_empty() && (user.eq_ignore_ascii_case(name) || user.eq_ignore_ascii_case(sid))
+    })
+}
+
 /// Judges a queried task against the exact login-start contract Scala owns:
-/// present, enabled, current-user interactive/limited principal, an AtLogOn
-/// trigger for that user, the exact executable, and the exact `serve` argument.
-/// Any mismatch reports `Disabled` with `broken` set; `Enabled` is only reported
-/// when Windows will actually run the expected definition.
+/// present, enabled, current-user interactive/limited principal, exactly one
+/// action binding the exact executable with the exact `serve` argument, and
+/// exactly one enabled AtLogOn trigger for that user. Additional actions or
+/// triggers are mutations the contract does not allow: any mismatch reports
+/// `Disabled` with `broken` set; `Enabled` is only reported when Windows will
+/// actually run the expected definition and nothing else.
 #[cfg(any(windows, test))]
 fn windows_evaluate(
     view: &WindowsTaskView,
     current_user: &str,
+    current_sid: &str,
     expected_executable: Option<&Path>,
     identity: String,
 ) -> StartupStatus {
@@ -536,20 +563,33 @@ fn windows_evaluate(
             broken: false,
         };
     }
-    let executable = view.execute.as_deref().map(PathBuf::from);
+    let executable = view
+        .actions
+        .first()
+        .and_then(|action| action.execute.as_deref())
+        .map(PathBuf::from);
     let stale = match (&executable, expected_executable) {
         (Some(registered), Some(current)) => registered != current,
         _ => false,
     };
-    let executable_matches = match (&executable, expected_executable) {
-        (_, None) => true,
-        (Some(registered), Some(current)) => registered == current,
-        (None, Some(_)) => false,
-    };
-    let user_matches = view
-        .user
-        .as_deref()
-        .is_some_and(|user| user.eq_ignore_ascii_case(current_user));
+    // The owned contract is exact: one action and one trigger. The explicit
+    // counts and the complete arrays must agree, so extra entries cannot hide
+    // behind a correct first element.
+    let single_action = view.action_count == 1 && view.actions.len() == 1;
+    let single_trigger = view.trigger_count == 1 && view.triggers.len() == 1;
+    let executable_matches = single_action
+        && match (&executable, expected_executable) {
+            (_, None) => true,
+            (Some(registered), Some(current)) => registered == current,
+            (None, Some(_)) => false,
+        };
+    let arguments_match = single_action
+        && view
+            .actions
+            .first()
+            .and_then(|action| action.arguments.as_deref())
+            == Some(SERVE_ARGUMENT);
+    let user_matches = windows_same_account(view.user.as_deref(), current_user, current_sid);
     let logon_matches = view
         .logon_type
         .as_deref()
@@ -558,18 +598,15 @@ fn windows_evaluate(
         .run_level
         .as_deref()
         .is_some_and(|level| level.eq_ignore_ascii_case("Limited"));
-    let trigger_matches = view.triggers.iter().any(|trigger| {
-        trigger
-            .trigger_type
-            .to_ascii_lowercase()
-            .contains("logontrigger")
-            && trigger
-                .user
-                .as_deref()
-                .is_some_and(|user| user.eq_ignore_ascii_case(current_user))
-            && trigger.enabled.unwrap_or(true)
-    });
-    let arguments_match = view.arguments.as_deref() == Some(SERVE_ARGUMENT);
+    let trigger_matches = single_trigger
+        && view.triggers.iter().all(|trigger| {
+            trigger
+                .trigger_type
+                .to_ascii_lowercase()
+                .contains("logontrigger")
+                && windows_same_account(trigger.user.as_deref(), current_user, current_sid)
+                && trigger.enabled.unwrap_or(true)
+        });
     let healthy = view.enabled
         && executable_matches
         && user_matches
@@ -620,6 +657,7 @@ fn windows_status() -> Result<StartupStatus, StartupError> {
     Ok(windows_evaluate(
         &view,
         &user,
+        &sid,
         current_executable().ok().as_deref(),
         identity,
     ))
@@ -871,6 +909,11 @@ mod tests {
         assert!(query.contains("CimClassName"));
         assert!(query.contains("LogonType"));
         assert!(query.contains("ConvertTo-Json"));
+        // Complete arrays plus explicit counts: cardinality is deterministic.
+        assert!(query.contains("action_count=$a.Count"));
+        assert!(query.contains("actions=$a"));
+        assert!(query.contains("trigger_count=$tr.Count"));
+        assert!(query.contains("triggers=$tr"));
 
         let identity = windows_identity_script();
         assert!(identity.contains("WindowsIdentity]::GetCurrent()"));
@@ -900,6 +943,8 @@ mod tests {
         assert_eq!(windows_task_identity(&who.sid), alice);
     }
 
+    const TEST_SID: &str = "S-1-5-21-111-222-333-1001";
+
     fn healthy_windows_task(execute: &str) -> WindowsTaskView {
         let json = serde_json::json!({
             "present": true,
@@ -907,11 +952,14 @@ mod tests {
             "user": r"DESKTOP\alice",
             "logon_type": "Interactive",
             "run_level": "Limited",
+            "action_count": 1,
+            "actions": [
+                {"execute": execute, "arguments": "serve"}
+            ],
+            "trigger_count": 1,
             "triggers": [
                 {"type": "MSFT_TaskLogonTrigger", "user": r"DESKTOP\alice", "enabled": true}
             ],
-            "execute": execute,
-            "arguments": "serve",
         });
         serde_json::from_str(&json.to_string()).unwrap()
     }
@@ -920,6 +968,7 @@ mod tests {
         windows_evaluate(
             view,
             r"DESKTOP\alice",
+            TEST_SID,
             Some(Path::new(r"C:\Scala\scala.exe")),
             "dev.scala.serve.deadbeefdeadbeef".to_owned(),
         )
@@ -958,13 +1007,34 @@ mod tests {
 
         // Wrong arguments: broken, never Enabled.
         let mut wrong_args = healthy_windows_task(r"C:\Scala\scala.exe");
-        wrong_args.arguments = Some("serve --port 9000".to_owned());
+        wrong_args.actions[0].arguments = Some("serve --port 9000".to_owned());
         let status = windows_health(&wrong_args);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        // An extra action alongside the correct one is a mutation: broken,
+        // never Enabled, even though the first action still matches.
+        let mut extra_action = healthy_windows_task(r"C:\Scala\scala.exe");
+        extra_action.action_count = 2;
+        extra_action.actions.push(WindowsActionView {
+            execute: Some(r"C:\Scala\scala.exe".to_owned()),
+            arguments: Some("serve".to_owned()),
+        });
+        let status = windows_health(&extra_action);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        // Zero actions: broken, never Enabled.
+        let mut no_action = healthy_windows_task(r"C:\Scala\scala.exe");
+        no_action.action_count = 0;
+        no_action.actions.clear();
+        let status = windows_health(&no_action);
         assert_ne!(status.state, StartupState::Enabled);
         assert!(status.broken);
 
         // Missing/foreign AtLogOn trigger: broken, never Enabled.
         let mut no_trigger = healthy_windows_task(r"C:\Scala\scala.exe");
+        no_trigger.trigger_count = 0;
         no_trigger.triggers.clear();
         let status = windows_health(&no_trigger);
         assert_ne!(status.state, StartupState::Enabled);
@@ -973,6 +1043,32 @@ mod tests {
         let mut boot_trigger = healthy_windows_task(r"C:\Scala\scala.exe");
         boot_trigger.triggers[0].trigger_type = "MSFT_TaskBootTrigger".to_owned();
         let status = windows_health(&boot_trigger);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        // An extra Boot trigger alongside the correct AtLogOn trigger:
+        // broken, never Enabled.
+        let mut extra_boot = healthy_windows_task(r"C:\Scala\scala.exe");
+        extra_boot.trigger_count = 2;
+        extra_boot.triggers.push(WindowsTriggerView {
+            trigger_type: "MSFT_TaskBootTrigger".to_owned(),
+            user: None,
+            enabled: Some(true),
+        });
+        let status = windows_health(&extra_boot);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        // A second AtLogOn trigger for the same user is still an extra
+        // trigger: broken, never Enabled.
+        let mut extra_logon = healthy_windows_task(r"C:\Scala\scala.exe");
+        extra_logon.trigger_count = 2;
+        extra_logon.triggers.push(WindowsTriggerView {
+            trigger_type: "MSFT_TaskLogonTrigger".to_owned(),
+            user: Some(r"DESKTOP\alice".to_owned()),
+            enabled: Some(true),
+        });
+        let status = windows_health(&extra_logon);
         assert_ne!(status.state, StartupState::Enabled);
         assert!(status.broken);
 
@@ -996,6 +1092,15 @@ mod tests {
         let status = windows_health(&elevated);
         assert_ne!(status.state, StartupState::Enabled);
         assert!(status.broken);
+
+        // The same account reported by SID instead of name still matches the
+        // principal and trigger user checks.
+        let mut sid_task = healthy_windows_task(r"C:\Scala\scala.exe");
+        sid_task.user = Some(TEST_SID.to_owned());
+        sid_task.triggers[0].user = Some(TEST_SID.to_owned());
+        let status = windows_health(&sid_task);
+        assert_eq!(status.state, StartupState::Enabled);
+        assert!(!status.broken);
     }
 
     #[test]
