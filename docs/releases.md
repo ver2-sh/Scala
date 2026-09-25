@@ -57,13 +57,13 @@ irm https://ver2.sh/scala/install.ps1 | iex
 ```
 
 For an inspect-first, reproducible installation, use the versioned URLs below
-to select the v0.1.0 release explicitly.
+to select the v0.1.1 release explicitly.
 
 Linux/macOS:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fLsS \
-  https://ver2.sh/scala/releases/download/v0.1.0/scala-installer.sh \
+  https://ver2.sh/scala/releases/download/v0.1.1/scala-installer.sh \
   -o scala-installer.sh
 # Inspect the downloaded script, then:
 sh scala-installer.sh
@@ -78,7 +78,7 @@ scala serve
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest -Uri 'https://ver2.sh/scala/releases/download/v0.1.0/scala-installer.ps1' -OutFile 'scala-installer.ps1'
+Invoke-WebRequest -Uri 'https://ver2.sh/scala/releases/download/v0.1.1/scala-installer.ps1' -OutFile 'scala-installer.ps1'
 # Inspect the downloaded script, then:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scala-installer.ps1
 # Open a fresh shell if the installer changed PATH.
