@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.1 — Scala Link compatibility
+
+Maintenance release restoring zero-configuration Scala Link compatibility with
+current Wayfinder Sync Chain installations.
+
+- Discover Wayfinder through deterministic OS-native local IPC rather than any
+  executable/install path: native Windows named pipe and safe Linux runtime
+  socket candidates.
+- Reconnect and re-register automatically when Wayfinder is started or restarted.
+- Report absent/unavailable Wayfinder local transport cleanly instead of exposing
+  raw filesystem errors.
+- Preserve existing Scala Link protocol, profile/runtime ownership, local serving
+  behavior and explicit Link enablement policy.
+
 ## 0.1.0 — Scala
 
 First public Scala developer release. The application and command are
