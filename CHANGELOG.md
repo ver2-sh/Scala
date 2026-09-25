@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.2 — Login startup control
+
+Adds first-class, per-user OS login startup management without changing Scala's
+inference-settings ownership or current-process lifecycle.
+
+- Add **Settings → Start automatically on login** backed directly by the native
+  OS registration rather than settings.json.
+- Add scriptable scala startup status|enable|disable; Scala starts scala serve
+  at the next login when enabled.
+- Use per-user systemd on Linux, LaunchAgent on macOS, and Task Scheduler on
+  Windows without administrator elevation.
+- Keep enable/disable registration-only: toggling startup never starts, stops,
+  or restarts the currently running Scala server.
+- Isolate Windows tasks per user with a SID-derived identity and validate the
+  exact owned task definition, including enabled state, current-user
+  interactive/limited principal, exact executable/arguments, one action, and
+  one AtLogOn trigger.
+
 ## 0.1.1 — Scala Link compatibility
 
 Maintenance release restoring zero-configuration Scala Link compatibility with
