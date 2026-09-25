@@ -486,8 +486,8 @@ impl App {
         mut setting_definitions: Vec<SettingDefinition>,
     ) -> Self {
         // Append the login-startup row to the Server scope. It is a UI-level
-        // control over the OS registration only — it has no `server.*`
-        // namespace, so it can never be persisted into `server_settings`.
+        // control over the OS registration only: its actions are special-routed
+        // before persistence, so it is never written into `server_settings`.
         setting_definitions.push(scala_core::startup::setting_definition());
         let mut logs = vec![LogEntry {
             level: LogLevel::Info,
@@ -1661,6 +1661,8 @@ impl App {
             Some(Ok(status)) => SettingValueDisplay {
                 value: if status.stale {
                     format!("{} (moved)", status.label())
+                } else if status.broken {
+                    format!("{} (broken)", status.label())
                 } else {
                     status.label().to_owned()
                 },
@@ -1710,6 +1712,13 @@ impl App {
                     lines.push(
                         "Registration binds a different executable than this binary; \
                          re-enable to rebind it."
+                            .to_owned(),
+                    );
+                }
+                if status.broken {
+                    lines.push(
+                        "Registration exists but does not match the login-start contract \
+                         (disabled or altered); re-enable to re-register it."
                             .to_owned(),
                     );
                 }
@@ -6070,9 +6079,10 @@ mod tests {
         scala_core::StartupStatus {
             state,
             mechanism: "systemd --user service",
-            identity: scala_core::startup::IDENTITY,
+            identity: scala_core::startup::IDENTITY.to_owned(),
             executable: None,
             stale: false,
+            broken: false,
         }
     }
 
@@ -6088,7 +6098,7 @@ mod tests {
         let mut app = test_app(vec![definition("server.bind", SettingScope::Server)]);
         app.screen = Screen::Settings;
         let startup_id = scala_core::startup::setting_definition().id;
-        assert_ne!(startup_id.namespace(), Some("server"));
+        assert_eq!(startup_id.namespace(), Some("server"));
 
         let index = startup_row_index(&app);
         let definition = app.settings_definitions()[index];
@@ -6127,6 +6137,15 @@ mod tests {
                 .value
                 .contains("moved")
         );
+
+        // A disabled/mutated registration is never shown as Enabled.
+        let mut status = startup_status(scala_core::startup::StartupState::Disabled);
+        status.broken = true;
+        app.startup = Some(Ok(status));
+        let display = app.settings_value_display(&startup_id);
+        assert!(display.value.contains("Disabled"), "{display:?}");
+        assert!(display.value.contains("broken"), "{display:?}");
+        assert!(!display.value.contains("Enabled"), "{display:?}");
     }
 
     #[test]

@@ -10,14 +10,22 @@ use std::process::Command;
 
 use crate::settings::{SettingCategory, SettingDefinition, SettingId, SettingKind, SettingScope};
 
-/// Settings-UI identifier for the login-startup control. This is deliberately
-/// not a `server.*` setting: it is never written to `SettingsState`, and
-/// `server_settings` validation would reject it.
-pub const SETTING_ID: &str = "application.start_on_login";
+/// Settings-UI identifier for the login-startup control. It is a valid
+/// Server-scoped id, but it is special-routed to the live OS registration and
+/// is never written to `SettingsState`.
+pub const SETTING_ID: &str = "server.start_on_login";
 
-/// Deterministic per-user registration identity owned by Scala: the systemd
-/// unit stem, the launchd label, and the Task Scheduler task name.
+/// Deterministic per-user registration identity owned by Scala on platforms
+/// whose native namespaces are already per-user: the systemd unit stem and the
+/// launchd label. Windows Task Scheduler task names are machine-global, so its
+/// identity is derived per user (see [`windows_task_identity`]).
 pub const IDENTITY: &str = "dev.scala.serve";
+
+/// Windows Task Scheduler task-name prefix. The full name appends a digest of
+/// the current user's SID so distinct users on one machine get independent
+/// Scala-owned tasks.
+#[cfg(any(windows, test))]
+pub const WINDOWS_TASK_PREFIX: &str = "dev.scala.serve";
 
 #[cfg(any(windows, test))]
 const SERVE_ARGUMENT: &str = "serve";
@@ -36,14 +44,21 @@ pub struct StartupStatus {
     pub state: StartupState,
     /// Human-readable mechanism name for this platform.
     pub mechanism: &'static str,
-    /// The registration identity (unit name, launchd label, or task name).
-    pub identity: &'static str,
+    /// The registration identity (unit name, launchd label, or task name). On
+    /// Windows this is the per-user task name actually calculated for the
+    /// current SID.
+    pub identity: String,
     /// The executable the registration launches, when readable.
     pub executable: Option<PathBuf>,
     /// The registration exists but points at a different executable than the
     /// running binary (for example after the binary was moved). Re-enabling
     /// startup rebinds the registration to the current executable.
     pub stale: bool,
+    /// A registration exists but does not match the login-start contract the
+    /// app owns (disabled task, wrong principal/trigger, or wrong arguments).
+    /// Re-enabling re-registers the expected definition. `Enabled` is never
+    /// reported while this is true.
+    pub broken: bool,
 }
 
 impl StartupStatus {
@@ -241,9 +256,10 @@ fn linux_status() -> Result<StartupStatus, StartupError> {
         return Ok(StartupStatus {
             state,
             mechanism: "systemd --user service",
-            identity: IDENTITY,
+            identity: IDENTITY.to_owned(),
             executable: None,
             stale: false,
+            broken: false,
         });
     }
     let text = std::fs::read_to_string(&file).map_err(|e| io_error(&file, e))?;
@@ -255,9 +271,10 @@ fn linux_status() -> Result<StartupStatus, StartupError> {
     Ok(StartupStatus {
         state: StartupState::Enabled,
         mechanism: "systemd --user service",
-        identity: IDENTITY,
+        identity: IDENTITY.to_owned(),
         executable,
         stale,
+        broken: false,
     })
 }
 
@@ -349,9 +366,10 @@ fn macos_status() -> Result<StartupStatus, StartupError> {
         return Ok(StartupStatus {
             state: StartupState::Disabled,
             mechanism: "per-user LaunchAgent (launchd)",
-            identity: IDENTITY,
+            identity: IDENTITY.to_owned(),
             executable: None,
             stale: false,
+            broken: false,
         });
     }
     let text = std::fs::read_to_string(&file).map_err(|e| io_error(&file, e))?;
@@ -363,9 +381,10 @@ fn macos_status() -> Result<StartupStatus, StartupError> {
     Ok(StartupStatus {
         state: StartupState::Enabled,
         mechanism: "per-user LaunchAgent (launchd)",
-        identity: IDENTITY,
+        identity: IDENTITY.to_owned(),
         executable,
         stale,
+        broken: false,
     })
 }
 
@@ -390,11 +409,82 @@ fn windows_ps(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// Deterministic, bounded, Scala-owned Task Scheduler task name for the current
+/// Windows user. Task Scheduler names are machine-global, so the current user's
+/// SID is folded into a stable digest: distinct users get independent tasks and
+/// the same user always calculates the same name. No credentials are involved.
+#[cfg(any(windows, test))]
+pub fn windows_task_identity(sid: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = format!("{:x}", Sha256::digest(sid.as_bytes()));
+    format!("{WINDOWS_TASK_PREFIX}.{}", &digest[..16])
+}
+
+/// Emits the current Windows identity as structured JSON: the user SID (for the
+/// task name) and the user name (for principal/trigger matching).
+#[cfg(any(windows, test))]
+fn windows_identity_script() -> String {
+    "$i=[System.Security.Principal.WindowsIdentity]::GetCurrent(); [pscustomobject]@{ sid=$i.User.Value; name=$i.Name } | ConvertTo-Json -Compress".to_owned()
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, serde::Deserialize)]
+struct WindowsIdentityView {
+    #[serde(default)]
+    sid: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// One Task Scheduler trigger as reported by the query script.
+#[cfg(any(windows, test))]
+#[derive(Debug, serde::Deserialize)]
+struct WindowsTriggerView {
+    #[serde(default, rename = "type")]
+    trigger_type: String,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+/// The Task Scheduler task as reported by the query script. Built from
+/// structured PowerShell objects (`Get-ScheduledTask` properties), never from
+/// localized human-readable `schtasks` text.
+#[cfg(any(windows, test))]
+#[derive(Debug, serde::Deserialize)]
+struct WindowsTaskView {
+    #[serde(default)]
+    present: bool,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    logon_type: Option<String>,
+    #[serde(default)]
+    run_level: Option<String>,
+    #[serde(default)]
+    triggers: Vec<WindowsTriggerView>,
+    #[serde(default)]
+    execute: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[cfg(any(windows, test))]
+fn windows_parse<T: serde::de::DeserializeOwned>(output: &str) -> Result<T, StartupError> {
+    serde_json::from_str(output.trim()).map_err(|error| StartupError::Command {
+        program: "powershell.exe",
+        message: format!("unexpected Task Scheduler query output: {error}"),
+    })
+}
+
 // Registers (or replaces) the per-user AtLogOn task without starting it.
 // Current user, interactive logon, limited run level: no elevation required.
 #[cfg(any(windows, test))]
-fn windows_register_script(executable: &str) -> String {
-    let task = windows_ps(IDENTITY);
+fn windows_register_script(task: &str, executable: &str) -> String {
+    let task = windows_ps(task);
     format!(
         "$a=New-ScheduledTaskAction -Execute {} -Argument {}; $u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited; $t=New-ScheduledTaskTrigger -AtLogOn -User $u; $s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName {task} -Action $a -Principal $p -Trigger $t -Settings $s -Force | Out-Null",
         windows_ps(executable),
@@ -404,20 +494,101 @@ fn windows_register_script(executable: &str) -> String {
 
 // Unregisters the task only if present; never stops task instances.
 #[cfg(any(windows, test))]
-fn windows_unregister_script() -> String {
-    let task = windows_ps(IDENTITY);
+fn windows_unregister_script(task: &str) -> String {
+    let task = windows_ps(task);
     format!(
         "if (Get-ScheduledTask -TaskName {task} -ErrorAction SilentlyContinue) {{ Unregister-ScheduledTask -TaskName {task} -Confirm:$false }}"
     )
 }
 
-// Prints ABSENT, or PRESENT followed by the registered action's executable.
+// Emits the registered task as structured JSON, or `{"present":false}`. Reports
+// the task enabled flag, principal semantics, triggers, and the first action's
+// executable and arguments so health is judged against the full login-start
+// contract rather than mere task existence.
 #[cfg(any(windows, test))]
-fn windows_query_script() -> String {
-    let task = windows_ps(IDENTITY);
+fn windows_query_script(task: &str) -> String {
+    let task = windows_ps(task);
     format!(
-        "$t=Get-ScheduledTask -TaskName {task} -ErrorAction SilentlyContinue; if ($null -eq $t) {{ 'SCALA_STARTUP_ABSENT' }} else {{ 'SCALA_STARTUP_PRESENT'; @($t.Actions)[0].Execute }}"
+        "$n={task}; $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false }} | ConvertTo-Json -Compress }} else {{ $a=@($t.Actions); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; enabled=$_.Enabled }} }}); $exe=$null; $argstr=$null; if ($a.Count -gt 0) {{ $exe=[string]$a[0].Execute; $argstr=[string]$a[0].Arguments }}; [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; user=[string]$t.Principal.UserId; logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; triggers=$tr; execute=$exe; arguments=$argstr }} | ConvertTo-Json -Compress -Depth 6 }}"
     )
+}
+
+/// Judges a queried task against the exact login-start contract Scala owns:
+/// present, enabled, current-user interactive/limited principal, an AtLogOn
+/// trigger for that user, the exact executable, and the exact `serve` argument.
+/// Any mismatch reports `Disabled` with `broken` set; `Enabled` is only reported
+/// when Windows will actually run the expected definition.
+#[cfg(any(windows, test))]
+fn windows_evaluate(
+    view: &WindowsTaskView,
+    current_user: &str,
+    expected_executable: Option<&Path>,
+    identity: String,
+) -> StartupStatus {
+    let mechanism = "per-user Task Scheduler logon task";
+    if !view.present {
+        return StartupStatus {
+            state: StartupState::Disabled,
+            mechanism,
+            identity,
+            executable: None,
+            stale: false,
+            broken: false,
+        };
+    }
+    let executable = view.execute.as_deref().map(PathBuf::from);
+    let stale = match (&executable, expected_executable) {
+        (Some(registered), Some(current)) => registered != current,
+        _ => false,
+    };
+    let executable_matches = match (&executable, expected_executable) {
+        (_, None) => true,
+        (Some(registered), Some(current)) => registered == current,
+        (None, Some(_)) => false,
+    };
+    let user_matches = view
+        .user
+        .as_deref()
+        .is_some_and(|user| user.eq_ignore_ascii_case(current_user));
+    let logon_matches = view
+        .logon_type
+        .as_deref()
+        .is_some_and(|logon| logon.eq_ignore_ascii_case("Interactive"));
+    let run_level_matches = view
+        .run_level
+        .as_deref()
+        .is_some_and(|level| level.eq_ignore_ascii_case("Limited"));
+    let trigger_matches = view.triggers.iter().any(|trigger| {
+        trigger
+            .trigger_type
+            .to_ascii_lowercase()
+            .contains("logontrigger")
+            && trigger
+                .user
+                .as_deref()
+                .is_some_and(|user| user.eq_ignore_ascii_case(current_user))
+            && trigger.enabled.unwrap_or(true)
+    });
+    let arguments_match = view.arguments.as_deref() == Some(SERVE_ARGUMENT);
+    let healthy = view.enabled
+        && executable_matches
+        && user_matches
+        && logon_matches
+        && run_level_matches
+        && trigger_matches
+        && arguments_match;
+    StartupStatus {
+        state: if healthy {
+            StartupState::Enabled
+        } else {
+            StartupState::Disabled
+        },
+        mechanism,
+        identity,
+        executable,
+        stale,
+        broken: !healthy,
+    }
 }
 
 #[cfg(windows)]
@@ -434,46 +605,44 @@ fn windows_run(script: &str) -> Result<String, StartupError> {
 }
 
 #[cfg(windows)]
+fn windows_identity() -> Result<(String, String), StartupError> {
+    let output = windows_run(&windows_identity_script())?;
+    let view: WindowsIdentityView = windows_parse(&output)?;
+    Ok((view.sid, view.name))
+}
+
+#[cfg(windows)]
 fn windows_status() -> Result<StartupStatus, StartupError> {
-    let output = windows_run(&windows_query_script())?;
-    let mut lines = output.lines();
-    if !matches!(lines.next().map(str::trim), Some("SCALA_STARTUP_PRESENT")) {
-        return Ok(StartupStatus {
-            state: StartupState::Disabled,
-            mechanism: "per-user Task Scheduler logon task",
-            identity: IDENTITY,
-            executable: None,
-            stale: false,
-        });
-    }
-    let executable = lines.next().map(|line| PathBuf::from(line.trim()));
-    let stale = match (&executable, current_executable().ok()) {
-        (Some(registered), Some(current)) => registered != &current,
-        _ => false,
-    };
-    Ok(StartupStatus {
-        state: StartupState::Enabled,
-        mechanism: "per-user Task Scheduler logon task",
-        identity: IDENTITY,
-        executable,
-        stale,
-    })
+    let (sid, user) = windows_identity()?;
+    let identity = windows_task_identity(&sid);
+    let output = windows_run(&windows_query_script(&identity))?;
+    let view: WindowsTaskView = windows_parse(&output)?;
+    Ok(windows_evaluate(
+        &view,
+        &user,
+        current_executable().ok().as_deref(),
+        identity,
+    ))
 }
 
 #[cfg(windows)]
 fn windows_enable() -> Result<(), StartupError> {
+    let (sid, _) = windows_identity()?;
+    let identity = windows_task_identity(&sid);
     let executable = current_executable()?;
     let path = executable.to_str().ok_or(StartupError::InvalidExecutable)?;
     if path.contains('"') || path.chars().any(char::is_control) {
         return Err(StartupError::InvalidExecutable);
     }
-    windows_run(&windows_register_script(path))?;
+    windows_run(&windows_register_script(&identity, path))?;
     Ok(())
 }
 
 #[cfg(windows)]
 fn windows_disable() -> Result<(), StartupError> {
-    windows_run(&windows_unregister_script())?;
+    let (sid, _) = windows_identity()?;
+    let identity = windows_task_identity(&sid);
+    windows_run(&windows_unregister_script(&identity))?;
     Ok(())
 }
 
@@ -496,9 +665,10 @@ pub fn status() -> Result<StartupStatus, StartupError> {
         Ok(StartupStatus {
             state: StartupState::Unsupported,
             mechanism: "unsupported platform",
-            identity: IDENTITY,
+            identity: IDENTITY.to_owned(),
             executable: None,
             stale: false,
+            broken: false,
         })
     }
 }
@@ -660,8 +830,17 @@ mod tests {
     }
 
     #[test]
+    fn startup_setting_definition_satisfies_its_scope() {
+        let definition = setting_definition();
+        assert_eq!(definition.id.as_str(), "server.start_on_login");
+        assert_eq!(definition.id.namespace(), Some("server"));
+        definition.validate_scope().expect("valid Server scope");
+    }
+
+    #[test]
     fn windows_scripts_are_registration_only_and_safely_quoted() {
-        let script = windows_register_script(r"C:\My Apps\scala.exe");
+        let task = windows_task_identity("S-1-5-21-1-2-3-1001");
+        let script = windows_register_script(&task, r"C:\My Apps\scala.exe");
         assert!(!script.contains("Start-ScheduledTask"));
         assert!(!script.contains("Stop-ScheduledTask"));
         assert!(script.contains("Register-ScheduledTask"));
@@ -669,23 +848,154 @@ mod tests {
         assert!(script.contains("-LogonType Interactive -RunLevel Limited"));
         assert!(script.contains("ExecutionTimeLimit ([TimeSpan]::Zero)"));
         assert!(script.contains("RestartCount 3"));
-        assert!(script.contains("-TaskName 'dev.scala.serve'"));
+        assert!(script.contains(&format!("-TaskName '{task}'")));
         assert!(script.contains(r"-Execute 'C:\My Apps\scala.exe'"));
         assert!(script.contains("-Argument 'serve'"));
         // Trailing backslashes are literal inside PowerShell single quotes.
-        let script = windows_register_script(r"C:\Scala\");
+        let script = windows_register_script(&task, r"C:\Scala\");
         assert!(script.contains(r"-Execute 'C:\Scala\'"));
         // Single quotes are doubled; a double quote is rejected at enable time.
         assert_eq!(windows_ps("it's"), "'it''s'");
 
-        let unregister = windows_unregister_script();
+        let unregister = windows_unregister_script(&task);
         assert!(!unregister.contains("Stop-ScheduledTask"));
         assert!(unregister.contains("Unregister-ScheduledTask"));
         assert!(unregister.contains("SilentlyContinue"));
+        assert!(unregister.contains(&task));
 
-        let query = windows_query_script();
-        assert!(query.contains("SCALA_STARTUP_ABSENT"));
-        assert!(query.contains("Actions"));
+        let query = windows_query_script(&task);
+        assert!(query.contains(&task));
+        // Structured object properties, not localized human-readable text.
+        assert!(query.contains("present=$true"));
+        assert!(query.contains("Settings.Enabled"));
+        assert!(query.contains("CimClassName"));
+        assert!(query.contains("LogonType"));
+        assert!(query.contains("ConvertTo-Json"));
+
+        let identity = windows_identity_script();
+        assert!(identity.contains("WindowsIdentity]::GetCurrent()"));
+        assert!(identity.contains("ConvertTo-Json"));
+    }
+
+    #[test]
+    fn windows_task_identity_is_per_user_and_deterministic() {
+        let alice = windows_task_identity("S-1-5-21-111-222-333-1001");
+        let bob = windows_task_identity("S-1-5-21-111-222-333-1002");
+        assert!(alice.starts_with("dev.scala.serve."), "{alice}");
+        assert_eq!(alice, windows_task_identity("S-1-5-21-111-222-333-1001"));
+        assert_ne!(alice, bob);
+        // Bounded: prefix plus a 16-hex-digit digest suffix.
+        assert_eq!(alice.len(), "dev.scala.serve.".len() + 16);
+        assert!(
+            alice["dev.scala.serve.".len()..]
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
+
+        // The identity query is parsed structurally and feeds the derivation.
+        let who: WindowsIdentityView =
+            windows_parse(r#"{"sid":"S-1-5-21-111-222-333-1001","name":"DESKTOP\\alice"}"#)
+                .unwrap();
+        assert_eq!(who.name, r"DESKTOP\alice");
+        assert_eq!(windows_task_identity(&who.sid), alice);
+    }
+
+    fn healthy_windows_task(execute: &str) -> WindowsTaskView {
+        let json = serde_json::json!({
+            "present": true,
+            "enabled": true,
+            "user": r"DESKTOP\alice",
+            "logon_type": "Interactive",
+            "run_level": "Limited",
+            "triggers": [
+                {"type": "MSFT_TaskLogonTrigger", "user": r"DESKTOP\alice", "enabled": true}
+            ],
+            "execute": execute,
+            "arguments": "serve",
+        });
+        serde_json::from_str(&json.to_string()).unwrap()
+    }
+
+    fn windows_health(view: &WindowsTaskView) -> StartupStatus {
+        windows_evaluate(
+            view,
+            r"DESKTOP\alice",
+            Some(Path::new(r"C:\Scala\scala.exe")),
+            "dev.scala.serve.deadbeefdeadbeef".to_owned(),
+        )
+    }
+
+    #[test]
+    fn windows_status_requires_full_login_contract() {
+        // Absent task: truthfully Disabled, not broken.
+        let absent: WindowsTaskView = serde_json::from_str(r#"{"present":false}"#).unwrap();
+        let status = windows_health(&absent);
+        assert_eq!(status.state, StartupState::Disabled);
+        assert!(!status.broken);
+        assert!(!status.stale);
+
+        // Registered, enabled, exact definition: the only Enabled outcome.
+        let status = windows_health(&healthy_windows_task(r"C:\Scala\scala.exe"));
+        assert_eq!(status.state, StartupState::Enabled);
+        assert!(!status.broken);
+        assert!(!status.stale);
+        assert_eq!(
+            status.executable,
+            Some(PathBuf::from(r"C:\Scala\scala.exe"))
+        );
+
+        // Registered but Disabled: never Enabled.
+        let mut disabled = healthy_windows_task(r"C:\Scala\scala.exe");
+        disabled.enabled = false;
+        let status = windows_health(&disabled);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        // Wrong executable: stale/broken, never Enabled.
+        let status = windows_health(&healthy_windows_task(r"C:\Other\scala.exe"));
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.stale && status.broken);
+
+        // Wrong arguments: broken, never Enabled.
+        let mut wrong_args = healthy_windows_task(r"C:\Scala\scala.exe");
+        wrong_args.arguments = Some("serve --port 9000".to_owned());
+        let status = windows_health(&wrong_args);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        // Missing/foreign AtLogOn trigger: broken, never Enabled.
+        let mut no_trigger = healthy_windows_task(r"C:\Scala\scala.exe");
+        no_trigger.triggers.clear();
+        let status = windows_health(&no_trigger);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        let mut boot_trigger = healthy_windows_task(r"C:\Scala\scala.exe");
+        boot_trigger.triggers[0].trigger_type = "MSFT_TaskBootTrigger".to_owned();
+        let status = windows_health(&boot_trigger);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        // Wrong trigger user: broken, never Enabled.
+        let mut wrong_trigger_user = healthy_windows_task(r"C:\Scala\scala.exe");
+        wrong_trigger_user.triggers[0].user = Some(r"DESKTOP\bob".to_owned());
+        let status = windows_health(&wrong_trigger_user);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        // Wrong principal/user: broken, never Enabled.
+        let mut wrong_user = healthy_windows_task(r"C:\Scala\scala.exe");
+        wrong_user.user = Some(r"DESKTOP\bob".to_owned());
+        let status = windows_health(&wrong_user);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        // Wrong principal semantics: broken, never Enabled.
+        let mut elevated = healthy_windows_task(r"C:\Scala\scala.exe");
+        elevated.run_level = Some("Highest".to_owned());
+        let status = windows_health(&elevated);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
     }
 
     #[test]
