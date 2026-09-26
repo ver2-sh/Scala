@@ -7,6 +7,17 @@ process defaults, scheduler/cache/state, native target bindings, masked-draft
 configuration/implementation, sparse proposal acceptance, Vision and schema-20
 startup/request evidence. Runtime code and templates are not patched or emulated.
 
+For native Windows, Scala additionally manages the reviewed portable package
+published by `natpate/ninfer-windows` `v0.7.1` (Windows x86_64, CUDA, RTX
+5090/sm_120a; no WSL). That port remains in the v2 generation and includes
+DFlash2. Its repository, release tag, asset and digest identities are retained
+as its own provenance; it is not relabeled as canonical `Neroued/ninfer`, whose
+managed route stays Linux source-only. Upstream `v0.8.x`/`v0.9.x` portable
+releases moved to NInfer v3 artifacts and remain unavailable while Scala admits
+v2 containers only. Capability credit applies to the exact reviewed release;
+other admitted `v0.7.x` packages keep truthful identity but stay
+needs-attention rather than inheriting the reviewed contract.
+
 Native target registry inspection covers Qwen3.6-27B and Qwen3.8-27B with
 `groupwise-int` and `nvfp4`, plus Qwen3.6-35B-A3B `groupwise-int`. The reviewed
 27B binding/variant supports DFlash2 when its complete native tensor bundle is

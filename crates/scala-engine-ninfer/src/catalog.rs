@@ -246,7 +246,7 @@ fn provider_error(message: &str) -> CatalogError {
     }
 }
 
-fn parse_github_timestamp(value: &str) -> Option<i64> {
+pub(crate) fn parse_github_timestamp(value: &str) -> Option<i64> {
     if value.len() != 20
         || value.as_bytes().get(4) != Some(&b'-')
         || value.as_bytes().get(7) != Some(&b'-')

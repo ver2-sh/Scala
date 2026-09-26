@@ -35,8 +35,10 @@ use walkdir::WalkDir;
 mod catalog;
 mod protocol;
 mod settings;
+mod windows_catalog;
 
 pub use catalog::NinferRuntimeCatalogProvider;
+pub use windows_catalog::NinferWindowsRuntimeCatalogProvider;
 
 pub const ENGINE_ID: &str = "ninfer";
 pub const UPSTREAM_REPOSITORY: &str = "https://github.com/Neroued/ninfer";
@@ -46,6 +48,7 @@ const CURRENT_PACKAGE_CAPABILITY_REVISION: &str = "d49296868dcc17bd478ec185f0d3a
 const CURRENT_PACKAGE_CAPABILITY_TREE: &str = "8e2f0275fc533cf11fe05a4ac3ac85f00eb91c72";
 const CURRENT_REQUEST_LOG_SCHEMA: u32 = 20;
 const MANAGED_NINFER_FUNCTIONAL_VARIANT: &str = "managed-linux-x86_64-cuda-sm120a";
+const MANAGED_NINFER_WINDOWS_FUNCTIONAL_VARIANT: &str = "managed-windows-x86_64-cuda-sm120a";
 
 // These are Git blob identities, not whole-repository identities. A later
 // upstream commit therefore retains a reviewed capability when the source
@@ -520,6 +523,19 @@ fn managed_ninfer_variant_update_identity(
     })
 }
 
+// The portable Windows releases form their own functional line: they must
+// never update toward canonical Linux source snapshots, and Linux source
+// builds must never update toward this separately published package. Within
+// the line, version ordering follows the admitted v0.7.x releases.
+fn managed_windows_ninfer_variant_update_identity(
+    identity: &scala_core::RuntimeIdentity,
+) -> Option<RuntimeVariantUpdateIdentity> {
+    windows_catalog::is_managed_windows_identity(identity).then(|| RuntimeVariantUpdateIdentity {
+        functional_variant: MANAGED_NINFER_WINDOWS_FUNCTIONAL_VARIANT.to_owned(),
+        source_recipe_generation: None,
+    })
+}
+
 // Scala owns identity, private transport, device selection, structured load
 // settings, request semantics, and all sampler behavior.
 const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
@@ -776,7 +792,7 @@ fn apply_ninfer_runtime_contract(
         if !setting_capability_is_reviewed(id, capabilities) {
             unsupported(
                 definition,
-                "this NInfer source runtime's capability contract for the setting is outdated or unreviewed; install or select the current reviewed runtime",
+                "this NInfer runtime's capability contract for the setting is outdated or unreviewed; install or select the current reviewed runtime",
             );
             continue;
         }
@@ -839,6 +855,20 @@ fn validate_ninfer_settings_prelaunch(
 fn ninfer_runtime_capabilities_for_installed(
     runtime: &InstalledRuntime,
 ) -> NinferRuntimeCapabilities {
+    // A managed portable Windows install keeps truthful immutable provenance
+    // (verified archive digest + release tag + adapter probe), so its identity
+    // is trustworthy. Capability domains are credited only for the exact
+    // reviewed release; other admitted releases stay unproven rather than
+    // inheriting credit the port review did not establish.
+    if matches!(
+        runtime.manifest.acquisition_method,
+        RuntimeAcquisitionMethod::OfficialReleaseAsset
+            | RuntimeAcquisitionMethod::PreseededOfficialPack
+    ) && windows_catalog::is_managed_windows_identity(&runtime.manifest.identity)
+    {
+        let reviewed = windows_catalog::is_reviewed_release_identity(&runtime.manifest.identity);
+        return ninfer_reviewed_capabilities(true, NinferReviewedDomains::all(reviewed));
+    }
     let managed_source = runtime.manifest.acquisition_method
         == RuntimeAcquisitionMethod::SourceBuild
         && runtime.manifest.identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
@@ -882,6 +912,14 @@ fn ninfer_runtime_capabilities_for_installed(
 fn ninfer_runtime_capabilities_for_available(
     runtime: &AvailableRuntime,
 ) -> NinferRuntimeCapabilities {
+    if matches!(
+        runtime.acquisition,
+        scala_core::RuntimeAcquisitionPlan::ReleaseAsset { .. }
+    ) && windows_catalog::is_managed_windows_identity(&runtime.identity)
+    {
+        let reviewed = windows_catalog::is_reviewed_release_identity(&runtime.identity);
+        return ninfer_reviewed_capabilities(true, NinferReviewedDomains::all(reviewed));
+    }
     let source = match &runtime.acquisition {
         scala_core::RuntimeAcquisitionPlan::SourceBuild(plan) => Some(&plan.source),
         _ => None,
@@ -1441,6 +1479,7 @@ impl EngineAdapter for NinferAdapter {
         identity: &scala_core::RuntimeIdentity,
     ) -> RuntimeVariantUpdateIdentity {
         managed_ninfer_variant_update_identity(identity)
+            .or_else(|| managed_windows_ninfer_variant_update_identity(identity))
             .unwrap_or_else(|| RuntimeVariantUpdateIdentity::exact(identity))
     }
 
@@ -1560,16 +1599,22 @@ impl EngineAdapter for NinferAdapter {
         )
         .compatibility;
         let base = combine_compatibility(native, device);
-        if runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::SourceBuild
-            && (!capabilities.trustworthy_identity
-                || !capabilities.request_protocol_semantics
-                || !capabilities.request_sampler_semantics
-                || !capabilities.startup_proof)
-        {
+        let unproven = match runtime.manifest.acquisition_method {
+            RuntimeAcquisitionMethod::SourceBuild
+            | RuntimeAcquisitionMethod::OfficialReleaseAsset
+            | RuntimeAcquisitionMethod::PreseededOfficialPack => {
+                !capabilities.trustworthy_identity
+                    || !capabilities.request_protocol_semantics
+                    || !capabilities.request_sampler_semantics
+                    || !capabilities.startup_proof
+            }
+            RuntimeAcquisitionMethod::ExternalBinary => false,
+        };
+        if unproven {
             combine_compatibility(
                 base,
                 RuntimeCompatibility::NeedsAttention(
-                    "this NInfer source runtime has outdated or unreviewed request/request-sampler/startup capability contracts; install or select the current reviewed runtime"
+                    "this NInfer runtime has outdated or unreviewed request/request-sampler/startup capability contracts; install or select the current reviewed runtime"
                         .to_owned(),
                 ),
             )
@@ -1610,18 +1655,20 @@ impl EngineAdapter for NinferAdapter {
         )
         .compatibility;
         let base = combine_compatibility(native, device);
-        if matches!(
-            &runtime.acquisition,
+        let unproven = match &runtime.acquisition {
             scala_core::RuntimeAcquisitionPlan::SourceBuild(_)
-        ) && (!capabilities.trustworthy_identity
-            || !capabilities.request_protocol_semantics
-            || !capabilities.request_sampler_semantics
-            || !capabilities.startup_proof)
-        {
+            | scala_core::RuntimeAcquisitionPlan::ReleaseAsset { .. } => {
+                !capabilities.trustworthy_identity
+                    || !capabilities.request_protocol_semantics
+                    || !capabilities.request_sampler_semantics
+                    || !capabilities.startup_proof
+            }
+        };
+        if unproven {
             combine_compatibility(
                 base,
                 RuntimeCompatibility::NeedsAttention(
-                    "this NInfer source runtime has outdated or unreviewed request/request-sampler/startup capability contracts; install or select the current reviewed runtime"
+                    "this NInfer runtime has outdated or unreviewed request/request-sampler/startup capability contracts; install or select the current reviewed runtime"
                         .to_owned(),
                 ),
             )
@@ -1923,7 +1970,7 @@ impl EngineAdapter for NinferAdapter {
         let runtime_capabilities = ninfer_runtime_capabilities_for_installed(&request.runtime);
         if !runtime_capabilities.startup_proof {
             return Err(EngineError::InvalidConfiguration(
-                "this NInfer source runtime's request-log/startup-proof capability contract is outdated or unreviewed; install or select the current reviewed runtime"
+                "this NInfer runtime's request-log/startup-proof capability contract is outdated or unreviewed; install or select the current reviewed runtime"
                     .to_owned(),
             ));
         }
@@ -3692,6 +3739,60 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn windows_and_linux_managed_lines_cannot_update_across_each_other() {
+        let identity = |platform: &str| scala_core::RuntimeIdentity {
+            engine_id: ENGINE_ID.to_owned(),
+            package_family: if platform == "windows" {
+                windows_catalog::PACKAGE_FAMILY.to_owned()
+            } else {
+                catalog::PACKAGE_FAMILY.to_owned()
+            },
+            version: if platform == "windows" {
+                "0.7.1".to_owned()
+            } else {
+                "git-20260831-aaaaaaaa".to_owned()
+            },
+            upstream_revision: Some("a".repeat(40)),
+            platform: platform.to_owned(),
+            architecture: "x86_64".to_owned(),
+            accelerator: "cuda".to_owned(),
+            variant: if platform == "windows" {
+                windows_catalog::VARIANT.to_owned()
+            } else {
+                "ninfer-serve-v2-sm120a".to_owned()
+            },
+            package: scala_core::RuntimePackageIdentity {
+                provider_id: if platform == "windows" {
+                    windows_catalog::PROVIDER_ID.to_owned()
+                } else {
+                    PROVIDER_ID.to_owned()
+                },
+                repository: Some(if platform == "windows" {
+                    windows_catalog::GITHUB_REPOSITORY.to_owned()
+                } else {
+                    GITHUB_REPOSITORY.to_owned()
+                }),
+                release_tag: platform
+                    .eq("windows")
+                    .then(|| windows_catalog::REVIEWED_RELEASE_TAG.to_owned()),
+                asset_id: None,
+                asset_name: None,
+                additional_assets: Vec::new(),
+            },
+        };
+        let adapter = NinferAdapter::from_config(None, Path::new("."));
+        let windows = adapter.runtime_variant_update_identity(&identity("windows"));
+        let linux = adapter.runtime_variant_update_identity(&identity("linux"));
+        assert_eq!(
+            windows.functional_variant,
+            MANAGED_NINFER_WINDOWS_FUNCTIONAL_VARIANT
+        );
+        assert_eq!(windows.source_recipe_generation, None);
+        assert_eq!(linux.functional_variant, MANAGED_NINFER_FUNCTIONAL_VARIANT);
+        assert_ne!(windows.functional_variant, linux.functional_variant);
     }
 
     #[test]

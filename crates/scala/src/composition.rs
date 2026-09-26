@@ -20,6 +20,7 @@ use scala_engine_llama_cpp::{
 };
 use scala_engine_ninfer::{
     ENGINE_ID as NINFER_ENGINE_ID, NinferAdapter, NinferRuntimeCatalogProvider,
+    NinferWindowsRuntimeCatalogProvider,
 };
 use scala_engine_q27::{ENGINE_ID as Q27_ENGINE_ID, Q27Adapter, Q27RuntimeCatalogProvider};
 
@@ -135,6 +136,7 @@ pub fn runtime_pack_manager_from_paths(
         Arc::new(LlamaCppSourceRuntimeCatalogProvider::new()),
         Arc::new(Q27RuntimeCatalogProvider::new()),
         Arc::new(NinferRuntimeCatalogProvider::new()),
+        Arc::new(NinferWindowsRuntimeCatalogProvider::new()),
     ];
     Ok(RuntimePackManager::new(paths, registry, providers)?)
 }

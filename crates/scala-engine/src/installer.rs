@@ -1981,7 +1981,11 @@ fn extract_zip(archive_path: &Path, staging: &Path) -> Result<(), RuntimeInstall
         let mut entry = archive
             .by_index(index)
             .map_err(|error| RuntimeInstallError::UnsafeArchive(error.to_string()))?;
-        let name = entry.name().to_owned();
+        // ZIP names use '/', but some Windows-produced archives record '\';
+        // normalize before the containment checks so both encodings describe
+        // the same staging-relative path while '..' and absolute or drive
+        // paths remain rejected.
+        let name = entry.name().replace('\\', "/");
         let relative = checked_archive_path(&name)?;
         if !seen.insert(normalized_archive_key(&relative)) {
             return Err(RuntimeInstallError::UnsafeArchive(format!(
@@ -2002,7 +2006,7 @@ fn extract_zip(archive_path: &Path, staging: &Path) -> Result<(), RuntimeInstall
             }
         }
         let destination = staging.join(&relative);
-        if entry.is_dir() {
+        if entry.is_dir() || name.ends_with('/') {
             std::fs::create_dir_all(&destination)
                 .map_err(|error| RuntimeInstallError::UnsafeArchive(error.to_string()))?;
             continue;
@@ -2586,6 +2590,53 @@ mod tests {
         .await
         .expect("detached blocking writer must ultimately drop and clean staging");
         assert!(!staging_path.exists());
+    }
+
+    #[test]
+    fn zip_backslash_separators_extract_to_the_same_relative_layout() {
+        let workspace = tempfile::tempdir().expect("temporary directory");
+        let zip_path = workspace.path().join("portable.zip");
+        {
+            let file = std::fs::File::create(&zip_path).expect("zip file");
+            let mut zip = zip::ZipWriter::new(file);
+            for (name, body) in [
+                ("package\\ninfer-serve.exe", "exe"),
+                ("package\\runtime.dll", "dll"),
+                ("package\\models\\README.txt", "readme"),
+            ] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .expect("zip entry");
+                zip.write_all(body.as_bytes()).expect("zip contents");
+            }
+            zip.finish().expect("finish zip");
+        }
+        let staging = workspace.path().join("staging");
+        std::fs::create_dir(&staging).expect("staging directory");
+        extract_archive(&zip_path, &staging, RuntimeArchiveFormat::Zip)
+            .expect("backslash-separated entries extract under the same layout");
+        for relative in [
+            "package/ninfer-serve.exe",
+            "package/runtime.dll",
+            "package/models/README.txt",
+        ] {
+            assert!(staging.join(relative).is_file(), "{relative}");
+        }
+
+        let bad_path = workspace.path().join("bad.zip");
+        {
+            let file = std::fs::File::create(&bad_path).expect("zip file");
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("..\\escape", zip::write::SimpleFileOptions::default())
+                .expect("zip entry");
+            zip.write_all(b"bad").expect("zip contents");
+            zip.finish().expect("finish zip");
+        }
+        let staging = workspace.path().join("bad-staging");
+        std::fs::create_dir(&staging).expect("bad staging directory");
+        assert!(matches!(
+            extract_archive(&bad_path, &staging, RuntimeArchiveFormat::Zip),
+            Err(RuntimeInstallError::UnsafeArchive(_))
+        ));
     }
 
     #[test]
