@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.4 — Windows startup and terminal reliability
+
+Improves Windows desktop behavior while keeping Scala's serving, runtime and
+settings ownership unchanged.
+
+- Run login-started Scala as a background process without leaving a persistent
+  console window, while normal CLI and TUI invocations keep their console.
+- Harden Windows login startup with SID-based task ownership, an explicit
+  delayed AtLogOn trigger, missed-start catch-up and bounded early-login retries.
+- Validate the full owned Task Scheduler definition, including principal,
+  action/arguments, trigger state/delay, restart policy, execution limit and
+  stored battery settings.
+- Use a Windows-safe glyph set in the TUI to avoid fallback-width rendering
+  problems on common console fonts.
+- Keep Windows NInfer startup-log cleanup dependency-free and compatible with
+  native package execution.
+
 ## 0.1.3 — Native Windows NInfer
 
 Adds a managed native-Windows NInfer route while preserving Scala's existing
