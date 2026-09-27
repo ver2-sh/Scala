@@ -9,6 +9,7 @@ mod update;
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use cli::{
@@ -26,6 +27,12 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // The login-startup launch detaches before anything can write to the
+    // inherited console, so no terminal window stays visible. Ordinary
+    // invocations never carry the flag and keep their console.
+    if std::env::args_os().any(|arg| arg == scala_core::startup::LOGIN_STARTUP_FLAG) {
+        scala_core::startup::detach_console();
+    }
     color_eyre::install().ok();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -85,6 +92,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         startup::run(&args.command, cli.json)?;
         return Ok(ExitCode::SUCCESS);
     }
+    if matches!(&cli.command, Some(Command::Serve(args)) if args.login_startup) {
+        return serve_at_login(&paths, cli.json).await;
+    }
     let _installation_guard = scala_update::session_guard()?;
     let core = ApplicationCore::load().await?;
     let _log_guard = init_logging(&paths);
@@ -126,32 +136,8 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 println!("Scala Link disabled in configuration. Restart Scala to disconnect.");
             }
         },
-        Command::Serve => {
-            let services = composition::ApplicationServices::new(&core)?;
-            let startup_guard = composition::ServerStartupGuard::acquire(&core.paths).await?;
-            let server = services
-                .start_server(core, composition::ModelDiscoveryReadiness::RequireReady)
-                .await?;
-            drop(startup_guard);
-            report_insecure_remote(server.auth_status(), cli.json);
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string(&serde_json::json!({
-                        "event": "listening",
-                        "address": server.local_addr(),
-                    }))?
-                );
-            } else {
-                println!("Scala API listening at http://{}", server.local_addr());
-                println!("Press Ctrl+C to stop.");
-            }
-            server
-                .run_while(async {
-                    shutdown_signal().await;
-                    Ok(())
-                })
-                .await?;
+        Command::Serve(_) => {
+            serve(core, cli.json).await?;
         }
         Command::Benchmarks(args) => {
             let client = scala_engine::ControlClient::discover(&core.paths).await?;
@@ -450,6 +436,111 @@ async fn run_tui(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
             setting_definitions,
         ))
         .await
+}
+
+/// Run the HTTP API gateway until shutdown. Shared by an ordinary
+/// `scala serve` and by each login-startup attempt.
+async fn serve(core: Arc<ApplicationCore>, json_output: bool) -> Result<()> {
+    let services = composition::ApplicationServices::new(&core)?;
+    let startup_guard = composition::ServerStartupGuard::acquire(&core.paths).await?;
+    let server = services
+        .start_server(core, composition::ModelDiscoveryReadiness::RequireReady)
+        .await?;
+    drop(startup_guard);
+    report_insecure_remote(server.auth_status(), json_output);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "event": "listening",
+                "address": server.local_addr(),
+            }))?
+        );
+    } else {
+        println!("Scala API listening at http://{}", server.local_addr());
+        println!("Press Ctrl+C to stop.");
+    }
+    server
+        .run_while(async {
+            shutdown_signal().await;
+            Ok(())
+        })
+        .await
+}
+
+/// One serve attempt failed before staying up long enough to count as
+/// established: retry while the bounded window allows, or stop.
+struct LoginRetry {
+    started: Instant,
+    delay: Duration,
+}
+
+/// An attempt surviving this long counts as established; a later exit is a
+/// genuine failure, not a login-time race.
+const LOGIN_STABLE_AFTER: Duration = Duration::from_secs(120);
+/// Total budget across attempts for transient login-session failures (network
+/// interfaces, mapped paths, a competing Scala still finishing startup).
+const LOGIN_STARTUP_WINDOW: Duration = Duration::from_secs(15 * 60);
+const LOGIN_RETRY_DELAY: Duration = Duration::from_secs(15);
+const LOGIN_RETRY_DELAY_MAX: Duration = Duration::from_secs(60);
+
+impl LoginRetry {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            delay: LOGIN_RETRY_DELAY,
+        }
+    }
+
+    /// `Some(delay)` waits that long before the next attempt; `None` stops.
+    /// An established attempt or an exhausted window ends the loop, so a
+    /// permanent configuration error cannot spin.
+    fn backoff(&mut self, now: Instant, attempt_uptime: Duration) -> Option<Duration> {
+        if attempt_uptime >= LOGIN_STABLE_AFTER {
+            return None;
+        }
+        if now + self.delay >= self.started + LOGIN_STARTUP_WINDOW {
+            return None;
+        }
+        let delay = self.delay;
+        self.delay = (self.delay * 2).min(LOGIN_RETRY_DELAY_MAX);
+        Some(delay)
+    }
+}
+
+/// `scala serve --login-startup`: the entry point used only by the owned
+/// Windows Scheduled Task. Every attempt runs the complete serve pipeline —
+/// session guard, configuration load, ownership guard, bind — so transient
+/// logon-session timing retries as one bounded unit.
+async fn serve_at_login(paths: &AppPaths, json_output: bool) -> Result<ExitCode> {
+    let _log_guard = init_logging(paths);
+    let mut retry = LoginRetry::new();
+    loop {
+        let attempt_started = Instant::now();
+        match serve_login_attempt(json_output).await {
+            Ok(()) => return Ok(ExitCode::SUCCESS),
+            Err(error) => match retry.backoff(Instant::now(), attempt_started.elapsed()) {
+                Some(delay) => {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        delay_seconds = delay.as_secs(),
+                        "login-startup serve failed early; retrying"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = shutdown_signal() => return Ok(ExitCode::SUCCESS),
+                    }
+                }
+                None => return Err(error),
+            },
+        }
+    }
+}
+
+async fn serve_login_attempt(json_output: bool) -> Result<()> {
+    let _installation_guard = scala_update::session_guard()?;
+    let core = ApplicationCore::load().await?;
+    serve(core, json_output).await
 }
 
 fn report_insecure_remote(status: &PublicAuthStatus, json_output: bool) {
@@ -1412,4 +1503,51 @@ fn init_logging(paths: &AppPaths) -> tracing_appender::non_blocking::WorkerGuard
         .with_writer(writer)
         .init();
     guard
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_retry_is_bounded_and_stops_on_established_or_exhausted() {
+        let start = Instant::now();
+        let mut retry = LoginRetry::new();
+
+        // An attempt that stayed up past the stable window is done — a later
+        // exit is a real failure, not a login race.
+        assert_eq!(
+            retry.backoff(start + Duration::from_secs(130), LOGIN_STABLE_AFTER),
+            None
+        );
+
+        // Early failures retry with a doubling, capped delay.
+        let mut retry = LoginRetry::new();
+        assert_eq!(
+            retry.backoff(start, Duration::ZERO),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            retry.backoff(start + Duration::from_secs(15), Duration::ZERO),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            retry.backoff(start + Duration::from_secs(45), Duration::ZERO),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            retry.backoff(start + Duration::from_secs(105), Duration::ZERO),
+            Some(Duration::from_secs(60))
+        );
+
+        // The window is finite: once the next delay would pass it, stop.
+        let mut retry = LoginRetry::new();
+        assert_eq!(
+            retry.backoff(
+                start + LOGIN_STARTUP_WINDOW - Duration::from_secs(10),
+                Duration::ZERO
+            ),
+            None
+        );
+    }
 }

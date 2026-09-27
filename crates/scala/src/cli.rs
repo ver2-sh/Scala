@@ -50,7 +50,7 @@ pub enum Command {
     /// Launch the interactive interface, attaching to or owning the serving stack
     Tui,
     /// Run the local HTTP API gateway headlessly until interrupted
-    Serve,
+    Serve(ServeArgs),
     /// Inspect public authentication or manage Scala API keys
     Auth(AuthArgs),
     /// Show current server, model, and engine state
@@ -114,6 +114,16 @@ pub struct DoctorArgs {
     /// Show successful checks in addition to warnings and failures
     #[arg(long)]
     pub verbose: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ServeArgs {
+    /// Internal: marks the OS login-startup launch owned by the Windows
+    /// Scheduled Task (detaches the session console and retries transient
+    /// early-logon startup failures within a bounded window). Not for
+    /// interactive use; `scala serve` itself is unchanged.
+    #[arg(long, hide = true)]
+    pub login_startup: bool,
 }
 
 #[derive(Debug, Args)]
@@ -472,6 +482,24 @@ mod update_tests {
             Some(Command::Update(UpdateArgs {
                 check: false,
                 yes: false
+            }))
+        ));
+    }
+
+    #[test]
+    fn serve_parses_plain_and_internal_login_startup_flag() {
+        let cli = Cli::try_parse_from(["scala", "serve"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve(ServeArgs {
+                login_startup: false
+            }))
+        ));
+        let cli = Cli::try_parse_from(["scala", "serve", "--login-startup"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Serve(ServeArgs {
+                login_startup: true
             }))
         ));
     }

@@ -30,6 +30,68 @@ pub const WINDOWS_TASK_PREFIX: &str = "dev.scala.serve";
 #[cfg(any(windows, test))]
 const SERVE_ARGUMENT: &str = "serve";
 
+/// Internal argument appended to the owned Windows Scheduled Task launch. It
+/// marks the process as the OS login-startup launch: the server detaches from
+/// the console Task Scheduler allocates (no persistent terminal window) and
+/// retries transient early-logon failures within a bounded window. The flag is
+/// hidden and changes nothing for an ordinary `scala serve`.
+pub const LOGIN_STARTUP_FLAG: &str = "--login-startup";
+
+/// The complete owned Scheduled Task argument string: `serve` plus the
+/// login-startup marker.
+#[cfg(any(windows, test))]
+fn windows_task_arguments() -> String {
+    format!("{SERVE_ARGUMENT} {LOGIN_STARTUP_FLAG}")
+}
+
+/// Detach this process from the console its launcher allocated. Task Scheduler
+/// runs console-subsystem executables attached to the interactive console,
+/// which leaves a persistent conhost window on the user's session. For the
+/// owned `--login-startup` launch only, the console is hidden if it already
+/// materialized and then freed outright; standard handles are rebound to NUL
+/// so detached output cannot hit a dead console handle. Ordinary invocations
+/// never call this: CLI and TUI keep their normal console.
+#[cfg(windows)]
+pub fn detach_console() {
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
+        System::Console::{
+            FreeConsole, GetConsoleWindow, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+            SetStdHandle,
+        },
+        UI::WindowsAndMessaging::{SW_HIDE, ShowWindow},
+    };
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    unsafe {
+        let window = GetConsoleWindow();
+        if !window.is_null() {
+            ShowWindow(window, SW_HIDE);
+        }
+        FreeConsole();
+        let name: Vec<u16> = "NUL\0".encode_utf16().collect();
+        let null = CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        );
+        if !null.is_null() {
+            SetStdHandle(STD_INPUT_HANDLE, null);
+            SetStdHandle(STD_OUTPUT_HANDLE, null);
+            SetStdHandle(STD_ERROR_HANDLE, null);
+        }
+    }
+}
+
+/// Non-Windows launches never own a console to detach from.
+#[cfg(not(windows))]
+pub fn detach_console() {}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum StartupState {
     Disabled,
@@ -442,8 +504,11 @@ struct WindowsIdentityView {
 struct WindowsTriggerView {
     #[serde(default, rename = "type")]
     trigger_type: String,
+    /// The trigger user's account resolved to its SID by the query script;
+    /// `null` when the identifier cannot be translated to a SID at all. The raw
+    /// reported text is ignored: identity is the resolved SID only.
     #[serde(default)]
-    user: Option<String>,
+    user_sid: Option<String>,
     #[serde(default)]
     enabled: Option<bool>,
 }
@@ -470,8 +535,11 @@ struct WindowsTaskView {
     present: bool,
     #[serde(default)]
     enabled: bool,
+    /// The principal's account resolved to its SID by the query script;
+    /// `null` when the identifier cannot be translated to a SID at all. The raw
+    /// reported text is ignored: identity is the resolved SID only.
     #[serde(default)]
-    user: Option<String>,
+    user_sid: Option<String>,
     #[serde(default)]
     logon_type: Option<String>,
     #[serde(default)]
@@ -500,9 +568,9 @@ fn windows_parse<T: serde::de::DeserializeOwned>(output: &str) -> Result<T, Star
 fn windows_register_script(task: &str, executable: &str) -> String {
     let task = windows_ps(task);
     format!(
-        "$a=New-ScheduledTaskAction -Execute {} -Argument {}; $u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited; $t=New-ScheduledTaskTrigger -AtLogOn -User $u; $s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries; Register-ScheduledTask -TaskName {task} -Action $a -Principal $p -Trigger $t -Settings $s -Force | Out-Null",
+        "$a=New-ScheduledTaskAction -Execute {} -Argument {}; $u=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive -RunLevel Limited; $t=New-ScheduledTaskTrigger -AtLogOn -User $u; $t.Delay='PT30S'; $s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable; Register-ScheduledTask -TaskName {task} -Action $a -Principal $p -Trigger $t -Settings $s -Force | Out-Null",
         windows_ps(executable),
-        windows_ps(SERVE_ARGUMENT),
+        windows_ps(&windows_task_arguments()),
     )
 }
 
@@ -522,32 +590,37 @@ fn windows_unregister_script(task: &str) -> String {
 #[cfg(any(windows, test))]
 fn windows_query_script(task: &str) -> String {
     let task = windows_ps(task);
+    // Account identifiers are resolved to SIDs inside the query: Windows
+    // exposes the same local account as `name`, `MACHINE\name`, or `S-1-5-…`,
+    // and only the resolved SID is authoritative for identity. `$rs` accepts a
+    // SID string or any account name form; anything unresolvable yields `null`,
+    // which fails closed.
     format!(
-        "$n={task}; $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false }} | ConvertTo-Json -Compress }} else {{ $a=@(@($t.Actions) | ForEach-Object {{ [pscustomobject]@{{ execute=[string]$_.Execute; arguments=[string]$_.Arguments }} }}); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; enabled=$_.Enabled }} }}); [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; user=[string]$t.Principal.UserId; logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; action_count=$a.Count; actions=$a; trigger_count=$tr.Count; triggers=$tr }} | ConvertTo-Json -Compress -Depth 6 }}"
+        "$n={task}; $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false }} | ConvertTo-Json -Compress }} else {{ $rs={{ param($u) if ([string]::IsNullOrWhiteSpace([string]$u)) {{ return $null }} try {{ return (New-Object System.Security.Principal.SecurityIdentifier([string]$u)).Value }} catch {{}} try {{ return (New-Object System.Security.Principal.NTAccount([string]$u)).Translate([System.Security.Principal.SecurityIdentifier]).Value }} catch {{ return $null }} }}; $a=@(@($t.Actions) | ForEach-Object {{ [pscustomobject]@{{ execute=[string]$_.Execute; arguments=[string]$_.Arguments }} }}); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; user_sid=(& $rs $_.UserId); enabled=$_.Enabled }} }}); [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; user=[string]$t.Principal.UserId; user_sid=(& $rs $t.Principal.UserId); logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; action_count=$a.Count; actions=$a; trigger_count=$tr.Count; triggers=$tr }} | ConvertTo-Json -Compress -Depth 6 }}"
     )
 }
 
-/// Task Scheduler may expose the same account either as `DOMAIN\name` or as
-/// its SID string; both representations identify the current user, so
-/// principal and trigger users match on either form.
+/// The query script resolves every reported account identifier to its SID
+/// before it reaches this check, so `name`, `MACHINE\name` and the literal SID
+/// form all reduce to one comparison: identity is established only when the
+/// resolved SID equals the current user's SID. An unresolvable or foreign
+/// account never matches.
 #[cfg(any(windows, test))]
-fn windows_same_account(reported: Option<&str>, name: &str, sid: &str) -> bool {
-    reported.is_some_and(|user| {
-        !user.is_empty() && (user.eq_ignore_ascii_case(name) || user.eq_ignore_ascii_case(sid))
-    })
+fn windows_same_user(reported_sid: Option<&str>, current_sid: &str) -> bool {
+    reported_sid.is_some_and(|sid| !sid.is_empty() && sid.eq_ignore_ascii_case(current_sid))
 }
 
 /// Judges a queried task against the exact login-start contract Scala owns:
-/// present, enabled, current-user interactive/limited principal, exactly one
-/// action binding the exact executable with the exact `serve` argument, and
-/// exactly one enabled AtLogOn trigger for that user. Additional actions or
-/// triggers are mutations the contract does not allow: any mismatch reports
-/// `Disabled` with `broken` set; `Enabled` is only reported when Windows will
-/// actually run the expected definition and nothing else.
+/// present, enabled, current-user interactive/limited principal (by resolved
+/// SID), exactly one action binding the exact executable with the exact
+/// `serve --login-startup` argument, and exactly one enabled AtLogOn trigger
+/// for that user. Additional actions or triggers are mutations the contract
+/// does not allow: any mismatch reports `Disabled` with `broken` set;
+/// `Enabled` is only reported when Windows will actually run the expected
+/// definition and nothing else.
 #[cfg(any(windows, test))]
 fn windows_evaluate(
     view: &WindowsTaskView,
-    current_user: &str,
     current_sid: &str,
     expected_executable: Option<&Path>,
     identity: String,
@@ -583,13 +656,14 @@ fn windows_evaluate(
             (Some(registered), Some(current)) => registered == current,
             (None, Some(_)) => false,
         };
+    let expected_arguments = windows_task_arguments();
     let arguments_match = single_action
         && view
             .actions
             .first()
             .and_then(|action| action.arguments.as_deref())
-            == Some(SERVE_ARGUMENT);
-    let user_matches = windows_same_account(view.user.as_deref(), current_user, current_sid);
+            == Some(expected_arguments.as_str());
+    let user_matches = windows_same_user(view.user_sid.as_deref(), current_sid);
     let logon_matches = view
         .logon_type
         .as_deref()
@@ -604,7 +678,7 @@ fn windows_evaluate(
                 .trigger_type
                 .to_ascii_lowercase()
                 .contains("logontrigger")
-                && windows_same_account(trigger.user.as_deref(), current_user, current_sid)
+                && windows_same_user(trigger.user_sid.as_deref(), current_sid)
                 && trigger.enabled.unwrap_or(true)
         });
     let healthy = view.enabled
@@ -650,13 +724,12 @@ fn windows_identity() -> Result<(String, String), StartupError> {
 
 #[cfg(windows)]
 fn windows_status() -> Result<StartupStatus, StartupError> {
-    let (sid, user) = windows_identity()?;
+    let (sid, _user) = windows_identity()?;
     let identity = windows_task_identity(&sid);
     let output = windows_run(&windows_query_script(&identity))?;
     let view: WindowsTaskView = windows_parse(&output)?;
     Ok(windows_evaluate(
         &view,
-        &user,
         &sid,
         current_executable().ok().as_deref(),
         identity,
@@ -886,9 +959,14 @@ mod tests {
         assert!(script.contains("-LogonType Interactive -RunLevel Limited"));
         assert!(script.contains("ExecutionTimeLimit ([TimeSpan]::Zero)"));
         assert!(script.contains("RestartCount 3"));
+        // A short trigger delay and missed-fire catch-up make the logon launch
+        // survive ordinary login-session resource timing.
+        assert!(script.contains("$t.Delay='PT30S'"));
+        assert!(script.contains("-StartWhenAvailable"));
         assert!(script.contains(&format!("-TaskName '{task}'")));
         assert!(script.contains(r"-Execute 'C:\My Apps\scala.exe'"));
-        assert!(script.contains("-Argument 'serve'"));
+        // The owned launch is `scala serve` plus the internal background flag.
+        assert!(script.contains("-Argument 'serve --login-startup'"));
         // Trailing backslashes are literal inside PowerShell single quotes.
         let script = windows_register_script(&task, r"C:\Scala\");
         assert!(script.contains(r"-Execute 'C:\Scala\'"));
@@ -914,6 +992,10 @@ mod tests {
         assert!(query.contains("actions=$a"));
         assert!(query.contains("trigger_count=$tr.Count"));
         assert!(query.contains("triggers=$tr"));
+        // Principal/trigger accounts are resolved to SIDs inside the query.
+        assert!(query.contains("user_sid="));
+        assert!(query.contains("SecurityIdentifier"));
+        assert!(query.contains("NTAccount"));
 
         let identity = windows_identity_script();
         assert!(identity.contains("WindowsIdentity]::GetCurrent()"));
@@ -950,15 +1032,16 @@ mod tests {
             "present": true,
             "enabled": true,
             "user": r"DESKTOP\alice",
+            "user_sid": TEST_SID,
             "logon_type": "Interactive",
             "run_level": "Limited",
             "action_count": 1,
             "actions": [
-                {"execute": execute, "arguments": "serve"}
+                {"execute": execute, "arguments": "serve --login-startup"}
             ],
             "trigger_count": 1,
             "triggers": [
-                {"type": "MSFT_TaskLogonTrigger", "user": r"DESKTOP\alice", "enabled": true}
+                {"type": "MSFT_TaskLogonTrigger", "user": r"DESKTOP\alice", "user_sid": TEST_SID, "enabled": true}
             ],
         });
         serde_json::from_str(&json.to_string()).unwrap()
@@ -967,7 +1050,6 @@ mod tests {
     fn windows_health(view: &WindowsTaskView) -> StartupStatus {
         windows_evaluate(
             view,
-            r"DESKTOP\alice",
             TEST_SID,
             Some(Path::new(r"C:\Scala\scala.exe")),
             "dev.scala.serve.deadbeefdeadbeef".to_owned(),
@@ -1012,13 +1094,21 @@ mod tests {
         assert_ne!(status.state, StartupState::Enabled);
         assert!(status.broken);
 
+        // A task without the login-startup flag launches with a visible
+        // console and no startup retry: not the owned definition, so broken.
+        let mut plain_serve = healthy_windows_task(r"C:\Scala\scala.exe");
+        plain_serve.actions[0].arguments = Some("serve".to_owned());
+        let status = windows_health(&plain_serve);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
         // An extra action alongside the correct one is a mutation: broken,
         // never Enabled, even though the first action still matches.
         let mut extra_action = healthy_windows_task(r"C:\Scala\scala.exe");
         extra_action.action_count = 2;
         extra_action.actions.push(WindowsActionView {
             execute: Some(r"C:\Scala\scala.exe".to_owned()),
-            arguments: Some("serve".to_owned()),
+            arguments: Some("serve --login-startup".to_owned()),
         });
         let status = windows_health(&extra_action);
         assert_ne!(status.state, StartupState::Enabled);
@@ -1052,7 +1142,7 @@ mod tests {
         extra_boot.trigger_count = 2;
         extra_boot.triggers.push(WindowsTriggerView {
             trigger_type: "MSFT_TaskBootTrigger".to_owned(),
-            user: None,
+            user_sid: None,
             enabled: Some(true),
         });
         let status = windows_health(&extra_boot);
@@ -1065,7 +1155,7 @@ mod tests {
         extra_logon.trigger_count = 2;
         extra_logon.triggers.push(WindowsTriggerView {
             trigger_type: "MSFT_TaskLogonTrigger".to_owned(),
-            user: Some(r"DESKTOP\alice".to_owned()),
+            user_sid: Some(TEST_SID.to_owned()),
             enabled: Some(true),
         });
         let status = windows_health(&extra_logon);
@@ -1074,14 +1164,14 @@ mod tests {
 
         // Wrong trigger user: broken, never Enabled.
         let mut wrong_trigger_user = healthy_windows_task(r"C:\Scala\scala.exe");
-        wrong_trigger_user.triggers[0].user = Some(r"DESKTOP\bob".to_owned());
+        wrong_trigger_user.triggers[0].user_sid = Some("S-1-5-21-111-222-333-1002".to_owned());
         let status = windows_health(&wrong_trigger_user);
         assert_ne!(status.state, StartupState::Enabled);
         assert!(status.broken);
 
         // Wrong principal/user: broken, never Enabled.
         let mut wrong_user = healthy_windows_task(r"C:\Scala\scala.exe");
-        wrong_user.user = Some(r"DESKTOP\bob".to_owned());
+        wrong_user.user_sid = Some("S-1-5-21-111-222-333-1002".to_owned());
         let status = windows_health(&wrong_user);
         assert_ne!(status.state, StartupState::Enabled);
         assert!(status.broken);
@@ -1092,15 +1182,80 @@ mod tests {
         let status = windows_health(&elevated);
         assert_ne!(status.state, StartupState::Enabled);
         assert!(status.broken);
+    }
 
-        // The same account reported by SID instead of name still matches the
-        // principal and trigger user checks.
-        let mut sid_task = healthy_windows_task(r"C:\Scala\scala.exe");
-        sid_task.user = Some(TEST_SID.to_owned());
-        sid_task.triggers[0].user = Some(TEST_SID.to_owned());
-        let status = windows_health(&sid_task);
-        assert_eq!(status.state, StartupState::Enabled);
-        assert!(!status.broken);
+    /// One task query result as emitted by the script: the raw account text is
+    /// carried for diagnostics, but only the resolved `user_sid` identifies the
+    /// account.
+    fn account_view(user: &str, user_sid: Option<&str>) -> WindowsTaskView {
+        let json = serde_json::json!({
+            "present": true,
+            "enabled": true,
+            "user": user,
+            "user_sid": user_sid,
+            "logon_type": "Interactive",
+            "run_level": "Limited",
+            "action_count": 1,
+            "actions": [
+                {"execute": r"C:\Scala\scala.exe", "arguments": "serve --login-startup"}
+            ],
+            "trigger_count": 1,
+            "triggers": [
+                {"type": "MSFT_TaskLogonTrigger", "user": user, "user_sid": user_sid, "enabled": true}
+            ],
+        });
+        serde_json::from_str(&json.to_string()).unwrap()
+    }
+
+    #[test]
+    fn windows_identity_uses_resolved_sid_not_account_text() {
+        // Every textual form of the same account resolves to the current SID:
+        // the short local name, MACHINE\name, and the literal SID string.
+        for reported in ["alice", r"DESKTOP\alice", TEST_SID] {
+            let status = windows_health(&account_view(reported, Some(TEST_SID)));
+            assert_eq!(
+                status.state,
+                StartupState::Enabled,
+                "reported form {reported} resolving to the current SID must be Enabled"
+            );
+            assert!(!status.broken);
+        }
+
+        // A foreign account is never accepted, in any textual form.
+        let foreign_sid = "S-1-5-21-111-222-333-1002";
+        for reported in ["bob", r"DESKTOP\bob", foreign_sid] {
+            let status = windows_health(&account_view(reported, Some(foreign_sid)));
+            assert_ne!(
+                status.state,
+                StartupState::Enabled,
+                "foreign account {reported} must fail closed"
+            );
+            assert!(status.broken);
+        }
+
+        // Account text that matches the current user's name but resolves to a
+        // different SID (e.g. a domain account shadowing the local name) is a
+        // different identity.
+        let status = windows_health(&account_view("alice", Some("S-1-5-21-999-888-777-500")));
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        // An identifier that cannot be translated to a SID at all is not the
+        // same identity.
+        let status = windows_health(&account_view("not-an-account", None));
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+        let status = windows_health(&account_view("not-an-account", Some("")));
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        // A trigger whose user is foreign while the principal matches: broken,
+        // never Enabled, even though the principal check passes.
+        let mut task = account_view("alice", Some(TEST_SID));
+        task.triggers[0].user_sid = Some(foreign_sid.to_owned());
+        let status = windows_health(&task);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
     }
 
     #[test]
