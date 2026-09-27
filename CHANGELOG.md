@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.3 — Native Windows NInfer
+
+Adds a managed native-Windows NInfer route while preserving Scala's existing
+engine/runtime separation and origin-neutral artifact admission.
+
+- Add a separate `natpate/ninfer-windows` provider for the exact reviewed
+  portable Windows x86_64 CUDA package; no WSL is required.
+- Pin the reviewed v0.7.1 release to its exact source tag/tree, GitHub asset
+  identity, size and SHA-256 so moved/replaced packages fail closed.
+- Keep canonical `Neroued/ninfer` managed source builds Linux-only and keep the
+  Windows/Linux runtime update lines independent.
+- Bound managed Windows support to the reviewed NInfer v2 package; v0.8+ / v3
+  releases remain unavailable until Scala has a separately reviewed v3 contract.
+- Preserve the portable ZIP layout and adjacent DLLs while safely normalizing
+  Windows archive separators before traversal/containment checks.
+
 ## 0.1.2 — Login startup control
 
 Adds first-class, per-user OS login startup management without changing Scala's
