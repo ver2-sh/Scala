@@ -2385,6 +2385,7 @@ impl EngineAdapter for NinferAdapter {
             }
         };
         self.pending_startups.write().await.remove(endpoint);
+        #[cfg(not(target_os = "windows"))]
         if let Err(error) = tokio::fs::remove_file(&pending.request_log_path).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -2392,6 +2393,11 @@ impl EngineAdapter for NinferAdapter {
                 "could not unlink the private NInfer startup log before serving requests: {error}"
             )));
         }
+        #[cfg(target_os = "windows")]
+        tracing::debug!(
+            path = %pending.request_log_path.display(),
+            "retaining validated NInfer startup log until the owned process exits"
+        );
         self.observed_defaults
             .write()
             .await
