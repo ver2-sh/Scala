@@ -2393,11 +2393,9 @@ impl EngineAdapter for NinferAdapter {
                 "could not unlink the private NInfer startup log before serving requests: {error}"
             )));
         }
-        #[cfg(target_os = "windows")]
-        tracing::debug!(
-            path = %pending.request_log_path.display(),
-            "retaining validated NInfer startup log until the owned process exits"
-        );
+        // Windows does not permit unlinking this file while ninfer-serve keeps
+        // its request-log handle open. LaunchSpec::temporary_files retains
+        // cleanup ownership and removes it after the owned process exits.
         self.observed_defaults
             .write()
             .await
