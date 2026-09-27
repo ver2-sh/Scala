@@ -154,6 +154,71 @@ const REVIEWED_SOURCE_BLOBS: &[(&str, &str)] = &[
     ("src/ops/kernel/speculative_round.cuh", "9cf696a622f788caf391c21074b112b9ce52e362"),
 ];
 
+// Reviewed source blobs for the exact portable Windows package in
+// windows_catalog: natpate/ninfer-windows release 384326322, tag v0.7.1 at
+// commit aa64ee5353b3c79a0a4301a0d60f1716fb0451be, tree
+// fd35700dbbf797b6e46114efd46bbc569e151844, archive SHA-256 d9bb7b4c...
+//
+// The portable build is a separate community fork, not canonical
+// Neroued/ninfer. At the reviewed tag all 97 capability-owning paths exist:
+// 74 blobs are byte-identical to REVIEWED_SOURCE_BLOBS and the 23 below
+// differ. Each differing blob was compared semantically against every domain
+// that owns it, and the fork's changes are contract-preserving:
+//
+// - Windows portability with identical semantics: Winsock/process-id and
+//   MSVC `_umul128` shims in acquire.cpp, context_cost.cpp, request_log.cpp
+//   and program.h (the 128-bit multiply fallback is upstream's own
+//   fuzz-checked reconstruction), plus a strictly equivalent media-root
+//   containment check;
+// - additive surface: `--webui`/`--webui-dir` options, the static webui
+//   mount, `/props`, SPA fallback and request-aware CORS in http_server,
+//   `status`/`meta.n_ctx` model fields in openai_common.cpp, and the
+//   `qwen3.8-27b/nvfp4full` weights profile in package.cpp, variant.cpp/.h
+//   and bindings.cpp add behavior without changing the managed contract --
+//   managed launches never pass --webui and API paths stay key-gated;
+// - an earlier-generation admission/materialization search (engine_core.h,
+//   resource_manager.h, materialization_planner.h, pressure_planner.h,
+//   program.h) plus matching diagnostics fields in types.h and
+//   request_log.cpp: the fixed-budget guided search and removed diagnostics
+//   predate the canonical search-budget machinery, while every cache/limit
+//   knob, its enforcement, and the schema-20 server_start record are
+//   unchanged;
+// - a strict acceptance widening: an omitted `model` field falls back to the
+//   single loaded model and is still validated, never serving another one;
+// - removal of the SparseMoeHints prefetch plumbing, which never reaches
+//   arithmetic.
+//
+// Capability credit for the portable package therefore covers the same
+// domains as canonical, but only for the exact pinned package: the binding
+// requires the reviewed tag, asset id/name/size and the verified archive
+// digest, not just a v0.7.x version string.
+#[rustfmt::skip]
+const WINDOWS_REVIEWED_SOURCE_BLOBS: &[(&str, &str)] = &[
+    ("include/ninfer/types.h", "d9c8c93c6dd3d7969ab576ca3b8dda0e5b17d92f"),
+    ("src/product/media_acquire/acquire.cpp", "0f37ff9b20bfcbf4c1d2057b009477feaefe26c9"),
+    ("src/runtime/engine/engine_core.h", "d4d9b2d678f21b0033009b873d2448e7c9d0b365"),
+    ("src/runtime/engine/resource_manager.h", "f14837e23ea29ecb89541e1ebd916f1b60f788b2"),
+    ("src/serve/http_server.cpp", "346a1c247a396092ca7b60280be4af28a157d6b6"),
+    ("src/serve/http_server.h", "719a4070adde41fb6dfa9e3b0730e9a39c64b37d"),
+    ("src/serve/openai_chat.h", "af83f81e582d6704bf10c88e424a14d6ec26dbb5"),
+    ("src/serve/openai_chat_http.cpp", "9bbb5c9de277cc3f6bcf102f0323b25a6945d68f"),
+    ("src/serve/openai_chat_request.cpp", "de6c9d1185b3400706f3e0c7c814cf1f4ed431d4"),
+    ("src/serve/openai_common.cpp", "1cb6855c601383d37b730b4e4ca4b8b2da79ccbe"),
+    ("src/serve/request_log.cpp", "77b5c6671ef3839a1b22fdad2f8380b5cd8372c8"),
+    ("src/serve/serve_options.cpp", "a7c3a3e897441ffaf96f0a17f3ce45a641e22578"),
+    ("src/serve/serve_options.h", "4b21ace5854fe583088cb2f2f5adf0a728c66611"),
+    ("src/runtime/engine/context_cost.cpp", "b869c5c09a1e6414279482991f422fc574dea48c"),
+    ("src/runtime/engine/materialization_planner.h", "74e10a2a71c467371acb9222c74290d4779359fb"),
+    ("src/targets/qwen3_6/impl/runtime/pressure_planner.h", "729c25aaf22001adc9f8cc59b3e9fcb68cc632fd"),
+    ("src/targets/qwen3_6/impl/runtime/program.h", "a1961d23522b8f00cf79617dd851636578d12da7"),
+    ("src/targets/qwen3_6/impl/runtime/text_context.h", "3b4deda322438d29a76e6d039e761c05553ca138"),
+    ("src/targets/qwen3_6/impl/runtime/text_context_impl.h", "872c13531a95db62adf83e7047c821b5bd671ad3"),
+    ("src/targets/qwen3_6_27b/impl/package.cpp", "99835f7391808b51a89801ed46d90e859f78ee12"),
+    ("src/targets/qwen3_6_27b/impl/variant.h", "b9c60984a77bd07e0681d855dbedec7fad6e1485"),
+    ("src/targets/qwen3_6_27b/impl/variant.cpp", "0dc8fa852d799323f4295fadeab9ea64162e6604"),
+    ("src/targets/qwen3_6_27b/impl/load/bindings.cpp", "f5659b86f6262446bb25e0bd368d4e5e063b46e5"),
+];
+
 const CORE_PROCESS_FILES: &[&str] = &[
     "apps/cli/options.cpp",
     "include/ninfer/types.h",
@@ -643,7 +708,7 @@ struct NinferStartupRequirements {
     greedy: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct NinferRuntimeCapabilities {
     trustworthy_identity: bool,
     core_process_controls: bool,
@@ -666,7 +731,7 @@ struct NinferRuntimeCapabilities {
     startup_proof: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct NinferReviewedDomains {
     core_process_controls: bool,
     context_cache_controls: bool,
@@ -858,16 +923,20 @@ fn ninfer_runtime_capabilities_for_installed(
     // A managed portable Windows install keeps truthful immutable provenance
     // (verified archive digest + release tag + adapter probe), so its identity
     // is trustworthy. Capability domains are credited only for the exact
-    // reviewed release; other admitted releases stay unproven rather than
-    // inheriting credit the port review did not establish.
+    // reviewed package: the pinned release/asset identity plus the persisted
+    // verified archive digest, covered per domain by the recorded
+    // Windows-source evidence. Any other package keeps truthful identity but
+    // receives no credit rather than inheriting review by name.
     if matches!(
         runtime.manifest.acquisition_method,
         RuntimeAcquisitionMethod::OfficialReleaseAsset
             | RuntimeAcquisitionMethod::PreseededOfficialPack
     ) && windows_catalog::is_managed_windows_identity(&runtime.manifest.identity)
     {
-        let reviewed = windows_catalog::is_reviewed_release_identity(&runtime.manifest.identity);
-        return ninfer_reviewed_capabilities(true, NinferReviewedDomains::all(reviewed));
+        let reviewed = windows_catalog::is_reviewed_installed_release(&runtime.manifest)
+            .then(windows_reviewed_domains)
+            .unwrap_or_default();
+        return ninfer_reviewed_capabilities(true, reviewed);
     }
     let managed_source = runtime.manifest.acquisition_method
         == RuntimeAcquisitionMethod::SourceBuild
@@ -917,8 +986,10 @@ fn ninfer_runtime_capabilities_for_available(
         scala_core::RuntimeAcquisitionPlan::ReleaseAsset { .. }
     ) && windows_catalog::is_managed_windows_identity(&runtime.identity)
     {
-        let reviewed = windows_catalog::is_reviewed_release_identity(&runtime.identity);
-        return ninfer_reviewed_capabilities(true, NinferReviewedDomains::all(reviewed));
+        let reviewed = windows_catalog::is_reviewed_release_candidate(runtime)
+            .then(windows_reviewed_domains)
+            .unwrap_or_default();
+        return ninfer_reviewed_capabilities(true, reviewed);
     }
     let source = match &runtime.acquisition {
         scala_core::RuntimeAcquisitionPlan::SourceBuild(plan) => Some(&plan.source),
@@ -1015,6 +1086,44 @@ fn source_domain_matches(observed: Option<&BTreeMap<String, String>>, required: 
         expected
             .is_some_and(|expected| observed.get(*path).is_some_and(|actual| actual == expected))
     })
+}
+
+/// Reviewed-domain evidence for the exact portable Windows package recorded in
+/// windows_catalog. Mirrors the canonical per-domain ownership rule: a domain
+/// is credited only when every contract-owning file has a reviewed blob at the
+/// reviewed Windows tag -- either the canonical blob (byte-identical there) or
+/// a Windows-specific blob reviewed in place. Because a release package has no
+/// checkable source tree, the blob set is bound to tag v0.7.1 commit
+/// aa64ee5.../tree fd35700... and the caller binds the package itself through
+/// the verified archive digest and asset identity.
+fn windows_reviewed_domains() -> NinferReviewedDomains {
+    let reviewed = |files: &[&str]| {
+        files.iter().all(|path| {
+            REVIEWED_SOURCE_BLOBS
+                .iter()
+                .chain(WINDOWS_REVIEWED_SOURCE_BLOBS.iter())
+                .any(|(candidate, _)| candidate == path)
+        })
+    };
+    NinferReviewedDomains {
+        core_process_controls: reviewed(CORE_PROCESS_FILES),
+        context_cache_controls: reviewed(CONTEXT_CACHE_FILES),
+        speculation_controls: reviewed(SPECULATION_FILES),
+        serving_limit_controls: reviewed(SERVING_LIMIT_FILES),
+        responses_store_controls: reviewed(RESPONSES_STORE_FILES),
+        request_default_controls: reviewed(REQUEST_DEFAULT_FILES),
+        process_sampler_controls: reviewed(PROCESS_SAMPLER_FILES),
+        model_sampler_defaults: reviewed(MODEL_SAMPLER_DEFAULT_FILES),
+        request_sampler_semantics: reviewed(REQUEST_SAMPLER_FILES),
+        request_protocol_semantics: reviewed(REQUEST_PROTOCOL_FILES),
+        request_log: reviewed(REQUEST_LOG_FILES),
+        thinking_process_controls: reviewed(THINKING_PROCESS_FILES),
+        thinking_request_semantics: reviewed(THINKING_REQUEST_FILES),
+        tool_calling: reviewed(TOOL_CALLING_FILES),
+        vision_process_controls: reviewed(VISION_PROCESS_FILES),
+        dflash_vision: reviewed(DFLASH_VISION_FILES),
+        media_request_semantics: reviewed(MEDIA_REQUEST_FILES),
+    }
 }
 
 fn ninfer_startup_requirements(
@@ -3881,5 +3990,224 @@ mod tests {
             assert!(ids.contains(expected), "missing setting {expected}");
         }
         assert!(!ids.iter().any(|id| id.contains("profile")));
+    }
+
+    fn windows_identity() -> scala_core::RuntimeIdentity {
+        scala_core::RuntimeIdentity {
+            engine_id: ENGINE_ID.to_owned(),
+            package_family: windows_catalog::PACKAGE_FAMILY.to_owned(),
+            version: windows_catalog::REVIEWED_RELEASE_VERSION.to_owned(),
+            upstream_revision: None,
+            platform: "windows".to_owned(),
+            architecture: "x86_64".to_owned(),
+            accelerator: "cuda".to_owned(),
+            variant: windows_catalog::VARIANT.to_owned(),
+            package: scala_core::RuntimePackageIdentity {
+                provider_id: windows_catalog::PROVIDER_ID.to_owned(),
+                repository: Some(windows_catalog::GITHUB_REPOSITORY.to_owned()),
+                release_tag: Some(windows_catalog::REVIEWED_RELEASE_TAG.to_owned()),
+                asset_id: Some("549408305".to_owned()),
+                asset_name: Some("ninfer-windows-0.7.1-win64-cuda131.zip".to_owned()),
+                additional_assets: Vec::new(),
+            },
+        }
+    }
+
+    fn windows_manifest() -> scala_core::RuntimeManifest {
+        let identity = windows_identity();
+        scala_core::RuntimeManifest {
+            schema_version: scala_core::RUNTIME_MANIFEST_SCHEMA_VERSION,
+            runtime_id: RuntimeId::from_identity(&identity),
+            identity,
+            supported_formats: vec![ArtifactFormat::Ninfer],
+            supported_native_identities: Vec::new(),
+            requirements: RuntimeRequirements::default(),
+            acquisition_method: RuntimeAcquisitionMethod::OfficialReleaseAsset,
+            source_url: Some(
+                "https://github.com/natpate/ninfer-windows/releases/tag/v0.7.1".to_owned(),
+            ),
+            downloaded_archive_sha256: Some(windows_catalog::REVIEWED_ARCHIVE_SHA256.to_owned()),
+            additional_downloaded_archive_sha256: Vec::new(),
+            source_build: None,
+            entrypoint: PathBuf::from("ninfer-serve.exe"),
+            entrypoint_sha256: "a".repeat(64),
+            installed_at_unix: Some(1),
+            probe: RuntimeProbeObservation {
+                compatible: true,
+                observed_engine_id: ENGINE_ID.to_owned(),
+                observed_version: None,
+                observed_revision: None,
+                detail: String::new(),
+                observed_at_unix: 0,
+            },
+        }
+    }
+
+    fn windows_candidate() -> AvailableRuntime {
+        let identity = windows_identity();
+        AvailableRuntime {
+            runtime_id: RuntimeId::from_identity(&identity),
+            identity,
+            display_name: "NInfer 0.7.1 portable Windows x86_64 CUDA".to_owned(),
+            supported_formats: vec![ArtifactFormat::Ninfer],
+            source_url:
+                "https://github.com/natpate/ninfer-windows/releases/tag/v0.7.1".to_owned(),
+            published_at_unix: None,
+            channels: Vec::new(),
+            prerelease: false,
+            acquisition: scala_core::RuntimeAcquisitionPlan::ReleaseAsset {
+                download: scala_core::RuntimeDownload {
+                    url: "https://github.com/natpate/ninfer-windows/releases/download/v0.7.1/ninfer-windows-0.7.1-win64-cuda131.zip"
+                        .to_owned(),
+                    size_bytes: 386_877_422,
+                    digest: Some(
+                        scala_core::RuntimeDigest::sha256(
+                            windows_catalog::REVIEWED_ARCHIVE_SHA256,
+                        )
+                        .unwrap(),
+                    ),
+                    archive_format: scala_core::RuntimeArchiveFormat::Zip,
+                    entrypoint_names: vec!["ninfer-serve.exe".to_owned()],
+                },
+                additional_downloads: Vec::new(),
+            },
+            supported_native_identities: Vec::new(),
+            requirements: RuntimeRequirements::default(),
+        }
+    }
+
+    fn assert_fully_reviewed(capabilities: NinferRuntimeCapabilities) {
+        assert_eq!(
+            capabilities.request_log_schema,
+            Some(CURRENT_REQUEST_LOG_SCHEMA)
+        );
+        assert!(
+            capabilities.trustworthy_identity
+                && capabilities.core_process_controls
+                && capabilities.context_cache_controls
+                && capabilities.speculation_controls
+                && capabilities.serving_limit_controls
+                && capabilities.responses_store_controls
+                && capabilities.request_default_controls
+                && capabilities.process_sampler_controls
+                && capabilities.model_sampler_defaults
+                && capabilities.request_sampler_semantics
+                && capabilities.request_protocol_semantics
+                && capabilities.thinking_process_controls
+                && capabilities.thinking_request_semantics
+                && capabilities.tool_calling
+                && capabilities.vision_process_controls
+                && capabilities.dflash_vision
+                && capabilities.media_request_semantics
+                && capabilities.startup_proof
+        );
+    }
+
+    fn assert_unreviewed(capabilities: NinferRuntimeCapabilities) {
+        assert_eq!(
+            capabilities,
+            ninfer_reviewed_capabilities(true, NinferReviewedDomains::default())
+        );
+    }
+
+    #[test]
+    fn windows_source_evidence_only_recovers_reviewed_paths() {
+        // The Windows blob set may only provide reviewed contents for paths
+        // that already own capability domains -- never introduce contract files
+        // the canonical review does not track.
+        let canonical = REVIEWED_SOURCE_BLOBS
+            .iter()
+            .copied()
+            .collect::<BTreeMap<_, _>>();
+        for (path, blob) in WINDOWS_REVIEWED_SOURCE_BLOBS {
+            assert!(
+                canonical
+                    .get(path)
+                    .is_some_and(|canonical_blob| canonical_blob != blob),
+                "{path} must shadow a canonical reviewed path with different contents"
+            );
+        }
+        // With the full v0.7.1 review recorded, every domain has complete
+        // coverage at the tag.
+        assert_fully_reviewed(ninfer_reviewed_capabilities(
+            true,
+            windows_reviewed_domains(),
+        ));
+    }
+
+    #[test]
+    fn installed_windows_review_credit_requires_the_exact_pinned_package() {
+        let installed = InstalledRuntime {
+            manifest: windows_manifest(),
+            installation_root: PathBuf::from("runtimes/ninfer"),
+        };
+        assert_fully_reviewed(ninfer_runtime_capabilities_for_installed(&installed));
+
+        // Same provider, version and tag with a different asset identity or a
+        // different persisted archive digest is a different package: it keeps
+        // truthful identity but receives no reviewed-domain credit.
+        for mutate in [
+            |manifest: &mut scala_core::RuntimeManifest| {
+                manifest.identity.package.asset_id = Some("1".to_owned());
+            },
+            |manifest: &mut scala_core::RuntimeManifest| {
+                manifest.identity.package.asset_name =
+                    Some("ninfer-windows-0.7.1-win64-cuda132.zip".to_owned());
+            },
+            |manifest: &mut scala_core::RuntimeManifest| {
+                manifest.downloaded_archive_sha256 = Some("0".repeat(64));
+            },
+            |manifest: &mut scala_core::RuntimeManifest| {
+                manifest.downloaded_archive_sha256 = None;
+            },
+            |manifest: &mut scala_core::RuntimeManifest| {
+                manifest.identity.version = "0.7.12".to_owned();
+            },
+        ] {
+            let mut manifest = windows_manifest();
+            mutate(&mut manifest);
+            manifest.runtime_id = RuntimeId::from_identity(&manifest.identity);
+            let installed = InstalledRuntime {
+                manifest,
+                installation_root: PathBuf::from("runtimes/ninfer"),
+            };
+            assert_unreviewed(ninfer_runtime_capabilities_for_installed(&installed));
+        }
+    }
+
+    #[test]
+    fn available_windows_review_credit_requires_the_exact_pinned_package() {
+        assert_fully_reviewed(ninfer_runtime_capabilities_for_available(
+            &windows_candidate(),
+        ));
+
+        for mutate in [
+            |runtime: &mut AvailableRuntime| {
+                runtime.identity.package.asset_id = Some("1".to_owned());
+            },
+            |runtime: &mut AvailableRuntime| {
+                runtime.identity.version = "0.7.12".to_owned();
+            },
+            |runtime: &mut AvailableRuntime| {
+                let scala_core::RuntimeAcquisitionPlan::ReleaseAsset { download, .. } =
+                    &mut runtime.acquisition
+                else {
+                    panic!("expected release asset acquisition");
+                };
+                download.digest = Some(scala_core::RuntimeDigest::sha256("0".repeat(64)).unwrap());
+            },
+            |runtime: &mut AvailableRuntime| {
+                let scala_core::RuntimeAcquisitionPlan::ReleaseAsset { download, .. } =
+                    &mut runtime.acquisition
+                else {
+                    panic!("expected release asset acquisition");
+                };
+                download.size_bytes += 1;
+            },
+        ] {
+            let mut runtime = windows_candidate();
+            mutate(&mut runtime);
+            assert_unreviewed(ninfer_runtime_capabilities_for_available(&runtime));
+        }
     }
 }
