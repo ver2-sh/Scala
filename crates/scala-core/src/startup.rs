@@ -55,7 +55,7 @@ fn windows_task_arguments() -> String {
 pub fn detach_console() {
     use std::ptr;
     use windows_sys::Win32::{
-        Foundation::GENERIC_READ,
+        Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
         System::Console::{
             FreeConsole, GetConsoleWindow, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -71,7 +71,7 @@ pub fn detach_console() {
         }
         FreeConsole();
         let name: Vec<u16> = "NUL\0".encode_utf16().collect();
-        let null = CreateFileW(
+        let nul = CreateFileW(
             name.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -80,10 +80,13 @@ pub fn detach_console() {
             0,
             ptr::null_mut(),
         );
-        if !null.is_null() {
-            SetStdHandle(STD_INPUT_HANDLE, null);
-            SetStdHandle(STD_OUTPUT_HANDLE, null);
-            SetStdHandle(STD_ERROR_HANDLE, null);
+        // CreateFileW reports failure as INVALID_HANDLE_VALUE, never as null.
+        // The handle stays open while it is installed as the process standard
+        // handles; closing it here would leave dead standard handles.
+        if !nul.is_null() && nul != INVALID_HANDLE_VALUE {
+            SetStdHandle(STD_INPUT_HANDLE, nul);
+            SetStdHandle(STD_OUTPUT_HANDLE, nul);
+            SetStdHandle(STD_ERROR_HANDLE, nul);
         }
     }
 }
@@ -511,6 +514,10 @@ struct WindowsTriggerView {
     user_sid: Option<String>,
     #[serde(default)]
     enabled: Option<bool>,
+    /// The trigger delay as stored in the task definition (`PT30S` for the
+    /// owned logon trigger); `null`/empty when unset.
+    #[serde(default)]
+    delay: Option<String>,
 }
 
 /// One Task Scheduler action as reported by the query script.
@@ -552,6 +559,23 @@ struct WindowsTaskView {
     trigger_count: usize,
     #[serde(default)]
     triggers: Vec<WindowsTriggerView>,
+    // The startup-affecting settings the owned registration defines. Duration
+    // fields report the stored Task Scheduler duration text (`PT1M`, `PT0S`);
+    // missing/empty values fail closed in the evaluator.
+    #[serde(default)]
+    start_when_available: bool,
+    #[serde(default)]
+    restart_count: usize,
+    #[serde(default)]
+    restart_interval: Option<String>,
+    #[serde(default)]
+    execution_time_limit: Option<String>,
+    #[serde(default)]
+    allow_start_on_batteries: bool,
+    #[serde(default)]
+    disallow_start_on_batteries: bool,
+    #[serde(default)]
+    stop_if_on_batteries: bool,
 }
 
 #[cfg(any(windows, test))]
@@ -585,8 +609,9 @@ fn windows_unregister_script(task: &str) -> String {
 
 // Emits the registered task as structured JSON, or `{"present":false}`. Reports
 // the task enabled flag, principal semantics, the complete action and trigger
-// lists, and explicit element counts so health is judged against the full
-// owned login-start definition rather than mere task existence.
+// lists (including the logon delay), the startup-affecting settings the
+// registration owns, and explicit element counts so health is judged against
+// the full owned login-start definition rather than mere task existence.
 #[cfg(any(windows, test))]
 fn windows_query_script(task: &str) -> String {
     let task = windows_ps(task);
@@ -596,7 +621,7 @@ fn windows_query_script(task: &str) -> String {
     // SID string or any account name form; anything unresolvable yields `null`,
     // which fails closed.
     format!(
-        "$n={task}; $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false }} | ConvertTo-Json -Compress }} else {{ $rs={{ param($u) if ([string]::IsNullOrWhiteSpace([string]$u)) {{ return $null }} try {{ return (New-Object System.Security.Principal.SecurityIdentifier([string]$u)).Value }} catch {{}} try {{ return (New-Object System.Security.Principal.NTAccount([string]$u)).Translate([System.Security.Principal.SecurityIdentifier]).Value }} catch {{ return $null }} }}; $a=@(@($t.Actions) | ForEach-Object {{ [pscustomobject]@{{ execute=[string]$_.Execute; arguments=[string]$_.Arguments }} }}); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; user_sid=(& $rs $_.UserId); enabled=$_.Enabled }} }}); [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; user=[string]$t.Principal.UserId; user_sid=(& $rs $t.Principal.UserId); logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; action_count=$a.Count; actions=$a; trigger_count=$tr.Count; triggers=$tr }} | ConvertTo-Json -Compress -Depth 6 }}"
+        "$n={task}; $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false }} | ConvertTo-Json -Compress }} else {{ $rs={{ param($u) if ([string]::IsNullOrWhiteSpace([string]$u)) {{ return $null }} try {{ return (New-Object System.Security.Principal.SecurityIdentifier([string]$u)).Value }} catch {{}} try {{ return (New-Object System.Security.Principal.NTAccount([string]$u)).Translate([System.Security.Principal.SecurityIdentifier]).Value }} catch {{ return $null }} }}; $a=@(@($t.Actions) | ForEach-Object {{ [pscustomobject]@{{ execute=[string]$_.Execute; arguments=[string]$_.Arguments }} }}); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; user_sid=(& $rs $_.UserId); enabled=$_.Enabled; delay=[string]$_.Delay }} }}); [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; user=[string]$t.Principal.UserId; user_sid=(& $rs $t.Principal.UserId); logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; action_count=$a.Count; actions=$a; trigger_count=$tr.Count; triggers=$tr; start_when_available=[bool]$t.Settings.StartWhenAvailable; restart_count=[int]$t.Settings.RestartCount; restart_interval=[string]$t.Settings.RestartInterval; execution_time_limit=[string]$t.Settings.ExecutionTimeLimit; allow_start_on_batteries=[bool]$t.Settings.AllowStartIfOnBatteries; disallow_start_on_batteries=[bool]$t.Settings.DisallowStartIfOnBatteries; stop_if_on_batteries=[bool]$t.Settings.StopIfGoingOnBatteries }} | ConvertTo-Json -Compress -Depth 6 }}"
     )
 }
 
@@ -613,11 +638,13 @@ fn windows_same_user(reported_sid: Option<&str>, current_sid: &str) -> bool {
 /// Judges a queried task against the exact login-start contract Scala owns:
 /// present, enabled, current-user interactive/limited principal (by resolved
 /// SID), exactly one action binding the exact executable with the exact
-/// `serve --login-startup` argument, and exactly one enabled AtLogOn trigger
-/// for that user. Additional actions or triggers are mutations the contract
-/// does not allow: any mismatch reports `Disabled` with `broken` set;
-/// `Enabled` is only reported when Windows will actually run the expected
-/// definition and nothing else.
+/// `serve --login-startup` argument, exactly one enabled AtLogOn trigger for
+/// that user with the owned `PT30S` delay, and the owned startup settings
+/// (missed-run catch-up, restart policy, unbounded execution time, battery
+/// behavior). Additional actions or triggers, and any altered setting, are
+/// mutations the contract does not allow: any mismatch reports `Disabled` with
+/// `broken` set; `Enabled` is only reported when Windows will actually run the
+/// expected definition and nothing else.
 #[cfg(any(windows, test))]
 fn windows_evaluate(
     view: &WindowsTaskView,
@@ -672,6 +699,8 @@ fn windows_evaluate(
         .run_level
         .as_deref()
         .is_some_and(|level| level.eq_ignore_ascii_case("Limited"));
+    // The owned trigger also carries the `PT30S` logon delay registration
+    // sets: an altered or removed delay is a mutation, not a detail.
     let trigger_matches = single_trigger
         && view.triggers.iter().all(|trigger| {
             trigger
@@ -680,14 +709,26 @@ fn windows_evaluate(
                 .contains("logontrigger")
                 && windows_same_user(trigger.user_sid.as_deref(), current_sid)
                 && trigger.enabled.unwrap_or(true)
+                && trigger.delay.as_deref() == Some("PT30S")
         });
+    // The owned startup settings as `New-ScheduledTaskSettingsSet` emits them:
+    // missed-run catch-up, restart-on-failure policy, no execution limit, and
+    // battery behavior that never suppresses or stops the logon launch.
+    let settings_match = view.start_when_available
+        && view.restart_count == 3
+        && view.restart_interval.as_deref() == Some("PT1M")
+        && view.execution_time_limit.as_deref() == Some("PT0S")
+        && view.allow_start_on_batteries
+        && !view.disallow_start_on_batteries
+        && !view.stop_if_on_batteries;
     let healthy = view.enabled
         && executable_matches
         && user_matches
         && logon_matches
         && run_level_matches
         && trigger_matches
-        && arguments_match;
+        && arguments_match
+        && settings_match;
     StartupStatus {
         state: if healthy {
             StartupState::Enabled
@@ -996,6 +1037,23 @@ mod tests {
         assert!(query.contains("user_sid="));
         assert!(query.contains("SecurityIdentifier"));
         assert!(query.contains("NTAccount"));
+        // The startup-affecting definition is queried too: trigger delay and
+        // the owned settings set, so external weakening cannot hide.
+        assert!(query.contains("delay=[string]$_.Delay"));
+        assert!(query.contains("start_when_available="));
+        assert!(query.contains("restart_count="));
+        assert!(query.contains("restart_interval="));
+        assert!(query.contains("execution_time_limit="));
+        assert!(query.contains("allow_start_on_batteries="));
+        assert!(query.contains("disallow_start_on_batteries="));
+        assert!(query.contains("stop_if_on_batteries="));
+        assert!(query.contains("StartWhenAvailable"));
+        assert!(query.contains("RestartCount"));
+        assert!(query.contains("RestartInterval"));
+        assert!(query.contains("ExecutionTimeLimit"));
+        assert!(query.contains("AllowStartIfOnBatteries"));
+        assert!(query.contains("DisallowStartIfOnBatteries"));
+        assert!(query.contains("StopIfGoingOnBatteries"));
 
         let identity = windows_identity_script();
         assert!(identity.contains("WindowsIdentity]::GetCurrent()"));
@@ -1041,8 +1099,15 @@ mod tests {
             ],
             "trigger_count": 1,
             "triggers": [
-                {"type": "MSFT_TaskLogonTrigger", "user": r"DESKTOP\alice", "user_sid": TEST_SID, "enabled": true}
+                {"type": "MSFT_TaskLogonTrigger", "user": r"DESKTOP\alice", "user_sid": TEST_SID, "enabled": true, "delay": "PT30S"}
             ],
+            "start_when_available": true,
+            "restart_count": 3,
+            "restart_interval": "PT1M",
+            "execution_time_limit": "PT0S",
+            "allow_start_on_batteries": true,
+            "disallow_start_on_batteries": false,
+            "stop_if_on_batteries": false,
         });
         serde_json::from_str(&json.to_string()).unwrap()
     }
@@ -1144,6 +1209,7 @@ mod tests {
             trigger_type: "MSFT_TaskBootTrigger".to_owned(),
             user_sid: None,
             enabled: Some(true),
+            delay: None,
         });
         let status = windows_health(&extra_boot);
         assert_ne!(status.state, StartupState::Enabled);
@@ -1157,6 +1223,7 @@ mod tests {
             trigger_type: "MSFT_TaskLogonTrigger".to_owned(),
             user_sid: Some(TEST_SID.to_owned()),
             enabled: Some(true),
+            delay: Some("PT30S".to_owned()),
         });
         let status = windows_health(&extra_logon);
         assert_ne!(status.state, StartupState::Enabled);
@@ -1184,6 +1251,99 @@ mod tests {
         assert!(status.broken);
     }
 
+    #[test]
+    fn windows_status_requires_owned_settings_and_delay() {
+        // The startup-affecting definition is part of the owned contract: an
+        // externally weakened task reports broken, never Enabled.
+
+        // Missing logon delay: broken.
+        let mut no_delay = healthy_windows_task(r"C:\Scala\scala.exe");
+        no_delay.triggers[0].delay = None;
+        let status = windows_health(&no_delay);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        // Wrong delay: broken.
+        for delay in ["", "PT0S", "PT1M", "PT5M"] {
+            let mut task = healthy_windows_task(r"C:\Scala\scala.exe");
+            task.triggers[0].delay = Some(delay.to_owned());
+            let status = windows_health(&task);
+            assert_ne!(
+                status.state,
+                StartupState::Enabled,
+                "delay {delay:?} must fail closed"
+            );
+            assert!(status.broken);
+        }
+
+        // Missed-run catch-up removed: broken.
+        let mut no_catchup = healthy_windows_task(r"C:\Scala\scala.exe");
+        no_catchup.start_when_available = false;
+        let status = windows_health(&no_catchup);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        // Restart-on-failure count changed: broken.
+        for count in [0, 2, 5] {
+            let mut task = healthy_windows_task(r"C:\Scala\scala.exe");
+            task.restart_count = count;
+            let status = windows_health(&task);
+            assert_ne!(
+                status.state,
+                StartupState::Enabled,
+                "restart_count {count} must fail closed"
+            );
+            assert!(status.broken);
+        }
+
+        // Restart interval changed or absent: broken.
+        for interval in [None, Some(""), Some("PT5M"), Some("PT30S")] {
+            let mut task = healthy_windows_task(r"C:\Scala\scala.exe");
+            task.restart_interval = interval.map(str::to_owned);
+            let status = windows_health(&task);
+            assert_ne!(
+                status.state,
+                StartupState::Enabled,
+                "restart_interval {interval:?} must fail closed"
+            );
+            assert!(status.broken);
+        }
+
+        // A finite execution limit would let Task Scheduler kill the server:
+        // broken. The owned value is `PT0S` (unbounded).
+        for limit in [None, Some(""), Some("PT72H"), Some("PT1H")] {
+            let mut task = healthy_windows_task(r"C:\Scala\scala.exe");
+            task.execution_time_limit = limit.map(str::to_owned);
+            let status = windows_health(&task);
+            assert_ne!(
+                status.state,
+                StartupState::Enabled,
+                "execution_time_limit {limit:?} must fail closed"
+            );
+            assert!(status.broken);
+        }
+
+        // Any battery-policy change that suppresses or stops the logon
+        // launch: broken.
+        let mut no_battery_start = healthy_windows_task(r"C:\Scala\scala.exe");
+        no_battery_start.allow_start_on_batteries = false;
+        let status = windows_health(&no_battery_start);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        let mut disallow_battery = healthy_windows_task(r"C:\Scala\scala.exe");
+        disallow_battery.disallow_start_on_batteries = true;
+        let status = windows_health(&disallow_battery);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+
+        let mut stop_on_battery = healthy_windows_task(r"C:\Scala\scala.exe");
+        stop_on_battery.stop_if_on_batteries = true;
+        let status = windows_health(&stop_on_battery);
+        assert_ne!(status.state, StartupState::Enabled);
+        assert!(status.broken);
+    }
+
     /// One task query result as emitted by the script: the raw account text is
     /// carried for diagnostics, but only the resolved `user_sid` identifies the
     /// account.
@@ -1201,8 +1361,15 @@ mod tests {
             ],
             "trigger_count": 1,
             "triggers": [
-                {"type": "MSFT_TaskLogonTrigger", "user": user, "user_sid": user_sid, "enabled": true}
+                {"type": "MSFT_TaskLogonTrigger", "user": user, "user_sid": user_sid, "enabled": true, "delay": "PT30S"}
             ],
+            "start_when_available": true,
+            "restart_count": 3,
+            "restart_interval": "PT1M",
+            "execution_time_limit": "PT0S",
+            "allow_start_on_batteries": true,
+            "disallow_start_on_batteries": false,
+            "stop_if_on_batteries": false,
         });
         serde_json::from_str(&json.to_string()).unwrap()
     }
