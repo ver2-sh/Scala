@@ -1,11 +1,13 @@
 //! UI-only projections of owner reports. Never passed to local stores/resolvers.
 use super::*;
+use crate::theme::Glyphs;
 use scala_engine::link::{LinkAction, LinkControlRequest, LinkPeer, LinkProfile, LinkSnapshot};
 
 impl App {
     pub fn link_detail(&self) -> String {
+        let sep = Glyphs::current(self.unicode).separator;
         let mut text = format!(
-            "Scala Link: {}\nWayfinder: {}\nLocal node: {}\nNode ID: {}\nScala peers: {} online / {} known\n\nConfigured: {} (applies after Scala restart)\nAutomatic local registration and reconnection.\ne Enable · x Disable · D Scrollable details\n",
+            "Scala Link: {}\nWayfinder: {}\nLocal node: {}\nNode ID: {}\nScala peers: {} online / {} known\n\nConfigured: {} (applies after Scala restart)\nAutomatic local registration and reconnection.\ne Enable{sep}x Disable{sep}D Scrollable details\n",
             if self.link.enabled {
                 "enabled"
             } else {
@@ -35,7 +37,7 @@ impl App {
         }
         for peer in &self.link.peers {
             text.push_str(&format!(
-                "\n{} · {}\n{}\n{}\n",
+                "\n{}{sep}{}\n{}\n{}\n",
                 peer.name,
                 if peer.reachable { "online" } else { "stale" },
                 peer.node_id,
@@ -45,7 +47,7 @@ impl App {
             ));
             if let Some(state) = &peer.state {
                 text.push_str(&format!(
-                    "{}\nModels: {} · Profiles: {}\n",
+                    "{}\nModels: {}{sep}Profiles: {}\n",
                     state.hardware,
                     state.models.len(),
                     state.profiles.len()
@@ -217,14 +219,16 @@ impl App {
             return String::new();
         };
         format!(
-            "{} · {}",
+            "{}{sep}{}",
             profile.id,
-            self.model_host_label(&profile.model_id)
+            self.model_host_label(&profile.model_id),
+            sep = Glyphs::current(self.unicode).separator
         )
     }
     pub fn link_summary(&self) -> String {
+        let sep = Glyphs::current(self.unicode).separator;
         if !self.link.enabled {
-            return "Scala Link disabled · Open Scala Link to set up peer connectivity".into();
+            return format!("Scala Link disabled{sep}Open Scala Link to set up peer connectivity");
         }
         let mut hosts = vec![self.local_host_label()];
         hosts.extend(self.link.peers.iter().map(|peer| {
@@ -234,9 +238,9 @@ impl App {
                 if peer.reachable { "online" } else { "stale" }
             )
         }));
-        let mut text = format!("Scala Link: {}", hosts.join(" · "));
+        let mut text = format!("Scala Link: {}", hosts.join(sep));
         if let Some(error) = &self.link.error {
-            text.push_str(&format!(" · {error}"));
+            text.push_str(&format!("{sep}{error}"));
         }
         text
     }
@@ -256,7 +260,13 @@ impl App {
             profile_id: profile.id.clone(),
             action,
         };
-        self.notice = Some(format!("{:?} {} on {}…", action, profile.id, peer.name));
+        self.notice = Some(format!(
+            "{:?} {} on {}{}",
+            action,
+            profile.id,
+            peer.name,
+            Glyphs::current(self.unicode).ellipsis
+        ));
         self.pending_link_action = Some(request);
         self.link_control_busy = true;
         Update::Render
@@ -277,11 +287,14 @@ impl App {
     }
     pub fn remote_profile_detail(&self) -> Option<String> {
         let (peer, profile) = self.selected_remote_profile()?;
+        let glyphs = Glyphs::current(self.unicode);
+        let sep = glyphs.separator;
+        let arrows = if glyphs.unicode { "←/→" } else { "</>" };
         let state = peer.state.as_ref()?;
         let backend = profile.backend.as_ref();
         let benchmark = state.benchmarks.iter().find(|b| b.profile_id == profile.id);
         Some(format!(
-            "Profile: {}\nHost: {} ({})\nNode: {}\nReachability: {}\nModel: {} · installed on owner: {}\nEngine: {}\nState: {}\nRuntime: {}\nHardware: {}\n{}\nLoaded context: {}\nLatest benchmark: {}\n\nl: Load on host    u: Unload on host    ←/→: Profile\nProfile settings and runtimes are managed on {}.",
+            "Profile: {}\nHost: {} ({})\nNode: {}\nReachability: {}\nModel: {}{sep}installed on owner: {}\nEngine: {}\nState: {}\nRuntime: {}\nHardware: {}\n{}\nLoaded context: {}\nLatest benchmark: {}\n\nl: Load on host    u: Unload on host    {arrows}: Profile\nProfile settings and runtimes are managed on {}.",
             profile.display_name,
             peer.name,
             state.server_version,
@@ -298,7 +311,7 @@ impl App {
             backend.map_or_else(
                 || "Not loaded; resolved by owner on load".into(),
                 |b| format!(
-                    "{} · {} · {}",
+                    "{}{sep}{}{sep}{}",
                     b.runtime_id
                         .as_ref()
                         .map(ToString::to_string)
@@ -321,7 +334,7 @@ impl App {
                     .clone()
                     .unwrap_or_else(|| "No benchmark recorded".into()),
                 |b| format!(
-                    "{} · {} · intelligence {}",
+                    "{}{sep}{}{sep}intelligence {}",
                     b.run_id,
                     b.status,
                     b.intelligence

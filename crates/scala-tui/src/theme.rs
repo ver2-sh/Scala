@@ -12,6 +12,16 @@ const ASCII_BORDER: border::Set<'static> = border::Set {
     horizontal_bottom: "-",
 };
 
+/// Windows consoles rasterize SGR bold with a different font weight, so
+/// per-cell emphasis toggling (animated bars, hover, selection) visibly
+/// switches the font. Emphasis in the coloured theme is carried by colour
+/// and inverse instead; the no-colour palette uses underline/inverse/faint,
+/// none of which change the rasterised font.
+#[cfg(windows)]
+const EMPHASIS: Modifier = Modifier::empty();
+#[cfg(not(windows))]
+const EMPHASIS: Modifier = Modifier::BOLD;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Glyphs {
     pub brand: &'static str,
@@ -23,58 +33,90 @@ pub struct Glyphs {
     pub dimensions: &'static str,
     pub up_down: &'static str,
     pub ellipsis: &'static str,
+    pub separator: &'static str,
     pub download: &'static str,
     pub cancel: &'static str,
     pub pause: &'static str,
     pub resume: &'static str,
     pub progress_full: &'static str,
     pub progress_empty: &'static str,
+    pub progress_head: &'static str,
+    pub progress_segment: &'static str,
+    pub caret: &'static str,
     pub border: border::Set<'static>,
     pub unicode: bool,
 }
 
 impl Glyphs {
     pub fn current(unicode: bool) -> Self {
-        if unicode {
-            Self {
-                brand: "◆",
-                running: "●",
-                stopped: "○",
-                transitional: "◆",
-                empty: "◇",
-                command: "›",
-                dimensions: "×",
-                up_down: "↑↓",
-                ellipsis: "…",
-                download: "↓",
-                cancel: "×",
-                pause: "Ⅱ",
-                resume: "▶",
-                progress_full: "█",
-                progress_empty: "─",
-                border: border::PLAIN,
-                unicode: true,
-            }
-        } else {
-            Self {
-                brand: "*",
-                running: "*",
-                stopped: "o",
-                transitional: "*",
-                empty: "-",
-                command: ">",
-                dimensions: "x",
-                up_down: "Up/Dn",
-                ellipsis: "...",
-                download: "v",
-                cancel: "x",
-                pause: "||",
-                resume: ">",
-                progress_full: "#",
-                progress_empty: "-",
-                border: ASCII_BORDER,
-                unicode: false,
-            }
+        if !unicode {
+            return Self::ascii();
+        }
+        // `tui.unicode` cannot unlock Unicode decoration on Windows: the
+        // affected console substituted even CP437-resident glyphs with '?',
+        // and font coverage varies with the terminal and configured font, so
+        // no marker that participates in dynamic redraws can be proven to
+        // rasterize natively. Windows therefore uses the verified ASCII set.
+        #[cfg(windows)]
+        {
+            Self::ascii()
+        }
+        #[cfg(not(windows))]
+        {
+            Self::unicode()
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn unicode() -> Self {
+        Self {
+            brand: "◆",
+            running: "●",
+            stopped: "○",
+            transitional: "◆",
+            empty: "◇",
+            command: "›",
+            dimensions: "×",
+            up_down: "↑↓",
+            ellipsis: "…",
+            separator: " · ",
+            download: "↓",
+            cancel: "×",
+            pause: "Ⅱ",
+            resume: "▶",
+            progress_full: "█",
+            progress_empty: "─",
+            progress_head: "╸",
+            progress_segment: "━",
+            caret: "▏",
+            border: border::PLAIN,
+            unicode: true,
+        }
+    }
+
+    fn ascii() -> Self {
+        Self {
+            brand: "*",
+            running: "*",
+            stopped: "o",
+            transitional: "*",
+            empty: "-",
+            command: ">",
+            dimensions: "x",
+            up_down: "Up/Dn",
+            ellipsis: "...",
+            separator: " | ",
+            download: "v",
+            cancel: "x",
+            pause: "||",
+            resume: ">",
+            progress_full: "#",
+            progress_empty: "-",
+            progress_head: ">",
+            progress_segment: "=",
+            caret: "|",
+            border: ASCII_BORDER,
+            unicode: false,
         }
     }
 }
@@ -102,20 +144,31 @@ impl Theme {
     pub fn current(configured_no_color: bool) -> Self {
         let no_color = configured_no_color || std::env::var_os("NO_COLOR").is_some();
         if no_color {
+            // With no colours to carry semantics, differentiation has to come
+            // from modifiers. Windows only uses treatments that leave the
+            // rasterised font weight untouched: underline, inverse and faint.
+            #[cfg(windows)]
+            let (emphasis, attention, alert) = (
+                Modifier::UNDERLINED,
+                Modifier::REVERSED,
+                Modifier::REVERSED | Modifier::UNDERLINED,
+            );
+            #[cfg(not(windows))]
+            let (emphasis, attention, alert) = (EMPHASIS, EMPHASIS, EMPHASIS);
             return Self {
                 text: Style::default(),
                 muted: Style::default().add_modifier(Modifier::DIM),
-                accent: Style::default().add_modifier(Modifier::BOLD),
-                success: Style::default().add_modifier(Modifier::BOLD),
-                warning: Style::default().add_modifier(Modifier::BOLD),
-                error: Style::default().add_modifier(Modifier::BOLD),
+                accent: Style::default().add_modifier(emphasis),
+                success: Style::default().add_modifier(emphasis),
+                warning: Style::default().add_modifier(attention),
+                error: Style::default().add_modifier(alert),
                 border: Style::default().add_modifier(Modifier::DIM),
                 selected: Style::default().add_modifier(Modifier::REVERSED),
-                nav_active: Style::default().add_modifier(Modifier::BOLD),
+                nav_active: Style::default().add_modifier(attention),
                 nav_inactive: Style::default().add_modifier(Modifier::DIM),
                 hovered: Style::default().add_modifier(Modifier::UNDERLINED),
                 focused: Style::default().add_modifier(Modifier::REVERSED),
-                command: Style::default().add_modifier(Modifier::BOLD),
+                command: Style::default().add_modifier(emphasis),
                 hint: Style::default().add_modifier(Modifier::DIM),
                 panel: Style::default(),
             };
@@ -125,7 +178,7 @@ impl Theme {
             muted: Style::default().fg(Color::Rgb(126, 139, 157)),
             accent: Style::default()
                 .fg(Color::Rgb(108, 205, 183))
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(EMPHASIS),
             success: Style::default().fg(Color::Rgb(111, 207, 151)),
             warning: Style::default().fg(Color::Rgb(238, 190, 92)),
             error: Style::default().fg(Color::Rgb(239, 119, 122)),
@@ -133,10 +186,10 @@ impl Theme {
             selected: Style::default()
                 .fg(Color::Rgb(234, 241, 247))
                 .bg(Color::Rgb(43, 78, 78))
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(EMPHASIS),
             nav_active: Style::default()
                 .fg(Color::Rgb(108, 205, 183))
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(EMPHASIS),
             nav_inactive: Style::default().fg(Color::Rgb(126, 139, 157)),
             hovered: Style::default().bg(Color::Rgb(35, 49, 58)),
             focused: Style::default().add_modifier(Modifier::UNDERLINED),

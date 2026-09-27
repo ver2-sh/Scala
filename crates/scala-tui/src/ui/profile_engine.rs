@@ -11,7 +11,9 @@ use crate::ui::components::{
 use crate::ui::layout::{HoverTarget, UiLayout};
 
 const DETAILED_HEADING_SUFFIX: &str = " · select the engine this profile binds";
+const DETAILED_HEADING_SUFFIX_ASCII: &str = " | select the engine this profile binds";
 const COMPACT_HEADING_SUFFIX: &str = " · choose engine";
+const COMPACT_HEADING_SUFFIX_ASCII: &str = " | choose engine";
 const MIN_DETAILED_NAME_WIDTH: usize = 12;
 
 pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, layout: &UiLayout) {
@@ -41,7 +43,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         area.height
             .saturating_sub(if layout.compact { 2 } else { 4 }),
     );
-    let suffix = heading_suffix(inner.width);
+    let suffix = heading_suffix(inner.width, glyphs.unicode);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -125,13 +127,24 @@ pub(super) fn popup_inner_width(popup_width: u16, compact: bool) -> u16 {
 }
 
 pub(super) fn heading_name_width(inner_width: u16) -> usize {
-    remaining_width(inner_width, &[heading_suffix(inner_width)])
+    // Both separator variants occupy the same width, so either measures correctly.
+    remaining_width(inner_width, &[heading_suffix(inner_width, true)])
 }
 
-fn heading_suffix(inner_width: u16) -> &'static str {
-    if remaining_width(inner_width, &[DETAILED_HEADING_SUFFIX]) >= MIN_DETAILED_NAME_WIDTH {
+fn heading_suffix(inner_width: u16, unicode: bool) -> &'static str {
+    let detailed = if unicode {
         DETAILED_HEADING_SUFFIX
     } else {
+        DETAILED_HEADING_SUFFIX_ASCII
+    };
+    let compact = if unicode {
         COMPACT_HEADING_SUFFIX
+    } else {
+        COMPACT_HEADING_SUFFIX_ASCII
+    };
+    if remaining_width(inner_width, &[detailed]) >= MIN_DETAILED_NAME_WIDTH {
+        detailed
+    } else {
+        compact
     }
 }

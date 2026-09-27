@@ -358,7 +358,7 @@ pub fn render_load_progress(
     };
     frame.render_widget(Paragraph::new(bar), bar_area);
 
-    let detail = progress_detail(progress, bar_area.width);
+    let detail = progress_detail(progress, bar_area.width, glyphs);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(detail, theme.muted))),
         detail_area,
@@ -392,11 +392,11 @@ fn indeterminate_bar(frame: u32, width: u16, glyphs: &Glyphs, theme: &Theme) -> 
     if width == 0 {
         return Line::default();
     }
-    let (track, head, segment) = if glyphs.unicode {
-        ("\u{2500}", "\u{2578}", "\u{2501}")
-    } else {
-        ("-", ">", "=")
-    };
+    let (track, head, segment) = (
+        glyphs.progress_empty,
+        glyphs.progress_head,
+        glyphs.progress_segment,
+    );
     let segment_len = (if glyphs.unicode { 6 } else { 5 }).min(width);
     let head_position = (frame as usize) % width;
     Line::from(
@@ -415,7 +415,7 @@ fn indeterminate_bar(frame: u32, width: u16, glyphs: &Glyphs, theme: &Theme) -> 
     )
 }
 
-fn progress_detail(progress: &BackendLoadProgress, width: u16) -> String {
+fn progress_detail(progress: &BackendLoadProgress, width: u16, glyphs: &Glyphs) -> String {
     let phase = progress.phase.label();
     let mut detail = if let Some(message) = &progress.message {
         if message.is_empty() {
@@ -434,7 +434,7 @@ fn progress_detail(progress: &BackendLoadProgress, width: u16) -> String {
         ));
     }
     if detail.len() > width as usize {
-        truncate_middle(&detail, width as usize, "\u{2026}")
+        truncate_middle(&detail, width as usize, glyphs.ellipsis)
     } else {
         detail
     }
@@ -467,11 +467,7 @@ pub fn load_progress_compact(
     } else {
         let inner_width = (width as usize).saturating_sub(phase.len() + 2);
         let position = (animation_frame as usize) % (inner_width.max(1) + 3);
-        let (track, head) = if glyphs.unicode {
-            ("\u{2500}", "\u{2578}")
-        } else {
-            ("-", ">")
-        };
+        let (track, head) = (glyphs.progress_empty, glyphs.progress_head);
         let bar: String = track.repeat(position.min(inner_width)) + head;
         let remaining = inner_width.saturating_sub(bar.chars().count());
         let full_bar = bar + track.repeat(remaining).as_str();
@@ -552,8 +548,13 @@ mod tests {
     fn determinate_bar_renders_filled_and_empty_segments() {
         let line = determinate_bar(0.5, 20, &glyphs(), &theme());
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains('\u{2588}'));
-        assert!(text.contains('\u{2591}'));
+        if glyphs().unicode {
+            assert!(text.contains('\u{2588}'));
+            assert!(text.contains('\u{2591}'));
+        } else {
+            assert!(text.contains('#'));
+            assert!(text.contains('-'));
+        }
         assert!(text.contains("50%"));
     }
 
@@ -594,10 +595,11 @@ mod tests {
         for frame in 0..40 {
             let line = indeterminate_bar(frame, 30, &glyphs(), &theme());
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let head = glyphs().progress_head;
             assert_eq!(UnicodeWidthStr::width(text.as_str()), 30);
-            assert_eq!(text.matches('\u{2578}').count(), 1);
+            assert_eq!(text.matches(head).count(), 1);
             if frame % 30 != 29 {
-                assert!(!text.ends_with('\u{2578}'));
+                assert!(!text.ends_with(head));
             }
         }
     }
@@ -618,7 +620,10 @@ mod tests {
                 let line = indeterminate_bar(frame, width, &glyphs(), &theme());
                 let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                 assert_eq!(UnicodeWidthStr::width(text.as_str()), width as usize);
-                assert_eq!(text.matches('\u{2578}').count(), usize::from(width > 0));
+                assert_eq!(
+                    text.matches(glyphs().progress_head).count(),
+                    usize::from(width > 0)
+                );
             }
         }
     }
@@ -629,7 +634,7 @@ mod tests {
             BackendLoadPhase::LoadingModel,
             "Loading tensors 148 / 200",
         );
-        let detail = progress_detail(&progress, 80);
+        let detail = progress_detail(&progress, 80, &glyphs());
         assert!(detail.contains("Loading model"));
         assert!(detail.contains("Loading tensors 148 / 200"));
     }
@@ -640,8 +645,8 @@ mod tests {
             BackendLoadPhase::LoadingModel,
             "a very long message that exceeds the available width",
         );
-        let detail = progress_detail(&progress, 20);
-        assert!(detail.contains('\u{2026}'));
+        let detail = progress_detail(&progress, 20, &glyphs());
+        assert!(detail.contains(glyphs().ellipsis));
         assert!(detail.chars().count() <= 20);
     }
 
@@ -654,7 +659,7 @@ mod tests {
             total: Some(200),
             message: Some("Loading tensors".to_owned()),
         };
-        let detail = progress_detail(&progress, 80);
+        let detail = progress_detail(&progress, 80, &glyphs());
         assert!(detail.contains("148 B / 200 B"));
     }
 
