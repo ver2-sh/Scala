@@ -24,6 +24,7 @@ use scala_model_library::{
 };
 
 use crate::commands::{self, CommandAction};
+use crate::theme::Glyphs;
 use crate::ui::layout::{
     DownloadJobAction, HoverTarget, InstalledModelAction, ModelProfileAction,
     SelectedRuntimeAction, UiLayout,
@@ -2040,7 +2041,12 @@ impl App {
                 scala_core::SettingSource::Invocation => "boot inference",
             };
             if running.value != current.value || running_source != current.source {
-                lines.push(format!("Running: {} · {}", running.value, running_source));
+                lines.push(format!(
+                    "Running: {}{sep}{}",
+                    running.value,
+                    running_source,
+                    sep = Glyphs::current(self.unicode).separator
+                ));
                 if let Some(detail) = running.detail.as_deref() {
                     lines.push(format!("Running detail: {detail}"));
                 }

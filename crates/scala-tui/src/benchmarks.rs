@@ -380,11 +380,17 @@ impl BenchmarkLayout {
         out
     }
 }
-fn number(value: &Value) -> String {
+fn number(value: &Value, glyphs: &Glyphs) -> String {
     value
         .as_f64()
         .map(|n| format!("{n:.1}"))
-        .unwrap_or_else(|| "—".into())
+        .unwrap_or_else(|| {
+            if glyphs.unicode {
+                "—".into()
+            } else {
+                "-".into()
+            }
+        })
 }
 fn text(value: &Value) -> String {
     value.as_str().map(str::to_owned).unwrap_or_else(|| {
@@ -656,8 +662,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             format_args!("{}", text(&active["phase"])),
             active["completed_tasks"],
             active["total_tasks"],
-            number(&active["elapsed_seconds"]),
-            number(&active["remaining_seconds"])
+            number(&active["elapsed_seconds"], glyphs),
+            number(&active["remaining_seconds"], glyphs)
         )
     } else if let Some(error) = &state.error {
         format!("Error: {error}")
@@ -682,31 +688,37 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     let latency = width >= 108;
     let prefill = width >= 124;
     let wide = width >= 161;
+    let up = if glyphs.unicode { "↑" } else { "^" };
+    let down = if glyphs.unicode { "↓" } else { "v" };
     let mut metrics = Vec::new();
     if width >= 28 {
-        metrics.push(("Intel ↑ /100", "intelligence", ""));
+        metrics.push((format!("Intel {up} /100"), "intelligence", ""));
     }
     if width >= 40 {
-        metrics.push(("Agent ↑ /100", "agentic", ""));
+        metrics.push((format!("Agent {up} /100"), "agentic", ""));
     }
     if width >= 54 {
-        metrics.push(("Coding ↑ /100", "coding", ""));
+        metrics.push((format!("Coding {up} /100"), "coding", ""));
     }
     if width >= 70 {
-        metrics.push(("Retrieval ↑ /100", "retrieval", ""));
+        metrics.push((format!("Retrieval {up} /100"), "retrieval", ""));
     }
     if output {
         metrics.push((
-            "Output TPS ↑",
+            format!("Output TPS {up}"),
             "native_end_to_end_output_tokens_per_second",
             "",
         ));
     }
     if prefill {
-        metrics.push(("Prefill TPS ↑", "native_prefill_tokens_per_second", ""));
+        metrics.push((
+            format!("Prefill TPS {up}"),
+            "native_prefill_tokens_per_second",
+            "",
+        ));
     }
     if latency {
-        metrics.push(("Latency ↓", "first_visible_ms", " ms"));
+        metrics.push((format!("Latency {down}"), "first_visible_ms", " ms"));
     }
     let mut tails = metrics
         .iter()
@@ -717,7 +729,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     }
     let columns = inventory_columns(l.header, &tails, &tails);
     let mut headings = vec!["Profile / run"];
-    headings.extend(metrics.iter().map(|(label, _, _)| *label));
+    headings.extend(metrics.iter().map(|(label, _, _)| label.as_str()));
     if wide {
         headings.extend(["Status", "Last benchmark"]);
     }

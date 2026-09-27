@@ -852,7 +852,11 @@ fn render_installed_model_actions(
         let hovered = app.hover == Some(HoverTarget::InstalledModelAction(*action));
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                truncate_middle(label, area.width as usize, "…"),
+                truncate_middle(
+                    label,
+                    area.width as usize,
+                    Glyphs::current(app.unicode).ellipsis,
+                ),
                 action_style(theme, state, hovered),
             ))),
             *area,
@@ -1045,7 +1049,7 @@ fn render_model_downloads(
         .iter()
         .filter(|job| job.phase == scala_model_library::ModelOperationPhase::Queued)
         .count();
-    let separator = if glyphs.unicode { " · " } else { " | " };
+    let separator = glyphs.separator;
     let title = format!(
         "Downloads  {active} active{separator}{queued} queued{separator}limit {}",
         app.max_parallel_model_downloads()
@@ -1239,7 +1243,7 @@ fn download_progress_bar(
 
 fn download_status(job: &scala_model_library::ModelDownloadJob, glyphs: &Glyphs) -> String {
     use scala_model_library::ModelOperationPhase;
-    let separator = if glyphs.unicode { " · " } else { " | " };
+    let separator = glyphs.separator;
     let transferred = job.total_bytes.map_or_else(
         || format!("{} / unknown", format_bytes(job.downloaded_bytes)),
         |total| {
@@ -1326,7 +1330,7 @@ fn render_runtimes(
     };
     frame.render_widget(
         section_title(
-            &format!("Runtimes · {}", app.local_host_label()),
+            &format!("Runtimes{}{}", glyphs.separator, app.local_host_label()),
             subtitle,
             theme,
         ),
@@ -1626,7 +1630,11 @@ fn render_selected_runtime_actions(
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                truncate_middle(&label, area.width as usize, "…"),
+                truncate_middle(
+                    &label,
+                    area.width as usize,
+                    Glyphs::current(app.unicode).ellipsis,
+                ),
                 action_style(
                     theme,
                     state,
@@ -1972,7 +1980,13 @@ fn runtime_summary(app: &App, id: &scala_core::RuntimeId) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
-fn render_metadata(frame: &mut Frame<'_>, area: Rect, fields: &[(&str, String)], theme: &Theme) {
+fn render_metadata(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    fields: &[(&str, String)],
+    theme: &Theme,
+    glyphs: &Glyphs,
+) {
     let columns = if fields.len() > area.height as usize {
         2
     } else {
@@ -1992,7 +2006,7 @@ fn render_metadata(frame: &mut Frame<'_>, area: Rect, fields: &[(&str, String)],
             Paragraph::new(truncate_middle(
                 value,
                 cells[1].width.saturating_sub(2) as usize,
-                "…",
+                glyphs.ellipsis,
             ))
             .style(theme.text),
             cells[1],
@@ -2060,6 +2074,7 @@ fn render_settings(
                 ),
             ],
             theme,
+            &Glyphs::current(app.unicode),
         );
     }
     render_setting_rows(frame, app, theme, ui_layout);
@@ -2073,6 +2088,8 @@ fn render_model_profiles(
     theme: &Theme,
     ui_layout: &UiLayout,
 ) {
+    let glyphs = Glyphs::current(app.unicode);
+    let sep = glyphs.separator;
     for (index, rect) in &ui_layout.settings_scope_rows {
         let Some(profile) = app.model_profile_values().get(*index).copied() else {
             continue;
@@ -2083,10 +2100,15 @@ fn render_model_profiles(
             .iter()
             .any(|model| model.id == profile.model_id);
         let label = if rect.width == 3 {
-            if rect.x == ui_layout.settings_scopes.x {
-                " ‹ ".to_owned()
+            let (collapsed, expanded) = if glyphs.unicode {
+                (" ‹ ", " › ")
             } else {
-                " › ".to_owned()
+                (" < ", " > ")
+            };
+            if rect.x == ui_layout.settings_scopes.x {
+                collapsed.to_owned()
+            } else {
+                expanded.to_owned()
             }
         } else {
             format!(" {} ", app.profile_label(*index))
@@ -2101,7 +2123,12 @@ fn render_model_profiles(
             theme.muted
         };
         frame.render_widget(
-            Paragraph::new(truncate_middle(&label, rect.width as usize, "…")).style(style),
+            Paragraph::new(truncate_middle(
+                &label,
+                rect.width as usize,
+                glyphs.ellipsis,
+            ))
+            .style(style),
             *rect,
         );
     }
@@ -2141,7 +2168,7 @@ fn render_model_profiles(
                 (
                     "Profile",
                     format!(
-                        "{} · {}",
+                        "{}{sep}{}",
                         app.model_host_label(&profile.model_id),
                         profile.id
                     ),
@@ -2158,9 +2185,9 @@ fn render_model_profiles(
                 (
                     "Configuration",
                     if app.selected_remote_profile().is_some() {
-                        "Owner report · read only".to_owned()
+                        format!("Owner report{sep}read only")
                     } else if app.settings_validation_error.is_some() {
-                        "Next load · invalid (see details)".to_owned()
+                        format!("Next load{sep}invalid (see details)")
                     } else {
                         "Next load".to_owned()
                     },
@@ -2179,6 +2206,7 @@ fn render_model_profiles(
                     Rect::new(info_area.x, info_area.y + row as u16, info_area.width, 1),
                     &fields,
                     theme,
+                    &glyphs,
                 );
             }
         } else {
@@ -2213,6 +2241,8 @@ pub(super) fn render_settings_input(
     theme: &Theme,
     ui_layout: &UiLayout,
 ) {
+    let glyphs = Glyphs::current(app.unicode);
+    let sep = glyphs.separator;
     let Some(input) = &app.settings_input else {
         return;
     };
@@ -2255,7 +2285,12 @@ pub(super) fn render_settings_input(
     };
     frame.render_widget(Clear, panel);
     frame.render_widget(
-        Paragraph::new(truncate_middle(&prompt, panel.width as usize, "…")).style(theme.hint),
+        Paragraph::new(truncate_middle(
+            &prompt,
+            panel.width as usize,
+            glyphs.ellipsis,
+        ))
+        .style(theme.hint),
         Rect::new(panel.x, panel.y, panel.width, 1),
     );
     if let Some(editor) = &input.editor {
@@ -2313,7 +2348,7 @@ pub(super) fn render_settings_input(
             editor.definition.kind.constraints()
         };
         let summary = format!(
-            "{} [{}]\n{timing} · {scope}\n{parent}\n{local}\n{} {}",
+            "{} [{}]\n{timing}{sep}{scope}\n{parent}\n{local}\n{} {}",
             editor.definition.label,
             editor.definition.id,
             constraints,
@@ -2351,9 +2386,9 @@ pub(super) fn render_settings_input(
             Paragraph::new(
                 if editor.custom() && editor.definition.kind == scala_core::SettingKind::JsonObject
                 {
-                    "Tab mode · F10 save · Esc"
+                    format!("Tab mode{sep}F10 save{sep}Esc")
                 } else {
-                    "↑↓/Tab · Enter save · Esc"
+                    format!("{}/Tab{sep}Enter save{sep}Esc", glyphs.up_down)
                 },
             )
             .style(theme.hint),
@@ -2365,7 +2400,7 @@ pub(super) fn render_settings_input(
                 Paragraph::new(format!(
                     "({}) {}",
                     if *index == editor.selected {
-                        "●"
+                        if glyphs.unicode { "●" } else { "*" }
                     } else {
                         " "
                     },
@@ -2404,7 +2439,7 @@ pub(super) fn render_settings_input(
                     .char_indices()
                     .nth(input.cursor)
                     .map_or(input.text.len(), |(i, _)| i);
-                marked.insert(byte, '▏');
+                marked.insert_str(byte, glyphs.caret);
                 let column = prefix.rsplit('\n').next().unwrap_or("").chars().count();
                 let horizontal = column.saturating_sub(field_width.saturating_sub(1));
                 marked
@@ -2618,7 +2653,11 @@ fn render_model_profile_actions(
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                truncate_middle(label, area.width as usize, "…"),
+                truncate_middle(
+                    label,
+                    area.width as usize,
+                    Glyphs::current(app.unicode).ellipsis,
+                ),
                 action_style(
                     theme,
                     state,
@@ -2642,6 +2681,7 @@ pub(super) fn selected_setting_detail(app: &App) -> Option<String> {
 }
 
 fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layout: &UiLayout) {
+    let glyphs = Glyphs::current(app.unicode);
     if app.settings_input.is_none()
         && let Some(detail) = selected_setting_detail(app)
     {
@@ -2651,11 +2691,10 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
                 .scroll((app.settings_detail_scroll, 0))
                 .style(theme.hint)
                 .wrap(Wrap { trim: true })
-                .block(
-                    Block::default()
-                        .borders(Borders::TOP)
-                        .title(" Setting · i expand/close · [ ] scroll "),
-                ),
+                .block(Block::default().borders(Borders::TOP).title(format!(
+                    " Setting{sep}i expand/close{sep}[ ] scroll ",
+                    sep = glyphs.separator
+                ))),
             ui_layout.settings_detail,
         );
     }
@@ -2665,7 +2704,13 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
             HoverTarget::SettingsDetails => "[ i Details ]",
             HoverTarget::ProfileActions => "[a Actions]",
             HoverTarget::SettingsSearch => "[ / Search ]",
-            HoverTarget::SettingsFilter if app.settings_overrides_only => "[ o Overrides ✓ ]",
+            HoverTarget::SettingsFilter if app.settings_overrides_only => {
+                if glyphs.unicode {
+                    "[ o Overrides ✓ ]"
+                } else {
+                    "[ o Overrides x ]"
+                }
+            }
             HoverTarget::SettingsFilter => "[ o Overrides ]",
             HoverTarget::SettingsReset => "[ R Reset scope ]",
             _ => "",
@@ -2673,7 +2718,13 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
         let label = if rect.width < 10 {
             match target {
                 HoverTarget::SettingsSearch => "[ / ]",
-                HoverTarget::SettingsFilter if app.settings_overrides_only => "[ o ✓ ]",
+                HoverTarget::SettingsFilter if app.settings_overrides_only => {
+                    if glyphs.unicode {
+                        "[ o ✓ ]"
+                    } else {
+                        "[ o x ]"
+                    }
+                }
                 HoverTarget::SettingsFilter => "[ o ]",
                 HoverTarget::SettingsReset => "[ R ]",
                 HoverTarget::SettingsDetails => "[ i ]",
@@ -2686,7 +2737,7 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
             truncate_middle(
                 &format!("[ / {} ]", app.settings_query),
                 rect.width as usize,
-                "…",
+                glyphs.ellipsis,
             )
         } else {
             label.to_owned()
@@ -2796,7 +2847,7 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
                 "Settings"
             }
         } else if !definition.supported {
-            "—"
+            if glyphs.unicode { "—" } else { "-" }
         } else if let Some(mechanism) = display.source.strip_prefix("OS: ") {
             mechanism
         } else if display.source.to_lowercase().contains("settings") {
@@ -2808,7 +2859,13 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
         } else {
             "Runtime"
         };
-        let action = if display.can_clear { "Inherit" } else { "—" };
+        let action = if display.can_clear {
+            "Inherit"
+        } else if glyphs.unicode {
+            "—"
+        } else {
+            "-"
+        };
         for (i, text) in [
             definition.label.as_str(),
             display.value.as_str(),
@@ -2841,7 +2898,7 @@ fn render_setting_rows(frame: &mut Frame<'_>, app: &App, theme: &Theme, ui_layou
                 Paragraph::new(truncate_middle(
                     text,
                     cell.width.saturating_sub(1) as usize,
-                    "…",
+                    glyphs.ellipsis,
                 ))
                 .style(cell_style),
                 cell,
