@@ -12,11 +12,18 @@ published by `natpate/ninfer-windows` `v0.7.1` (Windows x86_64, CUDA, RTX
 5090/sm_120a; no WSL). That port remains in the v2 generation and includes
 DFlash2. Its repository, release tag, asset and digest identities are retained
 as its own provenance; it is not relabeled as canonical `Neroued/ninfer`, whose
-managed route stays Linux source-only. Upstream `v0.8.x`/`v0.9.x` portable
-releases moved to NInfer v3 artifacts and remain unavailable while Scala admits
-v2 containers only. Capability credit applies to the exact reviewed release;
-other admitted `v0.7.x` packages keep truthful identity but stay
-needs-attention rather than inheriting the reviewed contract.
+managed route stays Linux source-only. The managed catalog exposes only that
+exact reviewed package: the release ID, the tag's resolved commit/tree, and
+the asset ID, name, size and SHA-256 digest are all pinned, so a replaced
+asset or a moved tag makes the package unavailable rather than inheriting
+review. Capability credit is evidence-bound per domain: at the reviewed tag,
+74 of the 97 capability-owning source blobs are byte-identical to the
+canonical reviewed set and the 23 differing fork blobs were reviewed in place
+as contract-preserving, so the package receives the same capability domains
+only while the exact pinned package facts hold. Upstream `v0.8.x`/`v0.9.x`
+portable releases moved to NInfer v3 artifacts and remain unavailable while
+Scala admits v2 containers only, and other `v0.7.x` tags are unreviewed and
+never candidates.
 
 Native target registry inspection covers Qwen3.6-27B and Qwen3.8-27B with
 `groupwise-int` and `nvfp4`, plus Qwen3.6-35B-A3B `groupwise-int`. The reviewed
