@@ -570,8 +570,9 @@ struct WindowsTaskView {
     restart_interval: Option<String>,
     #[serde(default)]
     execution_time_limit: Option<String>,
-    #[serde(default)]
-    allow_start_on_batteries: bool,
+    // The stored battery policy properties. `-AllowStartIfOnBatteries` is a
+    // `New-ScheduledTaskSettingsSet` parameter, not a persisted property: the
+    // owned registration persists as `DisallowStartIfOnBatteries=false`.
     #[serde(default)]
     disallow_start_on_batteries: bool,
     #[serde(default)]
@@ -621,7 +622,7 @@ fn windows_query_script(task: &str) -> String {
     // SID string or any account name form; anything unresolvable yields `null`,
     // which fails closed.
     format!(
-        "$n={task}; $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false }} | ConvertTo-Json -Compress }} else {{ $rs={{ param($u) if ([string]::IsNullOrWhiteSpace([string]$u)) {{ return $null }} try {{ return (New-Object System.Security.Principal.SecurityIdentifier([string]$u)).Value }} catch {{}} try {{ return (New-Object System.Security.Principal.NTAccount([string]$u)).Translate([System.Security.Principal.SecurityIdentifier]).Value }} catch {{ return $null }} }}; $a=@(@($t.Actions) | ForEach-Object {{ [pscustomobject]@{{ execute=[string]$_.Execute; arguments=[string]$_.Arguments }} }}); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; user_sid=(& $rs $_.UserId); enabled=$_.Enabled; delay=[string]$_.Delay }} }}); [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; user=[string]$t.Principal.UserId; user_sid=(& $rs $t.Principal.UserId); logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; action_count=$a.Count; actions=$a; trigger_count=$tr.Count; triggers=$tr; start_when_available=[bool]$t.Settings.StartWhenAvailable; restart_count=[int]$t.Settings.RestartCount; restart_interval=[string]$t.Settings.RestartInterval; execution_time_limit=[string]$t.Settings.ExecutionTimeLimit; allow_start_on_batteries=[bool]$t.Settings.AllowStartIfOnBatteries; disallow_start_on_batteries=[bool]$t.Settings.DisallowStartIfOnBatteries; stop_if_on_batteries=[bool]$t.Settings.StopIfGoingOnBatteries }} | ConvertTo-Json -Compress -Depth 6 }}"
+        "$n={task}; $t=Get-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; if ($null -eq $t) {{ [pscustomobject]@{{ present=$false }} | ConvertTo-Json -Compress }} else {{ $rs={{ param($u) if ([string]::IsNullOrWhiteSpace([string]$u)) {{ return $null }} try {{ return (New-Object System.Security.Principal.SecurityIdentifier([string]$u)).Value }} catch {{}} try {{ return (New-Object System.Security.Principal.NTAccount([string]$u)).Translate([System.Security.Principal.SecurityIdentifier]).Value }} catch {{ return $null }} }}; $a=@(@($t.Actions) | ForEach-Object {{ [pscustomobject]@{{ execute=[string]$_.Execute; arguments=[string]$_.Arguments }} }}); $tr=@(@($t.Triggers) | ForEach-Object {{ [pscustomobject]@{{ type=[string]$_.CimClass.CimClassName; user=$_.UserId; user_sid=(& $rs $_.UserId); enabled=$_.Enabled; delay=[string]$_.Delay }} }}); [pscustomobject]@{{ present=$true; enabled=[bool]$t.Settings.Enabled; user=[string]$t.Principal.UserId; user_sid=(& $rs $t.Principal.UserId); logon_type=[string]$t.Principal.LogonType; run_level=[string]$t.Principal.RunLevel; action_count=$a.Count; actions=$a; trigger_count=$tr.Count; triggers=$tr; start_when_available=[bool]$t.Settings.StartWhenAvailable; restart_count=[int]$t.Settings.RestartCount; restart_interval=[string]$t.Settings.RestartInterval; execution_time_limit=[string]$t.Settings.ExecutionTimeLimit; disallow_start_on_batteries=[bool]$t.Settings.DisallowStartIfOnBatteries; stop_if_on_batteries=[bool]$t.Settings.StopIfGoingOnBatteries }} | ConvertTo-Json -Compress -Depth 6 }}"
     )
 }
 
@@ -713,12 +714,14 @@ fn windows_evaluate(
         });
     // The owned startup settings as `New-ScheduledTaskSettingsSet` emits them:
     // missed-run catch-up, restart-on-failure policy, no execution limit, and
-    // battery behavior that never suppresses or stops the logon launch.
+    // battery behavior that never suppresses or stops the logon launch. The
+    // stored battery policy is the inverse pair `DisallowStartIfOnBatteries`
+    // and `StopIfGoingOnBatteries`; the registration's `-AllowStartIfOnBatteries`
+    // parameter persists as `DisallowStartIfOnBatteries=false`.
     let settings_match = view.start_when_available
         && view.restart_count == 3
         && view.restart_interval.as_deref() == Some("PT1M")
         && view.execution_time_limit.as_deref() == Some("PT0S")
-        && view.allow_start_on_batteries
         && !view.disallow_start_on_batteries
         && !view.stop_if_on_batteries;
     let healthy = view.enabled
@@ -1044,16 +1047,19 @@ mod tests {
         assert!(query.contains("restart_count="));
         assert!(query.contains("restart_interval="));
         assert!(query.contains("execution_time_limit="));
-        assert!(query.contains("allow_start_on_batteries="));
         assert!(query.contains("disallow_start_on_batteries="));
         assert!(query.contains("stop_if_on_batteries="));
         assert!(query.contains("StartWhenAvailable"));
         assert!(query.contains("RestartCount"));
         assert!(query.contains("RestartInterval"));
         assert!(query.contains("ExecutionTimeLimit"));
-        assert!(query.contains("AllowStartIfOnBatteries"));
         assert!(query.contains("DisallowStartIfOnBatteries"));
         assert!(query.contains("StopIfGoingOnBatteries"));
+        // `AllowStartIfOnBatteries` is a `New-ScheduledTaskSettingsSet`
+        // parameter, not a stored settings property: the query must not read
+        // it. (`DisallowStartIfOnBatteries` contains the lowercase substring
+        // "allowStartIfOnBatteries", so the property path is asserted.)
+        assert!(!query.contains("Settings.AllowStartIfOnBatteries"));
 
         let identity = windows_identity_script();
         assert!(identity.contains("WindowsIdentity]::GetCurrent()"));
@@ -1105,7 +1111,6 @@ mod tests {
             "restart_count": 3,
             "restart_interval": "PT1M",
             "execution_time_limit": "PT0S",
-            "allow_start_on_batteries": true,
             "disallow_start_on_batteries": false,
             "stop_if_on_batteries": false,
         });
@@ -1324,13 +1329,9 @@ mod tests {
         }
 
         // Any battery-policy change that suppresses or stops the logon
-        // launch: broken.
-        let mut no_battery_start = healthy_windows_task(r"C:\Scala\scala.exe");
-        no_battery_start.allow_start_on_batteries = false;
-        let status = windows_health(&no_battery_start);
-        assert_ne!(status.state, StartupState::Enabled);
-        assert!(status.broken);
-
+        // launch: broken. These are the stored properties; the owned
+        // registration's `-AllowStartIfOnBatteries` parameter persists as
+        // `DisallowStartIfOnBatteries=false`.
         let mut disallow_battery = healthy_windows_task(r"C:\Scala\scala.exe");
         disallow_battery.disallow_start_on_batteries = true;
         let status = windows_health(&disallow_battery);
@@ -1367,7 +1368,6 @@ mod tests {
             "restart_count": 3,
             "restart_interval": "PT1M",
             "execution_time_limit": "PT0S",
-            "allow_start_on_batteries": true,
             "disallow_start_on_batteries": false,
             "stop_if_on_batteries": false,
         });
