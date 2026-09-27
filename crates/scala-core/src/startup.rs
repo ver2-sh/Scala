@@ -709,7 +709,7 @@ fn windows_evaluate(
                 .to_ascii_lowercase()
                 .contains("logontrigger")
                 && windows_same_user(trigger.user_sid.as_deref(), current_sid)
-                && trigger.enabled.unwrap_or(true)
+                && trigger.enabled == Some(true)
                 && trigger.delay.as_deref() == Some("PT30S")
         });
     // The owned startup settings as `New-ScheduledTaskSettingsSet` emits them:
@@ -1233,6 +1233,22 @@ mod tests {
         let status = windows_health(&extra_logon);
         assert_ne!(status.state, StartupState::Enabled);
         assert!(status.broken);
+
+        // The owned AtLogOn trigger is healthy only when its `Enabled`
+        // property is explicitly true: a disabled trigger and a missing or
+        // unreadable property both fail closed like a missing SID or delay.
+        for (enabled, expected) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let mut task = healthy_windows_task(r"C:\Scala\scala.exe");
+            task.triggers[0].enabled = enabled;
+            let status = windows_health(&task);
+            assert_eq!(
+                status.state == StartupState::Enabled,
+                expected,
+                "trigger enabled {enabled:?} must {}pass",
+                if expected { "" } else { "not " }
+            );
+            assert_eq!(status.broken, !expected);
+        }
 
         // Wrong trigger user: broken, never Enabled.
         let mut wrong_trigger_user = healthy_windows_task(r"C:\Scala\scala.exe");
