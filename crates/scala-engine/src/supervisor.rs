@@ -47,6 +47,7 @@ pub async fn capture_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    scala_core::isolate_child_from_console(command.as_std_mut());
     let child = command.spawn().map_err(|error| {
         EngineError::Operation(format!("could not start engine probe: {error}"))
     })?;
@@ -149,6 +150,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         if let Some(directory) = &spec.working_directory {
             command.current_dir(directory);
         }
+        scala_core::isolate_child_from_console(command.as_std_mut());
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {

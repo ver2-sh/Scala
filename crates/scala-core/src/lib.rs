@@ -7,6 +7,7 @@ mod event;
 mod model;
 mod model_profile;
 mod norted_package;
+mod process;
 mod provenance;
 pub mod prune;
 mod runtime;
@@ -44,6 +45,7 @@ pub use norted_package::{
     norted_package_manifest_name, plan_norted_package_acquisition,
     recover_norted_package_primary_paths,
 };
+pub use process::isolate_child_from_console;
 pub use provenance::{
     AcquisitionMethod, AuxiliaryRuntimeIdentity, BuildProvenance, EngineInstallation,
     EngineRevision, EnvironmentVariableProvenance, ModelProfileRuntimeIdentity,

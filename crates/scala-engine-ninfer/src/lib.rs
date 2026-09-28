@@ -1053,6 +1053,7 @@ fn installed_source_blobs(runtime: &InstalledRuntime) -> Option<BTreeMap<String,
     for (path, _) in REVIEWED_SOURCE_BLOBS {
         command.arg(path);
     }
+    scala_core::isolate_child_from_console(&mut command);
     let output = command.output().ok()?;
     if !output.status.success() {
         return None;
