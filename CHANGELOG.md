@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.5 - Windows child-process isolation
+
+Prevents Scala-owned noninteractive child processes from mutating the parent
+Windows console while preserving existing runtime ownership and captured output.
+
+- Launch managed runtimes, probes and helper processes with `CREATE_NO_WINDOW`
+  on Windows so console-global changes in child executables cannot alter Scala's
+  TUI console state.
+- Preserve piped stdout/stderr, runtime lifecycle ownership and existing
+  termination behavior while keeping non-Windows process behavior unchanged.
+- Apply the same isolation policy to runtime discovery, installer/toolchain
+  probes, NInfer source inspection, startup helpers and doctor probes.
+- Avoid unsupported parent-directory sync after benchmark checkpoint
+  finalization on non-Unix platforms while retaining the Unix durability step.
+
 ## 0.1.4 — Windows startup and terminal reliability
 
 Improves Windows desktop behavior while keeping Scala's serving, runtime and
