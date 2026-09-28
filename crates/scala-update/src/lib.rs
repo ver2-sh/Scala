@@ -182,9 +182,24 @@ impl Candidate {
         self.updater.set_current_version(CURRENT.parse()?)?;
         // No timeout around replacement: dropping upstream during Windows rename/restore
         // would abandon its recovery. Discovery/download HTTP calls are bounded.
-        let result = self.updater.run().await.wrap_err(if cfg!(windows) {
-            "Update failed. PowerShell uses process-only Bypass; MachinePolicy/UserPolicy remain authoritative. If blocked by organizational policy, contact your administrator. Use your original startup method afterward"
-        } else { "Update failed; use your original startup method afterward" })?;
+        let result = match self.updater.run().await {
+            Ok(result) => result,
+            #[cfg(windows)]
+            Err(error @ axoupdater::AxoupdateError::CleanupFailed {}) => {
+                // Upstream may have installed successfully before failing to delete
+                // the relocated old image. Keep every replacement lock while proving it.
+                let target = self.state.latest.as_deref().expect("available release");
+                if let Err(verification) =
+                    verify_replacement(&receipt_path, &executable, &locked_prefix, target).await
+                {
+                    return Err(color_eyre::eyre::Report::new(error)).wrap_err(format!(
+                        "Application update failed (CleanupFailed); post-install verification failed: {verification:#}"
+                    ));
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error).wrap_err("Application update failed"),
+        };
         ensure!(result.is_some(), "No binary replacement was performed");
         Ok(())
     }
@@ -390,12 +405,19 @@ struct Provider {
 }
 impl Receipt {
     fn validate(&self, executable: &Path) -> Result<()> {
+        self.validate_version(executable, CURRENT)
+    }
+    fn validate_version(&self, executable: &Path, version: &str) -> Result<()> {
+        ensure!(
+            self.version == version,
+            "Receipt version {:?} does not match expected {version}",
+            self.version
+        );
         let name = if cfg!(windows) { "scala.exe" } else { "scala" };
         ensure!(
             official_source(&self.source)
                 && self.provider.source == "cargo-dist"
                 && semver::Version::parse(&self.provider.version).is_ok()
-                && self.version == CURRENT
                 && self.binaries == [name]
                 && self.cdylibs.is_empty()
                 && self.cstaticlibs.is_empty()
@@ -417,6 +439,52 @@ impl Receipt {
         );
         Ok(())
     }
+}
+#[cfg(windows)]
+async fn verify_replacement(
+    receipt_path: &Path,
+    executable: &Path,
+    locked_prefix: &Path,
+    target: &str,
+) -> Result<()> {
+    let receipt: Receipt = serde_json::from_slice(
+        &fs::read(receipt_path).wrap_err("Cannot re-read installed receipt")?,
+    )
+    .wrap_err("Invalid installed receipt")?;
+    receipt.validate_version(executable, target)?;
+    ensure!(
+        receipt.install_prefix.canonicalize()? == locked_prefix,
+        "Installed receipt changed installation prefix"
+    );
+    let output = tokio::time::timeout(
+        CHECK_TIMEOUT,
+        tokio::process::Command::new(executable)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .wrap_err("Installed executable --version timed out")?
+    .wrap_err_with(|| {
+        format!(
+            "Cannot run installed executable {} --version",
+            executable.display()
+        )
+    })?;
+    ensure!(
+        output.status.success(),
+        "Installed executable --version exited with {}; stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let version = std::str::from_utf8(&output.stdout).wrap_err("Invalid --version output")?;
+    ensure!(
+        version.trim() == format!("scala {target}"),
+        "Installed executable reported {:?}; expected scala {target}",
+        version.trim()
+    );
+    Ok(())
 }
 fn receipt_path() -> Result<PathBuf> {
     reject_source_overrides()?;

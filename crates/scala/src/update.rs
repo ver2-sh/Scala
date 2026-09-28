@@ -20,6 +20,16 @@ fn approved(input: &str) -> bool {
 }
 
 pub async fn run(paths: &AppPaths, args: &UpdateArgs, json: bool) -> Result<()> {
+    // The CLI prints only Display; expose updater causes without changing other commands.
+    run_update(paths, args, json)
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!("{error:#}"))
+}
+
+async fn run_update(paths: &AppPaths, args: &UpdateArgs, json: bool) -> Result<()> {
+    // Capture before Windows renames the image; never reuse update argv.
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let interactive = !json && io::stdin().is_terminal() && io::stdout().is_terminal();
     let candidate = scala_update::Candidate::discover(&paths.cache_dir).await?;
     let state = candidate.state.clone();
     if !json {
@@ -27,12 +37,7 @@ pub async fn run(paths: &AppPaths, args: &UpdateArgs, json: bool) -> Result<()> 
     }
     let mut outcome = "checked";
     if !args.check && state.available() {
-        if needs_prompt(
-            json,
-            io::stdin().is_terminal() && io::stdout().is_terminal(),
-            args.yes,
-        )
-        .wrap_err_with(|| {
+        if needs_prompt(json, interactive, args.yes).wrap_err_with(|| {
             format!(
                 "{}; replacement requires --yes in JSON/noninteractive mode",
                 state.message()
@@ -51,8 +56,12 @@ pub async fn run(paths: &AppPaths, args: &UpdateArgs, json: bool) -> Result<()> 
         }
         candidate.install(paths).await?;
         outcome = "updated";
+        if interactive {
+            println!("Scala updated. Restarting…");
+            return relaunch(&executable);
+        }
         if !json {
-            println!("Scala updated. Start Scala again using your original startup method.");
+            println!("Scala updated.");
         }
     }
     if json {
@@ -67,6 +76,23 @@ pub async fn run(paths: &AppPaths, args: &UpdateArgs, json: bool) -> Result<()> 
         );
     }
     Ok(())
+}
+
+fn relaunch(executable: &std::path::Path) -> Result<()> {
+    let mut command = std::process::Command::new(executable);
+    // No inherited arguments: the new process opens the default app, never update.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(command.exec()).wrap_err("Scala updated, but restarting the app failed")
+    }
+    #[cfg(not(unix))]
+    {
+        command
+            .spawn()
+            .wrap_err("Scala updated, but restarting the app failed")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
