@@ -14,7 +14,7 @@ use scala_core::{
     RuntimeOperationPhase, RuntimeOperationProgress, RuntimeProbeObservation,
     RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites, RuntimeSourceBuildProvenance,
     RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem, RuntimeSourceBuildToolchain,
-    effective_cmake_configuration_arguments, is_safe_relative_path,
+    effective_cmake_configuration_arguments, is_safe_relative_path, isolate_child_from_console,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -1293,6 +1293,7 @@ async fn probe_cpp_compiler(program: &str, standard: u16) -> Result<(), RuntimeI
         .stderr(Stdio::null())
         .kill_on_drop(true);
     configure_source_process_group(&mut command);
+    isolate_child_from_console(command.as_std_mut());
     let mut child = command.spawn().map_err(|error| {
         RuntimeInstallError::Prerequisite(format!(
             "could not start C++{standard} compiler probe with `{program}`: {error}"
@@ -1338,12 +1339,14 @@ async fn command_text(
     let mut command = tokio::process::Command::new(program);
     command
         .args(arguments)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     if let Some(current_dir) = current_dir {
         command.current_dir(current_dir);
     }
+    isolate_child_from_console(command.as_std_mut());
     let mut child = command.spawn().map_err(|error| {
         RuntimeInstallError::Prerequisite(format!("could not execute `{program}`: {error}"))
     })?;
@@ -1428,6 +1431,7 @@ async fn probe_status(program: &str, arguments: &[&str]) -> Result<(), RuntimeIn
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    isolate_child_from_console(command.as_std_mut());
     let status = tokio::time::timeout(SOURCE_PROBE_TIMEOUT, command.status())
         .await
         .map_err(|_| RuntimeInstallError::Prerequisite(format!("`{program}` probe timed out")))?
@@ -1452,6 +1456,7 @@ async fn run_source_command(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     configure_source_process_group(&mut command);
+    isolate_child_from_console(command.as_std_mut());
     if let Some(current_dir) = current_dir {
         command.current_dir(current_dir);
     }

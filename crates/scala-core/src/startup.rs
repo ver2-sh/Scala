@@ -195,13 +195,13 @@ fn invoke(program: &'static str, args: &[&str]) -> Result<String, StartupError> 
     if program == "systemctl" {
         return test_systemctl(args);
     }
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|source| StartupError::Command {
-            program,
-            message: format!("could not run: {source}"),
-        })?;
+    let mut command = Command::new(program);
+    command.args(args);
+    crate::process::isolate_child_from_console(&mut command);
+    let output = command.output().map_err(|source| StartupError::Command {
+        program,
+        message: format!("could not run: {source}"),
+    })?;
     if !output.status.success() {
         return Err(StartupError::Command {
             program,

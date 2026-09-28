@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use scala_core::{
     AcceleratorDevice, AvailableRuntime, ComputeCapability, HostCapabilities, RuntimeCompatibility,
-    RuntimeId, RuntimeRequirements, RuntimeSourceSnapshot,
+    RuntimeId, RuntimeRequirements, RuntimeSourceSnapshot, isolate_child_from_console,
 };
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -1011,6 +1011,7 @@ async fn query_nvidia_gpus() -> std::io::Result<(std::process::Output, bool)> {
             "--format=csv,noheader,nounits",
         ])
         .kill_on_drop(true);
+    isolate_child_from_console(command.as_std_mut());
     let rich = command.output().await?;
     if rich.status.success() || !compute_cap_query_is_unsupported(&rich.stderr) {
         return Ok((rich, true));
@@ -1023,6 +1024,7 @@ async fn query_nvidia_gpus() -> std::io::Result<(std::process::Output, bool)> {
             "--format=csv,noheader,nounits",
         ])
         .kill_on_drop(true);
+    isolate_child_from_console(fallback.as_std_mut());
     fallback.output().await.map(|output| (output, false))
 }
 

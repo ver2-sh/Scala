@@ -1463,6 +1463,7 @@ async fn inspect_source_toolchain(
 async fn command_version(executable: &str) -> Result<String, String> {
     let mut command = tokio::process::Command::new(executable);
     command.arg("--version").kill_on_drop(true);
+    scala_core::isolate_child_from_console(command.as_std_mut());
     let output = tokio::time::timeout(Duration::from_secs(2), command.output())
         .await
         .map_err(|_| format!("`{executable} --version` timed out"))?
