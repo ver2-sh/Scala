@@ -225,7 +225,15 @@ fn atomic_before<T: serde::Serialize>(
         return Err("benchmark finalization deadline; checkpoint retained".into());
     }
     temporary.persist(path).map_err(|e| e.to_string())?;
+    sync_parent_directory(parent)
+}
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<(), String> {
     std::fs::File::open(parent)
         .and_then(|f| f.sync_all())
         .map_err(|e| e.to_string())
+}
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> Result<(), String> {
+    Ok(())
 }
