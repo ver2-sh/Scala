@@ -1204,6 +1204,21 @@ impl std::fmt::Display for ReasoningEffort {
     }
 }
 
+/// Optional public model discovery facts, never persisted as inference overrides.
+/// Thinking uses `enable_thinking` on Chat and `reasoning.enabled` on Responses;
+/// effort uses `reasoning_effort` / `reasoning.effort`. Empty efforts grant none.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelCapabilities {
+    pub thinking: ThinkingCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ThinkingCapabilities {
+    pub switchable: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effort_options: Vec<ReasoningEffort>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GenerationSettingsPatch {
     pub temperature: Option<f64>,
@@ -1506,6 +1521,16 @@ pub trait EngineAdapter: Send + Sync {
         _settings: Option<&ResolvedSettings>,
     ) -> Vec<EngineFeature> {
         self.capabilities().features
+    }
+    /// Only advertise request controls proved by this exact serving tuple.
+    /// Settings support or a protocol format alone does not prove effort support.
+    fn model_capabilities(
+        &self,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _settings: &ResolvedSettings,
+    ) -> Option<ModelCapabilities> {
+        None
     }
     /// Whether a configured common setting should be copied into omitted
     /// per-request generation fields. Engines may instead own a setting as an

@@ -102,6 +102,30 @@ pub struct NinferContainerMetadata {
     pub metadata_bytes_read: u64,
 }
 
+impl NinferContainerMetadata {
+    /// Hash one embedded frontend resource, with a bounded read and no tensor IO.
+    /// Uses the native object directory, equally for bare and manifest-bound files.
+    pub fn frontend_resource_sha256(
+        &self,
+        path: &Path,
+        name: &str,
+    ) -> Result<Option<String>, NinferContainerError> {
+        let Some((_, offset, bytes)) = self.resources.iter().find(|(key, _, _)| key == name) else {
+            return Ok(None);
+        };
+        if *bytes > 1024 * 1024 {
+            return Err(invalid_ninfer_directory(
+                "frontend capability resource exceeds inspection bound",
+            ));
+        }
+        let mut file = std::fs::File::open(path)?;
+        file.seek(SeekFrom::Start(*offset))?;
+        let mut content = vec![0; *bytes as usize];
+        file.read_exact(&mut content)?;
+        Ok(Some(format!("{:x}", Sha256::digest(content))))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum NinferContainerError {
     #[error("could not read NInfer container metadata: {0}")]
@@ -1386,7 +1410,7 @@ fn artifact_timestamp(metadata: &Metadata) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
 
     use sha2::{Digest, Sha256};
 
@@ -1786,6 +1810,42 @@ mod tests {
             assert!(inspect(&malformed, "qwen3.8-27b", "nvfp4").is_err());
         }
         assert!(!metadata.dflash2);
+    }
+
+    #[test]
+    fn ninfer_frontend_capability_hash_reads_only_the_embedded_resource() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("arbitrary.ninfer");
+        let content = b"synthetic embedded template";
+        let directory = serde_json::json!({
+            "identity": { "model_id": "arbitrary", "weights_id": "arbitrary" },
+            "objects": [{ "name": "frontend/chat_template.jinja", "kind": "resource",
+                "encoding": "raw-bytes-v1", "offset": 0, "bytes": content.len() }]
+        });
+        write_ninfer_fixture(&path, &directory, 16384);
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(4096)).unwrap();
+        file.write_all(content).unwrap();
+        let metadata = inspect_ninfer_container(&path).unwrap();
+        assert_eq!(
+            metadata
+                .frontend_resource_sha256(&path, "frontend/chat_template.jinja")
+                .unwrap(),
+            Some(sha(content))
+        );
+        assert_eq!(
+            metadata
+                .frontend_resource_sha256(&path, "frontend/missing")
+                .unwrap(),
+            None
+        );
+        let mut bounded = metadata.clone();
+        bounded.resources[0].2 = 1024 * 1024 + 1;
+        assert!(
+            bounded
+                .frontend_resource_sha256(&path, "frontend/chat_template.jinja")
+                .is_err()
+        );
     }
 
     #[test]

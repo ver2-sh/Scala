@@ -326,6 +326,8 @@ struct ApiModel {
     object: &'static str,
     owned_by: String,
     created: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<scala_engine::ModelCapabilities>,
 }
 
 async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::OpenAiError> {
@@ -334,10 +336,10 @@ async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::O
         .read()
         .await
         .map_err(|e| error::runtime_error(scala_engine::RuntimeError::Operation(e.to_string())))?;
-    let mut models: Vec<_> = profiles
-        .profiles
-        .into_values()
-        .map(|profile| ApiModel {
+    let mut models = Vec::new();
+    for profile in profiles.profiles.into_values() {
+        models.push(ApiModel {
+            capabilities: state.runtime.model_capabilities(&profile).await,
             id: profile.id.to_string(),
             object: "model",
             owned_by: "scala-user".into(),
@@ -346,8 +348,8 @@ async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::O
                 .iter()
                 .find(|model| model.id == profile.model_id)
                 .map_or(0, |model| model.created),
-        })
-        .collect();
+        });
+    }
     if let Some(link) = &state.link {
         let linked = link.snapshot().await;
         let mut counts = std::collections::BTreeMap::<String, usize>::new();
@@ -374,6 +376,7 @@ async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::O
                 for profile in inventory.profiles.iter().filter(|p| p.installed) {
                     let name = profile.id.as_str();
                     models.push(ApiModel {
+                        capabilities: None,
                         id: if counts.get(name).copied().unwrap_or(0) > 1 {
                             scala_engine::link::qualified_alias(name, &peer.node_id)
                         } else {
@@ -772,6 +775,7 @@ mod tests {
     #[test]
     fn model_object_contains_only_the_supported_openai_fields() {
         let value = serde_json::to_value(ApiModel {
+            capabilities: None,
             id: "example".to_owned(),
             object: "model",
             owned_by: "scala-local".into(),
@@ -785,6 +789,48 @@ mod tests {
         assert!(object.contains_key("created"));
         assert!(object.contains_key("object"));
         assert!(object.contains_key("owned_by"));
+    }
+
+    #[test]
+    fn model_capabilities_are_additive_and_do_not_include_defaults() {
+        use scala_engine::{ModelCapabilities, ReasoningEffort, ThinkingCapabilities};
+        let model = ApiModel {
+            id: "arbitrary-profile".into(),
+            object: "model",
+            owned_by: "scala-user".into(),
+            created: 0,
+            capabilities: Some(ModelCapabilities {
+                thinking: ThinkingCapabilities {
+                    switchable: true,
+                    effort_options: vec![
+                        ReasoningEffort::Low,
+                        ReasoningEffort::Medium,
+                        ReasoningEffort::Xhigh,
+                    ],
+                },
+            }),
+        };
+        let value = serde_json::to_value(model).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 5);
+        assert_eq!(
+            value["capabilities"],
+            json!({"thinking":{"switchable":true,"effort_options":["low","medium","xhigh"]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn model_discovery_without_qualified_runtime_grants_no_capabilities_or_loads() {
+        let (_temporary, runtime, _model, core) = control_fixture().await;
+        let state = PublicApiState {
+            core,
+            runtime: runtime.clone(),
+            instance_id: Uuid::new_v4().to_string(),
+            link: None,
+        };
+        let listed = public_models(&state).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].capabilities.is_none());
+        assert!(runtime.status().await.backends.is_empty());
     }
 
     #[test]
