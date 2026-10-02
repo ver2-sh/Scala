@@ -1473,6 +1473,20 @@ impl RuntimePackManager {
             })
             .unwrap_or_default();
         let structured_output = selected_features.contains(&EngineFeature::StructuredOutput);
+        // A coarse artifact report without resolved settings cannot qualify
+        // native Decision. Reuse the profile/dispatch gate when a tuple exists.
+        let decision = selected
+            .as_ref()
+            .zip(selected_adapter.as_ref())
+            .zip(settings)
+            .is_some_and(|((selection, adapter), settings)| {
+                crate::native_decision_supported(
+                    adapter.as_ref(),
+                    &selection.runtime,
+                    model,
+                    settings,
+                )
+            });
 
         let text_generation = !self.registry.compatible_with(model).iter().any(|adapter| {
             adapter.supports_model_capability(model, crate::ApiCapability::Embeddings)
@@ -1496,6 +1510,7 @@ impl RuntimePackManager {
             tools: selected_features.contains(&EngineFeature::ToolCalling),
             vision: selected_features.contains(&EngineFeature::Vision),
             structured_output,
+            decision,
         })
     }
 

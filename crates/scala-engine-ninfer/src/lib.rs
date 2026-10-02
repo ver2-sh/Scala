@@ -65,6 +65,7 @@ fn ninfer_template_capabilities(digest: &str) -> Option<scala_engine::ModelCapab
         _ => return None,
     };
     Some(ModelCapabilities {
+        decision: false,
         thinking: ThinkingCapabilities {
             switchable: true,
             effort_options,
@@ -3844,6 +3845,23 @@ fn unix_timestamp() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn released_engine_remains_decision_unsupported() {
+        let adapter = NinferAdapter::from_config(None, Path::new("."));
+        let capabilities = adapter.capabilities();
+        assert_eq!(
+            capabilities.api,
+            vec![ApiCapability::Responses, ApiCapability::ChatCompletions]
+        );
+        assert_eq!(
+            capabilities.features,
+            vec![
+                EngineFeature::TextGeneration,
+                EngineFeature::ToolCalling,
+                EngineFeature::Vision
+            ]
+        );
+    }
     use scala_core::{ResolvedSetting, SettingId, SettingSource};
 
     use super::*;

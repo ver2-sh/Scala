@@ -135,6 +135,7 @@ pub(crate) fn runtime_error(error: RuntimeError) -> OpenAiError {
         RuntimeError::ModelProfileNotFound(_) => OpenAiError::model_not_found(),
         RuntimeError::BenchmarkReserved => OpenAiError { status: StatusCode::SERVICE_UNAVAILABLE, message: "Inference is temporarily reserved for a benchmark. Inspect or cancel it through private control.".into(), kind: "server_error", parameter: None, code: "benchmark_reserved" },
         RuntimeError::UnsupportedCapability => OpenAiError::invalid("The requested capability is unsupported by this Model Profile/runtime.", Some("model"), "unsupported_capability"),
+        RuntimeError::InvalidDecisionRequest(message) => OpenAiError::invalid(message, Some("questions"), "invalid_value"),
         RuntimeError::ModelNotFound(_) => OpenAiError {
             status: StatusCode::NOT_FOUND,
             message: "The requested model does not exist in the local model registry.".to_owned(),

@@ -25,6 +25,7 @@ use tokio::sync::watch;
 pub mod benchmark;
 mod catalog;
 mod control;
+mod decision;
 mod installer;
 pub mod link;
 mod manager;
@@ -32,6 +33,7 @@ mod packs;
 mod prune;
 mod store;
 mod supervisor;
+pub use decision::*;
 pub use prune::plan_runtime_prune;
 
 pub use catalog::{
@@ -91,6 +93,7 @@ pub enum ApiCapability {
     ChatCompletions,
     Completions,
     Embeddings,
+    Decision,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -100,6 +103,7 @@ pub enum EngineFeature {
     ToolCalling,
     StructuredOutput,
     Vision,
+    Decision,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -1043,6 +1047,8 @@ pub struct ModelServingCapabilities {
     pub tools: bool,
     pub vision: bool,
     pub structured_output: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decision: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -1210,6 +1216,8 @@ impl std::fmt::Display for ReasoningEffort {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
     pub thinking: ThinkingCapabilities,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decision: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1826,6 +1834,23 @@ pub trait EngineAdapter: Send + Sync {
     fn supports_model_capability(&self, _model: &ModelArtifact, capability: ApiCapability) -> bool {
         self.capabilities().api.contains(&capability)
     }
+    /// Opt in only after verifying a released native decision interface and
+    /// compatibility of this exact runtime/artifact/settings tuple.
+    fn supports_native_decision(
+        &self,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _settings: &ResolvedSettings,
+    ) -> bool {
+        false
+    }
+    async fn decide(
+        &self,
+        _endpoint: &str,
+        _request: DecisionRequest,
+    ) -> Result<DecisionOutput, EngineError> {
+        Err(EngineError::Unsupported("native decision".to_owned()))
+    }
     async fn complete(
         &self,
         _endpoint: &str,
@@ -2426,6 +2451,7 @@ mod tests {
         assert!(!capabilities.tools);
         assert!(!capabilities.vision);
         assert!(!capabilities.structured_output);
+        assert!(!capabilities.decision);
         serde_json::to_value(&capabilities).expect("serializable capabilities");
     }
 

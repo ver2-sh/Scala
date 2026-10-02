@@ -742,6 +742,7 @@ impl EngineAdapter for LlamaCppAdapter {
     fn supports_model_capability(&self, model: &ModelArtifact, capability: ApiCapability) -> bool {
         let pooled = pooled_embedding_model(model);
         match capability {
+            ApiCapability::Decision => false,
             ApiCapability::Embeddings => pooled,
             ApiCapability::Completions
             | ApiCapability::ChatCompletions
@@ -6027,6 +6028,27 @@ fn unix_timestamp() -> i64 {
 
 #[cfg(test)]
 mod recipe_update_tests {
+    #[test]
+    fn released_engine_remains_decision_unsupported() {
+        let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
+        let capabilities = adapter.capabilities();
+        assert_eq!(
+            capabilities.api,
+            vec![
+                ApiCapability::ChatCompletions,
+                ApiCapability::Completions,
+                ApiCapability::Embeddings
+            ]
+        );
+        assert_eq!(
+            capabilities.features,
+            vec![
+                EngineFeature::TextGeneration,
+                EngineFeature::ToolCalling,
+                EngineFeature::StructuredOutput
+            ]
+        );
+    }
     use scala_core::{
         RUNTIME_MANIFEST_SCHEMA_VERSION, RuntimeAcquisitionMethod, RuntimeIdentity,
         RuntimeManifest, RuntimePackageIdentity, RuntimeProbeObservation, RuntimeRequirements,
