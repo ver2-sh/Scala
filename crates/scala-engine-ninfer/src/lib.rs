@@ -47,6 +47,30 @@ pub const PROVIDER_ID: &str = "ninfer-official-source";
 const CURRENT_PACKAGE_CAPABILITY_REVISION: &str = "d49296868dcc17bd478ec185f0d3a801bcc0bf56";
 const CURRENT_PACKAGE_CAPABILITY_TREE: &str = "8e2f0275fc533cf11fe05a4ac3ac85f00eb91c72";
 const CURRENT_REQUEST_LOG_SCHEMA: u32 = 20;
+
+// Mirrors CompiledChatTemplate::resolve/capabilities in the reviewed frontend
+// source contract. These are embedded resource contents, never model identities
+// or package/provenance labels. The runtime gate must also prove that contract.
+fn ninfer_template_capabilities(digest: &str) -> Option<scala_engine::ModelCapabilities> {
+    use scala_engine::{ModelCapabilities, ReasoningEffort, ThinkingCapabilities};
+    let effort_options = match digest {
+        "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259" => vec![],
+        "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041" => {
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::Xhigh,
+            ]
+        }
+        _ => return None,
+    };
+    Some(ModelCapabilities {
+        thinking: ThinkingCapabilities {
+            switchable: true,
+            effort_options,
+        },
+    })
+}
 const MANAGED_NINFER_FUNCTIONAL_VARIANT: &str = "managed-linux-x86_64-cuda-sm120a";
 const MANAGED_NINFER_WINDOWS_FUNCTIONAL_VARIANT: &str = "managed-windows-x86_64-cuda-sm120a";
 
@@ -1549,6 +1573,28 @@ impl EngineAdapter for NinferAdapter {
                 EngineFeature::Vision,
             ],
         }
+    }
+
+    fn model_capabilities(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        _settings: &ResolvedSettings,
+    ) -> Option<scala_engine::ModelCapabilities> {
+        let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
+        if !capabilities.request_protocol_semantics || !capabilities.thinking_request_semantics {
+            return None;
+        }
+        let metadata = inspect_ninfer_container(&model.path).ok()?;
+        if model.native_identity.as_ref()
+            != Some(&ArtifactNativeIdentity::Ninfer(metadata.identity.clone()))
+        {
+            return None;
+        }
+        let digest = metadata
+            .frontend_resource_sha256(&model.path, "frontend/chat_template.jinja")
+            .ok()??;
+        ninfer_template_capabilities(&digest)
     }
 
     fn serving_features(
@@ -3801,6 +3847,27 @@ mod tests {
     use scala_core::{ResolvedSetting, SettingId, SettingSource};
 
     use super::*;
+
+    #[test]
+    fn public_capabilities_follow_native_template_semantics() {
+        let boolean = ninfer_template_capabilities(
+            "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+        )
+        .unwrap();
+        assert!(boolean.thinking.switchable);
+        assert!(boolean.thinking.effort_options.is_empty());
+        let efforts = ninfer_template_capabilities(
+            "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(efforts).unwrap(),
+            json!({"thinking":{"switchable":true,"effort_options":["low","medium","xhigh"]}})
+        );
+        for unknown in ["main", "Qwen3.8", "Norted", "unknown"] {
+            assert!(ninfer_template_capabilities(unknown).is_none());
+        }
+    }
 
     fn resolved(values: &[(&str, SettingValue)]) -> ResolvedSettings {
         ResolvedSettings {

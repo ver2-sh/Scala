@@ -1093,6 +1093,29 @@ struct Q27RuntimeCapabilities {
     supported_kv_modes: &'static [Q27KvMode],
 }
 
+fn q27_model_capabilities(
+    capabilities: Q27RuntimeCapabilities,
+    settings: &scala_core::ResolvedSettings,
+) -> Option<scala_engine::ModelCapabilities> {
+    // An arbitrary external template can ignore or reinterpret these controls.
+    if !capabilities.request_thinking
+        || setting_toggle(settings, "q27.request_thinking") != Some(true)
+        || setting_choice(settings, "q27.prompt_mode") == Some("external_template")
+    {
+        return None;
+    }
+    // Existing Q27 trained-template qualification includes `general.name`.
+    // Preserve its inference plumbing, but do not convert that name-derived
+    // fact into public effort grants. A name-independent native template
+    // capability contract is needed before advertising effort here.
+    Some(scala_engine::ModelCapabilities {
+        thinking: scala_engine::ThinkingCapabilities {
+            switchable: true,
+            effort_options: vec![],
+        },
+    })
+}
+
 fn q27_runtime_capabilities(
     identity: &RuntimeIdentity,
     acquisition: &RuntimeAcquisitionMethod,
@@ -2505,6 +2528,25 @@ impl EngineAdapter for Q27Adapter {
         // translated to Q27_REASONING_EFFORT. Explicit request effort remains
         // ephemeral and is translated separately in configured_backend_request.
         id != "reasoning_effort"
+    }
+
+    fn model_capabilities(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        settings: &scala_core::ResolvedSettings,
+    ) -> Option<scala_engine::ModelCapabilities> {
+        let capabilities = q27_runtime_capabilities(
+            &runtime.manifest.identity,
+            &runtime.manifest.acquisition_method,
+            runtime
+                .manifest
+                .source_build
+                .as_ref()
+                .map(Q27SourceBuildEvidence::Provenance),
+        );
+        inspect_q27_model(&model.path).ok()?;
+        q27_model_capabilities(capabilities, settings)
     }
 
     fn validate_generation_settings(
@@ -6355,6 +6397,41 @@ mod tests {
             compiled_w_max: Some(12),
             supported_kv_modes: Q27_V062_KV_MODES,
         }
+    }
+
+    #[test]
+    fn public_capabilities_require_request_compatibility_and_never_use_name_derived_effort() {
+        let mut capabilities = exact_capabilities();
+        let enabled = resolved(&[("q27.request_thinking", SettingValue::Toggle(true))]);
+        assert!(q27_model_capabilities(capabilities, &resolved(&[])).is_none());
+        assert!(
+            q27_model_capabilities(
+                capabilities,
+                &resolved(&[("q27.request_thinking", SettingValue::Toggle(false))])
+            )
+            .is_none()
+        );
+        let boolean = q27_model_capabilities(capabilities, &enabled).unwrap();
+        assert!(boolean.thinking.switchable);
+        assert!(boolean.thinking.effort_options.is_empty());
+        capabilities.reasoning_effort = false;
+        assert!(
+            q27_model_capabilities(capabilities, &enabled)
+                .unwrap()
+                .thinking
+                .effort_options
+                .is_empty()
+        );
+        capabilities.request_thinking = false;
+        assert!(q27_model_capabilities(capabilities, &enabled).is_none());
+        let external = resolved(&[
+            ("q27.request_thinking", SettingValue::Toggle(true)),
+            (
+                "q27.prompt_mode",
+                SettingValue::Choice("external_template".into()),
+            ),
+        ]);
+        assert!(q27_model_capabilities(exact_capabilities(), &external).is_none());
     }
 
     fn argument_strings(arguments: Vec<OsString>) -> Vec<String> {

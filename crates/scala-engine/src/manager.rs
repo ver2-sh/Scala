@@ -743,6 +743,80 @@ impl RuntimeManager {
         self.status_from_state(&state)
     }
 
+    /// Read-only discovery for the profile exposed by the public API. Reuse the
+    /// actual loaded tuple when inference would reuse it; otherwise resolve the
+    /// same Settings/profile/runtime selection as a load, without launching it.
+    pub async fn model_capabilities(
+        &self,
+        profile: &ModelProfile,
+    ) -> Option<crate::ModelCapabilities> {
+        {
+            let state = self.state.read().await;
+            if let Some(backend) = state.backends.get(&profile.id)
+                && backend.lifecycle == BackendLifecycle::Running
+                && !backend.retiring
+                && backend
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|p| p.model_profile.content_sha256 == profile.content_hash())
+                && let Some(active) = &backend.running
+            {
+                return active.adapter.model_capabilities(
+                    &active.runtime,
+                    &active.model,
+                    &active.settings,
+                );
+            }
+        }
+        let model = self.core.model(&profile.model_id).await?;
+        let adapter = self.registry.get(profile.engine_id.as_str())?;
+        if !matches!(
+            adapter.compatibility(&model),
+            crate::CompatibilityDecision::Supported
+        ) {
+            return None;
+        }
+        let mut settings = self
+            .settings
+            .read()
+            .await
+            .ok()?
+            .resolve(
+                &profile.id,
+                profile.engine_id.as_str(),
+                &profile.overrides,
+                &SettingsPatch::default(),
+                &self.core.paths.data_dir,
+            )
+            .ok()?;
+        adapter.normalize_settings(&mut settings).ok()?;
+        let inspection = self.packs.inspect_local().await;
+        let (selection, schema) = self
+            .packs
+            .settings_schema_from_local_inspection(
+                &model,
+                profile.engine_id.as_str(),
+                Some(&settings),
+                &inspection,
+            )
+            .await
+            .ok()?;
+        schema
+            .materialize_runtime_configuration(&mut settings)
+            .ok()?;
+        schema.validate(&settings).ok()?;
+        schema.materialize_effective(&mut settings).ok()?;
+        adapter
+            .validate_configuration(
+                &selection.runtime,
+                Some(&model),
+                &inspection.host,
+                &settings,
+            )
+            .ok()?;
+        adapter.model_capabilities(&selection.runtime, &model, &settings)
+    }
+
     pub async fn load(
         self: &Arc<Self>,
         profile_id: ModelProfileId,
