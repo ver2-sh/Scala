@@ -25,6 +25,10 @@ portable provider rather than canonical upstream.
 
 An `EngineAdapter` represents implementation knowledge: identity, supported artifact formats and capabilities, model compatibility, runtime probing, launch semantics, readiness, effective settings, and request/event translation. It never implies that only one executable exists.
 
+[Native Decision](native-decision.md) uses these same capability and runtime/model
+boundaries through `POST /v1/systemone`. All current engines remain unsupported;
+future adapters must qualify a released native interface and the exact serving pair.
+
 An `InstalledRuntime` represents one executable package and immutable provenance. Launch input is therefore:
 
 ```text

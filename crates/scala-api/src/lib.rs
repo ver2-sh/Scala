@@ -10,6 +10,7 @@ mod link;
 mod wayfinder;
 use link::execution_profile_id;
 mod responses;
+mod systemone;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -274,6 +275,7 @@ fn public_routes(state: PublicApiState, auth: PublicAuth) -> Router {
         .route("/v1/models/{model}", get(retrieve_model))
         .route("/v1/completions", post(completions::create))
         .route("/v1/embeddings", post(embeddings::create))
+        .route("/v1/systemone", post(systemone::create))
         .route("/v1/responses", post(responses::create))
         .route("/v1/chat/completions", post(chat::create))
         .layer(axum::extract::DefaultBodyLimit::max(
@@ -800,6 +802,7 @@ mod tests {
             owned_by: "scala-user".into(),
             created: 0,
             capabilities: Some(ModelCapabilities {
+                decision: false,
                 thinking: ThinkingCapabilities {
                     switchable: true,
                     effort_options: vec![

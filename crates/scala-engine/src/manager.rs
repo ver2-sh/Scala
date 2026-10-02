@@ -326,6 +326,8 @@ pub enum RuntimeError {
     BenchmarkReserved,
     #[error("the requested capability is unsupported by this model/runtime")]
     UnsupportedCapability,
+    #[error("invalid decision request: {0}")]
+    InvalidDecisionRequest(String),
     #[error("Model Profile `{0}` does not exist")]
     ModelProfileNotFound(ModelProfileId),
     #[error(
@@ -413,7 +415,30 @@ struct InferenceTarget {
     generation_settings: EffectiveGenerationSettings,
     settings: scala_core::ResolvedSettings,
     settings_schema: scala_core::SettingsSchema,
+    decision_identity: Option<crate::DecisionIdentity>,
     lease: InferenceLease,
+}
+
+fn decision_identity(
+    active: &RunningBackend,
+    provenance: Option<&RuntimeProvenance>,
+) -> Option<crate::DecisionIdentity> {
+    if !crate::native_decision_supported(
+        active.adapter.as_ref(),
+        &active.runtime,
+        &active.model,
+        &active.settings,
+    ) {
+        return None;
+    }
+    let provenance = provenance?;
+    Some(crate::DecisionIdentity {
+        model_profile_id: provenance.model_profile.model_profile_id.clone(),
+        model_id: provenance.model.model_id.clone(),
+        content_sha256: provenance.model.content_sha256.clone(),
+        native_identity: provenance.model.native_identity.clone(),
+        runtime: provenance.runtime.identity.clone(),
+    })
 }
 
 impl InferenceLease {
@@ -761,7 +786,8 @@ impl RuntimeManager {
                     .is_some_and(|p| p.model_profile.content_sha256 == profile.content_hash())
                 && let Some(active) = &backend.running
             {
-                return active.adapter.model_capabilities(
+                return crate::decision::reported_model_capabilities(
+                    active.adapter.as_ref(),
                     &active.runtime,
                     &active.model,
                     &active.settings,
@@ -814,7 +840,12 @@ impl RuntimeManager {
                 &settings,
             )
             .ok()?;
-        adapter.model_capabilities(&selection.runtime, &model, &settings)
+        crate::decision::reported_model_capabilities(
+            adapter.as_ref(),
+            &selection.runtime,
+            &model,
+            &settings,
+        )
     }
 
     pub async fn load(
@@ -1905,6 +1936,33 @@ impl RuntimeManager {
         }))
     }
 
+    pub async fn decide_routed(
+        self: &Arc<Self>,
+        request: crate::DecisionRequest,
+        routing: InferenceRoutingContext,
+    ) -> Result<crate::RoutedDecisionOutput, RuntimeError> {
+        request
+            .validate()
+            .map_err(RuntimeError::InvalidDecisionRequest)?;
+        let target = self
+            .inference_target(
+                &request.model_profile_id,
+                routing,
+                crate::ApiCapability::Decision,
+            )
+            .await?;
+        let identity = target
+            .decision_identity
+            .ok_or(RuntimeError::UnsupportedCapability)?;
+        target.lease.mark_processing_prompt();
+        let output = target
+            .adapter
+            .decide(&target.endpoint, request)
+            .await
+            .map_err(map_inference_error)?;
+        Ok(crate::RoutedDecisionOutput { output, identity })
+    }
+
     pub async fn embed_routed(
         self: &Arc<Self>,
         request: crate::EmbeddingRequest,
@@ -2329,7 +2387,14 @@ impl RuntimeManager {
             .registry
             .get(profile.engine_id.as_str())
             .ok_or(RuntimeError::UnsupportedCapability)?;
-        if !adapter.supports_model_capability(&model, capability) {
+        if !adapter.supports_model_capability(&model, capability)
+            || (capability == crate::ApiCapability::Decision
+                && (!adapter.capabilities().api.contains(&capability)
+                    || !adapter
+                        .capabilities()
+                        .features
+                        .contains(&crate::EngineFeature::Decision)))
+        {
             return Err(RuntimeError::UnsupportedCapability);
         }
         let role = routing.role.unwrap_or(profile.role);
@@ -2501,6 +2566,7 @@ impl RuntimeManager {
             generation_settings: active.effective_generation_settings,
             settings: active.settings.clone(),
             settings_schema: active.settings_schema.clone(),
+            decision_identity: decision_identity(active, backend.provenance.as_ref()),
             lease,
         })
     }
@@ -2550,6 +2616,7 @@ impl RuntimeManager {
             generation_settings: active.effective_generation_settings,
             settings: active.settings.clone(),
             settings_schema: active.settings_schema.clone(),
+            decision_identity: decision_identity(active, backend.provenance.as_ref()),
             lease,
         })
     }
@@ -3294,6 +3361,15 @@ mod tests {
     }
 
     async fn manager_fixture() -> ManagerFixture {
+        manager_fixture_with_adapter(None).await
+    }
+
+    async fn manager_fixture_with_adapter(
+        adapter: Option<Arc<dyn EngineAdapter>>,
+    ) -> ManagerFixture {
+        let engine_id = adapter
+            .as_ref()
+            .map_or_else(|| "llama.cpp".to_owned(), |adapter| adapter.identity().id);
         let temporary = tempfile::tempdir().expect("temporary manager fixture");
         let root = temporary.path();
         let model_dir = root.join("models");
@@ -3345,14 +3421,17 @@ mod tests {
                         profile_id.clone(),
                         "Fixture",
                         model_id,
-                        scala_core::EngineId::new("llama.cpp").expect("engine ID"),
+                        scala_core::EngineId::new(engine_id).expect("engine ID"),
                     )?;
                     Ok(())
                 }
             })
             .await
             .expect("model profile fixture");
-        let registry = EngineRegistry::default();
+        let mut registry = EngineRegistry::default();
+        if let Some(adapter) = adapter {
+            registry.register(adapter).expect("fixture adapter");
+        }
         let packs = RuntimePackManager::new(
             &paths,
             registry.clone(),
@@ -3393,6 +3472,188 @@ mod tests {
         })
         .await
         .expect("lifecycle transition")
+    }
+
+    async fn decision_fixture(
+        adapter: Arc<crate::decision::tests::DecisionAdapter>,
+        version: &str,
+        architecture: Option<&str>,
+    ) -> ManagerFixture {
+        let fixture = manager_fixture_with_adapter(Some(adapter.clone())).await;
+        let manager = &fixture.manager;
+        let profile =
+            manager.model_profiles.read().await.unwrap().profiles[&fixture.profile_id].clone();
+        let mut model = manager.core.model(&fixture.model_id).await.unwrap();
+        model.architecture = architecture.map(str::to_owned);
+        let mut runtime = crate::decision::tests::runtime();
+        runtime.manifest.identity.version = version.to_owned();
+        runtime.manifest.runtime_id = RuntimeId::from_identity(&runtime.manifest.identity);
+        let revision = scala_core::EngineRevision {
+            engine_id: adapter.identity().id,
+            version: Some(version.to_owned()),
+            revision: None,
+        };
+        let process = ProcessDescriptor {
+            supervisor_id: "synthetic".into(),
+            process_id: 0,
+            engine: revision.clone(),
+            runtime_id: runtime.manifest.runtime_id.clone(),
+            runtime_version: version.to_owned(),
+            runtime_variant: "default".into(),
+            runtime_executable_sha256: "b".repeat(64),
+            model_id: model.id.clone(),
+            endpoint: Some("http://127.0.0.1:1".into()),
+            launched_at_unix: 1,
+        };
+        let model_identity = crate::PreparedModelInput {
+            primary: model.clone(),
+            auxiliary: Vec::new(),
+            primary_file_identity: None,
+        }
+        .runtime_identity();
+        let provenance = RuntimeProvenance {
+            model: model_identity,
+            runtime: runtime.manifest.clone(),
+            runtime_entrypoint: runtime.entrypoint_path(),
+            selection_source: scala_core::RuntimeSelectionSource::Fallback,
+            accelerator_binding: None,
+            installation: scala_core::EngineInstallation {
+                engine: revision,
+                source_repository: None,
+                acquisition_method: scala_core::AcquisitionMethod::OfficialBinary,
+                binary_path: runtime.entrypoint_path(),
+                binary_sha256: Some("b".repeat(64)),
+                build: None,
+                platform: std::env::consts::OS.into(),
+                architecture: std::env::consts::ARCH.into(),
+                runtime_variant: Some("default".into()),
+                acquired_at_unix: Some(1),
+                observed_at_unix: 1,
+            },
+            model_profile: ModelProfileRuntimeIdentity {
+                model_profile_id: profile.id.clone(),
+                display_name: profile.display_name.clone(),
+                content_sha256: profile.content_hash(),
+                bound_model_id: profile.model_id.clone(),
+                bound_engine_id: profile.engine_id.clone(),
+                role: profile.role,
+            },
+            settings: SettingsProvenance::default(),
+            normalized_settings: BTreeMap::new(),
+            native_arguments: Vec::new(),
+            native_environment: Vec::new(),
+            inherits_parent_environment: false,
+            process: ProcessIdentity {
+                process_id: 0,
+                process_start_identity: Some("synthetic".into()),
+            },
+            private_backend_endpoint: "http://127.0.0.1:1".into(),
+            launched_at_unix: 1,
+        };
+        let runtime_lease = crate::RuntimeStore::new(&manager.core.paths)
+            .acquire_runtime_lease(&runtime.manifest.runtime_id)
+            .await
+            .unwrap();
+        let mut backend = empty_backend();
+        backend.lifecycle = BackendLifecycle::Running;
+        backend.residency = BackendResidency::Pinned;
+        backend.model_id = model.id.clone();
+        backend.provenance = Some(provenance);
+        backend.running = Some(RunningBackend {
+            runtime,
+            model,
+            adapter,
+            process,
+            endpoint: "http://127.0.0.1:1".into(),
+            effective_generation_settings: EffectiveGenerationSettings {
+                temperature: 0.0,
+                top_p: 1.0,
+            },
+            settings: scala_core::ResolvedSettings {
+                engine_id: "fixture-decision".into(),
+                ..Default::default()
+            },
+            settings_schema: scala_core::SettingsSchema::default(),
+            _runtime_lease: runtime_lease,
+        });
+        manager
+            .state
+            .write()
+            .await
+            .backends
+            .insert(fixture.profile_id.clone(), backend);
+        fixture
+    }
+
+    #[tokio::test]
+    async fn native_decision_dispatch_uses_the_qualified_pair_and_existing_identity() {
+        let adapter = Arc::new(crate::decision::tests::DecisionAdapter::new(true));
+        let fixture = decision_fixture(adapter.clone(), "1", Some("native-decision-fixture")).await;
+        let profile = fixture
+            .manager
+            .model_profiles
+            .read()
+            .await
+            .unwrap()
+            .profiles[&fixture.profile_id]
+            .clone();
+        assert!(
+            fixture
+                .manager
+                .model_capabilities(&profile)
+                .await
+                .unwrap()
+                .decision
+        );
+        let output = fixture
+            .manager
+            .decide_routed(
+                crate::decision::tests::request(fixture.profile_id.clone()),
+                InferenceRoutingContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(output.output.model.as_deref(), Some("native-fixture-1"));
+        assert_eq!(output.identity.model_profile_id, fixture.profile_id);
+        assert_eq!(output.identity.model_id, fixture.model_id);
+        assert_eq!(output.identity.runtime.version, "1");
+        assert_eq!(
+            serde_json::to_value(&output.output.answers["urgency"]).unwrap(),
+            serde_json::json!({"type":"score","score":0.4})
+        );
+        assert_eq!(
+            fixture.manager.status().await.backends[0].active_request_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_decision_pairs_and_native_rejections_never_fall_back() {
+        for (native, version, architecture, fail) in [
+            (false, "1", Some("native-decision-fixture"), false),
+            (true, "unqualified", Some("native-decision-fixture"), false),
+            (true, "1", None, false),
+            (true, "1", Some("native-decision-fixture"), true),
+        ] {
+            let mut adapter = crate::decision::tests::DecisionAdapter::new(native);
+            adapter.fail = fail;
+            let adapter = Arc::new(adapter);
+            let fixture = decision_fixture(adapter.clone(), version, architecture).await;
+            let result = fixture
+                .manager
+                .decide_routed(
+                    crate::decision::tests::request(fixture.profile_id.clone()),
+                    InferenceRoutingContext::default(),
+                )
+                .await;
+            assert!(matches!(result, Err(RuntimeError::UnsupportedCapability)));
+            assert_eq!(adapter.calls.load(Ordering::SeqCst), usize::from(fail));
+            assert_eq!(
+                fixture.manager.status().await.backends[0].active_request_count,
+                0
+            );
+        }
     }
 
     fn empty_backend() -> ManagedBackend {

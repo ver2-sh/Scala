@@ -1109,6 +1109,7 @@ fn q27_model_capabilities(
     // fact into public effort grants. A name-independent native template
     // capability contract is needed before advertising effort here.
     Some(scala_engine::ModelCapabilities {
+        decision: false,
         thinking: scala_engine::ThinkingCapabilities {
             switchable: true,
             effort_options: vec![],
@@ -6352,6 +6353,23 @@ impl Q27Adapter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn released_engine_remains_decision_unsupported() {
+        let adapter = Q27Adapter::from_config(None, Path::new("."));
+        let capabilities = adapter.capabilities();
+        assert_eq!(
+            capabilities.api,
+            vec![
+                ApiCapability::Responses,
+                ApiCapability::ChatCompletions,
+                ApiCapability::Completions
+            ]
+        );
+        assert_eq!(
+            capabilities.features,
+            vec![EngineFeature::TextGeneration, EngineFeature::ToolCalling]
+        );
+    }
     use scala_core::{ModelProfileId, ResolvedSetting, ResolvedSettings, SettingId, SettingSource};
 
     use super::*;

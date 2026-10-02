@@ -40,6 +40,7 @@ const SURFACES: &[&str] = &[
     "/v1/responses",
     "/v1/completions",
     "/v1/embeddings",
+    "/v1/systemone",
 ];
 
 tokio::task_local! { static EXECUTION_PROFILE: ModelProfileId; }
