@@ -804,6 +804,38 @@ POST /v1/completions
 POST /v1/embeddings
 ```
 
+Model list and retrieval responses retain the ordinary OpenAI model fields and
+may include an optional `capabilities` object:
+
+```json
+{"thinking":{"switchable":true,"effort_options":["low","medium","xhigh"]}}
+```
+
+This is the value of `capabilities`, describing request overrides rather than
+defaults. `switchable` grants Chat's `enable_thinking` and Responses'
+`reasoning.enabled`; `effort_options` lists exact supported `reasoning_effort` /
+`reasoning.effort` values. Missing or empty effort options grant no effort tiers.
+The optional extension can be ignored by ordinary OpenAI clients.
+
+Discovery uses the running profile's actual runtime/model/settings tuple when
+inference would reuse it, or the existing read-only runtime selection and settings
+compatibility path for an unloaded profile. It does not load models or perform
+inference, and does not persist defaults, observations, or overrides. Unknown or
+unsupported capabilities are omitted. Qualified NInfer request semantics must
+match the actual embedded template content hash (thinking-only or effort-capable),
+equally for bare and manifest-bound artifacts. Q27 requires qualified request
+semantics and enabled `q27.request_thinking` for boolean controls; arbitrary
+external templates grant none. Q27 effort advertisement is currently omitted
+because its existing trained-template qualification includes `general.name`,
+which is insufficient name-independent evidence for this public contract. Other adapters and remote
+Scala Link inventory profiles currently omit this optional advertisement.
+Capability metadata never depends on profile names or Norted provenance.
+
+Compatible clients such as Coded can discover these controls through the Scala
+Router without configuring effort metadata manually. An omitted effort continues
+to inherit `Runtime default → Settings → Model Profile → Load/inference override`;
+an explicit supported request effort wins for that request only.
+
 Public authentication is configured under `[server]` with `auth = "auto"`, `"required"`, or `"disabled"`:
 
 - `auto` disables public bearer authentication only for a loopback bind and requires it for every non-loopback bind.
