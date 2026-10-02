@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.6 - Model capabilities and update restart reliability
+
+Adds read-only request-capability discovery for model profiles while improving
+application update recovery and restart behavior.
+
+- Expose optional model thinking capabilities through /v1/models without
+  persisting runtime observations or changing inference defaults.
+- Qualify NInfer thinking switches and Low/Medium/XHigh effort support from the
+  exact runtime and embedded template semantics; keep q27 capability reporting
+  bounded to its reviewed request contract.
+- Keep capability discovery origin-neutral so equivalent artifacts receive the
+  same serving behavior regardless of provenance.
+- Restart Scala automatically after interactive application updates and improve
+  Windows cleanup/error handling during replacement.
+
 ## 0.1.5 - Windows child-process isolation
 
 Prevents Scala-owned noninteractive child processes from mutating the parent
