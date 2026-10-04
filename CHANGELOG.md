@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.8 - Native decision models
+
+Adds the native decision-model path while preserving Scala's origin-neutral
+runtime, engine and Model Profile boundaries.
+
+- Add bounded native decision capability admission derived from the qualified
+  engine/runtime/model combination rather than artifact origin or naming.
+- Add the /v1/systemone API route for native structured decision requests and
+  preserve request state/question shapes without generation emulation.
+- Keep llama.cpp, q27 and NInfer decision support independently qualified:
+  unsupported runtime/model pairs fail closed and never fall back to chat or
+  another engine.
+- Preserve ordinary serving behavior and existing runtime/model update ownership;
+  decision capability adds no hidden defaults or Norted-specific privilege.
+
 ## 0.1.6 - Model capabilities and update restart reliability
 
 Adds read-only request-capability discovery for model profiles while improving
