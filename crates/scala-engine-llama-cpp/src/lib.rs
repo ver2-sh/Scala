@@ -766,6 +766,15 @@ impl EngineAdapter for LlamaCppAdapter {
         }
     }
 
+    fn supports_native_decision_candidate(
+        &self,
+        _runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        settings: &scala_core::ResolvedSettings,
+    ) -> bool {
+        decision::candidate(model) && settings.model_profile_id.is_some()
+    }
+
     fn supports_native_decision(
         &self,
         runtime: &InstalledRuntime,

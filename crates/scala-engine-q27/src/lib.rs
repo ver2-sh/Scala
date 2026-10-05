@@ -1231,6 +1231,7 @@ fn q27_model_capabilities(
     // capability contract is needed before advertising effort here.
     Some(scala_engine::ModelCapabilities {
         decision: false,
+        decision_candidate: false,
         thinking: scala_engine::ThinkingCapabilities {
             switchable: true,
             effort_options: vec![],

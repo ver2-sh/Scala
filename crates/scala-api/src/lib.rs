@@ -803,6 +803,7 @@ mod tests {
             created: 0,
             capabilities: Some(ModelCapabilities {
                 decision: false,
+                decision_candidate: false,
                 thinking: ThinkingCapabilities {
                     switchable: true,
                     effort_options: vec![

@@ -20,5 +20,6 @@ tokio.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+scala-api = { path = "../scala-api" }
 axum.workspace = true
 tempfile.workspace = true
