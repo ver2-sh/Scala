@@ -18,8 +18,8 @@ use crate::catalog::{
 use crate::{ENGINE_ID, UPSTREAM_REPOSITORY};
 
 const PACKAGE_FAMILY: &str = "llama-cpp-managed-source";
-const CUDA12_RECIPE_VERSION: &str = "managed-portable-v4";
-const CUDA13_RECIPE_VERSION: &str = "managed-portable-cuda13-v2";
+const CUDA12_RECIPE_VERSION: &str = "managed-portable-v5";
+const CUDA13_RECIPE_VERSION: &str = "managed-portable-cuda13-v3";
 const CUDA_ARCHITECTURES: &str = "75-real;80-real;86-real;89-real;90-real;120a-real";
 const ACCELERATOR_TARGET: &str = "sm_75+sm_80+sm_86+sm_89+sm_90+sm_120a";
 const SOURCE_CONTRACT_FILE_LIMIT: usize = 512 * 1024;
@@ -328,7 +328,6 @@ fn source_contract_is_admitted(files: &SourceContractFiles) -> bool {
             &["if", "not", "defined", "cmake_cuda_architectures"],
             &["list", "append", "cmake_cuda_architectures", "120a-real"],
             &["enable_language", "cuda"],
-            &["if", "ggml_cuda_cub_3dot2"],
             &["fetchcontent_makeavailable", "cccl"],
             &["ggml_add_backend_library", "ggml-cuda"],
             &["if", "ggml_cuda_nccl"],
@@ -336,6 +335,10 @@ fn source_contract_is_admitted(files: &SourceContractFiles) -> bool {
         ]
         .iter()
         .all(|sequence| has_token_sequence(&cuda, sequence))
+        // Both upstream download guards are explicitly disabled by this recipe.
+        && (has_token_sequence(&cuda, &["if", "ggml_cuda_cub_3dot2"])
+            || (has_token_sequence(&cuda, &["if", "ggml_cuda_cccl_version"])
+                && has_token_sequence(&ggml, &["set", "ggml_cuda_cccl_version", "cache", "string"])))
         && [
             &["target_compile_features", "target", "public", "cxx_std_17"][..],
             &["if", "llama_subprocess"],
@@ -527,6 +530,7 @@ fn source_runtime(
                     "-DLLAMA_OPENSSL=OFF".to_owned(),
                     "-DLLAMA_SUBPROCESS=OFF".to_owned(),
                     "-DGGML_CUDA_CUB_3DOT2=OFF".to_owned(),
+                    "-DGGML_CUDA_CCCL_VERSION:STRING=".to_owned(),
                     "-DGGML_CPU_KLEIDIAI=OFF".to_owned(),
                     "-DFETCHCONTENT_FULLY_DISCONNECTED=ON".to_owned(),
                     "-DFETCHCONTENT_UPDATES_DISCONNECTED=ON".to_owned(),
@@ -730,6 +734,67 @@ mod tests {
     }
 
     #[test]
+    fn source_contract_admits_current_upstream_cccl_guard_without_downloads() {
+        let mut current = admitted_contract();
+        current
+            .ggml
+            .push_str("\nset(GGML_CUDA_CCCL_VERSION \"\" CACHE STRING \"CCCL git tag\")\n");
+        current.cuda = current
+            .cuda
+            .replace("GGML_CUDA_CUB_3DOT2", "GGML_CUDA_CCCL_VERSION");
+        current.server.push_str(
+            "\nadd_library(server-context STATIC server-decision.cpp server-decision.h)\n",
+        );
+        assert!(source_contract_is_admitted(&current));
+        current.cuda = current
+            .cuda
+            .replace("if (GGML_CUDA_CCCL_VERSION)", "if (TRUE)");
+        assert!(!source_contract_is_admitted(&current));
+    }
+
+    #[test]
+    fn official_systemone_nightly_has_normal_source_candidates() {
+        // Recorded upstream metadata, 2026-10-05. No live discovery or installation.
+        let release = GitHubRelease {
+            id: 403856467,
+            tag_name: "b11425".into(),
+            name: Some("b11425".into()),
+            html_url: "https://github.com/ggml-org/llama.cpp/releases/tag/b11425".into(),
+            target_commitish: "e117148a41d8e9bedb72e4c6c3f003ab0fe7f857".into(),
+            draft: false,
+            prerelease: true,
+            published_at: Some("2026-10-05T15:17:10Z".into()),
+            assets: Vec::new(),
+        };
+        let commit: GitHubCommit = serde_json::from_value(serde_json::json!({
+            "sha": release.target_commitish,
+            "html_url": "https://github.com/ggml-org/llama.cpp/commit/e117148a41d8e9bedb72e4c6c3f003ab0fe7f857",
+            "commit": { "committer": {"date":"2026-10-05T13:44:23Z"},
+                "tree": {"sha":"436a4153c9c8c8aac566c45daa871f87264a0b66"} }
+        })).unwrap();
+        let runtimes = source_runtimes(&release, &commit).unwrap();
+        assert_eq!(runtimes.len(), 2);
+        for runtime in runtimes {
+            assert_eq!(runtime.identity.version, "b11425");
+            assert_eq!(
+                runtime.identity.package.repository.as_deref(),
+                Some(GITHUB_REPOSITORY)
+            );
+            assert_eq!(
+                runtime.identity.upstream_revision.as_deref(),
+                Some(commit.sha.as_str())
+            );
+            assert!(runtime.channels.contains(&RuntimeReleaseChannel::Latest));
+            let RuntimeAcquisitionPlan::SourceBuild(plan) = runtime.acquisition else {
+                panic!("official source snapshot expected");
+            };
+            assert_eq!(plan.source.commit_sha, commit.sha);
+            assert_eq!(plan.source.tree_sha, commit.commit.tree.sha);
+            assert_eq!(plan.source.source_branch, "b11425");
+        }
+    }
+
+    #[test]
     fn source_contract_rejects_recipe_and_target_drift() {
         let mut cases = Vec::new();
 
@@ -811,6 +876,21 @@ mod tests {
             };
             assert_eq!(runtime.identity.variant, recipe.variant);
             assert_eq!(plan.recipe.recipe_version, recipe.variant);
+            assert!(
+                plan.recipe
+                    .cmake_configuration_arguments
+                    .contains(&"-DGGML_CUDA_CCCL_VERSION:STRING=".to_owned())
+            );
+            assert!(
+                plan.recipe
+                    .cmake_configuration_arguments
+                    .contains(&"-DGGML_CUDA_CUB_3DOT2=OFF".to_owned())
+            );
+            assert!(
+                plan.recipe
+                    .cmake_configuration_arguments
+                    .contains(&"-DFETCHCONTENT_FULLY_DISCONNECTED=ON".to_owned())
+            );
             assert_eq!(
                 plan.prerequisites.minimum_cuda_version.as_deref(),
                 Some(recipe.minimum_cuda)

@@ -399,6 +399,10 @@ pub(crate) mod tests {
         ));
         let reported = reported_model_capabilities(&adapter, &runtime, &model, &settings).unwrap();
         assert!(reported.decision);
+        assert_eq!(
+            serde_json::to_value(&reported).unwrap()["decision"],
+            json!(true)
+        );
         assert!(!reported.thinking.switchable);
         adapter.api = false;
         assert!(!native_decision_supported(

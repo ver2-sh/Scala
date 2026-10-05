@@ -4,8 +4,9 @@ Scala exposes the engine-neutral `ApiCapability::Decision` and
 `EngineFeature::Decision`. The authenticated `POST /v1/systemone` surface uses
 normal Model Profile IDs (including Link aliases), session/role routing, JIT
 resolution and request leases. It never calls chat, completion, logprobs, grammar
-or prompt-based approximations. llama.cpp, q27 and NInfer currently grant no
-Decision capability; a valid request to an existing unsupported profile returns
+or prompt-based approximations. llama.cpp supports qualified official upstream
+runtime/model pairs through its native `/v1/systemone` interface. q27 and NInfer
+still grant no Decision capability. A valid request to an existing unsupported profile returns
 HTTP 400 with the existing `invalid_request_error` envelope, `param: "model"`
 and `code: "unsupported_capability"`. Missing profiles retain the normal 404.
 
@@ -46,32 +47,85 @@ it remains the client's profile alias; that alias is not a native model identity
 Full launch/package lineage remains available through existing private control
 provenance. No decision observations enter persisted overrides.
 
-## Future adapter contract
+## Native llama.cpp qualification
 
-1. Wait for an upstream release with a native decision interface. Jev/System One
-   and Laya are reference examples, never engine names or privileged concepts.
-   In particular, [llama.cpp PR #29363](https://github.com/ggml-org/llama.cpp/pull/29363)
-   is not a Scala integration contract; development CLIs and unreleased endpoints
-   are not probed or implemented here.
-2. Qualify that released interface in the Scala adapter using the ordinary
-   installed-runtime identity, probes and compatibility checks. Keep the
-   executable separately managed; no custom runtime build, fork or vendor copy
-   is required by this contract.
-3. Establish compatibility for the concrete runtime, artifact and resolved
-   settings. Advertise Decision in the existing engine API/features lists,
-   qualify artifact support through `supports_model_capability`, expose it in
-   `serving_features`, and opt into `supports_native_decision` only for verified
-   pairs. Its default is false, even if the engine-wide lists include Decision.
-4. Implement `EngineAdapter::decide` as native request/response translation.
-   Its default is `EngineError::Unsupported`; rejection never triggers fallback.
-   Preserve native answers, distributions, confidence and identity exactly.
-5. The shared `native_decision_supported` gate controls both dispatch and public
-   Model Profile discovery (`capabilities.decision: true`). Unknown or unqualified
-   runtime/model combinations grant nothing. Existing thinking capabilities stay
-   unchanged, and false Decision is omitted from discovery.
-   `ModelServingCapabilities` also carries Decision through this same gate when
-   concrete runtime and resolved-settings context exists; format-only reports
-   cannot grant it.
+The supported interface is official llama-server's
+[POST `/v1/systemone`](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#post-v1systemone-typesafe-compatible-system-one-api),
+merged in [#29818](https://github.com/ggml-org/llama.cpp/pull/29818).
+Laya, Julia-1, Lev, OpenJev, Kev, Nimble and Clef are native model types, never
+Scala engines. They remain ordinary GGUF artifacts bound to ordinary llama.cpp
+Model Profiles. No fork or custom runtime is required.
+
+The bounded GGUF reader retains `{general.architecture}.decision.type`. A
+nonempty native type admits a candidate for JIT loading and suppresses generation
+and embedding claims; it does not grant Decision. Filename, repository, GGUF
+format and Norted metadata grant nothing. Upstream owns recognition of the native
+type, so Scala maintains no classifier architecture/name allowlist.
+
+Before launch, Scala binds a process-local proof to the immutable runtime ID,
+verified executable SHA-256, artifact ID/path/hash/size/native identity, profile
+ID and resolved configured settings. After startup it checks the private
+backend's `/props` model path, alias and build identity, and the single loaded
+entry in `/v1/models`. Current upstream
+[#29987](https://github.com/ggml-org/llama.cpp/pull/29987) reports
+`architecture.output_modalities`; when present it must include `decisions`.
+Unknown additional modalities are tolerated. Earlier System One nightlies omit
+that field.
+
+Scala also sends `{}` to `/v1/systemone`. Official upstream checks the native
+decision type before parsing questions: an ordinary model returns 501, an old
+server without the route returns 404, and an initialized Decision model returns
+400 `invalid_request_error`, message `"state" must be provided`. That exact
+validator response proves the native interface/model pair without running an
+inference task. Generic HTTP 400, a version string, or metadata alone cannot
+qualify it. Decision candidates skip Scala's generative chat capability probe.
+Proofs are cleared on unload/crash and replaced before every launch attempt.
+Changes to the runtime, executable, artifact, profile or configured settings
+require a fresh proof. Observations never enter persisted settings.
+
+The shared `native_decision_supported` gate still controls dispatch, public Model
+Profile discovery (`capabilities.decision: true`) and contextual
+`ModelServingCapabilities`. An unloaded/unverified pair cannot advertise
+Decision; the first valid JIT request may load and qualify its candidate. Old
+runtimes remain unsupported. Decision classifiers advertise neither
+`TextGeneration` nor chat, Responses, streaming or embedding capability. Ordinary
+chat and pooled embedding GGUF behavior is unchanged.
+
+## Native mapping and runtime discovery
+
+The adapter sends only `state` and `questions` to the already-running private
+llama-server's `/v1/systemone`. It never sends a model selector. JSON content,
+choice descriptions/nulls, score order and noul `true`/`false` criteria remain
+unchanged. Answers share Scala's type-tagged schema; native probabilities,
+confidence, legends and model identity are retained and absent observations stay
+absent. Native `usage.input_tokens` and `usage.output_tokens` map to existing
+usage counters; `total_tokens` is their checked sum. No timing/cache observations
+are invented. HTTP, malformed-response and transport failures use existing
+`EngineError` behavior with no alternate route or fallback.
+
+Concrete upstream validation is stricter than Scala's structural contract:
+question instructions must be provided and score criteria must have 2–10
+levels. Scala forwards requests unchanged, including omitted instructions, and
+returns native rejection rather than filling instructions or altering criteria.
+The public API contract is unchanged.
+
+As reviewed on 2026-10-05, official nightly
+[b11425](https://github.com/ggml-org/llama.cpp/releases/tag/b11425), commit
+`e117148a41d8e9bedb72e4c6c3f003ab0fe7f857`, contains #29818, Nimble/Clef support and
+the Laya correctness fix [#29903](https://github.com/ggml-org/llama.cpp/pull/29903).
+It predates the model modality field and qualifies through the native validator.
+Current master identifies itself as the 0.6.0 development line; version alone is
+never a support gate.
+
+Scala's existing official nightly/source providers can surface this revision.
+Managed CUDA source recipes are now `managed-portable-v5` (CUDA 12) and
+`managed-portable-cuda13-v3` (CUDA 13), explicitly disabling both historical and
+current upstream CCCL download guards. Old recipe/runtime identities and
+selections remain immutable. No runtime is installed or automatically selected
+by this integration. Laya/Clef native batches must fit the selected runtime's
+`--ubatch-size`; native model limits remain upstream-owned. Actual installation,
+host/toolkit qualification, model acquisition and operational inference are
+separate steps.
 
 Profiles continue to bind an ordinary artifact and engine target. GGUF, Q27 and
 NInfer formats, filenames, origin and Norted metadata/provenance alone never grant
