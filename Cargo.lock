@@ -2946,15 +2946,18 @@ name = "scala-engine-llama-cpp"
 version = "0.1.9"
 dependencies = [
  "async-trait",
+ "axum",
  "bytes",
  "futures-util",
  "jsonschema",
  "reqwest 0.12.28",
+ "scala-api",
  "scala-core",
  "scala-engine",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
  "toml",
 ]

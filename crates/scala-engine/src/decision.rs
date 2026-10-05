@@ -135,7 +135,7 @@ pub struct RoutedDecisionOutput {
     pub identity: DecisionIdentity,
 }
 
-/// The same exact-pair gate is used by discovery and dispatch. Format acceptance,
+/// Exact loaded execution qualification. Format acceptance,
 /// engine-wide declarations, filenames and package origin cannot grant support.
 pub fn native_decision_supported(
     adapter: &dyn EngineAdapter,
@@ -160,6 +160,30 @@ pub fn native_decision_supported(
         && adapter.supports_native_decision(runtime, model, settings)
 }
 
+/// Discoverability only: the ordinary native request must still JIT-load and
+/// pass `native_decision_supported`. No engine opts in by format or name alone.
+pub fn native_decision_candidate(
+    adapter: &dyn EngineAdapter,
+    runtime: &InstalledRuntime,
+    model: &ModelArtifact,
+    settings: &ResolvedSettings,
+) -> bool {
+    let capabilities = adapter.capabilities();
+    capabilities.api.contains(&ApiCapability::Decision)
+        && capabilities.features.contains(&EngineFeature::Decision)
+        && runtime.manifest.identity.engine_id == adapter.identity().id
+        && runtime.manifest.runtime_id
+            == scala_core::RuntimeId::from_identity(&runtime.manifest.identity)
+        && runtime.manifest.probe.compatible
+        && runtime.manifest.probe.observed_engine_id == adapter.identity().id
+        && runtime.manifest.supported_formats.contains(&model.format)
+        && settings.engine_id == adapter.identity().id
+        && adapter.runtime_compatibility(runtime).is_supported()
+        && adapter.compatibility(model).is_supported()
+        && adapter.supports_model_capability(model, ApiCapability::Decision)
+        && adapter.supports_native_decision_candidate(runtime, model, settings)
+}
+
 pub(crate) fn reported_model_capabilities(
     adapter: &dyn EngineAdapter,
     runtime: &InstalledRuntime,
@@ -167,18 +191,21 @@ pub(crate) fn reported_model_capabilities(
     settings: &ResolvedSettings,
 ) -> Option<ModelCapabilities> {
     let decision = native_decision_supported(adapter, runtime, model, settings);
+    let candidate = native_decision_candidate(adapter, runtime, model, settings);
     let mut reported = adapter.model_capabilities(runtime, model, settings);
-    if decision && reported.is_none() {
+    if (decision || candidate) && reported.is_none() {
         reported = Some(ModelCapabilities {
             thinking: crate::ThinkingCapabilities {
                 switchable: false,
                 effort_options: Vec::new(),
             },
-            decision: true,
+            decision,
+            decision_candidate: candidate,
         });
     }
     if let Some(reported) = &mut reported {
         reported.decision = decision;
+        reported.decision_candidate = candidate;
     }
     reported
 }
@@ -399,6 +426,10 @@ pub(crate) mod tests {
         ));
         let reported = reported_model_capabilities(&adapter, &runtime, &model, &settings).unwrap();
         assert!(reported.decision);
+        assert_eq!(
+            serde_json::to_value(&reported).unwrap()["decision"],
+            json!(true)
+        );
         assert!(!reported.thinking.switchable);
         adapter.api = false;
         assert!(!native_decision_supported(
