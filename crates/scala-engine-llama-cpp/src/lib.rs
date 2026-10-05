@@ -2,6 +2,7 @@
 
 mod catalog;
 mod chat;
+mod decision;
 mod prefill;
 mod source_catalog;
 
@@ -82,8 +83,10 @@ fn managed_llama_variant_update_identity(
         "managed-portable-v2" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 2),
         "managed-portable-v3" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 3),
         "managed-portable-v4" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 4),
+        "managed-portable-v5" => (MANAGED_CUDA12_FUNCTIONAL_VARIANT, 5),
         "managed-portable-cuda13-v1" => (MANAGED_CUDA13_FUNCTIONAL_VARIANT, 1),
         "managed-portable-cuda13-v2" => (MANAGED_CUDA13_FUNCTIONAL_VARIANT, 2),
+        "managed-portable-cuda13-v3" => (MANAGED_CUDA13_FUNCTIONAL_VARIANT, 3),
         _ => return None,
     };
     Some(RuntimeVariantUpdateIdentity {
@@ -328,6 +331,7 @@ pub struct LlamaCppAdapter {
     configuration_error: Option<String>,
     client: reqwest::Client,
     chat_proofs: std::sync::RwLock<BTreeMap<String, chat::LaunchProof>>,
+    decision_proofs: std::sync::RwLock<BTreeMap<String, decision::LaunchProof>>,
     capability_cache: tokio::sync::RwLock<BTreeMap<String, String>>,
     /// Replaced before every launch attempt; activated only for its matching process.
     prompt_timing: tokio::sync::RwLock<BTreeMap<String, PromptTimingLaunch>>,
@@ -435,6 +439,7 @@ impl LlamaCppAdapter {
             configuration_error,
             client: reqwest::Client::new(),
             chat_proofs: std::sync::RwLock::new(BTreeMap::new()),
+            decision_proofs: std::sync::RwLock::new(BTreeMap::new()),
             capability_cache: tokio::sync::RwLock::new(BTreeMap::new()),
             prompt_timing: tokio::sync::RwLock::new(BTreeMap::new()),
         }
@@ -717,11 +722,13 @@ impl EngineAdapter for LlamaCppAdapter {
                 ApiCapability::ChatCompletions,
                 ApiCapability::Completions,
                 ApiCapability::Embeddings,
+                ApiCapability::Decision,
             ],
             features: vec![
                 EngineFeature::TextGeneration,
                 EngineFeature::ToolCalling,
                 EngineFeature::StructuredOutput,
+                EngineFeature::Decision,
             ],
         }
     }
@@ -732,7 +739,15 @@ impl EngineAdapter for LlamaCppAdapter {
         model: &ModelArtifact,
         settings: Option<&scala_core::ResolvedSettings>,
     ) -> Vec<EngineFeature> {
-        if pooled_embedding_model(model) {
+        if decision::candidate(model) {
+            if settings
+                .is_some_and(|settings| self.supports_native_decision(runtime, model, settings))
+            {
+                vec![EngineFeature::Decision]
+            } else {
+                Vec::new()
+            }
+        } else if pooled_embedding_model(model) {
             Vec::new()
         } else {
             self.chat_serving_features(runtime, model, settings)
@@ -741,13 +756,40 @@ impl EngineAdapter for LlamaCppAdapter {
 
     fn supports_model_capability(&self, model: &ModelArtifact, capability: ApiCapability) -> bool {
         let pooled = pooled_embedding_model(model);
+        let decision = decision::candidate(model);
         match capability {
-            ApiCapability::Decision => false,
+            ApiCapability::Decision => decision,
             ApiCapability::Embeddings => pooled,
             ApiCapability::Completions
             | ApiCapability::ChatCompletions
-            | ApiCapability::Responses => !pooled,
+            | ApiCapability::Responses => !pooled && !decision,
         }
+    }
+
+    fn supports_native_decision_candidate(
+        &self,
+        _runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        settings: &scala_core::ResolvedSettings,
+    ) -> bool {
+        decision::candidate(model) && settings.model_profile_id.is_some()
+    }
+
+    fn supports_native_decision(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        settings: &scala_core::ResolvedSettings,
+    ) -> bool {
+        self.decision_supported(runtime, model, settings)
+    }
+
+    async fn decide(
+        &self,
+        endpoint: &str,
+        request: scala_engine::DecisionRequest,
+    ) -> Result<scala_engine::DecisionOutput, EngineError> {
+        self.native_decide(endpoint, request).await
     }
 
     fn runtime_variant_update_identity(
@@ -1482,6 +1524,10 @@ impl EngineAdapter for LlamaCppAdapter {
                 .expect("chat proof lock")
                 .remove(endpoint);
             self.prompt_timing.write().await.remove(endpoint);
+            self.decision_proofs
+                .write()
+                .expect("decision proof lock")
+                .remove(endpoint);
         }
     }
 
@@ -1529,7 +1575,10 @@ impl EngineAdapter for LlamaCppAdapter {
                 launch.ready
             })
         };
-        self.observe_chat(process).await;
+        self.observe_decision(process).await;
+        if !self.decision_candidate_endpoint(endpoint) {
+            self.observe_chat(process).await;
+        }
         let properties = self.startup_properties(endpoint).await?;
         let mut resolved_settings = serde_json::Map::from_iter([(
             "llama.cpp.context_length".to_owned(),
@@ -1543,6 +1592,10 @@ impl EngineAdapter for LlamaCppAdapter {
         }
         Ok(StartupObservation::Ready(BTreeMap::from([
             ("chat_contract".to_owned(), self.chat_observation(endpoint)),
+            (
+                "decision_contract".to_owned(),
+                self.decision_observation(endpoint),
+            ),
             (
                 "resolved_settings".to_owned(),
                 Value::Object(resolved_settings),
@@ -2118,6 +2171,7 @@ impl LlamaCppAdapter {
             return;
         };
         self.prepare_chat(spec).await;
+        self.prepare_decision(spec).await;
         // Clear old endpoint proof before verification, including failed/retried loads.
         self.prompt_timing.write().await.remove(endpoint);
         let reviewed = prefill::reviewed(&spec.runtime)
@@ -5625,7 +5679,8 @@ impl LlamaCppAdapter {
 }
 
 fn pooled_embedding_model(model: &ModelArtifact) -> bool {
-    matches!(model.native_identity.as_ref(), Some(scala_core::ArtifactNativeIdentity::Gguf(identity)) if matches!(identity.pooling_type, Some(1..=3)))
+    !decision::candidate(model)
+        && matches!(model.native_identity.as_ref(), Some(scala_core::ArtifactNativeIdentity::Gguf(identity)) if matches!(identity.pooling_type, Some(1..=3)))
 }
 
 #[cfg(test)]
@@ -6029,7 +6084,7 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod recipe_update_tests {
     #[test]
-    fn released_engine_remains_decision_unsupported() {
+    fn engine_declarations_include_native_decision_without_granting_a_pair() {
         let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
         let capabilities = adapter.capabilities();
         assert_eq!(
@@ -6037,7 +6092,8 @@ mod recipe_update_tests {
             vec![
                 ApiCapability::ChatCompletions,
                 ApiCapability::Completions,
-                ApiCapability::Embeddings
+                ApiCapability::Embeddings,
+                ApiCapability::Decision
             ]
         );
         assert_eq!(
@@ -6045,7 +6101,8 @@ mod recipe_update_tests {
             vec![
                 EngineFeature::TextGeneration,
                 EngineFeature::ToolCalling,
-                EngineFeature::StructuredOutput
+                EngineFeature::StructuredOutput,
+                EngineFeature::Decision
             ]
         );
     }
@@ -6116,6 +6173,7 @@ mod recipe_update_tests {
             ("managed-portable-v2", 2),
             ("managed-portable-v3", 3),
             ("managed-portable-v4", 4),
+            ("managed-portable-v5", 5),
         ] {
             assert_eq!(
                 adapter.runtime_variant_update_identity(&identity(variant, "cuda")),
@@ -6128,6 +6186,7 @@ mod recipe_update_tests {
         for (variant, generation) in [
             ("managed-portable-cuda13-v1", 1),
             ("managed-portable-cuda13-v2", 2),
+            ("managed-portable-cuda13-v3", 3),
         ] {
             assert_eq!(
                 adapter.runtime_variant_update_identity(&identity(variant, "cuda")),
@@ -6211,7 +6270,7 @@ mod recipe_update_tests {
     fn unknown_generations_and_other_accelerators_do_not_cross_update() {
         let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
         for runtime in [
-            identity("managed-portable-v5", "cuda"),
+            identity("managed-portable-v6", "cuda"),
             identity("managed-portable-v3", "vulkan"),
         ] {
             assert_eq!(

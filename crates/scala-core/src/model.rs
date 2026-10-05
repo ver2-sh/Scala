@@ -60,6 +60,10 @@ pub struct GgufArtifactIdentity {
     pub pooling_type: Option<u64>,
     pub version: u32,
     pub architecture: String,
+    /// Native `{architecture}.decision.type` metadata; only a candidate hint.
+    /// An engine must still qualify the concrete runtime/model/settings pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_type: Option<String>,
     pub context_length: Option<u64>,
     pub expert_count: Option<u64>,
     pub expert_used_count: Option<u64>,
@@ -502,6 +506,7 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
     let mut architecture = None;
     let mut architecture_numbers = HashMap::<String, u64>::new();
     let mut architecture_decimals = HashMap::<String, String>::new();
+    let mut architecture_decisions = HashMap::<String, String>::new();
     let mut chat_template_sha256 = None;
     let mut tokenizer = Sha256::new();
     let mut tokenizer_fields = 0_u64;
@@ -518,6 +523,7 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
             continue;
         }
         let capture = key == "general.architecture"
+            || key.ends_with(".decision.type")
             || key.ends_with(".pooling_type")
             || key.ends_with(".context_length")
             || key.ends_with(".expert_count")
@@ -529,6 +535,10 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
         let value = reader.value(value_type, capture.then_some(&key), None)?;
         if key == "general.architecture" {
             architecture = value.and_then(GgufScalar::into_string);
+        } else if key.ends_with(".decision.type") {
+            if let Some(value) = value.and_then(GgufScalar::into_string) {
+                architecture_decisions.insert(key, value);
+            }
         } else if key == "tokenizer.chat_template" {
             chat_template_sha256 = value.and_then(GgufScalar::into_string).map(|template| {
                 let digest = Sha256::digest(template.as_bytes());
@@ -577,6 +587,7 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
         .and_then(|key| architecture_decimals.get(key))
         .cloned();
     Ok(GgufArtifactIdentity {
+        decision_type: architecture_decisions.remove(&format!("{architecture}.decision.type")),
         pooling_type: architecture_numbers
             .get(&format!("{architecture}.pooling_type"))
             .copied(),

@@ -81,6 +81,7 @@ fn ninfer_template_capabilities(digest: &str) -> Option<scala_engine::ModelCapab
     };
     Some(ModelCapabilities {
         decision: false,
+        decision_candidate: false,
         thinking: ThinkingCapabilities {
             switchable: true,
             effort_options,

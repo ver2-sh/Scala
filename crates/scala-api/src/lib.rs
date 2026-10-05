@@ -796,13 +796,14 @@ mod tests {
     #[test]
     fn model_capabilities_are_additive_and_do_not_include_defaults() {
         use scala_engine::{ModelCapabilities, ReasoningEffort, ThinkingCapabilities};
-        let model = ApiModel {
+        let mut model = ApiModel {
             id: "arbitrary-profile".into(),
             object: "model",
             owned_by: "scala-user".into(),
             created: 0,
             capabilities: Some(ModelCapabilities {
                 decision: false,
+                decision_candidate: false,
                 thinking: ThinkingCapabilities {
                     switchable: true,
                     effort_options: vec![
@@ -813,12 +814,15 @@ mod tests {
                 },
             }),
         };
-        let value = serde_json::to_value(model).unwrap();
+        let value = serde_json::to_value(&model).unwrap();
         assert_eq!(value.as_object().unwrap().len(), 5);
         assert_eq!(
             value["capabilities"],
             json!({"thinking":{"switchable":true,"effort_options":["low","medium","xhigh"]}})
         );
+        model.capabilities.as_mut().unwrap().decision = true;
+        let value = serde_json::to_value(&model).unwrap();
+        assert_eq!(value["capabilities"]["decision"], json!(true));
     }
 
     #[tokio::test]
