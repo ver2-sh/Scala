@@ -21,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 
 use crate::catalog::{
-    GitHubReleaseAsset, GitHubReleaseClient, RuntimeProviderAuthority, is_allowed_github_host,
+    GitHubReleaseClient, RuntimeProviderAuthority, VerifiedInstallCandidate, is_allowed_github_host,
 };
 use crate::store::{RUNTIME_MANIFEST_FILE, RuntimeStaging, RuntimeStore, RuntimeStoreError};
 use crate::{EngineError, EngineRegistry};
@@ -117,6 +117,12 @@ impl RuntimeInstaller {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_origin(mut self, origin: reqwest::Url) -> Self {
+        self.github = self.github.with_test_origin(origin);
+        self
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<RuntimeOperationProgress> {
         self.progress.subscribe()
     }
@@ -131,10 +137,11 @@ impl RuntimeInstaller {
         }
     }
 
-    pub async fn install(
+    pub(crate) async fn install(
         &self,
-        available: &AvailableRuntime,
+        verified: &VerifiedInstallCandidate,
     ) -> Result<InstalledRuntime, RuntimeInstallError> {
+        let available = verified.available();
         available
             .validate()
             .map_err(|error| RuntimeInstallError::InvalidMetadata(error.to_string()))?;
@@ -163,7 +170,6 @@ impl RuntimeInstaller {
                 "release runtime is missing a package size".to_owned(),
             )
         })?;
-        let repository = authority.repository.clone();
         let expected = download
             .digest
             .as_ref()
@@ -174,7 +180,6 @@ impl RuntimeInstaller {
             ));
         }
         validate_release_source(available)?;
-        self.verify_published_assets(available).await?;
         let primary_asset_name = available
             .identity
             .package
@@ -183,8 +188,8 @@ impl RuntimeInstaller {
             .ok_or_else(|| {
                 RuntimeInstallError::InvalidMetadata("primary asset name is missing".to_owned())
             })?;
-        validate_release_asset_url(available, primary_asset_name, download)?;
-        let primary_asset_id = parse_asset_id(
+        let url = validate_release_asset_url(available, primary_asset_name, download)?;
+        parse_asset_id(
             available.identity.package.asset_id.as_deref(),
             primary_asset_name,
         )?;
@@ -196,8 +201,7 @@ impl RuntimeInstaller {
             .download(
                 available,
                 download,
-                &repository,
-                primary_asset_id,
+                &url,
                 &expected.value,
                 total_package_size,
             )
@@ -219,18 +223,11 @@ impl RuntimeInstaller {
                     available.runtime_id.to_string(),
                 ));
             }
-            validate_release_asset_url(available, &asset.asset_name, download)?;
-            let asset_id = parse_asset_id(Some(&asset.asset_id), &asset.asset_name)?;
+            let url = validate_release_asset_url(available, &asset.asset_name, download)?;
+            parse_asset_id(Some(&asset.asset_id), &asset.asset_name)?;
             additional_archives.push(
-                self.download(
-                    available,
-                    download,
-                    &repository,
-                    asset_id,
-                    &digest.value,
-                    total_package_size,
-                )
-                .await?,
+                self.download(available, download, &url, &digest.value, total_package_size)
+                    .await?,
             );
             additional_digests.push(digest.value.clone());
         }
@@ -748,74 +745,11 @@ impl RuntimeInstaller {
         }
     }
 
-    async fn verify_published_assets(
-        &self,
-        available: &AvailableRuntime,
-    ) -> Result<(), RuntimeInstallError> {
-        let (download, additional_downloads) = available.release_assets().ok_or_else(|| {
-            RuntimeInstallError::InvalidMetadata(
-                "release verification requires a release acquisition plan".to_owned(),
-            )
-        })?;
-        let package = &available.identity.package;
-        let repository = package.repository.as_deref().ok_or_else(|| {
-            RuntimeInstallError::InvalidMetadata(
-                "official repository identity is missing".to_owned(),
-            )
-        })?;
-        let release_tag = package.release_tag.as_deref().ok_or_else(|| {
-            RuntimeInstallError::InvalidMetadata("official release tag is missing".to_owned())
-        })?;
-        let release = self
-            .github
-            .release_by_tag(repository, release_tag)
-            .await
-            .map_err(|error| RuntimeInstallError::SourceChanged(error.to_string()))?
-            .ok_or_else(|| {
-                RuntimeInstallError::SourceChanged(format!(
-                    "release `{repository}@{release_tag}` is no longer published"
-                ))
-            })?;
-        if release.draft
-            || release.tag_name != release_tag
-            || release.html_url != available.source_url
-            || available
-                .identity
-                .upstream_revision
-                .as_deref()
-                .is_some_and(|revision| revision != release.target_commitish)
-        {
-            return Err(RuntimeInstallError::SourceChanged(format!(
-                "release `{repository}@{release_tag}` no longer matches the catalog identity"
-            )));
-        }
-
-        let primary_name = package.asset_name.as_deref().ok_or_else(|| {
-            RuntimeInstallError::InvalidMetadata("primary asset name is missing".to_owned())
-        })?;
-        verify_release_asset(
-            &release.assets,
-            package.asset_id.as_deref(),
-            primary_name,
-            download,
-        )?;
-        for (asset, download) in package.additional_assets.iter().zip(additional_downloads) {
-            verify_release_asset(
-                &release.assets,
-                Some(&asset.asset_id),
-                &asset.asset_name,
-                download,
-            )?;
-        }
-        Ok(())
-    }
-
     async fn download(
         &self,
         available: &AvailableRuntime,
         download: &scala_core::RuntimeDownload,
-        repository: &str,
-        asset_id: u64,
+        url: &reqwest::Url,
         expected: &str,
         total_package_size: u64,
     ) -> Result<PathBuf, RuntimeInstallError> {
@@ -869,7 +803,7 @@ impl RuntimeInstaller {
         let result = async {
             let response = self
                 .github
-                .release_asset_request(repository, asset_id)
+                .release_download_request(url)
                 .map_err(|error| RuntimeInstallError::Download(error.to_string()))?
                 .send()
                 .await
@@ -1890,38 +1824,6 @@ fn parse_asset_id(asset_id: Option<&str>, asset_name: &str) -> Result<u64, Runti
         })
 }
 
-fn verify_release_asset(
-    live_assets: &[GitHubReleaseAsset],
-    expected_id: Option<&str>,
-    expected_name: &str,
-    expected_download: &scala_core::RuntimeDownload,
-) -> Result<(), RuntimeInstallError> {
-    let expected_id = parse_asset_id(expected_id, expected_name)?;
-    let live = live_assets
-        .iter()
-        .find(|asset| asset.id == expected_id)
-        .ok_or_else(|| {
-            RuntimeInstallError::SourceChanged(format!(
-                "release asset `{expected_name}` no longer has GitHub asset ID {expected_id}"
-            ))
-        })?;
-    let live_digest = live
-        .digest
-        .as_deref()
-        .and_then(|digest| scala_core::RuntimeDigest::parse_github(digest).ok());
-    if live.state != "uploaded"
-        || live.name != expected_name
-        || live.size != expected_download.size_bytes
-        || live.browser_download_url != expected_download.url
-        || live_digest.as_ref() != expected_download.digest.as_ref()
-    {
-        return Err(RuntimeInstallError::SourceChanged(format!(
-            "release asset `{expected_name}` metadata changed after catalog discovery"
-        )));
-    }
-    Ok(())
-}
-
 fn validate_release_asset_url(
     available: &AvailableRuntime,
     asset_name: &str,
@@ -2403,6 +2305,132 @@ mod tests {
         run_source_command, validate_relative_link_target, verify_package_digest,
         verify_source_checkout,
     };
+
+    #[tokio::test]
+    async fn direct_release_transport_verifies_size_digest_and_rejects_redirects() {
+        use super::{RuntimeInstaller, validate_release_asset_url};
+        use crate::EngineRegistry;
+        use crate::test_support::{HttpFixture, paths, release, runtime};
+        use std::sync::Arc;
+        // Exercise valid, truncated, oversized and same-size replaced bytes.
+        for (body, expected_error) in [
+            (b"package".as_slice(), None),
+            (b"short".as_slice(), Some("size mismatch")),
+            (
+                b"package-extra".as_slice(),
+                Some("exceeded its advertised size"),
+            ),
+            (b"changed".as_slice(), Some("checksum mismatch")),
+        ] {
+            let candidate = runtime(&serde_json::from_value(release(b"package")).unwrap());
+            let root = tempfile::tempdir().unwrap();
+            let paths = paths(root.path());
+            let bytes = body.to_vec();
+            let server = HttpFixture::new(move |_| (200, vec![], bytes.clone())).await;
+            let installer = RuntimeInstaller::new(
+                Arc::new(RuntimeStore::new(&paths)),
+                EngineRegistry::default(),
+                paths.runtime_cache_dir.clone(),
+                std::iter::empty(),
+            )
+            .unwrap()
+            .with_test_origin(server.origin.clone());
+            let (download, _) = candidate.release_assets().unwrap();
+            let url = validate_release_asset_url(&candidate, "fixture.zip", download).unwrap();
+            let expected = &download.digest.as_ref().unwrap().value;
+            let result = installer
+                .download(&candidate, download, &url, expected, download.size_bytes)
+                .await;
+            if let Some(message) = expected_error {
+                assert!(
+                    result.unwrap_err().to_string().contains(message),
+                    "{message}"
+                );
+                assert_eq!(
+                    std::fs::read_dir(paths.runtime_cache_dir.join("downloads"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            } else {
+                let path = result.unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), body);
+                // Cached bytes also remain pinned to digest and size.
+                assert_eq!(
+                    installer
+                        .download(&candidate, download, &url, expected, download.size_bytes)
+                        .await
+                        .unwrap(),
+                    path
+                );
+            }
+            assert_eq!(
+                server.paths(),
+                ["/owner/repository/releases/download/v1/fixture.zip"]
+            );
+            assert!(
+                !server.requests.lock().unwrap()[0]
+                    .to_ascii_lowercase()
+                    .contains("authorization:")
+            );
+        }
+        let candidate = runtime(&serde_json::from_value(release(b"package")).unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(root.path());
+        let server = HttpFixture::new(|_| {
+            (
+                302,
+                vec![("Location", "https://example.com/untrusted.zip".into())],
+                vec![],
+            )
+        })
+        .await;
+        let installer = RuntimeInstaller::new(
+            Arc::new(RuntimeStore::new(&paths)),
+            EngineRegistry::default(),
+            paths.runtime_cache_dir.clone(),
+            std::iter::empty(),
+        )
+        .unwrap()
+        .with_test_origin(server.origin.clone());
+        let (download, _) = candidate.release_assets().unwrap();
+        let url = validate_release_asset_url(&candidate, "fixture.zip", download).unwrap();
+        let error = installer
+            .download(
+                &candidate,
+                download,
+                &url,
+                &download.digest.as_ref().unwrap().value,
+                download.size_bytes,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("redirect"));
+        assert_eq!(server.paths().len(), 1);
+    }
+
+    #[test]
+    fn direct_release_url_remains_bound_to_repository_tag_and_asset_name() {
+        use super::{parse_asset_id, validate_release_asset_url, validate_release_source};
+        use crate::test_support::{release, runtime};
+        let candidate = runtime(&serde_json::from_value(release(b"package")).unwrap());
+        validate_release_source(&candidate).unwrap();
+        let (download, _) = candidate.release_assets().unwrap();
+        for url in [
+            "https://github.com/attacker/repository/releases/download/v1/fixture.zip",
+            "https://github.com/owner/repository/releases/download/v2/fixture.zip",
+            "https://github.com/owner/repository/releases/download/v1/replaced.zip",
+            "https://api.github.com/repos/owner/repository/releases/assets/7",
+            "https://release-assets.githubusercontent.com/fixture.zip",
+        ] {
+            let mut changed = download.clone();
+            changed.url = url.into();
+            assert!(validate_release_asset_url(&candidate, "fixture.zip", &changed).is_err());
+        }
+        assert!(parse_asset_id(Some("0"), "fixture.zip").is_err());
+        assert!(parse_asset_id(None, "fixture.zip").is_err());
+        assert_eq!(parse_asset_id(Some("7"), "fixture.zip").unwrap(), 7);
+    }
 
     #[test]
     fn explicit_cuda_architectures_are_checked_against_nvcc_targets() {

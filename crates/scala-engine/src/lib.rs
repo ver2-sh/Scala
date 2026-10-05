@@ -33,6 +33,8 @@ mod packs;
 mod prune;
 mod store;
 mod supervisor;
+#[cfg(test)]
+mod test_support;
 pub use decision::*;
 pub use prune::plan_runtime_prune;
 

@@ -256,11 +256,17 @@ impl RuntimeCatalogProvider for Q27RuntimeCatalogProvider {
         let Some(release) = github.release_by_tag(GITHUB_REPOSITORY, tag).await? else {
             return Ok(None);
         };
-        let live = fetch_catalog_runtimes(github, &[release])
-            .await?
+        // A selected binary is admitted by release/asset identity and digest.
+        // Do not inspect its separately offered source recipe during binary
+        // verification; source candidates still require the full source audit.
+        let runtimes = if candidate.release_assets().is_some() {
+            fetch_catalog_runtimes_with_inspector(&[release], |_| async { Ok(None) }).await?
+        } else {
+            fetch_catalog_runtimes(github, &[release]).await?
+        };
+        Ok(runtimes
             .into_iter()
-            .find(|runtime| runtime.runtime_id == candidate.runtime_id);
-        Ok(live)
+            .find(|runtime| runtime.runtime_id == candidate.runtime_id))
     }
 }
 
@@ -311,6 +317,20 @@ async fn fetch_catalog_runtimes(
     github: &GitHubReleaseClient,
     releases: &[GitHubRelease],
 ) -> Result<Vec<AvailableRuntime>, CatalogError> {
+    fetch_catalog_runtimes_with_inspector(releases, |release| {
+        inspect_source_capability(github, release)
+    })
+    .await
+}
+
+async fn fetch_catalog_runtimes_with_inspector<'a, F, Fut>(
+    releases: &'a [GitHubRelease],
+    mut inspect: F,
+) -> Result<Vec<AvailableRuntime>, CatalogError>
+where
+    F: FnMut(&'a GitHubRelease) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Q27SourceCapability>, CatalogError>>,
+{
     let mut qualified = Vec::new();
     for (ordinal, release) in releases.iter().enumerate() {
         if release.draft {
@@ -319,16 +339,23 @@ async fn fetch_catalog_runtimes(
         let Some(version) = release_version(release) else {
             continue;
         };
-        // Offer the separately audited source recipe even when the release has
-        // binaries. Binary provenance does not inherit a source-built grant.
-        if version == "0.14.3"
-            && let Some(source) = inspect_source_capability(github, release).await?
+        let binary = release.assets.iter().find_map(|asset| {
+            qualify_release_asset(release, asset)
+                .map(|(asset_version, digest)| (asset, asset_version, digest))
+        });
+        // Source admission is explicitly reviewed, never inferred from a
+        // historical release lacking binaries. Inspect each reviewed tag at
+        // most once; v0.14.3 offers both its binary and separate source recipe.
+        if let Some((commit_sha, tree_sha)) = reviewed_source_revision(&release.tag_name)
+            && (binary.is_none() || release.tag_name == "v0.14.3")
+            && let Some(source) = inspect(release).await?
             && source.package_contract
-            && source.commit.sha == CURRENT_SOURCE_COMMIT
+            && source.commit.sha == commit_sha
+            && source.commit.commit.tree.sha == tree_sha
         {
             qualified.push(QualifiedRelease {
                 release,
-                version: version.clone(),
+                version,
                 binary: None,
                 source: Some(source),
                 published_at_unix: release
@@ -338,22 +365,12 @@ async fn fetch_catalog_runtimes(
                 ordinal,
             });
         }
-        let binary = release.assets.iter().find_map(|asset| {
-            qualify_release_asset(release, asset)
-                .map(|(asset_version, digest)| (asset, asset_version, digest))
-        });
-        let (version, binary, source) = if let Some((asset, asset_version, digest)) = binary {
-            (asset_version, Some((asset, digest)), None)
-        } else {
-            let source = inspect_source_capability(github, release).await?;
-            (version, None, source)
-        };
-        if binary.is_some() || source.is_some() {
+        if let Some((asset, version, digest)) = binary {
             qualified.push(QualifiedRelease {
                 release,
                 version,
-                binary,
-                source,
+                binary: Some((asset, digest)),
+                source: None,
                 published_at_unix: release
                     .published_at
                     .as_deref()
@@ -513,11 +530,25 @@ fn release_version(release: &GitHubRelease) -> Option<String> {
     .then(|| version.to_owned())
 }
 
+fn reviewed_source_revision(tag: &str) -> Option<(&'static str, &'static str)> {
+    match tag {
+        "v0.10.0" => Some((PACKAGE_SOURCE_COMMIT, PACKAGE_SOURCE_TREE)),
+        "v0.14.3" => Some((CURRENT_SOURCE_COMMIT, CURRENT_SOURCE_TREE)),
+        _ => None,
+    }
+}
+
 async fn inspect_source_capability(
     github: &GitHubReleaseClient,
     release: &GitHubRelease,
 ) -> Result<Option<Q27SourceCapability>, CatalogError> {
+    let Some((expected_commit, expected_tree)) = reviewed_source_revision(&release.tag_name) else {
+        return Ok(None);
+    };
     let commit = github.commit(GITHUB_REPOSITORY, &release.tag_name).await?;
+    if commit.sha != expected_commit || commit.commit.tree.sha != expected_tree {
+        return Ok(None);
+    }
     if !scala_core::is_full_git_sha(&commit.sha)
         || !scala_core::is_full_git_sha(&commit.commit.tree.sha)
         || commit.html_url
@@ -6489,6 +6520,91 @@ impl Q27Adapter {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn discovery_only_inspects_reviewed_source_tags_and_keeps_official_binaries() {
+        let release = |tag: &str, assets: Vec<GitHubReleaseAsset>| GitHubRelease {
+            id: tag.bytes().map(u64::from).sum(),
+            tag_name: tag.into(),
+            name: None,
+            html_url: format!("https://github.com/{GITHUB_REPOSITORY}/releases/tag/{tag}"),
+            target_commitish: "master".into(),
+            draft: false,
+            prerelease: false,
+            published_at: Some("2026-10-04T00:00:00Z".into()),
+            assets,
+        };
+        let asset = |tag: &str, id, size, digest: &str| GitHubReleaseAsset {
+            id,
+            name: format!("q27-{tag}-linux-x86_64.tar.gz"),
+            size,
+            browser_download_url: format!(
+                "https://github.com/{GITHUB_REPOSITORY}/releases/download/{tag}/q27-{tag}-linux-x86_64.tar.gz"
+            ),
+            digest: Some(format!("sha256:{digest}")),
+            state: "uploaded".into(),
+        };
+        let mut releases = (0..100)
+            .map(|n| release(&format!("v0.9.{n}"), vec![]))
+            .collect::<Vec<_>>();
+        releases.push(release("v0.10.0", vec![]));
+        releases.push(release(
+            "v0.14.3",
+            vec![asset("v0.14.3", 610271166, 27522833, CURRENT_ASSET_SHA256)],
+        ));
+        releases.push(release(
+            "v0.6.2",
+            vec![asset("v0.6.2", 7, 42, &"a".repeat(64))],
+        ));
+        let mut inspected = Vec::new();
+        let runtimes = fetch_catalog_runtimes_with_inspector(&releases, |release| {
+            inspected.push(release.tag_name.clone());
+            let (sha, tree) = reviewed_source_revision(&release.tag_name).expect("only reviewed tags are inspected");
+            let current = sha == CURRENT_SOURCE_COMMIT;
+            let commit: GitHubCommit = serde_json::from_value(json!({
+                "sha": sha, "html_url": format!("https://github.com/{GITHUB_REPOSITORY}/commit/{sha}"),
+                "commit": {"tree": {"sha": tree}, "committer": {"date": "2026-10-04T00:00:00Z"}}
+            })).unwrap();
+            std::future::ready(Ok(Some(Q27SourceCapability {
+                commit, makefile_sha256: if current { CURRENT_MAKEFILE_SHA256 } else { PACKAGE_MAKEFILE_SHA256 }.into(),
+                package_contract: true, minimum_cuda_version: if current { "13.2" } else { "12.8" }.into(),
+                supported_variant_ids: variants_for(if current { "0.14.3" } else { "0.10.0" }).iter().map(|v| v.id).collect(),
+                supported_cuda_compute_capabilities: vec![ComputeCapability::new(8, 6), ComputeCapability::new(8, 9), ComputeCapability::new(12, 0)],
+                accelerator_target: "sm_86+sm_89+sm_120".into(),
+            })))
+        }).await.unwrap();
+        assert_eq!(inspected, ["v0.10.0", "v0.14.3"]);
+        for (version, recipe, count) in [
+            ("0.10.0", SOURCE_RECIPE_VERSION, 3),
+            ("0.14.3", CURRENT_SOURCE_RECIPE_VERSION, 4),
+        ] {
+            let sources = runtimes
+                .iter()
+                .filter(|runtime| {
+                    runtime.identity.version == version && runtime.source_build().is_some()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(sources.len(), count);
+            for runtime in sources {
+                runtime.validate().unwrap();
+                assert_eq!(
+                    runtime.source_build().unwrap().recipe.recipe_version,
+                    recipe
+                );
+            }
+        }
+        for (version, count) in [("0.6.2", 3), ("0.14.3", 4)] {
+            assert_eq!(
+                runtimes
+                    .iter()
+                    .filter(|runtime| runtime.identity.version == version
+                        && runtime.release_assets().is_some())
+                    .count(),
+                count
+            );
+        }
+        assert_eq!(runtimes.len(), 14);
+    }
+
     #[test]
     fn released_engine_remains_decision_unsupported() {
         let adapter = Q27Adapter::from_config(None, Path::new("."));
