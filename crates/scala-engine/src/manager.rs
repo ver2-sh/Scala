@@ -1338,6 +1338,7 @@ impl RuntimeManager {
             mut startup_observation,
             effective_generation_settings,
             runtime,
+            model,
         ) = loop {
             let launch_spec = launch_attempts
                 .pop_front()
@@ -1388,6 +1389,9 @@ impl RuntimeManager {
             let selected_runtime = launch_spec.runtime.clone();
             let selected_accelerator_binding = launch_spec.accelerator_binding.clone();
             let model_identity = launch_spec.model.runtime_identity();
+            // Capability proofs must see the same prepared artifact as the
+            // launched server and provenance, including verified content hashes.
+            let selected_model = launch_spec.model.primary.clone();
             let normalized_settings = launch_spec.normalized_settings.clone();
             let settings = launch_spec.settings.clone();
             let native_arguments = launch_spec.native_arguments.clone();
@@ -1613,6 +1617,7 @@ impl RuntimeManager {
                         observation,
                         settings,
                         selected_runtime,
+                        selected_model,
                     );
                 }
                 StartupObservation::RetryContextCapacity {

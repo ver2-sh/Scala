@@ -1489,7 +1489,8 @@ impl RuntimePackManager {
             });
 
         let text_generation = !self.registry.compatible_with(model).iter().any(|adapter| {
-            adapter.supports_model_capability(model, crate::ApiCapability::Embeddings)
+            (adapter.supports_model_capability(model, crate::ApiCapability::Embeddings)
+                || adapter.supports_model_capability(model, crate::ApiCapability::Decision))
                 && !adapter.supports_model_capability(model, crate::ApiCapability::ChatCompletions)
                 && !adapter.supports_model_capability(model, crate::ApiCapability::Responses)
         });
@@ -2628,8 +2629,27 @@ mod tests {
         fn capabilities(&self) -> EngineCapabilities {
             EngineCapabilities {
                 artifact_formats: vec![ArtifactFormat::Gguf],
-                ..EngineCapabilities::default()
+                api: if self.id == "decision-only" {
+                    vec![crate::ApiCapability::Decision]
+                } else {
+                    Vec::new()
+                },
+                features: if self.id == "decision-only" {
+                    vec![crate::EngineFeature::Decision]
+                } else {
+                    Vec::new()
+                },
             }
+        }
+
+        fn supports_native_decision(
+            &self,
+            _: &InstalledRuntime,
+            model: &ModelArtifact,
+            _: &scala_core::ResolvedSettings,
+        ) -> bool {
+            self.id == "decision-only"
+                && model.architecture.as_deref() == Some("native-decision-fixture")
         }
 
         fn runtime_variant_update_identity(
@@ -2805,6 +2825,74 @@ mod tests {
         assert_eq!(selection.runtime.manifest.identity.engine_id, "fake_b");
         assert_eq!(schema.engine_id, "fake_b");
         assert_eq!(schema.definitions[0].id.as_str(), "fake_b.marker");
+    }
+
+    #[tokio::test]
+    async fn decision_only_public_serving_capabilities_require_context_and_do_not_grant_generation()
+    {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let paths = AppPaths {
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.toml"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            log_dir: root.join("logs"),
+            runtimes_dir: root.join("data/runtimes"),
+            runtime_cache_dir: root.join("cache/runtime-packs"),
+            runtime_selections_file: root.join("data/runtime-selections.json"),
+            settings_file: root.join("data/settings.json"),
+            settings_lock_file: root.join("data/.settings.lock"),
+            model_profiles_file: root.join("data/model-profiles.json"),
+            model_profiles_lock_file: root.join("data/.model-profiles.lock"),
+        };
+        paths.ensure_required().unwrap();
+        let mut registry = EngineRegistry::default();
+        registry
+            .register(Arc::new(BoundSchemaAdapter {
+                id: "decision-only",
+            }))
+            .unwrap();
+        let manager = super::RuntimePackManager::new(
+            &paths,
+            registry,
+            Vec::<Arc<dyn RuntimeCatalogProvider>>::new(),
+        )
+        .unwrap();
+        let mut model = crate::decision::tests::model();
+        let coarse = manager
+            .model_serving_capabilities(&model, None)
+            .await
+            .unwrap();
+        assert!(!coarse.decision);
+        assert!(
+            !coarse.text_output
+                && !coarse.responses
+                && !coarse.chat_completions
+                && !coarse.streaming
+        );
+        let settings = scala_core::ResolvedSettings {
+            engine_id: "decision-only".into(),
+            ..Default::default()
+        };
+        let contextual = manager
+            .model_serving_capabilities_with_settings(&model, None, Some(&settings))
+            .await
+            .unwrap();
+        assert!(contextual.decision);
+        assert_eq!(
+            serde_json::to_value(contextual).unwrap()["decision"],
+            serde_json::json!(true)
+        );
+        model.architecture = Some("ordinary-chat".into());
+        assert!(
+            !manager
+                .model_serving_capabilities_with_settings(&model, None, Some(&settings))
+                .await
+                .unwrap()
+                .decision
+        );
     }
 
     #[test]
