@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.10 - Native llama.cpp Decision serving
+
+Completes the native Decision path against official llama.cpp System One while
+preserving Scala's exact runtime/model/settings qualification boundary.
+
+- Qualify native llama.cpp /v1/systemone support for exact loaded Decision
+  runtime/model/settings tuples without granting capabilities from GGUF format,
+  filenames, provenance or version strings alone.
+- Expose a separate decision_candidate discovery fact so unloaded Decision
+  profiles remain selectable and can JIT-load after Scala restart or eviction,
+  while decision remains execution-qualified only.
+- Preserve Decision-only serving semantics so classifier GGUFs do not acquire
+  ordinary chat, Responses, streaming or embedding capability.
+- Translate omitted generic instructions only at the private llama.cpp boundary
+  and enforce llama.cpp's native 2-10 score-level limit before backend execution.
+- Update the managed llama.cpp source catalogue to admit the current official
+  System One-capable nightly source contract without changing existing runtime
+  identities or automatically selecting/installing a runtime.
+
 ## 0.1.9 - Runtime qualification updates
 
 Updates q27 and NInfer runtime admission while preserving Scala's strict
