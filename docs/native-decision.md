@@ -83,11 +83,32 @@ Proofs are cleared on unload/crash and replaced before every launch attempt.
 Changes to the runtime, executable, artifact, profile or configured settings
 require a fresh proof. Observations never enter persisted settings.
 
-The shared `native_decision_supported` gate still controls dispatch, public Model
-Profile discovery (`capabilities.decision: true`) and contextual
-`ModelServingCapabilities`. An unloaded/unverified pair cannot advertise
-Decision; the first valid JIT request may load and qualify its candidate. Old
-runtimes remain unsupported. Decision classifiers advertise neither
+The shared `native_decision_supported` gate still controls dispatch,
+`capabilities.decision: true` and contextual `ModelServingCapabilities`. An
+unloaded/unverified pair cannot advertise execution-qualified Decision.
+
+Public Model Profile discovery additionally exposes
+`capabilities.decision_candidate: true` for a resolved, configured native
+candidate with a compatible installed runtime. This is a selectable opportunity
+to attempt native qualification, not proof of runtime support. The adapter must
+explicitly opt in; the shared gate checks engine/API declarations, immutable
+runtime identity, compatible probe/format/model and resolved settings. llama.cpp
+opts in only for architecture-scoped native GGUF Decision metadata bound to a
+profile. Names and versions grant nothing. Missing/incompatible runtimes or
+invalid settings do not produce a selectable candidate. A compatible old llama
+runtime can be attempted but still cannot advertise `decision: true` or execute;
+its missing native route fails qualification.
+
+Coded consumes the explicit candidate through its existing transient discovery
+catalogue, Decision picker, identity-only role selection and native tool. Manual
+or persisted flags cannot grant either field. Cold starts and unloads therefore
+retain discoverability without retaining any process-local proof. The first
+ordinary `/v1/systemone` request JIT-loads, checks the exact pair and returns
+`unsupported_capability` if qualification fails, with no fallback. A Scala
+restart creates a new manager and adapter; unload clears proof and the next
+request qualifies again. No observation or synthesized instruction is persisted.
+
+Old runtimes remain unsupported. Decision classifiers advertise neither
 `TextGeneration` nor chat, Responses, streaming or embedding capability. Ordinary
 chat and pooled embedding GGUF behavior is unchanged.
 
@@ -105,9 +126,16 @@ are invented. HTTP, malformed-response and transport failures use existing
 
 Concrete upstream validation is stricter than Scala's structural contract:
 question instructions must be provided and score criteria must have 2–10
-levels. Scala forwards requests unchanged, including omitted instructions, and
-returns native rejection rather than filling instructions or altering criteria.
-The public API contract is unchanged.
+levels. The llama.cpp adapter serializes `instructions: ""` only when the public
+question has `instructions: None` (including public null). Explicit string,
+object and array instructions retain their JSON semantics. It does not mutate
+the public request, infer prompt text or persist the empty value. Current
+[upstream parser](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/server-decision.cpp)
+rejects only missing/null instructions, so an empty string is accepted. The
+adapter also rejects scores outside 2–10 levels locally before HTTP execution,
+with the question name and received count. Valid levels/order/content are
+unchanged. These limits are llama-specific; the engine-neutral optional
+instructions and nonempty score contract, q27 and NInfer remain unchanged.
 
 As reviewed on 2026-10-05, official nightly
 [b11425](https://github.com/ggml-org/llama.cpp/releases/tag/b11425), commit

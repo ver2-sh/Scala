@@ -3311,6 +3311,9 @@ fn exit_detail(exit: &ProcessExit) -> String {
 
 fn map_inference_error(error: EngineError) -> RuntimeError {
     match error {
+        EngineError::InvalidDecisionRequest(message) => {
+            RuntimeError::InvalidDecisionRequest(message)
+        }
         EngineError::InvalidGenerationSettings(message) => {
             RuntimeError::InvalidGenerationSettings(message)
         }

@@ -1218,6 +1218,9 @@ pub struct ModelCapabilities {
     pub thinking: ThinkingCapabilities,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub decision: bool,
+    /// Selectable for native JIT qualification, not permission to execute.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decision_candidate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1439,6 +1442,8 @@ pub enum EngineError {
     TimedOut(String),
     #[error("invalid engine configuration: {0}")]
     InvalidConfiguration(String),
+    #[error("invalid decision request: {0}")]
+    InvalidDecisionRequest(String),
     #[error("invalid generation settings: {0}")]
     InvalidGenerationSettings(String),
 }
@@ -1833,6 +1838,16 @@ pub trait EngineAdapter: Send + Sync {
     /// Artifact-specific support, separate from format compatibility and provenance.
     fn supports_model_capability(&self, _model: &ModelArtifact, capability: ApiCapability) -> bool {
         self.capabilities().api.contains(&capability)
+    }
+    /// Explicit native candidate discovery for a resolved, compatible tuple.
+    /// This grants neither execution nor generative support.
+    fn supports_native_decision_candidate(
+        &self,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _settings: &ResolvedSettings,
+    ) -> bool {
+        false
     }
     /// Opt in only after verifying a released native decision interface and
     /// compatibility of this exact runtime/artifact/settings tuple.
