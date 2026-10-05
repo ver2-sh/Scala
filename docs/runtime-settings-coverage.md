@@ -72,13 +72,16 @@ single-model process through `engine."llama.cpp".native` or ambient engine envir
 
 ## q27
 
-The stable serving contract is only v0.10.0 commit
-`4770e053656af9aababdc49c81f280ad21b74986`, tree
-`ff712f78fd17b5fe12149679114b6def003f16a6`. The 2026-09-04 upstream audit found HEAD
-`da8a2bf698a2bf1a893fa0afbcd49979919f40b3`, tree
-`3ef39c28e549b3b1cc339e33e3f47e35751d1150`, but no release newer than v0.10.0, so HEAD-only controls are not
-claimed for installable runtimes. All controls below are source-contract gated; external or unreviewed
-binaries do not receive them.
+The 2026-10-05 static audit adds the exact v0.14.3 source contract: annotated tag
+`cd3e2c4faa0dc476c49f73eab7736341689a268b`, commit
+`a4d5fc4be1231214e25c578eda7ab659a55689e7`, tree
+`db65c9363346935f2f12498d2438418e16e12557`. The independently reviewed v0.10.0 contract
+(commit `4770e053656af9aababdc49c81f280ad21b74986`, tree
+`ff712f78fd17b5fe12149679114b6def003f16a6`) remains admitted. Source recipes and persisted build
+provenance bind these exact trees and file digests; no version range or help text grants semantics.
+The v0.14.3 source recipe is offered separately alongside its binary archive. The historical v0.6.2
+binary grants remain; newer/custom/external binaries do not inherit source-built capability proof.
+See [immutable evidence and serving audit](q27-grep-contract.md#v0143-static-runtime-audit-2026-10-05).
 
 ### FIRST_CLASS_CONFIGURABLE
 
@@ -93,7 +96,7 @@ binaries do not receive them.
   FD decode attention, delta-scan mode/split, tool dialect/parser/error/size controls, and bare-system policy.
 - Protocol defaults remain `q27.*` identities even though OpenAI request fields are engine-neutral DTOs.
 
-`q27.reasoning_effort` is admitted only for the exact v0.10.0 source contract together with bounded
+`q27.reasoning_effort` is admitted only for an exact reviewed source contract together with bounded
 artifact metadata proving both a recognized Qwen3.8 v2 tier and q27's own normalized `general.name`
 `qwen38` trained-template selector. Qwen3.6 and unknown/mismatched fine-tune identities do not receive the
 row. The reviewed Qwen3.8 runtime default is `xhigh`; a persisted/Profile/invocation process value is
@@ -107,14 +110,36 @@ or the separate `q27.thinking` setting.
 ### SCALA_MANAGED
 
 - Positional model/tokenizer, bind host/port, API key, CUDA visibility/device selection, public identity and
-  compiled W8/W12/W16 maximum draft width. Compile-time constants/macros are runtime-variant identity, not
-  per-launch settings.
+  compiled W8/W12/W16 maximum draft width. The separate v0.14.3 `12g` identity selects
+  `q27-server-12g`, W_MAX=8, a 256-row prefill arena and **sm86 only**; it is not a W8/W12 alias.
+  Compile-time constants/macros are runtime-variant identity, not per-launch settings.
+- The `12g` route admits only bounded metadata for Bonsai 2 `bonsai2-t2-v1`/`t2-slim` (12 GB class)
+  or `bonsai2-t3-v1`/`t3-slim` (8 GB class), with the documented Hadamard descriptors and consistent
+  64-layer plain/65-layer MTP metadata. Qwen 24/32 GB tiers and unknown/non-slim recipes are rejected.
+  Bonsai 2 is not admitted to historical/custom builds. These are metadata admission facts, not full
+  tensor-inventory validation or benchmark-derived settings. No VRAM upper limit or install-script preset
+  is imposed; MTP-dependent settings remain unavailable without a prediction layer.
+- Exact v0.14.3 release metadata declares static CUDA 13.2, NVIDIA r580+ and glibc >=2.38.
+  Static CUDA linkage is an advisory, **not a host CUDA toolkit dependency**. Driver compatibility is
+  checked; glibc remains an explicit unverified prerequisite because shared host observations contain no
+  glibc fact. No such ABI/driver/compute-target floors are extrapolated to unreviewed releases. The separate
+  source Make recipe needs CUDA 13.2 to compile its mandatory `pf4.o`; local source builds do not inherit
+  the release's host glibc floor.
 
 ### NOT_APPLICABLE / UNSUPPORTED_BY_SCALA
 
 - q27 runtime catalog entries are Linux CUDA only; Metal-only controls are not shown.
-- Current unreleased q27 HEAD's `--enable-metrics` is not present in the installable/reviewed v0.10.0
-  server and is not claimed until an installable revision receives a new source capability contract.
+- v0.14.3 has opt-in `--enable-metrics`, but operational metrics configuration is not promoted into
+  inference settings in this bounded audit.
+- `Q27_DRAFT_VOCAB` and `Q27_DRAFT_VOCAB_CTX` remain unsupported: the exact source requires solo,
+  non-DFlash2 execution, `Q27_BATCH=0`, a physical MTP projection and a Q4/Q8/T2 draft head. Bounded
+  metadata does not prove the head dtype/inventory or projection, so slot/batch enforcement alone is
+  insufficient. Both names remain covered by dynamic environment scrubbing.
+- Additional v0.14.3 getters (DFlash2 and its internal D2 controls, `Q27_FIXED_STACK_GB`,
+  `Q27_BONSAI_FUSED`, `Q27_KV_INCREMENTAL`, `Q27_MTP_WARM`, `Q27_PF_FOLDLAST`,
+  `Q27_T2_PF_SHADOW`, `Q27_DUMP_PF_LOGITS`, `Q27_ECHO_MODEL`, `Q27_REQ_LOG`, `Q27_WAIT_LOG_MS`
+  and `Q27_SEED`) are not normal typed serving settings. No install-script memory preset, random seed
+  environment policy, diagnostic or internal kernel switch is promoted.
 - After subtracting the typed and Scala-managed values above, the exact v0.10.0 CUDA serving runtime's
   remaining environment inventory is deliberately unsupported:
   `Q27_ATTN_PF`, `Q27_BATCH_DBG`, `Q27_DRAFT_CEIL`, `Q27_DRAFT_CEIL1`, `Q27_DRIFT_CORPUS`,
@@ -131,15 +156,27 @@ q27 raw native arguments are disabled, including the former alternate paths for 
 prefix caching. Configured `Q27_*` variables are rejected, every inherited `Q27_*` name is scrubbed
 dynamically (including future names), and only values generated from reviewed typed `q27.*` settings are
 added back. Scala's independently owned `CUDA_VISIBLE_DEVICES` binding is applied separately. This makes
-the complete pinned v0.10.0 runtime environment inventory enforceable without promoting diagnostics into
+the pinned reviewed source-runtime environment boundary enforceable without promoting diagnostics into
 ordinary settings.
 
 ## NInfer
 
-The reviewed/current upstream capability revision is commit
+The reviewed/admitted canonical v2 capability revision is commit
 `d49296868dcc17bd478ec185f0d3a801bcc0bf56`, tree
 `8e2f0275fc533cf11fe05a4ac3ac85f00eb91c72`. Capability domains are separately fingerprinted so future source snapshots
 retain only unchanged reviewed domains.
+
+The 2026-10-05 static audit pinned canonical master at
+`68c54356fd490ab329bd1475d48957f886bb7dd1`, tree
+`a10f0928844093ef6ee9c2e0fa27e69980539e88`, 94 commits after the reviewed baseline.
+Of 97 recorded owner blobs, 17 are identical, 2 narrowly contract-preserving changed,
+21 semantic changed and 57 removed/restructured. All 17 capability domains remain
+ungranted at that head: no complete successor owner closure is proven. Independently,
+the native reader is v3-only and explicitly rejects Scala's admitted v2 containers.
+The managed Linux catalog therefore remains pinned to the reviewed v2 snapshot;
+runtime/container admission fails closed separately from capability grants. The exact
+reviewed Windows package and settings precedence remain unchanged. Full path/domain
+and format-owner evidence is in [the NInfer audit](ninfer.md#static-canonical-master-audit--2026-10-05).
 
 ### FIRST_CLASS_CONFIGURABLE
 
