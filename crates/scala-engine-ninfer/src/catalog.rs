@@ -9,7 +9,10 @@ use scala_core::{
 };
 use scala_engine::{CatalogError, GitHubCommit, GitHubReleaseClient, RuntimeCatalogProvider};
 
-use crate::{ENGINE_ID, GITHUB_REPOSITORY, PROVIDER_ID, UPSTREAM_REPOSITORY};
+use crate::{
+    CURRENT_PACKAGE_CAPABILITY_REVISION, CURRENT_PACKAGE_CAPABILITY_TREE, ENGINE_ID,
+    GITHUB_REPOSITORY, PROVIDER_ID, UPSTREAM_REPOSITORY,
+};
 
 pub const PACKAGE_FAMILY: &str = "ninfer-source";
 pub const RECIPE_VERSION: &str = "ninfer-serve-v2";
@@ -51,13 +54,14 @@ impl RuntimeCatalogProvider for NinferRuntimeCatalogProvider {
             ));
         }
         let commit = github
-            .commit(GITHUB_REPOSITORY, &repository.default_branch)
+            // Latest is the latest admitted v2 snapshot, not moving v3-only HEAD.
+            .commit(GITHUB_REPOSITORY, CURRENT_PACKAGE_CAPABILITY_REVISION)
             .await?;
         if !scala_core::is_full_git_sha(&commit.sha)
             || !scala_core::is_full_git_sha(&commit.commit.tree.sha)
         {
             return Err(provider_error(
-                "default-branch HEAD did not resolve to full commit and tree SHAs",
+                "reviewed source snapshot did not resolve to full commit and tree SHAs",
             ));
         }
         Ok(vec![source_runtime(repository.default_branch, commit)?])
@@ -77,6 +81,8 @@ impl RuntimeCatalogProvider for NinferRuntimeCatalogProvider {
             || plan.source.repository != GITHUB_REPOSITORY
             || plan.source.repository_url != format!("{UPSTREAM_REPOSITORY}.git")
             || plan.source.source_provider != PROVIDER_ID
+            || plan.source.commit_sha != CURRENT_PACKAGE_CAPABILITY_REVISION
+            || plan.source.tree_sha != CURRENT_PACKAGE_CAPABILITY_TREE
         {
             return Ok(None);
         }
@@ -107,10 +113,17 @@ impl RuntimeCatalogProvider for NinferRuntimeCatalogProvider {
     }
 }
 
-fn source_runtime(
+pub(super) fn source_runtime(
     source_branch: String,
     commit: GitHubCommit,
 ) -> Result<AvailableRuntime, CatalogError> {
+    if commit.sha != CURRENT_PACKAGE_CAPABILITY_REVISION
+        || commit.commit.tree.sha != CURRENT_PACKAGE_CAPABILITY_TREE
+    {
+        return Err(provider_error(
+            "source snapshot has no admitted NInfer v2 container contract; canonical master is v3-only",
+        ));
+    }
     let timestamp = parse_github_timestamp(&commit.commit.committer.date)
         .ok_or_else(|| provider_error("source commit has an invalid timestamp"))?;
     let date = commit
@@ -141,7 +154,7 @@ fn source_runtime(
     let runtime = AvailableRuntime {
         runtime_id: RuntimeId::from_identity(&identity),
         identity,
-        display_name: format!("NInfer source snapshot {}", &commit.sha[..8]),
+        display_name: format!("NInfer reviewed v2 source snapshot {}", &commit.sha[..8]),
         supported_formats: vec![ArtifactFormat::Ninfer],
         source_url: commit.html_url,
         published_at_unix: Some(timestamp),
@@ -229,6 +242,8 @@ fn source_runtime(
                     .to_owned(),
                 "This is a Scala-managed build from an exact official source snapshot, not an upstream binary release"
                     .to_owned(),
+                "Pinned to the reviewed NInfer v2 snapshot; audited canonical master is v3-only and is not admitted"
+                    .to_owned(),
             ],
             unverified_requirements: Vec::new(),
         },
@@ -312,11 +327,11 @@ mod tests {
     #[test]
     fn canonical_source_candidate_has_only_latest_and_the_fixed_recipe() {
         let commit = serde_json::from_value(serde_json::json!({
-            "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "html_url": "https://github.com/Neroued/ninfer/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha": crate::CURRENT_PACKAGE_CAPABILITY_REVISION,
+            "html_url": format!("https://github.com/Neroued/ninfer/commit/{}", crate::CURRENT_PACKAGE_CAPABILITY_REVISION),
             "commit": {
                 "committer": {"date": "2026-08-28T20:13:34Z"},
-                "tree": {"sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+                "tree": {"sha": crate::CURRENT_PACKAGE_CAPABILITY_TREE}
             }
         }))
         .expect("GitHub commit fixture");

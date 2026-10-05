@@ -75,6 +75,22 @@ const PACKAGE_SERVER_SHA256: &str =
 const PACKAGE_ENGINE_SHA256: &str =
     "5005f5926f24855b31c3bb3d9d5adf9e211a87c201d833dd54a194074e493aec";
 
+// Static source review of the exact annotated v0.14.3 tag (not a binary probe).
+// The historical contract above remains independently admitted.
+const CURRENT_SOURCE_RECIPE_VERSION: &str = "q27-upstream-make-v3-a4d5fc4";
+const CURRENT_SOURCE_COMMIT: &str = "a4d5fc4be1231214e25c578eda7ab659a55689e7";
+const CURRENT_SOURCE_TREE: &str = "db65c9363346935f2f12498d2438418e16e12557";
+const CURRENT_MAKEFILE_SHA256: &str =
+    "2065409f8f5365b3474aa91deb1f72e6d280253f1ae288b272b60cbc9f4897d1";
+const CURRENT_README_SHA256: &str =
+    "5bb6d0684905a105010c82e139d5840ecd6ca8e03e027024dd338c85c880d33b";
+const CURRENT_SERVER_SHA256: &str =
+    "608ec913486bd437b60a81e1a96ece7628a10261eba5fe077c5f987ffd6a8a1a";
+const CURRENT_ENGINE_SHA256: &str =
+    "9909cd4ae5800b820c73708c0ac5332bea47599e5951667337a6d9717e371a07";
+const CURRENT_ASSET_SHA256: &str =
+    "eb3db6102879c4239119958e83711af4948ed7a6e3144b82e18bc3ee146004f3";
+
 const SOURCE_METADATA_LIMIT: usize = 512 * 1024;
 
 mod model;
@@ -303,6 +319,25 @@ async fn fetch_catalog_runtimes(
         let Some(version) = release_version(release) else {
             continue;
         };
+        // Offer the separately audited source recipe even when the release has
+        // binaries. Binary provenance does not inherit a source-built grant.
+        if version == "0.14.3"
+            && let Some(source) = inspect_source_capability(github, release).await?
+            && source.package_contract
+            && source.commit.sha == CURRENT_SOURCE_COMMIT
+        {
+            qualified.push(QualifiedRelease {
+                release,
+                version: version.clone(),
+                binary: None,
+                source: Some(source),
+                published_at_unix: release
+                    .published_at
+                    .as_deref()
+                    .and_then(parse_github_timestamp),
+                ordinal,
+            });
+        }
         let binary = release.assets.iter().find_map(|asset| {
             qualify_release_asset(release, asset)
                 .map(|(asset_version, digest)| (asset, asset_version, digest))
@@ -357,7 +392,9 @@ fn materialize_qualified_releases(
             }
             let source_build = qualified.source.as_ref();
             let source_recipe_version = source_build.map(|source| {
-                if source.package_contract {
+                if source.package_contract && source.commit.sha == CURRENT_SOURCE_COMMIT {
+                    CURRENT_SOURCE_RECIPE_VERSION
+                } else if source.package_contract {
                     SOURCE_RECIPE_VERSION
                 } else {
                     SOURCE_RUNTIME_ONLY_RECIPE_VERSION
@@ -517,7 +554,9 @@ async fn inspect_source_capability(
     let Some(mut capability) = q27_source_capability_from_files(commit, &makefile, &readme) else {
         return Ok(None);
     };
-    if capability.makefile_sha256 != PACKAGE_MAKEFILE_SHA256 {
+    if capability.makefile_sha256 != PACKAGE_MAKEFILE_SHA256
+        && capability.makefile_sha256 != CURRENT_MAKEFILE_SHA256
+    {
         // The Make dependency/command closure is deliberately provider-audited
         // rather than guessed with a partial GNU Make parser.
         return Ok(None);
@@ -543,11 +582,15 @@ fn q27_source_capability_from_files(
     if cxx != "g++" || nvcc != "/usr/local/cuda/bin/nvcc" || !makefile.contains("-std=c++17") {
         return None;
     }
-    let supported_variant_ids = Q27_VARIANTS
-        .iter()
-        .filter(|variant| makefile_declares_target(makefile, variant.build_target))
-        .map(|variant| variant.id)
-        .collect::<Vec<_>>();
+    let supported_variant_ids = variants_for(if commit.sha == CURRENT_SOURCE_COMMIT {
+        "0.14.3"
+    } else {
+        ""
+    })
+    .iter()
+    .filter(|variant| makefile_declares_target(makefile, variant.build_target))
+    .map(|variant| variant.id)
+    .collect::<Vec<_>>();
     if supported_variant_ids.is_empty() {
         return None;
     }
@@ -567,11 +610,18 @@ fn q27_source_capability_from_files(
         .map(|capability| format!("sm_{}{}", capability.major, capability.minor))
         .collect::<Vec<_>>()
         .join("+");
+    let minimum_cuda_version = if commit.sha == CURRENT_SOURCE_COMMIT {
+        // All selected upstream Make targets depend on pf4.o (CUDA 13.2).
+        // The separately documented CUDA-12.8 Docker recipe is not ours.
+        "13.2".to_owned()
+    } else {
+        readme_cuda_floor(readme)?
+    };
     Some(Q27SourceCapability {
         commit,
         makefile_sha256: sha256_text(makefile),
         package_contract: false,
-        minimum_cuda_version: readme_cuda_floor(readme)?,
+        minimum_cuda_version,
         supported_variant_ids,
         supported_cuda_compute_capabilities,
         accelerator_target,
@@ -606,12 +656,18 @@ fn q27_source_package_contract_from_digests(
     server_sha256: &str,
     engine_sha256: &str,
 ) -> bool {
-    commit.sha == PACKAGE_SOURCE_COMMIT
+    (commit.sha == PACKAGE_SOURCE_COMMIT
         && commit.commit.tree.sha == PACKAGE_SOURCE_TREE
         && makefile_sha256 == PACKAGE_MAKEFILE_SHA256
         && readme_sha256 == PACKAGE_README_SHA256
         && server_sha256 == PACKAGE_SERVER_SHA256
-        && engine_sha256 == PACKAGE_ENGINE_SHA256
+        && engine_sha256 == PACKAGE_ENGINE_SHA256)
+        || (commit.sha == CURRENT_SOURCE_COMMIT
+            && commit.commit.tree.sha == CURRENT_SOURCE_TREE
+            && makefile_sha256 == CURRENT_MAKEFILE_SHA256
+            && readme_sha256 == CURRENT_README_SHA256
+            && server_sha256 == CURRENT_SERVER_SHA256
+            && engine_sha256 == CURRENT_ENGINE_SHA256)
 }
 
 fn make_variable_value<'a>(makefile: &'a str, name: &str) -> Option<&'a str> {
@@ -670,7 +726,11 @@ fn q27_source_build_plan(
             cmake_configuration_arguments: Vec::new(),
             build_target: variant.build_target.to_owned(),
             entrypoint: variant.build_target.into(),
-            accelerator_target: source.accelerator_target.clone(),
+            accelerator_target: if variant.id == "12g" {
+                "sm_86".to_owned()
+            } else {
+                source.accelerator_target.clone()
+            },
             rejected_build_environment: vec![
                 "CC".to_owned(),
                 "CXX".to_owned(),
@@ -716,14 +776,17 @@ fn source_requirements_for(
 ) -> RuntimeRequirements {
     let mut requirements = requirements_for(version, variant);
     requirements.minimum_nvidia_driver = None;
-    requirements.supported_cuda_compute_capabilities =
-        source.supported_cuda_compute_capabilities.clone();
+    requirements.supported_cuda_compute_capabilities = if variant.id == "12g" {
+        vec![ComputeCapability::new(8, 6)]
+    } else {
+        source.supported_cuda_compute_capabilities.clone()
+    };
     requirements
         .advisories
         .retain(|note| !note.contains("Prebuilt binaries"));
     requirements
         .unverified_requirements
-        .retain(|note| !note.contains("ELF requires"));
+        .retain(|note| !note.contains("ELF requires") && !note.contains("glibc >=2.38"));
     requirements.advisories.push(format!(
         "Built locally from the exact upstream commit with CUDA toolkit {}+; this is not an upstream binary",
         source.minimum_cuda_version
@@ -764,6 +827,14 @@ fn qualify_release_asset(
         return None;
     }
     let digest = RuntimeDigest::parse_github(asset.digest.as_deref()?).ok()?;
+    if version == "0.14.3"
+        && (release.tag_name != "v0.14.3"
+            || asset.id != 610271166
+            || asset.size != 27522833
+            || asset.digest.as_ref() != Some(&format!("sha256:{CURRENT_ASSET_SHA256}")))
+    {
+        return None;
+    }
     Some((version.to_owned(), digest))
 }
 
@@ -840,22 +911,37 @@ const Q27_VARIANTS: &[RuntimeVariant] = &[
         // a proven lower bound, not an invented exact W16 requirement.
         minimum_vram_exclusive_class_gib: Some(24),
     },
+    RuntimeVariant {
+        id: "12g",
+        label: "Bonsai 2 8–12 GB (sm86 only)",
+        entrypoint: "q27-server-12g",
+        build_target: "build/q27-server-12g",
+        minimum_vram_class_gib: Some(8),
+        minimum_vram_exclusive_class_gib: None,
+    },
 ];
 
-fn variants_for(_version: &str) -> &'static [RuntimeVariant] {
-    Q27_VARIANTS
+fn variants_for(version: &str) -> &'static [RuntimeVariant] {
+    if version == "0.14.3" {
+        Q27_VARIANTS
+    } else {
+        &Q27_VARIANTS[..3]
+    }
 }
 
 fn requirements_for(version: &str, variant: &RuntimeVariant) -> RuntimeRequirements {
-    let tri_arch = version_at_least(version, 0, 3, 1);
-    let supported_cuda_compute_capabilities = if tri_arch {
+    // Release/ABI claims are exact evidence, not monotone version assumptions.
+    let reviewed_binary = matches!(version, "0.6.2" | "0.14.3");
+    let supported_cuda_compute_capabilities = if !reviewed_binary {
+        Vec::new()
+    } else if version == "0.14.3" && variant.id == "12g" {
+        vec![ComputeCapability::new(8, 6)]
+    } else {
         vec![
             ComputeCapability::new(8, 6),
             ComputeCapability::new(8, 9),
             ComputeCapability::new(12, 0),
         ]
-    } else {
-        vec![ComputeCapability::new(8, 6), ComputeCapability::new(12, 0)]
     };
     let mut advisories = vec![
         match variant.id {
@@ -864,6 +950,7 @@ fn requirements_for(version: &str, variant: &RuntimeVariant) -> RuntimeRequireme
                 "W12 is q27's default server build and needs a 32 GiB-class card"
                     .to_owned()
             }
+            "12g" => "The distinct server-12g build is for Bonsai 2 slim packs on sm86 8–12 GB cards; W_MAX=8 and a 256-row prefill arena are not the W8/W12 route".to_owned(),
             _ => "W16 is a specialist repetition-heavy/file-re-emission build, not q27's recommended live-traffic default; upstream publishes no separate W16 VRAM floor"
                 .to_owned(),
         },
@@ -876,20 +963,28 @@ fn requirements_for(version: &str, variant: &RuntimeVariant) -> RuntimeRequireme
                 .to_owned(),
         );
     }
-    if tri_arch {
+    if reviewed_binary {
         advisories.push(
             "Prebuilt binaries statically link CUDA 13.2; q27 documents NVIDIA driver branch r580 or newer"
                 .to_owned(),
+        );
+    } else {
+        unverified_requirements.push(
+            "This release's binary CUDA linkage, NVIDIA driver and host ABI floors have not been reviewed by Scala".to_owned(),
         );
     }
     if version == "0.6.2" {
         unverified_requirements.push(
             "The v0.6.2 ELF requires glibc 2.38 and libstdc++ with GLIBCXX_3.4.32".to_owned(),
         );
+    } else if version == "0.14.3" {
+        unverified_requirements.push(
+            "The v0.14.3 release requires glibc >=2.38; Scala has no bounded host glibc observation, so this prerequisite remains unverified".to_owned(),
+        );
     }
     RuntimeRequirements {
         requires_nvidia_gpu: true,
-        minimum_nvidia_driver: tri_arch.then(|| "580".to_owned()),
+        minimum_nvidia_driver: reviewed_binary.then(|| "580".to_owned()),
         minimum_vram_bytes: None,
         minimum_vram_class_gib: variant.minimum_vram_class_gib,
         minimum_vram_exclusive_class_gib: variant.minimum_vram_exclusive_class_gib,
@@ -985,23 +1080,44 @@ fn q27_source_package_contract_is_trusted(
     evidence: Q27SourceBuildEvidence<'_>,
 ) -> bool {
     let source = evidence.source();
+    let (recipe, commit, tree, makefile) = if source.commit_sha == CURRENT_SOURCE_COMMIT {
+        if identity.version != "0.14.3" || source.source_branch != "v0.14.3" {
+            return false;
+        }
+        (
+            CURRENT_SOURCE_RECIPE_VERSION,
+            CURRENT_SOURCE_COMMIT,
+            CURRENT_SOURCE_TREE,
+            CURRENT_MAKEFILE_SHA256,
+        )
+    } else {
+        (
+            SOURCE_RECIPE_VERSION,
+            PACKAGE_SOURCE_COMMIT,
+            PACKAGE_SOURCE_TREE,
+            PACKAGE_MAKEFILE_SHA256,
+        )
+    };
     identity.engine_id == ENGINE_ID
         && identity.platform == "linux"
         && identity.architecture == "x86_64"
         && identity.accelerator == "cuda"
-        && identity.package_family == format!("{SOURCE_PACKAGE_FAMILY}-{SOURCE_RECIPE_VERSION}")
+        && identity.package_family == format!("{SOURCE_PACKAGE_FAMILY}-{recipe}")
         && identity.package.provider_id == PROVIDER_ID
         && identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
         && identity.package.release_tag.as_deref() == Some(source.source_branch.as_str())
         && identity.upstream_revision.as_deref() == Some(source.commit_sha.as_str())
         && source.repository == GITHUB_REPOSITORY
         && source.source_provider == PROVIDER_ID
-        && source.commit_sha == PACKAGE_SOURCE_COMMIT
-        && source.tree_sha == PACKAGE_SOURCE_TREE
-        && evidence.recipe_version() == SOURCE_RECIPE_VERSION
+        && source.commit_sha == commit
+        && source.tree_sha == tree
+        && evidence.recipe_version() == recipe
         && evidence.build_system() == RuntimeSourceBuildSystem::Make
-        && evidence.build_definition_sha256() == Some(PACKAGE_MAKEFILE_SHA256)
+        && evidence.build_definition_sha256() == Some(makefile)
         && evidence.entrypoint_matches_target()
+        && variants_for(&identity.version).iter().any(|variant| {
+            variant.id == identity.variant && variant.build_target == evidence.build_target()
+        })
 }
 
 /// Binary W_MAX is historical release evidence. Source W_MAX comes only from
@@ -1045,6 +1161,11 @@ fn q27_compiled_w_max(
         ("build/q27-server-w8", "w8") => Some(8),
         ("build/q27-server", "w12") => Some(12),
         ("build/q27-server-w16", "w16") => Some(16),
+        ("build/q27-server-12g", "12g")
+            if evidence.source().commit_sha == CURRENT_SOURCE_COMMIT =>
+        {
+            Some(8)
+        }
         _ => None,
     }
 }
@@ -1353,13 +1474,31 @@ struct Q27DeviceEvaluation {
 }
 
 fn q27_device_evaluation(
-    platform: &str,
-    architecture: &str,
+    identity: &RuntimeIdentity,
     requirements: &RuntimeRequirements,
     tier: Option<Q27Tier>,
     host: &HostCapabilities,
     external_build: bool,
 ) -> Q27DeviceEvaluation {
+    let incompatible_pack = if identity.variant == "12g" && !tier.is_some_and(Q27Tier::is_bonsai2) {
+        Some(
+            "q27 server-12g admits only the reviewed Bonsai 2 T2/T3 slim layouts, not W8/W12 Qwen packs",
+        )
+    } else if tier.is_some_and(Q27Tier::is_bonsai2)
+        && (identity.version != "0.14.3" || external_build)
+    {
+        Some(
+            "Bonsai 2 slim requires the reviewed q27 v0.14.3 managed runtime; historical/custom builds are not proven",
+        )
+    } else {
+        None
+    };
+    if let Some(reason) = incompatible_pack {
+        return Q27DeviceEvaluation {
+            compatibility: RuntimeCompatibility::Incompatible(reason.to_owned()),
+            accelerator: None,
+        };
+    }
     let devices = match q27_visible_devices(host) {
         Ok(devices) => devices,
         Err(compatibility) => {
@@ -1395,8 +1534,8 @@ fn q27_device_evaluation(
                 observations: Vec::new(),
             };
             let runtime = compatibility_for(
-                platform,
-                architecture,
+                &identity.platform,
+                &identity.architecture,
                 "cuda",
                 &effective_requirements,
                 &device_host,
@@ -2716,8 +2855,7 @@ impl EngineAdapter for Q27Adapter {
             Err(reason) => return RuntimeCompatibility::Incompatible(reason),
         };
         let evaluation = q27_device_evaluation(
-            &runtime.manifest.identity.platform,
-            &runtime.manifest.identity.architecture,
+            &runtime.manifest.identity,
             &runtime.manifest.requirements,
             facts.tier,
             host,
@@ -2765,8 +2903,7 @@ impl EngineAdapter for Q27Adapter {
     ) -> u16 {
         let accelerator = inspect_q27_model(&model.path).ok().and_then(|facts| {
             q27_device_evaluation(
-                &runtime.manifest.identity.platform,
-                &runtime.manifest.identity.architecture,
+                &runtime.manifest.identity,
                 &runtime.manifest.requirements,
                 facts.tier,
                 host,
@@ -2792,8 +2929,7 @@ impl EngineAdapter for Q27Adapter {
             Err(reason) => return RuntimeCompatibility::Incompatible(reason),
         };
         let evaluation = q27_device_evaluation(
-            &runtime.identity.platform,
-            &runtime.identity.architecture,
+            &runtime.identity,
             &runtime.requirements,
             facts.tier,
             host,
@@ -2810,8 +2946,7 @@ impl EngineAdapter for Q27Adapter {
     ) -> u16 {
         let accelerator = inspect_q27_model(&model.path).ok().and_then(|facts| {
             q27_device_evaluation(
-                &runtime.identity.platform,
-                &runtime.identity.architecture,
+                &runtime.identity,
                 &runtime.requirements,
                 facts.tier,
                 host,
@@ -2831,8 +2966,7 @@ impl EngineAdapter for Q27Adapter {
     ) -> Option<AcceleratorBinding> {
         inspect_q27_model(&model.path).ok().and_then(|facts| {
             q27_device_evaluation(
-                &runtime.manifest.identity.platform,
-                &runtime.manifest.identity.architecture,
+                &runtime.manifest.identity,
                 &runtime.manifest.requirements,
                 facts.tier,
                 host,
@@ -4664,47 +4798,49 @@ fn q27_settings_schema_from_usage(
     for definition in &mut definitions {
         let option = q27_setting_option(definition.id.as_str());
         let unavailable_by_version = q27_setting_unavailable_by_version(managed, version, option);
-        let observed = match definition.id.as_str() {
-            "q27.fast_head" => {
-                capabilities.fast_head_control
-                    || (usage_has_token(&usage, "--fast-head")
-                        && usage_has_token(&usage, "--no-fast-head"))
-            }
-            "q27.thinking" => capabilities.thinking,
-            "q27.thinking_budget" => capabilities.unlimited_think_budget,
-            "q27.request_thinking" => capabilities.request_thinking,
-            "q27.constrain_tools" => capabilities.tool_calling,
-            "q27.continuous_batching" | "q27.sampled_graphs" => {
-                capabilities.stable_serving_environment
-            }
-            "q27.temperature" | "q27.top_p" => capabilities.temperature_top_p,
-            "q27.top_k" | "q27.min_p" => capabilities.top_k_min_p,
-            "q27.seed" => capabilities.request_seed,
-            "q27.max_output_tokens" | "q27.system_prompt" => capabilities.trustworthy_identity,
-            "q27.reasoning" | "q27.reasoning_budget" => capabilities.request_thinking,
-            "q27.reasoning_effort" => {
-                include_model_dependent_settings && capabilities.reasoning_effort
-            }
-            "q27.kv_mode" => !capabilities.supported_kv_modes.is_empty(),
-            "q27.mtp" | "q27.mtp_max_depth" | "q27.mtp_min_probability" | "q27.suffix_drafting" => {
-                capabilities.mtp_environment
-            }
-            "q27.suffix_width_mode" => capabilities.compiled_w_max.is_some(),
-            "q27.prompt_mode"
-            | "q27.prompt_delivery"
-            | "q27.template_path"
-            | "q27.template_sha256"
-            | "q27.render_generation_prompt"
-            | "q27.template_thinking"
-            | "q27.response_filter" => {
-                capabilities.raw_completions && capabilities.exact_sharp_renderer
-            }
-            id if q27_environment_name(id).is_some() => capabilities.stable_serving_environment,
-            "q27.parallel_requests" => {
-                capabilities.trustworthy_identity || usage_has_token(&usage, option)
-            }
-            _ => usage_has_token(&usage, option),
-        };
+        let observed = capabilities.trustworthy_identity
+            && match definition.id.as_str() {
+                "q27.fast_head" => {
+                    capabilities.fast_head_control
+                        || (usage_has_token(&usage, "--fast-head")
+                            && usage_has_token(&usage, "--no-fast-head"))
+                }
+                "q27.thinking" => capabilities.thinking,
+                "q27.thinking_budget" => capabilities.unlimited_think_budget,
+                "q27.request_thinking" => capabilities.request_thinking,
+                "q27.constrain_tools" => capabilities.tool_calling,
+                "q27.continuous_batching" | "q27.sampled_graphs" => {
+                    capabilities.stable_serving_environment
+                }
+                "q27.temperature" | "q27.top_p" => capabilities.temperature_top_p,
+                "q27.top_k" | "q27.min_p" => capabilities.top_k_min_p,
+                "q27.seed" => capabilities.request_seed,
+                "q27.max_output_tokens" | "q27.system_prompt" => capabilities.trustworthy_identity,
+                "q27.reasoning" | "q27.reasoning_budget" => capabilities.request_thinking,
+                "q27.reasoning_effort" => {
+                    include_model_dependent_settings && capabilities.reasoning_effort
+                }
+                "q27.kv_mode" => !capabilities.supported_kv_modes.is_empty(),
+                "q27.mtp"
+                | "q27.mtp_max_depth"
+                | "q27.mtp_min_probability"
+                | "q27.suffix_drafting" => capabilities.mtp_environment,
+                "q27.suffix_width_mode" => capabilities.compiled_w_max.is_some(),
+                "q27.prompt_mode"
+                | "q27.prompt_delivery"
+                | "q27.template_path"
+                | "q27.template_sha256"
+                | "q27.render_generation_prompt"
+                | "q27.template_thinking"
+                | "q27.response_filter" => {
+                    capabilities.raw_completions && capabilities.exact_sharp_renderer
+                }
+                id if q27_environment_name(id).is_some() => capabilities.stable_serving_environment,
+                "q27.parallel_requests" => {
+                    capabilities.trustworthy_identity || usage_has_token(&usage, option)
+                }
+                _ => usage_has_token(&usage, option),
+            };
         if unavailable_by_version || !observed {
             definition.supported = false;
             definition.unsupported_reason = Some(if unavailable_by_version {
@@ -5637,8 +5773,7 @@ fn self_selected_q27_accelerator(
 ) -> Option<AcceleratorDevice> {
     inspect_q27_model(&model.path).ok().and_then(|facts| {
         q27_device_evaluation(
-            &runtime.manifest.identity.platform,
-            &runtime.manifest.identity.architecture,
+            &runtime.manifest.identity,
             &runtime.manifest.requirements,
             facts.tier,
             host,
@@ -6450,6 +6585,180 @@ mod tests {
             ),
         ]);
         assert!(q27_model_capabilities(exact_capabilities(), &external).is_none());
+    }
+
+    fn audit_source_fixture() -> (RuntimeIdentity, RuntimeSourceBuildProvenance) {
+        let identity = RuntimeIdentity {
+            engine_id: ENGINE_ID.into(),
+            package_family: format!("{SOURCE_PACKAGE_FAMILY}-{CURRENT_SOURCE_RECIPE_VERSION}"),
+            version: "0.14.3".into(),
+            upstream_revision: Some(CURRENT_SOURCE_COMMIT.into()),
+            platform: "linux".into(),
+            architecture: "x86_64".into(),
+            accelerator: "cuda".into(),
+            variant: "12g".into(),
+            package: RuntimePackageIdentity {
+                provider_id: PROVIDER_ID.into(),
+                repository: Some(GITHUB_REPOSITORY.into()),
+                release_tag: Some("v0.14.3".into()),
+                asset_id: None,
+                asset_name: None,
+                additional_assets: Vec::new(),
+            },
+        };
+        let provenance = serde_json::from_value(json!({
+            "source": {"repository": GITHUB_REPOSITORY, "repository_url": format!("{UPSTREAM_REPOSITORY}.git"),
+                "source_branch": "v0.14.3", "commit_sha": CURRENT_SOURCE_COMMIT, "tree_sha": CURRENT_SOURCE_TREE,
+                "commit_timestamp_unix": 0, "source_provider": PROVIDER_ID},
+            "recipe_version": CURRENT_SOURCE_RECIPE_VERSION, "build_system": "make",
+            "build_definition_sha256": CURRENT_MAKEFILE_SHA256, "cmake_configuration_arguments": [],
+            "build_target": "build/q27-server-12g", "entrypoint": "source/build/q27-server-12g",
+            "toolchain": {"cmake_version": "", "ninja_version": "", "make_version": "4.3", "cpp_compiler": "g++",
+                "nvcc_version": "13.2", "pkg_config_version": ""},
+            "build_platform": "linux", "build_architecture": "x86_64", "accelerator_target": "sm_86",
+            "built_at_unix": 0, "entrypoint_sha256": "0".repeat(64)
+        })).expect("synthetic source provenance");
+        (identity, provenance)
+    }
+
+    #[test]
+    fn current_source_grant_is_exact_and_unknown_help_never_grants_controls() {
+        let (identity, mut provenance) = audit_source_fixture();
+        let method = RuntimeAcquisitionMethod::SourceBuild;
+        let evidence = Some(Q27SourceBuildEvidence::Provenance(&provenance));
+        let capabilities = q27_runtime_capabilities(&identity, &method, evidence);
+        assert!(capabilities.stable_serving_environment && capabilities.tool_calling);
+        assert_eq!(capabilities.compiled_w_max, Some(8));
+        assert!(
+            !q27_setting_definitions()
+                .iter()
+                .any(|row| row.id.as_str() == "q27.draft_vocab")
+        );
+        assert!(q27_environment_name("q27.draft_vocab").is_none());
+        provenance.source.tree_sha = "0".repeat(40);
+        let schema = q27_settings_schema_from_usage(
+            None,
+            &identity,
+            &method,
+            Some(Q27SourceBuildEvidence::Provenance(&provenance)),
+            "--ctx --slots --fast-head --no-fast-head --prefix-cache",
+            true,
+        );
+        assert!(schema.definitions.iter().all(|row| !row.supported));
+        let unknown = q27_runtime_capabilities(
+            &identity,
+            &RuntimeAcquisitionMethod::OfficialReleaseAsset,
+            None,
+        );
+        assert!(!unknown.trustworthy_identity && !unknown.stable_serving_environment);
+    }
+
+    #[test]
+    fn current_contract_digests_do_not_replace_historical_grants() {
+        for (commit, tree, makefile, readme, server, engine) in [
+            (
+                CURRENT_SOURCE_COMMIT,
+                CURRENT_SOURCE_TREE,
+                CURRENT_MAKEFILE_SHA256,
+                CURRENT_README_SHA256,
+                CURRENT_SERVER_SHA256,
+                CURRENT_ENGINE_SHA256,
+            ),
+            (
+                PACKAGE_SOURCE_COMMIT,
+                PACKAGE_SOURCE_TREE,
+                PACKAGE_MAKEFILE_SHA256,
+                PACKAGE_README_SHA256,
+                PACKAGE_SERVER_SHA256,
+                PACKAGE_ENGINE_SHA256,
+            ),
+        ] {
+            let commit: GitHubCommit =
+                serde_json::from_value(json!({"sha": commit, "html_url": "",
+                "commit": {"committer": {"date": "2026-10-04T00:00:00Z"}, "tree": {"sha": tree}}}))
+                .unwrap();
+            assert!(q27_source_package_contract_from_digests(
+                &commit, makefile, readme, server, engine
+            ));
+            assert!(!q27_source_package_contract_from_digests(
+                &commit, makefile, readme, server, "unknown"
+            ));
+        }
+    }
+
+    #[test]
+    fn twelve_g_route_has_exact_targets_and_artifact_constraints_not_a_vram_ceiling() {
+        let (identity, _) = audit_source_fixture();
+        let variant = variants_for("0.14.3")
+            .iter()
+            .find(|v| v.id == "12g")
+            .unwrap();
+        assert_eq!(variant.entrypoint, "q27-server-12g");
+        assert_eq!(variants_for("0.14.2").len(), 3);
+        let requirements = requirements_for("0.14.3", variant);
+        assert_eq!(requirements.minimum_nvidia_driver.as_deref(), Some("580"));
+        assert_eq!(
+            requirements.supported_cuda_compute_capabilities,
+            vec![ComputeCapability::new(8, 6)]
+        );
+        assert!(
+            requirements
+                .unverified_requirements
+                .iter()
+                .any(|note| note.contains("glibc >=2.38"))
+        );
+        let unreviewed = requirements_for("0.15.0", &Q27_VARIANTS[0]);
+        assert!(unreviewed.minimum_nvidia_driver.is_none());
+        assert!(unreviewed.supported_cuda_compute_capabilities.is_empty());
+        let mut host = HostCapabilities {
+            platform: "linux".into(),
+            architecture: "x86_64".into(),
+            accelerators: vec![AcceleratorDevice {
+                accelerator: "cuda".into(),
+                stable_id: Some("GPU-00000000-0000-0000-0000-000000000001".into()),
+                name: None,
+                vram_bytes: Some(24 * 1024_u64.pow(3)),
+                driver_version: Some("590.1".into()),
+                compute_capability: Some(ComputeCapability::new(8, 6)),
+            }],
+            nvidia_gpu_absence_confirmed: false,
+            cuda_visible_devices: None,
+            observations: Vec::new(),
+        };
+        assert!(
+            q27_device_evaluation(
+                &identity,
+                &requirements,
+                Some(Q27Tier::Bonsai2T3Slim),
+                &host,
+                false
+            )
+            .compatibility
+            .is_usable()
+        );
+        assert!(
+            !q27_device_evaluation(
+                &identity,
+                &requirements,
+                Some(Q27Tier::Qwen38Default),
+                &host,
+                false
+            )
+            .compatibility
+            .is_usable()
+        );
+        host.accelerators[0].compute_capability = Some(ComputeCapability::new(8, 9));
+        assert!(
+            !q27_device_evaluation(
+                &identity,
+                &requirements,
+                Some(Q27Tier::Bonsai2T3Slim),
+                &host,
+                false
+            )
+            .compatibility
+            .is_usable()
+        );
     }
 
     fn argument_strings(arguments: Vec<OsString>) -> Vec<String> {

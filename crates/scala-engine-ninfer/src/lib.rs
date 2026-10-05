@@ -46,6 +46,21 @@ pub const GITHUB_REPOSITORY: &str = "Neroued/ninfer";
 pub const PROVIDER_ID: &str = "ninfer-official-source";
 const CURRENT_PACKAGE_CAPABILITY_REVISION: &str = "d49296868dcc17bd478ec185f0d3a801bcc0bf56";
 const CURRENT_PACKAGE_CAPABILITY_TREE: &str = "8e2f0275fc533cf11fe05a4ac3ac85f00eb91c72";
+// Static October audit: this snapshot rejects v2 containers; no domain is advanced.
+const AUDITED_UPSTREAM_REVISION: &str = "68c54356fd490ab329bd1475d48957f886bb7dd1";
+const AUDITED_UPSTREAM_TREE: &str = "a10f0928844093ef6ee9c2e0fa27e69980539e88";
+// Independent native-container evidence. A target registry alone does not prove
+// the loader can consume Scala's admitted v2 artifacts.
+const REVIEWED_V2_READER_BLOBS: &[(&str, &str)] = &[
+    (
+        "src/artifact/reader.cpp",
+        "56bce38c56746ce0b416360df470c5e949d2c1cc",
+    ),
+    (
+        "src/artifact/reader.h",
+        "e27e591d3b1c339436d43b56a80f1acb2d9b488f",
+    ),
+];
 const CURRENT_REQUEST_LOG_SCHEMA: u32 = 20;
 
 // Mirrors CompiledChatTemplate::resolve/capabilities in the reviewed frontend
@@ -942,6 +957,70 @@ fn validate_ninfer_settings_prelaunch(
     Ok(())
 }
 
+fn canonical_source_identity(
+    identity: &scala_core::RuntimeIdentity,
+    source: &scala_core::RuntimeSourceSnapshot,
+) -> bool {
+    managed_ninfer_variant_update_identity(identity).is_some()
+        && identity.upstream_revision.as_deref() == Some(source.commit_sha.as_str())
+        && source.repository == GITHUB_REPOSITORY
+        && source.repository_url == format!("{UPSTREAM_REPOSITORY}.git")
+        && source.source_provider == PROVIDER_ID
+}
+
+fn reviewed_v2_source(
+    source: &scala_core::RuntimeSourceSnapshot,
+    source_blobs: &BTreeMap<String, String>,
+) -> bool {
+    if source.commit_sha == AUDITED_UPSTREAM_REVISION && source.tree_sha == AUDITED_UPSTREAM_TREE {
+        return false;
+    }
+    (source.commit_sha == CURRENT_PACKAGE_CAPABILITY_REVISION
+        && source.tree_sha == CURRENT_PACKAGE_CAPABILITY_TREE)
+        || REVIEWED_V2_READER_BLOBS
+            .iter()
+            .all(|(path, blob)| source_blobs.get(*path).map(String::as_str) == Some(*blob))
+}
+
+fn incompatible_native_container(
+    identities: &[ArtifactNativeIdentity],
+) -> Option<CompatibilityDecision> {
+    let mut native = identities
+        .iter()
+        .filter_map(|identity| match identity {
+            ArtifactNativeIdentity::Ninfer(identity) => Some(identity),
+            _ => None,
+        })
+        .peekable();
+    (native.peek().is_some() && native.all(|identity| identity.container_version != 2)).then(|| {
+        CompatibilityDecision::Unsupported {
+            reason: "runtime native identities do not admit Scala's NInfer v2 container format"
+                .to_owned(),
+        }
+    })
+}
+
+fn source_container_compatibility(
+    identity: &scala_core::RuntimeIdentity,
+    source: &scala_core::RuntimeSourceSnapshot,
+    blobs: &BTreeMap<String, String>,
+) -> CompatibilityDecision {
+    if canonical_source_identity(identity, source) && reviewed_v2_source(source, blobs) {
+        CompatibilityDecision::Supported
+    } else {
+        let reason = if source.commit_sha == AUDITED_UPSTREAM_REVISION
+            && source.tree_sha == AUDITED_UPSTREAM_TREE
+        {
+            "audited canonical NInfer master is v3-only and explicitly rejects Scala's v2 artifacts"
+        } else {
+            "NInfer v2 container-reader support is unproven for this source snapshot"
+        };
+        CompatibilityDecision::Unsupported {
+            reason: reason.to_owned(),
+        }
+    }
+}
+
 fn ninfer_runtime_capabilities_for_installed(
     runtime: &InstalledRuntime,
 ) -> NinferRuntimeCapabilities {
@@ -965,7 +1044,10 @@ fn ninfer_runtime_capabilities_for_installed(
     }
     let managed_source = runtime.manifest.acquisition_method
         == RuntimeAcquisitionMethod::SourceBuild
-        && runtime.manifest.identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
+        && runtime.manifest.source_build.as_ref().is_some_and(|build| {
+            canonical_source_identity(&runtime.manifest.identity, &build.source)
+                && build.recipe_version == catalog::RECIPE_VERSION
+        })
         && runtime.manifest.identity.variant == format!("{}-sm120a", catalog::RECIPE_VERSION);
     let exact_current = managed_source
         && runtime.manifest.identity.upstream_revision.as_deref()
@@ -1020,8 +1102,8 @@ fn ninfer_runtime_capabilities_for_available(
         scala_core::RuntimeAcquisitionPlan::SourceBuild(plan) => Some(&plan.source),
         _ => None,
     };
-    let managed_source = source.is_some()
-        && runtime.identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
+    let managed_source = source
+        .is_some_and(|source| canonical_source_identity(&runtime.identity, source))
         && runtime.identity.variant == format!("{}-sm120a", catalog::RECIPE_VERSION);
     let current = managed_source
         && runtime.identity.upstream_revision.as_deref()
@@ -1075,7 +1157,7 @@ fn installed_source_blobs(runtime: &InstalledRuntime) -> Option<BTreeMap<String,
         .arg("-r")
         .arg(&source.source.commit_sha)
         .arg("--");
-    for (path, _) in REVIEWED_SOURCE_BLOBS {
+    for (path, _) in REVIEWED_SOURCE_BLOBS.iter().chain(REVIEWED_V2_READER_BLOBS) {
         command.arg(path);
     }
     scala_core::isolate_child_from_console(&mut command);
@@ -1668,6 +1750,17 @@ impl EngineAdapter for NinferAdapter {
                 reason: "runtime does not declare NInfer artifact support".to_owned(),
             };
         }
+        if let Some(decision) = incompatible_native_container(&runtime.supported_native_identities)
+        {
+            return decision;
+        }
+        if let scala_core::RuntimeAcquisitionPlan::SourceBuild(plan) = &runtime.acquisition {
+            return source_container_compatibility(
+                &runtime.identity,
+                &plan.source,
+                &BTreeMap::new(),
+            );
+        }
         CompatibilityDecision::Supported
     }
 
@@ -1688,6 +1781,24 @@ impl EngineAdapter for NinferAdapter {
             return CompatibilityDecision::Unsupported {
                 reason: "runtime does not declare NInfer artifact support".to_owned(),
             };
+        }
+        if let Some(decision) =
+            incompatible_native_container(&runtime.manifest.supported_native_identities)
+        {
+            return decision;
+        }
+        if runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::SourceBuild {
+            let Some(build) = &runtime.manifest.source_build else {
+                return CompatibilityDecision::Unsupported {
+                    reason: "NInfer source runtime has no container-reader evidence".to_owned(),
+                };
+            };
+            let blobs = installed_source_blobs(runtime).unwrap_or_default();
+            return source_container_compatibility(
+                &runtime.manifest.identity,
+                &build.source,
+                &blobs,
+            );
         }
         CompatibilityDecision::Supported
     }
@@ -4163,6 +4274,204 @@ mod tests {
             },
             supported_native_identities: Vec::new(),
             requirements: RuntimeRequirements::default(),
+        }
+    }
+
+    fn canonical_candidate() -> AvailableRuntime {
+        let commit = serde_json::from_value(json!({
+            "sha": CURRENT_PACKAGE_CAPABILITY_REVISION,
+            "html_url": format!("{UPSTREAM_REPOSITORY}/commit/{CURRENT_PACKAGE_CAPABILITY_REVISION}"),
+            "commit": {
+                "committer": {"date": "2026-08-28T20:13:34Z"},
+                "tree": {"sha": CURRENT_PACKAGE_CAPABILITY_TREE}
+            }
+        }))
+        .unwrap();
+        catalog::source_runtime("master".to_owned(), commit).unwrap()
+    }
+
+    fn canonical_installed(candidate: &AvailableRuntime) -> InstalledRuntime {
+        let scala_core::RuntimeAcquisitionPlan::SourceBuild(plan) = &candidate.acquisition else {
+            panic!("expected source build");
+        };
+        let mut manifest = windows_manifest();
+        manifest.identity = candidate.identity.clone();
+        manifest.runtime_id = candidate.runtime_id.clone();
+        manifest.acquisition_method = RuntimeAcquisitionMethod::SourceBuild;
+        // Synthetic provenance only: no compiler, runtime or model is executed.
+        manifest.source_build = Some(
+            serde_json::from_value(json!({
+                "source": plan.source,
+                "recipe_version": catalog::RECIPE_VERSION,
+                "cmake_configuration_arguments": [],
+                "build_target": "ninfer-serve",
+                "toolchain": {
+                    "cmake_version": "3.28", "ninja_version": "1", "cpp_compiler": "synthetic",
+                    "nvcc_version": "synthetic", "pkg_config_version": "synthetic"
+                },
+                "build_platform": "linux", "build_architecture": "x86_64",
+                "accelerator_target": "sm_120a", "built_at_unix": 0,
+                "entrypoint": "build/apps/ninfer-serve", "entrypoint_sha256": "a".repeat(64)
+            }))
+            .unwrap(),
+        );
+        InstalledRuntime {
+            manifest,
+            installation_root: PathBuf::new(),
+        }
+    }
+
+    #[test]
+    fn canonical_v2_snapshot_keeps_credit_but_v3_head_cannot_be_admitted() {
+        let adapter = NinferAdapter::from_config(None, Path::new("."));
+        let mut candidate = canonical_candidate();
+        assert_fully_reviewed(ninfer_runtime_capabilities_for_available(&candidate));
+        assert_eq!(
+            adapter.available_runtime_compatibility(&candidate),
+            CompatibilityDecision::Supported
+        );
+        let old_installed = canonical_installed(&candidate);
+        assert_fully_reviewed(ninfer_runtime_capabilities_for_installed(&old_installed));
+        assert_eq!(
+            adapter.runtime_compatibility(&old_installed),
+            CompatibilityDecision::Supported
+        );
+
+        candidate.identity.upstream_revision = Some(AUDITED_UPSTREAM_REVISION.to_owned());
+        let scala_core::RuntimeAcquisitionPlan::SourceBuild(plan) = &mut candidate.acquisition
+        else {
+            unreachable!();
+        };
+        plan.source.commit_sha = AUDITED_UPSTREAM_REVISION.to_owned();
+        plan.source.tree_sha = AUDITED_UPSTREAM_TREE.to_owned();
+        assert_unreviewed(ninfer_runtime_capabilities_for_available(&candidate));
+        let installed = canonical_installed(&candidate);
+        assert_unreviewed(ninfer_runtime_capabilities_for_installed(&installed));
+        for decision in [
+            adapter.available_runtime_compatibility(&candidate),
+            adapter.runtime_compatibility(&installed),
+        ] {
+            assert!(
+                matches!(decision, CompatibilityDecision::Unsupported { reason } if reason.contains("v3-only"))
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_v3_container_is_rejected_independently_of_package_credit() {
+        let adapter = NinferAdapter::from_config(None, Path::new("."));
+        let mut candidate = windows_candidate();
+        let mut manifest = windows_manifest();
+        let v3 = ArtifactNativeIdentity::Ninfer(NinferArtifactIdentity {
+            container_version: 3,
+            model_id: "synthetic".to_owned(),
+            weights_id: "synthetic".to_owned(),
+        });
+        candidate.supported_native_identities = vec![v3.clone()];
+        manifest.supported_native_identities = vec![v3];
+        // Package identity cannot overrule the independently incompatible container.
+        assert_fully_reviewed(ninfer_runtime_capabilities_for_available(&candidate));
+        assert!(matches!(
+            adapter.available_runtime_compatibility(&candidate),
+            CompatibilityDecision::Unsupported { .. }
+        ));
+        let installed = InstalledRuntime {
+            manifest,
+            installation_root: PathBuf::new(),
+        };
+        assert!(matches!(
+            adapter.runtime_compatibility(&installed),
+            CompatibilityDecision::Unsupported { .. }
+        ));
+        assert_eq!(incompatible_native_container(&[]), None);
+    }
+
+    #[test]
+    fn source_identity_and_reader_evidence_are_independent_fail_closed_contracts() {
+        let candidate = canonical_candidate();
+        let scala_core::RuntimeAcquisitionPlan::SourceBuild(plan) = &candidate.acquisition else {
+            unreachable!();
+        };
+        let mut source = plan.source.clone();
+        let mut identity = candidate.identity.clone();
+        source.commit_sha = "a".repeat(40);
+        source.tree_sha = "b".repeat(40);
+        identity.upstream_revision = Some(source.commit_sha.clone());
+        let mut blobs = REVIEWED_V2_READER_BLOBS
+            .iter()
+            .map(|(path, blob)| (path.to_string(), blob.to_string()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            source_container_compatibility(&identity, &source, &blobs),
+            CompatibilityDecision::Supported
+        );
+        blobs.remove("src/artifact/reader.h");
+        assert!(matches!(
+            source_container_compatibility(&identity, &source, &blobs),
+            CompatibilityDecision::Unsupported { .. }
+        ));
+        for field in ["repository", "repository_url", "source_provider"] {
+            let mut value = serde_json::to_value(plan.source.clone()).unwrap();
+            value[field] = json!("unknown");
+            let unknown = serde_json::from_value(value).unwrap();
+            assert!(!canonical_source_identity(&candidate.identity, &unknown));
+        }
+        for field in ["provider", "repository", "engine", "variant"] {
+            let mut unknown = candidate.clone();
+            match field {
+                "provider" => unknown.identity.package.provider_id = "unknown".to_owned(),
+                "repository" => unknown.identity.package.repository = Some("unknown".to_owned()),
+                "engine" => unknown.identity.engine_id = "unknown".to_owned(),
+                _ => unknown.identity.variant = "unknown".to_owned(),
+            }
+            assert!(!ninfer_runtime_capabilities_for_available(&unknown).trustworthy_identity);
+            assert!(
+                !ninfer_runtime_capabilities_for_installed(&canonical_installed(&unknown))
+                    .trustworthy_identity
+            );
+        }
+    }
+
+    #[test]
+    fn domain_credit_requires_every_original_owner_blob() {
+        let domains = [
+            CORE_PROCESS_FILES,
+            CONTEXT_CACHE_FILES,
+            SPECULATION_FILES,
+            SERVING_LIMIT_FILES,
+            RESPONSES_STORE_FILES,
+            REQUEST_DEFAULT_FILES,
+            PROCESS_SAMPLER_FILES,
+            MODEL_SAMPLER_DEFAULT_FILES,
+            REQUEST_SAMPLER_FILES,
+            REQUEST_PROTOCOL_FILES,
+            REQUEST_LOG_FILES,
+            THINKING_PROCESS_FILES,
+            THINKING_REQUEST_FILES,
+            TOOL_CALLING_FILES,
+            VISION_PROCESS_FILES,
+            DFLASH_VISION_FILES,
+            MEDIA_REQUEST_FILES,
+        ];
+        let reviewed = REVIEWED_SOURCE_BLOBS
+            .iter()
+            .map(|(path, blob)| (path.to_string(), blob.to_string()))
+            .collect::<BTreeMap<_, _>>();
+        for domain in domains {
+            assert!(source_domain_matches(Some(&reviewed), domain));
+            for owner in domain {
+                let mut changed = reviewed.clone();
+                changed.insert(owner.to_string(), "a".repeat(40));
+                assert!(
+                    !source_domain_matches(Some(&changed), domain),
+                    "changed owner {owner}"
+                );
+                changed.remove(*owner);
+                assert!(
+                    !source_domain_matches(Some(&changed), domain),
+                    "removed owner {owner}"
+                );
+            }
         }
     }
 
