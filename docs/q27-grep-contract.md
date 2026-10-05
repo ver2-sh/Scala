@@ -1,8 +1,11 @@
 # q27 Grep contract review
 
-Review basis: Scala master
-`094b2538ad9d16d8de3a160aefd289bc5d42f171`, with the existing q27 source contract
-unchanged. The reviewed upstream commit is
+The original review below records the historical v0.10.0 contract. The
+[v0.14.3 static audit](#v0143-static-runtime-audit-2026-10-05) adds a separate immutable contract;
+it does not claim the historical golden execution was repeated.
+
+Historical review basis: Scala master
+`094b2538ad9d16d8de3a160aefd289bc5d42f171`. The reviewed upstream commit is
 [`4770e053656af9aababdc49c81f280ad21b74986`](https://github.com/signalnine/q27/tree/4770e053656af9aababdc49c81f280ad21b74986),
 tree `ff712f78fd17b5fe12149679114b6def003f16a6`.
 Scala's existing provider checks commit/tree, source owners, build
@@ -148,3 +151,75 @@ smoke run was performed; no canonical history was created. Model ranking and
 representative-hardware timing calibration remain future work. The material
 runtime blocker is genuine constrained no-tools finalization, not Q6/Q6K artifact
 admission.
+
+## v0.14.3 static runtime audit (2026-10-05)
+
+This review used `git fetch --no-tags https://github.com/signalnine/q27.git
+refs/tags/v0.14.3:refs/audit/q27-v0.14.3` in Scala's object database only, followed by
+`git show`/`git ls-tree` and GitHub read APIs for the exact release/tag. No upstream
+checkout, build, golden execution, inference, model work, services or Actions ran.
+
+Immutable tag object `cd3e2c4faa0dc476c49f73eab7736341689a268b` targets commit
+[`a4d5fc4be1231214e25c578eda7ab659a55689e7`](https://github.com/signalnine/q27/tree/a4d5fc4be1231214e25c578eda7ab659a55689e7),
+tree `db65c9363346935f2f12498d2438418e16e12557`.
+SHA-256 of exact unmodified source bytes:
+
+| Owner | SHA-256 |
+|---|---|
+| `Makefile` | `2065409f8f5365b3474aa91deb1f72e6d280253f1ae288b272b60cbc9f4897d1` |
+| `README.md` | `5bb6d0684905a105010c82e139d5840ecd6ca8e03e027024dd338c85c880d33b` |
+| `src/server.cu` | `608ec913486bd437b60a81e1a96ece7628a10261eba5fe077c5f987ffd6a8a1a` |
+| `src/engine.cuh` | `9909cd4ae5800b820c73708c0ac5332bea47599e5951667337a6d9717e371a07` |
+| `src/api_common.h` | `afa192e456f9627cc539276c6d00c49bd49040f8bc4a95e02a6beac922eae942` |
+| `src/conductor.h` | `8116523aa64db6c01376c85794293a2dbef4444c85de62d95c77fe8410496fdf` |
+| `src/depthctl.h` | `a3fb1158f35423b2330c1bce097b5e7c8537adb020c62f3d2ab95251a511f9d7` |
+| `src/prefill.cu` | `6fdfd91261057878ba5ccccf9092158fe5ed5015f6b81f2aa43342db7b6cc6ce` |
+| `tools/repack.py` | `8f7e9df3cf6b92151a7f3bf2e96d039435abf8d3b61ec094e86c0db6a9ffa63b` |
+
+The provider matches commit/tree and the first four file digests, selects recipe
+`q27-upstream-make-v3-a4d5fc4`, and rechecks persisted source build provenance.
+The immutable tree binds secondary owners as well; no upstream source is copied.
+The old v0.10.0 source and v0.6.2 binary contracts remain separate. Unknown binaries,
+version labels, help tokens and a changed source digest receive no new grants.
+The audited source recipe is offered alongside, rather than inferred from, the binary.
+
+GitHub release ID `403127767`, published `2026-10-04T17:27:10Z`, has archive asset
+ID `610271166`, `q27-v0.14.3-linux-x86_64.tar.gz`, 27,522,833 bytes, digest
+`sha256:eb3db6102879c4239119958e83711af4948ed7a6e3144b82e18bc3ee146004f3`.
+Checksum asset ID `610271173`, `SHA256SUMS-0.14.3`, 98 bytes, digest
+`sha256:0cdd509849bb826f350818329ea58495afb966d0081530aac652a969ad7bed71`.
+These are API facts, not a downloaded/inspected ELF claim. Release metadata explicitly
+requires driver r580+ and glibc 2.38+ and declares static CUDA 13.2. This does not
+require a host CUDA toolkit. The standard servers have sm86/sm89/sm120 plus the
+sm120a PF4 object; the distinct `q27-server-12g` serving image is sm86 only.
+`Makefile:324–332` binds its W_MAX=8/PF_T=256 build; `README.md:187–223` and
+`tools/repack.py` bind the Bonsai 2 T2/T3 slim route. This is not a VRAM upper bound.
+
+### Serving semantics and intentionally unsupported additions
+
+The current `server.cu` argument parser, profile defaults and `parse_sample`, together
+with `engine.cuh`, `api_common.h`, `conductor.h`, `depthctl.h`, `prefill.cu` and prefix-cache
+owners retain the existing typed controls: context/slots, fast head, thinking and
+request thinking/budget, numeric request seed and samplers, KV modes, MTP/suffix limits,
+prefix-cache limits, the cc/ref profile, batching/graphs/GEMM/pooling/arena, adaptive
+and checkpoint policies, prefill/decode controls and tool parser/dialect/error/size
+policies. Existing mappings and precedence are preserved, not replaced by installer
+presets. The cc profile's actual batch graph capacity is still 64 (not its stale
+512 comment); absent seed remains zero unless forced-temperature sampling assigns a
+counter seed. `Q27_SEED=random` is not promoted into the numeric request seed contract.
+Bonsai metadata does not expand the existing Qwen v2 trained-template effort grant.
+
+The current native tool masks still depend on registered tools/openers and constrain
+tool bodies, not arbitrary no-tools JSON. No `response_format`/JSON-schema serving
+route was found in `server.cu`; StructuredOutput and Grep constrained finalization
+remain unavailable. Historical goldens above were not rerun.
+
+`Q27_DRAFT_VOCAB` remains unsupported. `engine.cuh:394–420` needs a physical MTP
+projection and an output head of Q4_G64, Q8_G128 or T2_G128; its reduced head is solo
+only, does not apply to DFlash2, and needs `Q27_BATCH=0`. Scala's bounded metadata
+inspection cannot deterministically prove that head inventory/dtype or physical MTP
+projection. Enforcing slots/batch alone would be insufficient, so neither this control
+nor `Q27_DRAFT_VOCAB_CTX` receives a typed row. Both are dynamically scrubbed along
+with all unconfigured `Q27_*` variables. DFlash2, fixed-stack memory estimates,
+metrics, logging, dump/probe/internal kernel controls and new environment presets are
+not promoted in this audit. Only synthetic Scala adapter tests were added.
