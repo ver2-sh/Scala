@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.9 - Runtime qualification updates
+
+Updates q27 and NInfer runtime admission while preserving Scala's strict
+artifact/engine/runtime/settings/profile boundaries.
+
+- Qualify q27 v0.14.3 from exact immutable source/release evidence and add the
+  distinct sm86-only `q27-server-12g` Bonsai 2 route with current host
+  requirements.
+- Keep q27 reduced-vocabulary MTP controls unsupported by default where their
+  native cross-constraints cannot be represented safely as ordinary settings.
+- Re-audit canonical NInfer master, recognize its v3-only container transition,
+  and keep Scala's managed Linux route pinned to the reviewed v2 source contract.
+- Withhold NInfer capability domains whose successor ownership is not proven;
+  provenance or repository identity alone never grants serving capabilities.
+
 ## 0.1.8 - Native decision models
 
 Adds the native decision-model path while preserving Scala's origin-neutral
