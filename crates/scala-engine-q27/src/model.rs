@@ -22,6 +22,8 @@ pub(crate) enum Q27Tier {
     Qwen38Q4s,
     Qwen38Q6,
     Qwen38Q6k,
+    Bonsai2T2Slim,
+    Bonsai2T3Slim,
 }
 
 impl Q27Tier {
@@ -38,6 +40,8 @@ impl Q27Tier {
             Self::Qwen38Q4s => "Qwen3.8 q4s",
             Self::Qwen38Q6 => "Qwen3.8 q6",
             Self::Qwen38Q6k => "Qwen3.8 q6k",
+            Self::Bonsai2T2Slim => "Bonsai 2 T2 slim",
+            Self::Bonsai2T3Slim => "Bonsai 2 T3 slim",
         }
     }
 
@@ -51,7 +55,13 @@ impl Q27Tier {
             | Self::Qwen38Q6 => 24,
             Self::Qwen36Q6 | Self::Qwen36Q6f | Self::Qwen36Q6k | Self::Qwen38Q6k => 32,
             Self::Qwen36Q8 => 48,
+            Self::Bonsai2T2Slim => 12,
+            Self::Bonsai2T3Slim => 8,
         }
+    }
+
+    pub(crate) fn is_bonsai2(self) -> bool {
+        matches!(self, Self::Bonsai2T2Slim | Self::Bonsai2T3Slim)
     }
 
     pub(crate) fn is_qwen38(self) -> bool {
@@ -145,8 +155,31 @@ fn normalize_model_name(name: &str) -> String {
 
 fn validate_current_architecture(metadata: &Map<String, Value>) -> Result<(), String> {
     require_string(metadata, "general.architecture", "qwen35")?;
+    let bonsai2 = metadata.get("bonsai2").and_then(Value::as_bool) == Some(true);
+    if bonsai2 {
+        if !published_tier(metadata).is_some_and(Q27Tier::is_bonsai2) {
+            return Err(
+                "Q27 Bonsai 2 requires a reviewed T2/T3 slim container and rotation metadata"
+                    .to_owned(),
+            );
+        }
+        match (
+            metadata.get("qwen35.block_count").and_then(Value::as_u64),
+            metadata
+                .get("qwen35.nextn_predict_layers")
+                .and_then(Value::as_u64),
+        ) {
+            (Some(64), None | Some(0)) | (Some(65), Some(1)) => {}
+            _ => {
+                return Err(
+                    "Q27 Bonsai 2 block_count/nextn_predict_layers is inconsistent".to_owned(),
+                );
+            }
+        }
+    } else {
+        require_u64(metadata, "qwen35.block_count", 65)?;
+    }
     for (key, expected) in [
-        ("qwen35.block_count", 65),
         ("qwen35.embedding_length", 5120),
         ("qwen35.feed_forward_length", 17408),
         ("qwen35.attention.head_count", 24),
@@ -167,6 +200,7 @@ fn validate_current_architecture(metadata: &Map<String, Value>) -> Result<(), St
     let nextn_predict_layers = metadata
         .get("qwen35.nextn_predict_layers")
         .and_then(Value::as_u64)
+        .or_else(|| bonsai2.then_some(0))
         .ok_or_else(|| {
             "Q27 architecture metadata `qwen35.nextn_predict_layers` is missing or not an unsigned integer"
                 .to_owned()
@@ -227,6 +261,25 @@ fn require_string(metadata: &Map<String, Value>, key: &str, expected: &str) -> R
 
 fn published_tier(metadata: &Map<String, Value>) -> Option<Q27Tier> {
     let policy = metadata.get("quant_policy")?.as_str()?;
+    if metadata.get("bonsai2").and_then(Value::as_bool) == Some(true) {
+        let rotation = metadata.get("hadamard")?.as_object()?;
+        if rotation.get("version")?.as_u64()? != 1
+            || rotation.get("block_size")?.as_u64()? != 1024
+            || rotation.get("transform")?.as_str()? != "normalized-sylvester-walsh-hadamard"
+            || rotation.get("axis")?.as_str()? != "input-last-dimension"
+            || rotation.get("sign_mode")?.as_str()? != "explicit"
+            || metadata.get("group_t2")?.as_u64()? != 128
+        {
+            return None;
+        }
+        return match (policy, metadata.get("bonsai2_container")?.as_str()?) {
+            ("bonsai2-t2-v1", "t2-slim") => Some(Q27Tier::Bonsai2T2Slim),
+            ("bonsai2-t3-v1", "t3-slim") if metadata.get("group_t3")?.as_u64()? == 128 => {
+                Some(Q27Tier::Bonsai2T3Slim)
+            }
+            _ => None,
+        };
+    }
     let q4_head = metadata.get("q4_head").and_then(Value::as_bool);
     let q8_extra = metadata.get("q8_extra").and_then(Value::as_str);
     match (policy, q4_head, q8_extra) {
@@ -355,6 +408,48 @@ mod tests {
                 .unwrap_err()
                 .contains("embedding_length")
         );
+    }
+
+    #[test]
+    fn bonsai_slim_admission_requires_explicit_layout_and_rotation_not_name() {
+        let mut metadata = architecture_metadata();
+        metadata["bonsai2"] = json!(true);
+        metadata["quant_policy"] = json!("bonsai2-t3-v1");
+        metadata["bonsai2_container"] = json!("t3-slim");
+        metadata["group_t2"] = json!(128);
+        metadata["group_t3"] = json!(128);
+        metadata["qwen35.block_count"] = json!(64);
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("qwen35.nextn_predict_layers");
+        metadata["hadamard"] = json!({"version": 1, "block_size": 1024,
+            "transform": "normalized-sylvester-walsh-hadamard", "axis": "input-last-dimension",
+            "sign_mode": "explicit"});
+        let file = write_model(&metadata);
+        let facts = inspect_q27_model(file.path()).unwrap();
+        assert_eq!(facts.tier, Some(Q27Tier::Bonsai2T3Slim));
+        assert!(!facts.capabilities.contains("mtp_layer_1"));
+        assert_eq!(Q27Tier::Bonsai2T3Slim.minimum_vram_class_gib(), 8);
+        assert_eq!(Q27Tier::Bonsai2T2Slim.minimum_vram_class_gib(), 12);
+        metadata["qwen35.block_count"] = json!(65);
+        metadata["qwen35.nextn_predict_layers"] = json!(1);
+        let file = write_model(&metadata);
+        assert!(
+            inspect_q27_model(file.path())
+                .unwrap()
+                .capabilities
+                .contains("mtp_layer_1")
+        );
+        for container in ["t3", "q4x-slim", "unknown"] {
+            metadata["bonsai2_container"] = json!(container);
+            let file = write_model(&metadata);
+            assert!(inspect_q27_model(file.path()).is_err());
+        }
+        metadata["bonsai2_container"] = json!("t3-slim");
+        metadata["hadamard"]["block_size"] = json!(512);
+        let file = write_model(&metadata);
+        assert!(inspect_q27_model(file.path()).is_err());
     }
 
     #[test]
