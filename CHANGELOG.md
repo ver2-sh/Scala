@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.11 - Runtime acquisition rate-limit hardening
+
+Reduces GitHub REST consumption during managed runtime discovery and installation
+without weakening Scala's runtime identity, compatibility or provenance checks.
+
+- Download official runtime archives through their validated GitHub release URLs
+  instead of the REST release-asset endpoint, while preserving repository/tag/
+  asset binding, advertised size checks and mandatory SHA-256 verification.
+- Carry a live provider-verified binary candidate into installation so the same
+  release is not immediately revalidated a second time; source-build validation
+  remains independently exact.
+- Coalesce repeated release-list metadata reads, extend ordinary catalogue
+  freshness to one hour and honor GitHub rate-limit cooldown/reset information
+  while retaining stale provider caches and optional token support.
+- Limit q27 source inspection to the explicitly reviewed v0.10.0 and v0.14.3
+  source contracts while preserving qualified official binary discovery.
+
 ## 0.1.10 - Native llama.cpp Decision serving
 
 Completes the native Decision path against official llama.cpp System One while
