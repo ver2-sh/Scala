@@ -957,11 +957,11 @@ impl RuntimePackManager {
             ensure_catalog_provenance_matches(&runtime, &entry.available)?;
             return Ok(runtime);
         }
-        let available = self
+        let verified = self
             .catalog
             .verify_install_candidate(&entry.available)
             .await?;
-        self.installer.install(&available).await.map_err(Into::into)
+        self.installer.install(&verified).await.map_err(Into::into)
     }
 
     pub async fn remove(
@@ -2731,9 +2731,17 @@ mod tests {
 
         async fn probe_runtime(
             &self,
-            _runtime: &InstalledRuntime,
+            runtime: &InstalledRuntime,
         ) -> Result<RuntimeProbeObservation, EngineError> {
-            unreachable!()
+            assert_eq!(self.id, "fixture-release");
+            Ok(RuntimeProbeObservation {
+                compatible: true,
+                observed_engine_id: self.id.into(),
+                observed_version: Some(runtime.manifest.identity.version.clone()),
+                observed_revision: runtime.manifest.identity.upstream_revision.clone(),
+                detail: "synthetic adapter; no executable run".into(),
+                observed_at_unix: 1,
+            })
         }
 
         async fn build_launch_spec(
@@ -2770,6 +2778,76 @@ mod tests {
         ) -> Result<InferenceStream, EngineError> {
             unreachable!()
         }
+    }
+
+    #[tokio::test]
+    async fn verified_binary_install_uses_one_live_release_lookup_and_direct_download() {
+        use crate::installer::RuntimeInstaller;
+        use crate::test_support::{HttpFixture, ReleaseProvider, paths, release, runtime};
+        use crate::{RuntimeCatalog, RuntimeStore};
+        use std::io::{Cursor, Write};
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zip.start_file("server", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"synthetic runtime; never executed").unwrap();
+        let archive = zip.finish().unwrap().into_inner();
+        let record = release(&archive);
+        let candidate = runtime(&serde_json::from_value(record.clone()).unwrap());
+        let server = HttpFixture::new(move |path| match path {
+            "/repos/owner/repository/releases/tags/v1" => {
+                (200, vec![], serde_json::to_vec(&record).unwrap())
+            }
+            "/owner/repository/releases/download/v1/fixture.zip" => (200, vec![], archive.clone()),
+            _ => panic!("unexpected request {path}"),
+        })
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let paths = paths(root.path());
+        let catalog = RuntimeCatalog::new(
+            paths.runtime_cache_dir.clone(),
+            [Arc::new(ReleaseProvider) as Arc<dyn RuntimeCatalogProvider>],
+        )
+        .unwrap()
+        .with_test_origin(server.origin.clone());
+        let mut registry = EngineRegistry::default();
+        registry
+            .register(Arc::new(BoundSchemaAdapter {
+                id: "fixture-release",
+            }))
+            .unwrap();
+        let installer = RuntimeInstaller::new(
+            Arc::new(RuntimeStore::new(&paths)),
+            registry,
+            paths.runtime_cache_dir.clone(),
+            catalog.authorities(),
+        )
+        .unwrap()
+        .with_test_origin(server.origin.clone());
+        let verified = catalog.verify_install_candidate(&candidate).await.unwrap();
+        let installed = installer.install(&verified).await.unwrap();
+        assert_eq!(installed.manifest.identity, candidate.identity);
+        assert_eq!(
+            installed.manifest.acquisition_method,
+            RuntimeAcquisitionMethod::OfficialReleaseAsset
+        );
+        assert_eq!(
+            installed.manifest.downloaded_archive_sha256.as_ref(),
+            candidate
+                .release_assets()
+                .unwrap()
+                .0
+                .digest
+                .as_ref()
+                .map(|digest| &digest.value)
+        );
+        assert!(installed.installation_root.join("server").is_file());
+        assert_eq!(
+            server.paths(),
+            [
+                "/repos/owner/repository/releases/tags/v1",
+                "/owner/repository/releases/download/v1/fixture.zip"
+            ]
+        );
     }
 
     #[tokio::test]

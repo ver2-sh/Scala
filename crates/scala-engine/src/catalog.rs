@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -14,12 +14,12 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 const CATALOG_CACHE_SCHEMA_VERSION: u32 = 1;
-const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const NVIDIA_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const GITHUB_API_VERSION_HEADER: &str = "X-GitHub-Api-Version";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum CatalogError {
     #[error("runtime provider `{provider}` failed: {message}")]
     Provider { provider: String, message: String },
@@ -149,6 +149,12 @@ impl RuntimeCatalog {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_origin(mut self, origin: reqwest::Url) -> Self {
+        self.github = self.github.with_test_origin(origin);
+        self
+    }
+
     pub fn provider_ids(&self) -> impl Iterator<Item = &str> {
         self.providers.keys().map(String::as_str)
     }
@@ -166,6 +172,11 @@ impl RuntimeCatalog {
         host: &HostCapabilities,
         force_refresh: bool,
     ) -> RuntimeCatalogSnapshot {
+        let github = if force_refresh {
+            self.github.with_fresh_release_cache()
+        } else {
+            self.github.clone()
+        };
         let mut all = Vec::new();
         let mut errors = Vec::new();
         let mut newest_fetch = None;
@@ -184,7 +195,7 @@ impl RuntimeCatalog {
                 (cache.runtimes, cache.fetched_at_unix)
             } else {
                 match provider
-                    .fetch(&self.github)
+                    .fetch(&github)
                     .await
                     .and_then(|runtimes| validate_provider_runtimes(&authority, runtimes))
                 {
@@ -251,7 +262,7 @@ impl RuntimeCatalog {
             for (provider_id, provider) in &self.providers {
                 let authority = RuntimeProviderAuthority::from_provider(provider.as_ref());
                 match provider
-                    .fetch_reference(&self.github, query.trim())
+                    .fetch_reference(&github, query.trim())
                     .await
                     .and_then(|runtimes| validate_provider_runtimes(&authority, runtimes))
                 {
@@ -352,10 +363,10 @@ impl RuntimeCatalog {
             })
     }
 
-    pub async fn verify_install_candidate(
+    pub(crate) async fn verify_install_candidate(
         &self,
         candidate: &AvailableRuntime,
-    ) -> Result<AvailableRuntime, CatalogError> {
+    ) -> Result<VerifiedInstallCandidate, CatalogError> {
         let provider_id = &candidate.identity.package.provider_id;
         let provider = self
             .providers
@@ -385,7 +396,7 @@ impl RuntimeCatalog {
                 ),
             });
         }
-        Ok(live)
+        Ok(VerifiedInstallCandidate(live))
     }
 
     pub async fn compare_source_history(
@@ -514,55 +525,43 @@ impl RuntimeCatalog {
     }
 }
 
+/// Only the catalog can construct this value after live provider admission and
+/// equality with the selected identity, acquisition plan, digest and size.
+pub(crate) struct VerifiedInstallCandidate(AvailableRuntime);
+
+impl VerifiedInstallCandidate {
+    pub(crate) fn available(&self) -> &AvailableRuntime {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GitHubReleaseClient {
     api_client: reqwest::Client,
     asset_client: reqwest::Client,
+    releases_cache: Arc<tokio::sync::Mutex<BTreeMap<String, CachedReleases>>>,
+    rate_limit: Arc<tokio::sync::Mutex<Option<(Instant, CatalogError)>>>,
+    #[cfg(test)]
+    test_origin: Option<reqwest::Url>,
+}
+
+#[derive(Debug)]
+struct CachedReleases {
+    fetched_at: Instant,
+    releases: Vec<GitHubRelease>,
 }
 
 impl GitHubReleaseClient {
     pub fn new() -> Result<Self, CatalogError> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_static("scala-runtime-catalog"),
+        let headers = github_api_headers(
+            std::env::var("GITHUB_TOKEN").ok(),
+            std::env::var("GH_TOKEN").ok(),
         );
-        headers.insert(
-            ACCEPT,
-            HeaderValue::from_static("application/vnd.github+json"),
-        );
-        headers.insert(
-            GITHUB_API_VERSION_HEADER,
-            HeaderValue::from_static(GITHUB_API_VERSION),
-        );
-        if let Some(token) = std::env::var("GITHUB_TOKEN")
-            .ok()
-            .or_else(|| std::env::var("GH_TOKEN").ok())
-            .filter(|token| !token.trim().is_empty())
-        {
-            // Optional authentication must never make local startup fail.
-            // Invalid header bytes are ignored without logging the token.
-            if let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) {
-                headers.insert(AUTHORIZATION, value);
-            }
-        }
-        let redirect = || {
-            reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() > 5 {
-                    return attempt.error("too many GitHub redirects");
-                }
-                if is_allowed_github_host(attempt.url()) {
-                    attempt.follow()
-                } else {
-                    attempt.error("GitHub request redirected to an untrusted host")
-                }
-            })
-        };
         let api_client = reqwest::Client::builder()
             .default_headers(headers)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
-            .redirect(redirect())
+            .redirect(github_redirect_policy())
             .build()
             .map_err(|error| CatalogError::Client(error.to_string()))?;
         let asset_client = reqwest::Client::builder()
@@ -571,54 +570,149 @@ impl GitHubReleaseClient {
             // Runtime archives can be hundreds of MiB. Bound a stalled read,
             // not the duration of a healthy streaming transfer.
             .read_timeout(Duration::from_secs(60))
-            .redirect(redirect())
+            .redirect(github_redirect_policy())
             .build()
             .map_err(|error| CatalogError::Client(error.to_string()))?;
         Ok(Self {
             api_client,
             asset_client,
+            releases_cache: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            rate_limit: Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(test)]
+            test_origin: None,
         })
     }
 
+    // A force-refresh gets a new collection cache, shared by all providers in
+    // that search. It never reuses a previously fetched collection.
+    fn with_fresh_release_cache(&self) -> Self {
+        Self {
+            releases_cache: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            ..self.clone()
+        }
+    }
+
     pub async fn releases(&self, repository: &str) -> Result<Vec<GitHubRelease>, CatalogError> {
+        const MAX_CACHED_REPOSITORIES: usize = 16;
         if !valid_repository(repository) {
             return Err(CatalogError::Request(format!(
                 "invalid configured GitHub repository `{repository}`"
             )));
         }
+        // Hold the small cache's async lock through the fetch to coalesce even
+        // concurrent calls from cloned clients. Exact install lookups bypass it.
+        let mut cache = self.releases_cache.lock().await;
+        if let Some(cached) = cache.get(repository)
+            && cached.fetched_at.elapsed() < DEFAULT_CACHE_TTL
+        {
+            return Ok(cached.releases.clone());
+        }
         let url = format!("https://api.github.com/repos/{repository}/releases?per_page=100");
-        let response = self
-            .api_client
+        let response = self.api_request(self.request_url(&url)?).await?;
+        let body = self.api_body(response).await?;
+        let releases: Vec<GitHubRelease> = serde_json::from_slice(&body)
+            .map_err(|error| CatalogError::Request(error.to_string()))?;
+        cache.retain(|_, cached| cached.fetched_at.elapsed() < DEFAULT_CACHE_TTL);
+        if cache.len() >= MAX_CACHED_REPOSITORIES
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, cached)| cached.fetched_at)
+                .map(|(repository, _)| repository.clone())
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            repository.to_owned(),
+            CachedReleases {
+                fetched_at: Instant::now(),
+                releases: releases.clone(),
+            },
+        );
+        Ok(releases)
+    }
+
+    async fn api_request(&self, url: reqwest::Url) -> Result<reqwest::Response, CatalogError> {
+        {
+            let mut rate_limit = self.rate_limit.lock().await;
+            if let Some((until, error)) = rate_limit.as_ref()
+                && Instant::now() < *until
+            {
+                return Err(error.clone());
+            }
+            *rate_limit = None;
+        }
+        self.api_client
             .get(url)
             .send()
             .await
-            .map_err(|error| CatalogError::Request(error.to_string()))?;
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| CatalogError::Request(error.to_string()))?;
-        if !status.is_success() {
-            let detail = serde_json::from_slice::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|value| {
-                    value
-                        .get("message")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| {
-                    status
-                        .canonical_reason()
-                        .unwrap_or("request failed")
-                        .to_owned()
-                });
-            return Err(CatalogError::Http {
-                status: status.as_u16(),
-                detail,
-            });
+            .map_err(|error| CatalogError::Request(error.to_string()))
+    }
+
+    async fn api_body(&self, response: reqwest::Response) -> Result<Vec<u8>, CatalogError> {
+        let remaining_zero = response
+            .headers()
+            .get("x-ratelimit-remaining")
+            .is_some_and(|value| value == "0");
+        let reset_seconds = response
+            .headers()
+            .get("x-ratelimit-reset")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<i64>().ok())
+            .map(|reset| reset.saturating_sub(unix_timestamp()).max(1) as u64);
+        let retry_seconds = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let result = github_api_body(response).await;
+        if let Err(error @ CatalogError::Http { status, detail }) = &result
+            && (*status == 429
+                || (*status == 403
+                    && (remaining_zero || detail.to_ascii_lowercase().contains("rate limit"))))
+        {
+            // Do not spend more quota on other providers/navigation while the
+            // primary allowance is exhausted. Force-refresh also honors this
+            // server cooldown; there are no automatic retries or polling.
+            let delay =
+                Duration::from_secs(reset_seconds.unwrap_or(60).max(retry_seconds.unwrap_or(0)));
+            let until = Instant::now()
+                .checked_add(delay)
+                .unwrap_or_else(|| Instant::now() + DEFAULT_CACHE_TTL);
+            *self.rate_limit.lock().await = Some((until, error.clone()));
         }
-        serde_json::from_slice(&body).map_err(|error| CatalogError::Request(error.to_string()))
+        result
+    }
+
+    fn request_url(&self, url: &str) -> Result<reqwest::Url, CatalogError> {
+        let url = url
+            .parse::<reqwest::Url>()
+            .map_err(|error| CatalogError::Request(error.to_string()))?;
+        #[cfg(test)]
+        if let Some(origin) = &self.test_origin {
+            let mut local = origin.clone();
+            local.set_path(url.path());
+            local.set_query(url.query());
+            return Ok(local);
+        }
+        Ok(url)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_origin(mut self, origin: reqwest::Url) -> Self {
+        self.test_origin = Some(origin);
+        self
+    }
+
+    pub(crate) fn release_download_request(
+        &self,
+        url: &reqwest::Url,
+    ) -> Result<reqwest::RequestBuilder, CatalogError> {
+        if !is_allowed_github_host(url) || url.host_str() != Some("github.com") {
+            return Err(CatalogError::Request(
+                "release URL is not hosted on github.com".to_owned(),
+            ));
+        }
+        Ok(self.asset_client.get(self.request_url(url.as_str())?))
     }
 
     pub async fn repository(&self, repository: &str) -> Result<GitHubRepository, CatalogError> {
@@ -681,32 +775,8 @@ impl GitHubReleaseClient {
                 }
             }
         }
-        let response = self
-            .api_client
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| CatalogError::Request(error.to_string()))?;
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| CatalogError::Request(error.to_string()))?;
-        if !status.is_success() {
-            let detail = serde_json::from_slice::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|value| value.get("message")?.as_str().map(str::to_owned))
-                .unwrap_or_else(|| {
-                    status
-                        .canonical_reason()
-                        .unwrap_or("request failed")
-                        .to_owned()
-                });
-            return Err(CatalogError::Http {
-                status: status.as_u16(),
-                detail,
-            });
-        }
+        let response = self.api_request(self.request_url(url.as_str())?).await?;
+        let body = self.api_body(response).await?;
         serde_json::from_slice(&body).map_err(|error| CatalogError::Request(error.to_string()))
     }
 
@@ -721,56 +791,14 @@ impl GitHubReleaseClient {
             ));
         }
         let url = format!("https://api.github.com/repos/{repository}/releases/tags/{tag}");
-        let response = self
-            .api_client
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| CatalogError::Request(error.to_string()))?;
+        let response = self.api_request(self.request_url(&url)?).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| CatalogError::Request(error.to_string()))?;
-        if !status.is_success() {
-            let detail = serde_json::from_slice::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|value| value.get("message")?.as_str().map(str::to_owned))
-                .unwrap_or_else(|| {
-                    status
-                        .canonical_reason()
-                        .unwrap_or("request failed")
-                        .to_owned()
-                });
-            return Err(CatalogError::Http {
-                status: status.as_u16(),
-                detail,
-            });
-        }
+        let body = self.api_body(response).await?;
         serde_json::from_slice(&body)
             .map(Some)
             .map_err(|error| CatalogError::Request(error.to_string()))
-    }
-
-    pub fn release_asset_request(
-        &self,
-        repository: &str,
-        asset_id: u64,
-    ) -> Result<reqwest::RequestBuilder, CatalogError> {
-        if !valid_repository(repository) || asset_id == 0 {
-            return Err(CatalogError::Request(
-                "invalid configured GitHub repository or release asset ID".to_owned(),
-            ));
-        }
-        let url = format!("https://api.github.com/repos/{repository}/releases/assets/{asset_id}");
-        Ok(self
-            .asset_client
-            .get(url)
-            .header(ACCEPT, "application/octet-stream")
-            .header(GITHUB_API_VERSION_HEADER, GITHUB_API_VERSION))
     }
 
     pub async fn fetch_small_text(
@@ -786,15 +814,25 @@ impl GitHubReleaseClient {
                 "asset URL is not hosted on an approved GitHub domain".to_owned(),
             ));
         }
-        let response = self
-            .asset_client
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| CatalogError::Request(error.to_string()))?;
-        if !response.status().is_success() {
+        let is_api = url.host_str() == Some("api.github.com");
+        let response = if is_api {
+            self.api_request(self.request_url(url.as_str())?).await?
+        } else {
+            self.asset_client
+                .get(self.request_url(url.as_str())?)
+                .send()
+                .await
+                .map_err(|error| CatalogError::Request(error.to_string()))?
+        };
+        let status = response.status();
+        if !status.is_success() {
+            if is_api {
+                // All REST requests, including small metadata fetches, use
+                // the authenticated client and respect its rate-limit reset.
+                self.api_body(response).await?;
+            }
             return Err(CatalogError::Http {
-                status: response.status().as_u16(),
+                status: status.as_u16(),
                 detail: "small release metadata asset request failed".to_owned(),
             });
         }
@@ -823,6 +861,91 @@ impl GitHubReleaseClient {
         }
         String::from_utf8(bytes).map_err(|error| CatalogError::Request(error.to_string()))
     }
+}
+
+fn github_api_headers(github_token: Option<String>, gh_token: Option<String>) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static("scala-runtime-catalog"),
+    );
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    headers.insert(
+        GITHUB_API_VERSION_HEADER,
+        HeaderValue::from_static(GITHUB_API_VERSION),
+    );
+    if let Some(token) = github_token
+        .filter(|token| !token.trim().is_empty())
+        .or_else(|| gh_token.filter(|token| !token.trim().is_empty()))
+    {
+        // Invalid optional credentials must not fail startup or expose secrets
+        // through header Debug output.
+        if let Ok(mut value) = HeaderValue::from_str(&format!("Bearer {token}")) {
+            value.set_sensitive(true);
+            headers.insert(AUTHORIZATION, value);
+        }
+    }
+    headers
+}
+
+fn github_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > 5 {
+            return attempt.error("too many GitHub redirects");
+        }
+        if is_allowed_github_host(attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.error("GitHub request redirected to an untrusted host")
+        }
+    })
+}
+
+async fn github_api_body(response: reqwest::Response) -> Result<Vec<u8>, CatalogError> {
+    let status = response.status();
+    let reset = response
+        .headers()
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| CatalogError::Request(error.to_string()))?;
+    if !status.is_success() {
+        let mut detail = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value.get("message")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| {
+                status
+                    .canonical_reason()
+                    .unwrap_or("request failed")
+                    .to_owned()
+            });
+        if matches!(status.as_u16(), 403 | 429) {
+            if let Some(reset) = reset {
+                detail.push_str(&format!(
+                    "; GitHub rate-limit reset at Unix timestamp {reset}"
+                ));
+            }
+            if let Some(retry_after) = retry_after {
+                detail.push_str(&format!("; retry-after {retry_after} seconds"));
+            }
+        }
+        return Err(CatalogError::Http {
+            status: status.as_u16(),
+            detail,
+        });
+    }
+    Ok(body.to_vec())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1589,6 +1712,299 @@ mod tests {
         isolated_cuda_environment_for_binding, parse_nvidia_smi_devices, same_install_candidate,
         visible_nvidia_device_set, visible_nvidia_devices,
     };
+
+    #[tokio::test]
+    async fn all_rest_methods_use_api_auth_and_share_rate_limit_cooldown() {
+        use super::{GitHubReleaseClient, github_api_headers};
+        use crate::test_support::{HttpFixture, release};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let limited = Arc::new(AtomicBool::new(false));
+        let reply_limited = limited.clone();
+        let server = HttpFixture::new(move |path| {
+            if reply_limited.load(Ordering::Relaxed) {
+                return (403, vec![("x-ratelimit-remaining", "0".into()), ("retry-after", "60".into())],
+                    br#"{"message":"API rate limit exceeded"}"#.to_vec());
+            }
+            let body = if path.contains("/releases/tags/") {
+                release(b"package")
+            } else if path.contains("/releases?") {
+                serde_json::json!([release(b"package")])
+            } else if path.contains("/commits/") {
+                serde_json::json!({"sha": "a".repeat(40), "html_url": "",
+                    "commit": {"tree": {"sha": "b".repeat(40)}, "committer": {"date": "2026-10-04T00:00:00Z"}}})
+            } else if path.contains("/compare/") {
+                serde_json::json!({"status": "ahead", "ahead_by": 1, "behind_by": 0})
+            } else {
+                serde_json::json!({"full_name": "owner/repository", "default_branch": "master", "html_url": "https://github.com/owner/repository"})
+            };
+            (200, vec![], serde_json::to_vec(&body).unwrap())
+        }).await;
+        let mut github = GitHubReleaseClient::new()
+            .unwrap()
+            .with_test_origin(server.origin.clone());
+        // Synthetic credential, without mutating process-global environment.
+        github.api_client = reqwest::Client::builder()
+            .no_proxy()
+            .default_headers(github_api_headers(None, Some("synthetic-only".into())))
+            .build()
+            .unwrap();
+        github.releases("owner/repository").await.unwrap();
+        github
+            .release_by_tag("owner/repository", "v1")
+            .await
+            .unwrap();
+        github.repository("owner/repository").await.unwrap();
+        github.commit("owner/repository", "v1").await.unwrap();
+        github
+            .compare_commits("owner/repository", &"a".repeat(40), &"b".repeat(40))
+            .await
+            .unwrap();
+        github
+            .fetch_small_text("https://api.github.com/repos/owner/repository", 4096)
+            .await
+            .unwrap();
+        assert_eq!(server.paths().len(), 6);
+        for request in server.requests.lock().unwrap().iter() {
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer synthetic-only")
+            );
+        }
+        limited.store(true, Ordering::Relaxed);
+        assert!(
+            github
+                .release_by_tag("owner/repository", "v1")
+                .await
+                .is_err()
+        );
+        assert!(github.commit("owner/repository", "v1").await.is_err());
+        assert!(github.repository("owner/repository").await.is_err());
+        assert!(
+            github
+                .fetch_small_text("https://api.github.com/repos/owner/repository", 4096)
+                .await
+                .is_err()
+        );
+        assert_eq!(server.paths().len(), 7); // Only the first rate-limited call reaches HTTP.
+        // Simulate expiry; subsequent user action is permitted, with no polling.
+        github.rate_limit.lock().await.as_mut().unwrap().0 = std::time::Instant::now();
+        limited.store(false, Ordering::Relaxed);
+        github.repository("owner/repository").await.unwrap();
+        assert_eq!(server.paths().len(), 8);
+    }
+
+    #[test]
+    fn optional_tokens_are_sensitive_and_never_needed_for_downloads() {
+        use super::{GitHubReleaseClient, github_api_headers};
+        use reqwest::header::AUTHORIZATION;
+        assert!(!github_api_headers(None, None).contains_key(AUTHORIZATION));
+        for (github, gh, expected) in [
+            (Some("primary"), Some("fallback"), "Bearer primary"),
+            (None, Some("fallback"), "Bearer fallback"),
+            (Some("  "), Some("fallback"), "Bearer fallback"),
+        ] {
+            let headers = github_api_headers(github.map(str::to_owned), gh.map(str::to_owned));
+            assert_eq!(headers[AUTHORIZATION], expected);
+            assert!(headers[AUTHORIZATION].is_sensitive());
+            assert!(!format!("{headers:?}").contains(expected));
+        }
+        let headers = github_api_headers(Some("invalid\ntoken".into()), None);
+        assert!(!headers.contains_key(AUTHORIZATION));
+        let url = "https://github.com/owner/repository/releases/download/v1/fixture.zip"
+            .parse()
+            .unwrap();
+        let request = GitHubReleaseClient::new()
+            .unwrap()
+            .release_download_request(&url)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(request.url(), &url);
+        assert!(!request.headers().contains_key(AUTHORIZATION));
+        assert!(!request.url().as_str().contains("api.github.com"));
+    }
+
+    #[tokio::test]
+    async fn release_collection_calls_are_coalesced_expire_and_can_force_refresh() {
+        use super::{DEFAULT_CACHE_TTL, GitHubReleaseClient};
+        use crate::test_support::HttpFixture;
+        let server = HttpFixture::new(|_| (200, vec![], b"[]".to_vec())).await;
+        let github = GitHubReleaseClient::new()
+            .unwrap()
+            .with_test_origin(server.origin.clone());
+        let clone = github.clone();
+        let (first, second) = tokio::join!(
+            github.releases("owner/repository"),
+            clone.releases("owner/repository")
+        );
+        first.unwrap();
+        second.unwrap();
+        github.releases("owner/repository").await.unwrap();
+        assert_eq!(
+            server.paths(),
+            ["/repos/owner/repository/releases?per_page=100"]
+        );
+        github
+            .releases_cache
+            .lock()
+            .await
+            .get_mut("owner/repository")
+            .unwrap()
+            .fetched_at -= DEFAULT_CACHE_TTL;
+        github.releases("owner/repository").await.unwrap();
+        assert_eq!(server.paths().len(), 2);
+        github
+            .with_fresh_release_cache()
+            .releases("owner/repository")
+            .await
+            .unwrap();
+        assert_eq!(server.paths().len(), 3);
+        for n in 0..20 {
+            github.releases(&format!("owner/repo{n}")).await.unwrap();
+        }
+        assert!(github.releases_cache.lock().await.len() <= 16);
+    }
+
+    #[tokio::test]
+    async fn catalog_keeps_hour_old_cache_and_rate_limited_stale_entries() {
+        use super::{DEFAULT_CACHE_TTL, RuntimeCatalog, unix_timestamp};
+        use crate::test_support::{HttpFixture, ReleaseProvider, release};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU16, Ordering},
+        };
+        let status = Arc::new(AtomicU16::new(200));
+        let reply_status = status.clone();
+        let body = serde_json::to_vec(&vec![release(b"fixture")]).unwrap();
+        let server = HttpFixture::new(move |_| {
+            let status = reply_status.load(Ordering::Relaxed);
+            if status == 200 {
+                (status, vec![], body.clone())
+            } else {
+                (
+                    status,
+                    vec![
+                        ("x-ratelimit-reset", "2000000000".into()),
+                        ("retry-after", "60".into()),
+                    ],
+                    br#"{"message":"API rate limit exceeded for fixture"}"#.to_vec(),
+                )
+            }
+        })
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let catalog = RuntimeCatalog::new(
+            root.path().to_owned(),
+            [Arc::new(ReleaseProvider) as Arc<dyn super::RuntimeCatalogProvider>],
+        )
+        .unwrap()
+        .with_test_origin(server.origin.clone());
+        let host = HostCapabilities::current_without_accelerator_probe();
+        let first = catalog.search("", &host, false).await;
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(server.paths().len(), 1);
+        let authority = &catalog.authorities()[0];
+        let mut cache = catalog
+            .read_cache("fixture-provider", authority)
+            .await
+            .unwrap()
+            .unwrap();
+        // Navigation within the new one-hour TTL must not refresh.
+        cache.fetched_at_unix = unix_timestamp() - 30 * 60;
+        catalog
+            .write_cache("fixture-provider", &cache)
+            .await
+            .unwrap();
+        assert_eq!(catalog.search("", &host, false).await.entries.len(), 1);
+        assert_eq!(server.paths().len(), 1);
+        // Explicit refresh still performs a new request and retains disk cache on error.
+        for code in [403, 429, 503] {
+            status.store(code, Ordering::Relaxed);
+            cache.fetched_at_unix = unix_timestamp() - DEFAULT_CACHE_TTL.as_secs() as i64 - 1;
+            catalog
+                .write_cache("fixture-provider", &cache)
+                .await
+                .unwrap();
+            let stale = catalog.search("", &host, true).await;
+            assert_eq!(stale.entries[0].available, first.entries[0].available);
+            assert!(stale.provider_errors[0].using_stale_cache);
+            if code != 503 {
+                let count = server.paths().len();
+                let again = catalog.search("", &host, true).await;
+                assert!(again.provider_errors[0].using_stale_cache);
+                assert_eq!(server.paths().len(), count); // Even force-refresh honors reset.
+                *catalog.github.rate_limit.lock().await = None; // Simulate reset for next status.
+                assert!(stale.provider_errors[0].message.contains("2000000000"));
+                assert!(stale.provider_errors[0].message.contains("retry-after 60"));
+            }
+            assert_eq!(
+                catalog
+                    .read_cache("fixture-provider", authority)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .fetched_at_unix,
+                cache.fetched_at_unix
+            );
+        }
+        assert_eq!(server.paths().len(), 4); // No automatic retries.
+    }
+
+    #[tokio::test]
+    async fn live_candidate_verification_rejects_changed_asset_identity_and_metadata() {
+        use super::{GitHubRelease, RuntimeCatalog};
+        use crate::test_support::{HttpFixture, ReleaseProvider, release, runtime};
+        use std::sync::{Arc, Mutex};
+        let original = release(b"fixture");
+        let candidate =
+            runtime(&serde_json::from_value::<GitHubRelease>(original.clone()).unwrap());
+        let live = Arc::new(Mutex::new(original.clone()));
+        let reply = live.clone();
+        let server = HttpFixture::new(move |_| {
+            (
+                200,
+                vec![],
+                serde_json::to_vec(&*reply.lock().unwrap()).unwrap(),
+            )
+        })
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let catalog = RuntimeCatalog::new(
+            root.path().to_owned(),
+            [Arc::new(ReleaseProvider) as Arc<dyn super::RuntimeCatalogProvider>],
+        )
+        .unwrap()
+        .with_test_origin(server.origin.clone());
+        catalog.verify_install_candidate(&candidate).await.unwrap();
+        for (field, value) in [
+            ("id", serde_json::json!(8)),
+            ("name", serde_json::json!("replacement.zip")),
+            ("size", serde_json::json!(42)),
+            (
+                "digest",
+                serde_json::json!(format!("sha256:{}", "b".repeat(64))),
+            ),
+            (
+                "browser_download_url",
+                serde_json::json!(
+                    "https://github.com/owner/repository/releases/download/v1/replacement.zip"
+                ),
+            ),
+        ] {
+            let mut changed = original.clone();
+            changed["assets"][0][field] = value;
+            *live.lock().unwrap() = changed;
+            assert!(
+                catalog.verify_install_candidate(&candidate).await.is_err(),
+                "{field}"
+            );
+        }
+        assert_eq!(server.paths().len(), 6); // Verification is always live, never list-cached.
+    }
 
     #[test]
     fn parses_nvidia_compute_capability_without_guessing_malformed_values() {
