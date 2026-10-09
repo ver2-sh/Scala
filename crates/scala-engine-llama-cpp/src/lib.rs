@@ -707,6 +707,12 @@ impl LlamaCppAdapter {
 
 #[async_trait]
 impl EngineAdapter for LlamaCppAdapter {
+    fn uses_setting_as_request_default(&self, id: &str) -> bool {
+        // --reasoning is a launch policy. This adapter does not yet have
+        // verified model/template evidence for a per-request boolean override.
+        id != "reasoning"
+    }
+
     fn identity(&self) -> EngineIdentity {
         EngineIdentity {
             id: ENGINE_ID.to_owned(),
@@ -864,6 +870,13 @@ impl EngineAdapter for LlamaCppAdapter {
         backend_defaults: &EffectiveGenerationSettings,
         settings_schema: &SettingsSchema,
     ) -> Result<(), EngineError> {
+        if request.generation_settings.reasoning_enabled.is_some() {
+            return Err(EngineError::ReasoningControls(
+                scala_engine::ReasoningControlError::NativeControlUnavailable(
+                    "llama.cpp request thinking ON/OFF requires verified runtime and model/template switchability; launch help and b10665 chat_template_caps do not provide that evidence",
+                ),
+            ));
+        }
         self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
         chat::validate_request(request)?;
         let required = [
@@ -6373,6 +6386,57 @@ mod generation_settings_tests {
         assert_eq!(explicit["temperature"], 0.25);
         assert_eq!(explicit["top_p"], 0.8);
         assert_eq!(explicit["max_completion_tokens"], 123);
+    }
+
+    #[test]
+    fn request_thinking_requires_model_evidence_and_never_changes_launch_policy() {
+        let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
+        assert!(!adapter.uses_setting_as_request_default("reasoning"));
+        assert!(adapter.uses_setting_as_request_default("reasoning_effort"));
+        for enabled in [true, false] {
+            // Even an advertised process --reasoning control is insufficient
+            // evidence for per-request switchability of the selected template.
+            let schema = SettingsSchema {
+                definitions: vec![SettingDefinition {
+                    supported: true,
+                    ..llama_setting_definitions()
+                        .into_iter()
+                        .find(|definition| definition.id.as_str() == "llama.cpp.reasoning")
+                        .unwrap()
+                }],
+                ..Default::default()
+            };
+            let error = adapter
+                .validate_inference_request(
+                    &request(GenerationSettingsPatch {
+                        reasoning_enabled: Some(enabled),
+                        ..Default::default()
+                    }),
+                    &EffectiveGenerationSettings {
+                        temperature: 0.8,
+                        top_p: 0.95,
+                    },
+                    &schema,
+                )
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("verified runtime and model/template switchability")
+            );
+        }
+        assert!(
+            adapter
+                .validate_inference_request(
+                    &request(GenerationSettingsPatch::default()),
+                    &EffectiveGenerationSettings {
+                        temperature: 0.8,
+                        top_p: 0.95
+                    },
+                    &SettingsSchema::default(),
+                )
+                .is_ok()
+        );
     }
 
     #[test]

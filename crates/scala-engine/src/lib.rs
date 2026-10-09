@@ -1213,7 +1213,7 @@ impl std::fmt::Display for ReasoningEffort {
 }
 
 /// Optional public model discovery facts, never persisted as inference overrides.
-/// Thinking uses `enable_thinking` on Chat and `reasoning.enabled` on Responses;
+/// Thinking uses `thinking.type` / `enable_thinking` on Chat and `reasoning.enabled` on Responses;
 /// effort uses `reasoning_effort` / `reasoning.effort`. Empty efforts grant none.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
@@ -1230,6 +1230,22 @@ pub struct ThinkingCapabilities {
     pub switchable: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effort_options: Vec<ReasoningEffort>,
+}
+
+/// Client-safe reasoning errors contain only Scala-owned facts and typed effort
+/// values. Native response bodies, artifact paths and settings values stay out.
+#[derive(Debug, thiserror::Error)]
+pub enum ReasoningControlError {
+    #[error("reasoning enable/disable conflicts with reasoning_effort")]
+    Conflict,
+    #[error("reasoning request controls lack verified model/runtime capability evidence")]
+    CapabilitiesUnverified,
+    #[error("this model/runtime does not support request-level thinking ON/OFF")]
+    NotSwitchable,
+    #[error("reasoning effort `{0}` is not verified for this model/runtime")]
+    EffortUnsupported(ReasoningEffort),
+    #[error("{0}")]
+    NativeControlUnavailable(&'static str),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1249,6 +1265,51 @@ pub struct GenerationSettingsPatch {
 }
 
 impl GenerationSettingsPatch {
+    /// Check only explicit controls, before inheritance can obscure their source.
+    pub fn validate_reasoning_controls(&self) -> Result<(), EngineError> {
+        if let (Some(enabled), Some(effort)) = (self.reasoning_enabled, self.reasoning_effort)
+            && enabled == (effort == ReasoningEffort::None)
+        {
+            return Err(EngineError::ReasoningControls(
+                ReasoningControlError::Conflict,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Admit request overrides using verified model/runtime capabilities only.
+    pub fn validate_reasoning_capabilities(
+        &self,
+        capabilities: Option<&ModelCapabilities>,
+    ) -> Result<(), EngineError> {
+        self.validate_reasoning_controls()?;
+        if self.reasoning_enabled.is_none() && self.reasoning_effort.is_none() {
+            return Ok(());
+        }
+        let thinking = &capabilities
+            .ok_or(EngineError::ReasoningControls(
+                ReasoningControlError::CapabilitiesUnverified,
+            ))?
+            .thinking;
+        if (self.reasoning_enabled.is_some()
+            || self.reasoning_effort == Some(ReasoningEffort::None))
+            && !thinking.switchable
+        {
+            return Err(EngineError::ReasoningControls(
+                ReasoningControlError::NotSwitchable,
+            ));
+        }
+        if let Some(effort) = self.reasoning_effort
+            && effort != ReasoningEffort::None
+            && !thinking.effort_options.contains(&effort)
+        {
+            return Err(EngineError::ReasoningControls(
+                ReasoningControlError::EffortUnsupported(effort),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.temperature.is_none()
             && self.top_p.is_none()
@@ -1410,6 +1471,15 @@ pub enum InferenceFinishReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "event")]
 pub enum InferenceEvent {
+    /// Private native reasoning text. Public adapters redact unless opted in.
+    ReasoningDelta {
+        delta: String,
+    },
+    /// Monotonic time from first observed reasoning delta to observed phase end.
+    /// Excludes time before the first delta; absent until an observed phase end.
+    ReasoningCompleted {
+        observed_duration_ms: u64,
+    },
     TextDelta {
         delta: String,
     },
@@ -1432,6 +1502,8 @@ pub type InferenceStream =
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    #[error("{0}")]
+    ReasoningControls(ReasoningControlError),
     #[error("engine operation is not implemented: {0}")]
     Unsupported(String),
     #[error("engine is not installed")]
@@ -2038,6 +2110,123 @@ impl EngineRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.adapters.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_capabilities_are_model_independent_and_do_not_grant_aliases() {
+        let capabilities = |switchable, effort_options| ModelCapabilities {
+            thinking: ThinkingCapabilities {
+                switchable,
+                effort_options,
+            },
+            decision: false,
+            decision_candidate: false,
+        };
+        let model_a = capabilities(
+            true,
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::Xhigh,
+            ],
+        );
+        let model_b = capabilities(
+            true,
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ],
+        );
+        let boolean = capabilities(true, vec![]);
+        let unsupported = capabilities(false, vec![]);
+        for effort in [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ] {
+            let request = GenerationSettingsPatch {
+                reasoning_effort: Some(effort),
+                ..Default::default()
+            };
+            assert_eq!(
+                request
+                    .validate_reasoning_capabilities(Some(&model_a))
+                    .is_ok(),
+                model_a.thinking.effort_options.contains(&effort)
+            );
+            assert_eq!(
+                request
+                    .validate_reasoning_capabilities(Some(&model_b))
+                    .is_ok(),
+                model_b.thinking.effort_options.contains(&effort)
+            );
+            assert!(
+                request
+                    .validate_reasoning_capabilities(Some(&boolean))
+                    .is_err()
+            );
+        }
+        for enabled in [true, false] {
+            let request = GenerationSettingsPatch {
+                reasoning_enabled: Some(enabled),
+                ..Default::default()
+            };
+            assert!(
+                request
+                    .validate_reasoning_capabilities(Some(&boolean))
+                    .is_ok()
+            );
+            assert!(
+                request
+                    .validate_reasoning_capabilities(Some(&unsupported))
+                    .is_err()
+            );
+            assert!(request.validate_reasoning_capabilities(None).is_err());
+        }
+        assert!(
+            GenerationSettingsPatch::default()
+                .validate_reasoning_capabilities(None)
+                .is_ok()
+        );
+        let fixed_reasoning = capabilities(false, vec![ReasoningEffort::Medium]);
+        assert!(
+            GenerationSettingsPatch {
+                reasoning_effort: Some(ReasoningEffort::Medium),
+                ..Default::default()
+            }
+            .validate_reasoning_capabilities(Some(&fixed_reasoning))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn reasoning_conflicts_are_rejected_before_defaults() {
+        for enabled in [true, false] {
+            for effort in [
+                ReasoningEffort::None,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::Xhigh,
+            ] {
+                let request = GenerationSettingsPatch {
+                    reasoning_enabled: Some(enabled),
+                    reasoning_effort: Some(effort),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    request.validate_reasoning_controls().is_ok(),
+                    enabled != (effort == ReasoningEffort::None)
+                );
+            }
+        }
     }
 }
 

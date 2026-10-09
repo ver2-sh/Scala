@@ -2652,6 +2652,7 @@ impl EngineAdapter for NinferAdapter {
         settings: &GenerationSettingsPatch,
         _backend_defaults: &EffectiveGenerationSettings,
     ) -> Result<(), EngineError> {
+        settings.validate_reasoning_controls()?;
         if settings.repeat_penalty.is_some_and(|value| value != 1.0) {
             return Err(EngineError::InvalidGenerationSettings(
                 "NInfer supports only the neutral repetition penalty 1.0".to_owned(),

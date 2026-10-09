@@ -1769,14 +1769,17 @@ fn setting_choice<'a>(settings: &'a scala_core::ResolvedSettings, id: &str) -> O
     }
 }
 
-fn q27_request_reasoning_effort(effort: scala_engine::ReasoningEffort) -> &'static str {
+fn q27_request_reasoning_effort(
+    effort: scala_engine::ReasoningEffort,
+) -> Result<&'static str, EngineError> {
     match effort {
-        scala_engine::ReasoningEffort::None => "none",
-        scala_engine::ReasoningEffort::Minimal | scala_engine::ReasoningEffort::Low => "low",
-        scala_engine::ReasoningEffort::Medium => "medium",
-        scala_engine::ReasoningEffort::High
-        | scala_engine::ReasoningEffort::Xhigh
-        | scala_engine::ReasoningEffort::Max => "xhigh",
+        scala_engine::ReasoningEffort::None => Ok("none"),
+        scala_engine::ReasoningEffort::Low => Ok("low"),
+        scala_engine::ReasoningEffort::Medium => Ok("medium"),
+        scala_engine::ReasoningEffort::Xhigh => Ok("xhigh"),
+        _ => Err(EngineError::ReasoningControls(
+            scala_engine::ReasoningControlError::EffortUnsupported(effort),
+        )),
     }
 }
 
@@ -2439,6 +2442,7 @@ impl Q27Adapter {
         request: &InferenceRequest,
         stream: bool,
     ) -> Result<(&'static str, Value), EngineError> {
+        request.generation_settings.validate_reasoning_controls()?;
         if request.messages.iter().any(InferenceMessage::has_media) {
             return Err(EngineError::InvalidGenerationSettings(
                 "q27 does not support media content".to_owned(),
@@ -2485,9 +2489,10 @@ impl Q27Adapter {
             && (!execution.capabilities.request_thinking
                 || setting_toggle(&execution.settings, "q27.request_thinking") != Some(true))
         {
-            return Err(EngineError::InvalidGenerationSettings(
-                "q27 per-request thinking enable, disable, and budget require `q27.request_thinking` to be enabled"
-                    .to_owned(),
+            return Err(EngineError::ReasoningControls(
+                scala_engine::ReasoningControlError::NativeControlUnavailable(
+                    "q27 per-request thinking enable, disable, and budget require qualified native controls and explicitly enabled `q27.request_thinking`",
+                ),
             ));
         }
         if request.generation_settings.reasoning_effort.is_some()
@@ -2527,7 +2532,8 @@ impl Q27Adapter {
         let request_effort = request
             .generation_settings
             .reasoning_effort
-            .map(q27_request_reasoning_effort);
+            .map(q27_request_reasoning_effort)
+            .transpose()?;
         let request_reasoning_enabled = match request.generation_settings.reasoning_effort {
             Some(scala_engine::ReasoningEffort::None) => Some(false),
             _ => request.generation_settings.reasoning_enabled,
@@ -7139,17 +7145,21 @@ mod tests {
     }
 
     #[test]
-    fn request_reasoning_effort_is_deliberately_canonicalized() {
+    fn request_reasoning_effort_rejects_unproved_aliases() {
+        for effort in [
+            scala_engine::ReasoningEffort::Minimal,
+            scala_engine::ReasoningEffort::High,
+            scala_engine::ReasoningEffort::Max,
+        ] {
+            assert!(q27_request_reasoning_effort(effort).is_err());
+        }
         for (effort, expected) in [
             (scala_engine::ReasoningEffort::None, "none"),
-            (scala_engine::ReasoningEffort::Minimal, "low"),
             (scala_engine::ReasoningEffort::Low, "low"),
             (scala_engine::ReasoningEffort::Medium, "medium"),
-            (scala_engine::ReasoningEffort::High, "xhigh"),
             (scala_engine::ReasoningEffort::Xhigh, "xhigh"),
-            (scala_engine::ReasoningEffort::Max, "xhigh"),
         ] {
-            assert_eq!(q27_request_reasoning_effort(effort), expected);
+            assert_eq!(q27_request_reasoning_effort(effort).unwrap(), expected);
         }
 
         let execution = Q27ConfiguredExecution {
@@ -7199,7 +7209,7 @@ mod tests {
             false,
         )
         .expect_err("q27 would ignore the engine-level disable without --request-think");
-        assert!(matches!(error, EngineError::InvalidGenerationSettings(_)));
+        assert!(matches!(error, EngineError::ReasoningControls(_)));
         assert!(error.to_string().contains("q27.request_thinking"));
     }
 
@@ -7234,6 +7244,52 @@ mod tests {
         .expect("request default body");
         assert_eq!(body["enable_thinking"], false);
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn thinking_on_off_keeps_process_effort_and_requires_explicit_qualified_switch() {
+        for enabled in [true, false] {
+            let mut execution = Q27ConfiguredExecution {
+                settings: resolved(&[
+                    ("q27.request_thinking", SettingValue::Toggle(true)),
+                    ("q27.thinking", SettingValue::Toggle(true)),
+                    (
+                        "q27.reasoning_effort",
+                        SettingValue::Choice("medium".into()),
+                    ),
+                ]),
+                sharp_template: None,
+                compiled_w_max: Some(12),
+                selected_kv_mode: None,
+                capabilities: exact_capabilities(),
+            };
+            let before = execution.settings.clone();
+            let request = inference_request(GenerationSettingsPatch {
+                reasoning_enabled: Some(enabled),
+                ..Default::default()
+            });
+            let (_, body) =
+                Q27Adapter::configured_backend_request(&execution, &request, false).unwrap();
+            assert_eq!(body["enable_thinking"], enabled);
+            assert!(body.get("reasoning_effort").is_none());
+            assert_eq!(execution.settings, before);
+            execution.capabilities.request_thinking = false;
+            assert!(Q27Adapter::configured_backend_request(&execution, &request, false).is_err());
+            execution.capabilities.request_thinking = true;
+            for configured in [None, Some(false)] {
+                execution.settings = resolved(
+                    &configured
+                        .into_iter()
+                        .map(|value| ("q27.request_thinking", SettingValue::Toggle(value)))
+                        .collect::<Vec<_>>(),
+                );
+                let before = execution.settings.clone();
+                assert!(
+                    Q27Adapter::configured_backend_request(&execution, &request, false).is_err()
+                );
+                assert_eq!(execution.settings, before);
+            }
+        }
     }
 
     #[test]

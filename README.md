@@ -812,7 +812,7 @@ may include an optional `capabilities` object:
 ```
 
 This is the value of `capabilities`, describing request overrides rather than
-defaults. `switchable` grants Chat's `enable_thinking` and Responses'
+defaults. `switchable` grants Chat's `thinking.type` / `enable_thinking` and Responses'
 `reasoning.enabled`; `effort_options` lists exact supported `reasoning_effort` /
 `reasoning.effort` values. Missing or empty effort options grant no effort tiers.
 The optional extension can be ignored by ordinary OpenAI clients.
@@ -916,13 +916,21 @@ sampled v0.10 execution; q27 accepts only numeric seeds and rejects the common `
 instead of treating it as an omitted seed. Its request thinking fields require
 `q27.request_thinking`. On a proven Qwen3.8 v0.10.0 combination, persistent
 `q27.reasoning_effort` selects the process default `low`, `medium`, or `xhigh` (runtime default
-`xhigh`), while request `minimal`/`low`, `medium`, and `high`/`xhigh`/`max` map to those three q27
-profiles. Request `none` disables thinking without changing the persistent default only when
+`xhigh`). Request effort tiers require verified name-independent model capabilities;
+q27 currently grants no such tiers. Unsupported efforts fail without alias conversion.
+Request `none` disables thinking without changing the persistent default only when
 `q27.request_thinking` is enabled, and is rejected otherwise. NInfer's
 configured reasoning budget is a launch default because its private Chat route has no matching
 per-request budget field. System prompt, output limit, sampler, stop, penalty, thinking, and effort
 values otherwise act as request defaults where the exact private contract supports them, and an
 explicit request wins.
+
+Chat also accepts strictly validated `{"thinking":{"type":"enabled"}}` and
+`{"thinking":{"type":"disabled"}}`. ON retains the effective supported effort;
+OFF suppresses inherited effort, and omitted controls retain existing defaults.
+Contradictory explicit controls fail with HTTP 400. See
+[reasoning controls and Unsloth Studio](docs/reasoning-controls.md) for native
+capability limitations, configuration, and the explicit streaming reasoning-text opt-in.
 
 `context_overflow=truncate_middle` is Scala request management, not llama.cpp context shift. It
 requires a finite request/profile output allowance, reads the exact effective slot context from the

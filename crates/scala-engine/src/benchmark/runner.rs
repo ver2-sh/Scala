@@ -1564,6 +1564,8 @@ impl RuntimeManager {
             let event = event.map_err(|error| classify_inference_error(error.to_string()))?;
             evidence.stream_event_observed = true;
             match event {
+                InferenceEvent::ReasoningDelta { .. }
+                | InferenceEvent::ReasoningCompleted { .. } => {}
                 InferenceEvent::TextDelta { delta } => {
                     bytes += delta.len();
                     if bytes > 65536 {

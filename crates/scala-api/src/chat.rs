@@ -54,6 +54,8 @@ const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
     "stream_options",
     "temperature",
     "thinking_token_budget",
+    "thinking",
+    "include_reasoning",
     "tool_choice",
     "tools",
     "top_logprobs",
@@ -91,6 +93,7 @@ pub(super) async fn create(
                 created,
                 model,
                 include_usage: parsed.include_usage,
+                include_reasoning: parsed.include_reasoning,
             },
             routed.stream,
         ))
@@ -106,6 +109,7 @@ pub(super) async fn create(
                 created,
                 model,
                 include_usage: false,
+                include_reasoning: false,
             },
             &routed.output,
         ))
@@ -117,6 +121,7 @@ pub(super) async fn create(
 pub(crate) struct ParsedRequest {
     pub(crate) normalized: NormalizedRequest,
     include_usage: bool,
+    include_reasoning: bool,
 }
 
 pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> {
@@ -131,6 +136,51 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
     generation_settings.reasoning_effort =
         optional_reasoning_effort(object.get("reasoning_effort"), "reasoning_effort")?;
     generation_settings.reasoning_enabled = optional_bool_value(object, "enable_thinking")?;
+    if let Some(thinking) = object.get("thinking") {
+        let thinking = thinking.as_object().ok_or_else(|| {
+            OpenAiError::invalid(
+                "`thinking` must be an object with type `enabled` or `disabled`.",
+                Some("thinking"),
+                "invalid_type",
+            )
+        })?;
+        reject_unknown_fields(thinking, &["type"], "thinking")?;
+        let enabled = match thinking.get("type").and_then(Value::as_str) {
+            Some("enabled") => true,
+            Some("disabled") => false,
+            _ => {
+                return Err(OpenAiError::invalid(
+                    "`thinking.type` must be `enabled` or `disabled`.",
+                    Some("thinking.type"),
+                    "invalid_value",
+                ));
+            }
+        };
+        if generation_settings
+            .reasoning_enabled
+            .is_some_and(|value| value != enabled)
+        {
+            return Err(OpenAiError::invalid(
+                "`thinking` conflicts with `enable_thinking`.",
+                Some("thinking"),
+                "invalid_value",
+            ));
+        }
+        generation_settings.reasoning_enabled = Some(enabled);
+    }
+    generation_settings
+        .validate_reasoning_controls()
+        .map_err(|error| {
+            OpenAiError::invalid(error.to_string(), Some("reasoning_effort"), "invalid_value")
+        })?;
+    let include_reasoning = optional_bool(object, "include_reasoning", false)?;
+    if include_reasoning && !stream {
+        return Err(OpenAiError::invalid(
+            "`include_reasoning` requires `stream = true`; it exposes native reasoning text.",
+            Some("include_reasoning"),
+            "invalid_value",
+        ));
+    }
     generation_settings.reasoning_budget =
         optional_nonnegative_u32(object, "thinking_token_budget")?.map(i64::from);
     let tools = parse_tools(object.get("tools"))?;
@@ -172,6 +222,7 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
             stream,
         },
         include_usage,
+        include_reasoning,
     })
 }
 
@@ -800,6 +851,7 @@ struct ChatContext {
     created: i64,
     model: String,
     include_usage: bool,
+    include_reasoning: bool,
 }
 
 fn completion_document(context: &ChatContext, output: &InferenceOutput) -> Value {
@@ -909,6 +961,14 @@ fn streaming_response(context: ChatContext, backend: InferenceStream) -> Respons
                 return None;
             }
             match state.backend.next().await {
+                Some(Ok(InferenceEvent::ReasoningDelta { delta })) => {
+                    if state.context.include_reasoning {
+                        state.push_chunk(json!({"choices": [{"index": 0,
+                            "delta": {"reasoning_content": delta},
+                            "logprobs": null, "finish_reason": null}]}));
+                    }
+                }
+                Some(Ok(InferenceEvent::ReasoningCompleted { .. })) => {}
                 Some(Ok(InferenceEvent::TextDelta { delta })) => {
                     state.push_chunk(json!({
                         "choices": [{
@@ -1041,6 +1101,242 @@ mod tests {
     use super::{ChatContext, completion_document, parse_request, streaming_response};
 
     #[test]
+    fn thinking_objects_validate_and_merge_explicit_controls() {
+        let base = json!({"model":"model", "messages":[{"role":"user","content":"hi"}]});
+        for (kind, enabled) in [("enabled", true), ("disabled", false)] {
+            let mut request = base.clone();
+            request["thinking"] = json!({"type":kind});
+            let parsed = parse_request(request.clone()).unwrap();
+            assert_eq!(
+                parsed.normalized.generation_settings.reasoning_enabled,
+                Some(enabled)
+            );
+            assert_eq!(parsed.normalized.generation_settings.reasoning_effort, None);
+            request["enable_thinking"] = json!(enabled);
+            assert!(parse_request(request.clone()).is_ok());
+            request["enable_thinking"] = json!(!enabled);
+            assert!(parse_request(request).is_err());
+        }
+        for invalid in [
+            json!(null),
+            json!(true),
+            json!("enabled"),
+            json!([]),
+            json!({}),
+            json!({"type":null}),
+            json!({"type":true}),
+            json!({"type":"auto"}),
+            json!({"type":"Enabled"}),
+            json!({"type":"enabled","budget_tokens":42}),
+        ] {
+            let mut request = base.clone();
+            request["thinking"] = invalid;
+            assert!(parse_request(request).is_err());
+        }
+        for (enabled, effort, valid) in [
+            (true, "none", false),
+            (false, "xhigh", false),
+            (false, "none", true),
+            (true, "medium", true),
+        ] {
+            let mut request = base.clone();
+            request["thinking"] = json!({"type":if enabled {"enabled"} else {"disabled"}});
+            request["reasoning_effort"] = json!(effort);
+            assert_eq!(parse_request(request).is_ok(), valid);
+        }
+        let parsed = parse_request(base.clone()).unwrap();
+        assert_eq!(
+            parsed.normalized.generation_settings.reasoning_enabled,
+            None
+        );
+        assert_eq!(parsed.normalized.generation_settings.reasoning_effort, None);
+        for effort in ["medium", "low"] {
+            let mut request = base.clone();
+            request["reasoning_effort"] = json!(effort);
+            assert_eq!(
+                parse_request(request)
+                    .unwrap()
+                    .normalized
+                    .generation_settings
+                    .reasoning_effort
+                    .unwrap()
+                    .as_str(),
+                effort
+            );
+        }
+        let mut request = base;
+        request["include_reasoning"] = json!(true);
+        assert!(parse_request(request.clone()).is_err());
+        request["stream"] = json!(true);
+        assert!(parse_request(request).unwrap().include_reasoning);
+    }
+
+    #[tokio::test]
+    async fn reasoning_wire_is_opt_in_ordered_and_recognizable_by_unsloth() {
+        // Contract consumer follows Unsloth chat-adapter.ts: nonempty
+        // delta.reasoning_content opens its timer; delta.content closes it.
+        for include_reasoning in [false, true] {
+            let backend: InferenceStream = Box::pin(stream::iter([
+                Ok(InferenceEvent::ReasoningDelta {
+                    delta: "private first".into(),
+                }),
+                Ok(InferenceEvent::ReasoningDelta {
+                    delta: " private second".into(),
+                }),
+                Ok(InferenceEvent::ReasoningCompleted {
+                    observed_duration_ms: 15,
+                }),
+                Ok(InferenceEvent::TextDelta {
+                    delta: "answer".into(),
+                }),
+                Ok(InferenceEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call".into()),
+                    name: Some("tool".into()),
+                    arguments_delta: "{}".into(),
+                }),
+                Ok(InferenceEvent::Completed {
+                    usage: Some(InferenceUsage {
+                        input_tokens: 2,
+                        output_tokens: 3,
+                        total_tokens: 5,
+                        reasoning_output_tokens: Some(2),
+                        ..Default::default()
+                    }),
+                    finish_reason: InferenceFinishReason::ToolCalls,
+                }),
+            ]));
+            let response = streaming_response(
+                ChatContext {
+                    completion_id: "chatcmpl_contract".into(),
+                    created: 1,
+                    model: "model".into(),
+                    include_usage: true,
+                    include_reasoning,
+                },
+                backend,
+            );
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 128 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert_eq!(body.contains("private first"), include_reasoning);
+            assert_eq!(body.contains("reasoning_content"), include_reasoning);
+            assert!(!body.contains("observed_duration_ms"));
+            assert!(!body.contains("_reasoningDurationMs"));
+            let mut opened = None;
+            let mut closed = None;
+            for (index, line) in body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .enumerate()
+            {
+                if line == "[DONE]" {
+                    continue;
+                }
+                let chunk: serde_json::Value = serde_json::from_str(line).unwrap();
+                let delta = &chunk["choices"][0]["delta"];
+                if delta["reasoning_content"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+                {
+                    opened.get_or_insert(index);
+                }
+                if opened.is_some() && delta["content"].as_str().is_some_and(|s| !s.is_empty()) {
+                    closed.get_or_insert(index);
+                }
+            }
+            assert_eq!(opened.is_some(), include_reasoning);
+            assert_eq!(closed.is_some(), include_reasoning);
+            if include_reasoning {
+                assert!(opened.unwrap() < closed.unwrap());
+            }
+            assert!(body.contains("\"tool_calls\""));
+            assert!(body.contains("\"total_tokens\":5"));
+            assert!(body.ends_with("data: [DONE]\n\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_reasoning_stream_redacts_and_terminates_with_error() {
+        let backend: InferenceStream =
+            Box::pin(stream::iter([Ok(InferenceEvent::ReasoningDelta {
+                delta: "secret".into(),
+            })]));
+        let response = streaming_response(
+            ChatContext {
+                completion_id: "chatcmpl_interrupted".into(),
+                created: 1,
+                model: "model".into(),
+                include_usage: true,
+                include_reasoning: false,
+            },
+            backend,
+        );
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!body.contains("secret"));
+        assert!(!body.contains("reasoning_content"));
+        assert!(body.contains("backend_inference_error"));
+        assert!(!body.contains("finish_reason\":\"stop"));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn dropping_reasoning_chat_body_cancels_owned_backend_stream() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let backend: InferenceStream = Box::pin(stream::unfold(
+            (0, Guard(dropped.clone())),
+            |(step, guard)| async move {
+                if step > 0 {
+                    std::future::pending::<()>().await;
+                }
+                Some((
+                    Ok(InferenceEvent::ReasoningDelta {
+                        delta: "native reasoning".into(),
+                    }),
+                    (step + 1, guard),
+                ))
+            },
+        ));
+        let response = streaming_response(
+            ChatContext {
+                completion_id: "chatcmpl_cancel".into(),
+                created: 1,
+                model: "model".into(),
+                include_usage: false,
+                include_reasoning: true,
+            },
+            backend,
+        );
+        let mut public = response.into_body().into_data_stream();
+        use futures_util::StreamExt;
+        assert!(public.next().await.unwrap().is_ok()); // assistant role
+        let delta = public.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&delta).contains("reasoning_content"));
+        drop(public);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn text_messages_and_generation_settings_normalize() {
         let parsed = parse_request(json!({
             "model": "model",
@@ -1146,6 +1442,7 @@ mod tests {
             created: 1,
             model: "model".to_owned(),
             include_usage: false,
+            include_reasoning: false,
         };
         let usage = InferenceUsage {
             input_tokens: 2,
@@ -1202,6 +1499,7 @@ mod tests {
                 created: 1,
                 model: "model".to_owned(),
                 include_usage: true,
+                include_reasoning: false,
             },
             backend,
         );

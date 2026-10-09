@@ -30,6 +30,7 @@ pub(crate) fn backend_request(
     streaming: bool,
     admission: RequestAdmission,
 ) -> Result<Value, EngineError> {
+    request.generation_settings.validate_reasoning_controls()?;
     if !admission.sampler_semantics
         && (request.generation_settings.temperature.is_some()
             || request.generation_settings.top_p.is_some()
@@ -54,8 +55,10 @@ pub(crate) fn backend_request(
         && (request.generation_settings.reasoning_enabled.is_some()
             || request.generation_settings.reasoning_effort.is_some())
     {
-        return Err(EngineError::InvalidGenerationSettings(
-            "this NInfer executable has no reviewed thinking-request semantic contract".to_owned(),
+        return Err(EngineError::ReasoningControls(
+            scala_engine::ReasoningControlError::NativeControlUnavailable(
+                "this NInfer executable has no reviewed thinking-request semantic contract",
+            ),
         ));
     }
     let has_tool_history = request
@@ -158,7 +161,12 @@ pub(crate) fn backend_request(
     if let Some(stop) = request.generation_settings.stop.as_ref() {
         body["stop"] = json!(stop);
     }
-    if let Some(enabled) = request.generation_settings.reasoning_enabled {
+    if let Some(enabled) = request.generation_settings.reasoning_enabled.or_else(|| {
+        request
+            .generation_settings
+            .reasoning_effort
+            .map(|effort| effort != scala_engine::ReasoningEffort::None)
+    }) {
         body["enable_thinking"] = json!(enabled);
     }
     if let Some(effort) = request.generation_settings.reasoning_effort {
@@ -392,6 +400,7 @@ struct SseState {
     usage: Option<InferenceUsage>,
     finish_reason: Option<InferenceFinishReason>,
     finished: bool,
+    reasoning_started: Option<std::time::Instant>,
 }
 
 pub(crate) fn sse_stream(
@@ -404,6 +413,7 @@ pub(crate) fn sse_stream(
         usage: None,
         finish_reason: None,
         finished: false,
+        reasoning_started: None,
     };
     Box::pin(stream::unfold(state, |mut state| async move {
         loop {
@@ -532,6 +542,47 @@ fn parse_sse_frames(state: &mut SseState) {
                     return;
                 }
             }
+        }
+        if let Some(delta) = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"))
+            .and_then(|delta| delta.get("reasoning_content"))
+            .and_then(Value::as_str)
+            .filter(|delta| !delta.is_empty())
+        {
+            state
+                .reasoning_started
+                .get_or_insert_with(std::time::Instant::now);
+            state.queued.push_back(Ok(InferenceEvent::ReasoningDelta {
+                delta: delta.to_owned(),
+            }));
+        }
+        let delta = value
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"));
+        let answer_started = delta.is_some_and(|delta| {
+            delta
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+                || delta
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+        });
+        if (answer_started || state.finish_reason.is_some())
+            && let Some(started) = state.reasoning_started.take()
+            && let Ok(observed_duration_ms) = u64::try_from(started.elapsed().as_millis())
+        {
+            state
+                .queued
+                .push_back(Ok(InferenceEvent::ReasoningCompleted {
+                    observed_duration_ms,
+                }));
         }
         if let Some(delta) = value
             .get("choices")
@@ -706,6 +757,147 @@ mod tests {
         }
     }
 
+    fn thinking_admission() -> RequestAdmission {
+        RequestAdmission {
+            protocol_semantics: true,
+            sampler_semantics: true,
+            thinking_semantics: true,
+            tool_calling: true,
+            media_semantics: true,
+            vision: false,
+            greedy: false,
+        }
+    }
+
+    #[test]
+    fn reasoning_native_request_translation_is_ephemeral_and_qualified() {
+        for effort in [
+            scala_engine::ReasoningEffort::Medium,
+            scala_engine::ReasoningEffort::Xhigh,
+        ] {
+            let mut request = request();
+            request.generation_settings.reasoning_enabled = Some(true);
+            request.generation_settings.reasoning_effort = Some(effort);
+            let body = backend_request(&request, true, thinking_admission()).unwrap();
+            assert_eq!(body["enable_thinking"], true);
+            assert_eq!(body["reasoning_effort"], effort.as_str());
+        }
+        for enabled in [true, false] {
+            let mut request = request();
+            request.generation_settings.reasoning_enabled = Some(enabled);
+            let before = request.clone();
+            let body = backend_request(&request, false, thinking_admission()).unwrap();
+            assert_eq!(body["enable_thinking"], enabled);
+            assert!(body.get("reasoning_effort").is_none());
+            assert_eq!(request.generation_settings, before.generation_settings);
+            let mut unqualified = thinking_admission();
+            unqualified.thinking_semantics = false;
+            assert!(backend_request(&request, false, unqualified).is_err());
+        }
+        let body = backend_request(&request(), false, thinking_admission()).unwrap();
+        assert!(body.get("enable_thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+        let mut none = request();
+        none.generation_settings.reasoning_effort = Some(scala_engine::ReasoningEffort::None);
+        assert_eq!(
+            backend_request(&none, false, thinking_admission()).unwrap()["enable_thinking"],
+            false
+        );
+        none.generation_settings.reasoning_enabled = Some(true);
+        assert!(backend_request(&none, false, thinking_admission()).is_err());
+    }
+
+    #[tokio::test]
+    async fn reasoning_duration_uses_observed_phase_instead_of_total_stream_time() {
+        let begin = std::time::Instant::now();
+        let source = stream::unfold(0, |step| async move {
+            let frame = match step {
+                0 => "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private\"}}]}\n\n",
+                1 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n"
+                }
+                2 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                }
+                _ => return None,
+            };
+            Some((Ok::<_, reqwest::Error>(Bytes::from_static(frame.as_bytes())), step + 1))
+        }).boxed();
+        let events = sse_stream(source).collect::<Vec<_>>().await;
+        let Ok(InferenceEvent::ReasoningCompleted {
+            observed_duration_ms,
+        }) = &events[1]
+        else {
+            panic!("missing observed duration")
+        };
+        assert!(*observed_duration_ms >= 10);
+        assert!(begin.elapsed().as_millis() >= u128::from(*observed_duration_ms) + 20);
+        assert!(matches!(
+            &events[0],
+            Ok(InferenceEvent::ReasoningDelta { .. })
+        ));
+        assert!(matches!(&events[2], Ok(InferenceEvent::TextDelta { .. })));
+        assert!(matches!(&events[3], Ok(InferenceEvent::Completed { .. })));
+    }
+
+    #[tokio::test]
+    async fn interrupted_or_missing_reasoning_does_not_invent_duration() {
+        for frames in [
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        ] {
+            let source = stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(
+                frames.as_bytes(),
+            ))])
+            .boxed();
+            let events = sse_stream(source).collect::<Vec<_>>().await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Ok(InferenceEvent::ReasoningCompleted { .. })))
+            );
+            if frames.contains("private") {
+                assert!(events.last().unwrap().is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_ends_before_tool_deltas_and_keeps_terminal_usage() {
+        let frames = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"private\",\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"function\":{\"name\":\"tool\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let events = sse_stream(
+            stream::iter([Ok::<_, reqwest::Error>(Bytes::from_static(
+                frames.as_bytes(),
+            ))])
+            .boxed(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert!(matches!(
+            &events[0],
+            Ok(InferenceEvent::ReasoningDelta { .. })
+        ));
+        assert!(matches!(
+            &events[1],
+            Ok(InferenceEvent::ReasoningCompleted { .. })
+        ));
+        assert!(matches!(
+            &events[2],
+            Ok(InferenceEvent::ToolCallDelta { .. })
+        ));
+        assert!(
+            matches!(&events[3], Ok(InferenceEvent::Completed { finish_reason: InferenceFinishReason::ToolCalls,
+            usage: Some(usage) }) if usage.total_tokens == 3)
+        );
+    }
+
     #[test]
     fn message_order_and_sampler_omission_are_preserved() {
         let admission = RequestAdmission {
@@ -773,7 +965,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_discards_reasoning_and_requires_terminal_state() {
+    async fn stream_preserves_private_reasoning_and_requires_terminal_state() {
         let frames = concat!(
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"secret\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":null}]}\n\n",
@@ -783,17 +975,24 @@ mod tests {
         let source = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from(frames))]).boxed();
         let events = sse_stream(source).collect::<Vec<_>>().await;
         assert!(matches!(
-            &events[0],
+            &events[2],
             Ok(InferenceEvent::TextDelta { delta }) if delta == "answer"
         ));
         assert!(matches!(
-            &events[1],
+            &events[3],
             Ok(InferenceEvent::Completed {
                 finish_reason: InferenceFinishReason::Stop,
                 ..
             })
         ));
-        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[0], Ok(InferenceEvent::ReasoningDelta { delta }) if delta == "secret")
+        );
+        assert!(matches!(
+            &events[1],
+            Ok(InferenceEvent::ReasoningCompleted { .. })
+        ));
+        assert_eq!(events.len(), 4);
 
         let no_reason = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from(
             "data: [DONE]\n\n",

@@ -1035,6 +1035,10 @@ fn streaming_response(context: ResponseContext, backend: InferenceStream) -> Res
                 return None;
             }
             match state.backend.next().await {
+                Some(Ok(
+                    InferenceEvent::ReasoningDelta { .. }
+                    | InferenceEvent::ReasoningCompleted { .. },
+                )) => {}
                 Some(Ok(InferenceEvent::TextDelta { delta })) => {
                     let output_index = state.ensure_text_started();
                     state.text.push_str(&delta);
@@ -1532,6 +1536,37 @@ mod tests {
     }
 
     struct DropSignal(Arc<AtomicBool>);
+
+    #[tokio::test]
+    async fn native_reasoning_events_remain_private_on_responses() {
+        let backend: InferenceStream = Box::pin(stream::iter([
+            Ok(InferenceEvent::ReasoningDelta {
+                delta: "private reasoning".into(),
+            }),
+            Ok(InferenceEvent::ReasoningCompleted {
+                observed_duration_ms: 10,
+            }),
+            Ok(InferenceEvent::TextDelta {
+                delta: "public answer".into(),
+            }),
+            Ok(InferenceEvent::Completed {
+                usage: None,
+                finish_reason: InferenceFinishReason::Stop,
+            }),
+        ]));
+        let response = streaming_response(context(), backend);
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), 128 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(!body.contains("private reasoning"));
+        assert!(!body.contains("observed_duration_ms"));
+        assert!(body.contains("public answer"));
+        assert!(body.contains("response.completed"));
+    }
 
     impl Drop for DropSignal {
         fn drop(&mut self) {

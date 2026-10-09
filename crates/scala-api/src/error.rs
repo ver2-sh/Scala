@@ -179,6 +179,13 @@ pub(crate) fn runtime_error(error: RuntimeError) -> OpenAiError {
             parameter: None,
             code: "backend_inference_error",
         },
+        RuntimeError::ReasoningControls(error) => OpenAiError {
+            status: StatusCode::BAD_REQUEST,
+            message: error.to_string(),
+            kind: "invalid_request_error",
+            parameter: None,
+            code: "unsupported_generation_settings",
+        },
         RuntimeError::InvalidGenerationSettings(_) => OpenAiError {
             status: StatusCode::BAD_REQUEST,
             message: "The requested generation settings cannot be honored by the active engine."
@@ -210,6 +217,30 @@ mod tests {
 
     use super::OpenAiError;
     use crate::MAX_INFERENCE_BODY_BYTES;
+
+    #[test]
+    fn reasoning_capability_errors_keep_client_safe_explanations() {
+        let error = super::runtime_error(scala_engine::RuntimeError::ReasoningControls(
+            scala_engine::ReasoningControlError::EffortUnsupported(
+                scala_engine::ReasoningEffort::Medium,
+            ),
+        ));
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.envelope()["error"]["code"],
+            "unsupported_generation_settings"
+        );
+        assert!(
+            error.envelope()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("medium")
+        );
+        let private = super::runtime_error(scala_engine::RuntimeError::InvalidGenerationSettings(
+            "/private/artifact native response".into(),
+        ));
+        assert!(!private.envelope().to_string().contains("/private/artifact"));
+    }
 
     #[test]
     fn authentication_error_is_sanitized_and_challenges_bearer() {

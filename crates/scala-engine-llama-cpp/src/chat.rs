@@ -283,6 +283,10 @@ pub(super) fn validate_stream(
             let event = source.next().await?;
             let mut done = false;
             let event = match event {
+                Ok(
+                    event @ (InferenceEvent::ReasoningDelta { .. }
+                    | InferenceEvent::ReasoningCompleted { .. }),
+                ) => Ok(event),
                 Ok(InferenceEvent::TextDelta { delta }) => {
                     text.push_str(&delta);
                     if text.len() > RESPONSE_LIMIT {

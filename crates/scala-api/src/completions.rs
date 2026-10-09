@@ -139,7 +139,16 @@ pub(super) async fn create(
                 if include_usage {
                     document["usage"] = Value::Null;
                 }
-                let (data, done) = match inference.next().await {
+                let event = loop {
+                    match inference.next().await {
+                        Some(Ok(
+                            InferenceEvent::ReasoningDelta { .. }
+                            | InferenceEvent::ReasoningCompleted { .. },
+                        )) => continue,
+                        event => break event,
+                    }
+                };
+                let (data, done) = match event {
                     Some(Ok(InferenceEvent::TextDelta { delta })) => {
                         document["choices"] = json!([{"text": delta, "index": 0, "logprobs": null, "finish_reason": null}]);
                         (format!("data: {document}\n\n"), false)

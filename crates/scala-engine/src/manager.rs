@@ -320,6 +320,8 @@ impl Default for RuntimeManagerOptions {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
+    #[error("{0}")]
+    ReasoningControls(crate::ReasoningControlError),
     #[error(
         "Inference is temporarily reserved for a benchmark; inspect or cancel it through private control"
     )]
@@ -415,8 +417,25 @@ struct InferenceTarget {
     generation_settings: EffectiveGenerationSettings,
     settings: scala_core::ResolvedSettings,
     settings_schema: scala_core::SettingsSchema,
+    runtime: crate::InstalledRuntime,
+    model: scala_core::ModelArtifact,
     decision_identity: Option<crate::DecisionIdentity>,
     lease: InferenceLease,
+}
+
+impl InferenceTarget {
+    fn reasoning_capabilities(
+        &self,
+        patch: &crate::GenerationSettingsPatch,
+    ) -> Option<crate::ModelCapabilities> {
+        // Qualify only explicit overrides, outside the manager state lock.
+        // Ordinary requests keep their existing defaults without new file IO.
+        if patch.reasoning_enabled.is_none() && patch.reasoning_effort.is_none() {
+            return None;
+        }
+        self.adapter
+            .model_capabilities(&self.runtime, &self.model, &self.settings)
+    }
 }
 
 fn decision_identity(
@@ -557,9 +576,10 @@ impl Stream for LeasedInferenceStream {
         let this = self.get_mut();
         let result = this.inner.as_mut().poll_next(cx);
         let generated_output = match &result {
-            std::task::Poll::Ready(Some(Ok(crate::InferenceEvent::TextDelta { delta }))) => {
-                !delta.is_empty()
-            }
+            std::task::Poll::Ready(Some(Ok(
+                crate::InferenceEvent::TextDelta { delta }
+                | crate::InferenceEvent::ReasoningDelta { delta },
+            ))) => !delta.is_empty(),
             std::task::Poll::Ready(Some(Ok(crate::InferenceEvent::ToolCallDelta { .. }))) => true,
             _ => false,
         };
@@ -2008,10 +2028,12 @@ impl RuntimeManager {
                 crate::ApiCapability::ChatCompletions,
             )
             .await?;
+        let model_capabilities = target.reasoning_capabilities(&request.generation_settings);
         prepare_inference_request(
             &target.adapter,
             &target.endpoint,
             &target.settings,
+            model_capabilities.as_ref(),
             &mut request,
         )
         .await
@@ -2061,10 +2083,12 @@ impl RuntimeManager {
                 crate::ApiCapability::ChatCompletions,
             )
             .await?;
+        let model_capabilities = target.reasoning_capabilities(&request.generation_settings);
         prepare_inference_request(
             &target.adapter,
             &target.endpoint,
             &target.settings,
+            model_capabilities.as_ref(),
             &mut request,
         )
         .await
@@ -2571,6 +2595,8 @@ impl RuntimeManager {
             generation_settings: active.effective_generation_settings,
             settings: active.settings.clone(),
             settings_schema: active.settings_schema.clone(),
+            runtime: active.runtime.clone(),
+            model: active.model.clone(),
             decision_identity: decision_identity(active, backend.provenance.as_ref()),
             lease,
         })
@@ -2621,6 +2647,8 @@ impl RuntimeManager {
             generation_settings: active.effective_generation_settings,
             settings: active.settings.clone(),
             settings_schema: active.settings_schema.clone(),
+            runtime: active.runtime.clone(),
+            model: active.model.clone(),
             decision_identity: decision_identity(active, backend.provenance.as_ref()),
             lease,
         })
@@ -2993,45 +3021,70 @@ fn prepare_completion_request(
         .map_err(map_inference_error)
 }
 
+fn prepare_reasoning_defaults(
+    adapter: &dyn EngineAdapter,
+    settings: &scala_core::ResolvedSettings,
+    patch: &mut crate::GenerationSettingsPatch,
+) {
+    // Request effort selects the mode as well as the effort. Never inherit a
+    // contradictory mode, or an effort that would undo explicit request OFF.
+    let explicit_enabled = patch.reasoning_enabled;
+    let explicit_effort = patch.reasoning_effort;
+    if explicit_enabled.is_none() && explicit_effort.is_some() {
+        // Non-none effort uses native effort semantics without inventing a
+        // boolean capability. `none` is explicitly a request to disable.
+        if explicit_effort == Some(crate::ReasoningEffort::None) {
+            patch.reasoning_enabled = Some(false);
+        }
+    } else if explicit_enabled.is_none()
+        && adapter.uses_setting_as_request_default("reasoning")
+        && let Some(scala_core::SettingValue::Choice(value)) = settings.runtime_value("reasoning")
+    {
+        patch.reasoning_enabled = match value.as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        };
+    }
+    if adapter.uses_setting_as_request_default("reasoning_effort")
+        && explicit_effort.is_none()
+        && explicit_enabled != Some(false)
+        && let Some(scala_core::SettingValue::Choice(value)) =
+            settings.runtime_value("reasoning_effort")
+    {
+        // `none` is a disabling policy, not an enabled effort default. ON
+        // removes that policy and lets the native template choose its default.
+        if explicit_enabled != Some(true) || value != "none" {
+            patch.reasoning_effort = serde_json::from_value(serde_json::json!(value)).ok();
+        }
+    }
+}
+
 async fn prepare_inference_request(
     adapter: &Arc<dyn EngineAdapter>,
     endpoint: &str,
     settings: &scala_core::ResolvedSettings,
+    capabilities: Option<&crate::ModelCapabilities>,
     request: &mut InferenceRequest,
 ) -> Result<(), EngineError> {
-    prepare_generation_patch(settings, &mut request.generation_settings);
-    if request.generation_settings.reasoning_enabled.is_none()
-        && let Some(scala_core::SettingValue::Choice(value)) = settings.runtime_value("reasoning")
-    {
-        request.generation_settings.reasoning_enabled = match value.as_str() {
-            "on" => Some(true),
-            "off" => Some(false),
-            "auto" => None,
-            _ => None,
-        };
+    request
+        .generation_settings
+        .validate_reasoning_capabilities(capabilities)?;
+    let explicit_reasoning = request.generation_settings.reasoning_enabled.is_some()
+        || request.generation_settings.reasoning_effort.is_some();
+    prepare_reasoning_defaults(adapter.as_ref(), settings, &mut request.generation_settings);
+    if explicit_reasoning {
+        request
+            .generation_settings
+            .validate_reasoning_capabilities(capabilities)?;
     }
+    prepare_generation_patch(settings, &mut request.generation_settings);
     if adapter.uses_setting_as_request_default("reasoning_budget")
         && request.generation_settings.reasoning_budget.is_none()
         && let Some(scala_core::SettingValue::Integer(value)) =
             settings.runtime_value("reasoning_budget")
     {
         request.generation_settings.reasoning_budget = Some(*value);
-    }
-    if adapter.uses_setting_as_request_default("reasoning_effort")
-        && request.generation_settings.reasoning_effort.is_none()
-        && let Some(scala_core::SettingValue::Choice(value)) =
-            settings.runtime_value("reasoning_effort")
-    {
-        request.generation_settings.reasoning_effort = match value.as_str() {
-            "none" => Some(crate::ReasoningEffort::None),
-            "minimal" => Some(crate::ReasoningEffort::Minimal),
-            "low" => Some(crate::ReasoningEffort::Low),
-            "medium" => Some(crate::ReasoningEffort::Medium),
-            "high" => Some(crate::ReasoningEffort::High),
-            "xhigh" => Some(crate::ReasoningEffort::Xhigh),
-            "max" => Some(crate::ReasoningEffort::Max),
-            _ => None,
-        };
     }
     if request.max_output_tokens.is_none()
         && let Some(scala_core::SettingValue::UnsignedInteger(value)) =
@@ -3311,6 +3364,7 @@ fn exit_detail(exit: &ProcessExit) -> String {
 
 fn map_inference_error(error: EngineError) -> RuntimeError {
     match error {
+        EngineError::ReasoningControls(error) => RuntimeError::ReasoningControls(error),
         EngineError::InvalidDecisionRequest(message) => {
             RuntimeError::InvalidDecisionRequest(message)
         }
@@ -3360,6 +3414,279 @@ fn retry_context_capacity_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_request_precedence_preserves_effective_defaults_and_sources() {
+        use crate::{GenerationSettingsPatch, ReasoningEffort};
+        use scala_core::{
+            ResolvedSetting, ResolvedSettings, SettingId, SettingSource, SettingValue,
+        };
+        let adapter = crate::decision::tests::DecisionAdapter::new(true);
+        for (default, effort) in [
+            ("xhigh", ReasoningEffort::Xhigh),
+            ("medium", ReasoningEffort::Medium),
+            ("none", ReasoningEffort::None),
+        ] {
+            for source in [
+                SettingSource::SettingsOverride,
+                SettingSource::ModelProfile {
+                    model_profile_id: ModelProfileId::new("reasoning-test").unwrap(),
+                },
+                SettingSource::Invocation,
+            ] {
+                let settings = ResolvedSettings {
+                    engine_id: "ninfer".into(),
+                    configured: BTreeMap::from([
+                        (
+                            SettingId::new("ninfer.reasoning_effort").unwrap(),
+                            ResolvedSetting {
+                                value: SettingValue::Choice(default.into()),
+                                source: source.clone(),
+                            },
+                        ),
+                        (
+                            SettingId::new("ninfer.reasoning").unwrap(),
+                            ResolvedSetting {
+                                value: SettingValue::Choice(
+                                    if default == "none" { "off" } else { "on" }.into(),
+                                ),
+                                source: source.clone(),
+                            },
+                        ),
+                        // Never inherit another engine's value.
+                        (
+                            SettingId::new("q27.reasoning_effort").unwrap(),
+                            ResolvedSetting {
+                                value: SettingValue::Choice("max".into()),
+                                source: source.clone(),
+                            },
+                        ),
+                    ]),
+                    ..Default::default()
+                };
+                let before = settings.clone();
+                let mut omitted = GenerationSettingsPatch::default();
+                prepare_reasoning_defaults(&adapter, &settings, &mut omitted);
+                assert_eq!(omitted.reasoning_effort, Some(effort));
+                assert_eq!(omitted.reasoning_enabled, Some(default != "none"));
+                let mut on = GenerationSettingsPatch {
+                    reasoning_enabled: Some(true),
+                    ..Default::default()
+                };
+                prepare_reasoning_defaults(&adapter, &settings, &mut on);
+                assert_eq!(on.reasoning_enabled, Some(true));
+                assert_eq!(on.reasoning_effort, (default != "none").then_some(effort));
+                let mut off = GenerationSettingsPatch {
+                    reasoning_enabled: Some(false),
+                    ..Default::default()
+                };
+                prepare_reasoning_defaults(&adapter, &settings, &mut off);
+                assert_eq!(off.reasoning_enabled, Some(false));
+                assert_eq!(off.reasoning_effort, None);
+                for explicit in [
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::None,
+                ] {
+                    let mut request = GenerationSettingsPatch {
+                        reasoning_effort: Some(explicit),
+                        ..Default::default()
+                    };
+                    prepare_reasoning_defaults(&adapter, &settings, &mut request);
+                    assert_eq!(request.reasoning_effort, Some(explicit));
+                    assert_eq!(
+                        request.reasoning_enabled,
+                        (explicit == ReasoningEffort::None).then_some(false)
+                    );
+                }
+                assert_eq!(settings, before);
+            }
+        }
+        let mut boolean = GenerationSettingsPatch {
+            reasoning_enabled: Some(true),
+            ..Default::default()
+        };
+        prepare_reasoning_defaults(
+            &adapter,
+            &scala_core::ResolvedSettings::default(),
+            &mut boolean,
+        );
+        assert_eq!(boolean.reasoning_effort, None);
+    }
+
+    #[tokio::test]
+    async fn reasoning_preparation_admits_effective_requests_without_native_calls() {
+        use crate::{
+            GenerationSettingsPatch, ModelCapabilities, ReasoningEffort, ThinkingCapabilities,
+        };
+        use scala_core::{
+            ResolvedSetting, ResolvedSettings, SettingId, SettingSource, SettingValue,
+        };
+        let adapter: Arc<dyn EngineAdapter> =
+            Arc::new(crate::decision::tests::DecisionAdapter::new(true));
+        let settings = ResolvedSettings {
+            engine_id: "ninfer".into(),
+            configured: BTreeMap::from([
+                (
+                    SettingId::new("ninfer.reasoning_effort").unwrap(),
+                    ResolvedSetting {
+                        value: SettingValue::Choice("xhigh".into()),
+                        source: SettingSource::Invocation,
+                    },
+                ),
+                (
+                    SettingId::new("ninfer.reasoning").unwrap(),
+                    ResolvedSetting {
+                        value: SettingValue::Choice("on".into()),
+                        source: SettingSource::Invocation,
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let before = settings.clone();
+        let capabilities = ModelCapabilities {
+            thinking: ThinkingCapabilities {
+                switchable: true,
+                effort_options: vec![
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::Xhigh,
+                ],
+            },
+            decision: false,
+            decision_candidate: false,
+        };
+        for (patch, expected_enabled, expected_effort) in [
+            (
+                GenerationSettingsPatch {
+                    reasoning_enabled: Some(true),
+                    ..Default::default()
+                },
+                Some(true),
+                Some(ReasoningEffort::Xhigh),
+            ),
+            (
+                GenerationSettingsPatch {
+                    reasoning_enabled: Some(false),
+                    ..Default::default()
+                },
+                Some(false),
+                None,
+            ),
+            (
+                GenerationSettingsPatch {
+                    reasoning_effort: Some(ReasoningEffort::Medium),
+                    ..Default::default()
+                },
+                None,
+                Some(ReasoningEffort::Medium),
+            ),
+            (
+                GenerationSettingsPatch {
+                    reasoning_effort: Some(ReasoningEffort::None),
+                    ..Default::default()
+                },
+                Some(false),
+                Some(ReasoningEffort::None),
+            ),
+            (
+                GenerationSettingsPatch::default(),
+                Some(true),
+                Some(ReasoningEffort::Xhigh),
+            ),
+        ] {
+            let explicit = patch.reasoning_enabled.is_some() || patch.reasoning_effort.is_some();
+            let mut request = InferenceRequest {
+                model_profile_id: ModelProfileId::new("reasoning-test").unwrap(),
+                messages: vec![crate::InferenceMessage::text(
+                    crate::InferenceRole::User,
+                    "synthetic",
+                )],
+                generation_settings: patch,
+                tools: vec![],
+                tool_choice: None,
+                parallel_tool_calls: None,
+                output_format: None,
+                max_output_tokens: None,
+                stream: false,
+            };
+            prepare_inference_request(
+                &adapter,
+                "must-not-contact",
+                &settings,
+                explicit.then_some(&capabilities),
+                &mut request,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                request.generation_settings.reasoning_enabled,
+                expected_enabled
+            );
+            assert_eq!(
+                request.generation_settings.reasoning_effort,
+                expected_effort
+            );
+        }
+        // An unsupported inherited effort cannot be silently substituted when ON
+        // targets a boolean-only model. OFF still works and suppresses it.
+        let boolean = ModelCapabilities {
+            thinking: ThinkingCapabilities {
+                switchable: true,
+                effort_options: vec![],
+            },
+            decision: false,
+            decision_candidate: false,
+        };
+        for enabled in [true, false] {
+            let mut request = InferenceRequest {
+                model_profile_id: ModelProfileId::new("reasoning-test").unwrap(),
+                messages: vec![crate::InferenceMessage::text(
+                    crate::InferenceRole::User,
+                    "synthetic",
+                )],
+                generation_settings: GenerationSettingsPatch {
+                    reasoning_enabled: Some(enabled),
+                    ..Default::default()
+                },
+                tools: vec![],
+                tool_choice: None,
+                parallel_tool_calls: None,
+                output_format: None,
+                max_output_tokens: None,
+                stream: false,
+            };
+            assert_eq!(
+                prepare_inference_request(
+                    &adapter,
+                    "must-not-contact",
+                    &settings,
+                    Some(&boolean),
+                    &mut request
+                )
+                .await
+                .is_ok(),
+                !enabled
+            );
+            request.generation_settings = GenerationSettingsPatch {
+                reasoning_enabled: Some(enabled),
+                ..Default::default()
+            };
+            assert!(matches!(
+                prepare_inference_request(
+                    &adapter,
+                    "must-not-contact",
+                    &settings,
+                    None,
+                    &mut request
+                )
+                .await,
+                Err(EngineError::ReasoningControls(_))
+            ));
+        }
+        assert_eq!(settings, before);
+    }
 
     struct ManagerFixture {
         _temporary: tempfile::TempDir,
