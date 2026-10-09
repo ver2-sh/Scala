@@ -864,12 +864,23 @@ impl EngineAdapter for LlamaCppAdapter {
         Ok(())
     }
 
+    fn validate_reasoning_admission(
+        &self,
+        settings: &GenerationSettingsPatch,
+        capabilities: Option<&scala_engine::ModelCapabilities>,
+    ) -> Result<(), EngineError> {
+        // Efforts retain exact runtime-schema admission below. Launch arguments
+        // do not establish a boolean thinking capability.
+        settings.validate_reasoning_switchability(capabilities)
+    }
+
     fn validate_inference_request(
         &self,
         request: &InferenceRequest,
         backend_defaults: &EffectiveGenerationSettings,
         settings_schema: &SettingsSchema,
     ) -> Result<(), EngineError> {
+        request.generation_settings.validate_reasoning_controls()?;
         if request.generation_settings.reasoning_enabled.is_some() {
             return Err(EngineError::ReasoningControls(
                 scala_engine::ReasoningControlError::NativeControlUnavailable(
@@ -6386,6 +6397,94 @@ mod generation_settings_tests {
         assert_eq!(explicit["temperature"], 0.25);
         assert_eq!(explicit["top_p"], 0.8);
         assert_eq!(explicit["max_completion_tokens"], 123);
+    }
+
+    #[test]
+    fn explicit_efforts_use_exact_native_schema_without_public_discovery() {
+        let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
+        let defaults = EffectiveGenerationSettings {
+            temperature: 0.8,
+            top_p: 0.95,
+        };
+        let mut definition = llama_setting_definitions()
+            .into_iter()
+            .find(|d| d.id.as_str() == "llama.cpp.reasoning_effort")
+            .unwrap();
+        definition.supported = true;
+        definition.kind = SettingKind::Choice {
+            choices: vec!["low".into(), "medium".into(), "high".into()],
+        };
+        let schema = SettingsSchema {
+            definitions: vec![definition],
+            ..Default::default()
+        };
+        let empty = scala_engine::ModelCapabilities {
+            thinking: scala_engine::ThinkingCapabilities {
+                switchable: false,
+                effort_options: vec![],
+            },
+            decision: false,
+            decision_candidate: false,
+        };
+        for capabilities in [None, Some(&empty)] {
+            for effort in [
+                scala_engine::ReasoningEffort::Low,
+                scala_engine::ReasoningEffort::Medium,
+                scala_engine::ReasoningEffort::High,
+            ] {
+                let request = request(GenerationSettingsPatch {
+                    reasoning_effort: Some(effort),
+                    ..Default::default()
+                });
+                adapter
+                    .validate_reasoning_admission(&request.generation_settings, capabilities)
+                    .unwrap();
+                adapter
+                    .validate_inference_request(&request, &defaults, &schema)
+                    .unwrap();
+                assert_eq!(
+                    adapter.backend_request(&request, false)["reasoning_effort"],
+                    effort.as_str()
+                );
+                assert!(
+                    adapter
+                        .validate_inference_request(&request, &defaults, &SettingsSchema::default())
+                        .is_err()
+                );
+            }
+        }
+        for effort in [
+            scala_engine::ReasoningEffort::Minimal,
+            scala_engine::ReasoningEffort::Xhigh,
+            scala_engine::ReasoningEffort::Max,
+            scala_engine::ReasoningEffort::None,
+        ] {
+            assert!(
+                adapter
+                    .validate_inference_request(
+                        &request(GenerationSettingsPatch {
+                            reasoning_effort: Some(effort),
+                            ..Default::default()
+                        }),
+                        &defaults,
+                        &schema
+                    )
+                    .is_err()
+            );
+        }
+        for enabled in [true, false] {
+            assert!(
+                adapter
+                    .validate_reasoning_admission(
+                        &GenerationSettingsPatch {
+                            reasoning_enabled: Some(enabled),
+                            ..Default::default()
+                        },
+                        None
+                    )
+                    .is_err()
+            );
+        }
     }
 
     #[test]

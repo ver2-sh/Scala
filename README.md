@@ -814,7 +814,9 @@ may include an optional `capabilities` object:
 This is the value of `capabilities`, describing request overrides rather than
 defaults. `switchable` grants Chat's `thinking.type` / `enable_thinking` and Responses'
 `reasoning.enabled`; `effort_options` lists exact supported `reasoning_effort` /
-`reasoning.effort` values. Missing or empty effort options grant no effort tiers.
+`reasoning.effort` values. Missing or empty effort options provide no public effort
+grants; qualified native adapters separately validate existing explicit efforts
+through their authoritative runtime/model request contracts.
 The optional extension can be ignored by ordinary OpenAI clients.
 
 Discovery uses the running profile's actual runtime/model/settings tuple when
