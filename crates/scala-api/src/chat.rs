@@ -1156,6 +1156,9 @@ impl ChatStreamState {
 }
 
 #[cfg(test)]
+mod unsloth_contract;
+
+#[cfg(test)]
 mod tests {
     use axum::body::to_bytes;
     use futures_util::stream;

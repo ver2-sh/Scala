@@ -5,7 +5,10 @@
     "edit_file": 7,
     "code_mode": 10,
     "multiple_results": 13,
-    "later_turn": 15
+    "later_turn": 15,
+    "distinct_user_participants": 17,
+    "distinct_assistant_participants": 19,
+    "mixed_replayed_history": 20
   },
   "request": {
     "model": "model",
@@ -51,7 +54,7 @@
             "type": "function",
             "function": {
               "name": "edit_file",
-              "arguments": "{\"path\":\"example.txt\",\"content\":\"example\"}"
+              "arguments": "{\"path\":\"example.txt\",\"edits\":[{\"old_string\":\"\",\"new_string\":\"example\"}]}"
             }
           }
         ]
@@ -94,7 +97,7 @@
             "type": "function",
             "function": {
               "name": "edit_file",
-              "arguments": "{\"path\":\"example.txt\",\"content\":\"revised\"}"
+              "arguments": "{\"path\":\"example.txt\",\"edits\":[{\"old_string\":\"example\",\"new_string\":\"revised\"}]}"
             }
           }
         ]
@@ -120,6 +123,30 @@
         "role": "user",
         "name": "coder",
         "content": "Continue using the previous history."
+      },
+      {
+        "role": "user",
+        "name": "reviewer",
+        "content": "Review the previous edit."
+      },
+      {
+        "role": "user",
+        "name": "coder",
+        "content": "Keep the existing behavior."
+      },
+      {
+        "role": "assistant",
+        "name": "code_helper",
+        "content": "The edit preserves behavior."
+      },
+      {
+        "role": "assistant",
+        "name": "review_helper",
+        "content": "The review is complete."
+      },
+      {
+        "role": "user",
+        "content": "Continue with both participants in history."
       }
     ]
   },
@@ -179,7 +206,7 @@
         {
           "id": "edit-1",
           "name": "edit_file",
-          "arguments": "{\"path\":\"example.txt\",\"content\":\"example\"}"
+          "arguments": "{\"path\":\"example.txt\",\"edits\":[{\"old_string\":\"\",\"new_string\":\"example\"}]}"
         }
       ]
     },
@@ -235,7 +262,7 @@
         {
           "id": "edit-2",
           "name": "edit_file",
-          "arguments": "{\"path\":\"example.txt\",\"content\":\"revised\"}"
+          "arguments": "{\"path\":\"example.txt\",\"edits\":[{\"old_string\":\"example\",\"new_string\":\"revised\"}]}"
         }
       ]
     },
@@ -278,6 +305,55 @@
         }
       ],
       "name": "coder"
+    },
+    {
+      "role": "user",
+      "name": "reviewer",
+      "content": [
+        {
+          "type": "text",
+          "text": "Review the previous edit."
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "name": "coder",
+      "content": [
+        {
+          "type": "text",
+          "text": "Keep the existing behavior."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "name": "code_helper",
+      "content": [
+        {
+          "type": "text",
+          "text": "The edit preserves behavior."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "name": "review_helper",
+      "content": [
+        {
+          "type": "text",
+          "text": "The review is complete."
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Continue with both participants in history."
+        }
+      ]
     }
   ],
   "native_messages": [
@@ -321,7 +397,7 @@
           "type": "function",
           "function": {
             "name": "edit_file",
-            "arguments": "{\"path\":\"example.txt\",\"content\":\"example\"}"
+            "arguments": "{\"path\":\"example.txt\",\"edits\":[{\"old_string\":\"\",\"new_string\":\"example\"}]}"
           }
         }
       ]
@@ -363,7 +439,7 @@
           "type": "function",
           "function": {
             "name": "edit_file",
-            "arguments": "{\"path\":\"example.txt\",\"content\":\"revised\"}"
+            "arguments": "{\"path\":\"example.txt\",\"edits\":[{\"old_string\":\"example\",\"new_string\":\"revised\"}]}"
           }
         }
       ]
@@ -387,6 +463,30 @@
       "role": "user",
       "name": "coder",
       "content": "Continue using the previous history."
+    },
+    {
+      "role": "user",
+      "name": "reviewer",
+      "content": "Review the previous edit."
+    },
+    {
+      "role": "user",
+      "name": "coder",
+      "content": "Keep the existing behavior."
+    },
+    {
+      "role": "assistant",
+      "name": "code_helper",
+      "content": "The edit preserves behavior."
+    },
+    {
+      "role": "assistant",
+      "name": "review_helper",
+      "content": "The review is complete."
+    },
+    {
+      "role": "user",
+      "content": "Continue with both participants in history."
     }
   ]
 }

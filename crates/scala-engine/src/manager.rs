@@ -3995,6 +3995,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsloth_profile_routing_preserves_normalized_history() {
+        let mut adapter = crate::decision::tests::DecisionAdapter::new(true);
+        *adapter.chat_history.get_mut().unwrap() = Some(Vec::new());
+        let adapter = Arc::new(adapter);
+        let fixture = decision_fixture(adapter.clone(), "1", None).await;
+        let data: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/named-chat-messages.json")).unwrap();
+        let messages: Vec<crate::InferenceMessage> =
+            serde_json::from_value(data["normalized_messages"].clone()).unwrap();
+        for length in data["turns"].as_object().unwrap().values() {
+            let length = length.as_u64().unwrap() as usize;
+            for stream in [false, true] {
+                let request = crate::InferenceRequest {
+                    model_profile_id: fixture.profile_id.clone(),
+                    messages: messages[..length].to_vec(),
+                    generation_settings: crate::GenerationSettingsPatch::default(),
+                    tools: Vec::new(),
+                    tool_choice: None,
+                    parallel_tool_calls: None,
+                    output_format: None,
+                    max_output_tokens: None,
+                    stream,
+                };
+                if stream {
+                    assert!(fixture.manager.infer_stream(request).await.is_err());
+                } else {
+                    assert!(fixture.manager.infer(request).await.is_err());
+                }
+                // The fixture stops exactly at adapter dispatch. It cannot run
+                // inference, launch/probe a process or contact a native endpoint.
+                let captured = adapter
+                    .chat_history
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+                assert_eq!(captured.model_profile_id, fixture.profile_id);
+                assert_eq!(captured.messages, messages[..length]);
+                assert_eq!(captured.stream, stream);
+                assert!(captured.tools.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn native_decision_dispatch_uses_the_qualified_pair_and_existing_identity() {
         let adapter = Arc::new(crate::decision::tests::DecisionAdapter::new(true));
         let fixture = decision_fixture(adapter.clone(), "1", Some("native-decision-fixture")).await;

@@ -227,6 +227,7 @@ pub(crate) mod tests {
         pub fail: bool,
         pub native_effort_admission: bool,
         pub calls: AtomicUsize,
+        pub chat_history: std::sync::Mutex<Option<Vec<InferenceRequest>>>,
     }
 
     impl DecisionAdapter {
@@ -238,12 +239,29 @@ pub(crate) mod tests {
                 fail: false,
                 native_effort_admission: false,
                 calls: AtomicUsize::new(0),
+                chat_history: std::sync::Mutex::new(None),
             }
         }
     }
 
     #[async_trait]
     impl EngineAdapter for DecisionAdapter {
+        fn validate_inference_request(
+            &self,
+            request: &InferenceRequest,
+            defaults: &EffectiveGenerationSettings,
+            _: &scala_core::SettingsSchema,
+        ) -> Result<(), EngineError> {
+            if self.chat_history.lock().unwrap().is_some() {
+                // Recording fixture only; native admission is exercised by
+                // each real adapter's contract tests.
+                return self.validate_generation_settings(&request.generation_settings, defaults);
+            }
+            Err(EngineError::Unsupported(
+                "synthetic decision adapter has no chat contract".into(),
+            ))
+        }
+
         fn validate_reasoning_admission(
             &self,
             settings: &GenerationSettingsPatch,
@@ -352,16 +370,24 @@ pub(crate) mod tests {
         async fn infer(
             &self,
             _: &str,
-            _: InferenceRequest,
+            request: InferenceRequest,
         ) -> Result<InferenceOutput, EngineError> {
+            if let Some(history) = self.chat_history.lock().unwrap().as_mut() {
+                history.push(request);
+                return Err(EngineError::Unsupported("synthetic chat boundary".into()));
+            }
             panic!("decision must never fall back to chat")
         }
         async fn infer_stream(
             &self,
             _: &str,
-            _: InferenceRequest,
+            request: InferenceRequest,
             _: InferenceActivityReporter,
         ) -> Result<InferenceStream, EngineError> {
+            if let Some(history) = self.chat_history.lock().unwrap().as_mut() {
+                history.push(request);
+                return Err(EngineError::Unsupported("synthetic chat boundary".into()));
+            }
             panic!("decision must never fall back to streaming chat")
         }
         async fn complete(

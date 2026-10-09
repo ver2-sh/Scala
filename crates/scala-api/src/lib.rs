@@ -7,6 +7,12 @@ mod embeddings;
 mod error;
 mod input;
 mod link;
+/// Compile the actual private NInfer serializer into contract tests without
+/// adding a production API or a runtime capability bypass.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../scala-engine-ninfer/src/protocol.rs"]
+mod ninfer_protocol_contract;
 mod wayfinder;
 use link::execution_profile_id;
 mod responses;
