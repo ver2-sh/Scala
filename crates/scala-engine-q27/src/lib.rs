@@ -2794,16 +2794,30 @@ impl EngineAdapter for Q27Adapter {
         Ok(())
     }
 
+    fn validate_reasoning_admission(
+        &self,
+        settings: &GenerationSettingsPatch,
+        capabilities: Option<&scala_engine::ModelCapabilities>,
+    ) -> Result<(), EngineError> {
+        // Public effort discovery is deliberately incomplete. Exact efforts
+        // and disabling remain gated by the native schema/execution contract.
+        settings.validate_reasoning_switchability(capabilities)
+    }
+
     fn validate_inference_request(
         &self,
         request: &InferenceRequest,
         backend_defaults: &EffectiveGenerationSettings,
         settings_schema: &SettingsSchema,
     ) -> Result<(), EngineError> {
+        request.generation_settings.validate_reasoning_controls()?;
         self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
-        if request.generation_settings.reasoning_effort.is_some() {
+        if let Some(effort) = request.generation_settings.reasoning_effort {
+            q27_request_reasoning_effort(effort)?;
             let id = SettingId::new("q27.reasoning_effort").expect("static setting ID");
-            if settings_schema.definition(&id).is_none() {
+            if settings_schema.definition(&id).is_none_or(|definition| {
+                effort != scala_engine::ReasoningEffort::None && !definition.supported
+            }) {
                 return Err(EngineError::InvalidGenerationSettings(
                     "the exact q27 runtime/model contract does not support reasoning effort"
                         .to_owned(),
@@ -7142,6 +7156,108 @@ mod tests {
             setting_choice(&execution.settings, "q27.reasoning_effort"),
             Some("xhigh")
         );
+    }
+
+    #[test]
+    fn explicit_efforts_use_qualified_native_contract_without_public_grants() {
+        let adapter = Q27Adapter::from_config(None, Path::new("."));
+        let schema = SettingsSchema {
+            definitions: q27_setting_definitions(),
+            ..Default::default()
+        };
+        let defaults = EffectiveGenerationSettings {
+            temperature: 0.8,
+            top_p: 0.95,
+        };
+        let execution = Q27ConfiguredExecution {
+            settings: resolved(&[("q27.request_thinking", SettingValue::Toggle(true))]),
+            sharp_template: None,
+            compiled_w_max: Some(12),
+            selected_kv_mode: None,
+            capabilities: exact_capabilities(),
+        };
+        let empty = scala_engine::ModelCapabilities {
+            thinking: scala_engine::ThinkingCapabilities {
+                switchable: true,
+                effort_options: vec![],
+            },
+            decision: false,
+            decision_candidate: false,
+        };
+        for capabilities in [None, Some(&empty)] {
+            for effort in [
+                scala_engine::ReasoningEffort::Low,
+                scala_engine::ReasoningEffort::Medium,
+                scala_engine::ReasoningEffort::Xhigh,
+                scala_engine::ReasoningEffort::None,
+            ] {
+                let request = inference_request(GenerationSettingsPatch {
+                    reasoning_effort: Some(effort),
+                    ..Default::default()
+                });
+                adapter
+                    .validate_reasoning_admission(&request.generation_settings, capabilities)
+                    .unwrap();
+                adapter
+                    .validate_inference_request(&request, &defaults, &schema)
+                    .unwrap();
+                let (_, body) =
+                    Q27Adapter::configured_backend_request(&execution, &request, true).unwrap();
+                assert_eq!(body["reasoning_effort"], effort.as_str());
+                if effort == scala_engine::ReasoningEffort::None {
+                    assert_eq!(body["enable_thinking"], false);
+                }
+                let without_request_thinking = Q27ConfiguredExecution {
+                    settings: scala_core::ResolvedSettings::default(),
+                    ..execution.clone()
+                };
+                assert_eq!(
+                    Q27Adapter::configured_backend_request(
+                        &without_request_thinking,
+                        &request,
+                        true
+                    )
+                    .is_ok(),
+                    effort != scala_engine::ReasoningEffort::None
+                );
+                let mut unsupported = schema.clone();
+                unsupported
+                    .definitions
+                    .iter_mut()
+                    .find(|d| d.id.as_str() == "q27.reasoning_effort")
+                    .unwrap()
+                    .supported = false;
+                assert_eq!(
+                    adapter
+                        .validate_inference_request(&request, &defaults, &unsupported)
+                        .is_ok(),
+                    effort == scala_engine::ReasoningEffort::None
+                );
+                assert!(
+                    adapter
+                        .validate_inference_request(&request, &defaults, &SettingsSchema::default())
+                        .is_err()
+                );
+            }
+        }
+        for effort in [
+            scala_engine::ReasoningEffort::Minimal,
+            scala_engine::ReasoningEffort::High,
+            scala_engine::ReasoningEffort::Max,
+        ] {
+            assert!(
+                adapter
+                    .validate_inference_request(
+                        &inference_request(GenerationSettingsPatch {
+                            reasoning_effort: Some(effort),
+                            ..Default::default()
+                        }),
+                        &defaults,
+                        &schema
+                    )
+                    .is_err()
+            );
+        }
     }
 
     #[test]

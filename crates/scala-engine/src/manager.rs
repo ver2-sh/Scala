@@ -3030,13 +3030,10 @@ fn prepare_reasoning_defaults(
     // contradictory mode, or an effort that would undo explicit request OFF.
     let explicit_enabled = patch.reasoning_enabled;
     let explicit_effort = patch.reasoning_effort;
-    if explicit_enabled.is_none() && explicit_effort.is_some() {
-        // Non-none effort uses native effort semantics without inventing a
-        // boolean capability. `none` is explicitly a request to disable.
-        if explicit_effort == Some(crate::ReasoningEffort::None) {
-            patch.reasoning_enabled = Some(false);
-        }
-    } else if explicit_enabled.is_none()
+    // Effort (including `none`) uses the adapter's native semantics. Do not
+    // manufacture a separate boolean control or inherit a contradictory mode.
+    if explicit_enabled.is_none()
+        && explicit_effort.is_none()
         && adapter.uses_setting_as_request_default("reasoning")
         && let Some(scala_core::SettingValue::Choice(value)) = settings.runtime_value("reasoning")
     {
@@ -3067,16 +3064,12 @@ async fn prepare_inference_request(
     capabilities: Option<&crate::ModelCapabilities>,
     request: &mut InferenceRequest,
 ) -> Result<(), EngineError> {
-    request
-        .generation_settings
-        .validate_reasoning_capabilities(capabilities)?;
+    adapter.validate_reasoning_admission(&request.generation_settings, capabilities)?;
     let explicit_reasoning = request.generation_settings.reasoning_enabled.is_some()
         || request.generation_settings.reasoning_effort.is_some();
     prepare_reasoning_defaults(adapter.as_ref(), settings, &mut request.generation_settings);
     if explicit_reasoning {
-        request
-            .generation_settings
-            .validate_reasoning_capabilities(capabilities)?;
+        adapter.validate_reasoning_admission(&request.generation_settings, capabilities)?;
     }
     prepare_generation_patch(settings, &mut request.generation_settings);
     if adapter.uses_setting_as_request_default("reasoning_budget")
@@ -3494,10 +3487,7 @@ mod tests {
                     };
                     prepare_reasoning_defaults(&adapter, &settings, &mut request);
                     assert_eq!(request.reasoning_effort, Some(explicit));
-                    assert_eq!(
-                        request.reasoning_enabled,
-                        (explicit == ReasoningEffort::None).then_some(false)
-                    );
+                    assert_eq!(request.reasoning_enabled, None);
                 }
                 assert_eq!(settings, before);
             }
@@ -3587,7 +3577,7 @@ mod tests {
                     reasoning_effort: Some(ReasoningEffort::None),
                     ..Default::default()
                 },
-                Some(false),
+                None,
                 Some(ReasoningEffort::None),
             ),
             (
@@ -3686,6 +3676,79 @@ mod tests {
             ));
         }
         assert_eq!(settings, before);
+    }
+
+    #[tokio::test]
+    async fn reasoning_preparation_defers_native_efforts_without_discovery_grants() {
+        use crate::{
+            GenerationSettingsPatch, ModelCapabilities, ReasoningEffort, ThinkingCapabilities,
+        };
+        let mut native = crate::decision::tests::DecisionAdapter::new(true);
+        native.native_effort_admission = true;
+        let adapter: Arc<dyn EngineAdapter> = Arc::new(native);
+        let empty = ModelCapabilities {
+            thinking: ThinkingCapabilities {
+                switchable: false,
+                effort_options: vec![],
+            },
+            decision: false,
+            decision_candidate: false,
+        };
+        for capabilities in [None, Some(&empty)] {
+            for effort in [
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::Xhigh,
+                ReasoningEffort::None,
+            ] {
+                let mut request = InferenceRequest {
+                    model_profile_id: ModelProfileId::new("native-effort-test").unwrap(),
+                    messages: vec![crate::InferenceMessage::text(
+                        crate::InferenceRole::User,
+                        "synthetic",
+                    )],
+                    generation_settings: GenerationSettingsPatch {
+                        reasoning_effort: Some(effort),
+                        ..Default::default()
+                    },
+                    tools: vec![],
+                    tool_choice: None,
+                    parallel_tool_calls: None,
+                    output_format: None,
+                    max_output_tokens: None,
+                    stream: false,
+                };
+                // The old manager rejected here, before native request validation.
+                prepare_inference_request(
+                    &adapter,
+                    "must-not-contact",
+                    &scala_core::ResolvedSettings::default(),
+                    capabilities,
+                    &mut request,
+                )
+                .await
+                .unwrap();
+                assert_eq!(request.generation_settings.reasoning_effort, Some(effort));
+                assert_eq!(request.generation_settings.reasoning_enabled, None);
+                for enabled in [true, false] {
+                    request.generation_settings = GenerationSettingsPatch {
+                        reasoning_enabled: Some(enabled),
+                        ..Default::default()
+                    };
+                    assert!(
+                        prepare_inference_request(
+                            &adapter,
+                            "must-not-contact",
+                            &scala_core::ResolvedSettings::default(),
+                            capabilities,
+                            &mut request
+                        )
+                        .await
+                        .is_err()
+                    );
+                }
+            }
+        }
     }
 
     struct ManagerFixture {

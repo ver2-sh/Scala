@@ -52,12 +52,19 @@ fail before inheritance:
 
 Public model discovery's `capabilities.thinking.switchable` and
 `capabilities.thinking.effort_options` describe verified overrides, not defaults.
-Missing capabilities grant no request controls; empty effort options grant no
-effort tiers. `none` is a disable operation requiring switchability, rather than
-an enabled effort tier. Unknown and unsupported models receive a clear HTTP 400
-reasoning diagnostic. Scala never derives effort support from model names,
-quantization, Norted lineage, arbitrary metadata, engine identity or launch help
-alone. Existing requests without explicit reasoning controls continue to use
+Missing capabilities grant no generic On/Off controls; empty effort options provide
+no public effort grants. Discovery is optional and can be incomplete. The manager
+uses adapter-owned admission before and after inheritance: NInfer retains its
+verified capability check, while llama.cpp and q27 validate explicit efforts
+through their existing native schema/execution contracts. Conflicts are checked
+before inheritance. Generic On/Off still requires verified switchability, even
+when combined with an effort. An effort-only `none` retains native disabling
+semantics without synthesizing a separate boolean request.
+
+Unknown and unsupported native controls fail before inference. No additional
+aliases or effort translations are granted by incomplete discovery. Scala never
+derives new generic thinking capabilities from launch arguments or engine names.
+Existing requests without explicit reasoning controls continue to use
 their existing resolved defaults.
 
 ## Native engine behavior and current evidence limits
@@ -66,7 +73,7 @@ their existing resolved defaults.
 | --- | --- | --- | --- |
 | NInfer | Native `enable_thinking: true`; retain effective supported request effort | Native `enable_thinking: false`; omit inherited effort | Reviewed native request semantics and existing embedded-template content capability proof |
 | q27 | Native `enable_thinking: true`; retain the process/template effort default | Native `enable_thinking: false`; preserve the process effort default | Reviewed native request semantics, explicitly enabled `q27.request_thinking`, existing runtime/model restrictions, and no arbitrary external template |
-| llama.cpp | Currently HTTP 400 for unverified model/template request controls | Currently HTTP 400; never drop OFF silently | Existing Scala discovery does not establish model switchability or exact effort choices |
+| llama.cpp | HTTP 400 for unverified boolean controls | HTTP 400 for unverified boolean controls | Explicit native efforts retain exact runtime-schema admission; launch arguments grant no boolean switchability |
 
 NInfer's `ninfer.thinking` remains a launch setting. `ninfer.preserve_thinking`
 remains separate private history retention, and its reasoning budget remains a
@@ -76,9 +83,13 @@ q27's `q27.thinking` and `q27.reasoning_effort` remain process settings. Scala
 does not enable `q27.request_thinking` automatically. q27's existing
 trained-template effort settings qualification uses `general.name`; existing
 public discovery deliberately declines to turn that into name-independent
-request effort grants. Consequently request effort tiers currently fail at
-routing even when a process effort is configured. The adapter also rejects
-unproved `minimal` → `low` and `high`/`max` → `xhigh` aliases.
+request effort grants. Explicit requests retain qualified native `low`, `medium`
+and `xhigh` semantics,
+including overriding a configured process effort. These enabled efforts do not
+require the boolean request toggle. `none` requires the qualified native disable
+contract and explicitly enabled `q27.request_thinking`; it leaves process defaults
+untouched. An unsupported native model effort schema rejects enabled tiers.
+The adapter also rejects unproved `minimal` → `low` and `high`/`max` → `xhigh` aliases.
 
 For llama.cpp, the already pinned
 [b10665 native request parser](https://github.com/ggml-org/llama.cpp/blob/ca3d5a3e10d53f7ea672cb9b6178faca3e2807bc/tools/server/server-common.cpp)
@@ -87,12 +98,14 @@ merges `chat_template_kwargs.enable_thinking` as a boolean and accepts
 not that every template can disable reasoning or accepts the same efforts.
 The pinned [template capability implementation](https://github.com/ggml-org/llama.cpp/blob/ca3d5a3e10d53f7ea672cb9b6178faca3e2807bc/common/jinja/caps.cpp)
 reports whether an effort variable is used, but neither switchability nor an
-effort vocabulary. Scala therefore cannot safely admit these request overrides
-using its existing evidence. A verified model/template capability contract is
-required before adding forwarding. Existing `llama.cpp.reasoning` and
-`llama.cpp.reasoning_effort` launch settings remain supported through their
-existing admission path. Explicit request efforts lacking model evidence also
-fail rather than treating launch help as a model effort grant.
+effort vocabulary. Scala therefore keeps generic boolean controls closed.
+Existing explicit
+`reasoning_effort` requests remain admitted by the selected runtime's qualified
+schema: the setting must be supported and the exact choice must be present. This
+restores the existing native request path independently of optional public model
+discovery. Unadvertised choices remain errors, including `none` when the native
+schema does not advertise it. Existing `llama.cpp.reasoning` and
+`llama.cpp.reasoning_effort` launch settings retain their admission path.
 
 ## Reasoning streams and thinking time
 
@@ -143,12 +156,41 @@ and delivers neither signal nor text without the opt-in.
 
 The normal Unsloth thinking toggle alone does not send `include_reasoning`.
 Without an explicit client facility to add that opt-in, Unsloth cannot obtain
-its text-based timer through Scala's default redacted stream. Its alternative
-`_reasoningDurationMs` event is private and is not implemented here. A local
-Unsloth timer may include transport delay, and terminal-only/interrupted streams
-do not prove a complete reasoning duration. End-to-end UI testing against an
-installed Unsloth runtime has not been performed; no default-private numeric
-thinking-time feature is claimed.
+its text-based timer through Scala's default redacted stream.
+
+A duration-only Scala event is not compatible with the inspected normal Custom
+Connection path. No default-private numeric thinking-time feature is implemented
+or claimed.
+
+On 2026-10-09 the installed Unsloth 2026.10.3 package was inspected read-only at
+`/srv/norted/cache/uv/archive-v0/J-IFFZ7wDrINOGGx/studio`. Its
+`backend/core/inference/external_provider.py` relays Custom Chat SSE through
+`sanitize_provider_sse_line` (lines 2073–2076). The installed
+`backend/core/inference/sse_control_frames.py` is byte-identical to the
+[upstream sanitizer at 6c723f7](https://github.com/unslothai/unsloth/blob/6c723f747799b56c8ecda16d0a93523eca3a2d61/studio/backend/core/inference/sse_control_frames.py):
+SHA-256 `9016bfa9c261d1fc2edd2c85317c79cbd8c4f604e8e68d72d5cf9b65dedada36`.
+The relay explicitly strips top-level `_reasoningDurationMs` and strips/drops
+`type: reasoning_summary`. A synthetic execution of the installed sanitizer
+confirmed that both pure duration envelopes are dropped, and a duration attached
+to an ordinary `choices` chunk is removed while the chunk survives.
+
+The installed frontend `dist/assets/chat-Owi-soaD.js` (SHA-256
+`e4ade65952bf49e7b4d8a6eaf2c0423bcb3b216607062f6ffd68ac2a870f08f1`)
+consumes `_reasoningDurationMs` via `recordServerDuration` and maps
+`reasoning_summary.duration_ms` to that private key. Its tracker assigns a server
+duration only when a visible reasoning group has already started. The reviewed
+upstream [tracker](https://github.com/unslothai/unsloth/blob/6c723f747799b56c8ecda16d0a93523eca3a2d61/studio/frontend/src/features/chat/utils/reasoning-duration.ts)
+and [adapter](https://github.com/unslothai/unsloth/blob/6c723f747799b56c8ecda16d0a93523eca3a2d61/studio/frontend/src/features/chat/api/chat-adapter.ts)
+confirm this behavior. Thus merely allowing the numeric key through the relay
+would still not establish a timer for a text-free stream.
+
+Additional integration would require an external-provider duration contract
+accepted by Unsloth's relay plus frontend support for duration observations
+without reasoning text/groups. Alternatively, a client facility could explicitly
+opt into real reasoning text with `include_reasoning`, accepting that disclosure.
+Neither integration is changed here. Installed source, production services and
+client settings are unchanged, and no end-to-end UI test was performed. Scala
+continues to keep observed intervals private and never invents timing or thoughts.
 
 ## Local validation
 
@@ -159,45 +201,38 @@ default/request precedence, distinct effort vocabularies, boolean/unsupported
 models, native admission, ordering/redaction, observed intervals, interruptions,
 tool/usage/terminal events and dropping the source on cancellation.
 
-The implementation was inspected against a clean `master` checkout at
-`21bcda84100062c60bbefd8f88dd1317064d030e` on 2026-10-09. No runtime was launched
-for this validation.
+This correction starts from `dca2af4708e66465f80191585300ab15c94d2d47` on the
+local `fix/reasoning-native-admission` branch. Shared history is unchanged; no
+push, runtime launch, real inference, benchmark or training is authorized.
 
-| Executed synthetic tests | Passed |
+Focused validation includes `cargo test -p scala-engine --lib reasoning --offline`
+and the full synthetic library suites for `scala-api`, `scala-engine-ninfer`,
+`scala-engine-llama-cpp` and `scala-engine-q27`, plus Scala Core's settings
+precedence test. The native regression tests exercise admission and request
+serialization with missing/empty public discovery, exact supported choices,
+unsupported schemas and q27's disable gate. The manager regression proves the
+native adapter gets effort admission while generic On/Off remains closed.
+
+All checks below passed locally on 2026-10-09:
+
+| Offline library test suite/filter | Passed |
 | --- | --- |
-| `cargo test -p scala-api --lib --offline` | 35 |
-| `cargo test -p scala-engine --lib reasoning --offline` | 4 |
-| `cargo test -p scala-engine-ninfer --lib --offline` | 42 |
-| `cargo test -p scala-engine-q27 --lib --offline` | 27 |
-| `cargo test -p scala-engine-llama-cpp --lib --offline` | 46 |
+| `scala-api` | 35 |
+| `scala-engine`, filter `reasoning` | 5 |
+| `scala-engine-ninfer` | 42 |
+| `scala-engine-llama-cpp` | 47 |
+| `scala-engine-q27` | 28 |
+| `scala-core`, filter `resolution_has_exact_three_layer_precedence` | 1 |
 
-Static checks use `cargo check --workspace --all-targets --offline`,
-`cargo fmt --all -- --check`, `git diff --check`, and
+The q27 native-effort regression was rerun after adding checks for disabled
+request-thinking and unsupported model schemas; it also passed.
+
+Static checks: `cargo fmt --all -- --check`,
+`cargo check --workspace --all-targets --offline`, `git diff --check`, and
 `cargo clippy -p scala-api -p scala-engine -p scala-engine-ninfer
 -p scala-engine-llama-cpp -p scala-engine-q27 --all-targets --offline -- -D warnings`.
 
-## Changed files for audit
-
-- `crates/scala-api/src/chat.rs`: strict controls, explicit text opt-in, SSE
-  serialization and public wire contracts.
-- `crates/scala-api/src/error.rs`: client-safe reasoning diagnostics while
-  retaining general backend error sanitization.
-- `crates/scala-api/src/responses.rs` and `crates/scala-api/src/completions.rs`:
-  preserve redaction and existing streaming contracts for the new private events.
-- `crates/scala-engine/src/lib.rs`: typed reasoning validation/errors and private
-  reasoning stream events; distinct synthetic capability vocabularies.
-- `crates/scala-engine/src/manager.rs`: actual serving-tuple qualification,
-  request precedence, source-preserving defaults and stream activity.
-- `crates/scala-engine/src/benchmark/runner.rs`: handle the additional event
-  variants without collecting private reasoning; no benchmark was run.
-- `crates/scala-engine-ninfer/src/protocol.rs` and
-  `crates/scala-engine-ninfer/src/lib.rs`: qualified native request translation,
-  conflicts, ordered reasoning events and observed phase intervals.
-- `crates/scala-engine-q27/src/lib.rs`: native gating, explicit conflicts,
-  rejection of unproved aliases and preservation tests.
-- `crates/scala-engine-llama-cpp/src/lib.rs` and
-  `crates/scala-engine-llama-cpp/src/chat.rs`: reject unverified boolean
-  requests, retain launch policies, handle additional event variants and test
-  admission without native inference.
-- `README.md` and this document: configuration, current evidence limits,
-  privacy/timer behavior and validation record.
+Changed correction files: engine `lib.rs` and `manager.rs`; the engine's
+`decision.rs` synthetic adapter fixture; llama.cpp and q27 adapter `lib.rs`;
+`README.md` and this document. Chat/Responses SSE and NInfer protocol code are
+unchanged, retaining privacy, ordering, usage, cancellation and error behavior.

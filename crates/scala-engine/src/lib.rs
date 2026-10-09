@@ -1214,7 +1214,8 @@ impl std::fmt::Display for ReasoningEffort {
 
 /// Optional public model discovery facts, never persisted as inference overrides.
 /// Thinking uses `thinking.type` / `enable_thinking` on Chat and `reasoning.enabled` on Responses;
-/// effort uses `reasoning_effort` / `reasoning.effort`. Empty efforts grant none.
+/// effort uses `reasoning_effort` / `reasoning.effort`. Discovery can be incomplete;
+/// adapters may separately admit efforts through their qualified native contracts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
     pub thinking: ThinkingCapabilities,
@@ -1308,6 +1309,20 @@ impl GenerationSettingsPatch {
             ));
         }
         Ok(())
+    }
+
+    /// Check explicit boolean controls without treating discovery as an effort
+    /// contract. Native adapters must still validate efforts before inference.
+    pub fn validate_reasoning_switchability(
+        &self,
+        capabilities: Option<&ModelCapabilities>,
+    ) -> Result<(), EngineError> {
+        self.validate_reasoning_controls()?;
+        Self {
+            reasoning_enabled: self.reasoning_enabled,
+            ..Default::default()
+        }
+        .validate_reasoning_capabilities(capabilities)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1856,6 +1871,16 @@ pub trait EngineAdapter: Send + Sync {
                 self.identity().id
             )))
         }
+    }
+    /// Preliminary admission before defaults are inherited. The default uses
+    /// discovery evidence. Native adapters may defer effort admission to their
+    /// authoritative request/schema checks, which must run before inference.
+    fn validate_reasoning_admission(
+        &self,
+        settings: &GenerationSettingsPatch,
+        capabilities: Option<&ModelCapabilities>,
+    ) -> Result<(), EngineError> {
+        settings.validate_reasoning_capabilities(capabilities)
     }
     fn validate_inference_request(
         &self,

@@ -225,6 +225,7 @@ pub(crate) mod tests {
         pub api: bool,
         pub feature: bool,
         pub fail: bool,
+        pub native_effort_admission: bool,
         pub calls: AtomicUsize,
     }
 
@@ -235,6 +236,7 @@ pub(crate) mod tests {
                 api: true,
                 feature: true,
                 fail: false,
+                native_effort_admission: false,
                 calls: AtomicUsize::new(0),
             }
         }
@@ -242,6 +244,18 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl EngineAdapter for DecisionAdapter {
+        fn validate_reasoning_admission(
+            &self,
+            settings: &GenerationSettingsPatch,
+            capabilities: Option<&ModelCapabilities>,
+        ) -> Result<(), EngineError> {
+            if self.native_effort_admission {
+                settings.validate_reasoning_switchability(capabilities)
+            } else {
+                settings.validate_reasoning_capabilities(capabilities)
+            }
+        }
+
         fn identity(&self) -> EngineIdentity {
             EngineIdentity {
                 id: "fixture-decision".into(),
