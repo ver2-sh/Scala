@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.12 - Model-agnostic reasoning controls
+
+Improves OpenAI-compatible Chat reasoning controls across Scala engines while
+preserving runtime-owned capabilities, Model Profiles and explicit request precedence.
+
+- Accept the validated `thinking.type=enabled|disabled` request shape used by
+  Unsloth Studio; ON inherits the selected model's supported effort and OFF
+  suppresses inherited reasoning without changing persistent settings.
+- Reject conflicting reasoning controls and unsupported per-request thinking
+  rather than silently changing a model's effort or process launch settings.
+- Preserve qualified llama.cpp and q27 native `reasoning_effort` requests
+  independently of optional model-capability discovery; keep q27's exact native
+  per-request thinking gate and reject unsupported aliases.
+- Track genuine NInfer reasoning stream phases and expose native reasoning text
+  only with an explicit streaming opt-in; default Chat and Responses behavior
+  keeps reasoning content private.
+- Document the remaining Unsloth Custom Connection limitation: its normal
+  relay does not yet support a privacy-preserving thinking-duration indicator.
+
 ## 0.1.11 - Runtime acquisition rate-limit hardening
 
 Reduces GitHub REST consumption during managed runtime discovery and installation
