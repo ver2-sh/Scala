@@ -2399,6 +2399,13 @@ impl Q27Adapter {
         request: &InferenceRequest,
         stream: bool,
     ) -> Result<Value, EngineError> {
+        if request
+            .messages
+            .iter()
+            .any(|message| message.name.is_some())
+        {
+            return Err(EngineError::MessageNamesUnsupported);
+        }
         if request.messages.iter().any(InferenceMessage::has_media)
             || !request.tools.is_empty()
             || request
@@ -2442,6 +2449,14 @@ impl Q27Adapter {
         request: &InferenceRequest,
         stream: bool,
     ) -> Result<(&'static str, Value), EngineError> {
+        if execution.sharp_template.is_none()
+            && request
+                .messages
+                .iter()
+                .any(|message| message.name.is_some())
+        {
+            return Err(EngineError::MessageNamesUnsupported);
+        }
         request.generation_settings.validate_reasoning_controls()?;
         if request.messages.iter().any(InferenceMessage::has_media) {
             return Err(EngineError::InvalidGenerationSettings(
@@ -4778,7 +4793,7 @@ fn message_json(message: &InferenceMessage) -> Value {
 }
 
 fn sharp_message_json(message: &InferenceMessage) -> Value {
-    json!({
+    let mut value = json!({
         "role": match message.role {
             InferenceRole::System => "system",
             InferenceRole::Developer => "developer",
@@ -4787,7 +4802,11 @@ fn sharp_message_json(message: &InferenceMessage) -> Value {
             InferenceRole::Tool => "tool",
         },
         "content": message.text_only().unwrap_or_default(),
-    })
+    });
+    if let Some(name) = &message.name {
+        value["name"] = json!(name);
+    }
+    value
 }
 
 fn invalid_probe(reason: String) -> EngineProbe {
@@ -7102,6 +7121,108 @@ mod tests {
         let settings = resolved(&[]);
         assert!(!q27_has_configured_execution(&settings));
         assert!(settings.value("q27.template_path").is_none());
+    }
+
+    #[test]
+    fn named_message_native_serialization_preserves_tools_and_rejects_participants() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../scala-engine/testdata/named-chat-messages.json"
+        ))
+        .unwrap();
+        let messages: Vec<InferenceMessage> =
+            serde_json::from_value(fixture["normalized_messages"].clone()).unwrap();
+        let execution = Q27ConfiguredExecution {
+            settings: resolved(&[]),
+            sharp_template: None,
+            compiled_w_max: Some(12),
+            selected_kv_mode: None,
+            capabilities: exact_capabilities(),
+        };
+        let adapter = Q27Adapter::from_config(None, Path::new("."));
+        for length in fixture["turns"].as_object().unwrap().values() {
+            let length = length.as_u64().unwrap() as usize;
+            let mut request = inference_request(GenerationSettingsPatch::default());
+            request.messages = messages[..length].to_vec();
+            for stream in [false, true] {
+                let body = Q27Adapter::configured_backend_request(&execution, &request, stream);
+                if request
+                    .messages
+                    .iter()
+                    .any(|message| message.name.is_some())
+                {
+                    assert!(matches!(body, Err(EngineError::MessageNamesUnsupported)));
+                    assert!(matches!(
+                        adapter.backend_request(&request, stream),
+                        Err(EngineError::MessageNamesUnsupported)
+                    ));
+                } else {
+                    let (route, body) = body.unwrap();
+                    assert_eq!(route, "/v1/chat/completions");
+                    assert_eq!(
+                        body["messages"],
+                        json!(&fixture["native_messages"].as_array().unwrap()[..length])
+                    );
+                }
+            }
+        }
+        // Native q27 must keep all parallel history for unnamed participants.
+        let mut unnamed = inference_request(GenerationSettingsPatch::default());
+        unnamed.messages = messages;
+        for message in &mut unnamed.messages {
+            message.name = None;
+        }
+        let mut expected = fixture["native_messages"].clone();
+        for message in expected.as_array_mut().unwrap() {
+            message.as_object_mut().unwrap().remove("name");
+        }
+        for stream in [false, true] {
+            let (_, body) =
+                Q27Adapter::configured_backend_request(&execution, &unnamed, stream).unwrap();
+            assert_eq!(body["messages"], expected);
+        }
+    }
+
+    #[test]
+    fn named_participants_reach_external_template_without_native_name_fields() {
+        let template = "{% for m in messages %}{{ m.role }}:{{ m.name|default('unnamed') }}:{{ m.content }}\n{% endfor %}";
+        let mut request = inference_request(GenerationSettingsPatch::default());
+        request.messages.clear();
+        for (role, name) in [
+            (InferenceRole::System, "policy"),
+            (InferenceRole::Developer, "app"),
+            (InferenceRole::User, "coder"),
+            (InferenceRole::Assistant, "helper"),
+        ] {
+            let mut message = InferenceMessage::text(role, "original content");
+            message.name = Some(name.into());
+            request.messages.push(message);
+        }
+        let execution = Q27ConfiguredExecution {
+            settings: resolved(&[]),
+            sharp_template: Some(template.into()),
+            compiled_w_max: Some(12),
+            selected_kv_mode: None,
+            capabilities: exact_capabilities(),
+        };
+        for stream in [false, true] {
+            let (route, body) =
+                Q27Adapter::configured_backend_request(&execution, &request, stream).unwrap();
+            assert_eq!(route, "/v1/completions");
+            assert!(body.get("messages").is_none());
+            assert_eq!(
+                body["prompt"],
+                "system:policy:original content\ndeveloper:app:original content\nuser:coder:original content\nassistant:helper:original content\n"
+            );
+        }
+        let mut native = execution.clone();
+        native.sharp_template = None;
+        for message in request.messages.clone() {
+            request.messages = vec![message];
+            assert!(matches!(
+                Q27Adapter::configured_backend_request(&native, &request, false),
+                Err(EngineError::MessageNamesUnsupported)
+            ));
+        }
     }
 
     #[test]

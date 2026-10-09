@@ -2444,6 +2444,17 @@ fn find_sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
 }
 
 fn backend_messages(messages: &[InferenceMessage]) -> Vec<Value> {
+    // The unnamed legacy path combines instructions. Named instructions must
+    // retain their individual identity and position for the native Jinja input.
+    if messages.iter().any(|message| {
+        message.name.is_some()
+            && matches!(
+                message.role,
+                InferenceRole::System | InferenceRole::Developer
+            )
+    }) {
+        return messages.iter().map(message_json).collect();
+    }
     let instructions = messages
         .iter()
         .filter(|message| {
@@ -2486,6 +2497,9 @@ fn message_json(message: &InferenceMessage) -> Value {
         },
         "content": message.text_only().unwrap_or_default(),
     });
+    if let Some(name) = &message.name {
+        value["name"] = json!(name);
+    }
     if !message.tool_calls.is_empty() {
         value["tool_calls"] = Value::Array(
             message
@@ -6376,6 +6390,63 @@ mod generation_settings_tests {
             max_output_tokens: Some(123),
             stream: false,
         }
+    }
+
+    #[test]
+    fn named_message_native_serialization_preserves_history_and_identity() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../scala-engine/testdata/named-chat-messages.json"
+        ))
+        .unwrap();
+        let messages: Vec<InferenceMessage> =
+            serde_json::from_value(fixture["normalized_messages"].clone()).unwrap();
+        let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
+        for length in fixture["turns"].as_object().unwrap().values() {
+            let length = length.as_u64().unwrap() as usize;
+            let mut request = request(GenerationSettingsPatch::default());
+            request.messages = messages[..length].to_vec();
+            let mut expected = fixture["native_messages"].as_array().unwrap()[..length].to_vec();
+            for message in &mut expected {
+                if message["content"].is_null() {
+                    message["content"] = json!("");
+                }
+            }
+            for stream in [false, true] {
+                assert_eq!(
+                    adapter.backend_request(&request, stream)["messages"],
+                    json!(expected)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn named_instructions_keep_each_identity_and_message_position() {
+        let mut first = InferenceMessage::text(InferenceRole::System, "first instruction");
+        first.name = Some("policy".into());
+        let mut second = InferenceMessage::text(InferenceRole::Developer, "second instruction");
+        second.name = Some("application".into());
+        let messages = vec![
+            first,
+            InferenceMessage::text(InferenceRole::User, "query"),
+            second,
+        ];
+        assert_eq!(
+            backend_messages(&messages),
+            vec![
+                json!({"role":"system","name":"policy","content":"first instruction"}),
+                json!({"role":"user","content":"query"}),
+                json!({"role":"system","name":"application","content":"second instruction"}),
+            ]
+        );
+        let unnamed = vec![
+            InferenceMessage::text(InferenceRole::System, "first"),
+            InferenceMessage::text(InferenceRole::Developer, "second"),
+        ];
+        assert_eq!(
+            backend_messages(&unnamed),
+            vec![json!({"role":"system","content":"first\n\nsecond"})]
+        );
     }
 
     #[test]

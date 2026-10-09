@@ -359,6 +359,8 @@ pub enum RuntimeError {
     BackendCrashed(String),
     #[error("invalid generation settings: {0}")]
     InvalidGenerationSettings(String),
+    #[error("the active native chat template cannot preserve message participant names")]
+    MessageNamesUnsupported,
     #[error("backend inference failed: {0}")]
     Inference(String),
     #[error("backend inference timed out: {0}")]
@@ -3364,6 +3366,7 @@ fn map_inference_error(error: EngineError) -> RuntimeError {
         EngineError::InvalidGenerationSettings(message) => {
             RuntimeError::InvalidGenerationSettings(message)
         }
+        EngineError::MessageNamesUnsupported => RuntimeError::MessageNamesUnsupported,
         EngineError::Unsupported(_) => RuntimeError::UnsupportedCapability,
         EngineError::TimedOut(message) => RuntimeError::InferenceTimedOut(message),
         EngineError::BackendUnavailable(message) => RuntimeError::InferenceUnavailable(message),
@@ -3407,6 +3410,14 @@ fn retry_context_capacity_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_message_capability_errors_survive_runtime_mapping() {
+        assert!(matches!(
+            super::map_inference_error(crate::EngineError::MessageNamesUnsupported),
+            super::RuntimeError::MessageNamesUnsupported
+        ));
+    }
 
     #[test]
     fn reasoning_request_precedence_preserves_effective_defaults_and_sources() {

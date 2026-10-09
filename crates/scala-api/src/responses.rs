@@ -265,6 +265,7 @@ fn parse_input_item(value: &Value, index: usize) -> Result<Vec<InferenceMessage>
         }
         return Ok(vec![InferenceMessage {
             role: InferenceRole::Assistant,
+            name: None,
             content: Vec::new(),
             tool_calls: vec![InferenceToolCall {
                 id: call_id,
@@ -296,6 +297,7 @@ fn parse_input_item(value: &Value, index: usize) -> Result<Vec<InferenceMessage>
         })?;
         return Ok(vec![InferenceMessage {
             role: InferenceRole::Tool,
+            name: None,
             content: parse_responses_content(
                 output,
                 &format!("{parameter}.output"),
@@ -331,6 +333,7 @@ fn parse_input_item(value: &Value, index: usize) -> Result<Vec<InferenceMessage>
     })?;
     Ok(vec![InferenceMessage {
         role,
+        name: None,
         content: parse_responses_content(content, &format!("{parameter}.content"), role)?,
         tool_calls: Vec::new(),
         tool_call_id: None,

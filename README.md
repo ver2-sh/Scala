@@ -902,6 +902,11 @@ reasoning effort and local thinking toggle/budget extensions,
 `response_format` text/JSON object/JSON Schema, and `max_completion_tokens` with its deprecated
 `max_tokens` alias. Equal token-limit aliases are accepted and conflicting aliases fail.
 Ordinary function tools use standard assistant `tool_calls` and tool-result history shapes.
+Chat participant names are retained for supported native templates. Named tool-result
+compatibility hints must match an earlier assistant call's ID and function name before
+being omitted as redundant. Native NInfer and native q27 chat cannot preserve participant
+names; they return `unsupported_message_name` rather than discarding identity. See
+[Chat message names](docs/chat-message-names.md) for validation, engine behavior and limits.
 Requests for multiple choices, logprobs, audio, stored completions, or stream obfuscation are
 rejected. Stream options require `stream=true`. Both public parsers produce the same
 engine-neutral `InferenceRequest`; neither endpoint proxies upstream JSON.

@@ -2724,6 +2724,13 @@ impl EngineAdapter for NinferAdapter {
         backend_defaults: &EffectiveGenerationSettings,
         _settings_schema: &scala_core::SettingsSchema,
     ) -> Result<(), EngineError> {
+        if request
+            .messages
+            .iter()
+            .any(|message| message.name.is_some())
+        {
+            return Err(EngineError::MessageNamesUnsupported);
+        }
         self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
         if matches!(
             request.output_format.as_ref(),

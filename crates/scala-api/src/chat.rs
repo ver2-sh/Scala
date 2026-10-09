@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 
 use axum::Json;
@@ -208,6 +208,7 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
         .enumerate()
         .map(|(index, message)| parse_message(message, index))
         .collect::<Result<Vec<_>, _>>()?;
+    let messages = normalize_tool_result_names(messages)?;
     let output_format = parse_response_format(object.get("response_format"))?;
     Ok(ParsedRequest {
         normalized: NormalizedRequest {
@@ -249,10 +250,11 @@ fn parse_message(value: &Value, index: usize) -> Result<InferenceMessage, OpenAi
         ],
         "Chat message",
     )?;
-    for field in ["name", "audio", "function_call", "refusal"] {
+    for field in ["audio", "function_call", "refusal"] {
         require_null_or(message, field, |_| false, "`null`")?;
     }
     let role = role(message.get("role"), &format!("{parameter}.role"))?;
+    let name = parse_message_name(message.get("name"), &format!("{parameter}.name"))?;
     let tool_calls = parse_message_tool_calls(message.get("tool_calls"), &parameter, role)?;
     let content = match message.get("content") {
         None | Some(Value::Null) if role == InferenceRole::Assistant && !tool_calls.is_empty() => {
@@ -289,10 +291,75 @@ fn parse_message(value: &Value, index: usize) -> Result<InferenceMessage, OpenAi
     };
     Ok(InferenceMessage {
         role,
+        name,
         content,
         tool_calls,
         tool_call_id,
     })
+}
+
+fn parse_message_name(
+    value: Option<&Value>,
+    parameter: &str,
+) -> Result<Option<String>, OpenAiError> {
+    let value = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value,
+    };
+    let name = value.as_str().ok_or_else(|| {
+        OpenAiError::invalid(
+            "Message `name` must be a string or null.",
+            Some(parameter),
+            "invalid_type",
+        )
+    })?;
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(OpenAiError::invalid(
+            "Message `name` must match [A-Za-z0-9_-]{1,64}.",
+            Some(parameter),
+            "invalid_value",
+        ));
+    }
+    Ok(Some(name.to_owned()))
+}
+
+fn normalize_tool_result_names(
+    mut messages: Vec<InferenceMessage>,
+) -> Result<Vec<InferenceMessage>, OpenAiError> {
+    let mut call_names = HashMap::new();
+    for (index, message) in messages.iter_mut().enumerate() {
+        if message.role == InferenceRole::Assistant {
+            for call in &message.tool_calls {
+                call_names.insert(call.id.as_str(), call.name.as_str());
+            }
+        }
+        if message.role != InferenceRole::Tool {
+            continue;
+        }
+        let Some(name) = message.name.as_deref() else {
+            continue;
+        };
+        // A tool-result name is a compatibility hint, not a second tool selector.
+        // Only an earlier assistant call can establish that it is redundant.
+        let call_name = message
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| call_names.get(id));
+        if call_name.is_none_or(|call_name| *call_name != name) {
+            return Err(OpenAiError::invalid(
+                "A named tool result must match the function name of an earlier assistant tool call with the same `tool_call_id`.",
+                Some(format!("messages[{index}].name")),
+                "invalid_value",
+            ));
+        }
+        message.name = None;
+    }
+    Ok(messages)
 }
 
 fn parse_chat_content(
@@ -1099,6 +1166,161 @@ mod tests {
     use serde_json::json;
 
     use super::{ChatContext, completion_document, parse_request, streaming_response};
+
+    #[test]
+    fn named_message_public_requests_preserve_history_and_tool_meaning() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../scala-engine/testdata/named-chat-messages.json"
+        ))
+        .unwrap();
+        let expected: Vec<scala_engine::InferenceMessage> =
+            serde_json::from_value(fixture["normalized_messages"].clone()).unwrap();
+        for (scenario, length) in fixture["turns"].as_object().unwrap() {
+            let length = length.as_u64().unwrap() as usize;
+            for streaming in [false, true] {
+                let mut request = fixture["request"].clone();
+                request["messages"].as_array_mut().unwrap().truncate(length);
+                request["stream"] = json!(streaming);
+                let parsed = parse_request(request)
+                    .unwrap()
+                    .normalized
+                    .inference_request()
+                    .unwrap();
+                assert_eq!(parsed.messages, expected[..length], "{scenario}");
+                assert_eq!(parsed.stream, streaming);
+                assert!(parsed.tools.is_empty()); // History names grant no tools.
+            }
+        }
+        // Existing clients can replay the same parallel history without
+        // participant names, while retaining named tool-result hints.
+        let mut request = fixture["request"].clone();
+        for message in request["messages"].as_array_mut().unwrap() {
+            if message["role"] != "tool" {
+                message.as_object_mut().unwrap().remove("name");
+            }
+        }
+        let mut expected = expected;
+        for message in &mut expected {
+            message.name = None;
+        }
+        assert_eq!(
+            parse_request(request).unwrap().normalized.messages,
+            expected
+        );
+    }
+
+    #[test]
+    fn participant_names_are_metadata_on_canonical_roles() {
+        for role in ["system", "developer", "user", "assistant"] {
+            for name in ["system".to_owned(), "user-2_ABC".to_owned(), "a".repeat(64)] {
+                let parsed = parse_request(json!({"model":"model", "messages":[
+                    {"role":role,"name":name,"content":"original content"}
+                ]}))
+                .unwrap();
+                let message = &parsed.normalized.messages[0];
+                assert_eq!(message.name.as_deref(), Some(name.as_str()));
+                assert_eq!(serde_json::to_value(message.role).unwrap(), role);
+                assert_eq!(message.text_only().as_deref(), Some("original content"));
+            }
+            for message in [
+                json!({"role":role,"content":"hello"}),
+                json!({"role":role,"content":"hello","name":null}),
+            ] {
+                let parsed = parse_request(json!({"model":"model","messages":[message]})).unwrap();
+                assert_eq!(parsed.normalized.messages[0].name, None);
+                assert!(
+                    serde_json::to_value(&parsed.normalized.messages[0])
+                        .unwrap()
+                        .get("name")
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_names_and_unrelated_fields_remain_errors() {
+        for role in ["system", "developer", "user", "assistant", "tool"] {
+            for name in [
+                json!(""),
+                json!(" "),
+                json!("two words"),
+                json!("line\nbreak"),
+                json!("<|system|>"),
+                json!("é"),
+                json!("a".repeat(65)),
+                json!(42),
+                json!(true),
+                json!([]),
+                json!({"name":"x"}),
+            ] {
+                let error = parse_request(json!({"model":"model","messages":[
+                    {"role":role,"content":"hello","name":name,"tool_call_id":null}
+                ]}))
+                .unwrap_err();
+                assert_eq!(error.envelope()["error"]["param"], "messages[0].name");
+            }
+        }
+        for message in [
+            json!({"role":"function","name":"web_search","content":"result"}),
+            json!({"role":"user","name":"coder","content":"hello","capability":"edit_file"}),
+            json!({"role":"assistant","name":"helper","content":"hello","function_call":{}}),
+            json!({"role":"user","name":"coder","content":"hello","tool_call_id":"call"}),
+        ] {
+            assert!(parse_request(json!({"model":"model","messages":[message]})).is_err());
+        }
+    }
+
+    #[test]
+    fn tool_result_names_require_matching_earlier_call_identifiers() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../scala-engine/testdata/named-chat-messages.json"
+        ))
+        .unwrap();
+        for name in [None, Some(json!(null)), Some(json!("web_search"))] {
+            let mut request = fixture["request"].clone();
+            request["messages"].as_array_mut().unwrap().truncate(3);
+            request["messages"][2]
+                .as_object_mut()
+                .unwrap()
+                .remove("name");
+            if let Some(name) = name {
+                request["messages"][2]["name"] = name;
+            }
+            assert_eq!(
+                parse_request(request).unwrap().normalized.messages[2].name,
+                None
+            );
+        }
+        for field in ["name", "tool_call_id"] {
+            let mut request = fixture["request"].clone();
+            request["messages"].as_array_mut().unwrap().truncate(3);
+            request["messages"][2][field] = json!("wrong");
+            assert!(parse_request(request).is_err());
+        }
+        for identifier in [None, Some(json!(null)), Some(json!("")), Some(json!(42))] {
+            let mut request = fixture["request"].clone();
+            request["messages"].as_array_mut().unwrap().truncate(3);
+            request["messages"][2]
+                .as_object_mut()
+                .unwrap()
+                .remove("tool_call_id");
+            if let Some(identifier) = identifier {
+                request["messages"][2]["tool_call_id"] = identifier;
+            }
+            assert!(parse_request(request).is_err());
+        }
+        let mut request = fixture["request"].clone();
+        request["messages"] = json!([
+            fixture["request"]["messages"][2].clone(),
+            fixture["request"]["messages"][1].clone()
+        ]);
+        assert!(parse_request(request).is_err()); // A later call cannot establish identity.
+        // Each result is matched by ID, independently of positional order.
+        let mut request = fixture["request"].clone();
+        request["messages"].as_array_mut().unwrap().swap(11, 12);
+        assert!(parse_request(request).is_ok());
+    }
 
     #[test]
     fn thinking_objects_validate_and_merge_explicit_controls() {

@@ -1,0 +1,392 @@
+{
+  "turns": {
+    "ordinary": 1,
+    "web_search": 3,
+    "edit_file": 7,
+    "code_mode": 10,
+    "multiple_results": 13,
+    "later_turn": 15
+  },
+  "request": {
+    "model": "model",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "search-1",
+            "type": "function",
+            "function": {
+              "name": "web_search",
+              "arguments": "{\"query\":\"Rust docs\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "name": "web_search",
+        "tool_call_id": "search-1",
+        "content": "Public search result"
+      },
+      {
+        "role": "assistant",
+        "content": "Here are the results."
+      },
+      {
+        "role": "user",
+        "content": "Edit example.txt"
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "edit-1",
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "arguments": "{\"path\":\"example.txt\",\"content\":\"example\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "name": "edit_file",
+        "tool_call_id": "edit-1",
+        "content": "File updated"
+      },
+      {
+        "role": "assistant",
+        "content": "The edit is complete."
+      },
+      {
+        "role": "user",
+        "name": "coder",
+        "content": "Check the code and sources."
+      },
+      {
+        "role": "assistant",
+        "name": "code_helper",
+        "content": "I will check both."
+      },
+      {
+        "role": "assistant",
+        "name": "code_helper",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "search-2",
+            "type": "function",
+            "function": {
+              "name": "web_search",
+              "arguments": "{\"query\":\"example\"}"
+            }
+          },
+          {
+            "id": "edit-2",
+            "type": "function",
+            "function": {
+              "name": "edit_file",
+              "arguments": "{\"path\":\"example.txt\",\"content\":\"revised\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "name": "web_search",
+        "tool_call_id": "search-2",
+        "content": "Second search result"
+      },
+      {
+        "role": "tool",
+        "name": "edit_file",
+        "tool_call_id": "edit-2",
+        "content": "Second edit completed"
+      },
+      {
+        "role": "assistant",
+        "name": "code_helper",
+        "content": "Both tasks are complete."
+      },
+      {
+        "role": "user",
+        "name": "coder",
+        "content": "Continue using the previous history."
+      }
+    ]
+  },
+  "normalized_messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Hello"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [],
+      "tool_calls": [
+        {
+          "id": "search-1",
+          "name": "web_search",
+          "arguments": "{\"query\":\"Rust docs\"}"
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": [
+        {
+          "type": "text",
+          "text": "Public search result"
+        }
+      ],
+      "tool_call_id": "search-1"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Here are the results."
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Edit example.txt"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [],
+      "tool_calls": [
+        {
+          "id": "edit-1",
+          "name": "edit_file",
+          "arguments": "{\"path\":\"example.txt\",\"content\":\"example\"}"
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": [
+        {
+          "type": "text",
+          "text": "File updated"
+        }
+      ],
+      "tool_call_id": "edit-1"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "The edit is complete."
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Check the code and sources."
+        }
+      ],
+      "name": "coder"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "I will check both."
+        }
+      ],
+      "name": "code_helper"
+    },
+    {
+      "role": "assistant",
+      "content": [],
+      "name": "code_helper",
+      "tool_calls": [
+        {
+          "id": "search-2",
+          "name": "web_search",
+          "arguments": "{\"query\":\"example\"}"
+        },
+        {
+          "id": "edit-2",
+          "name": "edit_file",
+          "arguments": "{\"path\":\"example.txt\",\"content\":\"revised\"}"
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": [
+        {
+          "type": "text",
+          "text": "Second search result"
+        }
+      ],
+      "tool_call_id": "search-2"
+    },
+    {
+      "role": "tool",
+      "content": [
+        {
+          "type": "text",
+          "text": "Second edit completed"
+        }
+      ],
+      "tool_call_id": "edit-2"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Both tasks are complete."
+        }
+      ],
+      "name": "code_helper"
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Continue using the previous history."
+        }
+      ],
+      "name": "coder"
+    }
+  ],
+  "native_messages": [
+    {
+      "role": "user",
+      "content": "Hello"
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "search-1",
+          "type": "function",
+          "function": {
+            "name": "web_search",
+            "arguments": "{\"query\":\"Rust docs\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "search-1",
+      "content": "Public search result"
+    },
+    {
+      "role": "assistant",
+      "content": "Here are the results."
+    },
+    {
+      "role": "user",
+      "content": "Edit example.txt"
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "edit-1",
+          "type": "function",
+          "function": {
+            "name": "edit_file",
+            "arguments": "{\"path\":\"example.txt\",\"content\":\"example\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "edit-1",
+      "content": "File updated"
+    },
+    {
+      "role": "assistant",
+      "content": "The edit is complete."
+    },
+    {
+      "role": "user",
+      "name": "coder",
+      "content": "Check the code and sources."
+    },
+    {
+      "role": "assistant",
+      "name": "code_helper",
+      "content": "I will check both."
+    },
+    {
+      "role": "assistant",
+      "name": "code_helper",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "search-2",
+          "type": "function",
+          "function": {
+            "name": "web_search",
+            "arguments": "{\"query\":\"example\"}"
+          }
+        },
+        {
+          "id": "edit-2",
+          "type": "function",
+          "function": {
+            "name": "edit_file",
+            "arguments": "{\"path\":\"example.txt\",\"content\":\"revised\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "search-2",
+      "content": "Second search result"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "edit-2",
+      "content": "Second edit completed"
+    },
+    {
+      "role": "assistant",
+      "name": "code_helper",
+      "content": "Both tasks are complete."
+    },
+    {
+      "role": "user",
+      "name": "coder",
+      "content": "Continue using the previous history."
+    }
+  ]
+}

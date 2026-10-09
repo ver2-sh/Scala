@@ -1140,6 +1140,10 @@ pub struct InferenceToolCall {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InferenceMessage {
     pub role: InferenceRole,
+    /// Participant identity for chat templates, never authority or a role override.
+    /// Redundant Chat tool-result names are validated against their call and omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub content: Vec<InferenceContentPart>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<InferenceToolCall>,
@@ -1151,6 +1155,7 @@ impl InferenceMessage {
     pub fn text(role: InferenceRole, text: impl Into<String>) -> Self {
         Self {
             role,
+            name: None,
             content: vec![InferenceContentPart::Text { text: text.into() }],
             tool_calls: Vec::new(),
             tool_call_id: None,
@@ -1535,6 +1540,8 @@ pub enum EngineError {
     InvalidDecisionRequest(String),
     #[error("invalid generation settings: {0}")]
     InvalidGenerationSettings(String),
+    #[error("the active native chat template cannot preserve message participant names")]
+    MessageNamesUnsupported,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2286,6 +2293,25 @@ mod tests {
         id: &'static str,
         architecture: &'static str,
         format: ArtifactFormat,
+    }
+
+    #[test]
+    fn named_message_serde_retains_identity_and_reads_unnamed_history() {
+        let old = serde_json::json!({"role":"user","content":[{"type":"text","text":"hello"}]});
+        let mut message: super::InferenceMessage = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(message.name, None);
+        assert_eq!(serde_json::to_value(&message).unwrap(), old);
+        message.name = Some("coder".into());
+        let encoded = serde_json::to_value(&message).unwrap();
+        assert_eq!(encoded["name"], "coder");
+        assert_eq!(
+            serde_json::from_value::<super::InferenceMessage>(encoded).unwrap(),
+            message
+        );
+        assert_eq!(
+            super::InferenceMessage::text(InferenceRole::User, "hello").name,
+            None
+        );
     }
 
     #[test]

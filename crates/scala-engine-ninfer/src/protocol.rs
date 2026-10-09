@@ -30,6 +30,13 @@ pub(crate) fn backend_request(
     streaming: bool,
     admission: RequestAdmission,
 ) -> Result<Value, EngineError> {
+    if request
+        .messages
+        .iter()
+        .any(|message| message.name.is_some())
+    {
+        return Err(EngineError::MessageNamesUnsupported);
+    }
     request.generation_settings.validate_reasoning_controls()?;
     if !admission.sampler_semantics
         && (request.generation_settings.temperature.is_some()
@@ -766,6 +773,66 @@ mod tests {
             media_semantics: true,
             vision: false,
             greedy: false,
+        }
+    }
+
+    #[test]
+    fn named_message_native_serialization_preserves_tools_and_rejects_participants() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../scala-engine/testdata/named-chat-messages.json"
+        ))
+        .unwrap();
+        let messages: Vec<InferenceMessage> =
+            serde_json::from_value(fixture["normalized_messages"].clone()).unwrap();
+        for length in fixture["turns"].as_object().unwrap().values() {
+            let length = length.as_u64().unwrap() as usize;
+            let mut request = request();
+            request.messages = messages[..length].to_vec();
+            for stream in [false, true] {
+                let body = backend_request(&request, stream, thinking_admission());
+                if request
+                    .messages
+                    .iter()
+                    .any(|message| message.name.is_some())
+                {
+                    assert!(matches!(body, Err(EngineError::MessageNamesUnsupported)));
+                } else {
+                    let expected = &fixture["native_messages"].as_array().unwrap()[..length];
+                    assert_eq!(body.unwrap()["messages"], json!(expected));
+                }
+            }
+        }
+        // An unnamed participant variant must still serialize all parallel
+        // calls, consecutive results and later history without reordering.
+        let mut unnamed = request();
+        unnamed.messages = messages;
+        for message in &mut unnamed.messages {
+            message.name = None;
+        }
+        let mut expected = fixture["native_messages"].clone();
+        for message in expected.as_array_mut().unwrap() {
+            message.as_object_mut().unwrap().remove("name");
+        }
+        for stream in [false, true] {
+            assert_eq!(
+                backend_request(&unnamed, stream, thinking_admission()).unwrap()["messages"],
+                expected
+            );
+        }
+        // Even a single named instruction or participant cannot be forwarded.
+        for role in [
+            InferenceRole::System,
+            InferenceRole::Developer,
+            InferenceRole::User,
+            InferenceRole::Assistant,
+        ] {
+            let mut request = request();
+            request.messages = vec![InferenceMessage::text(role, "original content")];
+            request.messages[0].name = Some("participant".into());
+            assert!(matches!(
+                backend_request(&request, false, thinking_admission()),
+                Err(EngineError::MessageNamesUnsupported)
+            ));
         }
     }
 

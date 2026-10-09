@@ -194,6 +194,11 @@ pub(crate) fn runtime_error(error: RuntimeError) -> OpenAiError {
             parameter: None,
             code: "unsupported_generation_settings",
         },
+        RuntimeError::MessageNamesUnsupported => OpenAiError::invalid(
+            "The active native chat template cannot preserve message participant names.",
+            Some("messages"),
+            "unsupported_message_name",
+        ),
         _ => OpenAiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "The local inference runtime is not available for this request.".to_owned(),
@@ -217,6 +222,21 @@ mod tests {
 
     use super::OpenAiError;
     use crate::MAX_INFERENCE_BODY_BYTES;
+
+    #[test]
+    fn unsupported_message_names_return_a_specific_safe_400() {
+        let error = super::runtime_error(scala_engine::RuntimeError::MessageNamesUnsupported);
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.envelope()["error"]["code"],
+            "unsupported_message_name"
+        );
+        assert_eq!(error.envelope()["error"]["param"], "messages");
+        assert_eq!(
+            error.envelope()["error"]["message"],
+            "The active native chat template cannot preserve message participant names."
+        );
+    }
 
     #[test]
     fn reasoning_capability_errors_keep_client_safe_explanations() {
