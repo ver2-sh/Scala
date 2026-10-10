@@ -1,8 +1,10 @@
 """Static/synthetic validation. Never import a real tensor runtime or score a model."""
 import copy
+import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import types
@@ -16,6 +18,26 @@ spec.loader.exec_module(runtime)
 
 
 class ClosureTests(unittest.TestCase):
+    def interpreter(self, root):
+        stack = contextlib.ExitStack()
+        if runtime.os.name == "nt":
+            base, env = root / "python", root / "env"
+            base.mkdir()
+            (env / "Scripts").mkdir(parents=True)
+            executable = env / "Scripts/python.exe"
+            executable.write_bytes(b"synthetic redirector")
+            (base / "python.exe").write_bytes(b"synthetic interpreter")
+            (base / "python312.dll").write_bytes(b"synthetic DLL")
+            (env / "pyvenv.cfg").write_text("synthetic virtual environment")
+            (env / "Lib/site-packages").mkdir(parents=True)
+            (env / "Lib/site-packages/_virtualenv.py").write_text("# synthetic activation hook\n")
+            executable.with_name("scala-native-decision.json").write_text(json.dumps({
+                "protocol": runtime.PROTOCOL, "interpreter": str(executable),
+                "runner": str(Path(runtime.__file__).resolve())}))
+            for name, value in (("executable", str(executable)), ("prefix", str(env)), ("base_prefix", str(base))):
+                stack.enter_context(patch.object(runtime.sys, name, value))
+        return stack
+
     def fixture(self, root, backend):
         sources = {}
         roles = {"model": ["config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json", "shim.py", "serve.json"]} if backend == "vllm-labels" else {"adapter": ["adapter_config.json", "adapter_model.safetensors", "decision_readout.json", "decision_readout.safetensors", "calibration.json"], "base": ["config.json", "model.safetensors"]}
@@ -67,7 +89,24 @@ class ClosureTests(unittest.TestCase):
             del source["files"]["../escape"]
             p = Path(source["path"]) / "model.safetensors"
             p.unlink()
-            p.symlink_to(path)
+            try:
+                p.symlink_to(path)
+            except OSError as error:
+                if os.name != "nt" or error.winerror != 1314:
+                    raise
+                # Native Windows directory junctions require no symlink
+                # privilege. Exercise canonical alias rejection without
+                # changing Developer Mode or security policy.
+                import subprocess
+                p.write_bytes(b"synthetic")
+                alias = Path(tmp) / "alias"
+                subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), source["path"]],
+                               check=True, stdout=subprocess.DEVNULL)
+                source["path"] = str(alias)
+                path.write_text(json.dumps(cfg))
+                with self.assertRaisesRegex(ValueError, "Invalid source root"):
+                    runtime.bundle(path)
+                return
             path.write_text(json.dumps(cfg))
             with self.assertRaisesRegex(ValueError, "canonical"):
                 runtime.bundle(path)
@@ -111,8 +150,13 @@ class ClosureTests(unittest.TestCase):
             path = root / "runtime.json"
             path.write_text(json.dumps(cfg))
             distributions = {name: types.SimpleNamespace(version="1", metadata={"Name": name}, files=[record], locate_file=lambda _: wheel_file) for name in packages}
-            with patch.object(runtime.importlib.metadata, "distribution", side_effect=distributions.__getitem__), patch.object(runtime.importlib.metadata, "distributions", return_value=list(distributions.values())):
-                self.assertEqual(runtime.runtime_identity(path)[0], cfg)
+            with self.interpreter(root), patch.object(runtime.importlib.metadata, "distribution", side_effect=distributions.__getitem__), patch.object(runtime.importlib.metadata, "distributions", return_value=list(distributions.values())):
+                observed, revision = runtime.runtime_identity(path)
+                self.assertEqual(observed, cfg)
+                if runtime.os.name == "nt":
+                    hook = Path(runtime.sys.prefix) / "Lib/site-packages/_virtualenv.py"
+                    hook.write_text("# changed activation hook\n")
+                    self.assertNotEqual(runtime.runtime_identity(path)[1], revision)
                 wheel_file.write_text("# changed wheel\n")
                 with self.assertRaisesRegex(ValueError, "Runtime package file changed"):
                     runtime.runtime_identity(path)
@@ -157,7 +201,7 @@ class ClosureTests(unittest.TestCase):
                               "entrypoint": "shim.py", "files": {"shim.py": {"size_bytes": source.stat().st_size, "sha256": runtime.sha(source)}}},
                    "wheel_attestations": {"pynvvideocodec": attestation}}
             path = root / "runtime.json"
-            with patch.object(runtime.importlib.metadata, "distribution", side_effect=dist.__getitem__), patch.object(runtime.importlib.metadata, "distributions", return_value=list(dist.values())):
+            with self.interpreter(root), patch.object(runtime.importlib.metadata, "distribution", side_effect=dist.__getitem__), patch.object(runtime.importlib.metadata, "distributions", return_value=list(dist.values())):
                 path.write_text(json.dumps(cfg))
                 self.assertEqual(runtime.runtime_identity(path)[0], cfg)
                 unbound = copy.deepcopy(cfg)
@@ -179,8 +223,11 @@ class ClosureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path, cfg = self.fixture(Path(tmp), "torch-readout")
             loaded = []
-            torch = types.SimpleNamespace(float32="F32")
-            native_backend = types.SimpleNamespace(engine=types.SimpleNamespace(readout=types.SimpleNamespace(weight=types.SimpleNamespace(dtype="F32"))), torch=torch)
+            cuda = types.SimpleNamespace(is_available=lambda: True, get_device_name=lambda: "synthetic CUDA", memory_allocated=lambda: 1, memory_reserved=lambda: 2)
+            torch = types.SimpleNamespace(float32="F32", cuda=cuda)
+            weight = types.SimpleNamespace(dtype="F32", device=types.SimpleNamespace(type="cuda"))
+            model = types.SimpleNamespace(parameters=lambda: [weight])
+            native_backend = types.SimpleNamespace(engine=types.SimpleNamespace(readout=types.SimpleNamespace(weight=weight), model=model), torch=torch)
             class App:
                 def middleware(self, *_):
                     return lambda function: function
@@ -197,6 +244,10 @@ class ClosureTests(unittest.TestCase):
                 self.assertFalse(loaded[1][1]["fast"])
                 self.assertFalse(loaded[1][1]["merge_lora"])
                 self.assertEqual(loaded[2][2]["calibration"], "native-calibrator")
+                weight.device.type = "cpu"
+                with self.assertRaisesRegex(ValueError, "complete model and readout on GPU"):
+                    runtime.serve_readout(settings, cfg, "revision", args)
+                weight.device.type = "cuda"
                 native_backend.engine.readout = None
                 with self.assertRaisesRegex(ValueError, "fallback forbidden"):
                     runtime.serve_readout(settings, cfg, "revision", args)
@@ -230,6 +281,42 @@ class ClosureTests(unittest.TestCase):
                 self.assertEqual(calls[1], (200, {"answers": {"x": {"type": "noul", "noul": 0.801}}}))
                 self.assertIn("vllm.entrypoints.openai.api_server", spawn.call_args.args[0])
                 self.assertIn(cfg["sources"]["model"]["path"], spawn.call_args.args[0])
+
+
+
+class WindowsVllmTests(unittest.TestCase):
+    def module(self):
+        spec = importlib.util.spec_from_file_location("windows_port_tests", Path(__file__).with_name("windows_vllm.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def config(self, port, root):
+        return {"backend": "vllm-labels", "packages": dict(port.VERSIONS),
+                "options": {"enforce_eager": True, "max_num_seqs": 4, "max_num_batched_tokens": 2048, "cpu_offload_gb": 0},
+                "windows_vllm": {"fork_revision": port.FORK_REVISION,
+                    "wheel": {"path": str(root / "original.whl"), "sha256": port.WHEEL_SHA256},
+                    "sdk": {"path": str(root), "files": {}},
+                    "environment": {**{name: str(root) for name in port.DIRECTORIES}, "USERNAME": "synthetic", "VLLM_USE_FLASHINFER_SAMPLER": "0"}}}
+
+    def test_build_version_platform_options_and_environment_are_strict(self):
+        port = self.module()
+        with tempfile.TemporaryDirectory() as temp:
+            cfg = self.config(port, Path(temp).resolve())
+            self.assertEqual(port.validate(cfg, True), cfg["windows_vllm"])
+            with self.assertRaises(ValueError): port.validate(cfg, False)
+            for mutate in (lambda c: c["packages"].update(vllm="0.30.0"),
+                           lambda c: c["windows_vllm"].update(fork_revision="0" * 40),
+                           lambda c: c["options"].update(cpu_offload_gb=1),
+                           lambda c: c["options"].update(enforce_eager=False),
+                           lambda c: c["windows_vllm"]["environment"].update(PATH="unbound"),
+                           lambda c: c["windows_vllm"]["wheel"].update(sha256="0" * 64)):
+                changed = copy.deepcopy(cfg); mutate(changed)
+                with self.assertRaises(ValueError): port.validate(changed, True)
+            command = port.command("C:/native python.exe", "D:/model 空", "source/model", 1234,
+                                   {**cfg, "options": {**cfg["options"], "max_model_len": 2048, "gpu_memory_utilization": 0.8}})
+            self.assertEqual(command[:6], ["C:/native python.exe", "-I", "-m", "vllm.entrypoints.cli.main", "serve", "D:/model 空"])
+            self.assertIn("--enforce-eager", command)
 
 
 if __name__ == "__main__":

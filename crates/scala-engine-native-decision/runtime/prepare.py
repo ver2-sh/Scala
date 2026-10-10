@@ -6,6 +6,7 @@ No profile, Scala Settings, runtime selection or production files are modified.
 import argparse
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shlex
 import shutil
@@ -25,7 +26,7 @@ def files(root, python_only=False):
         if not p.is_file() or any(part in {".git", ".cache", "__pycache__"} for part in p.relative_to(root).parts):
             continue
         runtime.regular(p)
-        result[str(p.relative_to(root))] = {"size_bytes": p.stat().st_size, "sha256": runtime.sha(p)}
+        result[p.relative_to(root).as_posix()] = {"size_bytes": p.stat().st_size, "sha256": runtime.sha(p)}
     return result
 
 
@@ -47,6 +48,7 @@ def main():
     r.add_argument("--wheel-attestation", action="append", nargs=4,
                    metavar=("PACKAGE", "ORIGINAL_WHEEL", "WHEEL_SHA256", "MISMATCHES_JSON"),
                    help="pin an original upstream wheel and exact known bad RECORD members; never alter installed bytes")
+    r.add_argument("--windows-vllm", type=Path, help="explicit qualified native Windows build, SDK and environment binding")
     r.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
     if args.mode == "bundle":
@@ -83,6 +85,8 @@ def main():
         cfg = {"schema_version": 1, "backend": args.backend, "packages": packages, "options": {k: json.loads(v) for k, v in args.option}}
         if len(cfg["options"]) != len(args.option):
             raise ValueError("Duplicate runtime option")
+        if args.windows_vllm:
+            cfg["windows_vllm"] = runtime.read_json(args.windows_vllm)
         if args.wheel_attestation:
             att = {}
             for package, wheel, wheel_hash, mismatches in args.wheel_attestation:
@@ -111,15 +115,36 @@ def main():
             if args.entrypoint not in inventory:
                 raise ValueError("Native label shim source is missing")
             cfg["source"] = {"path": str(root), "revision": args.source_revision, "entrypoint": args.entrypoint, "files": {args.entrypoint: inventory[args.entrypoint]}}
+        # A Windows runtime launches the actual venv executable directly. Never
+        # add a descriptor beside a shared/system interpreter.
+        launcher = python.with_name("scala-native-decision.json") if os.name == "nt" else None
+        if launcher:
+            isolated = json.loads(subprocess.check_output([str(python), "-I", "-c",
+                'import sys,json; print(json.dumps(sys.prefix != sys.base_prefix))'], text=True))
+            if not isolated or launcher.exists():
+                raise ValueError("Windows runtime requires an unbound dedicated virtual environment")
         args.output.mkdir(parents=True)
+        launcher_created = False
         try:
             (args.output / "runtime.json").write_text(json.dumps(cfg, indent=2) + "\n")
             shutil.copyfile(HERE / "server.py", args.output / "server.py")
-            entry = args.output / "native-decision-server"
-            entry.write_text("#!/bin/sh\nexec " + shlex.quote(str(python)) + " -I " + shlex.quote(str((args.output / "server.py").absolute())) + ' "$@"\n')
-            entry.chmod(0o755)
-            print(subprocess.check_output([str(entry.absolute()), "--scala-probe"], text=True).strip())
+            if args.windows_vllm:
+                shutil.copyfile(HERE / "windows_vllm.py", args.output / "windows_vllm.py")
+            if launcher:
+                with launcher.open("x", encoding="utf-8") as out:
+                    launcher_created = True
+                    json.dump({"protocol": runtime.PROTOCOL, "interpreter": str(python),
+                               "runner": str((args.output / "server.py").resolve(strict=True))}, out)
+                command = [str(python), "-I", str((args.output / "server.py").absolute())]
+            else:
+                entry = args.output / "native-decision-server"
+                entry.write_text("#!/bin/sh\nexec " + shlex.quote(str(python)) + " -I " + shlex.quote(str((args.output / "server.py").absolute())) + ' "$@"\n')
+                entry.chmod(0o755)
+                command = [str(entry.absolute())]
+            print(subprocess.check_output(command + ["--scala-probe"], text=True).strip())
         except BaseException:
+            if launcher_created:
+                launcher.unlink(missing_ok=True)
             shutil.rmtree(args.output)
             raise
 

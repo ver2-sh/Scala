@@ -29,11 +29,34 @@ BACKENDS = {"vllm-labels", "torch-readout"}
 
 
 def sha(path):
-    h = hashlib.sha256()
     with Path(path).open("rb") as f:
-        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+        # Most wheel members are tiny. Read them without allocating/zeroing a
+        # large bytearray per member; reuse a buffer for the remaining bytes of
+        # larger files. This hashes the same complete bytes on every platform.
+        first = f.read(64 * 1024)
+        digest = hashlib.sha256(first)
+        if len(first) < 64 * 1024:
+            return digest.hexdigest()
+        if hasattr(hashlib, "file_digest"):
+            return hashlib.file_digest(f, lambda: digest).hexdigest()
+        # Preserve Python 3.10 runtime compatibility.
+        buffer = bytearray(256 * 1024)
+        view = memoryview(buffer)
+        while size := f.readinto(buffer):
+            digest.update(view[:size])
+        return digest.hexdigest()
+
+
+def digests(paths):
+    if os.name == "nt" and len(paths) >= 128:
+        # Cold Windows opens of large header/DLL inventories can serialize on
+        # filesystem filters. Bound the I/O concurrency, preserving the exact
+        # ordered complete hashes and exceptions. This is metadata verification,
+        # never tensor execution or a discovery-time replacement for it.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            return list(pool.map(sha, paths))
+    return [sha(path) for path in paths]
 
 
 def read_json(path):
@@ -46,14 +69,28 @@ def read_json(path):
 
 def regular(path):
     path = Path(path)
-    if not path.is_absolute() or path.resolve(strict=True) != path or not path.is_file():
+    if not path.is_absolute() or not canonical_equal(path.resolve(strict=True), path) or not path.is_file():
         raise ValueError("Expected a canonical regular file")
     return path
 
 
+def canonical_equal(left, right):
+    # Rust canonical paths include the extended-length prefix. Compare only
+    # these two equivalent spellings; aliases/symlinks still fail resolution.
+    def spelling(path):
+        value = str(path)
+        if os.name == "nt":
+            if value.startswith("\\\\?\\UNC\\"):
+                value = "\\\\" + value[8:]
+            elif value.startswith("\\\\?\\"):
+                value = value[4:]
+        return value
+    return spelling(left) == spelling(right)
+
+
 def inventory(root, files, verify=True):
     root = Path(root)
-    if not root.is_absolute() or root.resolve(strict=True) != root or not root.is_dir() or not files:
+    if not root.is_absolute() or not canonical_equal(root.resolve(strict=True), root) or not root.is_dir() or not files:
         raise ValueError("Invalid source root/inventory")
     for relative, item in files.items():
         p = Path(relative)
@@ -99,7 +136,7 @@ def runtime_identity(config_path):
     cfg = read_json(config_path)
     common = {"schema_version", "backend", "packages", "options"}
     required_fields = common | {"source"}
-    allowed = required_fields | {"wheel_attestations"}
+    allowed = required_fields | {"wheel_attestations", "windows_vllm"}
     if not required_fields <= set(cfg) or set(cfg) - allowed or cfg["schema_version"] != 1 or cfg["backend"] not in BACKENDS:
         raise ValueError("Invalid explicit runtime configuration")
     source = cfg["source"]
@@ -109,12 +146,17 @@ def runtime_identity(config_path):
     root = inventory(source["path"], source["files"])
     options = cfg["options"]
     required = {"max_model_len", "gpu_memory_utilization", "min_context"} if cfg["backend"] == "vllm-labels" else {"rotations", "max_input_tokens", "device"}
+    windows_port = None
+    if "windows_vllm" in cfg:
+        windows_port = module("scala_windows_vllm", Path(__file__).with_name("windows_vllm.py"))
+        windows_port.validate(cfg, os.name == "nt")
+        required |= windows_port.EXTRA_OPTIONS
     if set(options) != required:
         raise ValueError("Runtime options must be explicit; unsupported overrides are rejected")
     if cfg["backend"] == "vllm-labels":
         if not isinstance(options["max_model_len"], int) or not isinstance(options["min_context"], int) or not 0 < options["min_context"] <= options["max_model_len"] or not 0 < options["gpu_memory_utilization"] < 1:
             raise ValueError("Invalid native context/memory configuration")
-        if cfg["packages"].get("vllm", "").split("+")[0] != "0.30.0":
+        if windows_port is None and cfg["packages"].get("vllm", "").split("+")[0] != "0.30.0":
             raise ValueError("This label readout contract requires vLLM 0.30.0")
         if source["entrypoint"] not in source["files"] or set(source["files"]) != {source["entrypoint"]}:
             raise ValueError("The label shim must be bound as runtime implementation code")
@@ -123,7 +165,7 @@ def runtime_identity(config_path):
         if options["rotations"] not in {1, 4} or not isinstance(options["max_input_tokens"], int) or options["max_input_tokens"] <= 0 or options["device"] not in {"cuda", "cpu", "mps"}:
             raise ValueError("Invalid native rotation/context/device configuration")
         required_packages = {"torch", "peft", "transformers", "safetensors", "fastapi", "uvicorn", "pydantic", "Pillow"}
-        actual = {str(p.relative_to(root)) for directory in (root / "src", root / "scripts") for p in directory.rglob("*.py")}
+        actual = {p.relative_to(root).as_posix() for directory in (root / "src", root / "scripts") for p in directory.rglob("*.py")}
         if actual != set(source["files"]):
             raise ValueError("Native implementation Python closure changed")
         if "scripts/playground/server.py" not in actual or "scripts/torch_decision.py" not in actual:
@@ -149,13 +191,14 @@ def runtime_identity(config_path):
         mismatches = attestation["mismatches"] if attestation else {}
         matched_mismatches = set()
         records = []
-        for file in dist.files or []:
-            if file.hash is None:
-                continue
-            path = Path(dist.locate_file(file))
-            if not path.is_file() or file.hash.mode != "sha256":
+        members = [file for file in dist.files or [] if file.hash is not None]
+        paths = [Path(dist.locate_file(file)) for file in members]
+        for file in members:
+            # Opening and hashing every member below also rejects missing files
+            # and directories. Avoid a separate serial Windows stat per member.
+            if file.hash.mode != "sha256":
                 raise ValueError(f"Unverifiable runtime package file: {file}")
-            observed_sha = sha(path)
+        for file, observed_sha in zip(members, digests(paths)):
             got = base64.urlsafe_b64encode(bytes.fromhex(observed_sha)).decode().rstrip("=")
             member = str(file)
             if got != file.hash.value:
@@ -176,6 +219,33 @@ def runtime_identity(config_path):
     if {normalize(d.metadata["Name"]) for d in importlib.metadata.distributions()} != {normalize(n) for n in cfg["packages"]}:
         raise ValueError("Runtime has unlocked distributions; use a dedicated, fully locked environment")
     identity = {"config": cfg, "packages": packages, "python": sha(Path(sys.executable).resolve()), "runner": sha(Path(__file__).resolve()), "python_version": sys.version}
+    if os.name == "nt":
+        launcher = regular(Path(sys.executable).with_name("scala-native-decision.json"))
+        launch = read_json(launcher)
+        if (set(launch) != {"protocol", "interpreter", "runner"} or launch["protocol"] != PROTOCOL
+                or sys.prefix == sys.base_prefix
+                or not canonical_equal(Path(launch["interpreter"]).resolve(strict=True), Path(sys.executable).resolve(strict=True))
+                or not canonical_equal(regular(Path(launch["runner"])), Path(__file__).resolve())):
+            raise ValueError("Invalid native Windows launcher/environment binding")
+        # Bind the redirector, base interpreter, DLL/stdlib environment and venv
+        # configuration, rather than merely hashing Windows' small python.exe.
+        base = Path(sys.base_prefix).resolve(strict=True)
+        interpreter_files = [p for p in base.rglob("*") if p.is_file()
+                             and "site-packages" not in p.parts and "__pycache__" not in p.parts]
+        interpreter_files.sort()
+        identity["windows_interpreter"] = {str(p.relative_to(base)): digest for p, digest in zip(interpreter_files, digests(interpreter_files))}
+        identity["windows_launcher"] = sha(launcher)
+        identity["windows_venv"] = sha(regular(Path(sys.prefix) / "pyvenv.cfg"))
+        # uv's venv activation hooks and native Python auxiliary wheel sites
+        # can affect import selection without belonging to a wheel RECORD.
+        # Bind their root-level Python/path controls as well as every wheel.
+        sites = {Path(sys.prefix) / "Lib/site-packages"}
+        sites.update(Path(d.locate_file("")) for d in importlib.metadata.distributions())
+        controls = sorted({p for site in sites if site.is_dir() for p in site.iterdir()
+                           if p.is_file() and p.suffix in {".py", ".pth"}})
+        identity["windows_site_controls"] = {str(p): digest for p, digest in zip(controls, digests(controls))}
+    if windows_port is not None:
+        identity["windows_vllm"] = windows_port.verify(cfg, packages, sys.modules[__name__])
     revision = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return cfg, revision
 
@@ -189,7 +259,7 @@ def bundle(path, verify=True):
             raise ValueError("Source needs its exact upstream identity")
         root = inventory(source["path"], source["files"], verify)
         # Reject unbound files that either native loader might consume.
-        actual = {str(p.relative_to(root)) for p in root.rglob("*") if p.is_file() and ".cache" not in p.parts and p.suffix in {".json", ".safetensors", ".py", ".jinja", ".txt"}}
+        actual = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file() and ".cache" not in p.parts and p.suffix in {".json", ".safetensors", ".py", ".jinja", ".txt"}}
         if actual - set(source["files"]):
             raise ValueError("Source contains unbound native input files")
     sources, bindings = cfg["sources"], cfg["bindings"]
@@ -255,6 +325,10 @@ def serve_labels(runtime, cfg, revision, args):
     options = runtime["options"]
     command = [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--model", str(root), "--served-model-name", contract.model,
                "--host", "127.0.0.1", "--port", str(port), "--max-model-len", str(options["max_model_len"]), "--gpu-memory-utilization", str(options["gpu_memory_utilization"])]
+    if "windows_vllm" in runtime:
+        port_runtime = module("scala_windows_vllm", Path(__file__).with_name("windows_vllm.py"))
+        command = port_runtime.command(sys.executable, root, contract.model, port, runtime)
+        os.environ.update(runtime["windows_vllm"]["environment"])
     child = subprocess.Popen(command)
     try:
         def stop(*_):
@@ -319,14 +393,26 @@ def serve_readout(runtime, cfg, revision, args):
         backend = native.TorchBackend(bundle=descriptor, adapter=Path(adapter["path"]), device=options["device"], rotations=options["rotations"], max_input_tokens=options["max_input_tokens"], fast=False, merge_lora=False)
         if backend.engine.readout is None or backend.engine.readout.weight.dtype != backend.torch.float32:
             raise ValueError("Trained fp32 readout was not loaded; fallback forbidden")
+        if options["device"] == "cuda":
+            if (not backend.torch.cuda.is_available()
+                    or backend.engine.readout.weight.device.type != "cuda"
+                    or any(p.device.type != "cuda" for p in backend.engine.model.parameters())):
+                raise ValueError("Native CUDA execution requires the complete model and readout on GPU")
         backend.model = adapter["repository"]
         app = native.create_app(backend, examples=[], static=Path(temporary), calibration=calibration)
         from fastapi.responses import JSONResponse
         health = identity_health(revision, cfg, args.bundle, args.launch_nonce)
+        execution = {**health, "execution_device": options["device"]}
+        if options["device"] == "cuda":
+            execution["cuda_device_name"] = backend.torch.cuda.get_device_name()
+            execution["cuda_allocated_bytes"] = backend.torch.cuda.memory_allocated()
+            execution["cuda_reserved_bytes"] = backend.torch.cuda.memory_reserved()
         @app.middleware("http")
         async def qualification(request, call_next):
             if request.url.path == "/health":
                 return JSONResponse(health)
+            if request.url.path == "/scala/execution" and request.method == "GET":
+                return JSONResponse(execution)
             if request.url.path != "/v1/systemone" or request.method != "POST":
                 return JSONResponse({"error": "not found"}, status_code=404)
             try:

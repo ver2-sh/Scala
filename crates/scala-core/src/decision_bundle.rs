@@ -81,7 +81,7 @@ impl DecisionBundle {
                 }
                 let full = source.path.join(path);
                 let resolved = full.canonicalize().map_err(|e| e.to_string())?;
-                if resolved != full
+                if canonical_spelling(&resolved) != canonical_spelling(&full)
                     || !resolved.is_file()
                     || resolved.metadata().map_err(|e| e.to_string())?.len() != file.size_bytes
                 {
@@ -146,6 +146,28 @@ impl DecisionBundle {
         }
         Ok(())
     }
+}
+
+fn canonical_spelling(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        let prefix: Vec<u16> = "\\\\?\\".encode_utf16().collect();
+        let unc: Vec<u16> = "\\\\?\\UNC\\".encode_utf16().collect();
+        let ordinary = if wide.starts_with(&unc) {
+            let mut value: Vec<u16> = "\\\\".encode_utf16().collect();
+            value.extend_from_slice(&wide[8..]);
+            value
+        } else if wide.starts_with(&prefix) {
+            wide[4..].to_vec()
+        } else {
+            wide
+        };
+        PathBuf::from(std::ffi::OsString::from_wide(&ordinary))
+    }
+    #[cfg(not(windows))]
+    path.to_owned()
 }
 
 fn hex(value: &str, len: usize) -> bool {

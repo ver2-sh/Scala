@@ -66,7 +66,9 @@ pub use store::{
     RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreIssue, RuntimeStoreIssueKind,
     RuntimeStoreSnapshot,
 };
-pub use supervisor::{CapturedCommand, TokioProcessSupervisor, capture_command};
+pub use supervisor::{
+    CapturedCommand, TokioProcessSupervisor, capture_command, capture_owned_command,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineIdentity {

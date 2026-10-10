@@ -993,6 +993,120 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn windows_decision_owner_inventory_aliases_and_validator_routing() {
+        let (_temporary, runtime, model, core) = crate::tests::control_fixture().await;
+        let owner = "b2993200f9df354843601bacda7d60e6d5318ee53c0ba24745f020c0e8159021";
+        let entry = "a".repeat(64);
+        let names = ["imajev-4b-decision", "h2o-lightning-4b-v1-1-decision"];
+        ModelProfilesStore::new(&core.paths)
+            .update(move |profiles| {
+                for name in names {
+                    let id = ModelProfileId::new(name).unwrap();
+                    profiles.create(
+                        id.clone(),
+                        name,
+                        model.clone(),
+                        scala_core::EngineId::new("native_decision").unwrap(),
+                    )?;
+                    profiles.profiles.get_mut(&id).unwrap().role = scala_core::ModelRole::Auxiliary;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // This constructs observational state only; never run/register Link or
+        // connect to the owner's live service. No weights or runtime are loaded.
+        let link = Arc::new(Link {
+            core: core.clone(),
+            runtime: runtime.clone(),
+            endpoints: Vec::new(),
+            credential: String::new(),
+            session: wayfinder::Session::default(),
+            hardware: RwLock::new("windows x86_64; NVIDIA GeForce RTX 4080 Laptop GPU".into()),
+            snapshot: RwLock::new(LinkSnapshot {
+                enabled: true,
+                node_id: Some(entry.clone()),
+                node_name: Some("entry".into()),
+                ..Default::default()
+            }),
+            slots: Arc::new(Semaphore::new(16)),
+        });
+        let mut inventory = link.inventory().await.unwrap();
+        inventory.node_id = owner.into();
+        inventory.name = "Eugene-Gaming".into();
+        inventory.engines = vec!["native_decision".into()];
+        inventory
+            .profiles
+            .retain(|profile| names.contains(&profile.id.as_str()));
+        let prototype = inventory.models[0].clone();
+        inventory.models.clear();
+        for profile in &mut inventory.profiles {
+            // IDs observed from the isolated Windows owner's descriptor paths;
+            // metadata fixtures are not evidence of native execution.
+            let artifact = if profile.id.as_str() == names[0] {
+                "imajev-4b-accc9e6bdd04"
+            } else {
+                "h2o-lightning-4b-v1-1-13d8ae2cb64f"
+            };
+            profile.model_id = scala_core::ModelId(artifact.into());
+            let mut model = prototype.clone();
+            model.id = profile.model_id.clone();
+            model.format = scala_core::ArtifactFormat::DecisionBundle;
+            inventory.models.push(model);
+        }
+        for profile in &inventory.profiles {
+            assert_eq!(profile.engine_id, "native_decision");
+            assert!(profile.installed && profile.backend.is_none());
+        }
+        // Exercise the actual serialization contract accepted from a Windows
+        // owner, including unloaded auxiliary profiles and retained ownership.
+        let inventory: NodeInventory = serde_json::from_value(json!(inventory)).unwrap();
+        link.snapshot.write().await.peers.push(LinkPeer {
+            node_id: owner.into(),
+            name: "Eugene-Gaming".into(),
+            reachable: true,
+            last_seen: crate::unix_timestamp(),
+            error: None,
+            state: Some(inventory),
+        });
+        let state = PublicApiState {
+            core,
+            runtime,
+            instance_id: entry,
+            link: Some(link.clone()),
+        };
+        let models = crate::public_models(&state).await.unwrap();
+        for name in names {
+            let alias = qualified_alias(name, owner);
+            assert!(
+                models
+                    .iter()
+                    .any(|model| model.id == alias && model.owned_by == owner)
+            );
+            assert!(
+                matches!(resolve(&state, &alias).await, Ok(Target::Remote {node,profile})
+                if node == owner && profile.as_str() == name)
+            );
+            assert!(resolve(&state, name).await.is_err()); // Shared names need an owner.
+        }
+        link.snapshot.write().await.node_id = Some(owner.into());
+        let response = link.dispatch(Operation::Inference {
+            profile_id:ModelProfileId::new(names[0]).unwrap(),path:"/v1/systemone".into(),
+            body:json!({"model":qualified_alias(names[0],owner),"state":null,"questions":{}}),
+            headers:BTreeMap::new(),
+        }, "a").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["param"], "state"); // Reached the owner's typed Decision validator.
+        assert!(state.runtime.status().await.backends.is_empty());
+    }
+
+    #[tokio::test]
     async fn unloaded_remote_profiles_are_discoverable_without_retargeting() {
         let (_temporary, runtime, _model, core) = crate::tests::control_fixture().await;
         let local = "a".repeat(64);

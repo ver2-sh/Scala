@@ -179,6 +179,97 @@ pub async fn local_runtime_observation_key(paths: Vec<PathBuf>) -> Option<String
         let mut hash = Sha256::new();
         for path in paths {
             hash.update(path.as_os_str().as_encoded_bytes());
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStrExt;
+                use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+                use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+                use windows_sys::Win32::Storage::FileSystem::{
+                    CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
+                    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
+                    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                    FileBasicInfo, FileIdInfo, GetFileAttributesExW, GetFileExInfoStandard,
+                    GetFileInformationByHandleEx, OPEN_EXISTING, WIN32_FILE_ATTRIBUTE_DATA,
+                };
+                let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+                let mut data = WIN32_FILE_ATTRIBUTE_DATA::default();
+                // SAFETY: terminated UTF-16 path and initialized output remain
+                // alive for this synchronous, metadata-only call.
+                if unsafe {
+                    GetFileAttributesExW(
+                        wide.as_ptr(),
+                        GetFileExInfoStandard,
+                        (&mut data as *mut WIN32_FILE_ATTRIBUTE_DATA).cast(),
+                    )
+                } == 0
+                {
+                    match std::io::Error::last_os_error().raw_os_error() {
+                        Some(2 | 3) => {
+                            hash.update(b"missing");
+                            continue;
+                        }
+                        _ => return None,
+                    }
+                }
+                if data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                    // NTFS timestamp tunneling can give a replacement the same
+                    // creation/write times and size. Bind file ID and change
+                    // time through an attributes-only handle, without reading
+                    // contents or taking an exclusive lock.
+                    let handle = unsafe {
+                        CreateFileW(
+                            wide.as_ptr(),
+                            FILE_READ_ATTRIBUTES,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            std::ptr::null(),
+                            OPEN_EXISTING,
+                            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if handle == INVALID_HANDLE_VALUE {
+                        return None;
+                    }
+                    // SAFETY: the new handle is valid and uniquely owned.
+                    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+                    let mut basic = FILE_BASIC_INFO::default();
+                    let mut id = FILE_ID_INFO::default();
+                    // SAFETY: the live handle and correctly sized initialized
+                    // metadata buffers remain valid through both calls.
+                    if unsafe {
+                        GetFileInformationByHandleEx(
+                            handle.as_raw_handle(),
+                            FileBasicInfo,
+                            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+                            std::mem::size_of_val(&basic) as u32,
+                        ) == 0
+                            || GetFileInformationByHandleEx(
+                                handle.as_raw_handle(),
+                                FileIdInfo,
+                                (&mut id as *mut FILE_ID_INFO).cast(),
+                                std::mem::size_of_val(&id) as u32,
+                            ) == 0
+                    } {
+                        return None;
+                    }
+                    hash.update(basic.ChangeTime.to_le_bytes());
+                    hash.update(id.VolumeSerialNumber.to_le_bytes());
+                    hash.update(id.FileId.Identifier);
+                    for value in [
+                        data.dwFileAttributes,
+                        data.nFileSizeHigh,
+                        data.nFileSizeLow,
+                        data.ftCreationTime.dwHighDateTime,
+                        data.ftCreationTime.dwLowDateTime,
+                        data.ftLastWriteTime.dwHighDateTime,
+                        data.ftLastWriteTime.dwLowDateTime,
+                    ] {
+                        hash.update(value.to_le_bytes());
+                    }
+                    continue;
+                }
+                // Reparse points still bind both link and target observations.
+            }
             for metadata in [std::fs::symlink_metadata(&path), std::fs::metadata(&path)] {
                 match metadata {
                     Ok(metadata) => {
@@ -861,7 +952,9 @@ impl RuntimePackManager {
                 .await;
                 let probe = match &probes {
                     Ok(probes) => probes
-                        .first()
+                        .iter()
+                        .find(|result| result.as_ref().is_ok_and(|probe| probe.healthy))
+                        .or_else(|| probes.first())
                         .map(|result| match result {
                             Ok(probe) => probe.clone(),
                             Err(error) => failed_discovery_probe(error.to_string()),
@@ -2838,6 +2931,31 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_observation_tracks_unicode_paths_attributes_replacement_and_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("dependency 空.py");
+        std::fs::write(&path, b"original").unwrap();
+        let observe = || super::local_runtime_observation_key(vec![path.clone()]);
+        let original = observe().await.unwrap();
+        assert_eq!(observe().await, Some(original.clone()));
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions.clone()).unwrap();
+        assert_ne!(observe().await, Some(original.clone()));
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let replacement = root.path().join("replacement.py");
+        std::fs::write(&replacement, b"modified").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let absent = observe().await.unwrap();
+        assert_ne!(absent, original);
+        std::fs::rename(replacement, &path).unwrap();
+        assert_ne!(observe().await, Some(original));
+        assert_ne!(observe().await, Some(absent));
+    }
 
     use async_trait::async_trait;
     use scala_core::{

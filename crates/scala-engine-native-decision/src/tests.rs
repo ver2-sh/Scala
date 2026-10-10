@@ -67,14 +67,45 @@ impl Fixture {
         let path = root.join("fixture.decisionbundle");
         std::fs::write(&path,serde_json::to_vec(&json!({"schema_version":1,"backend":backend,"sources":sources,"bindings":bindings})).unwrap()).unwrap();
         let model = ModelRegistry::discover(std::slice::from_ref(&root)).artifacts()[0].clone();
+        #[cfg(unix)]
         let executable = root.join("fixture-runtime");
+        #[cfg(windows)]
+        let executable = {
+            let venv = root.join("native runtime 空");
+            assert!(
+                std::process::Command::new(
+                    std::env::var_os("SCALA_DECISION_TEST_PYTHON")
+                        .unwrap_or_else(|| "python.exe".into())
+                )
+                .args(["-I", "-m", "venv", "--without-pip"])
+                .arg(&venv)
+                .status()
+                .unwrap()
+                .success()
+            );
+            venv.join("Scripts/python.exe")
+        };
         let probe = json!({"protocol":PROTOCOL,"engine_id":ENGINE_ID,"version":"1","revision":"2".repeat(64),"backend":backend,"model_code_sha256":if backend == "vllm-labels" { Some(format!("{:x}",Sha256::digest(b"synthetic"))) } else { None }});
         // Metadata-only fake executable, never a model server or forward pass.
+        #[cfg(unix)]
         std::fs::write(
             &executable,
             format!("#!/bin/sh\ncat <<'PROBE'\n{probe}\nPROBE\n"),
         )
         .unwrap();
+        #[cfg(windows)]
+        {
+            let runner = root.join("native wrapper 空.py");
+            std::fs::write(&runner, format!("print('{probe}')\n")).unwrap();
+            std::fs::write(
+                executable.with_file_name("scala-native-decision.json"),
+                serde_json::to_vec(
+                    &json!({"protocol":PROTOCOL,"interpreter":executable,"runner":runner}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -326,6 +357,199 @@ async fn multiple_explicit_external_variants_are_discovered_independently() {
     assert!(probes[2].is_err());
 }
 
+#[tokio::test]
+async fn unresponsive_startup_health_is_bounded_and_does_not_grant_proof() {
+    let f = Fixture::new("torch-readout");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/health",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    Json(json!({}))
+                }),
+            ),
+        )
+        .into_future(),
+    );
+    f.adapter.proofs.write().unwrap().insert(
+        endpoint.clone(),
+        Proof {
+            tuple: key(&f.runtime, &f.model, &f.settings),
+            nonce: "fresh".into(),
+            revision: "2".repeat(64),
+            backend: "torch-readout".into(),
+            bundle_sha256: "3".repeat(64),
+            profile: f.settings.model_profile_id.clone(),
+            ready: false,
+        },
+    );
+    let result = tokio::time::timeout(Duration::from_secs(3), f.adapter.qualify(&endpoint))
+        .await
+        .unwrap();
+    assert!(matches!(result, Err(EngineError::BackendUnavailable(_))));
+    assert!(!f.adapter.proof(&endpoint).unwrap().ready);
+    server.abort();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn native_windows_launch_binding_paths_and_observation_invalidation() {
+    let f = Fixture::new("torch-readout");
+    let binary = f.runtime.entrypoint_path();
+    let mut source = scala_core::DecisionBundle::read(&f.model.path).unwrap();
+    for binding in source.sources.values_mut() {
+        binding.path = PathBuf::from(
+            binding
+                .path
+                .to_str()
+                .unwrap()
+                .strip_prefix("\\\\?\\")
+                .unwrap(),
+        );
+    }
+    assert!(
+        source.validate().is_ok(),
+        "ordinary Windows source paths remain valid"
+    );
+    source.sources.get_mut("base").unwrap().path.push("..");
+    assert!(
+        source.validate().is_err(),
+        "canonical source validation rejects aliases"
+    );
+    assert!(
+        std::process::Command::new(&binary)
+            .env_clear()
+            .envs(launcher::runtime_environment().unwrap())
+            .args([
+                "-I",
+                "-c",
+                "import asyncio, socket; socket.socket().close()"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let descriptor = binary.with_file_name("scala-native-decision.json");
+    let original = std::fs::read(&descriptor).unwrap();
+    let runner = launcher::windows_launcher(&binary).await.unwrap();
+    let canonical = std::fs::canonicalize(&binary).unwrap();
+    let executable = launcher::executable(&canonical).await.unwrap();
+    assert_eq!(std::fs::canonicalize(&executable).unwrap(), canonical);
+    assert!(!executable.to_string_lossy().starts_with(r"\\?\"));
+    assert_eq!(
+        launcher::launch_prefix(&binary).await.unwrap(),
+        vec![
+            std::ffi::OsString::from("-I"),
+            runner.clone().into_os_string()
+        ]
+    );
+    assert!(f.adapter.probe_runtime(&f.runtime).await.is_ok());
+    let config = runner.with_file_name("runtime.json");
+    let sdk = f._dir.path().join("sdk");
+    std::fs::create_dir(&sdk).unwrap();
+    let kernel = sdk.join("kernel.lib");
+    let wheel = f._dir.path().join("published.whl");
+    let companion = runner.with_file_name("windows_vllm.py");
+    for path in [&kernel, &wheel, &companion] {
+        std::fs::write(path, b"original").unwrap();
+    }
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&json!({
+            "source":{"path":f._dir.path(),"files":{}},
+            "windows_vllm":{"wheel":{"path":wheel},"sdk":{"path":sdk,"files":{"kernel.lib":{}}}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let cfg: EngineConfig =
+        serde_json::from_value(json!({"enabled":true,"native":{"binary":binary}})).unwrap();
+    let adapter = NativeDecisionAdapter::from_config(Some(&cfg), f._dir.path());
+    let before = adapter.external_runtime_observation_key().await.unwrap();
+    assert_eq!(
+        adapter.external_runtime_observation_key().await,
+        Some(before.clone())
+    );
+    assert_eq!(adapter.observation_paths.lock().await.len(), 1);
+    for path in [&kernel, &wheel, &companion] {
+        let previous = adapter.external_runtime_observation_key().await.unwrap();
+        std::fs::write(path, b"modified").unwrap();
+        assert_ne!(
+            adapter.external_runtime_observation_key().await,
+            Some(previous)
+        );
+    }
+    std::fs::write(&runner, "print('tampered wrapper')\n").unwrap();
+    assert_ne!(
+        adapter.external_runtime_observation_key().await,
+        Some(before)
+    );
+    assert!(adapter.probe_runtime(&f.runtime).await.is_err());
+    let mut launch: Value = serde_json::from_slice(&original).unwrap();
+    launch["interpreter"] = json!(runner);
+    std::fs::write(&descriptor, serde_json::to_vec(&launch).unwrap()).unwrap();
+    assert!(launcher::windows_launcher(&binary).await.is_err());
+    assert!(adapter.probe().await.is_err());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn native_windows_long_executable_and_literal_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    let mut directory = root.path().canonicalize().unwrap();
+    for _ in 0..7 {
+        directory.push("long native runtime with spaces and Unicode 空");
+    }
+    std::fs::create_dir_all(&directory).unwrap();
+    let base =
+        std::env::var_os("SCALA_DECISION_TEST_PYTHON").unwrap_or_else(|| "python.exe".into());
+    assert!(
+        std::process::Command::new(base)
+            .args(["-I", "-m", "venv", "--without-pip"])
+            .arg(&directory)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let binary = directory.join("Scripts/python.exe");
+    let runner = directory.join("wrapper 空.py");
+    std::fs::write(
+        &runner,
+        "import json,sys; print(json.dumps(sys.argv[1:]))\n",
+    )
+    .unwrap();
+    std::fs::write(
+        binary.with_file_name("scala-native-decision.json"),
+        serde_json::to_vec(&json!({"protocol":PROTOCOL,"interpreter":binary,"runner":runner}))
+            .unwrap(),
+    )
+    .unwrap();
+    let executable = launcher::executable(&binary).await.unwrap();
+    assert!(executable.to_string_lossy().starts_with(r"\\?\"));
+    let mut arguments = launcher::launch_prefix(&binary).await.unwrap();
+    let literal = "space 空 \"quote\" & | %PATH% $()";
+    arguments.push(literal.into());
+    let strings: Vec<_> = arguments.iter().map(|a| a.to_str().unwrap()).collect();
+    let output = capture_owned_command(
+        &executable,
+        &strings,
+        &BTreeMap::new(),
+        &[],
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    assert!(output.success, "{}", output.stderr);
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&output.stdout).unwrap(),
+        vec![literal]
+    );
+}
+
 #[test]
 fn missing_native_usage_stays_absent_and_invalid_counts_fail() {
     assert!(native_usage(None).unwrap().is_none());
@@ -487,4 +711,73 @@ async fn slow_dependency_inventory_is_reused_and_topology_changes_rebuild_it() {
     assert!(adapter.external_runtime_observation_key().await.is_none());
     assert_eq!(enumerations(), 4);
     assert!(adapter.observation_paths.lock().await.is_empty());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_cold_discovery_retains_one_owned_metadata_probe() {
+    let fixture = Fixture::new("torch-readout");
+    let root = fixture._dir.path();
+    let binary = fixture.runtime.entrypoint_path();
+    let sidecar: Value = serde_json::from_slice(
+        &std::fs::read(binary.with_file_name("scala-native-decision.json")).unwrap(),
+    )
+    .unwrap();
+    let runner = PathBuf::from(sidecar["runner"].as_str().unwrap());
+    let original = std::fs::read_to_string(&runner).unwrap();
+    let count = root.join("probe-count");
+    std::fs::write(&runner, format!(
+        "import pathlib,time\nwith pathlib.Path({:?}).open('a') as f: f.write('probe\\n')\ntime.sleep(8.5)\n{}",
+        count.to_string_lossy(), original,
+    )).unwrap();
+    let config: EngineConfig =
+        serde_json::from_value(json!({"enabled":true,"native":{"binary":binary}})).unwrap();
+    let adapter = NativeDecisionAdapter::from_config(Some(&config), root);
+    let start = std::time::Instant::now();
+    assert!(adapter.external_runtime_probes().await[0].is_err());
+    assert!(start.elapsed() < Duration::from_secs(8));
+    assert!(
+        adapter.external_runtime_probes().await[0]
+            .as_ref()
+            .unwrap()
+            .healthy
+    );
+    assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 1);
+    assert!(adapter.pending_probes.lock().await.is_empty());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_adapter_drop_aborts_retained_metadata_process_tree() {
+    let fixture = Fixture::new("torch-readout");
+    let root = fixture._dir.path();
+    let binary = fixture.runtime.entrypoint_path();
+    let sidecar: Value = serde_json::from_slice(
+        &std::fs::read(binary.with_file_name("scala-native-decision.json")).unwrap(),
+    )
+    .unwrap();
+    let runner = PathBuf::from(sidecar["runner"].as_str().unwrap());
+    let pid_file = root.join("metadata-pid");
+    std::fs::write(&runner, format!("import os,pathlib,time\npathlib.Path({:?}).write_text(str(os.getpid()))\ntime.sleep(60)\n", pid_file.to_string_lossy())).unwrap();
+    let config: EngineConfig =
+        serde_json::from_value(json!({"enabled":true,"native":{"binary":binary}})).unwrap();
+    let adapter = NativeDecisionAdapter::from_config(Some(&config), root);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), adapter.external_runtime_probes())
+            .await
+            .is_err()
+    );
+    let pid: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+    drop(adapter);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let output = std::process::Command::new(&binary)
+        .args(["-I", "-c", &format!(
+            "import ctypes; k=ctypes.WinDLL('kernel32',use_last_error=True); k.OpenProcess.restype=ctypes.c_void_p; k.WaitForSingleObject.argtypes=[ctypes.c_void_p,ctypes.c_ulong]; k.CloseHandle.argtypes=[ctypes.c_void_p]; h=k.OpenProcess(0x100000,False,{pid}); assert not h or k.WaitForSingleObject(h,1000)==0; h and k.CloseHandle(h)"
+        )])
+        .output().unwrap();
+    assert!(
+        output.status.success(),
+        "metadata child outlived its adapter: {:?}",
+        output
+    );
 }

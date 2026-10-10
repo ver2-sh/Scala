@@ -85,9 +85,46 @@ These runtimes advertise Decision only, without chat, Responses, completions,
 streaming or embedding support. Generation defaults are optional observations in
 the manager; a Decision-only backend neither queries nor persists fictional
 sampling defaults. Existing adapters retain their existing observations. The new
-runtime opts into POSIX process group supervision, including cleanup of vLLM worker
-children on parent failure and immediate termination; existing adapters keep
-their previous launch policy. Non-POSIX native source runtimes are unsupported.
+runtime opts into POSIX process groups or native Windows Job Objects, including
+cleanup of workers on parent failure and immediate termination; existing adapters
+keep their previous launch policy. Windows children start suspended, enter a
+private non-inheritable kill-on-close job, then resume. Probe redirector children
+also belong to owned jobs, so timeout or cancellation cannot strand them.
+
+On Windows the entrypoint is the dedicated virtual environment's real
+`Scripts/python.exe`, with an adjacent bounded `scala-native-decision.json`:
+
+```json
+{"protocol":"scala-native-decision-v1","interpreter":"D:\\Runtimes\\env\\Scripts\\python.exe","runner":"D:\\Runtimes\\runtime\\server.py"}
+```
+
+Scala checks canonical interpreter equality and launches structured `-I`/wrapper
+arguments directly. No shell or POSIX compatibility layer is involved. Equivalent
+extended-length drive/UNC spellings are accepted without accepting source aliases,
+traversal or symlinks. Short executable paths use ordinary Windows spelling;
+actually long executable paths retain device syntax. Spaces and Unicode are
+preserved. Runtime execution clears the inherited environment and retains only
+the validated Windows `SystemRoot` needed by Winsock. The identity additionally
+binds the launcher descriptor, venv configuration, base interpreter DLL/stdlib
+closure, root-level Python/path import controls, and the existing complete
+wrapper/source/dependency/options closure.
+
+Authoritative Windows verification allows 120 seconds for cold DLL reads;
+POSIX retains 30 seconds. Public cold discovery retains its shared eight-second
+bound with independent per-variant deadlines. Warm observation reads metadata
+only, including Windows file attributes, file ID, change time and dependency topology; it does not
+rehash dependencies or initialize Python/CUDA on every model listing. Slow or
+failed cold verification grants no candidate or execution proof. Windows retains
+one owned metadata verification task per entrypoint across bounded waits; a later
+query can observe its complete result. Changing its metadata or dropping the
+adapter cancels the retained task. It never initializes a model or CUDA. Explicit full
+verification is separate from public discovery and always repeats before launch.
+
+The private health attestation and native validator qualification are unchanged.
+An operational-only private `/scala/execution` observation reports the actual
+CUDA device/allocation for `torch-readout`, bound to the same launch nonce.
+CUDA launches require CUDA availability, float32 readout weights on CUDA, and
+every model parameter on CUDA. These checks prohibit silent CPU offloading.
 
 ## Explicit provisioning boundary
 
@@ -125,6 +162,25 @@ Such overrides fail validation; inherited values remain absent. Configure explic
 runtime/model compatibility first and create **auxiliary** profiles through the
 normal Model Profiles store only when their engine and installed runtime resolve.
 No runtime-wide role or origin-based privilege is introduced.
+
+Native Windows CUDA provisioning for the pinned Imajev implementation is in
+[`provision-imajev.ps1`](../crates/scala-engine-native-decision/runtime/windows/provision-imajev.ps1)
+with a separately resolved, hash-locked Windows dependency closure. It scopes
+Python installation and package caches to the supplied runtime root, leaves
+system Python/PATH/drivers untouched, and verifies an existing immutable runtime
+against its original receipt on rerun. Windows configuration uses the interpreter
+entrypoint in `native.binaries`; backend/platform builds remain runtime variants
+of `native_decision`. No Windows vLLM version exception is currently admitted.
+
+The [`isolated_native_decision`](../crates/scala-api/examples/isolated_native_decision.rs)
+example uses the supported explicit `AppPaths` boundary, a new state tree,
+loopback ephemeral ports, isolated profile/runtime stores and disabled Link.
+[`qualify.py`](../crates/scala-engine-native-decision/runtime/qualify.py) is explicit
+operational qualification, never a routine synthetic test. It exercises typed
+choice/score/noul, exact native comparison, discovery/proof changes, owned-tree
+unload, startup cancellation, subsequent JIT and loaded-instance shutdown.
+See [Windows qualification evidence](native-decision-windows-qualification.md)
+for tested behavior, incomplete work and activation steps.
 
 The read-only Rust `inspect` example checks source bundles with Scala's actual
 artifact discovery without initializing application/production state:

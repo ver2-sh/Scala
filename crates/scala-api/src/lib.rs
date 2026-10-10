@@ -736,7 +736,7 @@ impl IntoResponse for ControlApiError {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod discovery_tests;
 
 #[cfg(test)]

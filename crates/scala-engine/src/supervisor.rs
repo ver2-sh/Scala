@@ -15,6 +15,10 @@ use crate::{
     EngineError, EngineRevision, LaunchSpec, ProcessDescriptor, ProcessExit, ProcessSupervisor,
 };
 
+#[cfg(windows)]
+#[path = "windows_job.rs"]
+mod windows_job;
+
 const DEFAULT_TERMINATION_TIMEOUT: Duration = Duration::from_secs(8);
 const LOG_TAIL_LINES: usize = 80;
 const LOG_LINE_LIMIT: usize = 4_096;
@@ -36,6 +40,46 @@ pub async fn capture_command(
     environment_remove: &[OsString],
     timeout: Duration,
 ) -> Result<CapturedCommand, EngineError> {
+    capture_command_scoped(
+        executable,
+        arguments,
+        environment,
+        environment_remove,
+        timeout,
+        false,
+    )
+    .await
+}
+
+/// Native Windows venv redirectors launch interpreter children even for probes.
+/// Own those children through timeout/cancellation; other engines retain their
+/// existing capture policy.
+pub async fn capture_owned_command(
+    executable: &Path,
+    arguments: &[&str],
+    environment: &BTreeMap<String, String>,
+    environment_remove: &[OsString],
+    timeout: Duration,
+) -> Result<CapturedCommand, EngineError> {
+    capture_command_scoped(
+        executable,
+        arguments,
+        environment,
+        environment_remove,
+        timeout,
+        true,
+    )
+    .await
+}
+
+async fn capture_command_scoped(
+    executable: &Path,
+    arguments: &[&str],
+    environment: &BTreeMap<String, String>,
+    environment_remove: &[OsString],
+    timeout: Duration,
+    _own_process_tree: bool,
+) -> Result<CapturedCommand, EngineError> {
     let mut command = Command::new(executable);
     for name in environment_remove {
         command.env_remove(name);
@@ -48,9 +92,34 @@ pub async fn capture_command(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     scala_core::isolate_child_from_console(command.as_std_mut());
+    #[cfg(windows)]
+    let owned_job = if _own_process_tree {
+        command.creation_flags(
+            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+                | windows_sys::Win32::System::Threading::CREATE_SUSPENDED,
+        );
+        Some(windows_job::OwnedJob::new().map_err(|e| {
+            EngineError::Operation(format!("could not create owned probe job: {e}"))
+        })?)
+    } else {
+        None
+    };
     let child = command.spawn().map_err(|error| {
         EngineError::Operation(format!("could not start engine probe: {error}"))
     })?;
+    #[cfg(windows)]
+    let mut child = child;
+    #[cfg(windows)]
+    if let Some(job) = &owned_job
+        && let Err(error) = job.attach_and_resume(&child)
+    {
+        let _ = job.terminate();
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(EngineError::Operation(format!(
+            "could not own probe process tree: {error}"
+        )));
+    }
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
         .map_err(|_| EngineError::TimedOut("engine probe did not finish in time".to_owned()))?
@@ -99,6 +168,8 @@ struct ChildActor {
     temporary_files: Vec<std::path::PathBuf>,
     termination_timeout: Duration,
     supervise_process_tree: bool,
+    #[cfg(windows)]
+    owned_job: Option<windows_job::OwnedJob>,
 }
 
 impl Default for TokioProcessSupervisor {
@@ -155,11 +226,25 @@ impl ProcessSupervisor for TokioProcessSupervisor {
         if spec.supervise_process_tree {
             command.process_group(0);
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         if spec.supervise_process_tree {
             return Err(EngineError::Unsupported("process tree supervision".into()));
         }
         scala_core::isolate_child_from_console(command.as_std_mut());
+        #[cfg(windows)]
+        let owned_job =
+            if spec.supervise_process_tree {
+                // Apply after console isolation, which sets creation flags itself.
+                command.creation_flags(
+                    windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+                        | windows_sys::Win32::System::Threading::CREATE_SUSPENDED,
+                );
+                Some(windows_job::OwnedJob::new().map_err(|e| {
+                    EngineError::Operation(format!("could not create owned job: {e}"))
+                })?)
+            } else {
+                None
+            };
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
@@ -169,6 +254,18 @@ impl ProcessSupervisor for TokioProcessSupervisor {
                 )));
             }
         };
+        #[cfg(windows)]
+        if let Some(job) = &owned_job
+            && let Err(error) = job.attach_and_resume(&child)
+        {
+            let _ = job.terminate();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            cleanup_temporary_files(&spec.temporary_files).await;
+            return Err(EngineError::Operation(format!(
+                "could not own runtime process tree: {error}"
+            )));
+        }
         let Some(process_id) = child.id() else {
             let _ = child.start_kill();
             let _ = child.wait().await;
@@ -227,6 +324,8 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             temporary_files: spec.temporary_files,
             termination_timeout: self.termination_timeout,
             supervise_process_tree: spec.supervise_process_tree,
+            #[cfg(windows)]
+            owned_job,
         }));
         Ok(descriptor)
     }
@@ -415,6 +514,8 @@ async fn run_child_actor(actor: ChildActor) {
         temporary_files,
         termination_timeout,
         supervise_process_tree,
+        #[cfg(windows)]
+        owned_job,
     } = actor;
     let mut termination_response = None;
     let mut expected = false;
@@ -424,7 +525,7 @@ async fn run_child_actor(actor: ChildActor) {
             if let Some(ProcessCommand::Terminate { response, immediate }) = command {
                 expected = true;
                 termination_response = Some(response);
-                terminate_child(&mut child, descriptor.process_id, supervise_process_tree, if immediate { Duration::ZERO } else { termination_timeout }).await
+                terminate_child(&mut child, descriptor.process_id, supervise_process_tree, if immediate { Duration::ZERO } else { termination_timeout }, #[cfg(windows)] owned_job.as_ref()).await
             } else {
                 child.wait().await
             }
@@ -435,6 +536,9 @@ async fn run_child_actor(actor: ChildActor) {
     if supervise_process_tree {
         let _ = signal_process_group(descriptor.process_id, libc::SIGKILL);
     }
+
+    #[cfg(windows)]
+    drop(owned_job); // Kill remaining workers even when the parent crashed.
 
     if tokio::time::timeout(Duration::from_secs(1), &mut stdout_task)
         .await
@@ -515,6 +619,7 @@ async fn terminate_child(
     process_id: u32,
     supervise_process_tree: bool,
     timeout: Duration,
+    #[cfg(windows)] owned_job: Option<&windows_job::OwnedJob>,
 ) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(unix)]
     if supervise_process_tree {
@@ -522,11 +627,16 @@ async fn terminate_child(
     } else {
         request_graceful_termination(child, process_id)?;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = supervise_process_tree;
+    #[cfg(windows)]
+    if let Some(job) = owned_job {
+        job.terminate()?;
+    } else {
         request_graceful_termination(child, process_id)?;
     }
+    #[cfg(not(any(unix, windows)))]
+    request_graceful_termination(child, process_id)?;
+    #[cfg(not(unix))]
+    let _ = supervise_process_tree;
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(result) => result,
         Err(_) => {
@@ -728,5 +838,144 @@ mod process_tree_tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("native worker survived process group termination");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_process_tree_tests {
+    use super::*;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+
+    async fn tree(parent_exits: bool) -> (Child, windows_job::OwnedJob, OwnedHandle) {
+        let python =
+            std::env::var_os("SCALA_DECISION_TEST_PYTHON").unwrap_or_else(|| "python.exe".into());
+        let script = format!(
+            "import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-I','-c','import time; time.sleep(300)']); print(p.pid,flush=True); {}",
+            if parent_exits {
+                "sys.exit(7)"
+            } else {
+                "time.sleep(300)"
+            }
+        );
+        let job = windows_job::OwnedJob::new().unwrap();
+        let mut command = Command::new(python);
+        command
+            .args(["-I", "-c", &script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+        let mut child = command.spawn().unwrap();
+        job.attach_and_resume(&child).unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let pid: u32 = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: open a synchronization-only handle to this fixture's worker.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        assert!(!handle.is_null());
+        // SAFETY: this unique handle is owned by the test guard.
+        (child, job, unsafe { OwnedHandle::from_raw_handle(handle) })
+    }
+
+    fn assert_stopped(worker: &OwnedHandle) {
+        // SAFETY: worker is a live synchronization handle, no mutation occurs.
+        assert_eq!(
+            unsafe { WaitForSingleObject(worker.as_raw_handle(), 2000) },
+            0,
+            "owned worker survived"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_probe_timeout_and_cancellation_stop_interpreter_workers() {
+        for cancel in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let marker = root.path().join("worker.pid");
+            let python = std::path::PathBuf::from(
+                std::env::var_os("SCALA_DECISION_TEST_PYTHON")
+                    .unwrap_or_else(|| "python.exe".into()),
+            );
+            let script = format!(
+                "import subprocess,sys,time; from pathlib import Path; p=subprocess.Popen([sys.executable,'-I','-c','import time; time.sleep(300)']); Path({marker:?}).write_text(str(p.pid)); time.sleep(300)"
+            );
+            let capture = tokio::spawn(async move {
+                capture_owned_command(
+                    &python,
+                    &["-I", "-c", &script],
+                    &BTreeMap::new(),
+                    &[],
+                    Duration::from_secs(3),
+                )
+                .await
+            });
+            let pid = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(value) = std::fs::read_to_string(&marker)
+                        && let Ok(pid) = value.parse::<u32>()
+                    {
+                        break pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // SAFETY: observe only this fixture's explicitly reported worker.
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            assert!(!handle.is_null());
+            // SAFETY: a fresh unique synchronization handle.
+            let worker = unsafe { OwnedHandle::from_raw_handle(handle) };
+            if cancel {
+                capture.abort();
+                assert!(capture.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(matches!(
+                    capture.await.unwrap(),
+                    Err(EngineError::TimedOut(_))
+                ));
+            }
+            assert_stopped(&worker);
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_job_stops_workers_on_immediate_and_normal_termination() {
+        for timeout in [Duration::ZERO, Duration::from_secs(1)] {
+            let (mut child, job, worker) = tree(false).await;
+            let pid = child.id().unwrap();
+            terminate_child(&mut child, pid, true, timeout, Some(&job))
+                .await
+                .unwrap();
+            assert_stopped(&worker);
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_job_close_stops_workers_after_parent_startup_failure() {
+        let (mut child, job, worker) = tree(true).await;
+        assert_eq!(child.wait().await.unwrap().code(), Some(7));
+        drop(job);
+        assert_stopped(&worker);
+    }
+
+    #[tokio::test]
+    async fn owned_job_drop_stops_live_parent_and_workers() {
+        let (mut child, job, worker) = tree(false).await;
+        drop(job);
+        // Windows uses exit code zero for JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_stopped(&worker);
     }
 }

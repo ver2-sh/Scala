@@ -17,6 +17,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+mod launcher;
+
 pub const ENGINE_ID: &str = "native_decision";
 const PROTOCOL: &str = "scala-native-decision-v1";
 const LIMIT: usize = 16 * 1024 * 1024;
@@ -27,9 +29,31 @@ pub struct NativeDecisionAdapter {
     client: reqwest::Client,
     proofs: RwLock<BTreeMap<String, Proof>>,
     observation_paths: tokio::sync::Mutex<BTreeMap<PathBuf, ObservationInventory>>,
+    #[cfg(windows)]
+    pending_probes: tokio::sync::Mutex<BTreeMap<PathBuf, PendingProbe>>,
+    discovery_probes:
+        tokio::sync::Mutex<BTreeMap<PathBuf, (String, std::time::Instant, EngineProbe)>>,
+}
+// Retain Windows metadata verification across the bounded discovery wait.
+// Dropping the adapter/task aborts the owned capture; it never initializes CUDA.
+#[cfg(windows)]
+struct PendingProbe {
+    key: Option<String>,
+    task: std::sync::Arc<tokio::sync::Mutex<ProbeTask>>,
+}
+#[cfg(windows)]
+struct ProbeTask {
+    handle: tokio::task::JoinHandle<Result<EngineProbe, EngineError>>,
+    result: Option<Result<EngineProbe, String>>,
+}
+#[cfg(windows)]
+impl Drop for ProbeTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 // Discovery change detectors only; never runtime identity or launch authority.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ObservationInventory {
     paths: Vec<PathBuf>,
     inventory_paths: Vec<PathBuf>,
@@ -182,13 +206,16 @@ impl NativeDecisionAdapter {
                 .expect("native HTTP client"),
             proofs: RwLock::new(BTreeMap::new()),
             observation_paths: tokio::sync::Mutex::new(BTreeMap::new()),
+            discovery_probes: tokio::sync::Mutex::new(BTreeMap::new()),
+            #[cfg(windows)]
+            pending_probes: tokio::sync::Mutex::new(BTreeMap::new()),
         }
     }
-    async fn probe_path(&self, path: &Path) -> Result<EngineProbe, EngineError> {
+    async fn probe_path(path: &Path) -> Result<EngineProbe, EngineError> {
         let path = tokio::fs::canonicalize(path)
             .await
             .map_err(|e| invalid(e.to_string()))?;
-        let (sha, p) = self.inspect(&path).await?;
+        let (sha, p) = Self::inspect(&path).await?;
         let detail = serde_json::to_string(&p).map_err(|e| invalid(e.to_string()))?;
         Ok(EngineProbe {
             installation: InstallationState::Installed {
@@ -215,14 +242,26 @@ impl NativeDecisionAdapter {
             detail,
         })
     }
-    async fn inspect(&self, path: &Path) -> Result<(String, Probe), EngineError> {
+    async fn inspect(path: &Path) -> Result<(String, Probe), EngineError> {
         let sha = digest(path).await?;
-        let output = capture_command(
-            path,
-            &["--scala-probe"],
+        let mut arguments = launcher::launch_prefix(path).await?;
+        arguments.push("--scala-probe".into());
+        let arguments = arguments
+            .iter()
+            .map(|a| {
+                a.to_str()
+                    .ok_or_else(|| invalid("Invalid launcher argument encoding"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = capture_owned_command(
+            &launcher::executable(path).await?,
+            &arguments,
             &BTreeMap::new(),
             &[],
-            Duration::from_secs(30),
+            // Native Windows DLL closure reads can take longer when the OS
+            // file cache is cold. This complete verification is independent of
+            // the unchanged bounded public discovery deadline below.
+            Duration::from_secs(if cfg!(windows) { 120 } else { 30 }),
         )
         .await?;
         if !output.success || output.stdout.len() > 65536 {
@@ -242,6 +281,140 @@ impl NativeDecisionAdapter {
             ));
         }
         Ok((sha, probe))
+    }
+    async fn binary_observation_key(&self, binary: &Path) -> Option<String> {
+        let cached = self.observation_paths.lock().await.get(binary).cloned();
+        if let Some(inventory) = cached
+            && local_runtime_observation_key(inventory.inventory_paths.clone())
+                .await
+                .as_ref()
+                == Some(&inventory.inventory_key)
+        {
+            return local_runtime_observation_key(inventory.paths.clone()).await;
+        }
+        self.observation_paths.lock().await.remove(binary);
+        // Only the explicit prepare.py launcher shape is understood. Unknown
+        // wrappers remain uncached, and are still authoritatively probed.
+        let (interpreter, runner, mut controls) = launcher::observation_launcher(binary).await?;
+        let config = runner.with_file_name("runtime.json");
+        controls.extend([
+            binary.to_owned(),
+            runner,
+            config.clone(),
+            interpreter.clone(),
+        ]);
+        let before = local_runtime_observation_key(controls.clone()).await?;
+        // Enumerate once per launcher/configuration and dependency topology.
+        // Large vLLM inventories may take longer than two seconds; this
+        // bounded enumeration imports no runtime/tensor code and performs
+        // no hashes or persistent writes.
+        let output = capture_owned_command(
+            &interpreter,
+            &[
+                "-I",
+                "-B",
+                "-c",
+                include_str!("observation.py"),
+                config.to_str()?,
+            ],
+            &BTreeMap::new(),
+            &[],
+            Duration::from_secs(5),
+        )
+        .await
+        .ok()?;
+        if !output.success
+            || output.stdout.len() > 16 * 1024 * 1024
+            || local_runtime_observation_key(controls.clone()).await? != before
+        {
+            return None;
+        }
+        let mut inventory: ObservationInventory = serde_json::from_str(&output.stdout).ok()?;
+        inventory.paths.extend(controls.iter().cloned());
+        inventory.inventory_paths.extend(controls);
+        inventory.paths.sort();
+        inventory.paths.dedup();
+        inventory.inventory_paths.sort();
+        inventory.inventory_paths.dedup();
+        inventory.inventory_key =
+            local_runtime_observation_key(inventory.inventory_paths.clone()).await?;
+        let key = local_runtime_observation_key(inventory.paths.clone()).await;
+        self.observation_paths
+            .lock()
+            .await
+            .insert(binary.to_owned(), inventory);
+        key
+    }
+    async fn discovery_probe(&self, path: &Path) -> Result<EngineProbe, EngineError> {
+        let before = self.binary_observation_key(path).await;
+        if let Some(key) = &before
+            && let Some((observed, at, probe)) = self.discovery_probes.lock().await.get(path)
+            && key == observed
+            && at.elapsed() < Duration::from_secs(300)
+        {
+            return Ok(probe.clone());
+        }
+        self.discovery_probes.lock().await.remove(path);
+        #[cfg(not(windows))]
+        let probe = Self::probe_path(path).await?;
+        #[cfg(windows)]
+        let probe = {
+            let task_state = {
+                let mut pending = self.pending_probes.lock().await;
+                if pending.get(path).is_some_and(|entry| entry.key != before) {
+                    pending.remove(path);
+                }
+                pending
+                    .entry(path.to_owned())
+                    .or_insert_with(|| {
+                        let path = path.to_owned();
+                        PendingProbe {
+                            key: before.clone(),
+                            task: std::sync::Arc::new(tokio::sync::Mutex::new(ProbeTask {
+                                handle: tokio::spawn(async move { Self::probe_path(&path).await }),
+                                result: None,
+                            })),
+                        }
+                    })
+                    .task
+                    .clone()
+            };
+            let mut task = task_state.lock().await;
+            if task.result.is_none() {
+                task.result = Some(
+                    (&mut task.handle)
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result.map_err(|error| error.to_string())),
+                );
+            }
+            let result = task
+                .result
+                .as_ref()
+                .expect("completed metadata probe")
+                .clone();
+            drop(task);
+            let mut pending = self.pending_probes.lock().await;
+            if pending
+                .get(path)
+                .is_some_and(|entry| std::sync::Arc::ptr_eq(&entry.task, &task_state))
+            {
+                pending.remove(path);
+            }
+            drop(pending);
+            result.map_err(invalid)?
+        };
+        let after = self.binary_observation_key(path).await;
+        if before.is_some() && before != after {
+            return Err(invalid("Native runtime changed during discovery"));
+        }
+        if let Some(key) = after.filter(|_| before.is_some()) {
+            self.discovery_probes.lock().await.insert(
+                path.to_owned(),
+                (key, std::time::Instant::now(), probe.clone()),
+            );
+        }
+        Ok(probe)
     }
     async fn read(
         &self,
@@ -282,7 +455,11 @@ impl NativeDecisionAdapter {
             current.ready = false;
         }
         let (status, observed) = self
-            .read(self.client.get(format!("{endpoint}/health")))
+            .read(
+                self.client
+                    .get(format!("{endpoint}/health"))
+                    .timeout(Duration::from_secs(2)),
+            )
             .await?;
         if !status.is_success() {
             return Ok(false);
@@ -299,6 +476,7 @@ impl NativeDecisionAdapter {
             .read(
                 self.client
                     .post(format!("{endpoint}/v1/systemone"))
+                    .timeout(Duration::from_secs(2))
                     .json(&json!({})),
             )
             .await?;
@@ -351,7 +529,7 @@ impl EngineAdapter for NativeDecisionAdapter {
         }
     }
     fn runtime_compatibility(&self, runtime: &InstalledRuntime) -> CompatibilityDecision {
-        if cfg!(unix)
+        if cfg!(any(unix, windows))
             && runtime.validate().is_ok()
             && runtime.manifest.identity.platform == std::env::consts::OS
             && runtime.manifest.identity.architecture == std::env::consts::ARCH
@@ -443,108 +621,56 @@ impl EngineAdapter for NativeDecisionAdapter {
                 .any(|p| p.ready && p.tuple == key(runtime, model, settings))
     }
     async fn probe(&self) -> Result<EngineProbe, EngineError> {
-        let Some(path) = self.binaries.first() else {
+        if self.binaries.is_empty() {
             return Ok(EngineProbe {
                 installation: InstallationState::NotInstalled,
                 update: UpdateState::Unknown,
                 healthy: false,
                 detail: "No explicit native Decision runtime configured".into(),
             });
-        };
-        self.probe_path(path).await
+        }
+        let mut failure = None;
+        for path in &self.binaries {
+            match self.discovery_probe(path).await {
+                Ok(probe) => return Ok(probe),
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+            }
+        }
+        Err(failure.expect("nonempty runtime inventory"))
     }
     async fn external_runtime_probes(&self) -> Vec<Result<EngineProbe, EngineError>> {
         if self.binaries.is_empty() {
             return vec![self.probe().await];
         }
-        futures_util::future::join_all(self.binaries.iter().map(|path| self.probe_path(path))).await
+        // Finish each variant inside the shared eight-second cold-probe bound.
+        // A hung/failed variant must not discard another completed observation.
+        futures_util::future::join_all(self.binaries.iter().map(|path| async move {
+            tokio::time::timeout(Duration::from_millis(7750), self.discovery_probe(path))
+                .await
+                .map_err(|_| EngineError::TimedOut("Native runtime discovery variant".into()))?
+        }))
+        .await
     }
     async fn external_runtime_observation_key(&self) -> Option<String> {
-        let mut cached = self.observation_paths.lock().await;
-        let mut paths = Vec::new();
+        let mut keys = Vec::new();
         for binary in &self.binaries {
-            if let Some(inventory) = cached.get(binary)
-                && local_runtime_observation_key(inventory.inventory_paths.clone())
-                    .await
-                    .as_ref()
-                    == Some(&inventory.inventory_key)
-            {
-                paths.extend(inventory.paths.iter().cloned());
-                continue;
-            }
-            cached.remove(binary);
-            // Only the explicit prepare.py launcher shape is understood. Unknown
-            // wrappers remain uncached, and are still authoritatively probed.
-            let launcher = tokio::fs::read_to_string(binary).await.ok()?;
-            let words = shlex::split(launcher.lines().nth(1)?)?;
-            if words.len() != 5
-                || words[0] != "exec"
-                || words[2] != "-I"
-                || words[4] != "$@"
-                || !Path::new(&words[1]).is_absolute()
-                || !Path::new(&words[3]).is_absolute()
-            {
-                return None;
-            }
-            let runner = PathBuf::from(&words[3]);
-            let config = runner.with_file_name("runtime.json");
-            let controls = vec![
-                binary.clone(),
-                runner,
-                config.clone(),
-                PathBuf::from(&words[1]),
-            ];
-            let before = local_runtime_observation_key(controls.clone()).await?;
-            // Enumerate once per launcher/configuration and dependency topology.
-            // Large vLLM inventories may take longer than two seconds; this
-            // bounded enumeration imports no runtime/tensor code and performs
-            // no hashes or persistent writes.
-            let output = capture_command(
-                Path::new(&words[1]),
-                &[
-                    "-I",
-                    "-B",
-                    "-c",
-                    include_str!("observation.py"),
-                    config.to_str()?,
-                ],
-                &BTreeMap::new(),
-                &[],
-                Duration::from_secs(5),
-            )
-            .await
-            .ok()?;
-            if !output.success
-                || output.stdout.len() > 16 * 1024 * 1024
-                || local_runtime_observation_key(controls.clone()).await? != before
-            {
-                return None;
-            }
-            let mut inventory: ObservationInventory = serde_json::from_str(&output.stdout).ok()?;
-            inventory.paths.extend(controls.iter().cloned());
-            inventory.inventory_paths.extend(controls);
-            inventory.paths.sort();
-            inventory.paths.dedup();
-            inventory.inventory_paths.sort();
-            inventory.inventory_paths.dedup();
-            inventory.inventory_key =
-                local_runtime_observation_key(inventory.inventory_paths.clone()).await?;
-            paths.extend(inventory.paths.iter().cloned());
-            cached.insert(binary.clone(), inventory);
+            keys.push(self.binary_observation_key(binary).await?);
         }
-        paths.sort();
-        paths.dedup();
-        // Content metadata changes invalidate the observation without rebuilding
-        // inventories. Directories/RECORD/control changes rebuild only that runtime.
-        // RuntimePackManager separately bounds the lifetime of qualified probes.
-        local_runtime_observation_key(paths).await
+        Some(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&keys).ok()?)
+        ))
     }
 
     async fn probe_runtime(
         &self,
         runtime: &InstalledRuntime,
     ) -> Result<RuntimeProbeObservation, EngineError> {
-        let (sha, p) = self.inspect(&runtime.entrypoint_path()).await?;
+        let (sha, p) = Self::inspect(&runtime.entrypoint_path()).await?;
         if !self.runtime_compatibility(runtime).is_supported()
             || sha != runtime.manifest.entrypoint_sha256
             || Some(&p.revision) != runtime.manifest.identity.upstream_revision.as_ref()
@@ -612,27 +738,29 @@ impl EngineAdapter for NativeDecisionAdapter {
             acquired_at_unix: None,
             observed_at_unix: now(),
         };
+        let mut arguments = launcher::launch_prefix(&runtime.entrypoint_path()).await?;
+        arguments.extend(vec![
+            "--bundle".into(),
+            request.model.primary.path.clone().into_os_string(),
+            "--host".into(),
+            request.backend_address.ip().to_string().into(),
+            "--port".into(),
+            request.backend_address.port().to_string().into(),
+            "--launch-nonce".into(),
+            uuid::Uuid::new_v4().to_string().into(),
+            "--runtime-revision".into(),
+            runtime
+                .manifest
+                .identity
+                .upstream_revision
+                .clone()
+                .unwrap()
+                .into(),
+        ]);
         Ok(LaunchSpec {
-            executable: runtime.entrypoint_path(),
-            arguments: vec![
-                "--bundle".into(),
-                request.model.primary.path.clone().into_os_string(),
-                "--host".into(),
-                request.backend_address.ip().to_string().into(),
-                "--port".into(),
-                request.backend_address.port().to_string().into(),
-                "--launch-nonce".into(),
-                uuid::Uuid::new_v4().to_string().into(),
-                "--runtime-revision".into(),
-                runtime
-                    .manifest
-                    .identity
-                    .upstream_revision
-                    .clone()
-                    .unwrap()
-                    .into(),
-            ],
-            environment: BTreeMap::new(),
+            executable: launcher::executable(&runtime.entrypoint_path()).await?,
+            arguments,
+            environment: launcher::runtime_environment()?,
             environment_remove: vec![],
             inherits_parent_environment: false,
             supervise_process_tree: true,
@@ -882,5 +1010,5 @@ fn validate_answers(
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests;

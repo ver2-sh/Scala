@@ -31,6 +31,21 @@ def watch(path, root):
         paths.add(path)
 
 
+if os.name == "nt":
+    paths.add(Path(sys.executable).with_name("scala-native-decision.json"))
+    paths.add(Path(sys.prefix) / "pyvenv.cfg")
+    site = Path(sys.prefix) / "Lib/site-packages"
+    paths.update(site.glob("*.pth"))
+    paths.update(site.glob("*.py"))
+    base = Path(sys.base_prefix).resolve(strict=True)
+    for directory, children, members in os.walk(base):
+        children[:] = [name for name in children if name not in {"site-packages", "__pycache__"}]
+        paths.add(Path(directory))
+        inventory_paths.add(Path(directory))
+        for member in members:
+            paths.add(Path(directory) / member)
+
+
 source = cfg["source"]
 root = Path(source["path"])
 for member in source["files"]:
@@ -38,6 +53,16 @@ for member in source["files"]:
 for directory, _, _ in os.walk(root):
     paths.add(Path(directory))
     inventory_paths.add(Path(directory))
+if "windows_vllm" in cfg:
+    build = cfg["windows_vllm"]
+    paths.add(config.with_name("windows_vllm.py"))
+    paths.add(Path(build["wheel"]["path"]))
+    sdk = Path(build["sdk"]["path"])
+    for member in build["sdk"]["files"]:
+        watch(sdk / member, sdk)
+    for directory, _, _ in os.walk(sdk):
+        paths.add(Path(directory))
+        inventory_paths.add(Path(directory))
 for attestation in cfg.get("wheel_attestations", {}).values():
     paths.add(Path(attestation["path"]))
 for directory in sys.path:
@@ -46,6 +71,9 @@ for directory in sys.path:
         inventory_paths.add(Path(directory))
 for dist in importlib.metadata.distributions():
     root = Path(dist.locate_file(""))
+    if os.name == "nt":
+        paths.update(root.glob("*.pth"))
+        paths.update(root.glob("*.py"))
     paths.add(root)
     inventory_paths.add(root)
     for member in dist.files or []:

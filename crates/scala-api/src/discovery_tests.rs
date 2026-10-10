@@ -12,7 +12,9 @@ use scala_engine::{
 use scala_engine_native_decision::NativeDecisionAdapter;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use tower::ServiceExt;
 
 struct Fixture {
@@ -30,7 +32,9 @@ impl Fixture {
     async fn new() -> Self {
         let (temp, _, _, core) = tests::control_fixture().await;
         let root = temp.path().canonicalize().unwrap();
+        #[cfg(unix)]
         let venv = root.join("venv");
+        #[cfg(unix)]
         assert!(
             std::process::Command::new("python3")
                 .args(["-m", "venv", "--without-pip"])
@@ -39,6 +43,7 @@ impl Fixture {
                 .unwrap()
                 .success()
         );
+        #[cfg(unix)]
         let python = venv.join("bin/python");
         let models = root.join("models");
         let mut binaries = Vec::new();
@@ -97,6 +102,22 @@ impl Fixture {
             let runtime_dir = root.join(format!("{name}-runtime"));
             let runtime_source = root.join(format!("{name}-implementation"));
             std::fs::create_dir(&runtime_dir).unwrap();
+            #[cfg(windows)]
+            let python = {
+                let venv = runtime_dir.join("native runtime 空");
+                assert!(
+                    std::process::Command::new(
+                        std::env::var_os("SCALA_DECISION_TEST_PYTHON")
+                            .unwrap_or_else(|| "python.exe".into())
+                    )
+                    .args(["-I", "-m", "venv", "--without-pip"])
+                    .arg(&venv)
+                    .status()
+                    .unwrap()
+                    .success()
+                );
+                venv.join("Scripts/python.exe")
+            };
             std::fs::create_dir(&runtime_source).unwrap();
             let dependency = runtime_source.join("dependency.py");
             std::fs::write(&dependency, b"synthetic").unwrap();
@@ -112,7 +133,9 @@ impl Fixture {
                 .unwrap(),
             )
             .unwrap();
+            #[cfg(unix)]
             let binary = runtime_dir.join("native-decision-server");
+            #[cfg(unix)]
             std::fs::write(
                 &binary,
                 format!(
@@ -122,7 +145,19 @@ impl Fixture {
                 ),
             )
             .unwrap();
+            #[cfg(unix)]
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            #[cfg(windows)]
+            let binary = {
+                std::fs::write(
+                    python.with_file_name("scala-native-decision.json"),
+                    serde_json::to_vec(&json!({"protocol":"scala-native-decision-v1",
+                        "interpreter":python,"runner":runner}))
+                    .unwrap(),
+                )
+                .unwrap();
+                python
+            };
             binaries.push(binary);
             counts.push(count);
             dependencies.push(dependency);
@@ -348,6 +383,23 @@ async fn native_discovery_refreshes_and_dependency_changes_fail_closed_before_la
     let listed = f.get("/v1/models?output_modalities=decisions").await;
     assert_eq!(listed["data"][0]["id"], "imajev");
     assert_eq!(listed["data"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        f.state.runtime.status().await.installed_engine_count,
+        1,
+        "a failed first variant must not invalidate the engine with a healthy runtime"
+    );
+    let healthy_probes = f.probes()[1];
+    assert_eq!(
+        f.get("/v1/models?output_modalities=decisions").await,
+        listed
+    );
+    assert_eq!(
+        f.probes()[1],
+        healthy_probes,
+        "a failed variant must not rehash the healthy runtime on warm discovery"
+    );
+    assert!(f.adapter.probe().await.unwrap().healthy);
+    assert_eq!(f.probes()[1], healthy_probes);
     std::fs::write(&f.dependencies[0], b"synthetic").unwrap();
     f.packs.refresh_local_observations().await;
     assert_eq!(
