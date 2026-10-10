@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.15 - Fast native Decision discovery and client interoperability
+
+Improves Scala's model catalogue and Model Profiles responsiveness for native
+Decision runtimes, including H2O-Lightning and Imajev, without changing inference
+engines, model weights, or running profiles.
+
+- Share process-local runtime inspections among profiles and requests instead of
+  repeating heavy external Python wheel-closure checks for every model listing.
+  Reuse dependency inventories with metadata and RECORD-based invalidation,
+  bounded freshness, and explicit refresh; execution still independently verifies
+  immutable runtime identities and artifact closure.
+- Probe external runtimes concurrently and bound cold discovery latency. Preserve
+  fail-closed runtime compatibility, Settings precedence and profile ownership.
+- Advertise native Decision candidates through both
+  `capabilities.decision_candidate` and
+  `architecture.output_modalities: ["decisions"]` for Unsloth/Coded, including
+  `GET /v1/models?output_modalities=decisions`, without declaring unqualified
+  execution capability.
+- Add synthetic discovery and dependency-topology regression coverage. Preserve
+  existing llama.cpp, NInfer and q27 discovery and inference contracts.
+
 ## 0.1.14 - Native source Decision runtimes
 
 Introduces narrowly qualified local source-backed Decision runtimes for
