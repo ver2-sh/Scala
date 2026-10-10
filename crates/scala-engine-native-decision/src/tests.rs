@@ -367,3 +367,124 @@ async fn invalid_inference_configuration_preserves_runtime_identity() {
             .is_err()
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn slow_dependency_inventory_is_reused_and_topology_changes_rebuild_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let venv = root.join("venv");
+    assert!(
+        std::process::Command::new("python3")
+            .args(["-m", "venv", "--without-pip"])
+            .arg(&venv)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let python = venv.join("bin/python");
+    let output = std::process::Command::new(&python)
+        .args([
+            "-I",
+            "-B",
+            "-c",
+            "import sysconfig; print(sysconfig.get_path('purelib'))",
+        ])
+        .output()
+        .unwrap();
+    let site = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let dist = site.join("fixture-1.0.dist-info");
+    std::fs::create_dir(&dist).unwrap();
+    std::fs::write(dist.join("METADATA"), b"Name: fixture\nVersion: 1.0\n").unwrap();
+    let record = dist.join("RECORD");
+    std::fs::write(
+        &record,
+        b"dependency.py,,\nfixture-1.0.dist-info/RECORD,,\n",
+    )
+    .unwrap();
+    let dependency = site.join("dependency.py");
+    std::fs::write(&dependency, b"original").unwrap();
+    let source = root.join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("shim.py"), b"synthetic").unwrap();
+    let config = root.join("runtime.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&json!({"source":{"path":source,"files":{"shim.py":{}}}})).unwrap(),
+    )
+    .unwrap();
+    let runner = root.join("server.py");
+    std::fs::write(
+        &runner,
+        b"raise AssertionError('observation must never launch')",
+    )
+    .unwrap();
+    let count = root.join("enumerations");
+    let interpreter = root.join("slow-python");
+    // Delays inventory construction beyond the old hard two-second deadline.
+    // The real observation.py still enumerates the synthetic wheel's RECORD.
+    std::fs::write(
+        &interpreter,
+        format!(
+            "#!/bin/sh\nprintf 'inventory\\n' >> {count:?}\nsleep 2.1\nexec {python:?} \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let binary = root.join("native-decision-server");
+    std::fs::write(
+        &binary,
+        format!("#!/bin/sh\nexec {interpreter:?} -I {runner:?} \"$@\"\n"),
+    )
+    .unwrap();
+    let cfg: EngineConfig =
+        serde_json::from_value(json!({"enabled":true,"native":{"binary":binary}})).unwrap();
+    let adapter = NativeDecisionAdapter::from_config(Some(&cfg), &root);
+    let enumerations = || std::fs::read_to_string(&count).unwrap().lines().count();
+    let start = std::time::Instant::now();
+    let first = adapter.external_runtime_observation_key().await.unwrap();
+    assert!(start.elapsed() > Duration::from_secs(2));
+    assert_eq!(
+        adapter.external_runtime_observation_key().await.as_ref(),
+        Some(&first)
+    );
+    assert_eq!(enumerations(), 1);
+    std::fs::write(&dependency, b"modified").unwrap();
+    let changed = adapter.external_runtime_observation_key().await.unwrap();
+    assert_ne!(changed, first);
+    assert_eq!(
+        enumerations(),
+        1,
+        "file edits reuse the dependency inventory"
+    );
+    // RECORD edits must discover newly declared paths even without a directory
+    // change (the new member is initially missing).
+    std::fs::write(
+        &record,
+        b"dependency.py,,\nnew.py,,\nfixture-1.0.dist-info/RECORD,,\n",
+    )
+    .unwrap();
+    let expanded = adapter.external_runtime_observation_key().await.unwrap();
+    assert_ne!(expanded, changed);
+    assert_eq!(enumerations(), 2);
+    let new = site.join("new.py");
+    std::fs::write(&new, b"original").unwrap();
+    let added = adapter.external_runtime_observation_key().await.unwrap();
+    assert_ne!(added, expanded);
+    assert_eq!(
+        enumerations(),
+        3,
+        "directory additions rebuild the inventory"
+    );
+    std::fs::write(&new, b"modified").unwrap();
+    assert_ne!(
+        adapter.external_runtime_observation_key().await.unwrap(),
+        added
+    );
+    assert_eq!(enumerations(), 3, "new wheel members remain watched");
+    std::fs::write(&config, b"invalid config").unwrap();
+    assert!(adapter.external_runtime_observation_key().await.is_none());
+    assert_eq!(enumerations(), 4);
+    assert!(adapter.observation_paths.lock().await.is_empty());
+}

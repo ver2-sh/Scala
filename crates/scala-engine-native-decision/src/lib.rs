@@ -26,7 +26,15 @@ pub struct NativeDecisionAdapter {
     error: Option<String>,
     client: reqwest::Client,
     proofs: RwLock<BTreeMap<String, Proof>>,
-    observation_paths: tokio::sync::Mutex<Option<(String, Vec<PathBuf>)>>,
+    observation_paths: tokio::sync::Mutex<BTreeMap<PathBuf, ObservationInventory>>,
+}
+// Discovery change detectors only; never runtime identity or launch authority.
+#[derive(Deserialize)]
+struct ObservationInventory {
+    paths: Vec<PathBuf>,
+    inventory_paths: Vec<PathBuf>,
+    #[serde(skip)]
+    inventory_key: String,
 }
 #[derive(Clone)]
 struct Proof {
@@ -173,7 +181,7 @@ impl NativeDecisionAdapter {
                 .build()
                 .expect("native HTTP client"),
             proofs: RwLock::new(BTreeMap::new()),
-            observation_paths: tokio::sync::Mutex::new(None),
+            observation_paths: tokio::sync::Mutex::new(BTreeMap::new()),
         }
     }
     async fn probe_path(&self, path: &Path) -> Result<EngineProbe, EngineError> {
@@ -453,14 +461,18 @@ impl EngineAdapter for NativeDecisionAdapter {
     }
     async fn external_runtime_observation_key(&self) -> Option<String> {
         let mut cached = self.observation_paths.lock().await;
-        if let Some((key, paths)) = cached.as_ref()
-            && local_runtime_observation_key(paths.clone()).await.as_ref() == Some(key)
-        {
-            return Some(key.clone());
-        }
-        *cached = None;
-        let mut paths = self.binaries.clone();
+        let mut paths = Vec::new();
         for binary in &self.binaries {
+            if let Some(inventory) = cached.get(binary)
+                && local_runtime_observation_key(inventory.inventory_paths.clone())
+                    .await
+                    .as_ref()
+                    == Some(&inventory.inventory_key)
+            {
+                paths.extend(inventory.paths.iter().cloned());
+                continue;
+            }
+            cached.remove(binary);
             // Only the explicit prepare.py launcher shape is understood. Unknown
             // wrappers remain uncached, and are still authoritatively probed.
             let launcher = tokio::fs::read_to_string(binary).await.ok()?;
@@ -476,9 +488,17 @@ impl EngineAdapter for NativeDecisionAdapter {
             }
             let runner = PathBuf::from(&words[3]);
             let config = runner.with_file_name("runtime.json");
-            // Metadata inventory only: no imports of runtime/tensor code, file
-            // hashing, weight reads or persistent writes. Works with already
-            // installed v1 wrappers, without replacing their runner/identity.
+            let controls = vec![
+                binary.clone(),
+                runner,
+                config.clone(),
+                PathBuf::from(&words[1]),
+            ];
+            let before = local_runtime_observation_key(controls.clone()).await?;
+            // Enumerate once per launcher/configuration and dependency topology.
+            // Large vLLM inventories may take longer than two seconds; this
+            // bounded enumeration imports no runtime/tensor code and performs
+            // no hashes or persistent writes.
             let output = capture_command(
                 Path::new(&words[1]),
                 &[
@@ -490,23 +510,36 @@ impl EngineAdapter for NativeDecisionAdapter {
                 ],
                 &BTreeMap::new(),
                 &[],
-                Duration::from_secs(2),
+                Duration::from_secs(5),
             )
             .await
             .ok()?;
-            if !output.success || output.stdout.len() > 16 * 1024 * 1024 {
+            if !output.success
+                || output.stdout.len() > 16 * 1024 * 1024
+                || local_runtime_observation_key(controls.clone()).await? != before
+            {
                 return None;
             }
-            let members: Vec<PathBuf> = serde_json::from_str(&output.stdout).ok()?;
-            paths.extend(members);
-            paths.extend([runner, config, PathBuf::from(&words[1])]);
+            let mut inventory: ObservationInventory = serde_json::from_str(&output.stdout).ok()?;
+            inventory.paths.extend(controls.iter().cloned());
+            inventory.inventory_paths.extend(controls);
+            inventory.paths.sort();
+            inventory.paths.dedup();
+            inventory.inventory_paths.sort();
+            inventory.inventory_paths.dedup();
+            inventory.inventory_key =
+                local_runtime_observation_key(inventory.inventory_paths.clone()).await?;
+            paths.extend(inventory.paths.iter().cloned());
+            cached.insert(binary.clone(), inventory);
         }
         paths.sort();
         paths.dedup();
-        let key = local_runtime_observation_key(paths.clone()).await?;
-        *cached = Some((key.clone(), paths));
-        Some(key)
+        // Content metadata changes invalidate the observation without rebuilding
+        // inventories. Directories/RECORD/control changes rebuild only that runtime.
+        // RuntimePackManager separately bounds the lifetime of qualified probes.
+        local_runtime_observation_key(paths).await
     }
+
     async fn probe_runtime(
         &self,
         runtime: &InstalledRuntime,
