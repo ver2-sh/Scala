@@ -94,7 +94,9 @@ def runtime_identity(config_path):
             raise ValueError("Native implementation Python closure changed")
         if "scripts/playground/server.py" not in actual or "scripts/torch_decision.py" not in actual:
             raise ValueError("Native readout implementation is missing")
-    if not required_packages <= set(cfg["packages"]):
+    # Wheel metadata names are case-insensitive (Pillow now records `pillow`).
+    normalize = lambda name: name.lower().replace("_", "-").replace(".", "-")
+    if not {normalize(n) for n in required_packages} <= {normalize(n) for n in cfg["packages"]}:
         raise ValueError("Required serving dependencies are missing from runtime lock")
     packages = {}
     # Verify the actual installed wheel file closure against RECORD, without
@@ -119,7 +121,6 @@ def runtime_identity(config_path):
         packages[name] = {"version": version, "files": sorted(records)}
     # All installed distributions must be locked, including transitive native
     # libraries. Editable/unlocked installs cannot acquire this runtime identity.
-    normalize = lambda name: name.lower().replace("_", "-").replace(".", "-")
     if {normalize(d.metadata["Name"]) for d in importlib.metadata.distributions()} != {normalize(n) for n in cfg["packages"]}:
         raise ValueError("Runtime has unlocked distributions; use a dedicated, fully locked environment")
     identity = {"config": cfg, "packages": packages, "python": sha(Path(sys.executable).resolve()), "runner": sha(Path(__file__).resolve()), "python_version": sys.version}

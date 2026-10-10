@@ -175,3 +175,38 @@ artifacts and reported neither execution-qualified. Scratch reports/logs are in
 `/srv/norted/scratch/native-decision-integration/qualification-report.json` and its
 sibling validation files. The production profile store's before/after SHA-256 is
 `49a6b7f253161d8d410e81a7476fc00025dae4fac034dcfc3d9b1e885da1c8e4`.
+
+## Audit follow-up staging, 2026-10-10
+
+Stable staging is `/srv/norted/runtimes/native-decision/staging-2026-10-10/`;
+`evidence/qualification-report.json` records the exact wheels, source identities,
+descriptor bindings, runtime resolution, validation and remaining release work.
+Both descriptors retain the original verified checkpoints. Moving a descriptor
+changes its path-derived artifact ID; use the staged profile bindings, not the
+earlier scratch IDs.
+
+Imajev's isolated Python 3.12 runtime passes the complete RECORD/source probe and
+resolves to `torch-readout`. Its options are CUDA, four rotations and 4,096 input
+tokens, with the original calibration and unmerged adapter/readout. A wrapper
+fix recognizes case-insensitive wheel names such as `pillow`; RECORD verification
+and missing-dependency rejection remain enforced.
+
+H2O provisioning is blocked: stock vLLM 0.30.0 and the pinned README's
+`0.30.0+cu129` build require `PyNvVideoCodec==2.0.4`. SHA-verified original Linux
+x86-64 wheels for the installed Python versions 3.10, 3.12, 3.13 and 3.14 contain
+two native libraries with incorrect RECORD hashes. No qualified H2O launcher or
+profile is installed. The separate DLPack wheel site inside the attempted H2O
+environment preserves original wheel contents and resolves its shared
+`build_backend.py` collision; it does not bypass the PyNvVideoCodec failure.
+
+The exact auxiliary profile bindings are detached staging files. Only Imajev has
+an installed-runtime binding; H2O's binding is explicitly blocked. Neither has
+execution proof or production registration. Read-only checks reject cross-variant
+fallback. Coded's Decision deadline now covers Scala's 300-second startup plus
+600-second native request allowance, retaining caller cancellation and fail-closed
+handling. Targeted synthetic/static checks perform no model loading or inference.
+
+The RTX 5090 reports only 1,307 MiB free with Swift resident. Original tensors alone
+occupy about 8,022 MiB for H2O and 8,888 MiB for Imajev's base, plus its adapter,
+readout and runtime/context overhead. Neither can coexist with the current Swift
+allocation. No service, live store, Swift configuration or Unsloth setting changed.

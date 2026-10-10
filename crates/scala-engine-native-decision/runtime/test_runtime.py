@@ -92,6 +92,31 @@ class ClosureTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 runtime.runtime_identity(p)
 
+    def test_runtime_accepts_canonical_wheel_names_and_still_verifies_records(self):
+        import base64
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            members = ["src/fixture.py", "scripts/torch_decision.py", "scripts/playground/server.py"]
+            for name in members:
+                p = root / name
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("# synthetic\n")
+            wheel_file = root / "wheel.py"
+            wheel_file.write_text("# synthetic wheel\n")
+            record = types.SimpleNamespace(hash=types.SimpleNamespace(mode="sha256", value=base64.urlsafe_b64encode(bytes.fromhex(runtime.sha(wheel_file))).decode().rstrip("=")))
+            packages = {name: "1" for name in ["torch", "peft", "transformers", "safetensors", "fastapi", "uvicorn", "pydantic", "pillow"]}
+            cfg = {"schema_version": 1, "backend": "torch-readout", "packages": packages,
+                   "options": {"rotations": 4, "max_input_tokens": 4096, "device": "cuda"},
+                   "source": {"path": str(root), "revision": "a" * 40, "files": {name: {"size_bytes": (root / name).stat().st_size, "sha256": runtime.sha(root / name)} for name in members}}}
+            path = root / "runtime.json"
+            path.write_text(json.dumps(cfg))
+            distributions = {name: types.SimpleNamespace(version="1", metadata={"Name": name}, files=[record], locate_file=lambda _: wheel_file) for name in packages}
+            with patch.object(runtime.importlib.metadata, "distribution", side_effect=distributions.__getitem__), patch.object(runtime.importlib.metadata, "distributions", return_value=list(distributions.values())):
+                self.assertEqual(runtime.runtime_identity(path)[0], cfg)
+                wheel_file.write_text("# changed wheel\n")
+                with self.assertRaisesRegex(ValueError, "Runtime package file changed"):
+                    runtime.runtime_identity(path)
+
     def test_torch_dispatch_uses_trained_readout_and_native_calibrator(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, cfg = self.fixture(Path(tmp), "torch-readout")
