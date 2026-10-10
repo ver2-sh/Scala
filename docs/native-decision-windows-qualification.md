@@ -1,4 +1,9 @@
-# Native Windows Decision qualification, 2026-10-10
+# Historical native Windows Decision evidence, 2026-10-10
+
+This record preserves the earlier operational run; it was not independently
+reverified in the subsequent Norted code-only pass. Current provisioning and
+compatibility admission are described in
+[Windows provisioning](native-decision-windows-provisioning.md).
 
 This is operational development evidence for the changes based on Scala
 `c816f4d240064f21ec98e4ae90a30faac857a53d`, not evidence for the unchanged installed
@@ -157,8 +162,9 @@ is v0.29.0 at `13e844c86da90c1f96bc516d161ea2a14901ab04`. Its published
 Python 3.12 Windows wheel is
 `vllm-0.29.0+cu132-cp312-cp312-win_amd64.whl`, SHA-256
 `736a53ff6cbb976735afb73b998c151c2afe69b08ab1546e1e5954d6e4454beb`.
-It advertises CUDA 13 and Ada support. This is not execution proof or permission
-to remove Scala's vLLM 0.30.0 requirement.
+It advertises CUDA 13 and Ada support. This was not execution proof. The audited
+implementation nevertheless already contained an explicit compatibility exception for this exact pinned Windows
+build; the ordinary vLLM 0.30.0 requirement remains for other runtimes.
 
 The unadmitted, separately locked `h2o-investigation-env` uses torch
 2.11.0+cu130, triton-windows 3.6.0.post26 and the port's pinned
@@ -175,11 +181,14 @@ Neither package nor RECORD was edited. Fresh verification hashes 46,812 RECORD
 members with zero mismatches. The corresponding locks, original wheels, pinned
 source and isolation/audit scripts are retained under the D roots above.
 
-Native GPU investigation outcome and build assessment: pending.
-No Windows version exception is currently admitted, and H2O is honestly
-unavailable in the isolated Scala inventory.
+Historical native GPU investigation outcome: pending. H2O was unavailable in
+the recorded isolated Scala inventory. The later code-only pass commits a
+reproducible provisioning route and corrects the admission wording: the exact
+Windows compatibility build is implemented, while successful native H2O execution
+qualification remains unrecorded. The private packaging/isolation scripts above
+are historical evidence, not current provisioning prerequisites.
 
-## Validation and remaining findings
+## Historical validation and remaining findings
 
 Linux `cargo test --workspace --lib --bins --offline`: 367 passed, one existing
 manual benchmark ignored. Workspace all-targets Clippy with warnings denied

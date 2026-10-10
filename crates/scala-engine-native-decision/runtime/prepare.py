@@ -48,7 +48,7 @@ def main():
     r.add_argument("--wheel-attestation", action="append", nargs=4,
                    metavar=("PACKAGE", "ORIGINAL_WHEEL", "WHEEL_SHA256", "MISMATCHES_JSON"),
                    help="pin an original upstream wheel and exact known bad RECORD members; never alter installed bytes")
-    r.add_argument("--windows-vllm", type=Path, help="explicit qualified native Windows build, SDK and environment binding")
+    r.add_argument("--windows-vllm", type=Path, help="explicit pinned native Windows compatibility build, SDK and environment binding")
     r.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
     if args.mode == "bundle":

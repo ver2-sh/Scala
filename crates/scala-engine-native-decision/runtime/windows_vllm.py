@@ -1,4 +1,4 @@
-"""Qualified native Windows vLLM build; metadata checks never import tensor code."""
+"""Pinned native Windows vLLM compatibility build; metadata checks never import tensor code."""
 import csv
 import io
 import os
@@ -21,18 +21,18 @@ def validate(cfg, windows):
             or set(build["wheel"]) != {"path", "sha256"}
             or build["wheel"]["sha256"] != WHEEL_SHA256
             or set(build["sdk"]) != {"path", "files"}):
-        raise ValueError("Unqualified native Windows vLLM build")
+        raise ValueError("Unrecognized native Windows vLLM build")
     options = cfg["options"]
     if (options.get("enforce_eager") is not True or options.get("cpu_offload_gb") != 0
             or any(type(options.get(key)) is not int or options[key] <= 0
                    for key in ("max_num_seqs", "max_num_batched_tokens"))):
-        raise ValueError("Invalid qualified Windows vLLM execution options")
+        raise ValueError("Invalid pinned Windows vLLM execution options")
     environment = build["environment"]
     if (set(environment) != DIRECTORIES | {"USERNAME", "VLLM_USE_FLASHINFER_SAMPLER"}
             or not all(isinstance(value, str) and value and "\0" not in value for value in environment.values())
             or environment["VLLM_USE_FLASHINFER_SAMPLER"] != "0"
             or environment["CUDA_HOME"] != build["sdk"]["path"]):
-        raise ValueError("Invalid qualified Windows vLLM environment")
+        raise ValueError("Invalid pinned Windows vLLM environment")
     return build
 
 
@@ -44,19 +44,19 @@ def verify(cfg, packages, runtime):
             raise ValueError("Windows runtime directory must be canonical and existing")
     archive = runtime.regular(Path(build["wheel"]["path"]))
     if runtime.sha(archive) != WHEEL_SHA256:
-        raise ValueError("Qualified Windows vLLM wheel changed")
+        raise ValueError("Pinned Windows vLLM wheel changed")
     # Check the actual installed payload against the exact published archive,
     # in addition to the ordinary complete RECORD checks. No RECORD exception.
     with zipfile.ZipFile(archive) as wheel:
         records = [name for name in wheel.namelist() if name.endswith(".dist-info/RECORD")]
         if len(records) != 1:
-            raise ValueError("Qualified Windows vLLM wheel has an invalid RECORD")
+            raise ValueError("Pinned Windows vLLM wheel has an invalid RECORD")
         expected = {row[0]: row[1].removeprefix("sha256=")
                     for row in csv.reader(io.StringIO(wheel.read(records[0]).decode("utf-8")))
                     if row[1].startswith("sha256=")}
     actual = {name.replace("\\", "/"): digest for name, digest in packages["vllm"]["files"]}
     if any(actual.get(name) != digest for name, digest in expected.items()):
-        raise ValueError("Installed vLLM differs from its qualified Windows wheel")
+        raise ValueError("Installed vLLM differs from its pinned Windows wheel")
     sdk = runtime.inventory(build["sdk"]["path"], build["sdk"]["files"])
     if {p.relative_to(sdk).as_posix() for p in sdk.rglob("*") if p.is_file()} != set(build["sdk"]["files"]):
         raise ValueError("Private CUDA SDK closure changed")

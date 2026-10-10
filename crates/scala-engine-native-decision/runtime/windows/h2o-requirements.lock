@@ -1,4 +1,4 @@
-# Native Windows resolution; original wheel hashes, installed via --find-links.
+# Native Windows resolution; source-packaged Humming wheel supplied by provision-h2o.ps1.
 agent-detector==2.0.0 \
     --hash=sha256:19c8ae185dbdca23c24abdcd8ac2cf58b8e84dc284c6f6db536656601f9ffc3f \
     --hash=sha256:22c6a1c9c23894a12f55aea625f060b8d3330fba774de72d02d5442bb580417f
@@ -1475,9 +1475,8 @@ huggingface-hub==2.2.0 \
     #   transformers
     #   vllm
 humming-kernels==0.1.15 \
-    --hash=sha256:9d0a67ae7c1d80000d94073d9c7b0a77010eb5d6ea4f999684f0a6a0d3025580
+    --hash=sha256:dd2e460632c27b05dac5bcb17a66e2101c8d906526009f88e2e10561483ea646
     # via
-    #   --override D:/Scala/Setup/decision-models/windows/h2o-overrides.txt
     #   vllm
 idna==3.20 \
     --hash=sha256:a7db850025b95ded1eae8a46181a1a6c56c92c96f0e2b005d9ff8dc0210cab44 \
@@ -4370,7 +4369,6 @@ torch==2.11.0+cu130 \
     --hash=sha256:ef8beae16d781c3244ef28dc7bee6d8871c26bbde65d5bf66e902cb61972c4ab \
     --hash=sha256:efcdfe08ec2c9db28b50cc7329fed0c90bb74fa6fbce0f7eb12e20db2279a40f
     # via
-    #   -r D:/Scala/Setup/decision-models/windows/h2o-investigation.in
     #   compressed-tensors
     #   flashinfer-python
     #   humming-kernels
@@ -4475,7 +4473,6 @@ torchvision==0.26.0+cu130 \
     --hash=sha256:d019b9d02433515d59ad403d8a6f521da7844c030d6c8003eeec39e15e59f9fa \
     --hash=sha256:e2b39db78be674ee4ce7e921f54b70e5c281594c9267d981c061684ed38df936
     # via
-    #   -r D:/Scala/Setup/decision-models/windows/h2o-investigation.in
     #   vllm
 tqdm==4.70.1 \
     --hash=sha256:c293e525e6fef9c20e8728fd4612df02a0aa31bb5fe91ecd93e123b1b7bffa73 \
@@ -4575,7 +4572,6 @@ uvicorn==0.54.0 \
     #   mcp
 vllm==0.29.0+cu132 \
     --hash=sha256:736a53ff6cbb976735afb73b998c151c2afe69b08ab1546e1e5954d6e4454beb
-    # via -r D:/Scala/Setup/decision-models/windows/h2o-investigation.in
 watchfiles==1.3.0 \
     --hash=sha256:000b9688fc8133037a8b075c8ebf98f32844ff8964dda61e85c1db547dafc441 \
     --hash=sha256:025b108f2d5cc2799cb941f79380df3e8b22bfb589c218e801767fe78d598c95 \

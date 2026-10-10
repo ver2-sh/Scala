@@ -17,7 +17,8 @@ unchanged, and this format has no Norted package manifest.
 
 Two backend contracts are implemented, independent of repository/profile names:
 
-- `vllm-labels`: stock vLLM **0.30.0** plus an explicitly installed upstream label
+- `vllm-labels`: stock vLLM **0.30.0** (or the explicitly pinned Windows
+  compatibility build described below) plus an installed upstream label
   shim. The original model configuration must retain `head_dtype: float32`.
   The native shim owns trained question rendering, exact `logprob_token_ids`
   reads for **every** label (including chunking beyond vLLM's limit), temperature,
@@ -170,7 +171,10 @@ Python installation and package caches to the supplied runtime root, leaves
 system Python/PATH/drivers untouched, and verifies an existing immutable runtime
 against its original receipt on rerun. Windows configuration uses the interpreter
 entrypoint in `native.binaries`; backend/platform builds remain runtime variants
-of `native_decision`. No Windows vLLM version exception is currently admitted.
+of `native_decision`. The narrowly pinned Windows vLLM 0.29.0+cu132 compatibility
+exception and reproducible H2O recipe are documented in
+[Windows provisioning](native-decision-windows-provisioning.md). Installed
+compatibility remains separate from native execution-qualified Decision.
 
 The [`isolated_native_decision`](../crates/scala-api/examples/isolated_native_decision.rs)
 example uses the supported explicit `AppPaths` boundary, a new state tree,

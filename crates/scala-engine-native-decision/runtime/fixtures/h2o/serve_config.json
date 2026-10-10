@@ -1,0 +1,18 @@
+{
+ "model": "h2oai/h2o-lightning-4b",
+ "base_model": "Qwen/Qwen3.5-4B",
+ "base_model_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+ "temperature": 0.8,
+ "noul_floor": 0.801,
+ "prompt": {
+  "chat_template": true,
+  "enable_thinking": false,
+  "system": "You are a decision engine. You read a record and answer one question about it by choosing exactly one option. Reply with a single letter.",
+  "layout": "plain",
+  "state_compact": true,
+  "prefill": "Answer:",
+  "max_state_tokens": 32000
+ },
+ "labels": ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "α", "β", "γ", "δ", "ε", "ζ", "η", "θ", "ι", "κ", "λ", "μ", "ν", "ξ", "ο", "π", "σ", "τ", "υ", "φ", "χ", "ψ", "ω", "in", "er", "on", "re", "at", "st", "en", "or", "th", "le", "it", "an", "ar", "al", "the", "ou", "is", "ing", "es", "ion", "ed", "ic", "et", "ro", "as", "el", "ct", "nd", "ent", "id", "am", "to", "of", "om", "im", "il", "and", "ur", "se", "ex", "ad", "ch", "ut", "if", "em", "ol", "ig", "iv", "ce", "od", "ate", "ag", "ay", "ot", "us", "un", "ul", "ue", "ow", "ew", "for", "ab", "ort", "um", "ame", "pe", "tr", "ck", "ist", "he", "lo", "be", "ers", "con", "ap", "ub", "ass", "int", "ly", "urn", "av", "ir", "nt", "end", "de", "ith", "out", "our", "lic", "res", "pt", "wh", "ver", "age", "ht", "ext", "ess", "os", "ect", "ke", "rom", "qu", "iz", "op", "up", "get", "ile", "ata", "ore", "ri", "pro", "ter", "ain", "com", "art", "ack", "est", "ine", "ill", "ind", "ere", "elf", "orm", "ult", "str", "you", "pl", "new", "ld", "oc", "ant", "ase", "ave", "ang", "are", "ial", "act", "ive", "ode", "ost", "not", "og", "ord", "all", "ff", "ont", "ime", "pr", "ies", "ure", "by", "ire", "sh", "ice", "ast", "ok", "cl", "ard", "was", "ip", "The", "ide", "ace", "ib", "ac", "rou", "we", "ak", "ve", "ath", "oid", "ust", "que", "ans", "pp", "one", "ail", "ach", "div", "ell"],
+ "max_options": 255
+}

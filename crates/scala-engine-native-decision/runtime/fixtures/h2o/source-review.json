@@ -1,0 +1,14 @@
+{
+  "model_revision": "193ad740925b176a3b70a5a13a7cff2f2fadd01e",
+  "vllm_revision": "13e844c86da90c1f96bc516d161ea2a14901ab04",
+  "projection_excerpt_sha256": "3cb7fea48c08851aed74084630e965e5d78b1dabe10b2f94fceb28ea0dfd0486",
+  "source_files": {
+    "vllm/model_executor/models/qwen3_5.py": "3abeac36180df7bd1bd96b1a7c698a8f212d92c063026420cbdd16d1980e90e6",
+    "vllm/model_executor/models/registry.py": "fef8293fe19cef01768a4c5bd8adc05e120202f1c1597eb264d090672894fbd7",
+    "vllm/config/model.py": "de2309f4f710f04588ac0835e1cfd215e1310bcb136bf53142685c926256a27c",
+    "vllm/model_executor/layers/logits_processor.py": "6b0603d67b0c756253c2fdc882a3896d2e873a16e9aa2ef877aabca8d36bdb5f",
+    "vllm/v1/sample/sampler.py": "f95805b2c6d06218c724826aa5f881a606e8d0a534a566aee7c85948520dd216",
+    "vllm/entrypoints/openai/completion/protocol.py": "4dcb857b80f94bf2f02cadbc27ec0e6c416b6de12d39d3b1bc86a66ee910e4d0",
+    "vllm/entrypoints/openai/completion/serving.py": "75d05ddddf303734a078a3e42fcb173fef58ea56da09bc0b5c7525cb9bbbf527"
+  }
+}
