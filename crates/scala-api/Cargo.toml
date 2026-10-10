@@ -24,6 +24,8 @@ sha2.workspace = true
 tower = { version = "0.5.2", features = ["util"] }
 
 [dev-dependencies]
+reqwest.workspace = true
+scala-engine-ninfer = { path = "../scala-engine-ninfer" }
 serde_json.workspace = true
 tempfile.workspace = true
 

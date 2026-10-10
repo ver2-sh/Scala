@@ -1,5 +1,9 @@
 # Chat Completions message names
 
+For installed Unsloth workflow construction, native CPU renderer evidence and
+the exact remaining upstream boundary, see the
+[Unsloth / NInfer interoperability audit](unsloth-ninfer-interop.md).
+
 Scala previously allowed `messages[].name` only when omitted or null, before
 parsing the role. That rejected named messages in Unsloth Studio tool loops and
 replayed history with HTTP 400, including Web Search and file-editing workflows.
