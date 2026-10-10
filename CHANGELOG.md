@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.1.14 - Native source Decision runtimes
+
+Introduces narrowly qualified local source-backed Decision runtimes for
+structured choice, ordinal score and yes/no answers, without changing
+existing generative serving or requiring Norted-produced artifacts.
+
+- Add the independent `native_decision` engine with explicit
+  `.decisionbundle` sources, external runtime discovery and profile-bound
+  native System One JIT serving. Source provenance, artifact metadata, names and
+  runtime identity alone never grant Decision capability.
+- Support original vLLM-based label scoring and trained PyTorch/PEFT readouts,
+  preserving native confidence, calibration and abstention observations.
+  Keep llama.cpp, q27 and NInfer inference controls and eligibility separate.
+- Verify complete pinned source and installed wheel closures before launch,
+  attest runtime/model identity through health and an exact native validator,
+  supervise native worker process trees, and fail closed on mismatches.
+- Allow explicitly SHA-pinned original wheel archives to attest narrowly
+  enumerated defective vendor RECORD members without editing their installed
+  bytes, RECORD files or changing the required package version. All other
+  wheel hashes remain mandatory.
+- Keep source bundles, engine runtimes, and user-owned Model Profiles separate:
+  this application release neither installs a particular model nor starts
+  inference or changes existing GPU residency.
+
 ## 0.1.13 - Unsloth named-message interoperability
 
 Improves Chat Completions tool-history compatibility with Unsloth Studio while
