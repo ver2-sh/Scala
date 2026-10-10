@@ -1480,7 +1480,7 @@ async fn execute_runtime_action(
 ) -> RuntimeTaskResult {
     match action {
         RuntimeAction::RefreshList => {
-            runtime_packs.refresh_host_capabilities().await;
+            runtime_packs.refresh_local_observations().await;
             RuntimeTaskResult::Listed(
                 runtime_packs
                     .list()

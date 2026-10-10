@@ -101,6 +101,29 @@ invalid settings do not produce a selectable candidate. A compatible old llama
 runtime can be attempted but still cannot advertise `decision: true` or execute;
 its missing native route fails qualification.
 
+Public discovery supports both client conventions: a genuine candidate or
+qualified Decision pair also exposes `architecture.output_modalities: ["decisions"]`.
+`GET /v1/models?output_modalities=decisions` filters this same catalogue; unfiltered
+discovery and Link IDs/ownership retain their existing behavior. This architecture
+field describes the modality available for qualification and grants no execution
+capability. Ordinary chat, incompatible artifacts, missing runtimes and invalid
+configuration receive neither Decision modality nor candidate capability.
+
+Runtime inventory observations are shared across profiles, API requests, startup
+status and settings resolution. They remain process-local and retain the exact
+verified runtime identity; no observations enter Settings or Model Profiles.
+Warm inspection checks file/directory metadata without hashing runtime payloads
+or relaunching integrity probes. Changes invalidate the observation, explicit
+runtime-list refresh discards it, and its verification age is bounded to five
+minutes (warm reads do not renew that age). Selections, profile settings and
+artifact compatibility are resolved on each discovery request. Cold external
+probes run concurrently and discovery bounds each adapter's probe wait to eight
+seconds; a timeout returns an unavailable runtime with a warning, and subsequent
+inspection can retry. This discovery bound does not change authoritative launch
+verification. An observation is never execution proof: each adapter still verifies
+the selected runtime before launching, and native Decision's wrapper repeats
+complete closure validation before loading weights.
+
 Coded consumes the explicit candidate through its existing transient discovery
 catalogue, Decision picker, identity-only role selection and native tool. Manual
 or persisted flags cannot grant either field. Cold starts and unloads therefore

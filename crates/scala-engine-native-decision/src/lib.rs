@@ -26,6 +26,7 @@ pub struct NativeDecisionAdapter {
     error: Option<String>,
     client: reqwest::Client,
     proofs: RwLock<BTreeMap<String, Proof>>,
+    observation_paths: tokio::sync::Mutex<Option<(String, Vec<PathBuf>)>>,
 }
 #[derive(Clone)]
 struct Proof {
@@ -172,6 +173,7 @@ impl NativeDecisionAdapter {
                 .build()
                 .expect("native HTTP client"),
             proofs: RwLock::new(BTreeMap::new()),
+            observation_paths: tokio::sync::Mutex::new(None),
         }
     }
     async fn probe_path(&self, path: &Path) -> Result<EngineProbe, EngineError> {
@@ -447,11 +449,63 @@ impl EngineAdapter for NativeDecisionAdapter {
         if self.binaries.is_empty() {
             return vec![self.probe().await];
         }
-        let mut probes = Vec::new();
-        for path in &self.binaries {
-            probes.push(self.probe_path(path).await);
+        futures_util::future::join_all(self.binaries.iter().map(|path| self.probe_path(path))).await
+    }
+    async fn external_runtime_observation_key(&self) -> Option<String> {
+        let mut cached = self.observation_paths.lock().await;
+        if let Some((key, paths)) = cached.as_ref()
+            && local_runtime_observation_key(paths.clone()).await.as_ref() == Some(key)
+        {
+            return Some(key.clone());
         }
-        probes
+        *cached = None;
+        let mut paths = self.binaries.clone();
+        for binary in &self.binaries {
+            // Only the explicit prepare.py launcher shape is understood. Unknown
+            // wrappers remain uncached, and are still authoritatively probed.
+            let launcher = tokio::fs::read_to_string(binary).await.ok()?;
+            let words = shlex::split(launcher.lines().nth(1)?)?;
+            if words.len() != 5
+                || words[0] != "exec"
+                || words[2] != "-I"
+                || words[4] != "$@"
+                || !Path::new(&words[1]).is_absolute()
+                || !Path::new(&words[3]).is_absolute()
+            {
+                return None;
+            }
+            let runner = PathBuf::from(&words[3]);
+            let config = runner.with_file_name("runtime.json");
+            // Metadata inventory only: no imports of runtime/tensor code, file
+            // hashing, weight reads or persistent writes. Works with already
+            // installed v1 wrappers, without replacing their runner/identity.
+            let output = capture_command(
+                Path::new(&words[1]),
+                &[
+                    "-I",
+                    "-B",
+                    "-c",
+                    include_str!("observation.py"),
+                    config.to_str()?,
+                ],
+                &BTreeMap::new(),
+                &[],
+                Duration::from_secs(2),
+            )
+            .await
+            .ok()?;
+            if !output.success || output.stdout.len() > 16 * 1024 * 1024 {
+                return None;
+            }
+            let members: Vec<PathBuf> = serde_json::from_str(&output.stdout).ok()?;
+            paths.extend(members);
+            paths.extend([runner, config, PathBuf::from(&words[1])]);
+        }
+        paths.sort();
+        paths.dedup();
+        let key = local_runtime_observation_key(paths.clone()).await?;
+        *cached = Some((key.clone(), paths));
+        Some(key)
     }
     async fn probe_runtime(
         &self,

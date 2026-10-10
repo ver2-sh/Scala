@@ -26,6 +26,7 @@ tower = { version = "0.5.2", features = ["util"] }
 [dev-dependencies]
 reqwest.workspace = true
 scala-engine-ninfer = { path = "../scala-engine-ninfer" }
+scala-engine-native-decision = { path = "../scala-engine-native-decision" }
 serde_json.workspace = true
 tempfile.workspace = true
 

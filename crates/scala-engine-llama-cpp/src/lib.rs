@@ -1236,6 +1236,11 @@ impl EngineAdapter for LlamaCppAdapter {
         })
     }
 
+    async fn external_runtime_observation_key(&self) -> Option<String> {
+        scala_engine::local_runtime_observation_key(self.binary_path.iter().cloned().collect())
+            .await
+    }
+
     async fn probe(&self) -> Result<EngineProbe, EngineError> {
         Ok(self.probe_uncached().await)
     }

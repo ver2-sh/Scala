@@ -48,6 +48,17 @@ code and actual dependency closure. A changed closure creates a different
 immutable runtime identity or fails the probe. External variants are discovered
 independently; a failed variant does not make another variant unavailable.
 
+Ordinary inspection reuses the shared engine-neutral verified observations
+described in [native Decision discovery](native-decision.md). For existing
+`prepare.py` absolute-interpreter launchers, a small isolated, bytecode-disabled
+metadata helper inventories the source, interpreter, installed distribution
+files/metadata, parent directories and attested wheel archives. Subsequent warm
+reads only stat those paths; they do not rerun Python or hash the wheel closure.
+File replacement, removal, permission changes and directory additions invalidate
+the observation. Unknown launcher shapes or failed metadata inspection remain
+uncached. No installed wrapper or runtime fingerprint is changed by this mechanism.
+The full original `--scala-probe` and pre-launch checks remain authoritative.
+
 Before each launch Scala clears old proof and verifies the exact runtime,
 executable SHA-256 and bundle digest. The wrapper independently repeats runtime
 verification and hashes the complete artifact closure before loading. The

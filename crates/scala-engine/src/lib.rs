@@ -60,7 +60,7 @@ pub use manager::{
 pub use packs::{
     InstalledRuntimeStatus, ModelProfileEngineSwitchCandidate, RuntimeListSnapshot,
     RuntimeLocalInspection, RuntimeModelCandidate, RuntimePackError, RuntimePackManager,
-    RuntimeSearchResult, RuntimeSearchSnapshot, RuntimeUpdateCheck,
+    RuntimeSearchResult, RuntimeSearchSnapshot, RuntimeUpdateCheck, local_runtime_observation_key,
 };
 pub use store::{
     RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreIssue, RuntimeStoreIssueKind,
@@ -1789,6 +1789,12 @@ pub trait EngineAdapter: Send + Sync {
     /// is qualified and identified separately by the existing runtime resolver.
     async fn external_runtime_probes(&self) -> Vec<Result<EngineProbe, EngineError>> {
         vec![self.probe().await]
+    }
+    /// Cheap invalidation key for the configured external runtime inputs.
+    /// Opt-in only: None keeps discovery uncached. This is never launch proof;
+    /// probe_runtime must still verify the exact runtime before execution.
+    async fn external_runtime_observation_key(&self) -> Option<String> {
+        None
     }
     /// Validates one exact runtime instance and records what the executable
     /// itself reported. Install activation and launch both use this boundary.

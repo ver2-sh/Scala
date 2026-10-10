@@ -139,6 +139,81 @@ pub struct RuntimePackManager {
     host: Arc<RwLock<HostCapabilities>>,
     host_initialized: Arc<std::sync::atomic::AtomicBool>,
     operation: Arc<Mutex<()>>,
+    external_observations: Arc<Mutex<BTreeMap<String, LocalRuntimeObservation>>>,
+    store_observation: Arc<Mutex<Option<LocalStoreObservation>>>,
+}
+
+// Observations belong to this manager/registry, never persistent settings.
+// Bound their lifetime even when filesystem notifications/metadata are imperfect.
+const OBSERVATION_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(300);
+struct LocalRuntimeObservation {
+    key: Option<String>,
+    probe: crate::EngineProbe,
+    at: std::time::Instant,
+    runtimes: Vec<InstalledRuntime>,
+    warnings: Vec<String>,
+}
+struct LocalStoreObservation {
+    paths: Vec<PathBuf>,
+    key: String,
+    at: std::time::Instant,
+    snapshot: RuntimeStoreSnapshot,
+}
+
+fn failed_discovery_probe(reason: String) -> crate::EngineProbe {
+    crate::EngineProbe {
+        installation: InstallationState::Invalid {
+            reason: reason.clone(),
+        },
+        update: crate::UpdateState::Unknown,
+        healthy: false,
+        detail: reason,
+    }
+}
+
+/// Cheap change detection, including symlink targets and Unix replacement/ctime.
+/// No file contents are hashed here and this key grants no execution authority.
+pub async fn local_runtime_observation_key(paths: Vec<PathBuf>) -> Option<String> {
+    tokio::task::spawn_blocking(move || {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        for path in paths {
+            hash.update(path.as_os_str().as_encoded_bytes());
+            for metadata in [std::fs::symlink_metadata(&path), std::fs::metadata(&path)] {
+                match metadata {
+                    Ok(metadata) => {
+                        hash.update(metadata.len().to_le_bytes());
+                        hash.update(format!(
+                            "{:?}{:?}",
+                            metadata.modified(),
+                            metadata.file_type()
+                        ));
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::MetadataExt;
+                            hash.update(format!(
+                                "{}:{}:{}:{}:{}:{}",
+                                metadata.dev(),
+                                metadata.ino(),
+                                metadata.ctime(),
+                                metadata.ctime_nsec(),
+                                metadata.mtime_nsec(),
+                                metadata.mode()
+                            ));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        hash.update(b"missing")
+                    }
+                    Err(_) => return None,
+                }
+            }
+        }
+        Some(format!("{:x}", hash.finalize()))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 impl RuntimePackManager {
@@ -254,6 +329,8 @@ impl RuntimePackManager {
                 HostCapabilities::current_without_accelerator_probe(),
             )),
             operation: Arc::new(Mutex::new(())),
+            external_observations: Arc::new(Mutex::new(BTreeMap::new())),
+            store_observation: Arc::new(Mutex::new(None)),
         }))
     }
 
@@ -576,7 +653,8 @@ impl RuntimePackManager {
     }
 
     pub async fn list(&self) -> Result<RuntimeListSnapshot, RuntimePackError> {
-        let RuntimeStoreSnapshot { runtimes, issues } = self.store.scan().await?;
+        self.store.ensure().await?;
+        let RuntimeStoreSnapshot { runtimes, issues } = self.observe_store().await?;
         let mut warnings = issues
             .into_iter()
             .map(|issue| issue.message)
@@ -611,8 +689,14 @@ impl RuntimePackManager {
     /// Inspects installed runtimes, selections, adapters, and host compatibility
     /// without initializing the store or consulting runtime providers.
     pub async fn inspect_local(&self) -> RuntimeLocalInspection {
-        let host = self.refresh_host_capabilities().await;
-        let (runtimes, store_issues, store_error) = match self.store.inspect_existing().await {
+        if !self
+            .host_initialized
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.refresh_host_capabilities().await;
+        }
+        let host = self.host_capabilities().await;
+        let (runtimes, store_issues, store_error) = match self.observe_store().await {
             Ok(snapshot) => (snapshot.runtimes, snapshot.issues, None),
             Err(error) => (Vec::new(), Vec::new(), Some(error.to_string())),
         };
@@ -654,38 +738,204 @@ impl RuntimePackManager {
         }
     }
 
+    /// Explicit runtime refresh discards observations; ordinary editors reuse them.
+    pub async fn refresh_local_observations(&self) {
+        self.external_observations.lock().await.clear();
+        *self.store_observation.lock().await = None;
+        self.refresh_host_capabilities().await;
+    }
+
+    /// Startup status uses the same verified observations as discovery instead
+    /// of independently probing the first configured executable again.
+    pub async fn engine_probes(&self) -> Vec<(crate::EngineIdentity, crate::EngineProbe)> {
+        self.collect_external_runtimes(Vec::new(), &mut Vec::new())
+            .await;
+        let observations = self.external_observations.lock().await;
+        self.registry
+            .adapters()
+            .filter_map(|adapter| {
+                let identity = adapter.identity();
+                observations
+                    .get(&identity.id)
+                    .map(|observation| (identity, observation.probe.clone()))
+            })
+            .collect()
+    }
+
+    async fn observe_store(&self) -> Result<RuntimeStoreSnapshot, RuntimeStoreError> {
+        let mut observation = self.store_observation.lock().await;
+        if let Some(cached) = observation.as_ref()
+            && cached.at.elapsed() < OBSERVATION_MAX_AGE
+            && local_runtime_observation_key(cached.paths.clone())
+                .await
+                .as_ref()
+                == Some(&cached.key)
+        {
+            return Ok(cached.snapshot.clone());
+        }
+        *observation = None;
+        let root = self.store.root().to_owned();
+        // Retain directory and file metadata to notice replacements/additions
+        // without walking or hashing the managed store again on a warm read.
+        let paths = tokio::task::spawn_blocking(move || {
+            let mut paths = vec![root.clone()];
+            if !root.exists() {
+                return Some(paths);
+            }
+            for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+                let entry = entry.ok()?;
+                paths.push(entry.path().to_owned());
+            }
+            Some(paths)
+        })
+        .await
+        .ok()
+        .flatten();
+        let before = match &paths {
+            Some(paths) => local_runtime_observation_key(paths.clone()).await,
+            None => None,
+        };
+        let snapshot = self.store.inspect_existing().await?;
+        if let Some(mut paths) = paths {
+            let unchanged =
+                before.is_some() && local_runtime_observation_key(paths.clone()).await == before;
+            if !unchanged {
+                return Err(RuntimeStoreError::Io {
+                    path: self.store.root().to_owned(),
+                    source: std::io::Error::other("runtime store changed during inspection; retry"),
+                });
+            }
+            paths.extend(
+                snapshot
+                    .runtimes
+                    .iter()
+                    .map(InstalledRuntime::entrypoint_path),
+            );
+            if snapshot.issues.is_empty()
+                && let Some(key) = local_runtime_observation_key(paths.clone()).await
+            {
+                *observation = Some(LocalStoreObservation {
+                    paths,
+                    key,
+                    at: std::time::Instant::now(),
+                    snapshot: snapshot.clone(),
+                });
+            }
+        }
+        Ok(snapshot)
+    }
+
     async fn collect_external_runtimes(
         &self,
         mut runtimes: Vec<InstalledRuntime>,
         warnings: &mut Vec<String>,
     ) -> Vec<InstalledRuntime> {
-        for adapter in self.registry.adapters() {
-            for probe in adapter.external_runtime_probes().await {
-                match probe {
-                    Ok(probe) => match probe.installation {
-                        InstallationState::Installed { installation } if probe.healthy => {
-                            match external_runtime(
-                                &adapter.identity().id,
-                                adapter.capabilities().artifact_formats,
-                                *installation,
-                                probe.detail,
-                            ) {
-                                Ok(runtime) => runtimes.push(runtime),
-                                Err(error) => warnings.push(error.to_string()),
+        // Single flight across API/TUI callers. Adapters and independent native
+        // variants run concurrently, so cold discovery costs the slowest probe.
+        let mut observations = self.external_observations.lock().await;
+        let results = futures_util::future::join_all(self.registry.adapters().map(|adapter| {
+            let cached = observations.get(&adapter.identity().id);
+            async move {
+                let id = adapter.identity().id;
+                let key = adapter.external_runtime_observation_key().await;
+                if let Some(cached) = cached
+                    && cached.at.elapsed() < OBSERVATION_MAX_AGE
+                    && key.is_some()
+                    && key == cached.key
+                {
+                    return (
+                        id,
+                        cached.runtimes.clone(),
+                        cached.warnings.clone(),
+                        cached.key.clone(),
+                        cached.probe.clone(),
+                        true,
+                    );
+                }
+                let mut found = Vec::new();
+                let mut warnings = Vec::new();
+                let probes = tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    adapter.external_runtime_probes(),
+                )
+                .await;
+                let probe = match &probes {
+                    Ok(probes) => probes
+                        .first()
+                        .map(|result| match result {
+                            Ok(probe) => probe.clone(),
+                            Err(error) => failed_discovery_probe(error.to_string()),
+                        })
+                        .unwrap_or_else(|| {
+                            failed_discovery_probe("no external runtime observations".into())
+                        }),
+                    Err(_) => {
+                        failed_discovery_probe(format!("{id} external runtime discovery timed out"))
+                    }
+                };
+                match probes {
+                    Err(_) => warnings.push(format!("{id} external runtime discovery timed out")),
+                    Ok(probes) => {
+                        for probe in probes {
+                            match probe {
+                                Ok(probe) => match probe.installation {
+                                    InstallationState::Installed { installation }
+                                        if probe.healthy =>
+                                    {
+                                        match external_runtime(
+                                            &id,
+                                            adapter.capabilities().artifact_formats,
+                                            *installation,
+                                            probe.detail,
+                                        ) {
+                                            Ok(runtime) => found.push(runtime),
+                                            Err(error) => warnings.push(error.to_string()),
+                                        }
+                                    }
+                                    InstallationState::Invalid { reason } => warnings.push(
+                                        format!("{id} external runtime is invalid: {reason}"),
+                                    ),
+                                    _ => {}
+                                },
+                                Err(error) => warnings
+                                    .push(format!("{id} external runtime probe failed: {error}")),
                             }
                         }
-                        InstallationState::Invalid { reason } => warnings.push(format!(
-                            "{} external runtime is invalid: {reason}",
-                            adapter.identity().id
-                        )),
-                        InstallationState::NotInstalled | InstallationState::Installed { .. } => {}
-                    },
-                    Err(error) => warnings.push(format!(
-                        "{} external runtime probe failed: {error}",
-                        adapter.identity().id
-                    )),
+                    }
                 }
+                let after = adapter.external_runtime_observation_key().await;
+                // Changed while probing: do not publish or retain an old identity.
+                if key.is_some() && key != after {
+                    found.clear();
+                    warnings.push(format!(
+                        "{id} runtime changed during discovery; retry inspection"
+                    ));
+                }
+                let cache_key = if warnings.is_empty() && key == after {
+                    after
+                } else {
+                    None
+                };
+                (id, found, warnings, cache_key, probe, false)
             }
+        }))
+        .await;
+        for (id, found, messages, key, probe, reused) in results {
+            if !reused {
+                observations.remove(&id);
+                observations.insert(
+                    id,
+                    LocalRuntimeObservation {
+                        key,
+                        probe,
+                        at: std::time::Instant::now(),
+                        runtimes: found.clone(),
+                        warnings: messages.clone(),
+                    },
+                );
+            }
+            runtimes.extend(found);
+            warnings.extend(messages);
         }
         runtimes
     }
@@ -2614,8 +2864,16 @@ mod tests {
         RuntimeVariantUpdateIdentity, UpdateState,
     };
 
+    #[derive(Default)]
     struct BoundSchemaAdapter {
+        observation: Option<Arc<TestObservation>>,
         id: &'static str,
+    }
+
+    struct TestObservation {
+        path: PathBuf,
+        calls: std::sync::atomic::AtomicUsize,
+        pending: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -2704,7 +2962,21 @@ mod tests {
             })
         }
 
+        async fn external_runtime_observation_key(&self) -> Option<String> {
+            super::local_runtime_observation_key(vec![self.observation.as_ref()?.path.clone()])
+                .await
+        }
+
         async fn probe(&self) -> Result<EngineProbe, EngineError> {
+            if let Some(o) = &self.observation {
+                o.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if o.pending.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                if !o.path.is_file() {
+                    return Err(EngineError::NotInstalled);
+                }
+            }
             Ok(EngineProbe {
                 installation: InstallationState::Installed {
                     installation: Box::new(EngineInstallation {
@@ -2782,6 +3054,95 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn local_observation_timeout_expiration_and_refresh_are_recoverable() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::test_support::paths(temp.path());
+        let file = temp.path().join("runtime");
+        std::fs::write(&file, b"initial").unwrap();
+        let observation = Arc::new(TestObservation {
+            path: file.clone(),
+            calls: AtomicUsize::new(0),
+            pending: AtomicBool::new(true),
+        });
+        let mut registry = EngineRegistry::default();
+        registry
+            .register(Arc::new(BoundSchemaAdapter {
+                id: "observed",
+                observation: Some(observation.clone()),
+            }))
+            .unwrap();
+        let packs = super::RuntimePackManager::new(
+            &paths,
+            registry,
+            Vec::<Arc<dyn RuntimeCatalogProvider>>::new(),
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        assert!(
+            packs
+                .collect_external_runtimes(Vec::new(), &mut warnings)
+                .await
+                .is_empty()
+        );
+        assert!(warnings[0].contains("timed out"));
+        observation.pending.store(false, Ordering::SeqCst);
+        warnings.clear();
+        assert_eq!(
+            packs
+                .collect_external_runtimes(Vec::new(), &mut warnings)
+                .await
+                .len(),
+            1
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(observation.calls.load(Ordering::SeqCst), 2);
+        packs
+            .collect_external_runtimes(Vec::new(), &mut warnings)
+            .await;
+        assert_eq!(observation.calls.load(Ordering::SeqCst), 2);
+        // Warm hits must not renew the verification age indefinitely.
+        packs
+            .external_observations
+            .lock()
+            .await
+            .get_mut("observed")
+            .unwrap()
+            .at -= super::OBSERVATION_MAX_AGE;
+        packs
+            .collect_external_runtimes(Vec::new(), &mut warnings)
+            .await;
+        assert_eq!(observation.calls.load(Ordering::SeqCst), 3);
+        std::fs::write(&file, b"changed").unwrap();
+        packs
+            .collect_external_runtimes(Vec::new(), &mut warnings)
+            .await;
+        assert_eq!(observation.calls.load(Ordering::SeqCst), 4);
+        std::fs::remove_file(&file).unwrap();
+        assert!(
+            packs
+                .collect_external_runtimes(Vec::new(), &mut warnings)
+                .await
+                .is_empty()
+        );
+        std::fs::write(&file, b"repaired").unwrap();
+        warnings.clear();
+        assert_eq!(
+            packs
+                .collect_external_runtimes(Vec::new(), &mut warnings)
+                .await
+                .len(),
+            1
+        );
+        assert!(warnings.is_empty());
+        packs.external_observations.lock().await.clear();
+        packs
+            .collect_external_runtimes(Vec::new(), &mut warnings)
+            .await;
+        assert_eq!(observation.calls.load(Ordering::SeqCst), 7);
+    }
+
     #[tokio::test]
     async fn verified_binary_install_uses_one_live_release_lookup_and_direct_download() {
         use crate::installer::RuntimeInstaller;
@@ -2815,6 +3176,7 @@ mod tests {
         registry
             .register(Arc::new(BoundSchemaAdapter {
                 id: "fixture-release",
+                ..Default::default()
             }))
             .unwrap();
         let installer = RuntimeInstaller::new(
@@ -2874,10 +3236,16 @@ mod tests {
         paths.ensure_required().expect("application paths");
         let mut registry = EngineRegistry::default();
         registry
-            .register(Arc::new(BoundSchemaAdapter { id: "fake_a" }))
+            .register(Arc::new(BoundSchemaAdapter {
+                id: "fake_a",
+                ..Default::default()
+            }))
             .expect("fake_a adapter");
         registry
-            .register(Arc::new(BoundSchemaAdapter { id: "fake_b" }))
+            .register(Arc::new(BoundSchemaAdapter {
+                id: "fake_b",
+                ..Default::default()
+            }))
             .expect("fake_b adapter");
         let providers = Vec::<Arc<dyn RuntimeCatalogProvider>>::new();
         let manager =
@@ -2932,6 +3300,7 @@ mod tests {
         registry
             .register(Arc::new(BoundSchemaAdapter {
                 id: "decision-only",
+                ..Default::default()
             }))
             .unwrap();
         let manager = super::RuntimePackManager::new(
@@ -3089,7 +3458,10 @@ mod tests {
 
     #[test]
     fn recipe_update_lines_are_explicit_and_never_offer_a_downgrade() {
-        let adapter = BoundSchemaAdapter { id: "fixture" };
+        let adapter = BoundSchemaAdapter {
+            id: "fixture",
+            ..Default::default()
+        };
         let installed_v1 = q27_identity("1.0.0", "recipe-v1", "fixture-family");
         let installed_v3 = q27_identity("1.0.0", "recipe-v3", "fixture-family");
         let candidate_v2 = available_fixture(q27_identity("1.0.0", "recipe-v2", "fixture-family"));
@@ -3216,6 +3588,7 @@ mod tests {
     fn installed_recipe_generations_rank_with_engine_owned_update_identity() {
         let adapter = BoundSchemaAdapter {
             id: "fixture-engine",
+            ..Default::default()
         };
         let mut v2 = installed_fixture(
             "git-20260831-aaaaaaaa",
@@ -3312,7 +3685,10 @@ mod tests {
         // The badge comparison spans functional variants for every engine,
         // without using SHA order or installation time as recency evidence.
         for engine_id in ["llama.cpp", "q27", "ninfer", "future-engine"] {
-            let adapter = BoundSchemaAdapter { id: engine_id };
+            let adapter = BoundSchemaAdapter {
+                id: engine_id,
+                ..Default::default()
+            };
             let mut older = older_source.clone();
             let mut newer = newer_source.clone();
             older.manifest.identity.engine_id = engine_id.to_owned();

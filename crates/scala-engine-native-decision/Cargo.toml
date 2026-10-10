@@ -18,6 +18,8 @@ sha2.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
+shlex = "2.0.1"
+
 [dev-dependencies]
 axum.workspace = true
 tempfile.workspace = true

@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Json, State, rejection::JsonRejection};
+use axum::extract::{Json, Query, State, rejection::JsonRejection};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -34,7 +34,7 @@ use scala_engine::{
     ControlLoadRequest, ControlStatus, ControlUnloadRequest, InferenceRoutingContext,
     RuntimeManager,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -335,7 +335,51 @@ struct ApiModel {
     owned_by: String,
     created: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    architecture: Option<ModelArchitecture>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     capabilities: Option<scala_engine::ModelCapabilities>,
+}
+
+#[derive(Serialize)]
+struct ModelArchitecture {
+    output_modalities: Vec<&'static str>,
+}
+
+impl ModelArchitecture {
+    fn from_capabilities(capabilities: Option<&scala_engine::ModelCapabilities>) -> Option<Self> {
+        capabilities
+            .filter(|c| c.decision_candidate || c.decision)
+            .map(|_| Self {
+                output_modalities: vec!["decisions"],
+            })
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct ModelDiscoveryQuery {
+    output_modalities: Option<String>,
+}
+
+fn filter_models(models: Vec<ApiModel>, query: &ModelDiscoveryQuery) -> Vec<ApiModel> {
+    let Some(requested) = query.output_modalities.as_deref() else {
+        return models;
+    };
+    let requested: Vec<_> = requested
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    models
+        .into_iter()
+        .filter(|model| {
+            requested.iter().all(|modality| {
+                model
+                    .architecture
+                    .as_ref()
+                    .is_some_and(|architecture| architecture.output_modalities.contains(modality))
+            })
+        })
+        .collect()
 }
 
 async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::OpenAiError> {
@@ -345,9 +389,12 @@ async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::O
         .await
         .map_err(|e| error::runtime_error(scala_engine::RuntimeError::Operation(e.to_string())))?;
     let mut models = Vec::new();
-    for profile in profiles.profiles.into_values() {
+    let profiles: Vec<_> = profiles.profiles.into_values().collect();
+    let capabilities = state.runtime.model_profile_capabilities(&profiles).await;
+    for (profile, capabilities) in profiles.into_iter().zip(capabilities) {
         models.push(ApiModel {
-            capabilities: state.runtime.model_capabilities(&profile).await,
+            architecture: ModelArchitecture::from_capabilities(capabilities.as_ref()),
+            capabilities,
             id: profile.id.to_string(),
             object: "model",
             owned_by: "scala-user".into(),
@@ -384,6 +431,7 @@ async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::O
                 for profile in inventory.profiles.iter().filter(|p| p.installed) {
                     let name = profile.id.as_str();
                     models.push(ApiModel {
+                        architecture: None,
                         capabilities: None,
                         id: if counts.get(name).copied().unwrap_or(0) > 1 {
                             scala_engine::link::qualified_alias(name, &peer.node_id)
@@ -408,10 +456,11 @@ async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::O
 
 async fn models(
     State(state): State<PublicApiState>,
+    Query(query): Query<ModelDiscoveryQuery>,
 ) -> Result<Json<ModelList>, error::OpenAiError> {
     Ok(Json(ModelList {
         object: "list",
-        data: public_models(&state).await?,
+        data: filter_models(public_models(&state).await?, &query),
     }))
 }
 
@@ -687,6 +736,9 @@ impl IntoResponse for ControlApiError {
     }
 }
 
+#[cfg(all(test, unix))]
+mod discovery_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,6 +835,7 @@ mod tests {
     #[test]
     fn model_object_contains_only_the_supported_openai_fields() {
         let value = serde_json::to_value(ApiModel {
+            architecture: None,
             capabilities: None,
             id: "example".to_owned(),
             object: "model",
@@ -803,6 +856,7 @@ mod tests {
     fn model_capabilities_are_additive_and_do_not_include_defaults() {
         use scala_engine::{ModelCapabilities, ReasoningEffort, ThinkingCapabilities};
         let mut model = ApiModel {
+            architecture: None,
             id: "arbitrary-profile".into(),
             object: "model",
             owned_by: "scala-user".into(),

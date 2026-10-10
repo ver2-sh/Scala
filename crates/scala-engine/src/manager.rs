@@ -757,16 +757,7 @@ impl RuntimeManager {
     }
 
     pub async fn refresh_engine_probes(&self) {
-        for adapter in self.registry.adapters() {
-            let identity = adapter.identity();
-            let probe = adapter.probe().await.unwrap_or_else(|error| EngineProbe {
-                installation: InstallationState::Invalid {
-                    reason: error.to_string(),
-                },
-                update: crate::UpdateState::Unknown,
-                healthy: false,
-                detail: error.to_string(),
-            });
+        for (identity, probe) in self.packs.engine_probes().await {
             self.state
                 .write()
                 .await
@@ -810,6 +801,35 @@ impl RuntimeManager {
         &self,
         profile: &ModelProfile,
     ) -> Option<crate::ModelCapabilities> {
+        let inspection = self.packs.inspect_local().await;
+        self.model_capabilities_from_inspection(profile, &inspection)
+            .await
+    }
+
+    /// A public discovery request resolves every profile against shared facts.
+    pub async fn model_profile_capabilities(
+        &self,
+        profiles: &[ModelProfile],
+    ) -> Vec<Option<crate::ModelCapabilities>> {
+        if profiles.is_empty() {
+            return Vec::new();
+        }
+        let inspection = self.packs.inspect_local().await;
+        let mut capabilities = Vec::with_capacity(profiles.len());
+        for profile in profiles {
+            capabilities.push(
+                self.model_capabilities_from_inspection(profile, &inspection)
+                    .await,
+            );
+        }
+        capabilities
+    }
+
+    async fn model_capabilities_from_inspection(
+        &self,
+        profile: &ModelProfile,
+        inspection: &crate::RuntimeLocalInspection,
+    ) -> Option<crate::ModelCapabilities> {
         {
             let state = self.state.read().await;
             if let Some(backend) = state.backends.get(&profile.id)
@@ -851,14 +871,13 @@ impl RuntimeManager {
             )
             .ok()?;
         adapter.normalize_settings(&mut settings).ok()?;
-        let inspection = self.packs.inspect_local().await;
         let (selection, schema) = self
             .packs
             .settings_schema_from_local_inspection(
                 &model,
                 profile.engine_id.as_str(),
                 Some(&settings),
-                &inspection,
+                inspection,
             )
             .await
             .ok()?;

@@ -30,4 +30,5 @@ rhai = { version = "=1.26.0", features = ["sync", "serde", "no_module", "no_time
 libc.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 serde_json.workspace = true
