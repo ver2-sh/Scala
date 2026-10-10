@@ -58,6 +58,16 @@ reads only stat those paths; they do not rerun Python or hash the wheel closure.
 File replacement, removal, permission changes and directory additions invalidate
 the observation. Unknown launcher shapes or failed metadata inspection remain
 uncached. No installed wrapper or runtime fingerprint is changed by this mechanism.
+On native Windows, very large vLLM dependency closures use a small set of
+launcher, implementation, original wheel and SDK path observations for bounded
+candidate catalogue freshness. Every cold runtime admission still runs complete
+wheel and implementation verification; every load independently reprobes and the
+wrapper hashes the full runtime and model closure. A changed dependency that
+does not alter one of the watched controls may retain an unqualified catalogue
+candidate until the next bounded refresh, but can never pass the required
+pre-launch integrity and native execution proof. Other backend observations
+retain their complete file inventories.
+
 The full original `--scala-probe` and pre-launch checks remain authoritative.
 
 Before each launch Scala clears old proof and verifies the exact runtime,

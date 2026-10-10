@@ -261,7 +261,7 @@ impl NativeDecisionAdapter {
             // Native Windows DLL closure reads can take longer when the OS
             // file cache is cold. This complete verification is independent of
             // the unchanged bounded public discovery deadline below.
-            Duration::from_secs(if cfg!(windows) { 120 } else { 30 }),
+            Duration::from_secs(if cfg!(windows) { 240 } else { 30 }),
         )
         .await?;
         if !output.success || output.stdout.len() > 65536 {
@@ -282,7 +282,54 @@ impl NativeDecisionAdapter {
         }
         Ok((sha, probe))
     }
+    // On Windows, a vLLM runtime has thousands of installed wheel members.
+    // Full verification is mandatory in probe_path and again before launch.
+    // Discovery observes its small bound control closure without serially
+    // opening every wheel file on every public model listing.
+    #[cfg(windows)]
+    async fn windows_vllm_control_key(&self, binary: &Path) -> Option<String> {
+        let (interpreter, runner, mut paths) = launcher::observation_launcher(binary).await?;
+        let config_path = runner.with_file_name("runtime.json");
+        let bytes = tokio::fs::read(&config_path).await.ok()?;
+        if bytes.len() > 1024 * 1024 {
+            return None;
+        }
+        let config: Value = serde_json::from_slice(&bytes).ok()?;
+        if config.get("backend")?.as_str()? != "vllm-labels" {
+            return None;
+        }
+        let source = config.get("source")?;
+        let source_path = PathBuf::from(source.get("path")?.as_str()?);
+        let shim = source_path.join(source.get("entrypoint")?.as_str()?);
+        let build = config.get("windows_vllm")?;
+        let wheel = PathBuf::from(build.get("wheel")?.get("path")?.as_str()?);
+        let sdk = PathBuf::from(build.get("sdk")?.get("path")?.as_str()?);
+        let site = interpreter
+            .parent()?
+            .parent()?
+            .join("Lib")
+            .join("site-packages");
+        paths.extend([
+            binary.to_owned(),
+            interpreter,
+            runner,
+            config_path,
+            source_path,
+            shim,
+            wheel,
+            sdk,
+            site,
+        ]);
+        paths.sort();
+        paths.dedup();
+        local_runtime_observation_key(paths).await
+    }
+
     async fn binary_observation_key(&self, binary: &Path) -> Option<String> {
+        #[cfg(windows)]
+        if let Some(key) = self.windows_vllm_control_key(binary).await {
+            return Some(format!("windows-vllm-control:{key}"));
+        }
         let cached = self.observation_paths.lock().await.get(binary).cloned();
         if let Some(inventory) = cached
             && local_runtime_observation_key(inventory.inventory_paths.clone())

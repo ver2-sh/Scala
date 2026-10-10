@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.17 - Windows vLLM Decision runtime discovery
+
+Fixes missing native Windows H2O Decision candidates when the pinned vLLM
+runtime contains a large installed Python dependency closure.
+
+- Track the bounded Windows vLLM launcher, implementation, original wheel and
+  SDK control paths for catalogue refresh instead of enumerating tens of
+  thousands of NTFS members on every model-listing request. Keep existing full
+  runtime fingerprint verification on cold admission and again before load.
+- Increase the bounded Windows runtime verification allowance for slow cold
+  filesystems. The public discovery deadline remains unchanged, and only the
+  original runtime/model/native validator proof grants execution capability.
+- Leave the native Windows Imajev/PyTorch readout and existing Linux runtime
+  observation behavior unchanged.
+
+This is an application update; model weights and Python/CUDA serving runtimes
+remain separately installed and owned by their local Scala node.
+
 ## 0.1.16 - Native Windows Decision runtimes
 
 Adds native Windows support for Scala's source-backed Decision engine without
