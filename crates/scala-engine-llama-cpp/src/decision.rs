@@ -74,6 +74,9 @@ fn native_request_body(request: &DecisionRequest) -> Result<Value, EngineError> 
     request
         .validate()
         .map_err(EngineError::InvalidDecisionRequest)?;
+    if !request.images.is_empty() {
+        return Err(EngineError::Unsupported("native decision images".into()));
+    }
     for (name, question) in &request.questions {
         if let DecisionQuestion::Score { criteria, .. } = question
             && !(2..=10).contains(&criteria.len())
@@ -635,6 +638,7 @@ mod tests {
         }
         fn request(&self) -> DecisionRequest {
             DecisionRequest { model_profile_id:self.spec.settings.model_profile_id.clone().unwrap(),
+                images: Vec::new(),
                 state:serde_json::from_value(json!({"message":"synthetic","nested":[1,2]})).unwrap(),
                 questions:serde_json::from_value(json!({
                     "route":{"type":"choice","instructions":{"question":"route?"},"criteria":{"accept":"allowed","reject":null}},
@@ -1259,6 +1263,23 @@ mod tests {
             *fixture.backend.calls.lock().unwrap(),
             vec![("POST".into(), "/v1/systemone".into(), expected)]
         );
+    }
+
+    #[tokio::test]
+    async fn native_decision_images_are_rejected_without_backend_dispatch() {
+        let fixture = fixture(true, Some("laya"), None).await;
+        fixture.qualify().await;
+        fixture.backend.calls.lock().unwrap().clear();
+        let mut request = fixture.request();
+        request.images = vec!["data:image/png;base64,YQ==".into()];
+        assert!(matches!(
+            fixture
+                .adapter
+                .decide(fixture.spec.endpoint.as_ref().unwrap(), request)
+                .await,
+            Err(EngineError::Unsupported(_))
+        ));
+        assert!(fixture.backend.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

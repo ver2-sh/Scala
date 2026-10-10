@@ -1963,6 +1963,7 @@ impl RuntimeManager {
                 &request.model_profile_id,
                 routing,
                 crate::ApiCapability::Completions,
+                false,
             )
             .await?;
         prepare_completion_request(&target, &mut request)?;
@@ -1984,6 +1985,7 @@ impl RuntimeManager {
                 &request.model_profile_id,
                 routing,
                 crate::ApiCapability::Completions,
+                false,
             )
             .await?;
         prepare_completion_request(&target, &mut request)?;
@@ -2012,11 +2014,17 @@ impl RuntimeManager {
                 &request.model_profile_id,
                 routing,
                 crate::ApiCapability::Decision,
+                !request.images.is_empty(),
             )
             .await?;
         let identity = target
             .decision_identity
             .ok_or(RuntimeError::UnsupportedCapability)?;
+        if !request.images.is_empty()
+            && !target.adapter.supports_model_decision_images(&target.model)
+        {
+            return Err(RuntimeError::UnsupportedCapability);
+        }
         target.lease.mark_processing_prompt();
         let output = target
             .adapter
@@ -2036,6 +2044,7 @@ impl RuntimeManager {
                 &request.model_profile_id,
                 routing,
                 crate::ApiCapability::Embeddings,
+                false,
             )
             .await?;
         target.lease.mark_processing_prompt();
@@ -2064,6 +2073,7 @@ impl RuntimeManager {
                 &request.model_profile_id,
                 routing,
                 crate::ApiCapability::ChatCompletions,
+                false,
             )
             .await?;
         let model_capabilities = target.reasoning_capabilities(&request.generation_settings);
@@ -2119,6 +2129,7 @@ impl RuntimeManager {
                 &request.model_profile_id,
                 routing,
                 crate::ApiCapability::ChatCompletions,
+                false,
             )
             .await?;
         let model_capabilities = target.reasoning_capabilities(&request.generation_settings);
@@ -2424,6 +2435,7 @@ impl RuntimeManager {
         requested: &ModelProfileId,
         routing: InferenceRoutingContext,
         capability: crate::ApiCapability,
+        decision_images: bool,
     ) -> Result<InferenceTarget, RuntimeError> {
         let _reservation = self.benchmark_admission()?;
         if self.shutting_down.load(Ordering::Acquire) {
@@ -2454,7 +2466,8 @@ impl RuntimeManager {
             .registry
             .get(profile.engine_id.as_str())
             .ok_or(RuntimeError::UnsupportedCapability)?;
-        if !adapter.supports_model_capability(&model, capability)
+        if (decision_images && !adapter.supports_model_decision_images(&model))
+            || !adapter.supports_model_capability(&model, capability)
             || (capability == crate::ApiCapability::Decision
                 && (!adapter.capabilities().api.contains(&capability)
                     || !adapter
@@ -4152,6 +4165,51 @@ mod tests {
             .unwrap();
         assert_eq!(output.output.model.as_deref(), Some("native-fixture-1"));
         assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn decision_images_require_explicit_support_even_on_a_qualified_text_pair() {
+        let adapter = Arc::new(crate::decision::tests::DecisionAdapter::new(true));
+        let fixture = decision_fixture(adapter.clone(), "1", Some("native-decision-fixture")).await;
+        let mut request = crate::decision::tests::request(fixture.profile_id.clone());
+        request.images = vec!["data:image/png;base64,YQ==".into()];
+        assert!(matches!(
+            fixture
+                .manager
+                .decide_routed(request, InferenceRoutingContext::default())
+                .await,
+            Err(RuntimeError::UnsupportedCapability)
+        ));
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture.manager.status().await.backends[0].active_request_count,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn decision_images_survive_routing_with_existing_identity() {
+        let mut adapter = crate::decision::tests::DecisionAdapter::new(true);
+        adapter.image_inputs = true;
+        let adapter = Arc::new(adapter);
+        let fixture = decision_fixture(adapter.clone(), "1", Some("native-decision-fixture")).await;
+        let mut request = crate::decision::tests::request(fixture.profile_id.clone());
+        request.images = vec![
+            "data:image/png;base64,YQ==".into(),
+            "data:image/webp;base64,Yg==".into(),
+        ];
+        let output = fixture
+            .manager
+            .decide_routed(request.clone(), InferenceRoutingContext::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&adapter.decision_requests.lock().unwrap()[0]).unwrap(),
+            serde_json::to_value(request).unwrap()
+        );
+        assert_eq!(output.identity.model_profile_id, fixture.profile_id);
+        assert_eq!(output.identity.runtime.version, "1");
+        assert_eq!(output.identity.model_id, fixture.model_id);
     }
 
     #[tokio::test]

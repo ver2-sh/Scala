@@ -993,6 +993,56 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn systemone_link_preserves_two_eight_mib_images_with_existing_limits() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let image = format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(vec![0; scala_engine::MAX_DECISION_IMAGE_BYTES])
+        );
+        let body = json!({"model":"imajev@owner", "state":{"task":"compare"},
+            "questions":{"q":{"type":"noul","instructions":"compare images"}},
+            "images":[image, image]});
+        assert!(serde_json::to_vec(&body).unwrap().len() < MAX_INFERENCE_BODY_BYTES);
+        let envelope = Envelope {
+            version: 1,
+            source: "entry".into(),
+            target: "owner".into(),
+            hops: 1,
+            operation: Operation::Inference {
+                profile_id: ModelProfileId::new("imajev").unwrap(),
+                path: "/v1/systemone".into(),
+                body: body.clone(),
+                headers: BTreeMap::new(),
+            },
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(65536);
+        let (sent, received) = tokio::join!(
+            wayfinder::write_json(&mut writer, &envelope, REQUEST_LIMIT),
+            wayfinder::read_json::<Envelope>(&mut reader, REQUEST_LIMIT)
+        );
+        sent.unwrap();
+        let Operation::Inference {
+            body: received,
+            profile_id,
+            path,
+            ..
+        } = received.unwrap().operation
+        else {
+            panic!("inference envelope")
+        };
+        assert_eq!(path, "/v1/systemone");
+        assert_eq!(received, body);
+        // Owner routing binds the profile separately; the original public body
+        // (including the qualified alias and image bytes) survives transport.
+        let request: scala_engine::DecisionRequest = serde_json::from_value(json!({
+            "model_profile_id":profile_id, "state":received["state"],
+            "questions":received["questions"], "images":received["images"]}))
+        .unwrap();
+        request.validate().unwrap();
+        assert_eq!(json!(request.images), body["images"]);
+    }
+
+    #[tokio::test]
     async fn windows_decision_owner_inventory_aliases_and_validator_routing() {
         let (_temporary, runtime, model, core) = crate::tests::control_fixture().await;
         let owner = "b2993200f9df354843601bacda7d60e6d5318ee53c0ba24745f020c0e8159021";

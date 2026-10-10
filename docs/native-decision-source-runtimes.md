@@ -13,6 +13,27 @@ canonical original files, not a conversion, copied checkpoint, Norted package,
 engine, runtime, Settings store or Model Profile. Norted manifest schemas are
 unchanged, and this format has no Norted package manifest.
 
+## Native image requests
+
+`POST /v1/systemone` accepts an optional top-level `images` array containing
+zero to two PNG, JPEG, or WebP base64 data URLs. Scala limits each decoded payload
+to 8 MiB and retains the existing 32 MiB inference-body and Link limits; two
+8 MiB images fit after base64 encoding. Image strings and their order survive
+API parsing, Model Profile routing, and Scala Link unchanged.
+
+Only a qualified native `torch-readout` runtime/artifact/profile pair admits
+images. H2O `vllm-labels`, llama.cpp Decision, and other adapters reject nonempty
+image inputs. Omitted or empty arrays retain text-only behavior. The native
+upstream handler still owns raster decoding, pixel/frame checks, preprocessing,
+calibration, probabilities, and abstention; image failures never retry as text.
+
+The readout runtime lock must include Pillow and torchvision alongside its
+existing serving dependencies. The wrapper reports exact missing package names
+and verifies installed locked wheel closures without loading a model. Installing
+this changed wrapper requires a fresh runtime identity/probe and ordinary tuple
+qualification; existing registered or running runtimes are not updated by a
+source change.
+
 ## Algorithms and qualification
 
 Two backend contracts are implemented, independent of repository/profile names:

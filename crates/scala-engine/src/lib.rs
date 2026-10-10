@@ -1978,6 +1978,11 @@ pub trait EngineAdapter: Send + Sync {
     ) -> bool {
         false
     }
+    /// Explicit image support for the artifact. Execution still requires exact
+    /// native runtime qualification; text-only adapters must leave this false.
+    fn supports_model_decision_images(&self, _model: &ModelArtifact) -> bool {
+        false
+    }
     /// Opt in only after verifying a released native decision interface and
     /// compatibility of this exact runtime/artifact/settings tuple.
     fn supports_native_decision(

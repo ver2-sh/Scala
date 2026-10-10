@@ -301,6 +301,30 @@ async fn both_backends_qualify_exact_pairs_and_preserve_native_answers() {
             json!({"state":request.state,"questions":request.questions})
         );
         assert!(b.calls.lock().unwrap()[1].get("model").is_none());
+        let mut image_request = request.clone();
+        image_request.images = vec![
+            "data:image/png;base64,YQ==".into(),
+            "data:image/jpeg;base64,Yg==".into(),
+        ];
+        assert_eq!(
+            f.adapter.supports_model_decision_images(&f.model),
+            backend == "torch-readout"
+        );
+        let before = b.calls.lock().unwrap().len();
+        let result = f.adapter.decide(&endpoint, image_request.clone()).await;
+        if backend == "torch-readout" {
+            assert_eq!(
+                serde_json::to_value(result.unwrap().answers).unwrap(),
+                response["answers"]
+            );
+            assert_eq!(
+                b.calls.lock().unwrap()[before],
+                json!({"state":request.state,"questions":request.questions,"images":image_request.images})
+            );
+        } else {
+            assert!(matches!(result, Err(EngineError::Unsupported(_))));
+            assert_eq!(b.calls.lock().unwrap().len(), before);
+        }
         let mut changed = f.settings.clone();
         changed.model_profile_id = Some(ModelProfileId::new("other").unwrap());
         assert!(!native_decision_supported(

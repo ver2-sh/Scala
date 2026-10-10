@@ -164,7 +164,7 @@ def runtime_identity(config_path):
     else:
         if options["rotations"] not in {1, 4} or not isinstance(options["max_input_tokens"], int) or options["max_input_tokens"] <= 0 or options["device"] not in {"cuda", "cpu", "mps"}:
             raise ValueError("Invalid native rotation/context/device configuration")
-        required_packages = {"torch", "peft", "transformers", "safetensors", "fastapi", "uvicorn", "pydantic", "Pillow"}
+        required_packages = {"torch", "torchvision", "peft", "transformers", "safetensors", "fastapi", "uvicorn", "pydantic", "Pillow"}
         actual = {p.relative_to(root).as_posix() for directory in (root / "src", root / "scripts") for p in directory.rglob("*.py")}
         if actual != set(source["files"]):
             raise ValueError("Native implementation Python closure changed")
@@ -172,8 +172,9 @@ def runtime_identity(config_path):
             raise ValueError("Native readout implementation is missing")
     # Wheel metadata names are case-insensitive (Pillow now records `pillow`).
     normalize = lambda name: name.lower().replace("_", "-").replace(".", "-")
-    if not {normalize(n) for n in required_packages} <= {normalize(n) for n in cfg["packages"]}:
-        raise ValueError("Required serving dependencies are missing from runtime lock")
+    missing = {normalize(n) for n in required_packages} - {normalize(n) for n in cfg["packages"]}
+    if missing:
+        raise ValueError("Required serving dependencies are missing from runtime lock: " + ", ".join(sorted(missing)))
     attestations = cfg.get("wheel_attestations", {})
     if not isinstance(attestations, dict) or any(normalize(k) != k for k in attestations):
         raise ValueError("Wheel attestation package names must be canonical")
@@ -359,6 +360,8 @@ def serve_labels(runtime, cfg, revision, args):
                     body = json.loads(self.rfile.read(size))
                     if not isinstance(body, dict) or "state" not in body:
                         return self._send(400, {"error": {"type": "invalid_request_error", "message": '"state" must be provided'}})
+                    if "images" in body and body["images"] != []:
+                        return self._send(422, {"error": "Native label backend does not support images"})
                     return self._send(200, shim.decide(body))
                 except native.BadRequest as e:
                     return self._send(400, {"detail": str(e)})
@@ -375,6 +378,61 @@ def serve_labels(runtime, cfg, revision, args):
         except subprocess.TimeoutExpired:
             child.kill()
             child.wait()
+
+
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+
+def validate_image_transport(images):
+    """Transport bounds only; upstream owns raster validation/preprocessing."""
+    if not isinstance(images, list) or len(images) > 2:
+        raise ValueError("images must be an array of at most two data URLs")
+    for index, image in enumerate(images):
+        if not isinstance(image, str) or "," not in image:
+            raise ValueError(f"images[{index}] must be a base64 data URL")
+        header, payload = image.split(",", 1)
+        if header not in {"data:image/png;base64", "data:image/jpeg;base64", "data:image/webp;base64"}:
+            raise ValueError(f"images[{index}] must be a PNG, JPEG, or WebP base64 data URL")
+        if len(payload) > ((MAX_IMAGE_BYTES + 2) // 3) * 4:
+            raise ValueError(f"images[{index}] exceeds 8 MiB")
+        try:
+            decoded = base64.b64decode(payload, validate=True)
+        except (ValueError, UnicodeEncodeError) as error:
+            raise ValueError(f"images[{index}] contains invalid base64") from error
+        if not decoded:
+            raise ValueError(f"images[{index}] must not be empty")
+        if len(decoded) > MAX_IMAGE_BYTES:
+            raise ValueError(f"images[{index}] exceeds 8 MiB")
+
+
+async def qualify_readout_request(request, call_next, health, execution):
+    from fastapi.responses import JSONResponse
+    if request.url.path == "/health":
+        return JSONResponse(health)
+    if request.url.path == "/scala/execution" and request.method == "GET":
+        return JSONResponse(execution)
+    if request.url.path != "/v1/systemone" or request.method != "POST":
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        if len(await request.body()) > 32 * 1024 * 1024:
+            return JSONResponse({"error": "Request exceeds 32 MiB"}, status_code=413)
+        data = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "invalid JSON"}, status_code=422)
+    if not isinstance(data, dict) or "state" not in data:
+        return JSONResponse({"error": {"type": "invalid_request_error", "message": '"state" must be provided'}}, status_code=400)
+    if set(data) - {"state", "questions", "images"}:
+        return JSONResponse({"error": "unsupported request fields"}, status_code=422)
+    try:
+        validate_image_transport(data.get("images", []))
+    except ValueError as error:
+        return JSONResponse({"error": str(error)}, status_code=422)
+    # Preserve optional public instructions. Empty instructions are
+    # accepted by H2O; Imajev requires a nonempty native instruction.
+    # Reject that unsupported request instead of inventing a prompt.
+    if any(not q.get("instructions") for q in data.get("questions", {}).values()):
+        return JSONResponse({"error": "Native readout requires question instructions"}, status_code=422)
+    return await call_next(request)
 
 
 def serve_readout(runtime, cfg, revision, args):
@@ -400,7 +458,6 @@ def serve_readout(runtime, cfg, revision, args):
                 raise ValueError("Native CUDA execution requires the complete model and readout on GPU")
         backend.model = adapter["repository"]
         app = native.create_app(backend, examples=[], static=Path(temporary), calibration=calibration)
-        from fastapi.responses import JSONResponse
         health = identity_health(revision, cfg, args.bundle, args.launch_nonce)
         execution = {**health, "execution_device": options["device"]}
         if options["device"] == "cuda":
@@ -409,26 +466,7 @@ def serve_readout(runtime, cfg, revision, args):
             execution["cuda_reserved_bytes"] = backend.torch.cuda.memory_reserved()
         @app.middleware("http")
         async def qualification(request, call_next):
-            if request.url.path == "/health":
-                return JSONResponse(health)
-            if request.url.path == "/scala/execution" and request.method == "GET":
-                return JSONResponse(execution)
-            if request.url.path != "/v1/systemone" or request.method != "POST":
-                return JSONResponse({"error": "not found"}, status_code=404)
-            try:
-                data = await request.json()
-            except ValueError:
-                return JSONResponse({"error": "invalid JSON"}, status_code=422)
-            if not isinstance(data, dict) or "state" not in data:
-                return JSONResponse({"error": {"type": "invalid_request_error", "message": '"state" must be provided'}}, status_code=400)
-            if set(data) - {"state", "questions"}:
-                return JSONResponse({"error": "unsupported request fields"}, status_code=422)
-            # Preserve optional public instructions. Empty instructions are
-            # accepted by H2O; Imajev requires a nonempty native instruction.
-            # Reject that unsupported request instead of inventing a prompt.
-            if any(not q.get("instructions") for q in data.get("questions", {}).values()):
-                return JSONResponse({"error": "Native readout requires question instructions"}, status_code=422)
-            return await call_next(request)
+            return await qualify_readout_request(request, call_next, health, execution)
         import uvicorn
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

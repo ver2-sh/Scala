@@ -667,6 +667,9 @@ impl EngineAdapter for NativeDecisionAdapter {
                 .values()
                 .any(|p| p.ready && p.tuple == key(runtime, model, settings))
     }
+    fn supports_model_decision_images(&self, model: &ModelArtifact) -> bool {
+        self.error.is_none() && bundle(model).is_ok_and(|b| b.backend == "torch-readout")
+    }
     async fn probe(&self) -> Result<EngineProbe, EngineError> {
         if self.binaries.is_empty() {
             return Ok(EngineProbe {
@@ -910,11 +913,18 @@ impl EngineAdapter for NativeDecisionAdapter {
                 "Native pair has not qualified".into(),
             ));
         }
+        if !request.images.is_empty() && proof.backend != "torch-readout" {
+            return Err(EngineError::Unsupported("native decision images".into()));
+        }
+        let mut body = json!({"state":request.state,"questions":request.questions});
+        if !request.images.is_empty() {
+            body["images"] = json!(request.images);
+        }
         let (status, body) = self
             .read(
                 self.client
                     .post(format!("{endpoint}/v1/systemone"))
-                    .json(&json!({"state":request.state,"questions":request.questions})),
+                    .json(&body),
             )
             .await?;
         if !status.is_success() {

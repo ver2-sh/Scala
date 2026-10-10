@@ -17,7 +17,11 @@ use crate::{
 
 fn parse(value: &Value) -> Result<(String, DecisionRequest), OpenAiError> {
     let object = object(value)?;
-    reject_unknown_fields(object, &["model", "state", "questions"], "Decision")?;
+    reject_unknown_fields(
+        object,
+        &["model", "state", "questions", "images"],
+        "Decision",
+    )?;
     let model = required_string(object, "model")?;
     let model_profile_id = crate::execution_profile_id(model.clone()).map_err(|_| {
         OpenAiError::invalid("Invalid Model Profile ID.", Some("model"), "invalid_value")
@@ -42,7 +46,20 @@ fn parse(value: &Value) -> Result<(String, DecisionRequest), OpenAiError> {
         model_profile_id,
         state,
         questions,
+        images: match object.get("images") {
+            None => Vec::new(),
+            Some(value) => serde_json::from_value(value.clone()).map_err(|_| {
+                OpenAiError::invalid(
+                    "`images` must be an array of data URL strings.",
+                    Some("images"),
+                    "invalid_value",
+                )
+            })?,
+        },
     };
+    request
+        .validate_images()
+        .map_err(|message| OpenAiError::invalid(message, Some("images"), "invalid_value"))?;
     request
         .validate()
         .map_err(|message| OpenAiError::invalid(message, Some("questions"), "invalid_value"))?;
@@ -82,6 +99,7 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use axum::response::IntoResponse;
     use tower::ServiceExt;
 
     fn body(state: Value) -> Value {
@@ -107,6 +125,7 @@ mod tests {
             assert_eq!(request.model_profile_id.as_str(), "fixture");
             assert_eq!(serde_json::to_value(request.state).unwrap(), state);
             assert_eq!(request.questions.len(), 3);
+            assert!(request.images.is_empty());
             assert!(matches!(
                 request.questions["route"],
                 DecisionQuestion::Choice { .. }
@@ -119,6 +138,37 @@ mod tests {
                 request.questions["safe"],
                 DecisionQuestion::Noul { .. }
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn systemone_preserves_native_images_and_rejects_invalid_transport() {
+        let mut value = body(json!({"context":"compare"}));
+        value["images"] = json!(["data:image/png;base64,YQ==", "data:image/webp;base64,Yg=="]);
+        let (_, request) = parse(&value).unwrap();
+        assert_eq!(json!(request.images), value["images"]);
+        value["images"] = json!([]);
+        assert!(parse(&value).unwrap().1.images.is_empty());
+        for images in [
+            Value::Null,
+            json!("data:image/png;base64,YQ=="),
+            json!([1]),
+            json!(["data:image/jpeg;base64,!"]),
+            json!(["data:image/gif;base64,YQ=="]),
+            json!([
+                "data:image/png;base64,YQ==",
+                "data:image/png;base64,YQ==",
+                "data:image/png;base64,YQ=="
+            ]),
+        ] {
+            value["images"] = images;
+            let error = parse(&value).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            let response = error.into_response();
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["error"]["param"], "images");
         }
     }
 
@@ -165,22 +215,35 @@ mod tests {
             },
             crate::PublicAuth::disabled(),
         );
-        let response = router
-            .oneshot(
-                Request::post("/v1/systemone")
-                    .header("content-type", "application/json")
-                    .body(Body::from(body(json!({"message":"context"})).to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(response.headers().contains_key("x-request-id"));
-        let value: Value =
-            serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
-        assert_eq!(value["error"]["code"], "unsupported_capability");
-        assert_eq!(value["error"]["param"], "model");
-        assert_eq!(value["error"]["type"], "invalid_request_error");
-        assert!(runtime.status().await.backends.is_empty());
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let image = format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(vec![0; scala_engine::MAX_DECISION_IMAGE_BYTES])
+        );
+        for images in [None, Some(json!([image, image]))] {
+            let mut value = body(json!({"message":"context"}));
+            if let Some(images) = images {
+                value["images"] = images;
+            }
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::post("/v1/systemone")
+                        .header("content-type", "application/json")
+                        .body(Body::from(value.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(response.headers().contains_key("x-request-id"));
+            let value: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap())
+                    .unwrap();
+            assert_eq!(value["error"]["code"], "unsupported_capability");
+            assert_eq!(value["error"]["param"], "model");
+            assert_eq!(value["error"]["type"], "invalid_request_error");
+            assert!(runtime.status().await.backends.is_empty());
+        }
     }
 }

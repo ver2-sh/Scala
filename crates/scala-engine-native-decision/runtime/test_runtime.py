@@ -1,5 +1,6 @@
 """Static/synthetic validation. Never import a real tensor runtime or score a model."""
 import copy
+import base64
 import contextlib
 import importlib.util
 import io
@@ -143,7 +144,7 @@ class ClosureTests(unittest.TestCase):
             wheel_file = root / "wheel.py"
             wheel_file.write_text("# synthetic wheel\n")
             record = types.SimpleNamespace(hash=types.SimpleNamespace(mode="sha256", value=base64.urlsafe_b64encode(bytes.fromhex(runtime.sha(wheel_file))).decode().rstrip("=")))
-            packages = {name: "1" for name in ["torch", "peft", "transformers", "safetensors", "fastapi", "uvicorn", "pydantic", "pillow"]}
+            packages = {name: "1" for name in ["torch", "torchvision", "peft", "transformers", "safetensors", "fastapi", "uvicorn", "pydantic", "pillow"]}
             cfg = {"schema_version": 1, "backend": "torch-readout", "packages": packages,
                    "options": {"rotations": 4, "max_input_tokens": 4096, "device": "cuda"},
                    "source": {"path": str(root), "revision": "a" * 40, "files": {name: {"size_bytes": (root / name).stat().st_size, "sha256": runtime.sha(root / name)} for name in members}}}
@@ -153,6 +154,13 @@ class ClosureTests(unittest.TestCase):
             with self.interpreter(root), patch.object(runtime.importlib.metadata, "distribution", side_effect=distributions.__getitem__), patch.object(runtime.importlib.metadata, "distributions", return_value=list(distributions.values())):
                 observed, revision = runtime.runtime_identity(path)
                 self.assertEqual(observed, cfg)
+                for required in ("torchvision", "pillow"):
+                    incomplete = copy.deepcopy(cfg)
+                    del incomplete["packages"][required]
+                    path.write_text(json.dumps(incomplete))
+                    with self.assertRaisesRegex(ValueError, required):
+                        runtime.runtime_identity(path)
+                path.write_text(json.dumps(cfg))
                 if runtime.os.name == "nt":
                     hook = Path(runtime.sys.prefix) / "Lib/site-packages/_virtualenv.py"
                     hook.write_text("# changed activation hook\n")
@@ -281,7 +289,86 @@ class ClosureTests(unittest.TestCase):
                 self.assertEqual(calls[1], (200, {"answers": {"x": {"type": "noul", "noul": 0.801}}}))
                 self.assertIn("vllm.entrypoints.openai.api_server", spawn.call_args.args[0])
                 self.assertIn(cfg["sources"]["model"]["path"], spawn.call_args.args[0])
+                calls.clear()
+                request["images"] = ["data:image/png;base64,YQ=="]
+                runtime.serve_labels(options, cfg, "revision", args)
+                self.assertEqual(calls[0][0], 422)
+                self.assertFalse(any(call[0] == "native" for call in calls))
 
+
+
+class ImageTransportTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def request(data):
+        raw = json.dumps(data).encode()
+        async def body():
+            return raw
+        async def json_body():
+            return json.loads(raw)
+        return types.SimpleNamespace(url=types.SimpleNamespace(path="/v1/systemone"),
+                                     method="POST", body=body, json=json_body)
+
+    async def dispatch(self, data):
+        calls = []
+        # No FastAPI installation or tensor imports needed for policy tests.
+        response = lambda body, status_code=200: types.SimpleNamespace(body=body, status_code=status_code)
+        native_response = response({"answers": {"q": {"type": "noul", "noul": 0.73,
+                                   "unknown_probability": 0.04, "abstained": False}}})
+        request = self.request(data)
+        async def next_request(received):
+            self.assertIs(received, request)
+            calls.append(await received.json())
+            return native_response
+        with patch.dict(sys.modules, {"fastapi.responses": types.SimpleNamespace(JSONResponse=response)}):
+            result = await runtime.qualify_readout_request(request, next_request, {}, {})
+        return result, calls, native_response
+
+    async def test_images_and_text_delegate_original_request_and_native_response(self):
+        for images in (None, [], ["data:image/png;base64,YQ=="],
+                       ["data:image/jpeg;base64,YQ==", "data:image/webp;base64,Yg=="]):
+            data = {"state": {"record": 7}, "questions": {"q": {"type": "noul", "instructions": "compare"}}}
+            if images is not None:
+                data["images"] = images
+            result, calls, native = await self.dispatch(data)
+            self.assertIs(result, native)
+            self.assertEqual(calls, [data])
+
+    async def test_invalid_images_and_generation_fields_never_reach_backend(self):
+        for images in (None, "data:image/png;base64,YQ==", [1],
+                       ["https://example.com/image.png"], ["data:image/gif;base64,YQ=="],
+                       ["data:image/png;base64,!"], ["data:image/png;base64,"],
+                       ["data:image/png;base64,YQ=="] * 3,
+                       ["data:image/png;base64," + base64.b64encode(b"x" * (runtime.MAX_IMAGE_BYTES + 1)).decode()]):
+            data = {"state": "context", "questions": {"q": {"type": "noul", "instructions": "check"}}, "images": images}
+            result, calls, _ = await self.dispatch(data)
+            self.assertEqual(result.status_code, 422)
+            self.assertEqual(calls, [])
+        for field in ("thinking", "messages", "temperature"):
+            data = {"state": "context", "questions": {"q": {"type": "noul", "instructions": "check"}}, field: True}
+            result, calls, _ = await self.dispatch(data)
+            self.assertEqual(result.status_code, 422)
+            self.assertEqual(calls, [])
+
+    async def test_two_eight_mib_images_fit_without_changing_body_limit(self):
+        image = "data:image/png;base64," + base64.b64encode(b"x" * runtime.MAX_IMAGE_BYTES).decode()
+        data = {"state": "context", "questions": {"q": {"type": "noul", "instructions": "check"}}, "images": [image, image]}
+        self.assertLess(len(json.dumps(data).encode()), 32 * 1024 * 1024)
+        result, calls, native = await self.dispatch(data)
+        self.assertIs(result, native)
+        self.assertEqual(calls, [data])
+
+    async def test_upstream_validation_error_is_preserved(self):
+        data = {"state": "context", "questions": {"q": {"type": "noul", "instructions": "check"}},
+                "images": ["data:image/png;base64,YQ=="]}
+        # Valid transport with invalid raster bytes: the authoritative upstream
+        # handler must still receive it and its rejection must survive unchanged.
+        error = types.SimpleNamespace(status_code=422, body={"error": "bad_image"})
+        async def upstream(request):
+            self.assertEqual(await request.json(), data)
+            return error
+        with patch.dict(sys.modules, {"fastapi.responses": types.SimpleNamespace(JSONResponse=lambda *a, **kw: None)}):
+            result = await runtime.qualify_readout_request(self.request(data), upstream, {}, {})
+        self.assertIs(result, error)
 
 
 class WindowsVllmTests(unittest.TestCase):

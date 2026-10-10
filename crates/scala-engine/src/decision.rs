@@ -1,5 +1,6 @@
 //! Native decision contracts. No text-generation translation or emulation.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::collections::BTreeMap;
 
 use scala_core::{
@@ -54,11 +55,52 @@ pub struct DecisionRequest {
     pub model_profile_id: ModelProfileId,
     pub state: DecisionContent,
     pub questions: BTreeMap<String, DecisionQuestion>,
+    /// Native image data URLs, in original order. Omission is text-only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
+pub const MAX_DECISION_IMAGES: usize = 2;
+pub const MAX_DECISION_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
 impl DecisionRequest {
+    /// Bound the transport without changing image bytes or preprocessing them.
+    /// The native backend still validates the raster and performs preprocessing.
+    pub fn validate_images(&self) -> Result<(), String> {
+        if self.images.len() > MAX_DECISION_IMAGES {
+            return Err("`images` accepts at most two images.".into());
+        }
+        for (index, image) in self.images.iter().enumerate() {
+            let (header, payload) = image.split_once(',').ok_or_else(|| {
+                format!("images[{index}] must be a PNG, JPEG, or WebP base64 data URL.")
+            })?;
+            if !matches!(
+                header,
+                "data:image/png;base64" | "data:image/jpeg;base64" | "data:image/webp;base64"
+            ) {
+                return Err(format!(
+                    "images[{index}] must be a PNG, JPEG, or WebP base64 data URL."
+                ));
+            }
+            if payload.len() > MAX_DECISION_IMAGE_BYTES.div_ceil(3) * 4 {
+                return Err(format!("images[{index}] exceeds 8 MiB."));
+            }
+            let decoded = STANDARD
+                .decode(payload)
+                .map_err(|_| format!("images[{index}] contains invalid base64."))?;
+            if decoded.is_empty() {
+                return Err(format!("images[{index}] must not be empty."));
+            }
+            if decoded.len() > MAX_DECISION_IMAGE_BYTES {
+                return Err(format!("images[{index}] exceeds 8 MiB."));
+            }
+        }
+        Ok(())
+    }
+
     /// Structural checks only; model-specific limits belong to the native adapter.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_images()?;
         if self.questions.is_empty() {
             return Err("`questions` must contain at least one named question.".into());
         }
@@ -242,6 +284,8 @@ pub(crate) mod tests {
         pub fail: bool,
         pub native_effort_admission: bool,
         pub calls: AtomicUsize,
+        pub image_inputs: bool,
+        pub decision_requests: std::sync::Mutex<Vec<DecisionRequest>>,
         pub chat_history: std::sync::Mutex<Option<Vec<InferenceRequest>>>,
     }
 
@@ -254,6 +298,8 @@ pub(crate) mod tests {
                 fail: false,
                 native_effort_admission: false,
                 calls: AtomicUsize::new(0),
+                image_inputs: false,
+                decision_requests: std::sync::Mutex::new(Vec::new()),
                 chat_history: std::sync::Mutex::new(None),
             }
         }
@@ -339,6 +385,7 @@ pub(crate) mod tests {
             request: DecisionRequest,
         ) -> Result<DecisionOutput, EngineError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.decision_requests.lock().unwrap().push(request.clone());
             assert_eq!(request.questions.len(), 3);
             assert!(matches!(request.state, DecisionContent::Object(_)));
             if self.fail {
@@ -355,6 +402,9 @@ pub(crate) mod tests {
         }
         fn native_options(&self) -> Vec<NativeOption> {
             Vec::new()
+        }
+        fn supports_model_decision_images(&self, _: &ModelArtifact) -> bool {
+            self.image_inputs
         }
         async fn probe(&self) -> Result<EngineProbe, EngineError> {
             Ok(EngineProbe {
@@ -458,12 +508,52 @@ pub(crate) mod tests {
     pub(crate) fn request(profile: ModelProfileId) -> DecisionRequest {
         DecisionRequest {
             model_profile_id: profile,
+            images: Vec::new(),
             state: serde_json::from_value(json!({"message":"synthetic"})).unwrap(),
             questions: serde_json::from_value(json!({
                 "route":{"type":"choice","criteria":{"accept":"allowed","reject":null}},
                 "urgency":{"type":"score","criteria":["low",{"level":"high"}]},
                 "safe":{"type":"noul","instructions":"Is this safe?","criteria":{"true":"safe","false":"unsafe"}}
             })).unwrap(),
+        }
+    }
+
+    #[test]
+    fn decision_images_are_bounded_and_round_trip_without_changing_text_requests() {
+        let mut request = request(ModelProfileId::new("fixture").unwrap());
+        let text = serde_json::to_value(&request).unwrap();
+        assert!(text.get("images").is_none());
+        assert!(
+            serde_json::from_value::<DecisionRequest>(text)
+                .unwrap()
+                .images
+                .is_empty()
+        );
+        let image = format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(vec![0; MAX_DECISION_IMAGE_BYTES])
+        );
+        request.images = vec![image.clone(), image];
+        request.validate().unwrap();
+        let encoded = serde_json::to_value(&request).unwrap();
+        let decoded: DecisionRequest = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.images, request.images);
+        assert_eq!(decoded.state, request.state);
+        assert_eq!(decoded.questions, request.questions);
+        for images in [
+            vec!["data:image/png;base64,YQ==".into(); 3],
+            vec!["https://example.com/image.png".into()],
+            vec!["data:image/gif;base64,YQ==".into()],
+            vec!["data:image/png;base64,".into()],
+            vec!["data:image/png;base64,!!!!".into()],
+            vec!["data:image/png;base64,YQ".into()],
+            vec![format!(
+                "data:image/png;base64,{}",
+                STANDARD.encode(vec![0; MAX_DECISION_IMAGE_BYTES + 1])
+            )],
+        ] {
+            request.images = images;
+            assert!(request.validate().is_err());
         }
     }
 
