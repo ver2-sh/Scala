@@ -26,6 +26,7 @@ pub enum ArtifactFormat {
     Gguf,
     Q27,
     Ninfer,
+    DecisionBundle,
 }
 
 impl ArtifactFormat {
@@ -34,6 +35,7 @@ impl ArtifactFormat {
             "gguf" => Some(Self::Gguf),
             "q27" => Some(Self::Q27),
             "ninfer" => Some(Self::Ninfer),
+            "decisionbundle" => Some(Self::DecisionBundle),
             _ => None,
         }
     }
@@ -43,6 +45,7 @@ impl ArtifactFormat {
             Self::Gguf => "gguf",
             Self::Q27 => "q27",
             Self::Ninfer => "ninfer",
+            Self::DecisionBundle => "decisionbundle",
         }
     }
 }
@@ -216,8 +219,9 @@ impl std::str::FromStr for ArtifactFormat {
             "gguf" => Ok(Self::Gguf),
             "q27" => Ok(Self::Q27),
             "ninfer" => Ok(Self::Ninfer),
+            "decisionbundle" => Ok(Self::DecisionBundle),
             _ => Err(format!(
-                "unsupported artifact format `{value}`; expected gguf, q27, or ninfer"
+                "unsupported artifact format `{value}`; expected gguf, q27, ninfer, or decisionbundle"
             )),
         }
     }
@@ -290,6 +294,15 @@ impl ModelRegistry {
                 let Some(format) = ArtifactFormat::from_path(path) else {
                     continue;
                 };
+                if format == ArtifactFormat::DecisionBundle
+                    && let Err(error) = crate::DecisionBundle::read(path)
+                {
+                    registry.warnings.push(format!(
+                        "Decision bundle {} was rejected: {error}",
+                        path.display()
+                    ));
+                    continue;
+                }
                 let canonical_path = match path.canonicalize() {
                     Ok(path) => path,
                     Err(error) => {
@@ -442,7 +455,9 @@ fn discover_package_for_artifact(
     let search_root = search_root.canonicalize().ok()?;
     let mut directory = artifact.parent()?;
     while directory.starts_with(&search_root) {
-        if crate::norted_package::local_norted_package_manifest(directory, format).exists() {
+        if crate::norted_package::local_norted_package_manifest(directory, format)
+            .is_some_and(|p| p.exists())
+        {
             let package = cache
                 .entry((directory.to_path_buf(), format))
                 .or_insert_with(|| discover_package_directory(directory, format))

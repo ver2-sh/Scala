@@ -2456,6 +2456,7 @@ impl EngineAdapter for NinferAdapter {
             environment,
             environment_remove: managed_environment_removals(),
             inherits_parent_environment: true,
+            supervise_process_tree: false,
             working_directory: binary_path.parent().map(PathBuf::from),
             temporary_files: vec![request_log_path],
             endpoint: Some(endpoint),

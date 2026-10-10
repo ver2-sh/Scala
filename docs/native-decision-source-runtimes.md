@@ -1,0 +1,177 @@
+# Native Decision source runtimes
+
+The `native_decision` engine supports explicit `.decisionbundle` source closures
+through the `scala-native-decision-v1` runtime protocol. It uses the existing
+Model Profile, runtime selection, authenticated `/v1/systemone`, auxiliary JIT,
+request lease and Decision qualification paths. It is registered alongside
+llama.cpp, q27 and NInfer; their artifact and native serving contracts are unchanged.
+
+Configuration alone cannot make these Hugging Face snapshots executable in the
+three older engines. They are neither GGUF Decision artifacts nor Q27/NInfer
+containers. The new source-bundle format is a small local descriptor referencing
+canonical original files, not a conversion, copied checkpoint, Norted package,
+engine, runtime, Settings store or Model Profile. Norted manifest schemas are
+unchanged, and this format has no Norted package manifest.
+
+## Algorithms and qualification
+
+Two backend contracts are implemented, independent of repository/profile names:
+
+- `vllm-labels`: stock vLLM **0.30.0** plus an explicitly installed upstream label
+  shim. The original model configuration must retain `head_dtype: float32`.
+  The native shim owns trained question rendering, exact `logprob_token_ids`
+  reads for **every** label (including chunking beyond vLLM's limit), temperature,
+  yes/no commitment floor, probabilities, confidence, ordinal expectation and
+  legends. Scala does not generate a prompt, parse output text or estimate missing
+  probabilities. The shim is implementation code bound into the **runtime**
+  identity. A model's bound shim digest must match that installed implementation;
+  arbitrary model-supplied code cannot acquire capability by calling itself a shim.
+- `torch-readout`: a pinned native source checkout calls PyTorch/PEFT with the
+  original adapter and exact local base checkpoint, unmerged LoRA, no graph
+  warm-up, and the original finite float32 linear readout/tokenizer binding.
+  Calibration is applied by upstream `TemperatureCalibrator`; rotation count
+  and context/device policy are explicit immutable runtime options. Missing
+  adapter/readout, vocabulary-row fallback, changed tokenizer binding and base
+  mismatch are rejected. No native thought/reasoning path is enabled. Original
+  native `unknown_probability` and `abstained` fields are retained as optional
+  observations on each answer. Missing observations stay absent.
+
+The bundle binds repository IDs, exact 40-character revisions, canonical source
+roots, each consumed file's size/SHA-256, and calibration/serving file selection.
+Metadata discovery is bounded; it checks required role/file bindings and current
+sizes without reading tensor payloads. It grants **no** execution capability.
+Before a runtime can be discovered, the wrapper's metadata-only probe verifies
+its implementation source and the fully locked installed wheel closure against
+RECORD, without importing tensor libraries or touching a GPU. The runtime
+fingerprint includes the interpreter, wrapper, explicit options, implementation
+code and actual dependency closure. A changed closure creates a different
+immutable runtime identity or fails the probe. External variants are discovered
+independently; a failed variant does not make another variant unavailable.
+
+Before each launch Scala clears old proof and verifies the exact runtime,
+executable SHA-256 and bundle digest. The wrapper independently repeats runtime
+verification and hashes the complete artifact closure before loading. The
+private health response must bind the runtime fingerprint, backend, verified
+bundle digest and fresh launch nonce, and attest that the native readout is
+initialized. Its native System One validator must return the exact state-required
+error for `{}`. This validation performs **no decision forward pass**. A mismatch,
+failed health observation, failed launch, unload or crash invalidates proof.
+The shared `native_decision_supported` gate controls execution and advertising.
+The public `decision_candidate` field requires a compatible installed variant,
+complete bundle, matching implementation binding and valid resolved configuration.
+It remains only an opportunity for JIT qualification.
+
+Both backend handlers receive only the original `state` and typed `questions`;
+Scala never sends a model selector to a loaded private backend. Native limits and
+missing instructions are rejected by upstream rather than reconstructed. Native
+answers must match the requested names/types/candidate inventory, with finite
+in-range observations. Scala preserves supplied values rather than normalizing
+or recalibrating them. Native token usage is mapped only when both input and
+output counts are present; Imajev's current native response lacks an output count,
+so Scala omits public usage rather than inventing a zero.
+
+These runtimes advertise Decision only, without chat, Responses, completions,
+streaming or embedding support. Generation defaults are optional observations in
+the manager; a Decision-only backend neither queries nor persists fictional
+sampling defaults. Existing adapters retain their existing observations. The new
+runtime opts into POSIX process group supervision, including cleanup of vLLM worker
+children on parent failure and immediate termination; existing adapters keep
+their previous launch policy. Non-POSIX native source runtimes are unsupported.
+
+## Explicit provisioning boundary
+
+`crates/scala-engine-native-decision/runtime/prepare.py` prepares source descriptors
+and isolated runtime directories. It never installs dependencies, creates a Model
+Profile, edits Settings, selects a runtime, starts serving, or changes production
+configuration. `prepare.py --help`, `prepare.py bundle --help` and
+`prepare.py runtime --help` document required explicit bindings/options.
+
+A prepared runtime requires a dedicated interpreter with **every installed
+wheel** locked, plus immutable native implementation source. `runtime` copies
+only Scala's small wrapper and writes a config/absolute-interpreter launcher. It
+probes dependencies only; failed preparation removes that new runtime directory.
+For `vllm-labels`, provide the source directory, exact revision and explicit shim
+entrypoint; for `torch-readout`, provide a clean Git checkout and its exact commit.
+The reviewed Imajev implementation is
+[`91729bff7a806187324e287fd0d730839dc32026`](https://github.com/mohit67890/imajev/tree/91729bff7a806187324e287fd0d730839dc32026).
+That runtime source commit is separate from the adapter's Hugging Face revision.
+
+After provisioning, ordinary explicit Scala configuration can expose both
+variants without a shared cross-engine inference parent:
+
+```toml
+[engine.native_decision]
+enabled = true
+[engine.native_decision.native]
+binaries = ["/absolute/label-runtime/native-decision-server", "/absolute/readout-runtime/native-decision-server"]
+```
+
+A single `native.binary` is also supported, mutually exclusive with `binaries`.
+There is no automatic runtime selection. Runtime options are read-only properties
+of that exact runtime, artifact calibration is model-owned, and no Settings,
+profile, load or request inference override is currently supported by this engine.
+Such overrides fail validation; inherited values remain absent. Configure explicit
+runtime/model compatibility first and create **auxiliary** profiles through the
+normal Model Profiles store only when their engine and installed runtime resolve.
+No runtime-wide role or origin-based privilege is introduced.
+
+The read-only Rust `inspect` example checks source bundles with Scala's actual
+artifact discovery without initializing application/production state:
+
+```sh
+cargo run -p scala-engine-native-decision --example inspect --offline -- /path/to/bundles
+```
+
+## Norted static qualification, 2026-10-10
+
+The original downloads remain in `/srv/norted/models/decision-sources/`.
+Descriptors were prepared under `/srv/norted/scratch/native-decision-integration/`:
+
+| Requested auxiliary profile | Descriptor | Native snapshot | Status |
+| --- | --- | --- | --- |
+| `h2o-lightning-4b-v1-1-decision` | `h2o-lightning-4b-v1-1.decisionbundle` | `h2oai/h2o-lightning-4b @ 193ad740925b176a3b70a5a13a7cff2f2fadd01e` | **Blocked; not registered** |
+| `imajev-4b-decision` | `imajev-4b.decisionbundle` | `mohit67890/imajev-4b @ f8d8234cebc6c99065c07731e59716dc0a6e27ab` | **Blocked; not registered** |
+
+Imajev's base is exactly `Qwen/Qwen3.5-4B @
+851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`. Its adapter metadata records a
+training-machine HF snapshot path; the repository/revision encoded there match
+this base. No upstream metadata was rewritten. Static readout header inspection
+confirmed `weight`, float32, shape `[256, 2560]`.
+
+The host reports an RTX 5090, 32,607 MiB VRAM, NVIDIA driver 595.91.07. System
+Python has no vLLM, torch, PEFT, transformers, safetensors, FastAPI or uvicorn
+installation. The checked Norted and Swift build virtual environments likewise
+have no native serving dependency sets. No qualified external runtime or complete
+Imajev runtime source checkout was installed/configured. Existing production Scala
+was not replaced or restarted to activate this source change. Both profiles are
+therefore unregistered rather than unusable placeholders.
+
+GPU support, available VRAM alongside Swift, native backend startup and operational
+model qualification remain unverified. H2O upstream measures H100; that evidence
+does not qualify this RTX 5090. There was no benchmark, training, real inference or
+model loading for development validation. Runtime provisioning and activation of
+this source change are separate operational work; this task changed no production
+serving state, Swift profile, runtime selection or Unsloth Studio state.
+
+Coded's existing `decision_candidate` discovery, identity-only selection and native
+Decision tool accept the profile/API shapes and preserve extra native observations.
+Its existing synthetic discovery and fusion Decision suites pass unchanged; no
+Coded contract change was needed.
+
+Sources: [pinned H2O release](https://huggingface.co/h2oai/h2o-lightning-4b/tree/193ad740925b176a3b70a5a13a7cff2f2fadd01e),
+[pinned Imajev adapter](https://huggingface.co/mohit67890/imajev-4b/tree/f8d8234cebc6c99065c07731e59716dc0a6e27ab),
+[pinned base](https://huggingface.co/Qwen/Qwen3.5-4B/tree/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a).
+
+Final local validation: `cargo test --workspace --lib --bins --offline` passed
+**360 tests**, with the existing manual hash-throughput benchmark left ignored.
+The native engine's six tests exercise both backend tuples, plural external
+runtime discovery, changed/unsupported identities, native usage and response
+preservation, and runtime identity retention under invalid inference configuration. Seven Python wrapper tests use mocked tensor/native servers; the
+pinned H2O shim's ten tests use its fake vLLM implementation. Coded's existing
+discovery and fusion Decision suites passed **151 tests**. Workspace checking,
+formatting, diff checks and native-engine Clippy with warnings denied passed.
+Scala's read-only inspector resolved both staged descriptors as real source
+artifacts and reported neither execution-qualified. Scratch reports/logs are in
+`/srv/norted/scratch/native-decision-integration/qualification-report.json` and its
+sibling validation files. The production profile store's before/after SHA-256 is
+`49a6b7f253161d8d410e81a7476fc00025dae4fac034dcfc3d9b1e885da1c8e4`.

@@ -117,6 +117,12 @@ pub fn engine_registry_from_config(
         config.engine.get(NINFER_ENGINE_ID),
         config_directory,
     )))?;
+    registry.register(Arc::new(
+        scala_engine_native_decision::NativeDecisionAdapter::from_config(
+            config.engine.get(scala_engine_native_decision::ENGINE_ID),
+            config_directory,
+        ),
+    ))?;
     Ok(registry)
 }
 

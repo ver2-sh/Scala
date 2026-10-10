@@ -1,7 +1,9 @@
 # Native Decision integration
 
 Scala exposes the engine-neutral `ApiCapability::Decision` and
-`EngineFeature::Decision`. The authenticated `POST /v1/systemone` surface uses
+`EngineFeature::Decision`. The explicit `native_decision` source-runtime engine
+also supports native label and trained linear-readout serving through verified
+local source bundles; see [source runtimes and Norted qualification](native-decision-source-runtimes.md). The authenticated `POST /v1/systemone` surface uses
 normal Model Profile IDs (including Link aliases), session/role routing, JIT
 resolution and request leases. It never calls chat, completion, logprobs, grammar
 or prompt-based approximations. llama.cpp supports qualified official upstream
@@ -157,5 +159,5 @@ separate steps.
 
 Profiles continue to bind an ordinary artifact and engine target. GGUF, Q27 and
 NInfer formats, filenames, origin and Norted metadata/provenance alone never grant
-Decision. There is no new artifact format, profile role or persistent setting.
+Decision. For llama.cpp there is no new artifact format, profile role or persistent setting.
 Tests use fake adapters and synthetic loaded backends; no native inference runs.

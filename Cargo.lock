@@ -2856,6 +2856,7 @@ dependencies = [
  "scala-core",
  "scala-engine",
  "scala-engine-llama-cpp",
+ "scala-engine-native-decision",
  "scala-engine-ninfer",
  "scala-engine-q27",
  "scala-model-library",
@@ -2962,6 +2963,24 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "scala-engine-native-decision"
+version = "0.1.13"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures-util",
+ "reqwest 0.12.28",
+ "scala-core",
+ "scala-engine",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

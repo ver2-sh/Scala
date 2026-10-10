@@ -134,7 +134,7 @@ pub struct ModelsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ModelsCommand {
-    /// List recognized .gguf, .q27, and .ninfer artifacts
+    /// List recognized .gguf, .q27, .ninfer and .decisionbundle artifacts
     List,
     /// Show private serving capabilities for one discovered model
     Info { model_id: String },

@@ -3366,6 +3366,7 @@ impl EngineAdapter for Q27Adapter {
             environment,
             environment_remove,
             inherits_parent_environment: true,
+            supervise_process_tree: false,
             working_directory: None,
             temporary_files: Vec::new(),
             endpoint: Some(endpoint),

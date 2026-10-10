@@ -5,6 +5,7 @@ members = [
     "crates/scala-engine",
     "crates/scala-engine-llama-cpp",
     "crates/scala-engine-ninfer",
+    "crates/scala-engine-native-decision",
     "crates/scala-engine-q27",
     "crates/scala-model-library",
     "crates/scala",

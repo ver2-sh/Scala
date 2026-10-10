@@ -819,6 +819,7 @@ impl UiLayout {
                                         ArtifactFormat::Gguf => 8,
                                         ArtifactFormat::Q27 => 7,
                                         ArtifactFormat::Ninfer => 10,
+                                        ArtifactFormat::DecisionBundle => 19,
                                     }
                                 } else {
                                     16

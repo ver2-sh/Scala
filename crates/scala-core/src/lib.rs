@@ -2,6 +2,7 @@
 
 mod auth;
 mod config;
+mod decision_bundle;
 mod error;
 mod event;
 mod model;
@@ -25,6 +26,7 @@ pub use config::{
     AppConfig, AppPaths, ConfigSource, EngineConfig, JitConfig, LinkConfig, LoadedConfig,
     ModelConfig, SUPPORTED_CONFIG_VERSION, ServerConfig, TuiConfig,
 };
+pub use decision_bundle::{DecisionBundle, DecisionFile, DecisionSource};
 pub use error::{CoreError, Result};
 pub use event::{AppEvent, LogLevel};
 pub use model::{

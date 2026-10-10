@@ -660,29 +660,31 @@ impl RuntimePackManager {
         warnings: &mut Vec<String>,
     ) -> Vec<InstalledRuntime> {
         for adapter in self.registry.adapters() {
-            match adapter.probe().await {
-                Ok(probe) => match probe.installation {
-                    InstallationState::Installed { installation } if probe.healthy => {
-                        match external_runtime(
-                            &adapter.identity().id,
-                            adapter.capabilities().artifact_formats,
-                            *installation,
-                            probe.detail,
-                        ) {
-                            Ok(runtime) => runtimes.push(runtime),
-                            Err(error) => warnings.push(error.to_string()),
+            for probe in adapter.external_runtime_probes().await {
+                match probe {
+                    Ok(probe) => match probe.installation {
+                        InstallationState::Installed { installation } if probe.healthy => {
+                            match external_runtime(
+                                &adapter.identity().id,
+                                adapter.capabilities().artifact_formats,
+                                *installation,
+                                probe.detail,
+                            ) {
+                                Ok(runtime) => runtimes.push(runtime),
+                                Err(error) => warnings.push(error.to_string()),
+                            }
                         }
-                    }
-                    InstallationState::Invalid { reason } => warnings.push(format!(
-                        "{} external runtime is invalid: {reason}",
+                        InstallationState::Invalid { reason } => warnings.push(format!(
+                            "{} external runtime is invalid: {reason}",
+                            adapter.identity().id
+                        )),
+                        InstallationState::NotInstalled | InstallationState::Installed { .. } => {}
+                    },
+                    Err(error) => warnings.push(format!(
+                        "{} external runtime probe failed: {error}",
                         adapter.identity().id
                     )),
-                    InstallationState::NotInstalled | InstallationState::Installed { .. } => {}
-                },
-                Err(error) => warnings.push(format!(
-                    "{} external runtime probe failed: {error}",
-                    adapter.identity().id
-                )),
+                }
             }
         }
         runtimes

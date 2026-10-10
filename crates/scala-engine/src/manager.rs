@@ -384,10 +384,17 @@ struct RunningBackend {
     adapter: Arc<dyn EngineAdapter>,
     process: ProcessDescriptor,
     endpoint: String,
-    effective_generation_settings: EffectiveGenerationSettings,
+    effective_generation_settings: Option<EffectiveGenerationSettings>,
     settings: scala_core::ResolvedSettings,
     settings_schema: scala_core::SettingsSchema,
     _runtime_lease: RuntimeLease,
+}
+
+impl RunningBackend {
+    fn generation_defaults(&self) -> Result<EffectiveGenerationSettings, EngineError> {
+        self.effective_generation_settings
+            .ok_or_else(|| EngineError::Unsupported("text generation defaults".into()))
+    }
 }
 
 struct BackendActivity {
@@ -416,7 +423,7 @@ struct InferenceLease {
 struct InferenceTarget {
     adapter: Arc<dyn EngineAdapter>,
     endpoint: String,
-    generation_settings: EffectiveGenerationSettings,
+    generation_settings: Option<EffectiveGenerationSettings>,
     settings: scala_core::ResolvedSettings,
     settings_schema: scala_core::SettingsSchema,
     runtime: crate::InstalledRuntime,
@@ -426,6 +433,12 @@ struct InferenceTarget {
 }
 
 impl InferenceTarget {
+    fn generation_defaults(&self) -> Result<EffectiveGenerationSettings, RuntimeError> {
+        self.generation_settings.ok_or_else(|| {
+            RuntimeError::Operation("This native backend has no text generation contract".into())
+        })
+    }
+
     fn reasoning_capabilities(
         &self,
         patch: &crate::GenerationSettingsPatch,
@@ -1603,7 +1616,7 @@ impl RuntimeManager {
             };
             match observation {
                 StartupObservation::Ready(mut observation) => {
-                    let settings = match adapter.effective_generation_settings(&process).await {
+                    let settings = match adapter.startup_generation_settings(&process).await {
                         Ok(settings) => settings,
                         Err(error) => {
                             cleanup_pending_launch_files(&launch_attempts).await;
@@ -1617,11 +1630,13 @@ impl RuntimeManager {
                             return Err(RuntimeError::StartupFailed(detail));
                         }
                     };
-                    if let Err(error) = merge_effective_generation_settings(
-                        &mut observation,
-                        &resolved_settings.engine_id,
-                        settings,
-                    ) {
+                    if let Some(settings) = settings
+                        && let Err(error) = merge_effective_generation_settings(
+                            &mut observation,
+                            &resolved_settings.engine_id,
+                            settings,
+                        )
+                    {
                         cleanup_pending_launch_files(&launch_attempts).await;
                         let detail = format!(
                             "could not record effective generation settings from the engine: {error}"
@@ -1755,14 +1770,16 @@ impl RuntimeManager {
             backend.residency = residency;
             if let Some(provenance) = backend.provenance.as_mut() {
                 provenance.normalized_settings.extend(startup_observation);
-                provenance.normalized_settings.insert(
-                    format!("{}.temperature", resolved_settings.engine_id),
-                    serde_json::json!(effective_generation_settings.temperature),
-                );
-                provenance.normalized_settings.insert(
-                    format!("{}.top_p", resolved_settings.engine_id),
-                    serde_json::json!(effective_generation_settings.top_p),
-                );
+                if let Some(effective_generation_settings) = effective_generation_settings {
+                    provenance.normalized_settings.insert(
+                        format!("{}.temperature", resolved_settings.engine_id),
+                        serde_json::json!(effective_generation_settings.temperature),
+                    );
+                    provenance.normalized_settings.insert(
+                        format!("{}.top_p", resolved_settings.engine_id),
+                        serde_json::json!(effective_generation_settings.top_p),
+                    );
+                }
                 reconcile_effective_settings_from_runtime(provenance);
             }
             let runtime_lease = backend
@@ -2044,12 +2061,12 @@ impl RuntimeManager {
             .adapter
             .validate_inference_request(
                 &request,
-                &target.generation_settings,
+                &target.generation_defaults()?,
                 &target.settings_schema,
             )
             .map_err(map_inference_error)?;
         let effective_generation_settings = target
-            .generation_settings
+            .generation_defaults()?
             .merged(&request.generation_settings);
         let effective_output_format = request.output_format.clone();
         let output = target
@@ -2099,12 +2116,12 @@ impl RuntimeManager {
             .adapter
             .validate_inference_request(
                 &request,
-                &target.generation_settings,
+                &target.generation_defaults()?,
                 &target.settings_schema,
             )
             .map_err(map_inference_error)?;
         let effective_generation_settings = target
-            .generation_settings
+            .generation_defaults()?
             .merged(&request.generation_settings);
         let effective_output_format = request.output_format.clone();
         target.lease.mark_processing_prompt();
@@ -3019,7 +3036,7 @@ fn prepare_completion_request(
     }
     target
         .adapter
-        .validate_generation_settings(&request.generation_settings, &target.generation_settings)
+        .validate_generation_settings(&request.generation_settings, &target.generation_defaults()?)
         .map_err(map_inference_error)
 }
 
@@ -3974,10 +3991,10 @@ mod tests {
             adapter,
             process,
             endpoint: "http://127.0.0.1:1".into(),
-            effective_generation_settings: EffectiveGenerationSettings {
+            effective_generation_settings: Some(EffectiveGenerationSettings {
                 temperature: 0.0,
                 top_p: 1.0,
-            },
+            }),
             settings: scala_core::ResolvedSettings {
                 engine_id: "fixture-decision".into(),
                 ..Default::default()
@@ -4082,6 +4099,40 @@ mod tests {
             fixture.manager.status().await.backends[0].active_request_count,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn decision_dispatch_requires_no_invented_generation_defaults() {
+        let adapter = Arc::new(crate::decision::tests::DecisionAdapter::new(true));
+        let fixture = decision_fixture(adapter.clone(), "1", Some("native-decision-fixture")).await;
+        {
+            let mut state = fixture.manager.state.write().await;
+            state
+                .backends
+                .get_mut(&fixture.profile_id)
+                .unwrap()
+                .running
+                .as_mut()
+                .unwrap()
+                .effective_generation_settings = None;
+        }
+        let target = fixture
+            .manager
+            .acquire_target(&fixture.profile_id)
+            .await
+            .unwrap();
+        assert!(target.generation_defaults().is_err());
+        drop(target);
+        let output = fixture
+            .manager
+            .decide_routed(
+                crate::decision::tests::request(fixture.profile_id.clone()),
+                InferenceRoutingContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.output.model.as_deref(), Some("native-fixture-1"));
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -3192,7 +3192,8 @@ impl App {
                     None => Some(ArtifactFormat::Gguf),
                     Some(ArtifactFormat::Gguf) => Some(ArtifactFormat::Q27),
                     Some(ArtifactFormat::Q27) => Some(ArtifactFormat::Ninfer),
-                    Some(ArtifactFormat::Ninfer) => None,
+                    Some(ArtifactFormat::Ninfer) => Some(ArtifactFormat::DecisionBundle),
+                    Some(ArtifactFormat::DecisionBundle) => None,
                 };
                 self.set_model_search_format(format)
             }

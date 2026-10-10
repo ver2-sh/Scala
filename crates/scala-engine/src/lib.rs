@@ -999,6 +999,8 @@ pub struct LaunchSpec {
     pub environment: BTreeMap<String, String>,
     pub environment_remove: Vec<OsString>,
     pub inherits_parent_environment: bool,
+    /// Opt-in POSIX process group supervision for runtimes with worker children.
+    pub supervise_process_tree: bool,
     pub working_directory: Option<PathBuf>,
     /// Adapter-created private files that the supervisor removes when the
     /// process exits. Adapters may remove them earlier after observation.
@@ -1783,6 +1785,11 @@ pub trait EngineAdapter: Send + Sync {
     /// Reports the legacy/flexible-entry runtime configured directly for this
     /// adapter. Managed packs are discovered by the shared runtime store.
     async fn probe(&self) -> Result<EngineProbe, EngineError>;
+    /// Discover independently configured external runtime variants. Each result
+    /// is qualified and identified separately by the existing runtime resolver.
+    async fn external_runtime_probes(&self) -> Vec<Result<EngineProbe, EngineError>> {
+        vec![self.probe().await]
+    }
     /// Validates one exact runtime instance and records what the executable
     /// itself reported. Install activation and launch both use this boundary.
     async fn probe_runtime(
@@ -1861,6 +1868,14 @@ pub trait EngineAdapter: Send + Sync {
     fn startup_progress(&self, _stderr_tail: &[String]) -> Option<BackendLoadProgress> {
         None
     }
+    /// Decision-only adapters have no generation defaults to observe.
+    async fn startup_generation_settings(
+        &self,
+        process: &ProcessDescriptor,
+    ) -> Result<Option<EffectiveGenerationSettings>, EngineError> {
+        self.effective_generation_settings(process).await.map(Some)
+    }
+
     async fn effective_generation_settings(
         &self,
         process: &ProcessDescriptor,

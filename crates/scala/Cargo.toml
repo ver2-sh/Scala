@@ -22,6 +22,7 @@ scala-api = { path = "../scala-api" }
 scala-core = { path = "../scala-core" }
 scala-engine = { path = "../scala-engine" }
 scala-engine-llama-cpp = { path = "../scala-engine-llama-cpp" }
+scala-engine-native-decision = { path = "../scala-engine-native-decision" }
 scala-engine-ninfer = { path = "../scala-engine-ninfer" }
 scala-engine-q27 = { path = "../scala-engine-q27" }
 scala-model-library = { path = "../scala-model-library" }

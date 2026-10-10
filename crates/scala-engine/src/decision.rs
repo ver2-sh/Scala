@@ -91,6 +91,8 @@ pub enum DecisionAnswer {
         probabilities: Option<BTreeMap<String, f64>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confidence: Option<f64>,
+        #[serde(flatten)]
+        observations: DecisionObservations,
     },
     Score {
         score: f64,
@@ -100,6 +102,8 @@ pub enum DecisionAnswer {
         probabilities: Option<BTreeMap<String, f64>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confidence: Option<f64>,
+        #[serde(flatten)]
+        observations: DecisionObservations,
     },
     Noul {
         noul: f64,
@@ -107,7 +111,18 @@ pub enum DecisionAnswer {
         probabilities: Option<BTreeMap<String, f64>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confidence: Option<f64>,
+        #[serde(flatten)]
+        observations: DecisionObservations,
     },
+}
+
+/// Optional native abstention observations. Absent fields stay absent.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DecisionObservations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_probability: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abstained: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

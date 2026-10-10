@@ -911,6 +911,7 @@ fn render_model_discover(
             Some(ArtifactFormat::Gguf) => "[ GGUF ]",
             Some(ArtifactFormat::Q27) => "[ Q27 ]",
             Some(ArtifactFormat::Ninfer) => "[ NInfer ]",
+            Some(ArtifactFormat::DecisionBundle) => "[ Decision bundle ]",
         };
         let mut style = if app.model_search_loading {
             theme.muted

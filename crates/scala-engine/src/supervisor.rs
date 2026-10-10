@@ -98,6 +98,7 @@ struct ChildActor {
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     temporary_files: Vec<std::path::PathBuf>,
     termination_timeout: Duration,
+    supervise_process_tree: bool,
 }
 
 impl Default for TokioProcessSupervisor {
@@ -149,6 +150,14 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             .kill_on_drop(true);
         if let Some(directory) = &spec.working_directory {
             command.current_dir(directory);
+        }
+        #[cfg(unix)]
+        if spec.supervise_process_tree {
+            command.process_group(0);
+        }
+        #[cfg(not(unix))]
+        if spec.supervise_process_tree {
+            return Err(EngineError::Unsupported("process tree supervision".into()));
         }
         scala_core::isolate_child_from_console(command.as_std_mut());
         let mut child = match command.spawn() {
@@ -217,6 +226,7 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             stderr_tail: tail,
             temporary_files: spec.temporary_files,
             termination_timeout: self.termination_timeout,
+            supervise_process_tree: spec.supervise_process_tree,
         }));
         Ok(descriptor)
     }
@@ -404,6 +414,7 @@ async fn run_child_actor(actor: ChildActor) {
         stderr_tail,
         temporary_files,
         termination_timeout,
+        supervise_process_tree,
     } = actor;
     let mut termination_response = None;
     let mut expected = false;
@@ -413,12 +424,17 @@ async fn run_child_actor(actor: ChildActor) {
             if let Some(ProcessCommand::Terminate { response, immediate }) = command {
                 expected = true;
                 termination_response = Some(response);
-                terminate_child(&mut child, descriptor.process_id, if immediate { Duration::ZERO } else { termination_timeout }).await
+                terminate_child(&mut child, descriptor.process_id, supervise_process_tree, if immediate { Duration::ZERO } else { termination_timeout }).await
             } else {
                 child.wait().await
             }
         }
     };
+
+    #[cfg(unix)]
+    if supervise_process_tree {
+        let _ = signal_process_group(descriptor.process_id, libc::SIGKILL);
+    }
 
     if tokio::time::timeout(Duration::from_secs(1), &mut stdout_task)
         .await
@@ -497,12 +513,27 @@ async fn cleanup_temporary_files(paths: &[std::path::PathBuf]) {
 async fn terminate_child(
     child: &mut Child,
     process_id: u32,
+    supervise_process_tree: bool,
     timeout: Duration,
 ) -> std::io::Result<std::process::ExitStatus> {
-    request_graceful_termination(child, process_id)?;
+    #[cfg(unix)]
+    if supervise_process_tree {
+        signal_process_group(process_id, libc::SIGTERM)?;
+    } else {
+        request_graceful_termination(child, process_id)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = supervise_process_tree;
+        request_graceful_termination(child, process_id)?;
+    }
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(result) => result,
         Err(_) => {
+            #[cfg(unix)]
+            if supervise_process_tree {
+                signal_process_group(process_id, libc::SIGKILL)?;
+            }
             child.start_kill()?;
             tokio::time::timeout(Duration::from_secs(2), child.wait())
                 .await
@@ -510,6 +541,25 @@ async fn terminate_child(
                     std::io::Error::new(std::io::ErrorKind::TimedOut, "force termination timed out")
                 })?
         }
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(process_id: u32, signal: i32) -> std::io::Result<()> {
+    let id =
+        i32::try_from(process_id).map_err(|_| std::io::Error::other("Invalid process group"))?;
+    if id <= 1 {
+        return Err(std::io::Error::other("Invalid process group"));
+    }
+    // SAFETY: the supervisor created a private group whose ID is this child's PID.
+    if unsafe { libc::kill(-id, signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
@@ -641,4 +691,42 @@ fn unix_timestamp() -> i64 {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
         .unwrap_or(0)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod process_tree_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[tokio::test]
+    async fn opted_in_process_group_termination_stops_worker_children() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 300 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let id = child.id().unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        let worker: u32 = lines.next_line().await.unwrap().unwrap().parse().unwrap();
+        terminate_child(&mut child, id, true, Duration::ZERO)
+            .await
+            .unwrap();
+        // A killed grandchild may briefly be a zombie awaiting PID 1. It must
+        // have no runnable worker left after the supervisor's group signal.
+        for _ in 0..20 {
+            let stat = std::fs::read_to_string(format!("/proc/{worker}/stat"));
+            if stat.as_ref().is_err()
+                || stat.as_ref().is_ok_and(|s| {
+                    s.split_once(") ")
+                        .is_some_and(|(_, tail)| tail.starts_with('Z'))
+                })
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("native worker survived process group termination");
+    }
 }

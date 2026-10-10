@@ -643,7 +643,7 @@ impl RuntimeManager {
                         .adapter
                         .validate_inference_request(
                             &probe_request,
-                            &running.effective_generation_settings,
+                            &running.generation_defaults().map_err(|e| e.to_string())?,
                             &running.settings_schema,
                         )
                         .map_err(|e| e.to_string())
@@ -1118,20 +1118,20 @@ impl RuntimeManager {
                         .adapter
                         .validate_inference_request(
                             &final_request,
-                            &running.effective_generation_settings,
+                            &running.generation_defaults().map_err(|e| e.to_string())?,
                             &running.settings_schema,
                         )
                         .and_then(|()| {
                             running.adapter.validate_inference_request(
                                 &history_request,
-                                &running.effective_generation_settings,
+                                &running.generation_defaults()?,
                                 &running.settings_schema,
                             )
                         })
                         .and_then(|()| {
                             running.adapter.validate_inference_request(
                                 &request,
-                                &running.effective_generation_settings,
+                                &running.generation_defaults()?,
                                 &running.settings_schema,
                             )
                         })

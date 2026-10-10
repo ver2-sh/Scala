@@ -1475,6 +1475,7 @@ impl EngineAdapter for LlamaCppAdapter {
             environment,
             environment_remove,
             inherits_parent_environment: true,
+            supervise_process_tree: false,
             working_directory: None,
             temporary_files: Vec::new(),
             endpoint: Some(http_endpoint(request.backend_address)),

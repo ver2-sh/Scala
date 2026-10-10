@@ -1381,7 +1381,9 @@ impl HuggingFaceCatalogProvider {
         primary_filename: &str,
         format: ArtifactFormat,
     ) -> Result<Option<(ResolvedPackage, Vec<ResolvedFile>)>> {
-        let manifest_name = norted_package_manifest_name(format);
+        let Some(manifest_name) = norted_package_manifest_name(format) else {
+            return Ok(None);
+        };
         let primary_path = Path::new(primary_filename);
         let mut directory = primary_path.parent().unwrap_or_else(|| Path::new(""));
         loop {
@@ -1731,7 +1733,7 @@ fn nearest_package_manifest(
     artifact_filename: &str,
     format: ArtifactFormat,
 ) -> Option<String> {
-    let manifest_name = norted_package_manifest_name(format);
+    let manifest_name = norted_package_manifest_name(format)?;
     let mut directory = Path::new(artifact_filename)
         .parent()
         .unwrap_or_else(|| Path::new(""));
@@ -1863,6 +1865,9 @@ fn validate_artifact(path: &Path, format: ArtifactFormat) -> Result<()> {
             .map_err(|error| ModelLibraryError::InvalidArtifact(error.to_string())),
         ArtifactFormat::Q27 => scala_engine_q27::validate_model_artifact(path)
             .map_err(ModelLibraryError::InvalidArtifact),
+        ArtifactFormat::DecisionBundle => scala_core::DecisionBundle::read(path)
+            .map(|_| ())
+            .map_err(ModelLibraryError::InvalidArtifact),
         ArtifactFormat::Ninfer => inspect_ninfer_container(path)
             .map(|_| ())
             .map_err(|error| ModelLibraryError::InvalidArtifact(error.to_string())),
@@ -1914,7 +1919,9 @@ async fn local_package_root(source: &Path, format: ArtifactFormat) -> Result<Opt
         ModelLibraryError::InvalidArtifact("artifact path has no parent directory".to_owned())
     })?;
     loop {
-        let manifest = scala_core::local_norted_package_manifest(directory, format);
+        let Some(manifest) = scala_core::local_norted_package_manifest(directory, format) else {
+            return Ok(None);
+        };
         if let Ok(metadata) = tokio::fs::metadata(&manifest).await
             && metadata.is_file()
             && metadata.len() > 0

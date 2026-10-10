@@ -591,6 +591,7 @@ mod tests {
             environment: BTreeMap::new(),
             environment_remove: Vec::new(),
             inherits_parent_environment: false,
+            supervise_process_tree: false,
             working_directory: None,
             temporary_files: Vec::new(),
             endpoint: Some(endpoint),
