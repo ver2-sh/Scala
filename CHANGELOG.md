@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.13 - Unsloth named-message interoperability
+
+Improves Chat Completions tool-history compatibility with Unsloth Studio while
+preserving native engine/template boundaries and safe message semantics.
+
+- Accept validated optional participant names in Chat message history and
+  normalize named tool results only when an earlier assistant tool call with
+  the same ID establishes the matching function name. Preserve tool arguments,
+  content, IDs and ordering without granting capabilities from message names.
+- Retain participant identities in the engine-neutral message representation
+  and forward them to qualified llama.cpp templates or explicit q27 external
+  templates. Return a typed unsupported-name error when NInfer or q27 native
+  Chat cannot represent meaningful participant identities.
+- Add synthetic Unsloth Web Search, edit_file and Code Mode continuation
+  fixtures, cross-layer Scala API/profile-routing tests, and an optional
+  CPU-only native contract harness verified against reviewed NInfer sources.
+- Document the remaining NInfer limitation for meaningful named participants
+  and the installed Unsloth external-provider builder's current omission of
+  ordinary participant names. Do not claim unrestricted Code Mode support.
+
 ## 0.1.12 - Model-agnostic reasoning controls
 
 Improves OpenAI-compatible Chat reasoning controls across Scala engines while
