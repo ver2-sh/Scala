@@ -175,3 +175,77 @@ artifacts and reported neither execution-qualified. Scratch reports/logs are in
 `/srv/norted/scratch/native-decision-integration/qualification-report.json` and its
 sibling validation files. The production profile store's before/after SHA-256 is
 `49a6b7f253161d8d410e81a7476fc00025dae4fac034dcfc3d9b1e885da1c8e4`.
+
+## Audit follow-up staging, 2026-10-10
+
+Stable staging is `/srv/norted/runtimes/native-decision/staging-2026-10-10/`;
+`evidence/qualification-report.json` records the exact wheels, source identities,
+descriptor bindings, runtime resolution, validation and remaining release work.
+Both descriptors retain the original verified checkpoints. Moving a descriptor
+changes its path-derived artifact ID; use the staged profile bindings, not the
+earlier scratch IDs.
+
+Imajev's isolated Python 3.12 runtime passes the complete RECORD/source probe and
+resolves to `torch-readout`. Its options are CUDA, four rotations and 4,096 input
+tokens, with the original calibration and unmerged adapter/readout. A wrapper
+fix recognizes case-insensitive wheel names such as `pillow`; RECORD verification
+and missing-dependency rejection remain enforced.
+
+H2O provisioning is blocked: stock vLLM 0.30.0 and the pinned README's
+`0.30.0+cu129` build require `PyNvVideoCodec==2.0.4`. SHA-verified original Linux
+x86-64 wheels for the installed Python versions 3.10, 3.12, 3.13 and 3.14 contain
+two native libraries with incorrect RECORD hashes. No qualified H2O launcher or
+profile is installed. The separate DLPack wheel site inside the attempted H2O
+environment preserves original wheel contents and resolves its shared
+`build_backend.py` collision; it does not bypass the PyNvVideoCodec failure.
+
+The exact auxiliary profile bindings are detached staging files. Only Imajev has
+an installed-runtime binding; H2O's binding is explicitly blocked. Neither has
+execution proof or production registration. Read-only checks reject cross-variant
+fallback. Coded's Decision deadline now covers Scala's 300-second startup plus
+600-second native request allowance, retaining caller cancellation and fail-closed
+handling. Targeted synthetic/static checks perform no model loading or inference.
+
+The RTX 5090 reports only 1,307 MiB free with Swift resident. Original tensors alone
+occupy about 8,022 MiB for H2O and 8,888 MiB for Imajev's base, plus its adapter,
+readout and runtime/context overhead. Neither can coexist with the current Swift
+allocation. No service, live store, Swift configuration or Unsloth setting changed.
+
+## Pinned wheel archive attestation for defective vendor RECORDs
+
+Some otherwise unmodified upstream binary wheels ship with bad internal RECORD
+hashes. NVIDIA PyNvVideoCodec **2.0.4** for CPython 3.12 Linux x86-64 has two
+such native members; its original archive SHA-256 matches the published PyPI
+checksum, and both mismatches are reproducible directly within that archive.
+The same packaging defect occurs in PyNvVideoCodec 2.0.5, so simply upgrading
+the dependency would not fix the verifier and would violate vLLM 0.30.0's
+explicit 2.0.4 requirement.
+
+The opt-in `prepare.py runtime --wheel-attestation PACKAGE WHEEL SHA256
+MISMATCHES_JSON` binds the **original archive bytes**, the full archive digest
+and the exact actual SHA-256 of each named member to an immutable runtime
+fingerprint. Only those enumerated members may disagree with their original
+RECORD: the wrapper requires the expected broken RECORD entry, verifies the
+matching original ZIP member bytes, hashes the installed bytes, and fails on
+additional, missing or unnecessary exceptions. All other installed files still
+require valid RECORD hashes. There are no patched packages, rewritten wheel
+metadata, upstream version substitutions or global trust exemptions. Other
+engine/runtime implementations are unaffected.
+
+The explicit H2O wheel attestation installed on Norted is:
+- PyPI wheel: `pynvvideocodec-2.0.4-cp312-cp312-manylinux_2_28_x86_64.whl`
+- Original archive SHA-256: `b59cec7a1a3f78fad13fead78cad8b6d9686827f9ff4477080245457675a01d0`
+- `PyNvVideoCodec_121.cpython-312-x86_64-linux-gnu.so`: actual SHA-256
+  `2fb85f8bcd33c13e240ef2a8c6277f4d5a0260b629ecf9a242a04f1403f582a8`
+- `PyNvVideoCodec_130.cpython-312-x86_64-linux-gnu.so`: actual SHA-256
+  `14f12a7977c2f681fb01693e41434308bfb5cf0e2c31ed2c29d1176337c86462`
+
+The stable `h2o-runtime/native-decision-server --scala-probe` now passes with
+the complete original vLLM 0.30.0 dependency closure. Scala's independent
+runtime/model resolver selects H2O as `vllm-labels` and Imajev as
+`torch-readout`; both detached auxiliary Model Profile bindings are retained
+in `evidence/`. Neither is execution-qualified or registered with the live
+Scala 0.1.13 service. With Swift 1.5 occupying approximately 30.8 GiB VRAM,
+H2O still needs a separate available-GPU operating window for real model load,
+typed-decision smoke tests and service activation. The vendor RECORD defect is
+no longer the provisioning blocker.

@@ -9,6 +9,8 @@ import sys
 sys.dont_write_bytecode = True
 import argparse
 import base64
+import csv
+import io
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -20,6 +22,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import zipfile
 
 PROTOCOL = "scala-native-decision-v1"
 BACKENDS = {"vllm-labels", "torch-readout"}
@@ -62,11 +65,42 @@ def inventory(root, files, verify=True):
     return root
 
 
+
+def original_wheel_attestation(name, version, info):
+    """Bind a known vendor RECORD defect to an exact upstream archive, never a rewritten RECORD.
+
+    Only specifically enumerated mismatches may use the archive's verified
+    original bytes. All other installed files must pass their normal RECORD
+    hashes, and the exception must be necessary and exactly reproduced.
+    """
+    if set(info) != {"path", "sha256", "mismatches"} or not isinstance(info["mismatches"], dict) or not info["mismatches"]:
+        raise ValueError("Invalid original wheel attestation")
+    archive = regular(Path(info["path"]))
+    if archive.suffix != ".whl" or len(info["sha256"]) != 64 or sha(archive) != info["sha256"]:
+        raise ValueError("Original wheel archive SHA256 does not match attestation")
+    with zipfile.ZipFile(archive) as wheel:
+        rows = [f for f in wheel.namelist() if f.endswith(".dist-info/RECORD")]
+        expected = name.lower().replace("-", "_").replace(".", "_") + "-" + version + ".dist-info/RECORD"
+        if rows != [expected]:
+            raise ValueError("Original wheel RECORD does not match package and version")
+        source_records = {r[0]: (r[1], r[2]) for r in csv.reader(io.StringIO(wheel.read(expected).decode("utf-8")))}
+        for member, expected_digest in info["mismatches"].items():
+            p = Path(member)
+            if (p.is_absolute() or not p.parts or any(x in {".", ".."} for x in p.parts)
+                    or len(expected_digest) != 64 or any(c not in "0123456789abcdef" for c in expected_digest)
+                    or member not in source_records or member not in wheel.namelist()):
+                raise ValueError("Invalid declared wheel RECORD mismatch")
+            if hashlib.sha256(wheel.read(member)).hexdigest() != expected_digest:
+                raise ValueError("Original wheel member SHA256 does not match attestation")
+    return source_records
+
+
 def runtime_identity(config_path):
     cfg = read_json(config_path)
     common = {"schema_version", "backend", "packages", "options"}
-    allowed = common | {"source"}
-    if set(cfg) != allowed or cfg["schema_version"] != 1 or cfg["backend"] not in BACKENDS:
+    required_fields = common | {"source"}
+    allowed = required_fields | {"wheel_attestations"}
+    if not required_fields <= set(cfg) or set(cfg) - allowed or cfg["schema_version"] != 1 or cfg["backend"] not in BACKENDS:
         raise ValueError("Invalid explicit runtime configuration")
     source = cfg["source"]
     required_source_fields = {"path", "revision", "files"} | ({"entrypoint"} if cfg["backend"] == "vllm-labels" else set())
@@ -94,8 +128,15 @@ def runtime_identity(config_path):
             raise ValueError("Native implementation Python closure changed")
         if "scripts/playground/server.py" not in actual or "scripts/torch_decision.py" not in actual:
             raise ValueError("Native readout implementation is missing")
-    if not required_packages <= set(cfg["packages"]):
+    # Wheel metadata names are case-insensitive (Pillow now records `pillow`).
+    normalize = lambda name: name.lower().replace("_", "-").replace(".", "-")
+    if not {normalize(n) for n in required_packages} <= {normalize(n) for n in cfg["packages"]}:
         raise ValueError("Required serving dependencies are missing from runtime lock")
+    attestations = cfg.get("wheel_attestations", {})
+    if not isinstance(attestations, dict) or any(normalize(k) != k for k in attestations):
+        raise ValueError("Wheel attestation package names must be canonical")
+    if set(attestations) - {normalize(n) for n in cfg["packages"]}:
+        raise ValueError("Attestation refers to an unlocked runtime package")
     packages = {}
     # Verify the actual installed wheel file closure against RECORD, without
     # importing torch, allocating a GPU context or evaluating a model.
@@ -103,6 +144,10 @@ def runtime_identity(config_path):
         dist = importlib.metadata.distribution(name)
         if dist.version != version:
             raise ValueError(f"Locked runtime package changed: {name}")
+        attestation = attestations.get(normalize(name))
+        source_records = original_wheel_attestation(name, version, attestation) if attestation else {}
+        mismatches = attestation["mismatches"] if attestation else {}
+        matched_mismatches = set()
         records = []
         for file in dist.files or []:
             if file.hash is None:
@@ -110,16 +155,24 @@ def runtime_identity(config_path):
             path = Path(dist.locate_file(file))
             if not path.is_file() or file.hash.mode != "sha256":
                 raise ValueError(f"Unverifiable runtime package file: {file}")
-            got = base64.urlsafe_b64encode(bytes.fromhex(sha(path))).decode().rstrip("=")
+            observed_sha = sha(path)
+            got = base64.urlsafe_b64encode(bytes.fromhex(observed_sha)).decode().rstrip("=")
+            member = str(file)
             if got != file.hash.value:
-                raise ValueError(f"Runtime package file changed: {file}")
-            records.append((str(file), got))
+                if (member not in mismatches or observed_sha != mismatches[member]
+                        or source_records.get(member, (None,))[0] != "sha256=" + file.hash.value):
+                    raise ValueError(f"Runtime package file changed: {file}")
+                matched_mismatches.add(member)
+            elif member in mismatches:
+                raise ValueError(f"Wheel RECORD exception is unnecessary: {member}")
+            records.append((member, got))
+        if set(mismatches) != matched_mismatches:
+            raise ValueError(f"Original wheel attestation not fully consumed: {name}")
         if not records:
             raise ValueError(f"Runtime package has no verifiable wheel closure: {name}")
         packages[name] = {"version": version, "files": sorted(records)}
     # All installed distributions must be locked, including transitive native
     # libraries. Editable/unlocked installs cannot acquire this runtime identity.
-    normalize = lambda name: name.lower().replace("_", "-").replace(".", "-")
     if {normalize(d.metadata["Name"]) for d in importlib.metadata.distributions()} != {normalize(n) for n in cfg["packages"]}:
         raise ValueError("Runtime has unlocked distributions; use a dedicated, fully locked environment")
     identity = {"config": cfg, "packages": packages, "python": sha(Path(sys.executable).resolve()), "runner": sha(Path(__file__).resolve()), "python_version": sys.version}

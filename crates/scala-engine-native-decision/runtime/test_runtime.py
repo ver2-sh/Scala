@@ -92,6 +92,89 @@ class ClosureTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 runtime.runtime_identity(p)
 
+    def test_runtime_accepts_canonical_wheel_names_and_still_verifies_records(self):
+        import base64
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            members = ["src/fixture.py", "scripts/torch_decision.py", "scripts/playground/server.py"]
+            for name in members:
+                p = root / name
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("# synthetic\n")
+            wheel_file = root / "wheel.py"
+            wheel_file.write_text("# synthetic wheel\n")
+            record = types.SimpleNamespace(hash=types.SimpleNamespace(mode="sha256", value=base64.urlsafe_b64encode(bytes.fromhex(runtime.sha(wheel_file))).decode().rstrip("=")))
+            packages = {name: "1" for name in ["torch", "peft", "transformers", "safetensors", "fastapi", "uvicorn", "pydantic", "pillow"]}
+            cfg = {"schema_version": 1, "backend": "torch-readout", "packages": packages,
+                   "options": {"rotations": 4, "max_input_tokens": 4096, "device": "cuda"},
+                   "source": {"path": str(root), "revision": "a" * 40, "files": {name: {"size_bytes": (root / name).stat().st_size, "sha256": runtime.sha(root / name)} for name in members}}}
+            path = root / "runtime.json"
+            path.write_text(json.dumps(cfg))
+            distributions = {name: types.SimpleNamespace(version="1", metadata={"Name": name}, files=[record], locate_file=lambda _: wheel_file) for name in packages}
+            with patch.object(runtime.importlib.metadata, "distribution", side_effect=distributions.__getitem__), patch.object(runtime.importlib.metadata, "distributions", return_value=list(distributions.values())):
+                self.assertEqual(runtime.runtime_identity(path)[0], cfg)
+                wheel_file.write_text("# changed wheel\n")
+                with self.assertRaisesRegex(ValueError, "Runtime package file changed"):
+                    runtime.runtime_identity(path)
+
+    def test_pinned_original_wheel_can_attest_only_exact_known_bad_record_bytes(self):
+        import base64
+        import zipfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "shim.py"
+            source.write_text("# pinned native shim\n")
+            wheel_member = "PyNvVideoCodec/native.so"
+            member = root / wheel_member
+            member.parent.mkdir()
+            member.write_bytes(b"original wheel member")
+            bogus_record = base64.urlsafe_b64encode(bytes.fromhex(runtime.sha(source))).decode().rstrip("=")
+            archive = root / "pynvvideocodec-2.0.4-py3-none-any.whl"
+            record_path = "pynvvideocodec-2.0.4.dist-info/RECORD"
+            with zipfile.ZipFile(archive, "w") as z:
+                z.write(member, wheel_member)
+                z.writestr(record_path, f"{wheel_member},sha256={bogus_record},123\n{record_path},,\n")
+            packages = {n: "0.30.0" if n == "vllm" else "2.0.4" if n == "pynvvideocodec" else "1"
+                        for n in ["vllm", "torch", "transformers", "safetensors", "pynvvideocodec"]}
+            dist = {}
+            class RecordedFile:
+                def __init__(self, name, hash_value):
+                    self.name = name
+                    self.hash = types.SimpleNamespace(mode="sha256", value=hash_value)
+                def __str__(self):
+                    return self.name
+            correct = base64.urlsafe_b64encode(bytes.fromhex(runtime.sha(source))).decode().rstrip("=")
+            for name in packages:
+                origin = member if name == "pynvvideocodec" else source
+                record = RecordedFile(wheel_member if name == "pynvvideocodec" else "shim.py", bogus_record if name == "pynvvideocodec" else correct)
+                dist[name] = types.SimpleNamespace(version=packages[name], metadata={"Name": name},
+                     files=[record], locate_file=lambda _file, path=origin: path)
+            attestation = {"path": str(archive), "sha256": runtime.sha(archive),
+                           "mismatches": {wheel_member: runtime.sha(member)}}
+            cfg = {"schema_version": 1, "backend": "vllm-labels", "packages": packages,
+                   "options": {"max_model_len": 40960, "min_context": 4096, "gpu_memory_utilization": 0.4},
+                   "source": {"path": str(root), "revision": "a" * 40,
+                              "entrypoint": "shim.py", "files": {"shim.py": {"size_bytes": source.stat().st_size, "sha256": runtime.sha(source)}}},
+                   "wheel_attestations": {"pynvvideocodec": attestation}}
+            path = root / "runtime.json"
+            with patch.object(runtime.importlib.metadata, "distribution", side_effect=dist.__getitem__), patch.object(runtime.importlib.metadata, "distributions", return_value=list(dist.values())):
+                path.write_text(json.dumps(cfg))
+                self.assertEqual(runtime.runtime_identity(path)[0], cfg)
+                unbound = copy.deepcopy(cfg)
+                del unbound["wheel_attestations"]
+                path.write_text(json.dumps(unbound))
+                with self.assertRaisesRegex(ValueError, "Runtime package file changed"):
+                    runtime.runtime_identity(path)
+                path.write_text(json.dumps(cfg))
+                member.write_bytes(b"untrusted changed bytes")
+                with self.assertRaisesRegex(ValueError, "Runtime package file changed"):
+                    runtime.runtime_identity(path)
+                member.write_bytes(b"original wheel member")
+                attestation["sha256"] = "0" * 64
+                path.write_text(json.dumps(cfg))
+                with self.assertRaisesRegex(ValueError, "archive SHA256"):
+                    runtime.runtime_identity(path)
+
     def test_torch_dispatch_uses_trained_readout_and_native_calibrator(self):
         with tempfile.TemporaryDirectory() as tmp:
             path, cfg = self.fixture(Path(tmp), "torch-readout")

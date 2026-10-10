@@ -44,6 +44,9 @@ def main():
     r.add_argument("--entrypoint", help="explicit label-shim source filename")
     r.add_argument("--source-revision", required=True)
     r.add_argument("--option", action="append", nargs=2, metavar=("NAME", "JSON_VALUE"), required=True)
+    r.add_argument("--wheel-attestation", action="append", nargs=4,
+                   metavar=("PACKAGE", "ORIGINAL_WHEEL", "WHEEL_SHA256", "MISMATCHES_JSON"),
+                   help="pin an original upstream wheel and exact known bad RECORD members; never alter installed bytes")
     r.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
     if args.mode == "bundle":
@@ -80,6 +83,15 @@ def main():
         cfg = {"schema_version": 1, "backend": args.backend, "packages": packages, "options": {k: json.loads(v) for k, v in args.option}}
         if len(cfg["options"]) != len(args.option):
             raise ValueError("Duplicate runtime option")
+        if args.wheel_attestation:
+            att = {}
+            for package, wheel, wheel_hash, mismatches in args.wheel_attestation:
+                canonical = package.lower().replace("_", "-").replace(".", "-")
+                if canonical in att:
+                    raise ValueError("Duplicate original wheel attestation")
+                att[canonical] = {"path": str(Path(wheel).resolve(strict=True)),
+                                  "sha256": wheel_hash, "mismatches": json.loads(mismatches)}
+            cfg["wheel_attestations"] = att
         if args.backend == "torch-readout":
             if args.source is None or not args.source_revision:
                 raise ValueError("Exact native readout source checkout is required")
