@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.1.16 - Native Windows Decision runtimes
+
+Adds native Windows support for Scala's source-backed Decision engine without
+WSL, while preserving the existing Linux implementation and runtime admission.
+Application updates remain separate from model/runtime installation.
+
+- Launch pinned Windows Python runtimes directly and supervise their process trees
+  with Windows Job Objects, including startup, cancellation, crash and unload
+  cleanup. Retain Windows-safe runtime integrity, source closure and discovery
+  invalidation without granting capabilities from metadata or origin.
+- Provide native Windows CUDA provisioning and isolated model qualification for
+  Imajev's original unmerged PyTorch/PEFT readout, float32 trained head and
+  calibration. Preserve decision-only auxiliary profiles and Settings inheritance.
+- Add reproducible, SHA-pinned Windows H2O Lightning provisioning for the
+  reviewed vLLM 0.29.0 Windows compatibility variant, original label-scoring
+  shim and private CUDA SDK, with fail-closed wheel/package verification and
+  independently qualified runtime identities.
+- Retain `decision_candidate` and `architecture.output_modalities` discovery
+  with execution-qualified `decision` granted only after the native proof.
+  Add offline Windows provisioning, native-lifecycle, typed Decision and
+  cross-platform regression coverage.
+
+Windows model runtimes and model weights are **not** included in this application
+release. Imajev has separate development-host smoke evidence; H2O's native
+Windows GPU inference remains unverified and is not advertised as qualified
+until its own runtime/model checks succeed.
+
 ## 0.1.15 - Fast native Decision discovery and client interoperability
 
 Improves Scala's model catalogue and Model Profiles responsiveness for native
