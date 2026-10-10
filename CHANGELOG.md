@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.18 - Native image decisions
+
+Adds genuine image inputs to Scala's existing typed Decision API, including
+the original IMAJEV-4B PyTorch/PEFT readout, without translating decisions into
+generative chat or changing other inference engines.
+
+- Accept optional PNG, JPEG or WebP image data URLs on `POST /v1/systemone`,
+  with at most two images of 8 MiB each and unchanged overall request limits.
+- Preserve original image data and order through Model Profile resolution,
+  Scala Link, native runtime dispatch and upstream image preprocessing.
+- Admit image requests only for qualified source-backed `torch-readout` pairs;
+  reject image inputs on native label runtimes, llama.cpp and incompatible
+  models instead of silently dropping images or using a generative fallback.
+- Keep text-only decisions, upstream probability and abstention readouts,
+  runtime integrity/identity and request-local validation unchanged.
+- Require a separately verified, newly qualified IMAJEV source runtime with
+  Pillow and torchvision. This application update never installs or restarts
+  runtimes or changes existing model profiles.
+
 ## 0.1.17 - Windows vLLM Decision runtime discovery
 
 Fixes missing native Windows H2O Decision candidates when the pinned vLLM
