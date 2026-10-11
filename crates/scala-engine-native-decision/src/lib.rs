@@ -29,24 +29,20 @@ pub struct NativeDecisionAdapter {
     client: reqwest::Client,
     proofs: RwLock<BTreeMap<String, Proof>>,
     observation_paths: tokio::sync::Mutex<BTreeMap<PathBuf, ObservationInventory>>,
-    #[cfg(windows)]
     pending_probes: tokio::sync::Mutex<BTreeMap<PathBuf, PendingProbe>>,
     discovery_probes:
         tokio::sync::Mutex<BTreeMap<PathBuf, (String, std::time::Instant, EngineProbe)>>,
 }
-// Retain Windows metadata verification across the bounded discovery wait.
+// Retain authoritative verification across bounded discovery and load waits.
 // Dropping the adapter/task aborts the owned capture; it never initializes CUDA.
-#[cfg(windows)]
 struct PendingProbe {
     key: Option<String>,
     task: std::sync::Arc<tokio::sync::Mutex<ProbeTask>>,
 }
-#[cfg(windows)]
 struct ProbeTask {
     handle: tokio::task::JoinHandle<Result<EngineProbe, EngineError>>,
     result: Option<Result<EngineProbe, String>>,
 }
-#[cfg(windows)]
 impl Drop for ProbeTask {
     fn drop(&mut self) {
         self.handle.abort();
@@ -207,7 +203,6 @@ impl NativeDecisionAdapter {
             proofs: RwLock::new(BTreeMap::new()),
             observation_paths: tokio::sync::Mutex::new(BTreeMap::new()),
             discovery_probes: tokio::sync::Mutex::new(BTreeMap::new()),
-            #[cfg(windows)]
             pending_probes: tokio::sync::Mutex::new(BTreeMap::new()),
         }
     }
@@ -402,66 +397,66 @@ impl NativeDecisionAdapter {
             return Ok(probe.clone());
         }
         self.discovery_probes.lock().await.remove(path);
-        #[cfg(not(windows))]
-        let probe = Self::probe_path(path).await?;
-        #[cfg(windows)]
-        let probe = {
-            let task_state = {
-                let mut pending = self.pending_probes.lock().await;
-                if pending.get(path).is_some_and(|entry| entry.key != before) {
-                    pending.remove(path);
-                }
-                pending
-                    .entry(path.to_owned())
-                    .or_insert_with(|| {
-                        let path = path.to_owned();
-                        PendingProbe {
-                            key: before.clone(),
-                            task: std::sync::Arc::new(tokio::sync::Mutex::new(ProbeTask {
-                                handle: tokio::spawn(async move { Self::probe_path(&path).await }),
-                                result: None,
-                            })),
-                        }
-                    })
-                    .task
-                    .clone()
-            };
-            let mut task = task_state.lock().await;
-            if task.result.is_none() {
-                task.result = Some(
-                    (&mut task.handle)
-                        .await
-                        .map_err(|error| error.to_string())
-                        .and_then(|result| result.map_err(|error| error.to_string())),
-                );
+        let task_state = {
+            let mut pending = self.pending_probes.lock().await;
+            if pending.get(path).is_some_and(|entry| entry.key != before) {
+                pending.remove(path);
             }
-            let result = task
+            pending
+                .entry(path.to_owned())
+                .or_insert_with(|| {
+                    let path = path.to_owned();
+                    PendingProbe {
+                        key: before.clone(),
+                        task: std::sync::Arc::new(tokio::sync::Mutex::new(ProbeTask {
+                            handle: tokio::spawn(async move { Self::probe_path(&path).await }),
+                            result: None,
+                        })),
+                    }
+                })
+                .task
+                .clone()
+        };
+        let mut task = task_state.lock().await;
+        if task.result.is_none() {
+            task.result = Some(
+                (&mut task.handle)
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string())),
+            );
+        }
+        let result = async {
+            let probe = task
                 .result
                 .as_ref()
                 .expect("completed metadata probe")
-                .clone();
-            drop(task);
-            let mut pending = self.pending_probes.lock().await;
-            if pending
-                .get(path)
-                .is_some_and(|entry| std::sync::Arc::ptr_eq(&entry.task, &task_state))
-            {
-                pending.remove(path);
+                .clone()
+                .map_err(invalid)?;
+            let after = self.binary_observation_key(path).await;
+            if before.is_some() && before != after {
+                return Err(invalid("Native runtime changed during discovery"));
             }
-            drop(pending);
-            result.map_err(invalid)?
-        };
-        let after = self.binary_observation_key(path).await;
-        if before.is_some() && before != after {
-            return Err(invalid("Native runtime changed during discovery"));
+            if let Some(key) = after.filter(|_| before.is_some()) {
+                self.discovery_probes.lock().await.insert(
+                    path.to_owned(),
+                    (key, std::time::Instant::now(), probe.clone()),
+                );
+            }
+            Ok(probe)
         }
-        if let Some(key) = after.filter(|_| before.is_some()) {
-            self.discovery_probes.lock().await.insert(
-                path.to_owned(),
-                (key, std::time::Instant::now(), probe.clone()),
-            );
+        .await;
+        drop(task);
+        // Publish before removing the flight, so a concurrent waiter cannot
+        // restart a cold probe in the gap between verification and caching.
+        let mut pending = self.pending_probes.lock().await;
+        if pending
+            .get(path)
+            .is_some_and(|entry| std::sync::Arc::ptr_eq(&entry.task, &task_state))
+        {
+            pending.remove(path);
         }
-        Ok(probe)
+        result
     }
     async fn read(
         &self,
@@ -702,6 +697,19 @@ impl EngineAdapter for NativeDecisionAdapter {
             tokio::time::timeout(Duration::from_millis(7750), self.discovery_probe(path))
                 .await
                 .map_err(|_| EngineError::TimedOut("Native runtime discovery variant".into()))?
+        }))
+        .await
+    }
+    fn external_runtime_load_verification_timeout(&self) -> Option<Duration> {
+        // Allow the independent 240s Windows capture (30s elsewhere), plus
+        // bounded observation bookkeeping. This never changes public listing.
+        Some(Duration::from_secs(if cfg!(windows) { 250 } else { 40 }))
+    }
+    async fn external_runtime_probes_for_load(&self) -> Vec<Result<EngineProbe, EngineError>> {
+        futures_util::future::join_all(self.binaries.iter().map(|path| async move {
+            self.discovery_probe(path)
+                .await
+                .map_err(|error| invalid(format!("{}: {error}", path.display())))
         }))
         .await
     }

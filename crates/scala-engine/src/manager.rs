@@ -1240,15 +1240,37 @@ impl RuntimeManager {
             BackendLoadProgress::indeterminate(BackendLoadPhase::SelectingRuntime),
         )
         .await;
-        let (_, selection) = match self
-            .select_runtime(
+        let selection_result = {
+            let selection = self.select_runtime(
                 &model,
                 &engine_id,
                 runtime_id.as_ref(),
                 Some(&resolved_settings),
-            )
-            .await
-        {
+            );
+            tokio::pin!(selection);
+            loop {
+                let cancelled = self.load_cancelled(cancellation_epoch)
+                    || self
+                        .state
+                        .read()
+                        .await
+                        .backends
+                        .get(&profile_id)
+                        .is_none_or(|backend| {
+                            backend.generation != generation || backend.cancel_loading
+                        });
+                if cancelled {
+                    break Err(RuntimeError::Operation(
+                        "model load was cancelled".to_owned(),
+                    ));
+                }
+                tokio::select! {
+                    result = &mut selection => break result,
+                    () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
+        };
+        let (_, selection) = match selection_result {
             Ok(selection) => selection,
             Err(error) => {
                 self.fail_loading(generation, error.to_string(), None).await;
@@ -2302,7 +2324,7 @@ impl RuntimeManager {
     ) -> Result<(Arc<dyn EngineAdapter>, RuntimeSelection), RuntimeError> {
         let selection = self
             .packs
-            .resolve_for_engine_with_settings(model, engine_id, explicit_runtime, settings)
+            .resolve_for_load_with_settings(model, engine_id, explicit_runtime, settings)
             .await
             .map_err(|error| match error {
                 RuntimePackError::Incompatible { reason, .. } => RuntimeError::Incompatible {
@@ -4392,6 +4414,40 @@ mod tests {
         gate.notify_one();
         let stopped = unload.await.expect("unload task").expect("unload");
         assert!(stopped.backends.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unload_and_shutdown_cancel_pending_runtime_verification() {
+        for shutdown in [false, true] {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let mut adapter = crate::decision::tests::DecisionAdapter::new(true);
+            adapter.load_probe_gate = Some((gate.clone(), Duration::from_secs(250)));
+            let fixture = manager_fixture_with_adapter(Some(Arc::new(adapter))).await;
+            fixture
+                .manager
+                .start_load(fixture.profile_id.clone())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), gate.notified())
+                .await
+                .unwrap();
+            // No process can be launched by this fixture. Cancellation must
+            // release admission rather than await the 250-second probe budget.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                if shutdown {
+                    fixture.manager.shutdown().await;
+                } else {
+                    fixture
+                        .manager
+                        .unload(fixture.profile_id.clone())
+                        .await
+                        .unwrap();
+                }
+            })
+            .await
+            .expect("pending verification must be cancellable");
+            assert!(fixture.manager.status().await.backends.is_empty());
+        }
     }
 
     #[tokio::test]

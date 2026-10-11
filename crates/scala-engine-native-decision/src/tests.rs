@@ -381,6 +381,234 @@ async fn multiple_explicit_external_variants_are_discovered_independently() {
     assert!(probes[2].is_err());
 }
 
+// Fake metadata executables only: no tensor imports, server, or model load.
+// On Windows this delays the real bound interpreter/wrapper --scala-probe.
+fn delay_metadata_probe(fixture: &Fixture, seconds: f64, fail: bool) -> PathBuf {
+    let binary = fixture.runtime.entrypoint_path();
+    let count = fixture._dir.path().join("probe-count");
+    #[cfg(unix)]
+    {
+        let original = std::fs::read_to_string(&binary).unwrap();
+        let completion = if fail {
+            "exit 1\n"
+        } else {
+            original.strip_prefix("#!/bin/sh\n").unwrap()
+        };
+        std::fs::write(
+            &binary,
+            format!("#!/bin/sh\nprintf 'probe\\n' >> {count:?}\nsleep {seconds}\n{completion}"),
+        )
+        .unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let runner = PathBuf::from(
+            serde_json::from_slice::<Value>(
+                &std::fs::read(binary.with_file_name("scala-native-decision.json")).unwrap(),
+            )
+            .unwrap()["runner"]
+                .as_str()
+                .unwrap(),
+        );
+        let original = std::fs::read_to_string(&runner).unwrap();
+        let completion = if fail {
+            "raise SystemExit(1)\n"
+        } else {
+            &original
+        };
+        std::fs::write(&runner, format!(
+            "import pathlib,time\nwith pathlib.Path({:?}).open('a') as f: f.write('probe\\n')\ntime.sleep({seconds})\n{completion}",
+            count.to_string_lossy(),
+        )).unwrap();
+    }
+    count
+}
+
+fn admission_fixture(
+    labels: &Fixture,
+    readout: &Fixture,
+) -> (
+    Arc<NativeDecisionAdapter>,
+    Arc<RuntimePackManager>,
+    scala_core::AppPaths,
+) {
+    let root = labels._dir.path();
+    let paths = scala_core::AppPaths {
+        config_dir: root.join("config"),
+        config_file: root.join("config/config.toml"),
+        data_dir: root.join("data"),
+        state_dir: root.join("state"),
+        cache_dir: root.join("cache"),
+        log_dir: root.join("logs"),
+        runtimes_dir: root.join("data/runtimes"),
+        runtime_cache_dir: root.join("cache/runtime-packs"),
+        runtime_selections_file: root.join("data/runtime-selections.json"),
+        settings_file: root.join("data/settings.json"),
+        settings_lock_file: root.join("data/.settings.lock"),
+        model_profiles_file: root.join("data/model-profiles.json"),
+        model_profiles_lock_file: root.join("data/.model-profiles.lock"),
+    };
+    let config: EngineConfig = serde_json::from_value(json!({"enabled":true,"native":{"binaries":[labels.runtime.entrypoint_path(), readout.runtime.entrypoint_path()]}})).unwrap();
+    let adapter = Arc::new(NativeDecisionAdapter::from_config(Some(&config), root));
+    let mut registry = EngineRegistry::default();
+    registry.register(adapter.clone()).unwrap();
+    let packs = RuntimePackManager::new(&paths, registry, Vec::new()).unwrap();
+    (adapter, packs, paths)
+}
+
+#[tokio::test]
+async fn cold_first_load_admission_completes_slow_probe_without_hiding_independent_variant() {
+    let labels = Fixture::new("vllm-labels");
+    let readout = Fixture::new("torch-readout");
+    let count = delay_metadata_probe(&labels, 10.81, false);
+    let (adapter, packs, paths) = admission_fixture(&labels, &readout);
+    let start = std::time::Instant::now();
+    let (selection, ()) = tokio::join!(
+        packs.resolve_for_load_with_settings(
+            &labels.model,
+            ENGINE_ID,
+            None,
+            Some(&labels.settings)
+        ),
+        async {
+            let probes = adapter.external_runtime_probes().await;
+            assert!(matches!(probes[0], Err(EngineError::TimedOut(_))));
+            assert!(probes[1].as_ref().unwrap().healthy);
+            assert!(start.elapsed() < Duration::from_secs(9));
+            assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1);
+        }
+    );
+    let selection = selection.expect("first admission must finish authoritative verification");
+    assert_eq!(selection.runtime.manifest.identity.variant, "vllm-labels");
+    assert!(binding_matches(
+        &selection.runtime,
+        &bundle(&labels.model).unwrap()
+    ));
+    assert_eq!(
+        selection.runtime.manifest.entrypoint_sha256,
+        digest(&labels.runtime.entrypoint_path()).await.unwrap()
+    );
+    assert!(start.elapsed() >= Duration::from_secs(10));
+    assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 1);
+    assert!(!paths.runtime_selections_file.exists());
+    assert!(!native_decision_supported(
+        &*adapter,
+        &selection.runtime,
+        &labels.model,
+        &labels.settings
+    ));
+}
+
+#[tokio::test]
+async fn cold_load_admission_reports_genuine_verification_failure_and_keeps_independent_variant() {
+    let labels = Fixture::new("vllm-labels");
+    let readout = Fixture::new("torch-readout");
+    let count = delay_metadata_probe(&labels, 10.81, true);
+    let (adapter, packs, _) = admission_fixture(&labels, &readout);
+    let (result, probes) = tokio::join!(
+        packs.resolve_for_load_with_settings(
+            &labels.model,
+            ENGINE_ID,
+            None,
+            Some(&labels.settings)
+        ),
+        adapter.external_runtime_probes()
+    );
+    let error = result.unwrap_err();
+    assert!(matches!(error, RuntimePackError::Verification { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("Native runtime dependency/identity probe failed")
+    );
+    assert!(probes[1].as_ref().unwrap().healthy);
+    assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 1);
+    assert!(adapter.proofs.read().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cancelled_cold_load_wait_reuses_owned_verification_on_next_admission() {
+    let labels = Fixture::new("vllm-labels");
+    let readout = Fixture::new("torch-readout");
+    let count = delay_metadata_probe(&labels, 10.81, false);
+    let (_, packs, _) = admission_fixture(&labels, &readout);
+    // Cancel after the public window, while authoritative admission is waiting.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(8200),
+            packs.resolve_for_load_with_settings(
+                &labels.model,
+                ENGINE_ID,
+                None,
+                Some(&labels.settings)
+            ),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1);
+    let selection = packs
+        .resolve_for_load_with_settings(&labels.model, ENGINE_ID, None, Some(&labels.settings))
+        .await
+        .unwrap();
+    assert_eq!(selection.runtime.manifest.identity.variant, "vllm-labels");
+    assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 1);
+}
+
+#[tokio::test]
+async fn load_admission_preserves_exact_selection_and_rejects_mismatched_shim() {
+    let labels = Fixture::new("vllm-labels");
+    let readout = Fixture::new("torch-readout");
+    let (adapter, packs, paths) = admission_fixture(&labels, &readout);
+    let list = packs.list().await.unwrap();
+    let selected = &list
+        .installed
+        .iter()
+        .find(|status| status.runtime.manifest.identity.variant == "torch-readout")
+        .unwrap()
+        .runtime
+        .manifest
+        .runtime_id;
+    packs
+        .select_format(scala_core::ArtifactFormat::DecisionBundle, selected.clone())
+        .await
+        .unwrap();
+    let stored = std::fs::read(&paths.runtime_selections_file).unwrap();
+    let result = packs
+        .resolve_for_load_with_settings(&labels.model, ENGINE_ID, None, Some(&labels.settings))
+        .await;
+    assert!(
+        matches!(result, Err(RuntimePackError::Incompatible { runtime_id, .. }) if &runtime_id == selected)
+    );
+    assert_eq!(
+        std::fs::read(&paths.runtime_selections_file).unwrap(),
+        stored
+    );
+    packs
+        .clear_format_selection(scala_core::ArtifactFormat::DecisionBundle)
+        .await
+        .unwrap();
+    // Rebind the synthetic source inventory to another shim fingerprint. The
+    // runtime's successful probe alone must not qualify this different bundle.
+    let mut document: Value =
+        serde_json::from_slice(&std::fs::read(&labels.model.path).unwrap()).unwrap();
+    let shim = labels._dir.path().join("model/shim.py");
+    std::fs::write(shim, b"different").unwrap();
+    document["sources"]["model"]["files"]["shim.py"]["sha256"] =
+        json!(format!("{:x}", Sha256::digest(b"different")));
+    std::fs::write(&labels.model.path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let error = packs
+        .resolve_for_load_with_settings(&labels.model, ENGINE_ID, None, Some(&labels.settings))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Native source/readout/runtime mismatch")
+    );
+    assert!(adapter.proofs.read().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn unresponsive_startup_health_is_bounded_and_does_not_grant_proof() {
     let f = Fixture::new("torch-readout");

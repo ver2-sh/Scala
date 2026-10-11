@@ -287,6 +287,7 @@ pub(crate) mod tests {
         pub image_inputs: bool,
         pub decision_requests: std::sync::Mutex<Vec<DecisionRequest>>,
         pub chat_history: std::sync::Mutex<Option<Vec<InferenceRequest>>>,
+        pub load_probe_gate: Option<(std::sync::Arc<tokio::sync::Notify>, std::time::Duration)>,
     }
 
     impl DecisionAdapter {
@@ -301,6 +302,7 @@ pub(crate) mod tests {
                 image_inputs: false,
                 decision_requests: std::sync::Mutex::new(Vec::new()),
                 chat_history: std::sync::Mutex::new(None),
+                load_probe_gate: None,
             }
         }
     }
@@ -413,6 +415,17 @@ pub(crate) mod tests {
                 healthy: true,
                 detail: "synthetic".into(),
             })
+        }
+        fn external_runtime_load_verification_timeout(&self) -> Option<std::time::Duration> {
+            self.load_probe_gate.as_ref().map(|(_, timeout)| *timeout)
+        }
+        async fn external_runtime_probes_for_load(&self) -> Vec<Result<EngineProbe, EngineError>> {
+            if let Some((gate, _)) = &self.load_probe_gate {
+                gate.notify_one();
+                std::future::pending().await
+            } else {
+                self.external_runtime_probes().await
+            }
         }
         async fn probe_runtime(
             &self,

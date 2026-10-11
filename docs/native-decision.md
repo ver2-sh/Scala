@@ -124,6 +124,17 @@ verification. An observation is never execution proof: each adapter still verifi
 the selected runtime before launching, and native Decision's wrapper repeats
 complete closure validation before loading weights.
 
+Explicit Model Profile loads can wait separately for authoritative external
+runtime verification when public discovery has not yet admitted a candidate.
+Native Decision reuses the owned in-flight probe; on Windows its complete capture
+has a 240-second allowance, with a 250-second admission bound including observation
+bookkeeping. Public discovery retains the eight-second adapter bound and the
+7.75-second independent variant waits. The longer load wait holds no public
+discovery lock and can be cancelled without restarting the shared probe. Verified
+variants remain independent, failures retain verification diagnostics, and the
+normal exact runtime/model/Settings checks and launch verification still apply.
+Admission does not persist a selection or grant Decision execution capability.
+
 Coded consumes the explicit candidate through its existing transient discovery
 catalogue, Decision picker, identity-only role selection and native tool. Manual
 or persisted flags cannot grant either field. Cold starts and unloads therefore

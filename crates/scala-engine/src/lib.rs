@@ -1792,6 +1792,18 @@ pub trait EngineAdapter: Send + Sync {
     async fn external_runtime_probes(&self) -> Vec<Result<EngineProbe, EngineError>> {
         vec![self.probe().await]
     }
+    /// Opt in to a separate, bounded verification wait when explicit load
+    /// admission cannot resolve a runtime from public discovery. This grants
+    /// no compatibility: the usual exact runtime/model/settings resolver and
+    /// launch verification still apply. Public discovery keeps its own budget.
+    fn external_runtime_load_verification_timeout(&self) -> Option<Duration> {
+        None
+    }
+    /// Complete authoritative external verification for load admission. An
+    /// adapter with expensive probes should reuse its in-flight discovery work.
+    async fn external_runtime_probes_for_load(&self) -> Vec<Result<EngineProbe, EngineError>> {
+        self.external_runtime_probes().await
+    }
     /// Cheap invalidation key for the configured external runtime inputs.
     /// Opt-in only: None keeps discovery uncached. This is never launch proof;
     /// probe_runtime must still verify the exact runtime before execution.

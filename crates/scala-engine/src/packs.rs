@@ -58,6 +58,8 @@ pub enum RuntimePackError {
     Selection(String),
     #[error("engine adapter failed: {0}")]
     Adapter(#[from] EngineError),
+    #[error("engine `{engine_id}` runtime verification failed: {reason}")]
+    Verification { engine_id: String, reason: String },
     #[error(transparent)]
     Settings(#[from] SettingsError),
 }
@@ -1512,6 +1514,82 @@ impl RuntimePackManager {
         self.resolve_from_snapshot(model, explicit, settings, Some(engine_id), &list)
     }
 
+    /// Explicit load admission may complete an adapter's authoritative cold
+    /// verification after bounded public discovery. Never hold the public
+    /// observation lock during this wait or write a runtime selection.
+    pub async fn resolve_for_load_with_settings(
+        &self,
+        model: &ModelArtifact,
+        engine_id: &str,
+        explicit: Option<&RuntimeId>,
+        settings: Option<&scala_core::ResolvedSettings>,
+    ) -> Result<RuntimeSelection, RuntimePackError> {
+        self.refresh_host_capabilities().await;
+        let mut list = self.list().await?;
+        let initial = self.resolve_from_snapshot(model, explicit, settings, Some(engine_id), &list);
+        if initial.is_ok() {
+            return initial;
+        }
+        let Some(adapter) = self.registry.get(engine_id) else {
+            return initial;
+        };
+        let Some(timeout) = adapter.external_runtime_load_verification_timeout() else {
+            return initial;
+        };
+        let verification_error = |reason| RuntimePackError::Verification {
+            engine_id: engine_id.to_owned(),
+            reason,
+        };
+        let probes = tokio::time::timeout(timeout, adapter.external_runtime_probes_for_load())
+            .await
+            .map_err(|_| {
+                verification_error(format!(
+                    "authoritative external runtime verification timed out after {} seconds",
+                    timeout.as_secs()
+                ))
+            })?;
+        let mut verified = Vec::new();
+        let mut failures = Vec::new();
+        for probe in probes {
+            match probe {
+                Ok(probe) => match probe.installation {
+                    InstallationState::Installed { installation } if probe.healthy => {
+                        match external_runtime(
+                            engine_id,
+                            adapter.capabilities().artifact_formats,
+                            *installation,
+                            probe.detail,
+                        ) {
+                            Ok(runtime) => verified.push(runtime),
+                            Err(error) => failures.push(error.to_string()),
+                        }
+                    }
+                    InstallationState::Invalid { reason } => failures.push(reason),
+                    _ if !probe.healthy => failures.push(probe.detail),
+                    _ => {}
+                },
+                Err(error) => failures.push(error.to_string()),
+            }
+        }
+        // Replace only this engine's external observations. Managed packs and
+        // independently verified variants remain candidates under the resolver.
+        list.installed.retain(|status| {
+            status.runtime.manifest.identity.engine_id != engine_id
+                || status.runtime.manifest.acquisition_method
+                    != RuntimeAcquisitionMethod::ExternalBinary
+        });
+        list.installed
+            .extend(self.assess_installed(verified, &list.selections, &list.host));
+        match self.resolve_from_snapshot(model, explicit, settings, Some(engine_id), &list) {
+            Ok(selection) => Ok(selection),
+            Err(error) if !failures.is_empty() => Err(verification_error(format!(
+                "{}; {error}",
+                failures.join("; ")
+            ))),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Applies the normal runtime-selection and compatibility authority to a
     /// previously captured read-only local inspection.
     pub fn resolve_from_local_inspection(
@@ -2931,6 +3009,48 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn load_verification_timeout_does_not_block_public_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::test_support::paths(temp.path());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut adapter = crate::decision::tests::DecisionAdapter::new(true);
+        adapter.load_probe_gate = Some((gate.clone(), std::time::Duration::from_secs(1)));
+        let mut registry = crate::EngineRegistry::default();
+        registry.register(Arc::new(adapter)).unwrap();
+        let packs = super::RuntimePackManager::new(&paths, registry, Vec::new()).unwrap();
+        let load_packs = packs.clone();
+        let load = tokio::spawn(async move {
+            load_packs
+                .resolve_for_load_with_settings(
+                    &crate::decision::tests::model(),
+                    "fixture-decision",
+                    None,
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.notified())
+            .await
+            .unwrap();
+        let list = tokio::time::timeout(std::time::Duration::from_millis(500), packs.list())
+            .await
+            .expect("public discovery must not share the load verification lock")
+            .unwrap();
+        assert!(list.installed.is_empty());
+        let error = load.await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            super::RuntimePackError::Verification { .. }
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("authoritative external runtime verification timed out after 1 seconds")
+        );
+        assert!(!paths.runtime_selections_file.exists());
+    }
 
     #[cfg(windows)]
     #[tokio::test]
