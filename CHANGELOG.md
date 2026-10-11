@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.19 - Reliable cold Decision runtime selection
+
+Fixes Windows H2O-Lightning first-load failures when a pinned external
+native_decision runtime needs longer than Scala's bounded public discovery
+window to complete authoritative integrity verification.
+
+- Keep public model and runtime discovery bounded and responsive while explicit
+  Model Profile loads can finish independent, verified external runtime probes.
+- Reuse one in-flight native runtime probe after cold-discovery timeout or
+  load cancellation rather than repeatedly discarding valid work.
+- Preserve original runtime/model/Settings compatibility, exact execution
+  identity, native qualification and failure diagnostics, without persisting
+  synthetic selections or switching to an unrelated runtime.
+- Preserve independent IMAJEV and H2O variants, and allow load verification
+  cancellation without blocking public inventory requests.
+
+This is an application update only. It does not install or replace model
+weights, Python/vLLM/CUDA runtimes, Model Profiles or inference settings.
+Actual Windows H2O GPU execution remains separately qualified.
+
 ## 0.1.18 - Native image decisions
 
 Adds genuine image inputs to Scala's existing typed Decision API, including
