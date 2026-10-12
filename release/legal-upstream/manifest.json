@@ -190,5 +190,37 @@
     "url": "https://raw.githubusercontent.com/retep998/winapi-rs/796a8e6c2971dc2ff1bcff166e6671284f9b5b6b/LICENSE-MIT",
     "sha256": "ce7bc3499fee93d5022ef430d5e4201e79a6d9154f3974e42f41349f0569e09b",
     "basis": "Upstream repository license; crate omits VCS metadata"
+  },
+  {
+    "package": "zune-core",
+    "version": "0.4.12",
+    "file": "zune-core-0.4.12/LICENSE-ZLIB",
+    "url": "https://raw.githubusercontent.com/etemesi254/zune-image/f8fbb123d5ed04441e8324a555bfcda0cb1bd28f/LICENSE-ZLIB",
+    "sha256": "7fa429541e55b1509909e058f2d21a37467e4958ec713b357f6e0cf9dc4ee352",
+    "basis": "Published crate VCS revision"
+  },
+  {
+    "package": "zune-core",
+    "version": "0.4.12",
+    "file": "zune-core-0.4.12/LICENSE.md",
+    "url": "https://raw.githubusercontent.com/etemesi254/zune-image/f8fbb123d5ed04441e8324a555bfcda0cb1bd28f/LICENSE.md",
+    "sha256": "c6dff146a9f31848ac296faa5a08a4253caf2c384c86f906dc99e7fc0a39cc8c",
+    "basis": "Published crate VCS revision"
+  },
+  {
+    "package": "zune-jpeg",
+    "version": "0.4.21",
+    "file": "zune-jpeg-0.4.21/LICENSE-ZLIB",
+    "url": "https://raw.githubusercontent.com/etemesi254/zune-image/fa2c767a01d7d9373911d0bf63e0588553d67e0e/LICENSE-ZLIB",
+    "sha256": "7fa429541e55b1509909e058f2d21a37467e4958ec713b357f6e0cf9dc4ee352",
+    "basis": "Published crate VCS revision"
+  },
+  {
+    "package": "zune-jpeg",
+    "version": "0.4.21",
+    "file": "zune-jpeg-0.4.21/LICENSE.md",
+    "url": "https://raw.githubusercontent.com/etemesi254/zune-image/fa2c767a01d7d9373911d0bf63e0588553d67e0e/LICENSE.md",
+    "sha256": "c6dff146a9f31848ac296faa5a08a4253caf2c384c86f906dc99e7fc0a39cc8c",
+    "basis": "Published crate VCS revision"
   }
 ]
