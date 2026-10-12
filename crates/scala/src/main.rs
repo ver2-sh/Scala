@@ -579,22 +579,29 @@ async fn model_info(
     let model = core.model(&model_id).await.ok_or_else(|| {
         color_eyre::eyre::eyre!("model `{model_id}` does not exist in the discovered registry")
     })?;
-    let active_model = match ControlClient::discover(&core.paths).await {
-        Ok(client) => client
-            .status()
-            .await?
-            .backends
-            .into_iter()
-            .find(|backend| backend.model_id == model_id)
-            .map(|backend| backend.model_id),
+    let active_backend = match ControlClient::discover(&core.paths).await {
+        Ok(client) => client.status().await?.backends.into_iter().find(|backend| {
+            backend.model_id == model_id
+                && backend.lifecycle == scala_engine::BackendLifecycle::Running
+                && !backend.retiring
+        }),
         Err(ControlClientError::Unavailable) => None,
         Err(error) => return Err(error.into()),
     };
     let registry = composition::engine_registry(&core)?;
     let packs = composition::runtime_pack_manager(&core, registry)?;
-    let capabilities = packs
-        .model_serving_capabilities(&model, active_model.as_ref())
+    let mut capabilities = packs
+        .model_serving_capabilities(&model, active_backend.as_ref().map(|b| &b.model_id))
         .await?;
+    if let Some(c) = active_backend
+        .as_ref()
+        .and_then(|b| b.capabilities.as_ref())
+    {
+        capabilities.decision = c.decision;
+        capabilities.decision_candidate = c.decision_candidate;
+        capabilities.openai_decisions = c.openai_decisions;
+        capabilities.decision_images = c.decision_images;
+    }
     output::model_info(&capabilities, json_output)?;
     Ok(())
 }
@@ -1197,6 +1204,14 @@ async fn record_llama_local_file_identities(
         1024_u64 * 1024 * 1024 * 1024,
     )
     .await?;
+    scala_engine::record_local_file_setting_identity(
+        patch,
+        "llama.cpp.projector",
+        "llama.cpp.projector_sha256",
+        &core.paths.data_dir,
+        1024_u64 * 1024 * 1024 * 1024,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1217,6 +1232,7 @@ async fn record_q27_local_file_identity(
 
 fn add_llama_bound_identity_ids(ids: &mut Vec<SettingId>) -> Result<()> {
     for (path, sha256) in [
+        ("llama.cpp.projector", "llama.cpp.projector_sha256"),
         (
             "llama.cpp.chat_template_file",
             "llama.cpp.chat_template_sha256",

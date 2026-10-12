@@ -1,6 +1,6 @@
 # Native NInfer, MTP and DFlash2
 
-The current reviewed runtime is clean upstream `Neroued/ninfer` commit
+The retained v2 runtime is clean upstream `Neroued/ninfer` commit
 `d49296868dcc17bd478ec185f0d3a801bcc0bf56`, tree
 `8e2f0275fc533cf11fe05a4ac3ac85f00eb91c72`. Source owners cover CLI parsing,
 process defaults, scheduler/cache/state, native target bindings, masked-draft
@@ -12,7 +12,7 @@ published by `natpate/ninfer-windows` `v0.7.1` (Windows x86_64, CUDA, RTX
 5090/sm_120a; no WSL). That port remains in the v2 generation and includes
 DFlash2. Its repository, release tag, asset and digest identities are retained
 as its own provenance; it is not relabeled as canonical `Neroued/ninfer`, whose
-managed route stays Linux source-only. The managed catalog exposes only that
+managed route stays Linux source-only. The v2 package route exposes only that
 exact reviewed package: the release ID, the tag's resolved commit/tree, and
 the asset ID, name, size and SHA-256 digest are all pinned, so a replaced
 asset or a moved tag makes the package unavailable rather than inheriting
@@ -20,10 +20,8 @@ review. Capability credit is evidence-bound per domain: at the reviewed tag,
 74 of the 97 capability-owning source blobs are byte-identical to the
 canonical reviewed set and the 23 differing fork blobs were reviewed in place
 as contract-preserving, so the package receives the same capability domains
-only while the exact pinned package facts hold. Upstream `v0.8.x`/`v0.9.x`
-portable releases moved to NInfer v3 artifacts and remain unavailable while
-Scala admits v2 containers only, and other `v0.7.x` tags are unreviewed and
-never candidates.
+only while the exact pinned package facts hold. The independently reviewed
+`v0.9.1` v3 route is described below; other unreviewed packages receive no credit.
 
 Native target registry inspection covers Qwen3.6-27B and Qwen3.8-27B with
 `groupwise-int` and `nvfp4`, plus Qwen3.6-35B-A3B `groupwise-int`. The reviewed
@@ -74,9 +72,92 @@ The stock-Qwen draft at `z-lab/Qwen3.8-27B-DFlash2` revision
 Implementation validation uses existing synthetic local contracts; it does not
 rebuild models, rerun benchmarks or start a production service.
 
+## Current parallel v3 admission — October 2026
+
+Canonical Linux v3 is exact source commit
+`81c8ce093b2c1646a87566a8e59d807fcf0ec95c`, tree
+`8b42cb632277161d47aa0a67db55ca8400bf7118`, recipe `ninfer-serve-v3`, variant
+`ninfer-serve-v3-sm120a`. There is no invented canonical binary release. Native
+Windows v3 is the independently pinned `natpate/ninfer-windows` v0.9.1 portable
+CUDA 13.1 package at commit `fe115cdecd16acc96df72206053e94f5c8f25214`, tree
+`35c0b544bb109311f9c0244b985d052aee4cb379`. See the
+[qualification ledger](integration-october-2026.md) for package/executable hashes,
+source owner closure and host/toolchain requirements. The old v2 Linux and Windows
+v0.7.1 identities and capability evidence remain available independently.
+Runtime selection is explicit; neither artifacts nor profiles are upgraded.
+
+The shared v3 inspector validates the exact 32-byte entry/part header, version,
+artifact ID, bounded unique-key directory, native framing/ranges, 4096-byte payload
+and 256-byte object alignment, split resources, architecture/configuration,
+quantization geometry, bindings/Uses, frontend resources and optional component
+inventories. Continuation files require safe sibling names, matching artifact IDs,
+correct indices and actual sizes. Missing/partial/conflicting resources and native
+input-divisor/token-index violations fail closed. Required speculative and vision
+resources are checked for the selected mode. Bare `.ninfer` and manifest-bound
+artifacts have the same native capabilities; local import preserves continuation
+parts. Manifest hashes/lineage do not grant serving privilege. V2 and v3 readers
+remain separate, and incompatible artifact/runtime generations are rejected.
+Offline conversion stays with upstream or Norted tooling.
+
+Linux capability qualification uses an independent 196-file SHA-256 owner closure
+in `crates/scala-engine-ninfer/src/v3/owners.rs`, including successor artifact,
+product, CLI/server, frontend, constraint, scheduler, media, speculative and
+request-log owners. It does not reuse old v2 source hashes. Installation verifies
+that closure and exact source/recipe/build identity. Linux startup/request evidence
+uses schema 25; Windows v0.9.1 uses its actual older schema 21, independently from
+v2 schema 20. Native Windows is not WSL and requires no operator-installed toolkit
+for the portable package. All current routes target RTX 5090/sm_120a.
+
+V3 startup validation observes the selected artifact, GPU, context/KV, speculative
+backend and settings without persisting them. Conditional sampler/thinking/template
+defaults remain unknown until native evidence supplies them. Linux schema 25 uses
+`ninfer.host_context_mib` / `--host-context-mib`; old host-state/cache ceilings are
+not borrowed into that generation. Optional MTP, DFlash/DFlash2 and vision admission
+requires physical native resources and supported binding policy, not a model name
+or producer manifest. The native scheduler, CUDA kernels, replay/cache, media
+frontend and cancellation remain upstream-owned.
+
+### Native constrained output on qualified Linux v3
+
+The pinned Linux source supports Chat Completions `response_format` and Responses
+`text.format` for JSON object and JSON Schema modes; `structured_outputs` supports
+native GBNF grammar, literal choice and regex constraints. Strict function-tool
+parameters remain native constraints. Ordinary, MTP, DFlash and DFlash2 paths use
+the same qualified native constraint implementation, including streaming. Scala
+validates the representable envelope and forwards native interfaces; it adds no
+grammar engine, constraint sampler or post-hoc substitute.
+
+The admitted JSON Schema assertion subset is `type`, `properties`, `required`,
+`additionalProperties`, `items`, `prefixItems`, `additionalItems`, `minItems`,
+`maxItems`, `minLength`, `maxLength`, `pattern`, `minimum`, `maximum`,
+`exclusiveMinimum`, `exclusiveMaximum`, `const`, `enum`, `anyOf`, `oneOf`, `allOf`
+and local `$ref`, with boolean schemas, `$defs`/`definitions`, supported annotation
+keywords and draft-07/2020-12 dialect declarations. External references, nested
+`$id` and unsupported assertions fail with field-specific errors rather than
+weakening constraints. Original numeric assertions must survive JSON conversion
+exactly. Native compilation remains authoritative for satisfiability and grammar.
+Native malformed/unsupported/unsatisfiable-schema, invalid grammar/choice/regex,
+invalid tool constraint and constraint-dead-end categories are preserved.
+
+Required native completion evidence is checked on ordinary and streaming results.
+Missing, malformed or contradictory evidence fails explicitly. A native length
+termination with incomplete constrained output stays incomplete/max-output-tokens;
+other incomplete output is an actionable protocol error rather than a successful
+strict result. Streaming requires a native terminal reason, completion proof and
+`[DONE]`. No missing native constraint guarantee is fabricated.
+
+**Windows v0.9.1 limitation:** its source does not implement these constrained
+output interfaces or strict tools. Its schema-21 capability gate rejects JSON
+formats/grammar/choice/regex/strict tools rather than inheriting Linux schema-25
+credit. This verified upstream incompatibility is documented with exact source
+owners in the ledger. Ordinary native Windows v3 serving remains a separate
+qualified package route.
+
 ## Static canonical-master audit — 2026-10-05
 
-This is a finite source audit, not a build, inference result, model migration or
+This historical audit records the then-unqualified 68c54356 snapshot; it does not
+describe the separately qualified October target above. It is a finite source
+audit, not a build, inference result, model migration or
 blanket qualification of upstream HEAD. Canonical `Neroued/ninfer` master was
 fetched once into Scala's Git objects as `refs/audit/ninfer-master`:
 
@@ -108,10 +189,10 @@ for Scala's admitted v2 artifacts; no upgrade or conversion was run.
 | `src/artifact/framing.h` | absent | `6947f0b848a1bbf3e7d1ce47138bf3be6a3f076b` |
 | `src/artifact/schema.cpp` | absent | `71f7b86d1d3bb7c70aa9e21cf4819186dbc1d77e` |
 
-The Linux catalog now resolves the **reviewed v2 commit**, not default-branch HEAD.
+At this historical audit, the Linux catalog resolved the **reviewed v2 commit**, not default-branch HEAD.
 `Latest` means latest admitted managed snapshot, not latest upstream commit;
 the label and advisory say it is pinned. Candidate re-verification also requires
-that exact reviewed commit/tree. The adapter independently rejects the audited
+that exact reviewed commit/tree. The historical gate rejected that audited
 v3 source snapshot for runtime selection and runtime/model compatibility, so a
 stale candidate or installed manifest cannot admit it merely because settings
 are empty or its target registry happens to resemble v2. Explicit runtime native
@@ -122,10 +203,10 @@ Other installed canonical source snapshots need the exact reviewed v2 reader
 **and** reader-header blobs to prove container support; this does not grant any
 capability domain. Source credit additionally requires the canonical repository,
 repository URL, provider, managed platform/variant and matching identity revision.
-Unknown source/repository identity never inherits reviewed credit. The Windows
-catalog's existing exact package gate still withholds its v3 releases. Scala's
-shared artifact parser remains v2-only; supporting v3 would require a separate
-shared-format/frontend/draft inventory review, not a version-number bump.
+Unknown source/repository identity never inherits reviewed credit. At that audit, the Windows
+catalog withheld v3 packages and the shared parser was v2-only. The separately
+reviewed October integration above supplies the new shared-format/frontend/draft
+inventory contract; the historical 68c54356 snapshot remains unqualified.
 
 ### Complete baseline-blob classification
 
@@ -325,5 +406,5 @@ The preserving labels are grounded in direct diffs and exact moved declarations,
 not inferred from path similarity. The tables above supply the semantic findings;
 the script reproduces path/hash coverage. Validation remains synthetic: every
 owner's changed or missing blob withholds its domain, canonical v2 retains credit,
-v3 candidate/installed runtime selection is rejected, unknown source identity gets
+the audited 68c54356 v3 candidate/installed runtime selection is rejected, unknown source identity gets
 no credit, and the existing exact Windows and Decision contracts remain intact.

@@ -16,6 +16,9 @@ use crate::{
 
 pub const PACKAGE_FAMILY: &str = "ninfer-source";
 pub const RECIPE_VERSION: &str = "ninfer-serve-v2";
+pub const V3_RECIPE_VERSION: &str = "ninfer-serve-v3";
+pub const V3_REVISION: &str = "81c8ce093b2c1646a87566a8e59d807fcf0ec95c";
+pub const V3_TREE: &str = "8b42cb632277161d47aa0a67db55ca8400bf7118";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NinferRuntimeCatalogProvider;
@@ -64,7 +67,11 @@ impl RuntimeCatalogProvider for NinferRuntimeCatalogProvider {
                 "reviewed source snapshot did not resolve to full commit and tree SHAs",
             ));
         }
-        Ok(vec![source_runtime(repository.default_branch, commit)?])
+        let v3 = github.commit(GITHUB_REPOSITORY, V3_REVISION).await?;
+        Ok(vec![
+            source_runtime(repository.default_branch.clone(), commit)?,
+            source_runtime(repository.default_branch, v3)?,
+        ])
     }
 
     async fn verify_candidate(
@@ -81,8 +88,7 @@ impl RuntimeCatalogProvider for NinferRuntimeCatalogProvider {
             || plan.source.repository != GITHUB_REPOSITORY
             || plan.source.repository_url != format!("{UPSTREAM_REPOSITORY}.git")
             || plan.source.source_provider != PROVIDER_ID
-            || plan.source.commit_sha != CURRENT_PACKAGE_CAPABILITY_REVISION
-            || plan.source.tree_sha != CURRENT_PACKAGE_CAPABILITY_TREE
+            || !reviewed_snapshot(&plan.source.commit_sha, &plan.source.tree_sha)
         {
             return Ok(None);
         }
@@ -117,13 +123,17 @@ pub(super) fn source_runtime(
     source_branch: String,
     commit: GitHubCommit,
 ) -> Result<AvailableRuntime, CatalogError> {
-    if commit.sha != CURRENT_PACKAGE_CAPABILITY_REVISION
-        || commit.commit.tree.sha != CURRENT_PACKAGE_CAPABILITY_TREE
-    {
+    if !reviewed_snapshot(&commit.sha, &commit.commit.tree.sha) {
         return Err(provider_error(
-            "source snapshot has no admitted NInfer v2 container contract; canonical master is v3-only",
+            "source snapshot has no independently reviewed NInfer container contract",
         ));
     }
+    let v3 = commit.sha == V3_REVISION;
+    let recipe = if v3 {
+        V3_RECIPE_VERSION
+    } else {
+        RECIPE_VERSION
+    };
     let timestamp = parse_github_timestamp(&commit.commit.committer.date)
         .ok_or_else(|| provider_error("source commit has an invalid timestamp"))?;
     let date = commit
@@ -141,7 +151,7 @@ pub(super) fn source_runtime(
         platform: "linux".to_owned(),
         architecture: "x86_64".to_owned(),
         accelerator: "cuda".to_owned(),
-        variant: format!("{RECIPE_VERSION}-sm120a"),
+        variant: format!("{recipe}-sm120a"),
         package: RuntimePackageIdentity {
             provider_id: PROVIDER_ID.to_owned(),
             repository: Some(GITHUB_REPOSITORY.to_owned()),
@@ -154,7 +164,7 @@ pub(super) fn source_runtime(
     let runtime = AvailableRuntime {
         runtime_id: RuntimeId::from_identity(&identity),
         identity,
-        display_name: format!("NInfer reviewed v2 source snapshot {}", &commit.sha[..8]),
+        display_name: format!("NInfer reviewed v{} source snapshot {}", if v3 {3}else{2}, &commit.sha[..8]),
         supported_formats: vec![ArtifactFormat::Ninfer],
         source_url: commit.html_url,
         published_at_unix: Some(timestamp),
@@ -171,9 +181,9 @@ pub(super) fn source_runtime(
                 source_provider: PROVIDER_ID.to_owned(),
             },
             recipe: RuntimeSourceBuildRecipe {
-                recipe_version: RECIPE_VERSION.to_owned(),
+                recipe_version: recipe.to_owned(),
                 build_system: RuntimeSourceBuildSystem::Cmake,
-                build_definition_sha256: None,
+                build_definition_sha256: if v3 {Some(crate::v3::CMAKE_SHA256.into())} else {None},
                 cmake_configuration_arguments: vec![
                     "-G".to_owned(),
                     "Ninja".to_owned(),
@@ -227,7 +237,7 @@ pub(super) fn source_runtime(
                 ]),
             },
         })),
-        supported_native_identities: Vec::new(),
+        supported_native_identities: if v3 {crate::v3::native_identities()} else {Vec::new()},
         requirements: RuntimeRequirements {
             requires_nvidia_gpu: true,
             minimum_nvidia_driver: None,
@@ -242,8 +252,7 @@ pub(super) fn source_runtime(
                     .to_owned(),
                 "This is a Scala-managed build from an exact official source snapshot, not an upstream binary release"
                     .to_owned(),
-                "Pinned to the reviewed NInfer v2 snapshot; audited canonical master is v3-only and is not admitted"
-                    .to_owned(),
+                if v3 {"Requires native v3 artifacts; v2 artifacts require a separately selected v2 Runtime"} else {"Requires native v2 artifacts; no automatic artifact conversion"}.to_owned(),
             ],
             unverified_requirements: Vec::new(),
         },
@@ -319,6 +328,30 @@ mod tests {
     use super::{parse_github_timestamp, source_runtime};
 
     #[test]
+    fn v3_source_has_an_independent_generation_and_rejects_replaced_tree() {
+        let commit = |tree: &str| {
+            serde_json::from_value(serde_json::json!({
+            "sha":super::V3_REVISION,"html_url":"https://github.com/Neroued/ninfer/commit/81c8ce09",
+            "commit":{"committer":{"date":"2026-10-07T00:00:00Z"},"tree":{"sha":tree}}
+        })).unwrap()
+        };
+        let runtime = source_runtime("master".into(), commit(super::V3_TREE)).unwrap();
+        assert_eq!(runtime.identity.variant, "ninfer-serve-v3-sm120a");
+        assert_eq!(
+            runtime.identity.upstream_revision.as_deref(),
+            Some(super::V3_REVISION)
+        );
+        assert!(runtime.supported_native_identities.iter().all(|i| matches!(i, scala_core::ArtifactNativeIdentity::Ninfer(i) if i.container_version == 3)));
+        assert!(!runtime.supported_native_identities.is_empty());
+        let RuntimeAcquisitionPlan::SourceBuild(p) = runtime.acquisition else {
+            panic!("source")
+        };
+        assert_eq!(p.recipe.recipe_version, super::V3_RECIPE_VERSION);
+        assert_eq!(p.source.tree_sha, super::V3_TREE);
+        assert!(source_runtime("master".into(), commit(&"a".repeat(40))).is_err());
+    }
+
+    #[test]
     fn source_commit_timestamp_is_strict() {
         assert!(parse_github_timestamp("2026-08-29T04:13:34Z").is_some());
         assert!(parse_github_timestamp("2026-02-29T04:13:34Z").is_none());
@@ -375,4 +408,9 @@ mod tests {
             "build/apps/ninfer-serve"
         );
     }
+}
+
+fn reviewed_snapshot(commit: &str, tree: &str) -> bool {
+    (commit == CURRENT_PACKAGE_CAPABILITY_REVISION && tree == CURRENT_PACKAGE_CAPABILITY_TREE)
+        || (commit == V3_REVISION && tree == V3_TREE)
 }

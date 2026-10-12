@@ -44,6 +44,7 @@ const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
     "service_tier",
     "store",
     "stream",
+    "structured_outputs",
     "stream_options",
     "temperature",
     "seed",
@@ -86,7 +87,7 @@ pub(super) async fn create(
             .runtime
             .infer_stream_routed(inference, routing)
             .await
-            .map_err(runtime_error)?;
+            .map_err(|e| runtime_error(e).for_responses())?;
         Ok(streaming_response(
             ResponseContext {
                 response_id,
@@ -109,7 +110,7 @@ pub(super) async fn create(
             .runtime
             .infer_routed(inference, routing)
             .await
-            .map_err(runtime_error)?;
+            .map_err(|e| runtime_error(e).for_responses())?;
         let status = if routed.output.finish_reason == InferenceFinishReason::MaxOutputTokens {
             ResponseStatus::Incomplete
         } else {
@@ -162,7 +163,10 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
     let tools = parse_tools(object.get("tools"))?;
     let tool_choice = parse_tool_choice(object.get("tool_choice"), &tools)?;
     let parallel_tool_calls = optional_bool_value(object, "parallel_tool_calls")?;
-    let output_format = parse_text_format(object.get("text"))?;
+    let output_format = crate::input::structured_outputs(
+        object.get("structured_outputs"),
+        parse_text_format(object.get("text"))?,
+    )?;
     let input = object.get("input").ok_or_else(|| {
         OpenAiError::invalid(
             "Missing required field: input",
@@ -471,7 +475,7 @@ fn parse_tools(value: Option<&Value>) -> Result<Vec<InferenceTool>, OpenAiError>
                 format!("{parameter}.type"),
             ));
         }
-        require_null_or(tool, "strict", |value| value == false, "`false`")?;
+        let strict = crate::input::optional_bool_value(tool, "strict")?;
         let name = required_nonempty(tool.get("name"), &format!("{parameter}.name"))?;
         if parsed
             .iter()
@@ -495,6 +499,7 @@ fn parse_tools(value: Option<&Value>) -> Result<Vec<InferenceTool>, OpenAiError>
             ));
         }
         parsed.push(InferenceTool {
+            strict,
             name,
             description: tool
                 .get("description")
@@ -717,11 +722,11 @@ fn parse_text_format(value: Option<&Value>) -> Result<Option<OutputFormat>, Open
             let description = optional_string(format, "description")?;
             let schema = format
                 .get("schema")
-                .filter(|value| value.is_object())
+                .filter(|value| value.is_object() || value.is_boolean())
                 .cloned()
                 .ok_or_else(|| {
                     OpenAiError::invalid(
-                        "`text.format.schema` must be a JSON object.",
+                        "`text.format.schema` must be a JSON object or boolean.",
                         Some("text.format.schema"),
                         "invalid_type",
                     )
@@ -906,7 +911,7 @@ fn responses_tool(tool: &InferenceTool) -> Value {
         "name": tool.name,
         "description": tool.description,
         "parameters": tool.parameters,
-        "strict": false,
+        "strict": tool.strict.unwrap_or(false),
     })
 }
 
@@ -934,7 +939,13 @@ fn function_call_item(context: &ResponseContext, index: u32, call: &InferenceToo
 
 fn responses_output_format(format: Option<&OutputFormat>) -> Value {
     match format {
-        None | Some(OutputFormat::Text) => json!({ "type": "text" }),
+        None
+        | Some(
+            OutputFormat::Text
+            | OutputFormat::Gbnf { .. }
+            | OutputFormat::LiteralChoice { .. }
+            | OutputFormat::Regex { .. },
+        ) => json!({ "type": "text" }),
         Some(OutputFormat::JsonObject) => json!({ "type": "json_object" }),
         Some(OutputFormat::JsonSchema {
             name,
@@ -1067,8 +1078,8 @@ fn streaming_response(context: ResponseContext, backend: InferenceStream) -> Res
                     finish_reason,
                 })) => state.complete(usage.as_ref(), finish_reason),
                 Some(Err(error)) => {
-                    tracing::warn!(%error, "private engine Responses stream failed");
-                    state.fail();
+                    tracing::warn!("private engine Responses stream failed");
+                    state.fail_with(OpenAiError::stream_error(error));
                 }
                 None => {
                     tracing::warn!("private engine Responses stream ended without completion");
@@ -1290,10 +1301,14 @@ impl PublicStreamState {
     }
 
     fn fail(&mut self) {
-        let error = json!({
-            "code": "server_error",
-            "message": "The model failed to generate a response.",
-        });
+        self.fail_with(OpenAiError::streaming_backend_failure());
+    }
+    fn fail_with(&mut self, error: OpenAiError) {
+        let error = if error.status == StatusCode::BAD_GATEWAY {
+            json!({"code":"server_error","message":"The model failed to generate a response."})
+        } else {
+            error.for_responses().error_object()
+        };
         let response = response_document(&self.context, ResponseStatus::Failed, None, Some(error));
         self.push_event("response.failed", json!({ "response": response }));
         self.terminal = true;
@@ -1610,8 +1625,8 @@ mod tests {
             tool_choice: None,
             parallel_tool_calls: false,
             effective_generation_settings: EffectiveGenerationSettings {
-                temperature: 0.7,
-                top_p: 0.95,
+                temperature: Some(0.7),
+                top_p: Some(0.95),
             },
         }
     }

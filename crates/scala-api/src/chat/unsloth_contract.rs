@@ -19,6 +19,7 @@ fn admission() -> RequestAdmission {
         media_semantics: true,
         vision: false,
         greedy: false,
+        constrained: false,
     }
 }
 
@@ -87,8 +88,8 @@ fn unsloth_public_to_native_contract() {
             let validation = adapter.validate_inference_request(
                 &request,
                 &EffectiveGenerationSettings {
-                    temperature: 0.0,
-                    top_p: 1.0,
+                    temperature: Some(0.0),
+                    top_p: Some(1.0),
                 },
                 &SettingsSchema::default(),
             );

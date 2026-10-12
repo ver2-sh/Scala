@@ -303,8 +303,8 @@ async fn both_backends_qualify_exact_pairs_and_preserve_native_answers() {
         assert!(b.calls.lock().unwrap()[1].get("model").is_none());
         let mut image_request = request.clone();
         image_request.images = vec![
-            "data:image/png;base64,YQ==".into(),
-            "data:image/jpeg;base64,Yg==".into(),
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC".into(),
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC".into(),
         ];
         assert_eq!(
             f.adapter.supports_model_decision_images(&f.model),

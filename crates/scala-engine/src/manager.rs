@@ -190,6 +190,8 @@ pub struct BackendStatus {
     pub provenance: Option<RuntimeProvenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallel_requests: Option<BackendParallelism>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::ModelCapabilities>,
     pub activities: Vec<InferenceActivity>,
     pub active_request_count: usize,
     pub primary_lease_count: usize,
@@ -210,6 +212,10 @@ pub enum InferenceActivityPhase {
     Active,
     ProcessingPrompt,
     Generating,
+    ProcessingDecision,
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 /// A bounded, payload-free observation of one request currently using a backend.
@@ -224,6 +230,10 @@ pub struct InferenceActivity {
     pub prompt_total: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -328,6 +338,12 @@ pub enum RuntimeError {
     BenchmarkReserved,
     #[error("the requested capability is unsupported by this model/runtime")]
     UnsupportedCapability,
+    #[error("native request rejected ({code}) at {parameter}")]
+    NativeRequest {
+        message: String,
+        parameter: String,
+        code: &'static str,
+    },
     #[error("invalid decision request: {0}")]
     InvalidDecisionRequest(String),
     #[error("Model Profile `{0}` does not exist")]
@@ -402,6 +418,8 @@ struct BackendActivity {
     last_used_unix: AtomicI64,
     requests: StdMutex<BTreeMap<u64, InferenceActivity>>,
     drained: Notify,
+    terminal: StdMutex<VecDeque<(std::time::Instant, InferenceActivity)>>,
+    cancel: tokio::sync::watch::Sender<bool>,
 }
 
 impl BackendActivity {
@@ -411,13 +429,40 @@ impl BackendActivity {
             last_used_unix: AtomicI64::new(unix_timestamp()),
             requests: StdMutex::new(BTreeMap::new()),
             drained: Notify::new(),
+            terminal: StdMutex::new(VecDeque::new()),
+            cancel: tokio::sync::watch::channel(false).0,
         })
+    }
+
+    fn snapshot(&self) -> Vec<InferenceActivity> {
+        let mut requests: Vec<_> = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .take(STATUS_ACTIVITY_LIMIT)
+            .cloned()
+            .collect();
+        let mut terminal = self
+            .terminal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        terminal.retain(|(time, _)| time.elapsed() < Duration::from_secs(30));
+        requests.extend(
+            terminal
+                .iter()
+                .rev()
+                .take(STATUS_ACTIVITY_LIMIT.saturating_sub(requests.len()))
+                .map(|(_, activity)| activity.clone()),
+        );
+        requests
     }
 }
 
 struct InferenceLease {
     activity: Arc<BackendActivity>,
     request_sequence: u64,
+    decision_terminal: Option<InferenceActivityPhase>,
 }
 
 struct InferenceTarget {
@@ -430,6 +475,47 @@ struct InferenceTarget {
     model: scala_core::ModelArtifact,
     decision_identity: Option<crate::DecisionIdentity>,
     lease: InferenceLease,
+}
+
+/// Dropping a JIT admission future must retire precisely its reserved load.
+/// It must never cancel another request's later generation for the profile.
+struct JitAdmissionGuard {
+    manager: Weak<RuntimeManager>,
+    profile_id: ModelProfileId,
+    generation: u64,
+    armed: bool,
+}
+
+impl Drop for JitAdmissionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(manager) = self.manager.upgrade() {
+            let profile = self.profile_id.clone();
+            let generation = self.generation;
+            tokio::spawn(async move {
+                manager
+                    .cancel_loading_generation(&profile, Some(generation))
+                    .await;
+                let operation = Arc::clone(&manager.operation).lock_owned().await;
+                let owns = manager
+                    .state
+                    .read()
+                    .await
+                    .backends
+                    .get(&profile)
+                    .is_some_and(|b| {
+                        b.generation == generation && b.lifecycle == BackendLifecycle::Stopping
+                    });
+                if owns {
+                    let _ = manager
+                        .stop_backend_with_operation_held(&profile, operation)
+                        .await;
+                }
+            });
+        }
+    }
 }
 
 impl InferenceTarget {
@@ -493,11 +579,29 @@ impl InferenceLease {
                     prompt_current: None,
                     prompt_total: None,
                     generated_tokens: None,
+                    request_id: None,
+                    session_id: None,
                 },
             );
         Self {
             activity,
             request_sequence,
+            decision_terminal: None,
+        }
+    }
+
+    fn mark_decision(&mut self, session_id: String, request_id: Option<String>) {
+        self.decision_terminal = Some(InferenceActivityPhase::Cancelled);
+        if let Some(request) = self
+            .activity
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&self.request_sequence)
+        {
+            request.phase = InferenceActivityPhase::ProcessingDecision;
+            request.session_id = Some(session_id);
+            request.request_id = request_id;
         }
     }
 
@@ -562,11 +666,24 @@ impl InferenceLease {
 
 impl Drop for InferenceLease {
     fn drop(&mut self) {
-        self.activity
+        let removed = self
+            .activity
             .requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.request_sequence);
+        if let (Some(mut request), Some(phase)) = (removed, self.decision_terminal) {
+            request.phase = phase;
+            let mut terminal = self
+                .activity
+                .terminal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            terminal.push_back((std::time::Instant::now(), request));
+            while terminal.len() > STATUS_ACTIVITY_LIMIT {
+                terminal.pop_front();
+            }
+        }
         self.activity
             .last_used_unix
             .store(unix_timestamp(), Ordering::Release);
@@ -790,8 +907,40 @@ impl RuntimeManager {
     }
 
     pub async fn status(&self) -> ControlStatus {
-        let state = self.state.read().await;
-        self.status_from_state(&state)
+        let mut status = {
+            let state = self.state.read().await;
+            self.status_from_state(&state)
+        };
+        if status
+            .backends
+            .iter()
+            .any(|b| b.lifecycle == BackendLifecycle::Running && !b.retiring)
+            && let Ok(profiles) = self.model_profiles.read().await
+        {
+            let selected: Vec<_> = status
+                .backends
+                .iter()
+                .filter(|b| b.lifecycle == BackendLifecycle::Running && !b.retiring)
+                .filter_map(|b| profiles.profiles.get(&b.model_profile_id).cloned())
+                .collect();
+            let capabilities = self.model_profile_capabilities(&selected).await;
+            let state = self.state.read().await;
+            for (profile, capabilities) in selected.into_iter().zip(capabilities) {
+                if let Some(b) = status
+                    .backends
+                    .iter_mut()
+                    .find(|b| b.model_profile_id == profile.id)
+                    && state.backends.get(&profile.id).is_some_and(|current| {
+                        current.generation == b.generation
+                            && current.lifecycle == BackendLifecycle::Running
+                            && !current.retiring
+                    })
+                {
+                    b.capabilities = capabilities;
+                }
+            }
+        }
+        status
     }
 
     /// Read-only discovery for the profile exposed by the public API. Reuse the
@@ -1900,6 +2049,9 @@ impl RuntimeManager {
                         .and_then(|id| self.registry.get(id))
                 });
             let activity = Arc::clone(&backend.activity);
+            // Each Decision future drops its own native HTTP connection. Text
+            // streams retain their existing drain behavior.
+            activity.cancel.send_replace(true);
             push_notice(
                 &mut state,
                 RuntimeNoticeLevel::Info,
@@ -2028,10 +2180,42 @@ impl RuntimeManager {
         request: crate::DecisionRequest,
         routing: InferenceRoutingContext,
     ) -> Result<crate::RoutedDecisionOutput, RuntimeError> {
+        self.decide_with_contract(request, routing, false, None)
+            .await
+    }
+
+    pub async fn decide_openai_routed(
+        self: &Arc<Self>,
+        request: crate::DecisionRequest,
+        routing: InferenceRoutingContext,
+    ) -> Result<crate::RoutedDecisionOutput, RuntimeError> {
+        self.decide_with_contract(request, routing, true, None)
+            .await
+    }
+
+    pub async fn decide_correlated_routed(
+        self: &Arc<Self>,
+        request: crate::DecisionRequest,
+        routing: InferenceRoutingContext,
+        openai: bool,
+        request_id: String,
+    ) -> Result<crate::RoutedDecisionOutput, RuntimeError> {
+        self.decide_with_contract(request, routing, openai, Some(request_id))
+            .await
+    }
+
+    async fn decide_with_contract(
+        self: &Arc<Self>,
+        request: crate::DecisionRequest,
+        routing: InferenceRoutingContext,
+        openai: bool,
+        request_id: Option<String>,
+    ) -> Result<crate::RoutedDecisionOutput, RuntimeError> {
         request
             .validate()
             .map_err(RuntimeError::InvalidDecisionRequest)?;
-        let target = self
+        let session_id = routing.session_id.clone();
+        let mut target = self
             .inference_target(
                 &request.model_profile_id,
                 routing,
@@ -2047,12 +2231,35 @@ impl RuntimeManager {
         {
             return Err(RuntimeError::UnsupportedCapability);
         }
-        target.lease.mark_processing_prompt();
-        let output = target
-            .adapter
-            .decide(&target.endpoint, request)
-            .await
-            .map_err(map_inference_error)?;
+        if openai {
+            target
+                .adapter
+                .validate_openai_decision_request(
+                    &target.runtime,
+                    &target.model,
+                    &target.settings,
+                    &request,
+                )
+                .map_err(map_inference_error)?;
+        }
+        target.lease.mark_decision(session_id, request_id);
+        let mut cancel = target.lease.activity.cancel.subscribe();
+        if *cancel.borrow() {
+            return Err(RuntimeError::InferenceUnavailable(
+                "decision request cancelled during backend retirement".into(),
+            ));
+        }
+        let result = tokio::select! {
+            biased;
+            _ = cancel.changed() => return Err(RuntimeError::InferenceUnavailable("decision request cancelled during backend retirement".into())),
+            result = target.adapter.decide(&target.endpoint, request) => result.map_err(map_inference_error),
+        };
+        target.lease.decision_terminal = Some(match &result {
+            Ok(_) => InferenceActivityPhase::Completed,
+            Err(RuntimeError::InferenceTimedOut(_)) => InferenceActivityPhase::Cancelled,
+            Err(_) => InferenceActivityPhase::Failed,
+        });
+        let output = result?;
         Ok(crate::RoutedDecisionOutput { output, identity })
     }
 
@@ -2061,6 +2268,13 @@ impl RuntimeManager {
         request: crate::EmbeddingRequest,
         routing: InferenceRoutingContext,
     ) -> Result<crate::EmbeddingOutput, RuntimeError> {
+        request.input.validate_inline_media().map_err(|message| {
+            map_inference_error(EngineError::NativeRequest {
+                message,
+                parameter: "input".into(),
+                code: "invalid_value",
+            })
+        })?;
         let target = self
             .inference_target(
                 &request.model_profile_id,
@@ -2069,6 +2283,16 @@ impl RuntimeManager {
                 false,
             )
             .await?;
+        target
+            .adapter
+            .validate_embedding_request(
+                &target.runtime,
+                &target.model,
+                &target.settings,
+                &target.endpoint,
+                &request,
+            )
+            .map_err(map_inference_error)?;
         target.lease.mark_processing_prompt();
         target
             .adapter
@@ -2272,12 +2496,22 @@ impl RuntimeManager {
     }
 
     async fn cancel_loading(&self, profile_id: &ModelProfileId) {
+        self.cancel_loading_generation(profile_id, None).await;
+    }
+
+    async fn cancel_loading_generation(
+        &self,
+        profile_id: &ModelProfileId,
+        generation: Option<u64>,
+    ) {
         let (process, adapter) = {
             let mut state = self.state.write().await;
             let Some(backend) = state.backends.get_mut(profile_id) else {
                 return;
             };
-            if backend.lifecycle != BackendLifecycle::Loading {
+            if backend.lifecycle != BackendLifecycle::Loading
+                || generation.is_some_and(|g| g != backend.generation)
+            {
                 return;
             }
             backend.lifecycle = BackendLifecycle::Stopping;
@@ -2606,6 +2840,12 @@ impl RuntimeManager {
                 cancellation_epoch,
             )
             .await?;
+        let mut admission = JitAdmissionGuard {
+            manager: Arc::downgrade(self),
+            profile_id: requested.clone(),
+            generation,
+            armed: true,
+        };
         self.load_admitted(
             AdmittedLoad {
                 model_profile: profile,
@@ -2630,6 +2870,7 @@ impl RuntimeManager {
                 error
             }
         })?;
+        admission.armed = false;
         let operation = Arc::clone(&self.operation).lock_owned().await;
         let target = self.acquire_target(requested).await;
         drop(operation);
@@ -2938,15 +3179,8 @@ impl RuntimeManager {
                     failure: backend.failure.clone(),
                     provenance: backend.provenance.clone(),
                     parallel_requests: backend_parallelism(backend),
-                    activities: backend
-                        .activity
-                        .requests
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .values()
-                        .take(STATUS_ACTIVITY_LIMIT)
-                        .cloned()
-                        .collect(),
+                    capabilities: None,
+                    activities: backend.activity.snapshot(),
                     active_request_count: backend.activity.active_requests.load(Ordering::Acquire),
                     primary_lease_count,
                     last_used_unix: backend.activity.last_used_unix.load(Ordering::Acquire),
@@ -3431,6 +3665,15 @@ fn exit_detail(exit: &ProcessExit) -> String {
 fn map_inference_error(error: EngineError) -> RuntimeError {
     match error {
         EngineError::ReasoningControls(error) => RuntimeError::ReasoningControls(error),
+        EngineError::NativeRequest {
+            message,
+            parameter,
+            code,
+        } => RuntimeError::NativeRequest {
+            message,
+            parameter,
+            code,
+        },
         EngineError::InvalidDecisionRequest(message) => {
             RuntimeError::InvalidDecisionRequest(message)
         }
@@ -3628,6 +3871,8 @@ mod tests {
             },
             decision: false,
             decision_candidate: false,
+            openai_decisions: false,
+            decision_images: false,
         };
         for (patch, expected_enabled, expected_effort) in [
             (
@@ -3710,6 +3955,8 @@ mod tests {
             },
             decision: false,
             decision_candidate: false,
+            openai_decisions: false,
+            decision_images: false,
         };
         for enabled in [true, false] {
             let mut request = InferenceRequest {
@@ -3775,6 +4022,8 @@ mod tests {
             },
             decision: false,
             decision_candidate: false,
+            openai_decisions: false,
+            decision_images: false,
         };
         for capabilities in [None, Some(&empty)] {
             for effort in [
@@ -4046,8 +4295,8 @@ mod tests {
             process,
             endpoint: "http://127.0.0.1:1".into(),
             effective_generation_settings: Some(EffectiveGenerationSettings {
-                temperature: 0.0,
-                top_p: 1.0,
+                temperature: Some(0.0),
+                top_p: Some(1.0),
             }),
             settings: scala_core::ResolvedSettings {
                 engine_id: "fixture-decision".into(),
@@ -4156,6 +4405,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decision_cancellation_is_request_local_and_releases_leases_with_terminal_observations()
+    {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut adapter = crate::decision::tests::DecisionAdapter::new(true);
+        adapter.decision_gate = Some(gate.clone());
+        let adapter = Arc::new(adapter);
+        let fixture = decision_fixture(adapter.clone(), "1", Some("native-decision-fixture")).await;
+        let launch = |id: &str| {
+            let manager = fixture.manager.clone();
+            let profile = fixture.profile_id.clone();
+            let id = id.to_owned();
+            tokio::spawn(async move {
+                manager
+                    .decide_correlated_routed(
+                        crate::decision::tests::request(profile),
+                        InferenceRoutingContext::default(),
+                        false,
+                        id,
+                    )
+                    .await
+            })
+        };
+        let a = launch("client-a");
+        let b = launch("client-b");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while adapter.calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let before = fixture.manager.status().await;
+        assert_eq!(before.backends[0].active_request_count, 2);
+        assert!(
+            before.backends[0]
+                .activities
+                .iter()
+                .all(|a| a.phase == InferenceActivityPhase::ProcessingDecision
+                    && a.generated_tokens.is_none())
+        );
+        a.abort();
+        assert!(matches!(a.await, Err(error) if error.is_cancelled()));
+        assert_eq!(adapter.decision_cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture.manager.status().await.backends[0].active_request_count,
+            1
+        );
+        gate.add_permits(1);
+        b.await.unwrap().unwrap();
+        let after = fixture.manager.status().await;
+        assert_eq!(after.backends[0].active_request_count, 0);
+        assert!(
+            after.backends[0]
+                .activities
+                .iter()
+                .any(|a| a.phase == InferenceActivityPhase::Cancelled
+                    && a.request_id.as_deref() == Some("client-a"))
+        );
+        assert!(
+            after.backends[0]
+                .activities
+                .iter()
+                .any(|a| a.phase == InferenceActivityPhase::Completed
+                    && a.request_id.as_deref() == Some("client-b"))
+        );
+        let c = launch("retiring");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while adapter.calls.load(Ordering::SeqCst) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let retired = tokio::time::timeout(
+            Duration::from_secs(2),
+            fixture.manager.unload(fixture.profile_id.clone()),
+        )
+        .await
+        .unwrap();
+        // This fixture registers a synthetic process, outside the supervisor.
+        assert!(
+            matches!(retired, Err(RuntimeError::Operation(message)) if message.contains("not tracked"))
+        );
+        assert!(c.await.unwrap().is_err());
+        assert_eq!(
+            fixture.manager.status().await.backends[0].active_request_count,
+            0
+        );
+        assert_eq!(adapter.decision_cancelled.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn decision_terminal_history_is_bounded_transient_and_content_free() {
+        let activity = BackendActivity::new();
+        for i in 0..40 {
+            let mut lease = InferenceLease::acquire(activity.clone(), i);
+            lease.mark_decision("session".into(), Some(format!("id-{i}")));
+            lease.decision_terminal = Some(if i % 2 == 0 {
+                InferenceActivityPhase::Completed
+            } else {
+                InferenceActivityPhase::Failed
+            });
+        }
+        assert_eq!(activity.active_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(activity.snapshot().len(), STATUS_ACTIVITY_LIMIT);
+        for (time, _) in activity.terminal.lock().unwrap().iter_mut() {
+            *time = std::time::Instant::now() - Duration::from_secs(31);
+        }
+        assert!(activity.snapshot().is_empty());
+    }
+
+    #[tokio::test]
     async fn decision_dispatch_requires_no_invented_generation_defaults() {
         let adapter = Arc::new(crate::decision::tests::DecisionAdapter::new(true));
         let fixture = decision_fixture(adapter.clone(), "1", Some("native-decision-fixture")).await;
@@ -4194,7 +4555,7 @@ mod tests {
         let adapter = Arc::new(crate::decision::tests::DecisionAdapter::new(true));
         let fixture = decision_fixture(adapter.clone(), "1", Some("native-decision-fixture")).await;
         let mut request = crate::decision::tests::request(fixture.profile_id.clone());
-        request.images = vec!["data:image/png;base64,YQ==".into()];
+        request.images = vec!["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC".into()];
         assert!(matches!(
             fixture
                 .manager
@@ -4217,8 +4578,8 @@ mod tests {
         let fixture = decision_fixture(adapter.clone(), "1", Some("native-decision-fixture")).await;
         let mut request = crate::decision::tests::request(fixture.profile_id.clone());
         request.images = vec![
-            "data:image/png;base64,YQ==".into(),
-            "data:image/webp;base64,Yg==".into(),
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC".into(),
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC".into(),
         ];
         let output = fixture
             .manager

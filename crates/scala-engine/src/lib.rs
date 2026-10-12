@@ -26,9 +26,11 @@ pub mod benchmark;
 mod catalog;
 mod control;
 mod decision;
+mod embeddings;
 mod installer;
 pub mod link;
 mod manager;
+pub mod media;
 mod packs;
 mod prune;
 mod store;
@@ -36,6 +38,7 @@ mod supervisor;
 #[cfg(test)]
 mod test_support;
 pub use decision::*;
+pub use embeddings::*;
 pub use prune::plan_runtime_prune;
 
 pub use catalog::{
@@ -590,11 +593,41 @@ async fn prepare_norted_package_input_inner(
     progress: Option<&LoadProgressReporter>,
 ) -> Result<PreparedModelInput, EngineError> {
     let Some(package) = &model.norted_package else {
-        return Ok(PreparedModelInput {
+        let mut prepared = PreparedModelInput {
             primary: model.clone(),
             auxiliary: Vec::new(),
             primary_file_identity: None,
-        });
+        };
+        for declared in &model.auxiliary_artifacts {
+            let path =
+                canonical_regular_file(&declared.path, "explicit auxiliary artifact").await?;
+            let metadata = tokio::fs::metadata(&path).await.map_err(package_io)?;
+            let digest = hash_package_artifact(
+                &path,
+                "auxiliary",
+                "initial preparation",
+                BackendLoadPhase::PreparingModel,
+                "Verifying auxiliary artifact",
+                progress,
+            )
+            .await
+            .map_err(package_io)?;
+            if metadata.len() != declared.size_bytes
+                || declared.hash.as_deref() != Some(digest.as_str())
+            {
+                return Err(EngineError::InvalidConfiguration(
+                    "Explicit auxiliary artifact requires its immutable size and SHA-256".into(),
+                ));
+            }
+            prepared.auxiliary.push(PreparedAuxiliaryArtifact {
+                role: declared.role.clone(),
+                path,
+                size_bytes: metadata.len(),
+                content_sha256: digest,
+            });
+        }
+        append_native_continuations(&mut prepared, progress).await?;
+        return Ok(prepared);
     };
     let canonical = canonical_regular_file(&model.path, "Norted package primary artifact").await?;
     if canonical != model.path {
@@ -683,11 +716,57 @@ async fn prepare_norted_package_input_inner(
             content_sha256: observed,
         });
     }
-    Ok(PreparedModelInput {
+    let mut prepared = PreparedModelInput {
         primary,
         auxiliary,
         primary_file_identity: Some(file_identity(&metadata)),
-    })
+    };
+    append_native_continuations(&mut prepared, progress).await?;
+    Ok(prepared)
+}
+
+async fn append_native_continuations(
+    model: &mut PreparedModelInput,
+    progress: Option<&LoadProgressReporter>,
+) -> Result<(), EngineError> {
+    if model.primary.format != ArtifactFormat::Ninfer {
+        return Ok(());
+    }
+    let native = scala_core::inspect_ninfer_container(&model.primary.path)
+        .map_err(|e| EngineError::InvalidConfiguration(e.to_string()))?;
+    for path in native.continuation_paths(&model.primary.path) {
+        if model.auxiliary.iter().any(|a| a.path == path) {
+            continue;
+        }
+        let metadata = tokio::fs::metadata(&path).await.map_err(package_io)?;
+        let digest = hash_package_artifact(
+            &path,
+            "ninfer_part",
+            "initial preparation",
+            BackendLoadPhase::PreparingModel,
+            "Verifying native continuation",
+            progress,
+        )
+        .await
+        .map_err(package_io)?;
+        let role = AuxiliaryArtifactRole::Other("ninfer_part".into());
+        model
+            .primary
+            .auxiliary_artifacts
+            .push(scala_core::AuxiliaryArtifact {
+                role: role.clone(),
+                path: path.clone(),
+                size_bytes: metadata.len(),
+                hash: Some(digest.clone()),
+            });
+        model.auxiliary.push(PreparedAuxiliaryArtifact {
+            role,
+            path,
+            size_bytes: metadata.len(),
+            content_sha256: digest,
+        });
+    }
+    Ok(())
 }
 
 pub async fn revalidate_norted_package_before_launch(
@@ -711,6 +790,28 @@ async fn revalidate_norted_package_before_launch_inner(
     progress: Option<&LoadProgressReporter>,
 ) -> Result<(), EngineError> {
     let Some(package) = &model.primary.norted_package else {
+        for auxiliary in &model.auxiliary {
+            let path = canonical_regular_file(&auxiliary.path, "prepared auxiliary").await?;
+            let metadata = tokio::fs::metadata(&path).await.map_err(package_io)?;
+            let digest = hash_package_artifact(
+                &path,
+                "auxiliary",
+                "final pre-launch revalidation",
+                BackendLoadPhase::PreparingLaunch,
+                "Revalidating auxiliary artifact",
+                progress,
+            )
+            .await
+            .map_err(package_io)?;
+            if path != auxiliary.path
+                || metadata.len() != auxiliary.size_bytes
+                || digest != auxiliary.content_sha256
+            {
+                return Err(EngineError::InvalidConfiguration(
+                    "Auxiliary artifact changed before launch".into(),
+                ));
+            }
+        }
         return Ok(());
     };
     let canonical =
@@ -1029,8 +1130,8 @@ pub enum StartupObservation {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EffectiveGenerationSettings {
-    pub temperature: f64,
-    pub top_p: f64,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -1055,6 +1156,12 @@ pub struct ModelServingCapabilities {
     pub structured_output: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub decision: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decision_candidate: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub openai_decisions: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decision_images: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -1085,8 +1192,8 @@ fn norted_package_summary(model: &ModelArtifact) -> Option<NortedPackageSummary>
 impl EffectiveGenerationSettings {
     pub fn merged(self, patch: &GenerationSettingsPatch) -> Self {
         Self {
-            temperature: patch.temperature.unwrap_or(self.temperature),
-            top_p: patch.top_p.unwrap_or(self.top_p),
+            temperature: patch.temperature.or(self.temperature),
+            top_p: patch.top_p.or(self.top_p),
         }
     }
 }
@@ -1233,6 +1340,10 @@ pub struct ModelCapabilities {
     /// Selectable for native JIT qualification, not permission to execute.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub decision_candidate: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub openai_decisions: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub decision_images: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1352,6 +1463,8 @@ impl GenerationSettingsPatch {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InferenceTool {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -1370,6 +1483,15 @@ pub enum InferenceToolChoice {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum OutputFormat {
+    Gbnf {
+        grammar: String,
+    },
+    LiteralChoice {
+        choices: Vec<String>,
+    },
+    Regex {
+        regex: String,
+    },
     Text,
     JsonObject,
     JsonSchema {
@@ -1407,12 +1529,6 @@ pub struct CompletionRequest {
     pub prompt: String,
     pub generation_settings: GenerationSettingsPatch,
     pub max_output_tokens: Option<u32>,
-}
-
-#[derive(Debug, Clone)]
-pub struct EmbeddingRequest {
-    pub model_profile_id: scala_core::ModelProfileId,
-    pub input: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1540,6 +1656,12 @@ pub enum EngineError {
     TimedOut(String),
     #[error("invalid engine configuration: {0}")]
     InvalidConfiguration(String),
+    #[error("native request rejected ({code}) at {parameter}")]
+    NativeRequest {
+        message: String,
+        parameter: String,
+        code: &'static str,
+    },
     #[error("invalid decision request: {0}")]
     InvalidDecisionRequest(String),
     #[error("invalid generation settings: {0}")]
@@ -1930,6 +2052,11 @@ pub trait EngineAdapter: Send + Sync {
         backend_defaults: &EffectiveGenerationSettings,
         _settings_schema: &SettingsSchema,
     ) -> Result<(), EngineError> {
+        if request.tools.iter().any(|t| t.strict == Some(true)) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "this engine has no qualified strict function-tool contract".into(),
+            ));
+        }
         self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
         if !request.tools.is_empty()
             || request.tool_choice.is_some()
@@ -1953,7 +2080,7 @@ pub trait EngineAdapter: Send + Sync {
         }
         if matches!(
             request.output_format.as_ref(),
-            Some(OutputFormat::JsonObject | OutputFormat::JsonSchema { .. })
+            Some(format) if !matches!(format, OutputFormat::Text)
         ) {
             return Err(EngineError::InvalidGenerationSettings(format!(
                 "engine `{}` does not support structured output",
@@ -2005,6 +2132,38 @@ pub trait EngineAdapter: Send + Sync {
     ) -> bool {
         false
     }
+    /// Separate admission for the OpenAI output contract. A System One route
+    /// alone proves neither probability semantics, mandatory distributions nor
+    /// complete per-request native usage observations.
+    fn supports_openai_decisions(
+        &self,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _settings: &ResolvedSettings,
+    ) -> bool {
+        false
+    }
+
+    fn qualified_decision_images(
+        &self,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _settings: &ResolvedSettings,
+    ) -> bool {
+        false
+    }
+
+    fn validate_openai_decision_request(
+        &self,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _settings: &ResolvedSettings,
+        _request: &DecisionRequest,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported(
+            "this native pair has no qualified OpenAI Decisions output contract".into(),
+        ))
+    }
     async fn decide(
         &self,
         _endpoint: &str,
@@ -2029,6 +2188,35 @@ pub trait EngineAdapter: Send + Sync {
             "streaming raw completions".to_owned(),
         ))
     }
+    /// Validate the exact selected pair before the existing private executor.
+    /// Structured input is an engine-specific extension, never inherited.
+    fn validate_embedding_request(
+        &self,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _settings: &ResolvedSettings,
+        _endpoint: &str,
+        request: &EmbeddingRequest,
+    ) -> Result<(), EngineError> {
+        request
+            .input
+            .validate_inline_media()
+            .map_err(|message| EngineError::NativeRequest {
+                message,
+                parameter: "input".into(),
+                code: "invalid_value",
+            })?;
+        if request.input.structured() {
+            return Err(EngineError::NativeRequest {
+                message: "This engine has no qualified native structured embedding input contract."
+                    .into(),
+                parameter: "input".into(),
+                code: "unsupported_embedding_media",
+            });
+        }
+        Ok(())
+    }
+
     async fn embed(
         &self,
         _endpoint: &str,
@@ -2198,6 +2386,8 @@ mod reasoning_tests {
             },
             decision: false,
             decision_candidate: false,
+            openai_decisions: false,
+            decision_images: false,
         };
         let model_a = capabilities(
             true,
@@ -2357,8 +2547,8 @@ mod tests {
     #[test]
     fn effective_generation_settings_merge_without_changing_backend_defaults() {
         let backend_defaults = EffectiveGenerationSettings {
-            temperature: 0.7,
-            top_p: 0.9,
+            temperature: Some(0.7),
+            top_p: Some(0.9),
         };
         let override_temperature = GenerationSettingsPatch {
             temperature: Some(0.2),
@@ -2372,12 +2562,12 @@ mod tests {
         assert_eq!(
             backend_defaults.merged(&override_temperature),
             EffectiveGenerationSettings {
-                temperature: 0.2,
-                top_p: 0.9,
+                temperature: Some(0.2),
+                top_p: Some(0.9),
             }
         );
-        assert_eq!(backend_defaults.temperature, 0.7);
-        assert_eq!(backend_defaults.top_p, 0.9);
+        assert_eq!(backend_defaults.temperature, Some(0.7));
+        assert_eq!(backend_defaults.top_p, Some(0.9));
     }
 
     #[tokio::test]
@@ -2666,8 +2856,8 @@ mod tests {
                 .validate_generation_settings(
                     &GenerationSettingsPatch::default(),
                     &EffectiveGenerationSettings {
-                        temperature: 0.0,
-                        top_p: 1.0,
+                        temperature: Some(0.0),
+                        top_p: Some(1.0),
                     },
                 )
                 .is_ok()
@@ -2679,8 +2869,8 @@ mod tests {
                     ..Default::default()
                 },
                 &EffectiveGenerationSettings {
-                    temperature: 0.0,
-                    top_p: 1.0,
+                    temperature: Some(0.0),
+                    top_p: Some(1.0),
                 },
             ),
             Err(EngineError::InvalidGenerationSettings(_))
@@ -3003,6 +3193,7 @@ mod tests {
             failure: None,
             provenance: None,
             parallel_requests: None,
+            capabilities: None,
             activities: Vec::new(),
             active_request_count: 0,
             primary_lease_count: 0,

@@ -51,6 +51,7 @@ const ALLOWED_TOP_LEVEL_FIELDS: &[&str] = &[
     "stop",
     "store",
     "stream",
+    "structured_outputs",
     "stream_options",
     "temperature",
     "thinking_token_budget",
@@ -209,7 +210,10 @@ pub(crate) fn parse_request(value: Value) -> Result<ParsedRequest, OpenAiError> 
         .map(|(index, message)| parse_message(message, index))
         .collect::<Result<Vec<_>, _>>()?;
     let messages = normalize_tool_result_names(messages)?;
-    let output_format = parse_response_format(object.get("response_format"))?;
+    let output_format = crate::input::structured_outputs(
+        object.get("structured_outputs"),
+        parse_response_format(object.get("response_format"))?,
+    )?;
     Ok(ParsedRequest {
         normalized: NormalizedRequest {
             model,
@@ -585,7 +589,7 @@ fn parse_tools(value: Option<&Value>) -> Result<Vec<InferenceTool>, OpenAiError>
             &["name", "description", "parameters", "strict"],
             "function tool",
         )?;
-        require_null_or(function, "strict", |value| value == false, "`false`")?;
+        let strict = crate::input::optional_bool_value(function, "strict")?;
         let name = required_nonempty(function.get("name"), &format!("{parameter}.function.name"))?;
         if parsed
             .iter()
@@ -609,6 +613,7 @@ fn parse_tools(value: Option<&Value>) -> Result<Vec<InferenceTool>, OpenAiError>
             ));
         }
         parsed.push(InferenceTool {
+            strict,
             name,
             description: function
                 .get("description")
@@ -843,11 +848,11 @@ fn parse_response_format(value: Option<&Value>) -> Result<Option<OutputFormat>, 
             let description = optional_string(wrapper, "description")?;
             let schema = wrapper
                 .get("schema")
-                .filter(|value| value.is_object())
+                .filter(|value| value.is_object() || value.is_boolean())
                 .cloned()
                 .ok_or_else(|| {
                     OpenAiError::invalid(
-                        "`response_format.json_schema.schema` must be a JSON object.",
+                        "`response_format.json_schema.schema` must be a JSON object or boolean.",
                         Some("response_format.json_schema.schema"),
                         "invalid_type",
                     )
@@ -1079,8 +1084,8 @@ fn streaming_response(context: ChatContext, backend: InferenceStream) -> Respons
                     finish_reason,
                 })) => state.complete(usage.as_ref(), finish_reason),
                 Some(Err(error)) => {
-                    tracing::warn!(%error, "private engine Chat stream failed");
-                    state.fail();
+                    tracing::warn!("private engine Chat stream failed");
+                    state.fail_with(OpenAiError::stream_error(error));
                 }
                 None => {
                     tracing::warn!("private engine Chat stream ended without completion");
@@ -1146,7 +1151,9 @@ impl ChatStreamState {
     }
 
     fn fail(&mut self) {
-        let error = OpenAiError::streaming_backend_failure();
+        self.fail_with(OpenAiError::streaming_backend_failure());
+    }
+    fn fail_with(&mut self, error: OpenAiError) {
         self.queue
             .push_back(Ok(Bytes::from(format!("data: {}\n\n", error.envelope()))));
         self.queue

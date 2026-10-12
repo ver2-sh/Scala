@@ -45,33 +45,25 @@ pub(super) async fn create(
             "encoding_format",
         ));
     }
-    let input = match object.get("input") {
-        Some(Value::String(text)) => vec![text.clone()],
-        Some(Value::Array(items)) if !items.is_empty() => items
-            .iter()
-            .map(|item| item.as_str().map(str::to_owned))
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| {
-                OpenAiError::unsupported(
-                    "Only string and string-array embedding inputs are supported.",
-                    "input",
-                )
-            })?,
-        _ => {
-            return Err(OpenAiError::invalid(
-                "`input` must be a string or non-empty string array.",
-                Some("input"),
-                "invalid_value",
-            ));
+    let mut input: scala_engine::EmbeddingInput = serde_json::from_value(
+        object.get("input").cloned().ok_or_else(|| invalid_input("Missing embedding input."))?,
+    ).map_err(|_| invalid_input("`input` must be a string, content object, or nonempty ordered array of strings/content objects; only typed text, image_url, input_audio and input_video parts are accepted."))?;
+    input.validate_structure().map_err(invalid_input)?;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        for entry in input.entries_mut() {
+            if let scala_engine::EmbeddingEntry::Content(group) = entry {
+                for part in &mut group.content {
+                    if let Some((kind, source)) = part.media_mut() {
+                        *source = crate::media::acquire(kind, source).await?;
+                    }
+                }
+            }
         }
-    };
-    if input.iter().any(String::is_empty) {
-        return Err(OpenAiError::invalid(
-            "Embedding inputs must not be empty strings.",
-            Some("input"),
-            "invalid_value",
-        ));
-    }
+        Ok::<_, OpenAiError>(())
+    })
+    .await
+    .map_err(|_| invalid_input("Embedding media acquisition exceeded 30 seconds."))??;
+    input.validate_inline_media().map_err(invalid_input)?;
     correlation.record_inference(&model, false);
     let output = state
         .runtime
@@ -109,4 +101,8 @@ pub(super) async fn create(
         response["usage"] = json!({"prompt_tokens": prompt, "total_tokens": total});
     }
     Ok(Json(response))
+}
+
+fn invalid_input(message: impl Into<String>) -> OpenAiError {
+    OpenAiError::invalid(message, Some("input"), "invalid_value")
 }

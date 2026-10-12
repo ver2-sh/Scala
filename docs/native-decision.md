@@ -150,8 +150,9 @@ chat and pooled embedding GGUF behavior is unchanged.
 
 ## Native mapping and runtime discovery
 
-The adapter sends only `state` and `questions` to the already-running private
-llama-server's `/v1/systemone`. It never sends a model selector. JSON content,
+The adapter sends native `state`, `questions` and, when supplied separately,
+admitted shared `images` to the already-running private llama-server's
+`/v1/systemone`. It never sends a model selector. JSON content,
 choice descriptions/nulls, score order and noul `true`/`false` criteria remain
 unchanged. Answers share Scala's type-tagged schema; native probabilities,
 confidence, legends and model identity are retained and absent observations stay
@@ -178,8 +179,8 @@ As reviewed on 2026-10-05, official nightly
 `e117148a41d8e9bedb72e4c6c3f003ab0fe7f857`, contains #29818, Nimble/Clef support and
 the Laya correctness fix [#29903](https://github.com/ggml-org/llama.cpp/pull/29903).
 It predates the model modality field and qualifies through the native validator.
-Current master identifies itself as the 0.6.0 development line; version alone is
-never a support gate.
+That historical review preceded the released v0.6.0 contract below; version alone
+is never a support gate.
 
 Scala's existing official nightly/source providers can surface this revision.
 Managed CUDA source recipes are now `managed-portable-v5` (CUDA 12) and
@@ -193,5 +194,118 @@ separate steps.
 
 Profiles continue to bind an ordinary artifact and engine target. GGUF, Q27 and
 NInfer formats, filenames, origin and Norted metadata/provenance alone never grant
-Decision. For llama.cpp there is no new artifact format, profile role or persistent setting.
+Decision. For llama.cpp there is no new artifact format or profile role. Explicit vision
+projector settings below bind an existing GGUF auxiliary artifact.
 Tests use fake adapters and synthetic loaded backends; no native inference runs.
+
+
+## October 2026: OpenAI Decisions and native vision
+
+`POST /v1/decisions` follows the [OpenAI create reference](https://developers.openai.com/api/reference/resources/decisions/methods/create)
+and [Decisions guide](https://developers.openai.com/api/docs/guides/decisions).
+It is a separate validated conversion surface over the existing native Decision
+execution, not an alias for System One. `model` remains a Scala Model Profile
+reference, including owner-routed Link aliases. Authentication, correlation,
+session/role routing, JIT loading and the public 32 MiB body bound are unchanged.
+
+Input is a string or ordered user messages containing text and supported images,
+subject to the selected native protocol's position/association limits below.
+Other roles, content modalities, file IDs and unrepresentable image detail controls
+are rejected. Questions and answers retain request order, original names or null,
+and distinct boolean/string choice values. Internal question/choice keys never
+replace public names/values. Choice descriptions and ordered score labels survive
+native translation. Duplicate typed choice values are invalid; `true` and `"true"`
+are distinct. The transport admits 1–1024 questions and 2–255 choices/score levels;
+these are bounds, not a guarantee that a local model supports those sizes. Native
+model option/context limits still apply, including llama.cpp's 2–10 score levels.
+
+Predicate requires native P(true), not an arbitrary normalized expectation. Lev's
+nine-level noul expectation is therefore unavailable through this predicate
+mapping, while its existing System One behavior remains intact. Choice and score
+require actual native distributions and confidence, validated without filling
+missing observations. Scores retain native level indices and expected-score
+semantics. Native refusal is a distinct typed outcome; abstention is not converted
+into refusal. Native model identity and usage are mandatory for this route.
+A successful response always contains `answers`, `model` and `usage`, including native
+`input_tokens`, `input_tokens_details.cached_tokens`,
+`input_tokens_details.cache_write_tokens`, `output_tokens`,
+`output_tokens_details.reasoning_tokens` and `total_tokens`. Counters must be
+nonnegative integers and the reported total must equal input plus output without
+overflow. Missing or incompatible required observations produce HTTP 502 with
+`native_decision_contract_mismatch`; no counter is filled from unobserved zeros,
+System One accounting, startup observations or another request. Link entry nodes
+also validate required response fields before forwarding a successful Decisions
+response. System One's existing optional observations and profile-alias fallback
+remain backward compatible.
+
+Neither frozen llama.cpp revision supplies complete usage: native `post_systemone`
+reports only input tokens (the native task token count, summed across variants for
+non-joint models) and an explicit output count of zero. Cache, cache-write and
+reasoning counts are absent. Scala's existing checked System One sum does not
+complete the OpenAI contract. Consequently these pairs advertise
+`openai_decisions: false` (false flags are omitted on the wire) and `/v1/decisions` fails with HTTP 400
+`unsupported_capability` before inference, directing callers to `/v1/systemone`.
+A reviewed revision alone grants no OpenAI capability. Native `decision_candidate`,
+qualified `decision` and qualified `decision_images` remain independent. Synthetic
+complete-usage protocol tests demonstrate the successful conversion; they do not
+qualify a production llama.cpp pair.
+
+Execution qualification is separate for `decision`, `openai_decisions` and
+`decision_images`; none follows merely from exposure of `/v1/systemone`.
+The reviewed llama.cpp source contracts are stable v0.6.0/b11429 and frozen
+b11565, recorded in [the immutable integration ledger](integration-october-2026.md).
+Other runtimes retain their own support gates. GGUF decision metadata and native
+output modalities are candidate/evidence inputs, never execution authority.
+Proof also binds physical executable/model/auxiliary fingerprints and probe
+identity. A change, unload, crash or restart clears execution capability until
+qualification succeeds again. CLI/TUI, Model Profile inspection, `/v1/models`
+and Link carry candidate and owner-verified capabilities separately. Older Link
+peers retain their inventory shape; a read-only capability inventory extension
+falls back to that older inventory without granting absent evidence.
+
+Native image routing is enabled only after the exact runtime/model pair qualifies,
+reports vision and binds a compatible projector. Upstream's image-admission
+families at these revisions are Clef/OpenJev, and additionally
+pplx-decider/lfm2-d1/lfm2-d1-omni at b11565. These source-owned image limits are not
+a filename or architecture classifier for Decision. Explicit
+`llama.cpp.projector` plus `llama.cpp.projector_sha256` binds a local GGUF projector;
+prepared auxiliary integrity follows the existing artifact contract. Text-only
+pairs reject images. Original bytes and image order are retained;
+embedded text/image positions and message associations are separate guarantees.
+At both frozen revisions, `parse_state()` removes `image_url` parts from a state
+array or `state.messages`, appending their bytes to a shared ordered media list.
+`render()` and joint image handling receive that list separately from the remaining
+state; the model's native template places the media markers. Inline positions,
+image annotations and per-message image associations are unavailable.
+
+Scala therefore admits text-only state/messages, a sole image-only message with
+one or two admitted images (also through `state.messages`; System One's embedded
+URLs must match its transport `images` list), and System One's
+explicit top-level `images` with shared state. The explicit list preserves native
+shared-media semantics, including comparisons by image order. Embedded images
+mixed with text, or embedded images in any multi-message request, fail before
+inference with HTTP 400 `unsupported_decision_media` and a specific
+`input[i].content[j]` or `state[i].content[j]` / `state.messages[i].content[j]`
+parameter. This includes text-before-image, image-before-text and labelled
+comparisons interleaved across messages, even if the image bytes/order would
+survive. Embedded media must match the admitted image list; it is never sent a
+second time through top-level images. Scala adds no prompt markers, changes no
+native templates and provides no chat or text-generation fallback.
+
+Image acquisition admits at most two PNG/JPEG/WebP images, each at most 8 MiB
+compressed and 4096 by 4096 pixels, with bounded decoding. Declared MIME must match
+actual bytes. Data URLs remain byte-preserving. HTTP(S) references use public-only
+DNS/IP admission, pinned DNS results, standard ports, bounded response streaming
+and timeouts, with redirects, credentials and proxy use disabled. Private/local
+addresses, malformed rasters and unsupported media are rejected before execution.
+System One's existing image transport receives the same native admission checks.
+
+Decision activity uses existing admission/loading and request leases, then
+`ProcessingDecision` and bounded transient `Completed`, `Failed` or `Cancelled`
+observations (16 recent terminals, 30-second retention). It does not report token
+generation. Request/session identity and runtime ownership survive these phases.
+Disconnect, timeout and unload/shutdown drop the corresponding native HTTP future
+and lease; upstream's request-stop mechanism cancels that work. Owned JIT-load
+cancellation does not invalidate another request's load or inference. No new public
+cancellation protocol or persistent progress settings are introduced. Synthetic
+HTTP disconnect/concurrency tests exercise cleanup; no live model was used.

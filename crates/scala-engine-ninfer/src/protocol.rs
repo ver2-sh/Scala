@@ -23,6 +23,7 @@ pub(crate) struct RequestAdmission {
     pub(crate) media_semantics: bool,
     pub(crate) vision: bool,
     pub(crate) greedy: bool,
+    pub(crate) constrained: bool,
 }
 
 pub(crate) fn backend_request(
@@ -123,7 +124,8 @@ pub(crate) fn backend_request(
                 .to_owned(),
         ));
     }
-    if !request.tools.is_empty()
+    if !admission.constrained
+        && !request.tools.is_empty()
         && matches!(
             request.tool_choice,
             Some(InferenceToolChoice::Required | InferenceToolChoice::Function { .. })
@@ -133,11 +135,35 @@ pub(crate) fn backend_request(
             "NInfer can enforce only auto or none tool_choice".to_owned(),
         ));
     }
-    if !request.tools.is_empty() && request.parallel_tool_calls == Some(false) {
+    if !admission.constrained
+        && !request.tools.is_empty()
+        && request.parallel_tool_calls == Some(false)
+    {
         return Err(EngineError::InvalidGenerationSettings(
             "NInfer cannot guarantee a single tool call; parallel_tool_calls=false is unsupported"
                 .to_owned(),
         ));
+    }
+    let constrained = request
+        .output_format
+        .as_ref()
+        .is_some_and(|f| !matches!(f, scala_engine::OutputFormat::Text))
+        || request.tools.iter().any(|t| t.strict == Some(true));
+    if constrained && !admission.constrained {
+        return Err(EngineError::InvalidGenerationSettings("This exact NInfer Runtime has no native constrained-output contract; select the reviewed Linux v3 source Runtime.".into()));
+    }
+    if constrained
+        && request
+            .generation_settings
+            .stop
+            .as_ref()
+            .is_some_and(|s| !s.is_empty())
+    {
+        return Err(EngineError::NativeRequest {
+            message: "NInfer constraints cannot be combined with custom stop strings.".into(),
+            parameter: "stop".into(),
+            code: "invalid_output_constraint",
+        });
     }
     let mut body = json!({
         "model": request.model_profile_id.as_str(),
@@ -197,6 +223,7 @@ pub(crate) fn backend_request(
                             "name": tool.name,
                             "description": tool.description,
                             "parameters": tool.parameters,
+                            "strict": tool.strict,
                         }
                     })
                 })
@@ -206,13 +233,46 @@ pub(crate) fn backend_request(
             body["tool_choice"] = match choice {
                 InferenceToolChoice::Auto => json!("auto"),
                 InferenceToolChoice::None => json!("none"),
-                InferenceToolChoice::Required | InferenceToolChoice::Function { .. } => {
-                    unreachable!("unsupported choices rejected above")
+                InferenceToolChoice::Required => json!("required"),
+                InferenceToolChoice::Function { name } => {
+                    json!({"type":"function","function":{"name":name}})
                 }
             };
         }
         if let Some(parallel) = request.parallel_tool_calls {
             body["parallel_tool_calls"] = json!(parallel);
+        }
+    }
+    if let Some(format) = &request.output_format {
+        use scala_engine::OutputFormat;
+        match format {
+            OutputFormat::Text => {}
+            OutputFormat::JsonObject => body["response_format"] = json!({"type":"json_object"}),
+            OutputFormat::JsonSchema {
+                name,
+                description,
+                schema,
+                strict,
+            } => {
+                let mut spec = json!({"schema":schema});
+                if let Some(name) = name {
+                    spec["name"] = json!(name);
+                }
+                if let Some(description) = description {
+                    spec["description"] = json!(description);
+                }
+                if let Some(strict) = strict {
+                    spec["strict"] = json!(strict);
+                }
+                body["response_format"] = json!({"type":"json_schema","json_schema":spec});
+            }
+            OutputFormat::Gbnf { grammar } => {
+                body["structured_outputs"] = json!({"grammar":grammar})
+            }
+            OutputFormat::LiteralChoice { choices } => {
+                body["structured_outputs"] = json!({"choice":choices})
+            }
+            OutputFormat::Regex { regex } => body["structured_outputs"] = json!({"regex":regex}),
         }
     }
     Ok(body)
@@ -276,18 +336,65 @@ fn message_json(message: &InferenceMessage) -> Value {
     value
 }
 
+pub(crate) fn requires_constraint_observation(request: &InferenceRequest) -> bool {
+    !matches!(
+        request.output_format,
+        None | Some(scala_engine::OutputFormat::Text)
+    ) || request.tools.iter().any(|tool| tool.strict == Some(true))
+}
+fn validate_constraint(
+    observation: Option<&Value>,
+    required: bool,
+    finish: InferenceFinishReason,
+) -> Result<(), EngineError> {
+    let Some(c) = observation else {
+        return if required {
+            Err(EngineError::Operation(
+                "Native constrained output omitted its completion observation.".into(),
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    if !matches!(
+        c["branch"].as_str(),
+        Some("content" | "tools" | "undecided")
+    ) || c["complete"].as_bool().is_none()
+        || c["terminated"].as_bool().is_none()
+    {
+        return Err(EngineError::Operation(
+            "Invalid native constraint completion observation.".into(),
+        ));
+    }
+    if c["complete"] == false && finish != InferenceFinishReason::MaxOutputTokens {
+        return Err(EngineError::NativeRequest {
+            message: "Native generation ended before completing the requested output constraint; retry with sufficient output/context budget.".into(),
+            parameter: "response_format".into(), code: "incomplete_constrained_output",
+        });
+    }
+    Ok(())
+}
+
 pub(crate) async fn parse_completion_response(
     response: reqwest::Response,
+    constrained: bool,
 ) -> Result<InferenceOutput, EngineError> {
     let status = response.status();
     let body = read_bounded_body(response, PRIVATE_BODY_LIMIT).await?;
     if !status.is_success() {
         return Err(backend_http_error(status, &body));
     }
-    decode_completion_body(&body)
+    decode_completion_body_checked(&body, constrained)
 }
 
+#[cfg(test)]
 fn decode_completion_body(body: &[u8]) -> Result<InferenceOutput, EngineError> {
+    decode_completion_body_checked(body, false)
+}
+fn decode_completion_body_checked(
+    body: &[u8],
+    constrained: bool,
+) -> Result<InferenceOutput, EngineError> {
     let response: ChatCompletionResponse = serde_json::from_slice(body).map_err(|error| {
         EngineError::Operation(format!("invalid NInfer completion response: {error}"))
     })?;
@@ -295,6 +402,7 @@ fn decode_completion_body(body: &[u8]) -> Result<InferenceOutput, EngineError> {
         EngineError::Operation("NInfer response contained no completion choice".to_owned())
     })?;
     let finish_reason = map_finish_reason(choice.finish_reason.as_deref())?;
+    validate_constraint(response.constraint.as_ref(), constrained, finish_reason)?;
     let tool_calls = choice
         .message
         .tool_calls
@@ -320,17 +428,22 @@ fn decode_completion_body(body: &[u8]) -> Result<InferenceOutput, EngineError> {
 
 pub(crate) async fn parse_stream_response(
     response: reqwest::Response,
+    constrained: bool,
 ) -> Result<InferenceStream, EngineError> {
     let status = response.status();
     if !status.is_success() {
         let body = read_bounded_body(response, SSE_FRAME_LIMIT).await?;
         return Err(backend_http_error(status, &body));
     }
-    Ok(sse_stream(response.bytes_stream().boxed()))
+    Ok(sse_stream_checked(
+        response.bytes_stream().boxed(),
+        constrained,
+    ))
 }
 
 #[derive(Deserialize)]
 struct ChatCompletionResponse {
+    constraint: Option<Value>,
     choices: Vec<ChatChoice>,
     usage: Option<ChatUsage>,
 }
@@ -408,10 +521,19 @@ struct SseState {
     finish_reason: Option<InferenceFinishReason>,
     finished: bool,
     reasoning_started: Option<std::time::Instant>,
+    constraint: Option<Value>,
+    constrained: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn sse_stream(
     source: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+) -> InferenceStream {
+    sse_stream_checked(source, false)
+}
+fn sse_stream_checked(
+    source: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    constrained: bool,
 ) -> InferenceStream {
     let state = SseState {
         source,
@@ -421,6 +543,8 @@ pub(crate) fn sse_stream(
         finish_reason: None,
         finished: false,
         reasoning_started: None,
+        constraint: None,
+        constrained,
     };
     Box::pin(stream::unfold(state, |mut state| async move {
         loop {
@@ -485,10 +609,17 @@ fn parse_sse_frames(state: &mut SseState) {
         if data == "[DONE]" {
             match state.finish_reason.take() {
                 Some(finish_reason) => {
-                    state.queued.push_back(Ok(InferenceEvent::Completed {
-                        usage: state.usage.take(),
+                    match validate_constraint(
+                        state.constraint.as_ref(),
+                        state.constrained,
                         finish_reason,
-                    }));
+                    ) {
+                        Ok(()) => state.queued.push_back(Ok(InferenceEvent::Completed {
+                            usage: state.usage.take(),
+                            finish_reason,
+                        })),
+                        Err(error) => state.queued.push_back(Err(error)),
+                    }
                 }
                 None => state.queued.push_back(Err(EngineError::BackendUnavailable(
                     "NInfer stream reached [DONE] without a terminal finish reason".to_owned(),
@@ -507,13 +638,27 @@ fn parse_sse_frames(state: &mut SseState) {
                 return;
             }
         };
-        if let Some(error) = value.get("error") {
-            state.queued.push_back(Err(EngineError::Operation(format!(
-                "NInfer streaming error: {}",
-                backend_error_message(error)
-            ))));
+        if value.get("error").is_some() {
+            state.queued.push_back(Err(backend_http_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                data.as_bytes(),
+            )));
             state.finished = true;
             return;
+        }
+        if let Some(c) = value.get("constraint").filter(|v| !v.is_null()) {
+            if state
+                .constraint
+                .as_ref()
+                .is_some_and(|previous| previous != c)
+            {
+                state.queued.push_back(Err(EngineError::Operation(
+                    "conflicting native constraint observations".into(),
+                )));
+                state.finished = true;
+                return;
+            }
+            state.constraint = Some(c.clone());
         }
         if let Some(usage) = value.get("usage").filter(|usage| !usage.is_null()) {
             match serde_json::from_value::<ChatUsage>(usage.clone()) {
@@ -683,6 +828,42 @@ pub(crate) fn map_transport_error(error: reqwest::Error) -> EngineError {
 }
 
 pub(crate) fn backend_http_error(status: reqwest::StatusCode, body: &[u8]) -> EngineError {
+    if status == reqwest::StatusCode::BAD_REQUEST
+        && let Ok(v) = serde_json::from_slice::<Value>(body)
+    {
+        let e = &v["error"];
+        let code = match e["code"].as_str() {
+            Some("invalid_json_schema") => Some("invalid_json_schema"),
+            Some("unsupported_json_schema") => Some("unsupported_json_schema"),
+            Some("unsatisfiable_json_schema") => Some("unsatisfiable_json_schema"),
+            Some("invalid_output_constraint") => Some("invalid_output_constraint"),
+            Some("invalid_tool_constraint") => Some("invalid_tool_constraint"),
+            Some("invalid_grammar") => Some("invalid_grammar"),
+            Some("invalid_regex") => Some("invalid_regex"),
+            Some("invalid_choice") => Some("invalid_choice"),
+            Some("constraint_dead_end") => Some("constraint_dead_end"),
+            Some("invalid_request_error") => Some("invalid_request_error"),
+            None if e["type"] == "invalid_request_error" => Some("invalid_request_error"),
+            _ => None,
+        };
+        if let Some(code) = code {
+            return EngineError::NativeRequest {
+                message: e["message"]
+                    .as_str()
+                    .unwrap_or("Native output constraint rejected.")
+                    .chars()
+                    .take(4096)
+                    .collect(),
+                parameter: e["param"]
+                    .as_str()
+                    .unwrap_or("response_format")
+                    .chars()
+                    .take(512)
+                    .collect(),
+                code,
+            };
+        }
+    }
     let message = serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|value| value.get("error").cloned())
@@ -766,6 +947,7 @@ mod tests {
 
     fn thinking_admission() -> RequestAdmission {
         RequestAdmission {
+            constrained: false,
             protocol_semantics: true,
             sampler_semantics: true,
             thinking_semantics: true,
@@ -773,6 +955,133 @@ mod tests {
             media_semantics: true,
             vision: false,
             greedy: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn native_constraint_completion_is_required_and_streamed_without_false_success() {
+        let mut body = json!({"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]});
+        assert!(decode_completion_body_checked(body.to_string().as_bytes(), true).is_err());
+        body["constraint"] = json!({"branch":"content","complete":true,"terminated":true});
+        assert!(decode_completion_body_checked(body.to_string().as_bytes(), true).is_ok());
+        body["constraint"]["complete"] = json!(false);
+        assert!(matches!(
+            decode_completion_body_checked(body.to_string().as_bytes(), true),
+            Err(EngineError::NativeRequest {
+                code: "incomplete_constrained_output",
+                ..
+            })
+        ));
+        body["choices"][0]["finish_reason"] = json!("length");
+        assert_eq!(
+            decode_completion_body_checked(body.to_string().as_bytes(), true)
+                .unwrap()
+                .finish_reason,
+            InferenceFinishReason::MaxOutputTokens
+        );
+        for complete in [false, true] {
+            let payload = json!({"choices":[{"delta":{},"finish_reason":"stop"}],"constraint":{"branch":"content","complete":complete,"terminated":true}});
+            let source = stream::iter(vec![Ok(Bytes::from(format!(
+                "data: {payload}\n\ndata: [DONE]\n\n"
+            )))])
+            .boxed();
+            let events = sse_stream_checked(source, true).collect::<Vec<_>>().await;
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|e| matches!(e, Ok(InferenceEvent::Completed { .. }))),
+                complete
+            );
+            assert_eq!(events.iter().any(Result::is_err), !complete);
+        }
+    }
+
+    #[test]
+    fn native_v3_constraints_are_exact_and_v2_windows_guarantees_stay_closed() {
+        use scala_engine::OutputFormat;
+        let cases = [
+            (OutputFormat::JsonObject, json!({"type":"json_object"})),
+            (
+                OutputFormat::JsonSchema {
+                    name: Some("answer".into()),
+                    description: None,
+                    schema: json!({"type":"object","properties":{"x":{"type":"integer","minimum":0}},"required":["x"],"additionalProperties":false}),
+                    strict: Some(true),
+                },
+                json!("schema"),
+            ),
+            (
+                OutputFormat::Gbnf {
+                    grammar: "root ::= \"ok\"".into(),
+                },
+                json!({"grammar":"root ::= \"ok\""}),
+            ),
+            (
+                OutputFormat::LiteralChoice {
+                    choices: vec!["a".into(), "b".into()],
+                },
+                json!({"choice":["a","b"]}),
+            ),
+            (
+                OutputFormat::Regex {
+                    regex: "[a-z]+".into(),
+                },
+                json!({"regex":"[a-z]+"}),
+            ),
+        ];
+        for (format, expected) in cases {
+            for streaming in [false, true] {
+                let mut r = request();
+                r.output_format = Some(format.clone());
+                assert!(backend_request(&r, streaming, thinking_admission()).is_err());
+                let mut admitted = thinking_admission();
+                admitted.constrained = true;
+                let body = backend_request(&r, streaming, admitted).unwrap();
+                if expected == json!("schema") {
+                    assert_eq!(
+                        body["response_format"]["json_schema"]["schema"],
+                        json!({"type":"object","properties":{"x":{"type":"integer","minimum":0}},"required":["x"],"additionalProperties":false})
+                    );
+                    assert!(
+                        body["response_format"]["json_schema"]
+                            .get("description")
+                            .is_none()
+                    );
+                } else if matches!(format, OutputFormat::JsonObject) {
+                    assert_eq!(body["response_format"], expected);
+                } else {
+                    assert_eq!(body["structured_outputs"], expected);
+                }
+                r.generation_settings.stop = Some(vec!["x".into()]);
+                assert!(backend_request(&r, streaming, admitted).is_err());
+            }
+        }
+        let mut r = request();
+        r.tools.push(scala_engine::InferenceTool {
+            name: "lookup".into(),
+            description: None,
+            parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+            strict: Some(true),
+        });
+        let mut admitted = thinking_admission();
+        assert!(backend_request(&r, false, admitted).is_err());
+        admitted.constrained = true;
+        let body = backend_request(&r, true, admitted).unwrap();
+        assert_eq!(body["tools"][0]["function"]["strict"], true);
+    }
+    #[test]
+    fn native_schema_failure_categories_and_parameter_locations_survive() {
+        for code in [
+            "invalid_json_schema",
+            "unsupported_json_schema",
+            "unsatisfiable_json_schema",
+            "invalid_output_constraint",
+            "invalid_tool_constraint",
+        ] {
+            let wire=serde_json::to_vec(&json!({"error":{"code":code,"param":"response_format.json_schema.schema/properties/x/format","message":"native schema rejection"}})).unwrap();
+            assert!(
+                matches!(backend_http_error(reqwest::StatusCode::BAD_REQUEST,&wire),EngineError::NativeRequest{code:actual,parameter,..} if actual==code && parameter.ends_with("/properties/x/format"))
+            );
         }
     }
 
@@ -968,6 +1277,7 @@ mod tests {
     #[test]
     fn message_order_and_sampler_omission_are_preserved() {
         let admission = RequestAdmission {
+            constrained: false,
             protocol_semantics: true,
             sampler_semantics: true,
             thinking_semantics: true,

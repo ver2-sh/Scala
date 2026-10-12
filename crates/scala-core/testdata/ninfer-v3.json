@@ -1,0 +1,345 @@
+{
+  "components": {
+    "text": {
+      "config": {
+        "architectures": [
+          "Qwen3_5ForCausalLM"
+        ],
+        "model_type": "qwen3_5_text",
+        "hidden_size": 8,
+        "vocab_size": 16,
+        "num_hidden_layers": 1,
+        "max_position_embeddings": 512,
+        "tie_word_embeddings": false,
+        "rms_norm_eps": 1e-06,
+        "layer_types": [
+          "full_attention"
+        ],
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+        "rope_parameters": {
+          "rope_theta": 10000,
+          "partial_rotary_factor": 1,
+          "mrope_section": [
+            2,
+            0,
+            0
+          ]
+        },
+        "intermediate_size": 16
+      },
+      "resources": {
+        "tokenizer.json": "resource-tokenizer.json",
+        "tokenizer_config.json": "resource-tokenizer_config.json",
+        "chat_template.jinja": "resource-chat_template.jinja",
+        "generation_config.json": "resource-generation_config.json"
+      }
+    }
+  },
+  "objects": [
+    {
+      "id": "physical-0",
+      "kind": "tensor",
+      "shape": [
+        16,
+        8
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 0,
+      "bytes": 256
+    },
+    {
+      "id": "physical-1",
+      "kind": "tensor",
+      "shape": [
+        16,
+        8
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 256,
+      "bytes": 256
+    },
+    {
+      "id": "physical-2",
+      "kind": "tensor",
+      "shape": [
+        8
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 512,
+      "bytes": 16
+    },
+    {
+      "id": "physical-3",
+      "kind": "tensor",
+      "shape": [
+        8
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 768,
+      "bytes": 16
+    },
+    {
+      "id": "physical-4",
+      "kind": "tensor",
+      "shape": [
+        8
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 1024,
+      "bytes": 16
+    },
+    {
+      "id": "physical-5",
+      "kind": "tensor",
+      "shape": [
+        8,
+        8
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 1280,
+      "bytes": 128
+    },
+    {
+      "id": "physical-6",
+      "kind": "tensor",
+      "shape": [
+        4,
+        8
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 1536,
+      "bytes": 64
+    },
+    {
+      "id": "physical-7",
+      "kind": "tensor",
+      "shape": [
+        8,
+        8
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 1792,
+      "bytes": 128
+    },
+    {
+      "id": "physical-8",
+      "kind": "tensor",
+      "shape": [
+        4,
+        8
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 2048,
+      "bytes": 64
+    },
+    {
+      "id": "physical-9",
+      "kind": "tensor",
+      "shape": [
+        4
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 2304,
+      "bytes": 8
+    },
+    {
+      "id": "physical-10",
+      "kind": "tensor",
+      "shape": [
+        4
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 2560,
+      "bytes": 8
+    },
+    {
+      "id": "physical-11",
+      "kind": "tensor",
+      "shape": [
+        8,
+        8
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 2816,
+      "bytes": 128
+    },
+    {
+      "id": "physical-12",
+      "kind": "tensor",
+      "shape": [
+        16,
+        8
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 3072,
+      "bytes": 256
+    },
+    {
+      "id": "physical-13",
+      "kind": "tensor",
+      "shape": [
+        16,
+        8
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 3328,
+      "bytes": 256
+    },
+    {
+      "id": "physical-14",
+      "kind": "tensor",
+      "shape": [
+        8,
+        16
+      ],
+      "format": "bf16",
+      "layout": "contiguous_le_v1",
+      "offset": 3584,
+      "bytes": 256
+    },
+    {
+      "id": "resource-tokenizer.json",
+      "kind": "resource",
+      "encoding": "raw_bytes_v1",
+      "offset": 3840,
+      "bytes": 2
+    },
+    {
+      "id": "resource-tokenizer_config.json",
+      "kind": "resource",
+      "encoding": "raw_bytes_v1",
+      "offset": 3842,
+      "bytes": 2
+    },
+    {
+      "id": "resource-chat_template.jinja",
+      "kind": "resource",
+      "encoding": "raw_bytes_v1",
+      "offset": 3844,
+      "bytes": 2
+    },
+    {
+      "id": "resource-generation_config.json",
+      "kind": "resource",
+      "encoding": "raw_bytes_v1",
+      "offset": 3846,
+      "bytes": 2
+    }
+  ],
+  "bindings": {
+    "text/token_embedding": {
+      "object": "physical-0"
+    },
+    "text/output_head": {
+      "object": "physical-1"
+    },
+    "text/final_norm": {
+      "object": "physical-2"
+    },
+    "text/layers/0/input_norm": {
+      "object": "physical-3"
+    },
+    "text/layers/0/post_attention_norm": {
+      "object": "physical-4"
+    },
+    "text/layers/0/attention/query": {
+      "object": "physical-5"
+    },
+    "text/layers/0/attention/key": {
+      "object": "physical-6"
+    },
+    "text/layers/0/attention/gate": {
+      "object": "physical-7"
+    },
+    "text/layers/0/attention/value": {
+      "object": "physical-8"
+    },
+    "text/layers/0/attention/query_norm": {
+      "object": "physical-9"
+    },
+    "text/layers/0/attention/key_norm": {
+      "object": "physical-10"
+    },
+    "text/layers/0/attention/output": {
+      "object": "physical-11"
+    },
+    "text/layers/0/mlp/gate": {
+      "object": "physical-12"
+    },
+    "text/layers/0/mlp/up": {
+      "object": "physical-13"
+    },
+    "text/layers/0/mlp/down": {
+      "object": "physical-14"
+    }
+  },
+  "uses": [
+    {
+      "parameter": "text/output_head",
+      "input": "text/final_hidden",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/attention/query",
+      "input": "text/layers/0/mixer_input",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/attention/key",
+      "input": "text/layers/0/mixer_input",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/attention/gate",
+      "input": "text/layers/0/mixer_input",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/attention/value",
+      "input": "text/layers/0/mixer_input",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/attention/output",
+      "input": "text/layers/0/attention/gated_output",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/mlp/gate",
+      "input": "text/layers/0/ffn_input",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/mlp/up",
+      "input": "text/layers/0/ffn_input",
+      "activation_policy": "A16Only"
+    },
+    {
+      "parameter": "text/layers/0/mlp/down",
+      "input": "text/layers/0/mlp/product",
+      "activation_policy": "A16Only"
+    }
+  ],
+  "files": [
+    {
+      "path": null,
+      "payload_bytes": 3848
+    }
+  ]
+}

@@ -14,7 +14,76 @@ pub(super) fn candidate(model: &ModelArtifact) -> bool {
             if identity.decision_type.as_deref().is_some_and(|kind| !kind.is_empty() && kind != "none"))
 }
 
-fn tuple_key(
+// Metadata identifiers from the pinned native can_use_images() switch.
+// This never detects Decision: executable/model/probe qualification is required first.
+fn reviewed_image_contract(revision: Option<&str>, native_type: Option<&str>) -> bool {
+    match revision {
+        Some("d81235049384534c167caea52b85a694f6103d14") => {
+            matches!(native_type, Some("openjev" | "clef"))
+        }
+        Some("f9a95aeb2096d0c0218e0cd6e6d901cd37be798a") => matches!(
+            native_type,
+            Some("openjev" | "clef" | "pplx-decider" | "lfm2-d1" | "lfm2-d1-omni")
+        ),
+        _ => false,
+    }
+}
+
+pub(super) fn file_fingerprint(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(format!(
+            "{}:{modified}:{}:{}:{}:{}",
+            metadata.len(),
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        Some(format!(
+            "{}:{modified}:{:?}",
+            metadata.len(),
+            metadata.created().ok()
+        ))
+    }
+}
+fn qualified_files(
+    runtime: &InstalledRuntime,
+    model: &ModelArtifact,
+    settings: &ResolvedSettings,
+) -> Vec<(PathBuf, Option<String>)> {
+    let mut paths = vec![runtime.entrypoint_path(), model.path.clone()];
+    paths.extend(model.auxiliary_artifacts.iter().map(|a| a.path.clone()));
+    paths.extend(settings.configured.values().filter_map(|value| {
+        if let scala_core::SettingValue::Path(path) = &value.value {
+            Some(path.clone())
+        } else {
+            None
+        }
+    }));
+    paths
+        .into_iter()
+        .map(|path| {
+            let stamp = file_fingerprint(&path);
+            (path, stamp)
+        })
+        .collect()
+}
+pub(super) fn tuple_key(
     runtime: &InstalledRuntime,
     model: &ModelArtifact,
     settings: &ResolvedSettings,
@@ -25,11 +94,14 @@ fn tuple_key(
             serde_json::to_vec(&(
                 LlamaCppAdapter::capability_key(runtime),
                 &runtime.manifest.identity,
+                &runtime.manifest.probe,
+                qualified_files(runtime, model, settings),
                 &model.id,
                 &model.path,
                 &model.hash,
                 model.size_bytes,
                 &model.native_identity,
+                &model.auxiliary_artifacts,
                 &settings.engine_id,
                 &settings.model_profile_id,
                 &settings.configured,
@@ -51,6 +123,9 @@ pub(super) struct LaunchProof {
     ready: bool,
     build_info: Option<String>,
     model_metadata: Option<Value>,
+    vision: bool,
+    image_contract: bool,
+    files: Vec<(PathBuf, Option<String>)>,
 }
 
 async fn body(response: reqwest::Response) -> Result<(reqwest::StatusCode, Vec<u8>), EngineError> {
@@ -69,14 +144,19 @@ async fn body(response: reqwest::Response) -> Result<(reqwest::StatusCode, Vec<u
     Ok((status, bytes))
 }
 
+fn media_error(message: impl Into<String>, parameter: impl Into<String>) -> EngineError {
+    EngineError::NativeRequest {
+        message: message.into(),
+        parameter: parameter.into(),
+        code: "unsupported_decision_media",
+    }
+}
+
 /// Translate only the private native wire body; public requests stay unchanged.
-fn native_request_body(request: &DecisionRequest) -> Result<Value, EngineError> {
+pub(super) fn native_request_body(request: &DecisionRequest) -> Result<Value, EngineError> {
     request
         .validate()
         .map_err(EngineError::InvalidDecisionRequest)?;
-    if !request.images.is_empty() {
-        return Err(EngineError::Unsupported("native decision images".into()));
-    }
     for (name, question) in &request.questions {
         if let DecisionQuestion::Score { criteria, .. } = question
             && !(2..=10).contains(&criteria.len())
@@ -100,7 +180,94 @@ fn native_request_body(request: &DecisionRequest) -> Result<Value, EngineError> 
             .entry("instructions")
             .or_insert_with(|| json!(""));
     }
-    Ok(json!({"state": request.state, "questions": questions}))
+    let mut body = json!({"state": request.state, "questions": questions});
+    let mut embedded = Vec::new();
+    let (messages, prefix) = match &request.state {
+        scala_engine::DecisionContent::Array(messages) => (Some(messages), "state"),
+        scala_engine::DecisionContent::Object(state) => (
+            state.get("messages").and_then(Value::as_array),
+            "state.messages",
+        ),
+        _ => (None, "state"),
+    };
+    if let Some(messages) = messages {
+        let mut first_image = None;
+        let mut has_other_parts = false;
+        for (i, message) in messages.iter().enumerate() {
+            let Some(parts) = message.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for (j, part) in parts.iter().enumerate() {
+                let field = format!("{prefix}[{i}].content[{j}]");
+                match part.get("type").and_then(Value::as_str) {
+                    Some("image_url") => {
+                        let image_url = &part["image_url"];
+                        let url = image_url
+                            .as_str()
+                            .or_else(|| image_url.get("url").and_then(Value::as_str))
+                            .ok_or_else(|| {
+                                media_error(
+                                    "Invalid native image_url part",
+                                    format!("{field}.image_url"),
+                                )
+                            })?;
+                        // parse_state removes the whole part, including annotations.
+                        if part.as_object().is_some_and(|p| {
+                            p.keys()
+                                .any(|k| !matches!(k.as_str(), "type" | "image_url"))
+                        }) || image_url
+                            .as_object()
+                            .is_some_and(|p| p.keys().any(|k| k != "url"))
+                        {
+                            return Err(media_error(
+                                "Native Decision cannot retain image annotations or detail controls.",
+                                field,
+                            ));
+                        }
+                        first_image.get_or_insert(field);
+                        embedded.push(url);
+                    }
+                    Some("input_audio" | "audio" | "video_url" | "input_image" | "file") => {
+                        return Err(media_error(
+                            "This native Decision transport admits text and validated images only.",
+                            field,
+                        ));
+                    }
+                    _ => has_other_parts = true,
+                }
+            }
+        }
+        if let Some(field) = first_image {
+            // At both frozen revisions parse_state removes image parts and render
+            // receives only a shared ordered media list. It cannot retain text/image
+            // positions or associate images with one of several messages. A sole
+            // image-only message has neither ambiguity; explicit top-level images
+            // already express the native shared-media semantics.
+            if messages.len() != 1 || has_other_parts {
+                return Err(media_error(
+                    "Native Decision retains image bytes/order but cannot retain embedded text/image positions or associations across messages. Use a single image-only message, or /v1/systemone with explicit shared images and state.",
+                    field,
+                ));
+            }
+        }
+    }
+    if !embedded.is_empty() {
+        if embedded
+            != request
+                .images
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        {
+            return Err(media_error(
+                "Embedded decision media must match the admitted ordered images.",
+                prefix,
+            ));
+        }
+    } else if !request.images.is_empty() {
+        body["images"] = json!(request.images);
+    }
+    Ok(body)
 }
 
 impl LlamaCppAdapter {
@@ -135,6 +302,15 @@ impl LlamaCppAdapter {
                     ready: false,
                     build_info: None,
                     model_metadata: None,
+                    vision: false,
+                    files: qualified_files(&spec.runtime, &spec.model.primary, &spec.settings),
+                    image_contract: reviewed_image_contract(
+                        spec.runtime.manifest.identity.upstream_revision.as_deref(),
+                        match &spec.model.primary.native_identity {
+                            Some(ArtifactNativeIdentity::Gguf(i)) => i.decision_type.as_deref(),
+                            _ => None,
+                        },
+                    ),
                 },
             );
     }
@@ -250,7 +426,11 @@ impl LlamaCppAdapter {
             {
                 return None;
             }
-            Some((build_info, model.clone()))
+            Some((
+                build_info,
+                model.clone(),
+                props.pointer("/modalities/vision").and_then(Value::as_bool) == Some(true),
+            ))
         }
         .await;
         let mut proofs = self.decision_proofs.write().expect("decision proof lock");
@@ -261,11 +441,26 @@ impl LlamaCppAdapter {
                 && proof.model_id == process.model_id
         }) {
             proof.ready = result.is_some();
-            if let Some((build_info, metadata)) = result {
+            if let Some((build_info, metadata, vision)) = result {
                 proof.build_info = Some(build_info);
                 proof.model_metadata = Some(metadata);
+                proof.vision = vision && proof.image_contract;
             }
         }
+    }
+
+    pub(super) fn decision_vision_supported(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        settings: &ResolvedSettings,
+    ) -> bool {
+        let key = tuple_key(runtime, model, settings);
+        self.decision_proofs
+            .read()
+            .expect("decision proof lock")
+            .values()
+            .any(|p| p.key == key && p.ready && p.vision && p.executable_verified)
     }
 
     pub(super) fn decision_supported(
@@ -319,7 +514,12 @@ impl LlamaCppAdapter {
             .is_some_and(|proof| {
                 proof.executable_verified
                     && proof.ready
+                    && proof
+                        .files
+                        .iter()
+                        .all(|(path, stamp)| file_fingerprint(path) == *stamp)
                     && proof.profile_id.as_ref() == Some(&request.model_profile_id)
+                    && (request.images.is_empty() || proof.vision)
             })
         {
             return Err(EngineError::Unsupported(
@@ -332,6 +532,7 @@ impl LlamaCppAdapter {
         let (status, bytes) = body(
             self.client
                 .post(format!("{endpoint}/v1/systemone"))
+                .timeout(Duration::from_secs(10 * 60))
                 .json(&request_body)
                 .send()
                 .await
@@ -339,8 +540,30 @@ impl LlamaCppAdapter {
         )
         .await?;
         if !status.is_success() {
+            if status == reqwest::StatusCode::BAD_REQUEST {
+                let message = serde_json::from_slice::<Value>(&bytes)
+                    .ok()
+                    .and_then(|v| {
+                        v.pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .map(|s| s.chars().take(2048).collect::<String>())
+                    })
+                    .unwrap_or_else(|| {
+                        "Native decision request violates this model's limits".into()
+                    });
+                return Err(EngineError::InvalidDecisionRequest(message));
+            }
+            if status == reqwest::StatusCode::NOT_IMPLEMENTED {
+                return Err(EngineError::Unsupported(
+                    "This exact native decision pair does not support the requested modality"
+                        .into(),
+                ));
+            }
             return Err(backend_http_error(status, &bytes));
         }
+        let native_usage = serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("usage").cloned());
         let wire: WireOutput = serde_json::from_slice(&bytes).map_err(|error| {
             EngineError::Operation(format!("invalid llama.cpp System One response: {error}"))
         })?;
@@ -362,6 +585,7 @@ impl LlamaCppAdapter {
             })
             .transpose()?;
         Ok(DecisionOutput {
+            native_usage,
             model: wire.model,
             answers: wire.answers,
             usage,
@@ -397,6 +621,9 @@ mod tests {
 
     struct Backend {
         calls: Mutex<Vec<(String, String, Value)>>,
+        gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+        pending: std::sync::atomic::AtomicUsize,
+        cancelled: std::sync::atomic::AtomicUsize,
         props: Value,
         models: Value,
         native: bool,
@@ -420,6 +647,38 @@ mod tests {
             .lock()
             .unwrap()
             .push((method, path.clone(), payload.clone()));
+        let gate = backend.gate.lock().unwrap().clone();
+        if path == "/v1/systemone"
+            && payload != json!({})
+            && let Some(gate) = gate
+        {
+            struct Pending<'a> {
+                backend: &'a Backend,
+                complete: bool,
+            }
+            impl Drop for Pending<'_> {
+                fn drop(&mut self) {
+                    self.backend
+                        .pending
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    if !self.complete {
+                        self.backend
+                            .cancelled
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+            backend
+                .pending
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut pending = Pending {
+                backend: &backend,
+                complete: false,
+            };
+            let permit = gate.acquire().await.unwrap();
+            permit.forget();
+            pending.complete = true;
+        }
         let (status, value) = match path.as_str() {
             "/props" => (StatusCode::OK, backend.props.clone()),
             "/v1/models" | "/models" => (StatusCode::OK, backend.models.clone()),
@@ -518,7 +777,7 @@ mod tests {
         let sha = hash_file(&executable).await.unwrap();
         let identity: RuntimeIdentity = serde_json::from_value(json!({
             "engine_id":ENGINE_ID,"package_family":"llama-cpp","version":if native {"b11425"} else {"b10000"},
-            "upstream_revision":null,"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,
+            "upstream_revision":if native {Some("d81235049384534c167caea52b85a694f6103d14")}else{None},"platform":std::env::consts::OS,"architecture":std::env::consts::ARCH,
             "accelerator":"cpu","variant":"cpu", "package":{"provider_id":LLAMA_CPP_RUNTIME_PROVIDER_ID,
                 "repository":"ggml-org/llama.cpp","release_tag":if native {"b11425"} else {"b10000"},"asset_id":"1","asset_name":"fixture.zip"}
         })).unwrap();
@@ -553,13 +812,16 @@ mod tests {
         }
         let backend = Arc::new(Backend {
             calls: Mutex::new(Vec::new()),
+            gate: Mutex::new(None),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            cancelled: std::sync::atomic::AtomicUsize::new(0),
             native,
             probe_response: Mutex::new((
                 StatusCode::BAD_REQUEST,
                 json!({"error":{"code":400,"type":"invalid_request_error","message":STATE_REQUIRED}}),
             )),
             props: json!({"model_path":path,"model_alias":"decision-profile","build_info":"b11425-e117148",
-                "default_generation_settings":{"n_ctx":2048,"params":{"temperature":0.8,"top_p":0.9}},"total_slots":1}),
+                "default_generation_settings":{"n_ctx":2048,"params":{"temperature":0.8,"top_p":0.9}},"total_slots":1,"modalities":{"vision":matches!(kind,Some("clef"|"openjev"))}}),
             models: json!({"object":"list","data":[listed]}),
             response: Mutex::new((
                 StatusCode::OK,
@@ -653,9 +915,46 @@ mod tests {
     struct ManagedAdapter {
         native: LlamaCppAdapter,
         template: LaunchSpec,
+        // Test-only native protocol with complete usage, independent of the real
+        // llama System One wire. Never grants production llama compatibility.
+        complete_openai_contract: bool,
     }
     #[async_trait]
     impl EngineAdapter for ManagedAdapter {
+        fn supports_openai_decisions(
+            &self,
+            r: &InstalledRuntime,
+            m: &ModelArtifact,
+            s: &ResolvedSettings,
+        ) -> bool {
+            self.complete_openai_contract && self.native.supports_native_decision(r, m, s)
+        }
+        fn qualified_decision_images(
+            &self,
+            r: &InstalledRuntime,
+            m: &ModelArtifact,
+            s: &ResolvedSettings,
+        ) -> bool {
+            self.native.qualified_decision_images(r, m, s)
+        }
+        fn supports_model_decision_images(&self, m: &ModelArtifact) -> bool {
+            self.native.supports_model_decision_images(m)
+        }
+        fn validate_openai_decision_request(
+            &self,
+            r: &InstalledRuntime,
+            m: &ModelArtifact,
+            s: &ResolvedSettings,
+            q: &DecisionRequest,
+        ) -> Result<(), EngineError> {
+            if self.supports_openai_decisions(r, m, s) {
+                native_request_body(q)?;
+                Ok(())
+            } else {
+                self.native.validate_openai_decision_request(r, m, s, q)
+            }
+        }
+
         fn identity(&self) -> EngineIdentity {
             self.native.identity()
         }
@@ -746,8 +1045,8 @@ mod tests {
             _: &ProcessDescriptor,
         ) -> Result<EffectiveGenerationSettings, EngineError> {
             Ok(EffectiveGenerationSettings {
-                temperature: 0.0,
-                top_p: 1.0,
+                temperature: Some(0.0),
+                top_p: Some(1.0),
             })
         }
         async fn decide(
@@ -840,11 +1139,13 @@ mod tests {
             EngineRegistry, RuntimeManager, RuntimeManagerOptions, RuntimePackManager, RuntimeStore,
         };
         use std::sync::atomic::Ordering;
-        for (native, kind, valid_proof) in [
-            (true, Some("laya"), true),
-            (false, Some("laya"), true),
-            (true, None, true),
-            (true, Some("laya"), false),
+        for (native, kind, valid_proof, complete_openai_contract) in [
+            (true, Some("laya"), true, false),
+            (true, Some("clef"), true, false),
+            (true, Some("laya"), true, true),
+            (false, Some("laya"), true, false),
+            (true, None, true, false),
+            (true, Some("laya"), false, false),
         ] {
             let fixture = fixture(native, kind, None).await;
             if !valid_proof {
@@ -918,6 +1219,7 @@ mod tests {
                 let adapter = Arc::new(ManagedAdapter {
                     native: LlamaCppAdapter::from_config(None, Path::new(".")),
                     template: fixture.spec.clone(),
+                    complete_openai_contract,
                 });
                 let mut registry = EngineRegistry::default();
                 registry.register(adapter.clone()).unwrap();
@@ -971,6 +1273,140 @@ mod tests {
                         let (_, listed) =
                             public_request(&endpoint, "GET", "/v1/models", Value::Null).await;
                         assert_eq!(listed["data"][0]["capabilities"]["decision"], true);
+                        assert_eq!(
+                            listed["data"][0]["capabilities"]["openai_decisions"] == true,
+                            complete_openai_contract
+                        );
+                        assert_eq!(
+                            listed["data"][0]["capabilities"]["decision_images"] == true,
+                            kind == Some("clef")
+                        );
+                        if restart == 0 && unload == 0 {
+                            *fixture.backend.gate.lock().unwrap() =
+                                Some(Arc::new(tokio::sync::Semaphore::new(0)));
+                            let url = format!("{endpoint}/v1/systemone");
+                            let request_body = json!({"model":profile_id,"state":request.state,"questions":request.questions});
+                            let client = tokio::spawn(async move {
+                                reqwest::Client::new()
+                                    .post(url)
+                                    .json(&request_body)
+                                    .send()
+                                    .await
+                            });
+                            tokio::time::timeout(Duration::from_secs(3), async {
+                                while fixture.backend.pending.load(Ordering::SeqCst) == 0 {
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await
+                            .unwrap();
+                            client.abort();
+                            assert!(matches!(client.await,Err(e) if e.is_cancelled()));
+                            tokio::time::timeout(Duration::from_secs(3),async {
+                                while fixture.backend.pending.load(Ordering::SeqCst) != 0 || manager.status().await.backends[0].active_request_count != 0 { tokio::task::yield_now().await; }
+                            }).await.expect("public disconnect must cancel its private HTTP request and release its lease");
+                            assert_eq!(fixture.backend.cancelled.load(Ordering::SeqCst), 1);
+                            *fixture.backend.gate.lock().unwrap() = None;
+                        }
+                        let original = fixture.backend.response.lock().unwrap().clone();
+                        let usage = json!({"input_tokens":42,"input_tokens_details":{"cached_tokens":7,"cache_write_tokens":3},
+                            "output_tokens":5,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":47});
+                        for native_usage in [
+                            None,
+                            Some(json!({"input_tokens":42,"output_tokens":0})),
+                            Some(usage.clone()),
+                        ] {
+                            let mut wire = json!({"model":"native-reported","answers":{"q00000000":{"type":"noul","noul":0.8}}});
+                            if let Some(usage) = &native_usage {
+                                wire["usage"] = usage.clone();
+                            }
+                            *fixture.backend.response.lock().unwrap() = (StatusCode::OK, wire);
+                            manager.unload(profile_id.clone()).await.unwrap();
+                            let native_calls = fixture.backend.calls.lock().unwrap().len();
+                            let (status,result)=public_request(&endpoint,"POST","/v1/decisions",json!({"model":profile_id,"input":"synthetic","questions":[{"type":"predicate","instructions":"test"}]})).await;
+                            if complete_openai_contract && native_usage == Some(usage.clone()) {
+                                assert_eq!(status, StatusCode::OK, "{result}");
+                                assert_eq!(
+                                    result["answers"][0],
+                                    json!({"name":null,"type":"predicate","probability":0.8})
+                                );
+                                assert_eq!(result["model"], "native-reported");
+                                assert_eq!(result["usage"], usage);
+                            } else if complete_openai_contract {
+                                assert_eq!(status, StatusCode::BAD_GATEWAY, "{result}");
+                                assert_eq!(
+                                    result["error"]["code"],
+                                    "native_decision_contract_mismatch"
+                                );
+                            } else {
+                                assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+                                assert_eq!(result["error"]["code"], "unsupported_capability");
+                                // Only props/models and the empty qualification probe;
+                                // no inference even if a fake response supplies usage.
+                                assert!(
+                                    fixture.backend.calls.lock().unwrap()[native_calls..]
+                                        .iter()
+                                        .all(|(_, path, body)| path != "/v1/systemone"
+                                            || body == &json!({}))
+                                );
+                            }
+                        }
+                        *fixture.backend.response.lock().unwrap() = original;
+                        if kind == Some("clef") {
+                            let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+                            for multiple_messages in [false, true] {
+                                for openai in [false, true] {
+                                    let (image_type, text_type) = if openai {
+                                        ("input_image", "input_text")
+                                    } else {
+                                        ("image_url", "text")
+                                    };
+                                    let part = if openai {
+                                        json!({"type":image_type,"image_url":image})
+                                    } else {
+                                        json!({"type":image_type,"image_url":{"url":image}})
+                                    };
+                                    let first = json!({"role":"user","content":[{"type":text_type,"text":"Image A:"},part]});
+                                    let mut messages = vec![first];
+                                    if multiple_messages {
+                                        messages.push(json!({"role":"user","content":[{"type":text_type,"text":"Compare Image B with Image A:"},part]}));
+                                    }
+                                    let body = if openai {
+                                        json!({"model":profile_id,"input":messages,"questions":[{"type":"predicate","instructions":"compare"}]})
+                                    } else {
+                                        json!({"model":profile_id,"state":messages,"images":vec![image; if multiple_messages {2} else {1}],"questions":request.questions})
+                                    };
+                                    let native_calls = fixture.backend.calls.lock().unwrap().len();
+                                    let (status, error) = public_request(
+                                        &endpoint,
+                                        "POST",
+                                        if openai {
+                                            "/v1/decisions"
+                                        } else {
+                                            "/v1/systemone"
+                                        },
+                                        body,
+                                    )
+                                    .await;
+                                    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+                                    assert_eq!(
+                                        error["error"]["code"],
+                                        "unsupported_decision_media"
+                                    );
+                                    assert_eq!(
+                                        error["error"]["param"],
+                                        format!(
+                                            "{}[0].content[1]",
+                                            if openai { "input" } else { "state" }
+                                        )
+                                    );
+                                    assert_eq!(
+                                        fixture.backend.calls.lock().unwrap().len(),
+                                        native_calls
+                                    );
+                                }
+                            }
+                        }
                         // Adapter validation reaches the public 400 envelope without HTTP.
                         let native_calls = fixture.backend.calls.lock().unwrap().len();
                         for levels in [1, 11] {
@@ -1103,6 +1539,25 @@ mod tests {
         );
         model.native_identity = None;
         assert!(!candidate(&model));
+    }
+
+    #[tokio::test]
+    async fn physical_file_and_probe_changes_expire_loaded_decision_evidence() {
+        let mut f = fixture(true, Some("laya"), None).await;
+        f.qualify().await;
+        assert!(f.supported());
+        f.spec.runtime.manifest.probe.observed_at_unix += 1;
+        assert!(!f.supported());
+        f.qualify().await;
+        assert!(f.supported());
+        std::fs::write(&f.spec.model.primary.path, b"replaced artifact").unwrap();
+        assert!(!f.supported());
+        assert!(matches!(
+            f.adapter
+                .decide(f.spec.endpoint.as_ref().unwrap(), f.request())
+                .await,
+            Err(EngineError::Unsupported(_))
+        ));
     }
 
     #[tokio::test]
@@ -1266,12 +1721,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_decision_vision_preserves_bytes_order_and_requires_exact_runtime_proof() {
+        for kind in ["clef", "openjev"] {
+            let mut fixture = fixture(true, Some(kind), None).await;
+            fixture.qualify().await;
+            assert!(fixture.adapter.decision_vision_supported(
+                &fixture.spec.runtime,
+                &fixture.spec.model.primary,
+                &fixture.spec.settings
+            ));
+            let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+            let mut request = fixture.request();
+            let image2 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+            request.images = vec![image.into(), image2.into()];
+            request.state = serde_json::from_value(json!([{"role":"user","content":[{"type":"image_url","image_url":{"url":image}},{"type":"image_url","image_url":{"url":image2}}]}])).unwrap();
+            fixture.backend.calls.lock().unwrap().clear();
+            fixture
+                .adapter
+                .decide(fixture.spec.endpoint.as_ref().unwrap(), request.clone())
+                .await
+                .unwrap();
+            let calls = fixture.backend.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].2["state"], json!(request.state));
+            assert!(calls[0].2.get("images").is_none());
+            drop(calls);
+            fixture.spec.runtime.manifest.identity.upstream_revision = Some("a".repeat(40));
+            assert!(!fixture.adapter.decision_vision_supported(
+                &fixture.spec.runtime,
+                &fixture.spec.model.primary,
+                &fixture.spec.settings
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_media_list_retains_order_but_cannot_represent_positions_or_message_associations()
+     {
+        let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+        let image2 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+        for revision in [
+            "d81235049384534c167caea52b85a694f6103d14",
+            "f9a95aeb2096d0c0218e0cd6e6d901cd37be798a",
+        ] {
+            let mut fixture = fixture(true, Some("clef"), None).await;
+            fixture.spec.runtime.manifest.identity.upstream_revision = Some(revision.into());
+            fixture.spec.runtime.manifest.runtime_id =
+                RuntimeId::from_identity(&fixture.spec.runtime.manifest.identity);
+            fixture.process.runtime_id = fixture.spec.runtime.manifest.runtime_id.clone();
+            fixture.qualify().await;
+            assert!(fixture.supported());
+            assert!(!fixture.adapter.supports_openai_decisions(
+                &fixture.spec.runtime,
+                &fixture.spec.model.primary,
+                &fixture.spec.settings
+            ));
+            assert!(fixture.adapter.qualified_decision_images(
+                &fixture.spec.runtime,
+                &fixture.spec.model.primary,
+                &fixture.spec.settings
+            ));
+            let image_part = json!({"type":"image_url","image_url":{"url":image}});
+            let image_part2 = json!({"type":"image_url","image_url":{"url":image2}});
+            let label_a = json!({"type":"text","text":"Image A:"});
+            let label_b = json!({"type":"text","text":"Image B: compare it with Image A"});
+            for (state, images) in [
+                (json!("text only"), vec![]),
+                (
+                    json!([{"role":"user","content":[label_a.clone()]},{"role":"user","content":[label_b.clone()]}]),
+                    vec![],
+                ),
+                (
+                    json!([{"role":"user","content":[image_part.clone()]}]),
+                    vec![image],
+                ),
+                (
+                    json!([{"role":"user","content":[image_part.clone(),image_part2.clone()]}]),
+                    vec![image, image2],
+                ),
+                (
+                    json!({"messages":[{"role":"user","content":[image_part.clone(),image_part2.clone()]}]}),
+                    vec![image, image2],
+                ),
+                // Explicit shared images do not promise embedded positions.
+                (
+                    json!({"compare":"first image A with second image B"}),
+                    vec![image, image2],
+                ),
+            ] {
+                let mut request = fixture.request();
+                request.state = serde_json::from_value(state.clone()).unwrap();
+                request.images = images.iter().map(|s| (*s).into()).collect();
+                fixture.backend.calls.lock().unwrap().clear();
+                fixture
+                    .adapter
+                    .decide(fixture.spec.endpoint.as_ref().unwrap(), request)
+                    .await
+                    .unwrap();
+                let calls = fixture.backend.calls.lock().unwrap();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].2["state"], state);
+                if !images.is_empty() && state.is_object() && state.get("messages").is_none() {
+                    assert_eq!(calls[0].2["images"], json!(images));
+                } else {
+                    assert!(calls[0].2.get("images").is_none());
+                }
+            }
+            let arrangements = [
+                (
+                    json!([{"role":"user","content":[label_a.clone(),image_part.clone()]}]),
+                    vec![image],
+                    "[0].content[1]",
+                ),
+                (
+                    json!([{"role":"user","content":[image_part.clone(),label_a.clone()]}]),
+                    vec![image],
+                    "[0].content[0]",
+                ),
+                (
+                    json!([{"role":"user","content":[label_a.clone(),image_part.clone(),label_b.clone(),image_part2.clone()]}]),
+                    vec![image, image2],
+                    "[0].content[1]",
+                ),
+                (
+                    json!([{"role":"user","content":[label_a.clone(),image_part.clone()]},{"role":"user","content":[label_b.clone(),image_part2.clone()]}]),
+                    vec![image, image2],
+                    "[0].content[1]",
+                ),
+                (
+                    json!([{"role":"user","content":"context"},{"role":"user","content":[image_part.clone()]}]),
+                    vec![image],
+                    "[1].content[0]",
+                ),
+                (
+                    json!([{"role":"user","content":[image_part.clone()]},{"role":"user","content":[image_part2.clone()]}]),
+                    vec![image, image2],
+                    "[0].content[0]",
+                ),
+            ];
+            for (state, images, field) in arrangements {
+                for wrapped in [false, true] {
+                    let mut request = fixture.request();
+                    request.images = images.iter().map(|s| (*s).into()).collect();
+                    request.state = serde_json::from_value(if wrapped {
+                        json!({"messages":state})
+                    } else {
+                        state.clone()
+                    })
+                    .unwrap();
+                    fixture.backend.calls.lock().unwrap().clear();
+                    let error = fixture
+                        .adapter
+                        .decide(fixture.spec.endpoint.as_ref().unwrap(), request)
+                        .await
+                        .unwrap_err();
+                    let expected =
+                        format!("state{}{field}", if wrapped { ".messages" } else { "" });
+                    assert!(
+                        matches!(error, EngineError::NativeRequest {parameter, code:"unsupported_decision_media", ..} if parameter == expected)
+                    );
+                    assert!(fixture.backend.calls.lock().unwrap().is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn native_decision_images_are_rejected_without_backend_dispatch() {
         let fixture = fixture(true, Some("laya"), None).await;
         fixture.qualify().await;
         fixture.backend.calls.lock().unwrap().clear();
         let mut request = fixture.request();
-        request.images = vec!["data:image/png;base64,YQ==".into()];
+        request.images = vec!["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC".into()];
         assert!(matches!(
             fixture
                 .adapter
@@ -1390,9 +2011,21 @@ mod tests {
                 (status, json!({"error":{"message":"native failure"}}));
             let mut request = fixture.request();
             request.state = DecisionContent::Array(vec![json!({"content":"kept structured"})]);
-            assert!(
-                matches!(fixture.adapter.decide(fixture.spec.endpoint.as_ref().unwrap(),request).await,Err(EngineError::Operation(message)) if message.contains("native failure"))
-            );
+            let result = fixture
+                .adapter
+                .decide(fixture.spec.endpoint.as_ref().unwrap(), request)
+                .await;
+            match status {
+                StatusCode::BAD_REQUEST => assert!(
+                    matches!(result,Err(EngineError::InvalidDecisionRequest(message)) if message.contains("native failure"))
+                ),
+                StatusCode::NOT_IMPLEMENTED => {
+                    assert!(matches!(result, Err(EngineError::Unsupported(_))))
+                }
+                _ => assert!(
+                    matches!(result,Err(EngineError::Operation(message)) if message.contains("native failure"))
+                ),
+            }
         }
         *fixture.backend.response.lock().unwrap() =
             (StatusCode::OK, json!({"answers":{"safe":{"noul":0.5}}}));

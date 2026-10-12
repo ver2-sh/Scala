@@ -59,6 +59,11 @@ pub enum ArtifactNativeIdentity {
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct GgufArtifactIdentity {
+    /// Projector-native encoder metadata. These are candidate facts only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projector_vision: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projector_audio: Option<bool>,
     /// Native pooling: 1 = mean, 2 = CLS, 3 = last; other values are not pooled embeddings.
     pub pooling_type: Option<u64>,
     pub version: u32,
@@ -107,9 +112,20 @@ pub struct NinferContainerMetadata {
     pub dflash2: bool,
     pub(crate) resources: Vec<(String, u64, u64)>,
     pub metadata_bytes_read: u64,
+    /// Native v3 component/binding facts, never producer capability assertions.
+    pub v3_directory: Option<serde_json::Value>,
+    pub(crate) v3_files: Vec<(Option<String>, u64, u64)>,
 }
 
 impl NinferContainerMetadata {
+    /// Validated sibling payload files for native multipart v3 artifacts.
+    pub fn continuation_paths(&self, entry: &Path) -> Vec<PathBuf> {
+        self.v3_files
+            .iter()
+            .filter_map(|(name, _, _)| name.as_ref())
+            .map(|name| entry.parent().unwrap_or(Path::new(".")).join(name))
+            .collect()
+    }
     /// Hash one embedded frontend resource, with a bounded read and no tensor IO.
     /// Uses the native object directory, equally for bare and manifest-bound files.
     pub fn frontend_resource_sha256(
@@ -125,6 +141,10 @@ impl NinferContainerMetadata {
                 "frontend capability resource exceeds inspection bound",
             ));
         }
+        if self.v3_directory.is_some() {
+            let content = ninfer_v3::read_resource(path, self, *offset, *bytes)?;
+            return Ok(Some(format!("{:x}", Sha256::digest(content))));
+        }
         let mut file = std::fs::File::open(path)?;
         file.seek(SeekFrom::Start(*offset))?;
         let mut content = vec![0; *bytes as usize];
@@ -139,7 +159,7 @@ pub enum NinferContainerError {
     Io(#[from] std::io::Error),
     #[error("NInfer container magic is not recognized")]
     InvalidMagic,
-    #[error("NInfer container version {0} is unsupported; version 2 is required")]
+    #[error("NInfer container version {0} is unsupported; version 2 or 3 is required")]
     UnsupportedVersion(u8),
     #[error("NInfer directory length must be between 1 and {maximum} bytes; observed {observed}")]
     InvalidDirectoryLength { observed: u64, maximum: u64 },
@@ -519,6 +539,8 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
     }
 
     let mut architecture = None;
+    let mut projector_vision = None;
+    let mut projector_audio = None;
     let mut architecture_numbers = HashMap::<String, u64>::new();
     let mut architecture_decimals = HashMap::<String, String>::new();
     let mut architecture_decisions = HashMap::<String, String>::new();
@@ -538,6 +560,8 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
             continue;
         }
         let capture = key == "general.architecture"
+            || key == "clip.has_vision_encoder"
+            || key == "clip.has_audio_encoder"
             || key.ends_with(".decision.type")
             || key.ends_with(".pooling_type")
             || key.ends_with(".context_length")
@@ -548,7 +572,24 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
             || key.ends_with(".rope.scale_linear")
             || key == "tokenizer.chat_template";
         let value = reader.value(value_type, capture.then_some(&key), None)?;
-        if key == "general.architecture" {
+        if matches!(
+            key.as_str(),
+            "clip.has_vision_encoder" | "clip.has_audio_encoder"
+        ) {
+            let flag = if value_type == 7 {
+                value
+                    .and_then(GgufScalar::into_u64)
+                    .filter(|v| *v <= 1)
+                    .map(|v| v == 1)
+            } else {
+                None
+            };
+            if key == "clip.has_vision_encoder" {
+                projector_vision = flag;
+            } else {
+                projector_audio = flag;
+            }
+        } else if key == "general.architecture" {
             architecture = value.and_then(GgufScalar::into_string);
         } else if key.ends_with(".decision.type") {
             if let Some(value) = value.and_then(GgufScalar::into_string) {
@@ -602,6 +643,8 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
         .and_then(|key| architecture_decimals.get(key))
         .cloned();
     Ok(GgufArtifactIdentity {
+        projector_vision,
+        projector_audio,
         decision_type: architecture_decisions.remove(&format!("{architecture}.decision.type")),
         pooling_type: architecture_numbers
             .get(&format!("{architecture}.pooling_type"))
@@ -776,11 +819,20 @@ const NINFER_PREFIX_BYTES: u64 = 16;
 const NINFER_PAYLOAD_ALIGNMENT: u64 = 4096;
 const MAX_NINFER_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
 
+#[path = "ninfer_v3.rs"]
+mod ninfer_v3;
+
 pub fn inspect_ninfer_container(
     path: &Path,
 ) -> Result<NinferContainerMetadata, NinferContainerError> {
     let mut file = std::fs::File::open(path)?;
     let file_bytes = file.metadata()?.len();
+    let mut magic = [0; 8];
+    file.read_exact(&mut magic)?;
+    file.seek(SeekFrom::Start(0))?;
+    if &magic == b"NINFER\0\x03" {
+        return ninfer_v3::inspect(path, &mut file, file_bytes);
+    }
     inspect_ninfer_reader(&mut file, file_bytes)
 }
 
@@ -842,6 +894,8 @@ fn inspect_ninfer_reader(
             })
             .collect(),
         metadata_bytes_read: NINFER_PREFIX_BYTES + json_bytes,
+        v3_directory: None,
+        v3_files: Vec::new(),
     })
 }
 

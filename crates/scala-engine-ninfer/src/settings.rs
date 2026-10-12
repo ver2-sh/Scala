@@ -29,6 +29,13 @@ const NINFER_COMMON_SETTINGS: &[&str] = &[
 pub(crate) fn definitions() -> Vec<SettingDefinition> {
     let mut definitions = common_setting_definitions_for(crate::ENGINE_ID, NINFER_COMMON_SETTINGS);
     definitions.extend([
+        unsigned(
+            "ninfer.host_context_mib",
+            "Host context budget",
+            "Native v3 total pinned Host context budget in MiB",
+            0,
+            Some(u64::MAX >> 20),
+        ),
         definition(
             "ninfer.kv_dtype",
             "KV dtype",
@@ -621,10 +628,20 @@ pub(crate) fn apply_model_capabilities(
         .find(|definition| definition.id.as_str() == "ninfer.speculative_backend")
         && let SettingKind::Choice { choices } = &mut definition.kind
     {
-        choices.retain(|choice| match choice.as_str() {
-            "dflash" => dflash_target(model) && (!vision_requested || dflash_vision_supported),
-            "dflash2" => dflash2_target(model) && dflash_vision_supported,
-            _ => true,
+        let v3 = matches!(model.native_identity.as_ref(),Some(ArtifactNativeIdentity::Ninfer(i)) if i.container_version==3);
+        choices.retain(|choice| {
+            if v3 {
+                crate::v3::component_present(model, choice)
+                    && (!vision_requested || choice == "mtp" || dflash_vision_supported)
+            } else {
+                match choice.as_str() {
+                    "dflash" => {
+                        dflash_target(model) && (!vision_requested || dflash_vision_supported)
+                    }
+                    "dflash2" => dflash2_target(model) && dflash_vision_supported,
+                    _ => true,
+                }
+            }
         });
     }
 }
@@ -634,6 +651,10 @@ pub(crate) fn validate_model_settings(
     model: &ModelArtifact,
     dflash_vision_supported: bool,
 ) -> Result<(), String> {
+    if matches!(model.native_identity.as_ref(), Some(ArtifactNativeIdentity::Ninfer(i)) if i.container_version == 3)
+    {
+        return crate::v3::validate_model_settings(settings, model);
+    }
     if choice_value(settings, "ninfer.speculative_backend").map_err(|error| error.to_string())?
         == Some("dflash")
     {
@@ -666,6 +687,9 @@ fn dflash2_target(model: &ModelArtifact) -> bool {
 }
 
 fn dflash_target(model: &ModelArtifact) -> bool {
+    if crate::v3::component_present(model, "dflash") {
+        return true;
+    }
     matches!(
         model.native_identity.as_ref(),
         Some(ArtifactNativeIdentity::Ninfer(identity))
@@ -787,6 +811,7 @@ pub(crate) fn execution_path_for_setting(id: &str) -> SettingExecutionPath {
         "ninfer.thinking" => LaunchOption("--no-thinking"),
         "ninfer.preserve_thinking" => LaunchOption("--preserve-thinking"),
         "ninfer.device_state_slots" => LaunchOption("--device-state-slots"),
+        "ninfer.host_context_mib" => LaunchOption("--host-context-mib"),
         "ninfer.host_state_slots" => LaunchOption("--host-state-slots"),
         "ninfer.host_kv_mib" => LaunchOption("--host-kv-mib"),
         "ninfer.max_private_continuations" => LaunchOption("--max-private-continuations"),

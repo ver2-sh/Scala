@@ -47,7 +47,20 @@ impl RuntimeCatalogProvider for LlamaCppRuntimeCatalogProvider {
         &self,
         github: &GitHubReleaseClient,
     ) -> Result<Vec<AvailableRuntime>, CatalogError> {
-        let releases = github.releases(GITHUB_REPOSITORY).await?;
+        let mut releases = github.releases(GITHUB_REPOSITORY).await?;
+        // Resolve the stable pointer even when its nightly is outside the latest page.
+        if let Some(tag) = verified_stable_nightly(github, &releases).await
+            && !releases.iter().any(|r| r.tag_name == tag)
+            && let Some(r) = github.release_by_tag(GITHUB_REPOSITORY, &tag).await?
+        {
+            releases.push(r);
+        }
+        for r in &mut releases {
+            if matches!(r.tag_name.as_str(), "b11429" | "b11565") {
+                let c = github.commit(GITHUB_REPOSITORY, &r.tag_name).await?;
+                r.target_commitish = c.sha;
+            }
+        }
         let mut runtimes = Vec::new();
         for release in &releases {
             if release.draft || nightly_number(&release.tag_name).is_none() {
@@ -66,22 +79,37 @@ impl RuntimeCatalogProvider for LlamaCppRuntimeCatalogProvider {
         github: &GitHubReleaseClient,
         reference: &str,
     ) -> Result<Vec<AvailableRuntime>, CatalogError> {
-        let Some(tag) = nightly_tag_from_reference(reference) else {
+        let (tag, stable) = if let Some(tag) = nightly_tag_from_reference(reference) {
+            (tag, false)
+        } else if semantic_version(reference).is_some() {
+            let Some(release) = github.release_by_tag(GITHUB_REPOSITORY, reference).await? else {
+                return Ok(Vec::new());
+            };
+            let Some(tag) = verified_stable_nightly(github, &[release]).await else {
+                return Ok(Vec::new());
+            };
+            (tag, true)
+        } else {
             return Ok(Vec::new());
         };
-        let Some(release) = github.release_by_tag(GITHUB_REPOSITORY, &tag).await? else {
+        let Some(mut release) = github.release_by_tag(GITHUB_REPOSITORY, &tag).await? else {
             return Ok(Vec::new());
         };
         if release.draft || nightly_number(&release.tag_name).is_none() {
             return Ok(Vec::new());
         }
+        release.target_commitish = github.commit(GITHUB_REPOSITORY, &tag).await?.sha;
         let mut runtimes = runtimes_for_release(&release)?;
         for runtime in &mut runtimes {
-            runtime.channels = release
-                .prerelease
-                .then_some(RuntimeReleaseChannel::Prerelease)
-                .into_iter()
-                .collect();
+            runtime.channels = if stable {
+                vec![RuntimeReleaseChannel::Stable]
+            } else {
+                release
+                    .prerelease
+                    .then_some(RuntimeReleaseChannel::Prerelease)
+                    .into_iter()
+                    .collect()
+            };
         }
         Ok(runtimes)
     }
@@ -249,7 +277,7 @@ fn available_runtime(
                 .map(|companion| {
                     vec![runtime_download(
                         companion,
-                        RuntimeArchiveFormat::Zip,
+                        classification.archive_format,
                         Vec::new(),
                     )]
                 })
@@ -332,6 +360,23 @@ fn classify_asset(tag: &str, name: &str) -> Option<AssetClassification> {
     }
 
     let package = remainder.strip_suffix(".tar.gz")?;
+    if let Some(cuda) = package.strip_prefix("ubuntu-cuda-") {
+        let (version, arch) = cuda.rsplit_once('-')?;
+        if !valid_dotted_version(version) {
+            return None;
+        }
+        return Some(AssetClassification {
+            platform: "linux",
+            architecture: linux_architecture(arch)?,
+            accelerator: "cuda",
+            variant: version.into(),
+            display_backend: format!("CUDA {version}"),
+            archive_format: RuntimeArchiveFormat::TarGz,
+            cuda_companion_name: Some(format!(
+                "cudart-llama-{tag}-bin-ubuntu-cuda-{version}-{arch}.tar.gz"
+            )),
+        });
+    }
     if let Some(architecture) = package.strip_prefix("ubuntu-").and_then(linux_architecture) {
         return Some(classification(
             "linux",
@@ -471,10 +516,21 @@ async fn verified_stable_nightly(
     }
     let nightly_tag = text.trim();
     nightly_number(nightly_tag)?;
-    let nightly = releases
-        .iter()
-        .find(|release| !release.draft && release.tag_name == nightly_tag && release.prerelease)?;
-    if nightly.target_commitish != stable.target_commitish {
+    let nightly = github
+        .release_by_tag(GITHUB_REPOSITORY, nightly_tag)
+        .await
+        .ok()??;
+    if nightly.draft || !nightly.prerelease {
+        return None;
+    }
+    let stable_commit = github
+        .commit(GITHUB_REPOSITORY, &stable.tag_name)
+        .await
+        .ok()?;
+    let nightly_commit = github.commit(GITHUB_REPOSITORY, nightly_tag).await.ok()?;
+    if stable_commit.sha != nightly_commit.sha
+        || stable_commit.commit.tree.sha != nightly_commit.commit.tree.sha
+    {
         return None;
     }
     Some(nightly_tag.to_owned())
@@ -587,6 +643,34 @@ fn days_from_civil(mut year: i64, month: i64, day: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn b11565_linux_cuda_requires_verified_companion_assets() {
+        for version in ["12.8", "13.4"] {
+            let main = format!("llama-b11565-bin-ubuntu-cuda-{version}-x64.tar.gz");
+            let companion = format!("cudart-llama-b11565-bin-ubuntu-cuda-{version}-x64.tar.gz");
+            let mut release = release_with_tag_and_assets("b11565", vec![asset(&main, "uploaded")]);
+            release.target_commitish = "f9a95aeb2096d0c0218e0cd6e6d901cd37be798a".into();
+            assert!(runtimes_for_release(&release).unwrap().is_empty());
+            let mut c = asset(&companion, "uploaded");
+            c.browser_download_url = format!(
+                "https://github.com/{GITHUB_REPOSITORY}/releases/download/b11565/{companion}"
+            );
+            release.assets[0].browser_download_url =
+                format!("https://github.com/{GITHUB_REPOSITORY}/releases/download/b11565/{main}");
+            release.assets.push(c);
+            let runtimes = runtimes_for_release(&release).unwrap();
+            assert_eq!(runtimes.len(), 1);
+            assert_eq!(runtimes[0].identity.variant, version);
+            assert_eq!(
+                runtimes[0].identity.upstream_revision,
+                Some(release.target_commitish.clone())
+            );
+            assert_eq!(runtimes[0].release_assets().unwrap().1.len(), 1);
+            release.assets[1].digest = None;
+            assert!(runtimes_for_release(&release).unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn exact_nightly_reference_is_recovered_from_ids_and_queries() {

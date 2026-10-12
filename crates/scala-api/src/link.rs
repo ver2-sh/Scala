@@ -41,6 +41,7 @@ const SURFACES: &[&str] = &[
     "/v1/completions",
     "/v1/embeddings",
     "/v1/systemone",
+    "/v1/decisions",
 ];
 
 tokio::task_local! { static EXECUTION_PROFILE: ModelProfileId; }
@@ -66,6 +67,7 @@ struct Envelope {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
     State,
+    StateCapabilities,
     Control {
         profile_id: ModelProfileId,
         action: LinkAction,
@@ -144,6 +146,12 @@ impl Link {
         snapshot
     }
     async fn inventory(&self) -> Result<NodeInventory> {
+        self.inventory_with_capabilities(false).await
+    }
+    async fn inventory_with_capabilities(
+        &self,
+        include_capabilities: bool,
+    ) -> Result<NodeInventory> {
         let identity = self.snapshot.read().await;
         let node_id = identity
             .node_id
@@ -160,6 +168,13 @@ impl Link {
             .read()
             .await
             .map_err(|e| e.to_string())?;
+        let capabilities: BTreeMap<_, _> = if include_capabilities {
+            let rows: Vec<_> = profiles.profiles.values().cloned().collect();
+            let caps = self.runtime.model_profile_capabilities(&rows).await;
+            rows.into_iter().zip(caps).map(|(p, c)| (p.id, c)).collect()
+        } else {
+            BTreeMap::new()
+        };
         let (benchmarks, benchmark_error) = match self.runtime.link_benchmarks().await {
             Ok(rows) => (rows, None),
             Err(error) => (Vec::new(), Some(error)),
@@ -213,6 +228,7 @@ impl Link {
                     engine_id: p.engine_id.to_string(),
                     role: p.role,
                     installed: snapshot.models.iter().any(|m| m.id == p.model_id),
+                    capabilities: capabilities.get(&p.id).cloned().flatten(),
                     backend: status.backend(&p.id).map(|b| LinkBackend {
                         lifecycle: b.lifecycle,
                         generation: b.generation, residency: b.residency,
@@ -321,10 +337,17 @@ impl Link {
         let refresh = stream::iter(status.nodes.into_iter().filter(|n| !n.local).map(
             |node| async move {
                 let result = if node.reachable {
-                    tokio::time::timeout(
-                        Duration::from_secs(4),
-                        self.request_state(&node.id, Operation::State),
-                    )
+                    tokio::time::timeout(Duration::from_secs(4), async {
+                        match self
+                            .request_state(&node.id, Operation::StateCapabilities)
+                            .await
+                        {
+                            Ok(state) => Ok(state),
+                            // Read-only extension negotiation. Authority-changing
+                            // Control/Inference operations are never retried.
+                            Err(_) => self.request_state(&node.id, Operation::State).await,
+                        }
+                    })
                     .await
                     .unwrap_or_else(|_| Err("Peer state refresh timed out".into()))
                 } else {
@@ -586,6 +609,9 @@ impl Link {
     async fn dispatch(&self, operation: Operation, source: &str) -> Response {
         match operation {
             Operation::State => inventory_response(self.inventory().await),
+            Operation::StateCapabilities => {
+                inventory_response(self.inventory_with_capabilities(true).await)
+            }
             Operation::Control { profile_id, action } => {
                 let result = match action {
                     LinkAction::Load => self.runtime.start_load(profile_id).await,
@@ -882,7 +908,7 @@ pub(crate) async fn route(
                 headers,
             };
             match link.request(&node, operation).await {
-                Ok(response) => response,
+                Ok(response) => decision_response(parts.uri.path(), response).await,
                 Err(error) => link_error(StatusCode::BAD_GATEWAY, error, "link_transport_error")
                     .into_response(),
             }
@@ -890,6 +916,37 @@ pub(crate) async fn route(
         Err(error) => error.into_response(),
     }
 }
+async fn decision_response(path: &str, response: Response) -> Response {
+    if path != "/v1/decisions" || !response.status().is_success() {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, MAX_INFERENCE_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return link_error(
+                StatusCode::BAD_GATEWAY,
+                "Decision owner response could not be read within the local body limit.",
+                "native_decision_contract_mismatch",
+            )
+            .into_response();
+        }
+    };
+    let result = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|_| {
+            link_error(
+                StatusCode::BAD_GATEWAY,
+                "Decision owner returned malformed JSON.",
+                "native_decision_contract_mismatch",
+            )
+        })
+        .and_then(|value| crate::decisions::validate_required_response(&value));
+    match result {
+        Ok(()) => Response::from_parts(parts, Body::from(bytes)),
+        Err(error) => error.into_response(),
+    }
+}
+
 fn forwarded_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
     [
         "x-scala-session",
@@ -993,11 +1050,169 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn embedding_link_preserves_native_groups_headers_vectors_and_usage() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use tokio::io::AsyncReadExt;
+        let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+        for media in [
+            json!({"type":"image_url","image_url":{"url":image}}),
+            json!({"type":"input_audio","input_audio":{"data":STANDARD.encode(include_bytes!("../../scala-engine/testdata/embedding.wav")),"format":"wav"}}),
+            json!({"type":"input_video","input_video":{"url":format!("data:video/x-msvideo;base64,{}",STANDARD.encode(include_bytes!("../../scala-engine/testdata/embedding.avi")))}}),
+        ] {
+            let body = json!({"model":"embedding-profile@owner","input":["first",{"content":[{"type":"text","text":"  before\n"},media,{"type":"text","text":"after"}]}],"encoding_format":"base64"});
+            let headers = BTreeMap::from([
+                ("x-scala-session-id".into(), "session".into()),
+                ("x-scala-role".into(), "validator".into()),
+            ]);
+            let envelope = Envelope {
+                version: LINK_VERSION,
+                source: "entry".into(),
+                target: "owner".into(),
+                hops: 1,
+                operation: Operation::Inference {
+                    profile_id: ModelProfileId::new("embedding-profile").unwrap(),
+                    path: "/v1/embeddings".into(),
+                    body: body.clone(),
+                    headers: headers.clone(),
+                },
+            };
+            let (mut writer, mut reader) = tokio::io::duplex(1024);
+            let (sent, received) = tokio::join!(
+                wayfinder::write_json(&mut writer, &envelope, REQUEST_LIMIT),
+                wayfinder::read_json::<Envelope>(&mut reader, REQUEST_LIMIT)
+            );
+            sent.unwrap();
+            let Operation::Inference {
+                profile_id,
+                path,
+                body: received,
+                headers: received_headers,
+            } = received.unwrap().operation
+            else {
+                panic!("embedding operation")
+            };
+            assert_eq!(profile_id.as_str(), "embedding-profile");
+            assert_eq!(path, "/v1/embeddings");
+            assert_eq!(received, body);
+            assert_eq!(received_headers, headers);
+            let input: scala_engine::EmbeddingInput =
+                serde_json::from_value(received["input"].clone()).unwrap();
+            input.validate_inline_media().unwrap();
+            assert_eq!(input.len(), 2);
+            for encoding in ["float", "base64"] {
+                let vector = if encoding == "float" {
+                    json!([0.25, 0.75])
+                } else {
+                    json!(
+                        STANDARD.encode(
+                            [0.25f32, 0.75]
+                                .iter()
+                                .flat_map(|v| v.to_le_bytes())
+                                .collect::<Vec<_>>()
+                        )
+                    )
+                };
+                let value = json!({"object":"list","model":"embedding-profile@owner","data":[{"index":0,"embedding":vector},{"index":1,"embedding":vector}],"usage":{"prompt_tokens":17,"total_tokens":17}});
+                let mut response = axum::Json(value.clone()).into_response();
+                response
+                    .headers_mut()
+                    .insert("x-request-id", "owner-id".parse().unwrap());
+                let (mut writer, mut reader) = tokio::io::duplex(1024);
+                let read = async {
+                    let len = reader.read_u32().await.unwrap() as usize;
+                    let mut head = vec![0; len];
+                    reader.read_exact(&mut head).await.unwrap();
+                    let head: ResponseHead = serde_json::from_slice(&head).unwrap();
+                    assert_eq!(head.status, 200);
+                    assert_eq!(head.headers["x-request-id"], "owner-id");
+                    let mut bytes = Vec::new();
+                    loop {
+                        let len = reader.read_u32().await.unwrap() as usize;
+                        if len == 0 {
+                            break;
+                        }
+                        let at = bytes.len();
+                        bytes.resize(at + len, 0);
+                        reader.read_exact(&mut bytes[at..]).await.unwrap();
+                    }
+                    serde_json::from_slice::<Value>(&bytes).unwrap()
+                };
+                let (sent, received) = tokio::join!(send_response_to(&mut writer, response), read);
+                sent.unwrap();
+                assert_eq!(received, value);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decisions_owner_success_requires_complete_usage_while_systemone_stays_native() {
+        let complete = json!({"model":"owner-native", "answers":[{"type":"predicate","name":null,"probability":0.8}],
+            "usage":{"input_tokens":42,"input_tokens_details":{"cached_tokens":7,"cache_write_tokens":3},
+                "output_tokens":5,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":47}});
+        for usage in [
+            None,
+            Some(json!({"input_tokens":42,"output_tokens":0})),
+            Some(complete["usage"].clone()),
+        ] {
+            let mut value = complete.clone();
+            value.as_object_mut().unwrap().remove("usage");
+            if let Some(usage) = &usage {
+                value["usage"] = usage.clone();
+            }
+            for path in ["/v1/systemone", "/v1/decisions"] {
+                let mut response = (StatusCode::OK, axum::Json(value.clone())).into_response();
+                response
+                    .headers_mut()
+                    .insert("x-request-id", "owner-id".parse().unwrap());
+                let response = decision_response(path, response).await;
+                let success = path == "/v1/systemone" || usage == Some(complete["usage"].clone());
+                assert_eq!(
+                    response.status(),
+                    if success {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    }
+                );
+                if success {
+                    assert_eq!(response.headers()["x-request-id"], "owner-id");
+                }
+                let result: Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                if success {
+                    assert_eq!(result, value);
+                } else {
+                    assert_eq!(result["error"]["code"], "native_decision_contract_mismatch");
+                }
+            }
+        }
+        let error =
+            json!({"error":{"code":"unsupported_decision_media","param":"input[1].content[0]"}});
+        let response = decision_response(
+            "/v1/decisions",
+            (StatusCode::BAD_REQUEST, axum::Json(error.clone())).into_response(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let result: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result, error);
+    }
+
+    #[tokio::test]
     async fn systemone_link_preserves_two_eight_mib_images_with_existing_limits() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         let image = format!(
             "data:image/png;base64,{}",
-            STANDARD.encode(vec![0; scala_engine::MAX_DECISION_IMAGE_BYTES])
+            STANDARD.encode({let mut bytes=STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC").unwrap();bytes.resize(scala_engine::MAX_DECISION_IMAGE_BYTES,0);bytes})
         );
         let body = json!({"model":"imajev@owner", "state":{"task":"compare"},
             "questions":{"q":{"type":"noul","instructions":"compare images"}},
@@ -1110,6 +1325,15 @@ mod tests {
         }
         // Exercise the actual serialization contract accepted from a Windows
         // owner, including unloaded auxiliary profiles and retained ownership.
+        assert!(inventory.profiles.iter().all(|p| p.capabilities.is_none()));
+        assert!(
+            json!(inventory)["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p.get("capabilities").is_none())
+        ); // Old v1 strict readers retain their shape.
+        inventory.profiles.iter_mut().find(|p| p.id.as_str() == names[0]).unwrap().capabilities = Some(serde_json::from_value(json!({"thinking":{"switchable":false},"decision_candidate":true,"decision":true,"openai_decisions":false})).unwrap());
         let inventory: NodeInventory = serde_json::from_value(json!(inventory)).unwrap();
         link.snapshot.write().await.peers.push(LinkPeer {
             node_id: owner.into(),
@@ -1138,6 +1362,16 @@ mod tests {
                 if node == owner && profile.as_str() == name)
             );
             assert!(resolve(&state, name).await.is_err()); // Shared names need an owner.
+            if name == names[0] {
+                let c = models
+                    .iter()
+                    .find(|m| m.id == alias)
+                    .unwrap()
+                    .capabilities
+                    .as_ref()
+                    .unwrap();
+                assert!(c.decision_candidate && c.decision && !c.openai_decisions);
+            }
         }
         link.snapshot.write().await.node_id = Some(owner.into());
         let response = link.dispatch(Operation::Inference {
@@ -1153,6 +1387,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["error"]["param"], "state"); // Reached the owner's typed Decision validator.
+        let response = link.dispatch(Operation::Inference {
+            profile_id: ModelProfileId::new(names[0]).unwrap(), path: "/v1/decisions".into(),
+            body: json!({"model":qualified_alias(names[0],owner),"input":null,"questions":[]}), headers:BTreeMap::new(),
+        }, "a").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["param"], "input");
         assert!(state.runtime.status().await.backends.is_empty());
     }
 

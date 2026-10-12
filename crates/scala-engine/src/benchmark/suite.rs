@@ -40,6 +40,7 @@ pub fn tools() -> Vec<InferenceTool> {
         ("update", "Replace a virtual string value using its current integer revision. Conflicts require reading again.", json!({"key":{"type":"string"},"revision":{"type":"integer","minimum":0},"value":{"type":"string"}}), vec!["key","revision","value"]),
         ("verify", "Read back a virtual key and record that its current state was verified.", json!({"key":{"type":"string"}}), vec!["key"]),
     ].into_iter().map(|(name,description,properties,required)| InferenceTool {
+            strict: None,
         name:name.into(), description:Some(description.into()),
         parameters:json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}),
     }).collect()

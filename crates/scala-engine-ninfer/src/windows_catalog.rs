@@ -41,12 +41,60 @@ const REVIEWED_RELEASE_ID: u64 = 384326322;
 const REVIEWED_TAG_COMMIT: &str = "aa64ee5353b3c79a0a4301a0d60f1716fb0451be";
 const REVIEWED_TAG_TREE: &str = "fd35700dbbf797b6e46114efd46bbc569e151844";
 const REVIEWED_ASSET_ID: u64 = 549408305;
+#[cfg(test)]
 const REVIEWED_ASSET_ID_STR: &str = "549408305";
 const REVIEWED_ASSET_NAME: &str = "ninfer-windows-0.7.1-win64-cuda131.zip";
 const REVIEWED_ASSET_SIZE: u64 = 386877422;
 pub(crate) const REVIEWED_ARCHIVE_SHA256: &str =
     "d9bb7b4c4f5ded7de9f42ba25635a64d9d4f3412310701ff37f66743e8e940b5";
 
+pub(crate) const V3_COMMIT: &str = "fe115cdecd16acc96df72206053e94f5c8f25214";
+pub(crate) const V3_TREE: &str = "35c0b544bb109311f9c0244b985d052aee4cb379";
+pub(crate) const V3_VARIANT: &str = "portable-v3-sm120a";
+pub(crate) const V3_ARCHIVE_SHA256: &str =
+    "d05f9df73feb43b47de23cb09ee9b9e79b040afb8d73ae30a0f4c93dea379060";
+#[derive(Clone, Copy)]
+struct Package {
+    version: &'static str,
+    tag: &'static str,
+    commit: &'static str,
+    tree: &'static str,
+    release: u64,
+    asset: u64,
+    name: &'static str,
+    size: u64,
+    digest: &'static str,
+    variant: &'static str,
+}
+fn package(tag: &str) -> Option<Package> {
+    match tag {
+        REVIEWED_RELEASE_TAG => Some(Package {
+            version: REVIEWED_RELEASE_VERSION,
+            tag: REVIEWED_RELEASE_TAG,
+            commit: REVIEWED_TAG_COMMIT,
+            tree: REVIEWED_TAG_TREE,
+            release: REVIEWED_RELEASE_ID,
+            asset: REVIEWED_ASSET_ID,
+            name: REVIEWED_ASSET_NAME,
+            size: REVIEWED_ASSET_SIZE,
+            digest: REVIEWED_ARCHIVE_SHA256,
+            variant: VARIANT,
+        }),
+        "v0.9.1" => Some(Package {
+            version: "0.9.1",
+            tag: "v0.9.1",
+            commit: V3_COMMIT,
+            tree: V3_TREE,
+            release: 398720301,
+            asset: 596739681,
+            name: "ninfer-windows-0.9.1-win64-cuda131.zip",
+            size: 450215373,
+            digest: V3_ARCHIVE_SHA256,
+            variant: V3_VARIANT,
+        }),
+        _ => None,
+    }
+}
 const ENTRYPOINT_NAME: &str = "ninfer-serve.exe";
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -158,18 +206,12 @@ async fn reviewed_package_for_release(
     github: &GitHubReleaseClient,
     release: &GitHubRelease,
 ) -> Result<Option<AvailableRuntime>, CatalogError> {
-    if release.tag_name != REVIEWED_RELEASE_TAG {
+    let Some(p) = package(&release.tag_name) else {
         return Ok(None);
-    }
-    let commit = github
-        .commit(GITHUB_REPOSITORY, REVIEWED_RELEASE_TAG)
-        .await?;
-    if !commit.sha.eq_ignore_ascii_case(REVIEWED_TAG_COMMIT)
-        || !commit
-            .commit
-            .tree
-            .sha
-            .eq_ignore_ascii_case(REVIEWED_TAG_TREE)
+    };
+    let commit = github.commit(GITHUB_REPOSITORY, p.tag).await?;
+    if !commit.sha.eq_ignore_ascii_case(p.commit)
+        || !commit.commit.tree.sha.eq_ignore_ascii_case(p.tree)
     {
         return Ok(None);
     }
@@ -185,7 +227,7 @@ pub(crate) fn is_managed_windows_identity(identity: &RuntimeIdentity) -> bool {
         && identity.platform == "windows"
         && identity.architecture == "x86_64"
         && identity.accelerator == "cuda"
-        && identity.variant == VARIANT
+        && matches!(identity.variant.as_str(), VARIANT | V3_VARIANT)
         && identity.package.provider_id == PROVIDER_ID
         && identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
 }
@@ -197,12 +239,16 @@ pub(crate) fn is_managed_windows_identity(identity: &RuntimeIdentity) -> bool {
 /// runtimes) via `is_reviewed_release_candidate` /
 /// `is_reviewed_installed_release`.
 pub(crate) fn is_reviewed_release_identity(identity: &RuntimeIdentity) -> bool {
+    let Some(p) = identity.package.release_tag.as_deref().and_then(package) else {
+        return false;
+    };
     is_managed_windows_identity(identity)
-        && identity.version == REVIEWED_RELEASE_VERSION
-        && identity.package.release_tag.as_deref() == Some(REVIEWED_RELEASE_TAG)
-        && identity.package.asset_id.as_deref() == Some(REVIEWED_ASSET_ID_STR)
-        && identity.package.asset_name.as_deref() == Some(REVIEWED_ASSET_NAME)
+        && identity.version == p.version
+        && identity.variant == p.variant
+        && identity.package.asset_id.as_deref() == Some(p.asset.to_string().as_str())
+        && identity.package.asset_name.as_deref() == Some(p.name)
         && identity.package.additional_assets.is_empty()
+        && (p.variant != V3_VARIANT || identity.upstream_revision.as_deref() == Some(p.commit))
 }
 
 /// Full reviewed-package binding for a catalog candidate: the exact identity
@@ -216,9 +262,9 @@ pub(crate) fn is_reviewed_release_candidate(runtime: &AvailableRuntime) -> bool 
                 additional_downloads,
             } if additional_downloads.is_empty()
                 && download.archive_format == RuntimeArchiveFormat::Zip
-                && download.size_bytes == REVIEWED_ASSET_SIZE
+                && download.size_bytes == package(runtime.identity.package.release_tag.as_deref().unwrap_or("")).map(|p|p.size).unwrap_or(0)
                 && download.digest.as_ref().is_some_and(|digest| {
-                    digest.algorithm == "sha256" && digest.value == REVIEWED_ARCHIVE_SHA256
+                    digest.algorithm == "sha256" && Some(digest.value.as_str()) == package(runtime.identity.package.release_tag.as_deref().unwrap_or("")).map(|p|p.digest)
                 })
         )
 }
@@ -229,7 +275,17 @@ pub(crate) fn is_reviewed_release_candidate(runtime: &AvailableRuntime) -> bool 
 /// capability credit, even under the same provider, version and tag.
 pub(crate) fn is_reviewed_installed_release(manifest: &RuntimeManifest) -> bool {
     is_reviewed_release_identity(&manifest.identity)
-        && manifest.downloaded_archive_sha256.as_deref() == Some(REVIEWED_ARCHIVE_SHA256)
+        && manifest.downloaded_archive_sha256.as_deref()
+            == manifest
+                .identity
+                .package
+                .release_tag
+                .as_deref()
+                .and_then(package)
+                .map(|p| p.digest)
+        && (manifest.identity.variant != V3_VARIANT
+            || manifest.entrypoint_sha256
+                == "1b5f99b08a9569fc9a92014b09be1d1e9a828666d5cd4a006880c48572944b61")
         && manifest.additional_downloaded_archive_sha256.is_empty()
 }
 
@@ -255,15 +311,16 @@ fn runtime_for_release(release: &GitHubRelease) -> Result<Option<AvailableRuntim
     // asset's id, name, size and advertised digest must all match the reviewed
     // facts. A replaced or re-uploaded asset under the same tag stays hidden
     // rather than inheriting the reviewed release's identity.
-    if release.id != REVIEWED_RELEASE_ID
-        || asset.id != REVIEWED_ASSET_ID
-        || asset.name != REVIEWED_ASSET_NAME
-        || asset.size != REVIEWED_ASSET_SIZE
+    let p = package(&release.tag_name).expect("admitted release");
+    if release.id != p.release
+        || asset.id != p.asset
+        || asset.name != p.name
+        || asset.size != p.size
         || asset
             .digest
             .as_deref()
             .and_then(|digest| RuntimeDigest::parse_github(digest).ok())
-            .is_none_or(|digest| digest.value != REVIEWED_ARCHIVE_SHA256)
+            .is_none_or(|digest| digest.value != p.digest)
     {
         return Ok(None);
     }
@@ -271,11 +328,15 @@ fn runtime_for_release(release: &GitHubRelease) -> Result<Option<AvailableRuntim
         engine_id: ENGINE_ID.to_owned(),
         package_family: PACKAGE_FAMILY.to_owned(),
         version: version.clone(),
-        upstream_revision: commit_revision(&release.target_commitish),
+        upstream_revision: if p.variant == V3_VARIANT {
+            Some(p.commit.to_owned())
+        } else {
+            commit_revision(&release.target_commitish)
+        },
         platform: "windows".to_owned(),
         architecture: "x86_64".to_owned(),
         accelerator: "cuda".to_owned(),
-        variant: VARIANT.to_owned(),
+        variant: p.variant.to_owned(),
         package: RuntimePackageIdentity {
             provider_id: PROVIDER_ID.to_owned(),
             repository: Some(GITHUB_REPOSITORY.to_owned()),
@@ -310,7 +371,7 @@ fn runtime_for_release(release: &GitHubRelease) -> Result<Option<AvailableRuntim
             },
             additional_downloads: Vec::new(),
         },
-        supported_native_identities: Vec::new(),
+        supported_native_identities: if p.variant == V3_VARIANT {crate::v3::native_identities()} else {Vec::new()},
         requirements: RuntimeRequirements {
             requires_nvidia_gpu: true,
             minimum_nvidia_driver: None,
@@ -345,9 +406,9 @@ fn runtime_for_release(release: &GitHubRelease) -> Result<Option<AvailableRuntim
 /// Only the exact reviewed release is admitted. Semantic-version resemblance
 /// is not review evidence: other `v0.7.x` tags -- including hypothetical newer
 /// ones -- stay hidden until a package is actually reviewed; `v0.8.0` and
-/// later moved to NInfer v3 artifacts that Scala does not load.
+/// other unreviewed generations remain unavailable.
 fn release_version(tag_name: &str) -> Option<String> {
-    (tag_name == REVIEWED_RELEASE_TAG).then(|| REVIEWED_RELEASE_VERSION.to_owned())
+    package(tag_name).map(|p| p.version.to_owned())
 }
 
 fn release_version_parts(tag_name: &str) -> Option<(u64, u64, u64)> {
@@ -453,12 +514,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn v0_9_1_is_independently_pinned_and_never_substitutes_v2() {
+        let p = package("v0.9.1").unwrap();
+        let mut r = reviewed_release();
+        r.id = p.release;
+        r.tag_name = "v0.9.1".into();
+        r.assets[0].id = p.asset;
+        r.assets[0].name = p.name.into();
+        r.assets[0].size = p.size;
+        r.assets[0].digest = Some(format!("sha256:{}", p.digest));
+        r.assets[0].browser_download_url = format!(
+            "https://github.com/{GITHUB_REPOSITORY}/releases/download/v0.9.1/{}",
+            p.name
+        );
+        let runtime = runtime_for_release(&r).unwrap().unwrap();
+        assert_eq!(runtime.identity.variant, V3_VARIANT);
+        assert_eq!(
+            runtime.identity.upstream_revision.as_deref(),
+            Some(V3_COMMIT)
+        );
+        assert!(is_reviewed_release_candidate(&runtime));
+        assert!(runtime.supported_native_identities.iter().all(|i| matches!(i, scala_core::ArtifactNativeIdentity::Ninfer(i) if i.container_version == 3)));
+        r.assets[0].digest = Some(format!("sha256:{}", "a".repeat(64)));
+        assert!(runtime_for_release(&r).unwrap().is_none());
+        assert_ne!(
+            runtime.identity.variant,
+            runtime_for_release(&reviewed_release())
+                .unwrap()
+                .unwrap()
+                .identity
+                .variant
+        );
+    }
+
+    #[test]
     fn only_the_exact_reviewed_release_is_admitted() {
         assert_eq!(release_version("v0.7.1").as_deref(), Some("0.7.1"));
         // No other tag is admitted from semantic-version resemblance: older
         // portable releases predate the reviewed generation, hypothetical
         // future v0.7.x releases are unreviewed until a package is actually
-        // examined, and v0.8.x/v0.9.x are NInfer v3 while Scala is v2-only.
+        // examined, and unreviewed v0.8.x/v0.9.x packages stay unavailable.
         for tag in [
             "v0.1.0",
             "v0.6.1",
@@ -609,7 +704,7 @@ mod tests {
     #[test]
     fn v3_and_other_or_ambiguous_releases_are_not_candidates() {
         // Other v0.7.x tags are unreviewed rather than assumed-compatible;
-        // v0.8+ moved to NInfer v3 artifacts Scala does not load.
+        // Only the independently reviewed v0.9.1 package admits v3.
         for tag in [
             "v0.6.1", "v0.7.0", "v0.7.2", "v0.7.12", "v0.8.0", "v0.8.1", "v0.9.0",
         ] {

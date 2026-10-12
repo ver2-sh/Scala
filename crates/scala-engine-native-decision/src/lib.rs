@@ -951,6 +951,7 @@ impl EngineAdapter for NativeDecisionAdapter {
         .map_err(|e| EngineError::Operation(e.to_string()))?;
         validate_answers(&request, &answers)?;
         Ok(DecisionOutput {
+            native_usage: None,
             model: body.get("model").and_then(Value::as_str).map(str::to_owned),
             answers,
             usage,
@@ -1024,6 +1025,7 @@ fn validate_answers(
             )));
         }
         let (probabilities, confidence, observations) = match answer {
+            DecisionAnswer::Refusal {} => continue,
             DecisionAnswer::Choice {
                 probabilities,
                 confidence,
