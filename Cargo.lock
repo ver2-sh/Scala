@@ -2997,6 +2997,7 @@ version = "0.1.19"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "futures-util",
  "jsonschema",

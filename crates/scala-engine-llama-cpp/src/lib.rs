@@ -3,6 +3,7 @@
 mod catalog;
 mod chat;
 mod decision;
+mod embeddings;
 mod prefill;
 mod source_catalog;
 
@@ -332,6 +333,7 @@ pub struct LlamaCppAdapter {
     client: reqwest::Client,
     chat_proofs: std::sync::RwLock<BTreeMap<String, chat::LaunchProof>>,
     decision_proofs: std::sync::RwLock<BTreeMap<String, decision::LaunchProof>>,
+    embedding_proofs: std::sync::RwLock<BTreeMap<String, embeddings::LaunchProof>>,
     capability_cache: tokio::sync::RwLock<BTreeMap<String, String>>,
     /// Replaced before every launch attempt; activated only for its matching process.
     prompt_timing: tokio::sync::RwLock<BTreeMap<String, PromptTimingLaunch>>,
@@ -440,6 +442,7 @@ impl LlamaCppAdapter {
             client: reqwest::Client::new(),
             chat_proofs: std::sync::RwLock::new(BTreeMap::new()),
             decision_proofs: std::sync::RwLock::new(BTreeMap::new()),
+            embedding_proofs: std::sync::RwLock::new(BTreeMap::new()),
             capability_cache: tokio::sync::RwLock::new(BTreeMap::new()),
             prompt_timing: tokio::sync::RwLock::new(BTreeMap::new()),
         }
@@ -1638,6 +1641,10 @@ impl EngineAdapter for LlamaCppAdapter {
 
     async fn clear_launch_state(&self, endpoint: Option<&str>) {
         if let Some(endpoint) = endpoint {
+            self.embedding_proofs
+                .write()
+                .expect("embedding proof lock")
+                .remove(endpoint);
             self.chat_proofs
                 .write()
                 .expect("chat proof lock")
@@ -1695,6 +1702,7 @@ impl EngineAdapter for LlamaCppAdapter {
             })
         };
         self.observe_decision(process).await;
+        self.observe_embeddings(process).await;
         if !self.decision_candidate_endpoint(endpoint) {
             self.observe_chat(process).await;
         }
@@ -1773,22 +1781,53 @@ impl EngineAdapter for LlamaCppAdapter {
         })
     }
 
+    fn validate_embedding_request(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        settings: &scala_core::ResolvedSettings,
+        endpoint: &str,
+        request: &scala_engine::EmbeddingRequest,
+    ) -> Result<(), EngineError> {
+        if request.input.structured()
+            && !self
+                .embedding_proofs
+                .read()
+                .expect("embedding proof lock")
+                .get(endpoint)
+                .is_some_and(|p| p.matches_pair(runtime, model, settings))
+        {
+            return Err(EngineError::NativeRequest {
+                message: "Structured embeddings are unqualified for the selected Runtime/model/Settings tuple.".into(),
+                parameter: "input".into(), code: "unsupported_embedding_media",
+            });
+        }
+        self.validate_embedding_endpoint(endpoint, request)
+    }
+
     async fn embed(
         &self,
         endpoint: &str,
         request: scala_engine::EmbeddingRequest,
     ) -> Result<scala_engine::EmbeddingOutput, EngineError> {
+        self.validate_embedding_endpoint(endpoint, &request)?;
         let response = self.client.post(format!("{endpoint}/v1/embeddings"))
             .timeout(INFERENCE_TIMEOUT)
-            .json(&json!({"model": request.model_profile_id.as_str(), "input": request.input, "encoding_format": "float"}))
+            .json(&json!({"model": request.model_profile_id.as_str(), "input": request.input.native_value(), "encoding_format": "float"}))
             .send().await.map_err(map_transport_error)?;
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| EngineError::BackendUnavailable(e.to_string()))?;
+        let (status, bytes) = embeddings::body(response).await?;
         if !status.is_success() {
-            return Err(backend_http_error(status, &bytes));
+            if status == reqwest::StatusCode::BAD_REQUEST
+                || status == reqwest::StatusCode::NOT_IMPLEMENTED
+            {
+                return Err(EngineError::NativeRequest {
+                    message: "Native embedding input was rejected; check the selected model's modality, token/context and batch limits.".into(),
+                    parameter: "input".into(), code: "unsupported_embedding_input",
+                });
+            }
+            return Err(EngineError::Operation(format!(
+                "Native embedding request failed (HTTP {status}); verify model modality and context limits."
+            )));
         }
         #[derive(Deserialize)]
         struct Item {
@@ -1806,7 +1845,7 @@ impl EngineAdapter for LlamaCppAdapter {
             usage: Option<Usage>,
         }
         let response: Embeddings = serde_json::from_slice(&bytes)
-            .map_err(|e| EngineError::Operation(format!("invalid embedding response: {e}")))?;
+            .map_err(|_| EngineError::Operation("Invalid native embedding response.".into()))?;
         let invalid = || EngineError::Operation("invalid embedding indexes or vectors".to_owned());
         if response.data.len() != request.input.len() {
             return Err(invalid());
@@ -1829,7 +1868,12 @@ impl EngineAdapter for LlamaCppAdapter {
             Some(usage) if usage.prompt_tokens == usage.total_tokens => {
                 (Some(usage.prompt_tokens), Some(usage.total_tokens))
             }
-            _ => (None, None),
+            Some(_) => {
+                return Err(EngineError::Operation(
+                    "Invalid native embedding usage.".into(),
+                ));
+            }
+            None => (None, None),
         };
         Ok(scala_engine::EmbeddingOutput {
             vectors: vectors
@@ -2291,6 +2335,7 @@ impl LlamaCppAdapter {
         };
         self.prepare_chat(spec).await;
         self.prepare_decision(spec).await;
+        self.prepare_embeddings(spec).await;
         // Clear old endpoint proof before verification, including failed/retried loads.
         self.prompt_timing.write().await.remove(endpoint);
         let reviewed = prefill::reviewed(&spec.runtime)

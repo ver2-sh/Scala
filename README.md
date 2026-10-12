@@ -980,9 +980,36 @@ output stays false because the audited NInfer source rejects constrained non-tex
 
 Responses remains the primary generation API; Chat Completions is the modern compatibility generation API. `/v1/completions` provides legacy **raw-prompt** compatibility, with no chat template or system-message injection. llama.cpp and exact reviewed q27 runtimes support it, including streaming; NInfer does not. Requests accept one string `prompt`, `model`, `stream`, `stream_options.include_usage`, `max_tokens`, `temperature`, `top_p`, and adapter-supported `top_k`, `min_p`, `seed`, stop strings and penalties. q27 rejects stop strings and repetition/presence/frequency penalties. Non-default `n`/`best_of`, `echo=true`, non-null `logprobs`/`suffix`, non-empty `logit_bias`, token-ID prompts and multiple prompts fail explicitly. `user` is accepted as client metadata without changing inference.
 
-`/v1/embeddings` requires an embedding-capable Model Profile/runtime. Initially only llama.cpp is supported. Bounded inspection of the actual GGUF reads `<architecture>.pooling_type`: mean (1), CLS (2), or last (3) establishes pooled embedding capability. Missing/unknown, none (0), and rank (4) do not. Raw and package-managed artifacts use the same inspection, independently of Builder provenance and filenames. Such profiles launch normally with `--embedding`, without forcing pooling. Runtime inference supplies numeric vectors; Scala formats float arrays or base64 little-endian float32 bytes, preserving input order and indexes. Token accounting is included only when supplied consistently by the runtime.
+`/v1/embeddings` requires an embedding-capable Model Profile/runtime. Only llama.cpp is qualified; q27 and NInfer do not support this route. Bounded inspection of the actual GGUF reads `<architecture>.pooling_type`: mean (1), CLS (2), or last (3) admits a pooled embedding candidate. Missing/unknown, none (0), and rank (4) do not. Raw and package-managed artifacts use the same inspection, independently of Builder provenance and filenames. Such profiles launch normally with `--embedding`, without forcing pooling. Runtime inference supplies numeric vectors; Scala formats float arrays or base64 little-endian float32 bytes, preserving input order and indexes. Token accounting is included only when supplied consistently by the runtime.
 
-Embeddings accepts `input` as a non-empty string or non-empty array of non-empty strings, `encoding_format` of `float` (default) or `base64`, and optional `user`. Any supplied `dimensions`, token-array inputs, or unknown fields are rejected. Unsupported model/runtime capabilities fail explicitly with sanitized OpenAI-style errors. Both new inference routes share authentication, request correlation, the 32 MiB body limit, X-Scala routing, JIT loading, and runtime leases.
+Standard text embeddings accept `input` as a nonempty string or nonempty array of nonempty strings, `encoding_format` of `float` (default) or `base64`, and optional `user`. Any supplied `dimensions`, token arrays, or unknown fields are rejected. Both inference routes share authentication, request correlation, the 32 MiB body limit, X-Scala routing, JIT loading, and runtime leases.
+
+The **llama.cpp native multimodal extension** also accepts a single `{ "content": [...] }` object, an ordered array of such objects, or an array mixing strings and content objects. Each entry produces exactly one vector. This extension is not part of the standard OpenAI Embeddings API and is not a universal Engine or GGUF capability. Scala forwards typed content directly to native `/v1/embeddings`, preserving grouping, part order, exact text and media bytes. It never embeds media through generated descriptions or chat.
+
+```json
+{"model":"<EMBEDDING_MODEL_PROFILE_ID>","input":{"content":[
+  {"type":"image_url","image_url":{"url":"data:image/png;base64,<PNG_BYTES>"}},
+  {"type":"text","text":"Describe this image"}
+]}}
+```
+
+```json
+{"model":"<EMBEDDING_MODEL_PROFILE_ID>","input":[
+  {"content":[{"type":"input_audio","input_audio":{"data":"<PCM_WAV_BASE64>","format":"wav"}}]},
+  {"content":[{"type":"input_video","input_video":{"url":"data:video/x-msvideo;base64,<AVI_BYTES>"}}]},
+  "Another text input"
+],"encoding_format":"base64"}
+```
+
+The placeholders above represent complete encoded files. Native audio/video accept exactly one `data` or `url` field: raw standard base64, a base64 data URI, or a public HTTP(S) URL. Images accept raw base64, a base64 data URI or public HTTP(S) URL in `image_url.url`. Image `detail` may be omitted or `auto`; audio `format` may be omitted or `wav`; video has no `format` field. No content part is silently dropped.
+
+Admitted media are PNG/JPEG/WebP images, integer PCM WAV audio (`audio/wav`, 1–2 channels, 8–192 kHz, 8/16/24/32 bits, at most 60 seconds), and self-contained raw 24-bit BGR AVI video (`video/x-msvideo`, one stream, no indexes, 1–1024 pixels per axis, 1–64 frames, 1–60 fps, at most 10 seconds). Native miniaudio also recognizes MP3/FLAC, and native FFmpeg accepts broader containers; these compressed/opaque forms are explicitly rejected here because their native decode sizes and external-resource behavior are not bounded by Scala's admitted transport. No transcoding is performed. Images have the existing 4096x4096 / 64 MiB decode limits. Requests allow 1–1024 logical inputs, 1–64 parts per object, at most two media payloads, 8 MiB each and 16 MiB total.
+
+Remote acquisition uses standard ports, excludes credentials, private/loopback/link-local/metadata/overlay addresses and `.ts.net` hosts, requires exclusively public DNS answers, pins those addresses, disables proxies and redirects, and checks Content-Type against validated bytes. Limits are 15 seconds per payload and 30 seconds per request including DNS. Local paths and `file://` are rejected; acquired bytes reach native as inline base64, so native cannot fetch the original URL.
+
+Structured embeddings require one of the [frozen October llama.cpp revisions](docs/integration-october-2026.md#native-multimodal-embeddings-completion), an actual pooled model and startup evidence from the selected private endpoint. Media additionally requires exactly one SHA-256-verified artifact-bound projector or explicit `llama.cpp.projector` plus `llama.cpp.projector_sha256` through Settings/Profile/load overrides. Native `clip.has_vision_encoder` and `clip.has_audio_encoder` metadata and loaded `/props` plus `/v1/models` must corroborate each modality independently. Video also needs `MTMD_VIDEO` and identified executable FFmpeg/FFprobe resources on the native launch PATH; WebP uses those resources too. A vision chat model alone does not qualify for pooled vision embeddings. Missing or contradictory evidence fails with a structured error. Older text-only combinations retain the legacy path.
+
+Native pooling, normalization, token/context/batch limits and preprocessing remain native. Responses validate count, indexes, dimensions, finite nonempty vectors and native usage. Missing usage is omitted; inconsistent usage is an error. Scala never estimates media token counts or returns fabricated vectors. Link carries the same requests and responses to the Model Profile owner without moving artifacts or introducing different embedding semantics.
 
 ```sh
 curl http://127.0.0.1:8742/v1/embeddings \

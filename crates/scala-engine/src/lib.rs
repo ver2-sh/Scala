@@ -26,9 +26,11 @@ pub mod benchmark;
 mod catalog;
 mod control;
 mod decision;
+mod embeddings;
 mod installer;
 pub mod link;
 mod manager;
+pub mod media;
 mod packs;
 mod prune;
 mod store;
@@ -36,6 +38,7 @@ mod supervisor;
 #[cfg(test)]
 mod test_support;
 pub use decision::*;
+pub use embeddings::*;
 pub use prune::plan_runtime_prune;
 
 pub use catalog::{
@@ -1529,12 +1532,6 @@ pub struct CompletionRequest {
 }
 
 #[derive(Debug, Clone)]
-pub struct EmbeddingRequest {
-    pub model_profile_id: scala_core::ModelProfileId,
-    pub input: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
 pub struct EmbeddingOutput {
     /// One numeric vector per input, in original input order.
     pub vectors: Vec<Vec<f32>>,
@@ -2191,6 +2188,35 @@ pub trait EngineAdapter: Send + Sync {
             "streaming raw completions".to_owned(),
         ))
     }
+    /// Validate the exact selected pair before the existing private executor.
+    /// Structured input is an engine-specific extension, never inherited.
+    fn validate_embedding_request(
+        &self,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _settings: &ResolvedSettings,
+        _endpoint: &str,
+        request: &EmbeddingRequest,
+    ) -> Result<(), EngineError> {
+        request
+            .input
+            .validate_inline_media()
+            .map_err(|message| EngineError::NativeRequest {
+                message,
+                parameter: "input".into(),
+                code: "invalid_value",
+            })?;
+        if request.input.structured() {
+            return Err(EngineError::NativeRequest {
+                message: "This engine has no qualified native structured embedding input contract."
+                    .into(),
+                parameter: "input".into(),
+                code: "unsupported_embedding_media",
+            });
+        }
+        Ok(())
+    }
+
     async fn embed(
         &self,
         _endpoint: &str,

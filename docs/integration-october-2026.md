@@ -347,3 +347,99 @@ No GitHub Actions, production GPU service or model inference was used.
 - `docs/ninfer.md`
 - `docs/q27-grep-contract.md`
 - `docs/runtime-settings-coverage.md`
+
+
+## Native multimodal embeddings completion
+
+This completion started from clean `integration/october-2026-inference` at
+`6ca9372b8ee5f7ccf87ff6e9e97603fcff5e4cd8`. It preserves all prior October
+Decision, llama.cpp, q27 v0.14.5, NInfer v3 and constrained-output integrations.
+No model, production Settings/Profile or live Scala service was changed.
+
+Contracts were checked at both frozen llama.cpp revisions, including
+[stable server README](https://github.com/ggml-org/llama.cpp/blob/d81235049384534c167caea52b85a694f6103d14/tools/server/README.md#post-v1embeddings-openai-compatible-embeddings-api)
+and [nightly server README](https://github.com/ggml-org/llama.cpp/blob/f9a95aeb2096d0c0218e0cd6e6d901cd37be798a/tools/server/README.md#post-v1embeddings-openai-compatible-embeddings-api),
+`server-context.cpp::handle_embeddings_impl`, `server-common.cpp`
+(`tokenize_oai_content_array`, `oaicompat_content_load_media`, `handle_media`,
+`format_embeddings_response_oaicompat`), `server-task.cpp` embedding results,
+and `tools/mtmd` (`mtmd.cpp`, `clip.cpp`, `mtmd-helper.cpp`, CMakeLists).
+Both accept a single content object and ordered string/object mixtures as well
+as the documented object array. Each object schedules one embedding task;
+content parts are processed in supplied order without a chat template. This is
+a llama.cpp extension, not standard OpenAI Embeddings API functionality.
+
+The public contracts, examples and limits are in the [README](../README.md#secure-serving-and-openai-compatible-apis).
+All four native part types are implemented now: text, image_url, input_audio,
+input_video. Image URL uses `image_url.url`; audio/video accept exactly one
+`data` or `url` with raw base64, data URI or safely acquired HTTP(S). Native
+ignores audio `format`; Scala accepts only omitted/`wav`, matching the bytes.
+Video has no format field. Other/ambiguous fields, unsupported token arrays,
+empty inputs/groups and unknown part types fail before native dispatch.
+
+Qualification distinguishes pooled-model candidates from loaded proof. It
+uses the exact immutable runtime, real model architecture/pooling metadata,
+existing SHA-256 projector/auxiliary binding, native encoder metadata,
+matching `/props` and `/v1/models`, and an empty-input validation-only probe
+that never dispatches inference. Images, audio and video qualify independently.
+FFmpeg/FFprobe identities must also be available on native PATH for video and
+WebP; compile-time video capability alone is insufficient. Proofs are ephemeral,
+file-sensitive and removed with backend lifecycle state. No capability derives
+from GGUF alone, a vision filename, chat capability, producer origin, or another
+Engine. Existing text-only runtime/model combinations remain usable.
+
+The native audio reader recognizes WAV/MP3/FLAC and allocates from decoded frame
+length; the video reader launches FFprobe/FFmpeg on supplied bytes without a
+protocol allowlist. Scala therefore admits complete integer PCM WAV and a
+fully inspected, self-contained uncompressed BGR AVI subset. The small synthetic
+AVI is also decoded by local libavformat/libavcodec as two 2x2 rawvideo frames;
+the WAV decodes as four PCM samples. Compressed audio, MP4/WebM, playlists,
+opaque AVI extensions/indexes, secondary streams and external container
+references are explicitly unsupported by this bounded transport. These are
+intentional security limits, not deferred modality implementations. Native
+context/batch/token limits still apply; no pooling/normalization/preprocessing
+or launch defaults were changed, and no transcoding or fabricated usage/vector
+fallback was introduced.
+
+Media reuses shared Decision raster validation/acquisition, with 32 MiB request,
+two 8 MiB media, 15-second per-file / 30-second request limits including DNS,
+strict base64/MIME and decoded geometry/duration bounds, no credentials/files,
+no private/metadata/overlay hosts, public-only pinned DNS, no proxies and no
+redirects. Acquired bytes become inline data so native cannot fetch the URL.
+Responses retain exact native usage or its absence and validate vector
+count/order/index/dimension/finiteness. Errors cannot echo media or credentials.
+Scala Link uses the existing bounded owner request/response wire; artifacts
+stay on their owner. Settings precedence and persisted contracts stay intact.
+
+Synthetic coverage includes both frozen revisions, all public input forms and
+modalities, mixed ordered parts/inputs, invalid shapes/media/size/decoded bounds,
+private URLs, DNS rebinding/redirect resistance, missing or corrupt projectors,
+independent modality evidence, wrong loaded identities/pooling, resource changes,
+text-only compatibility, public float/base64/usage, cold Profile JIT and unload,
+Link request/response forwarding, and explicit q27/NInfer embedding boundaries.
+
+
+Files changed for this completion:
+
+| Area | Files |
+| --- | --- |
+| Public API and shared acquisition | `crates/scala-api/src/embeddings.rs`, `media.rs` (new), `decisions/images.rs`, `lib.rs`, `link.rs` |
+| Engine contract, validation and routing | `crates/scala-engine/src/embeddings.rs` (new), `media.rs` (new), `decision.rs`, `lib.rs`, `manager.rs` |
+| GGUF encoder inspection | `crates/scala-core/src/model.rs` |
+| Native adapter and synthetic backend tests | `crates/scala-engine-llama-cpp/src/embeddings.rs` (new), `embeddings/tests.rs` (new), `lib.rs`, `decision.rs`, `Cargo.toml` |
+| Engine boundary tests only | `crates/scala-engine-q27/src/lib.rs`, `crates/scala-engine-ninfer/src/lib.rs` |
+| Tiny byte fixtures | `crates/scala-engine/testdata/embedding.wav` (52 bytes), `embedding.avi` (272 bytes) |
+| Documentation and test dependency lock | `README.md`, `docs/architecture.md`, `docs/integration-october-2026.md`, `Cargo.lock` |
+
+Blocking findings: none for the admitted contracts. Material limits are the
+explicit WAV/AVI safe subsets, exact reviewed-runtime and loaded-pair proof,
+projector/encoder integrity, and native FFmpeg/FFprobe availability for video
+and WebP. Actual model execution remains native and was not run during development.
+
+
+Completion validation (all successful, no warnings): `cargo fmt --check`,
+`cargo check --workspace`, `cargo clippy --workspace`, `cargo test --workspace`
+(**432 passed, 0 failed, 1 existing ignored test, 22 suites including doc tests**),
+and `git diff --check`. The tiny WAV/AVI fixtures also passed the local
+libavformat/libavcodec format/decode check. No GitHub Actions, model inference,
+GPU work, conversion, training, quantization, benchmarks, deployment, push,
+merge or release was performed.

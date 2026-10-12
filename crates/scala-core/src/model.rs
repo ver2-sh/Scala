@@ -59,6 +59,11 @@ pub enum ArtifactNativeIdentity {
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct GgufArtifactIdentity {
+    /// Projector-native encoder metadata. These are candidate facts only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projector_vision: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projector_audio: Option<bool>,
     /// Native pooling: 1 = mean, 2 = CLS, 3 = last; other values are not pooled embeddings.
     pub pooling_type: Option<u64>,
     pub version: u32,
@@ -534,6 +539,8 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
     }
 
     let mut architecture = None;
+    let mut projector_vision = None;
+    let mut projector_audio = None;
     let mut architecture_numbers = HashMap::<String, u64>::new();
     let mut architecture_decimals = HashMap::<String, String>::new();
     let mut architecture_decisions = HashMap::<String, String>::new();
@@ -553,6 +560,8 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
             continue;
         }
         let capture = key == "general.architecture"
+            || key == "clip.has_vision_encoder"
+            || key == "clip.has_audio_encoder"
             || key.ends_with(".decision.type")
             || key.ends_with(".pooling_type")
             || key.ends_with(".context_length")
@@ -563,7 +572,24 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
             || key.ends_with(".rope.scale_linear")
             || key == "tokenizer.chat_template";
         let value = reader.value(value_type, capture.then_some(&key), None)?;
-        if key == "general.architecture" {
+        if matches!(
+            key.as_str(),
+            "clip.has_vision_encoder" | "clip.has_audio_encoder"
+        ) {
+            let flag = if value_type == 7 {
+                value
+                    .and_then(GgufScalar::into_u64)
+                    .filter(|v| *v <= 1)
+                    .map(|v| v == 1)
+            } else {
+                None
+            };
+            if key == "clip.has_vision_encoder" {
+                projector_vision = flag;
+            } else {
+                projector_audio = flag;
+            }
+        } else if key == "general.architecture" {
             architecture = value.and_then(GgufScalar::into_string);
         } else if key.ends_with(".decision.type") {
             if let Some(value) = value.and_then(GgufScalar::into_string) {
@@ -617,6 +643,8 @@ pub fn inspect_gguf_metadata(path: &Path) -> Result<GgufArtifactIdentity, GgufMe
         .and_then(|key| architecture_decimals.get(key))
         .cloned();
     Ok(GgufArtifactIdentity {
+        projector_vision,
+        projector_audio,
         decision_type: architecture_decisions.remove(&format!("{architecture}.decision.type")),
         pooling_type: architecture_numbers
             .get(&format!("{architecture}.pooling_type"))

@@ -4033,6 +4033,16 @@ fn unix_timestamp() -> i64 {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn embeddings_remain_outside_this_native_engine_contract() {
+        let adapter = super::NinferAdapter::from_config(None, std::path::Path::new("."));
+        assert!(
+            !scala_engine::EngineAdapter::capabilities(&adapter)
+                .api
+                .contains(&scala_engine::ApiCapability::Embeddings)
+        );
+    }
+
+    #[test]
     fn released_engine_remains_decision_unsupported() {
         let adapter = NinferAdapter::from_config(None, Path::new("."));
         let capabilities = adapter.capabilities();

@@ -8,6 +8,7 @@ mod embeddings;
 mod error;
 mod input;
 mod link;
+mod media;
 /// Compile the actual private NInfer serializer into contract tests without
 /// adding a production API or a runtime capability bypass.
 #[cfg(test)]

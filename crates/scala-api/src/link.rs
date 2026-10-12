@@ -1050,6 +1050,101 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn embedding_link_preserves_native_groups_headers_vectors_and_usage() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use tokio::io::AsyncReadExt;
+        let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+        for media in [
+            json!({"type":"image_url","image_url":{"url":image}}),
+            json!({"type":"input_audio","input_audio":{"data":STANDARD.encode(include_bytes!("../../scala-engine/testdata/embedding.wav")),"format":"wav"}}),
+            json!({"type":"input_video","input_video":{"url":format!("data:video/x-msvideo;base64,{}",STANDARD.encode(include_bytes!("../../scala-engine/testdata/embedding.avi")))}}),
+        ] {
+            let body = json!({"model":"embedding-profile@owner","input":["first",{"content":[{"type":"text","text":"  before\n"},media,{"type":"text","text":"after"}]}],"encoding_format":"base64"});
+            let headers = BTreeMap::from([
+                ("x-scala-session-id".into(), "session".into()),
+                ("x-scala-role".into(), "validator".into()),
+            ]);
+            let envelope = Envelope {
+                version: LINK_VERSION,
+                source: "entry".into(),
+                target: "owner".into(),
+                hops: 1,
+                operation: Operation::Inference {
+                    profile_id: ModelProfileId::new("embedding-profile").unwrap(),
+                    path: "/v1/embeddings".into(),
+                    body: body.clone(),
+                    headers: headers.clone(),
+                },
+            };
+            let (mut writer, mut reader) = tokio::io::duplex(1024);
+            let (sent, received) = tokio::join!(
+                wayfinder::write_json(&mut writer, &envelope, REQUEST_LIMIT),
+                wayfinder::read_json::<Envelope>(&mut reader, REQUEST_LIMIT)
+            );
+            sent.unwrap();
+            let Operation::Inference {
+                profile_id,
+                path,
+                body: received,
+                headers: received_headers,
+            } = received.unwrap().operation
+            else {
+                panic!("embedding operation")
+            };
+            assert_eq!(profile_id.as_str(), "embedding-profile");
+            assert_eq!(path, "/v1/embeddings");
+            assert_eq!(received, body);
+            assert_eq!(received_headers, headers);
+            let input: scala_engine::EmbeddingInput =
+                serde_json::from_value(received["input"].clone()).unwrap();
+            input.validate_inline_media().unwrap();
+            assert_eq!(input.len(), 2);
+            for encoding in ["float", "base64"] {
+                let vector = if encoding == "float" {
+                    json!([0.25, 0.75])
+                } else {
+                    json!(
+                        STANDARD.encode(
+                            [0.25f32, 0.75]
+                                .iter()
+                                .flat_map(|v| v.to_le_bytes())
+                                .collect::<Vec<_>>()
+                        )
+                    )
+                };
+                let value = json!({"object":"list","model":"embedding-profile@owner","data":[{"index":0,"embedding":vector},{"index":1,"embedding":vector}],"usage":{"prompt_tokens":17,"total_tokens":17}});
+                let mut response = axum::Json(value.clone()).into_response();
+                response
+                    .headers_mut()
+                    .insert("x-request-id", "owner-id".parse().unwrap());
+                let (mut writer, mut reader) = tokio::io::duplex(1024);
+                let read = async {
+                    let len = reader.read_u32().await.unwrap() as usize;
+                    let mut head = vec![0; len];
+                    reader.read_exact(&mut head).await.unwrap();
+                    let head: ResponseHead = serde_json::from_slice(&head).unwrap();
+                    assert_eq!(head.status, 200);
+                    assert_eq!(head.headers["x-request-id"], "owner-id");
+                    let mut bytes = Vec::new();
+                    loop {
+                        let len = reader.read_u32().await.unwrap() as usize;
+                        if len == 0 {
+                            break;
+                        }
+                        let at = bytes.len();
+                        bytes.resize(at + len, 0);
+                        reader.read_exact(&mut bytes[at..]).await.unwrap();
+                    }
+                    serde_json::from_slice::<Value>(&bytes).unwrap()
+                };
+                let (sent, received) = tokio::join!(send_response_to(&mut writer, response), read);
+                sent.unwrap();
+                assert_eq!(received, value);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn decisions_owner_success_requires_complete_usage_while_systemone_stays_native() {
         let complete = json!({"model":"owner-native", "answers":[{"type":"predicate","name":null,"probability":0.8}],
             "usage":{"input_tokens":42,"input_tokens_details":{"cached_tokens":7,"cache_write_tokens":3},

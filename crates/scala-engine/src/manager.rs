@@ -2268,6 +2268,13 @@ impl RuntimeManager {
         request: crate::EmbeddingRequest,
         routing: InferenceRoutingContext,
     ) -> Result<crate::EmbeddingOutput, RuntimeError> {
+        request.input.validate_inline_media().map_err(|message| {
+            map_inference_error(EngineError::NativeRequest {
+                message,
+                parameter: "input".into(),
+                code: "invalid_value",
+            })
+        })?;
         let target = self
             .inference_target(
                 &request.model_profile_id,
@@ -2276,6 +2283,16 @@ impl RuntimeManager {
                 false,
             )
             .await?;
+        target
+            .adapter
+            .validate_embedding_request(
+                &target.runtime,
+                &target.model,
+                &target.settings,
+                &target.endpoint,
+                &request,
+            )
+            .map_err(map_inference_error)?;
         target.lease.mark_processing_prompt();
         target
             .adapter

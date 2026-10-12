@@ -61,7 +61,7 @@ pub struct DecisionRequest {
 }
 
 pub const MAX_DECISION_IMAGES: usize = 2;
-pub const MAX_DECISION_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_DECISION_IMAGE_BYTES: usize = crate::media::MAX_MEDIA_BYTES;
 
 impl DecisionRequest {
     /// Bound the transport without changing image bytes or preprocessing them.
@@ -706,24 +706,5 @@ pub(crate) mod tests {
 /// Shared native Decision transport validation. Decode under strict allocation
 /// and geometry limits without altering the bytes delivered to the runtime.
 pub fn validate_decision_raster(bytes: &[u8]) -> Result<&'static str, String> {
-    if bytes.len() > MAX_DECISION_IMAGE_BYTES {
-        return Err("image exceeds 8 MiB".into());
-    }
-    let format = image::guess_format(bytes).map_err(|_| "invalid image format")?;
-    let mime = match format {
-        image::ImageFormat::Png => "image/png",
-        image::ImageFormat::Jpeg => "image/jpeg",
-        image::ImageFormat::WebP => "image/webp",
-        _ => return Err("only PNG, JPEG and WebP are admitted".into()),
-    };
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(4096);
-    limits.max_image_height = Some(4096);
-    limits.max_alloc = Some(64 * 1024 * 1024);
-    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
-    reader.limits(limits);
-    reader
-        .decode()
-        .map_err(|_| "malformed image or image exceeds 4096 by 4096 / 64 MiB decode limit")?;
-    Ok(mime)
+    crate::media::validate_raster(bytes)
 }

@@ -29,7 +29,7 @@ fn reviewed_image_contract(revision: Option<&str>, native_type: Option<&str>) ->
     }
 }
 
-fn file_fingerprint(path: &Path) -> Option<String> {
+pub(super) fn file_fingerprint(path: &Path) -> Option<String> {
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() {
         return None;
@@ -83,7 +83,7 @@ fn qualified_files(
         })
         .collect()
 }
-fn tuple_key(
+pub(super) fn tuple_key(
     runtime: &InstalledRuntime,
     model: &ModelArtifact,
     settings: &ResolvedSettings,

@@ -6776,6 +6776,16 @@ impl Q27Adapter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn embeddings_remain_outside_this_native_engine_contract() {
+        let adapter = super::Q27Adapter::from_config(None, std::path::Path::new("."));
+        assert!(
+            !scala_engine::EngineAdapter::capabilities(&adapter)
+                .api
+                .contains(&scala_engine::ApiCapability::Embeddings)
+        );
+    }
+
     #[tokio::test]
     async fn discovery_only_inspects_reviewed_source_tags_and_keeps_official_binaries() {
         let release = |tag: &str, assets: Vec<GitHubReleaseAsset>| GitHubRelease {
