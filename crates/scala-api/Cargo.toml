@@ -11,10 +11,12 @@ async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
+reqwest.workspace = true
+url.workspace = true
 scala-core = { path = "../scala-core" }
 scala-engine = { path = "../scala-engine" }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

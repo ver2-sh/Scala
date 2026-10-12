@@ -604,7 +604,11 @@ impl LlamaCppAdapter {
         }
     }
 
-    fn backend_request(&self, request: &InferenceRequest, stream: bool) -> Value {
+    fn backend_request(
+        &self,
+        request: &InferenceRequest,
+        stream: bool,
+    ) -> Result<Value, EngineError> {
         let messages = backend_messages(&request.messages);
         let mut body = json!({
             "model": request.model_profile_id.as_str(),
@@ -641,6 +645,13 @@ impl LlamaCppAdapter {
         }
         if let Some(output_format) = &request.output_format {
             body["response_format"] = match output_format {
+                OutputFormat::Gbnf { .. }
+                | OutputFormat::LiteralChoice { .. }
+                | OutputFormat::Regex { .. } => {
+                    return Err(EngineError::InvalidGenerationSettings(
+                        "unsupported structured_outputs extension".into(),
+                    ));
+                }
                 OutputFormat::Text => json!({ "type": "text" }),
                 OutputFormat::JsonObject => {
                     json!({ "type": "json_object", "schema": {"type": "object"} })
@@ -671,7 +682,7 @@ impl LlamaCppAdapter {
             body["return_progress"] = json!(true);
             body["timings_per_token"] = json!(true);
         }
-        body
+        Ok(body)
     }
 
     async fn startup_properties(
@@ -790,6 +801,69 @@ impl EngineAdapter for LlamaCppAdapter {
         self.decision_supported(runtime, model, settings)
     }
 
+    fn supports_model_decision_images(&self, model: &ModelArtifact) -> bool {
+        // This admits a loading attempt. The loaded /props vision observation
+        // and native can_use_images check remain authoritative at dispatch.
+        decision::candidate(model)
+    }
+
+    fn supports_openai_decisions(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        settings: &scala_core::ResolvedSettings,
+    ) -> bool {
+        self.decision_supported(runtime, model, settings)
+            && matches!(
+                runtime.manifest.identity.upstream_revision.as_deref(),
+                Some(
+                    "d81235049384534c167caea52b85a694f6103d14"
+                        | "f9a95aeb2096d0c0218e0cd6e6d901cd37be798a"
+                )
+            )
+    }
+
+    fn qualified_decision_images(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        settings: &scala_core::ResolvedSettings,
+    ) -> bool {
+        self.supports_openai_decisions(runtime, model, settings)
+            && self.decision_vision_supported(runtime, model, settings)
+    }
+
+    fn validate_openai_decision_request(
+        &self,
+        runtime: &InstalledRuntime,
+        model: &ModelArtifact,
+        settings: &scala_core::ResolvedSettings,
+        request: &scala_engine::DecisionRequest,
+    ) -> Result<(), EngineError> {
+        if !self.decision_supported(runtime, model, settings)
+            || !matches!(
+                runtime.manifest.identity.upstream_revision.as_deref(),
+                Some(
+                    "d81235049384534c167caea52b85a694f6103d14"
+                        | "f9a95aeb2096d0c0218e0cd6e6d901cd37be798a"
+                )
+            )
+        {
+            return Err(EngineError::Unsupported("OpenAI Decisions requires an execution-qualified pair and a reviewed native output contract (v0.6.0 or b11565)".into()));
+        }
+        // This is a semantic exception from upstream format_answer, never a
+        // model detector: Lev returns a rating expectation, not P(true).
+        if matches!(&model.native_identity, Some(ArtifactNativeIdentity::Gguf(identity)) if identity.decision_type.as_deref() == Some("lev"))
+            && request
+                .questions
+                .values()
+                .any(|q| matches!(q, scala_engine::DecisionQuestion::Noul { .. }))
+        {
+            return Err(EngineError::InvalidDecisionRequest("This native pair returns a noul rating expectation and cannot honor predicate probability; use /v1/systemone or choice questions.".into()));
+        }
+        Ok(())
+    }
+
     async fn decide(
         &self,
         endpoint: &str,
@@ -888,6 +962,23 @@ impl EngineAdapter for LlamaCppAdapter {
                 ),
             ));
         }
+        if request.tools.iter().any(|t| t.strict == Some(true)) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "strict function tools are not qualified for this Engine".into(),
+            ));
+        }
+        if matches!(
+            &request.output_format,
+            Some(
+                OutputFormat::Gbnf { .. }
+                    | OutputFormat::LiteralChoice { .. }
+                    | OutputFormat::Regex { .. }
+            )
+        ) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "this Engine does not admit NInfer's structured_outputs extension".into(),
+            ));
+        }
         self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
         chat::validate_request(request)?;
         let required = [
@@ -957,7 +1048,7 @@ impl EngineAdapter for LlamaCppAdapter {
             .client
             .post(format!("{endpoint}/v1/chat/completions/input_tokens"))
             .timeout(PROPS_TIMEOUT)
-            .json(&self.backend_request(request, false))
+            .json(&self.backend_request(request, false)?)
             .send()
             .await
             .map_err(map_transport_error)?;
@@ -1435,6 +1526,25 @@ impl EngineAdapter for LlamaCppAdapter {
             OsString::from("--port"),
             OsString::from(request.backend_address.port().to_string()),
         ];
+        let projectors: Vec<_> = request
+            .model
+            .auxiliary
+            .iter()
+            .filter(|a| a.role == scala_core::AuxiliaryArtifactRole::Projector)
+            .collect();
+        if projectors.len() > 1
+            || (!projectors.is_empty() && request.settings.value("llama.cpp.projector").is_some())
+        {
+            return Err(EngineError::InvalidConfiguration(
+                "Select exactly one explicit or artifact-bound projector".into(),
+            ));
+        }
+        if let Some(projector) = projectors.first() {
+            scala_core::inspect_gguf_metadata(&projector.path).map_err(|e| {
+                EngineError::InvalidConfiguration(format!("projector must be valid GGUF: {e}"))
+            })?;
+            push_value_argument(&mut arguments, "--mmproj", projector.path.to_string_lossy());
+        }
         if pooled_embedding_model(&request.model.primary) {
             let help = self.cached_runtime_help(&request.runtime).await?;
             if !help_has_option(&help, "--embedding") {
@@ -1679,8 +1789,8 @@ impl EngineAdapter for LlamaCppAdapter {
             ));
         }
         Ok(EffectiveGenerationSettings {
-            temperature: params.temperature,
-            top_p: params.top_p,
+            temperature: Some(params.temperature),
+            top_p: Some(params.top_p),
         })
     }
 
@@ -1780,7 +1890,7 @@ impl EngineAdapter for LlamaCppAdapter {
         self.send_completion(
             endpoint,
             "/v1/chat/completions",
-            self.backend_request(&request, false),
+            self.backend_request(&request, false)?,
         )
         .await
     }
@@ -1795,7 +1905,7 @@ impl EngineAdapter for LlamaCppAdapter {
         self.send_completion_stream(
             endpoint,
             "/v1/chat/completions",
-            self.backend_request(&request, true),
+            self.backend_request(&request, true)?,
             activity,
         )
         .await
@@ -2724,6 +2834,34 @@ fn llama_extended_setting_definitions() -> Vec<SettingDefinition> {
         choices: values.iter().map(|value| (*value).to_owned()).collect(),
     };
     let specs = [
+        (
+            "moe_cache_mib",
+            "MoE GPU cache",
+            "Native GPU expert cache capacity in MiB",
+            uint(0),
+            "0",
+        ),
+        (
+            "draft_sampling",
+            "Draft sampling",
+            "Native speculative draft sampling policy",
+            choice(&["greedy", "probabilistic"]),
+            "greedy",
+        ),
+        (
+            "projector",
+            "Vision projector",
+            "Explicit local GGUF projector; requires recorded SHA-256",
+            SettingKind::Path,
+            "None",
+        ),
+        (
+            "projector_sha256",
+            "Projector identity",
+            "Immutable SHA-256 of the explicit projector",
+            SettingKind::String,
+            "None",
+        ),
         (
             "threads_batch",
             "Batch CPU threads",
@@ -3843,7 +3981,8 @@ fn llama_definition(
                     "CUDA selects one compatible visible NVIDIA GPU by exact UUID; other runtimes retain ordinary automatic device behavior",
                 ),
             ),
-            "llama.cpp.chat_template_file"
+            "llama.cpp.projector" | "llama.cpp.projector_sha256"
+            | "llama.cpp.chat_template_file"
             | "llama.cpp.chat_template_sha256"
             | "llama.cpp.speculative_draft_model"
             | "llama.cpp.speculative_draft_sha256"
@@ -4005,6 +4144,11 @@ fn llama_direct_setting(id: &str) -> Option<LlamaDirectSetting> {
         "llama.cpp.lazy_mode" => value!("--lazy-mode", "LLAMA_ARG_LAZY_MODE"),
         "llama.cpp.numa" => value!("--numa", "LLAMA_ARG_NUMA"),
         "llama.cpp.override_tensor" => value!("--override-tensor", "LLAMA_ARG_OVERRIDE_TENSOR"),
+        "llama.cpp.moe_cache_mib" => value!("--moe-cache-mib", "LLAMA_ARG_MOE_CACHE_MIB"),
+        "llama.cpp.draft_sampling" => {
+            value!("--spec-draft-sampling", "LLAMA_ARG_SPEC_DRAFT_SAMPLING")
+        }
+        "llama.cpp.projector" => value!("--mmproj", "LLAMA_ARG_MMPROJ"),
         "llama.cpp.cpu_ffn_layers" => value!("--n-cpu-ffn", "LLAMA_ARG_N_CPU_FFN"),
         "llama.cpp.split_mode" => value!("--split-mode", "LLAMA_ARG_SPLIT_MODE"),
         "llama.cpp.tensor_split" => value!("--tensor-split", "LLAMA_ARG_TENSOR_SPLIT"),
@@ -4286,6 +4430,7 @@ fn llama_setting_contract(id: &str) -> Vec<&'static str> {
         return vec![setting.required];
     }
     match id {
+        "llama.cpp.projector" | "llama.cpp.projector_sha256" => vec!["--mmproj"],
         "llama.cpp.devices" => vec!["--device"],
         "llama.cpp.context_length" => vec!["--ctx-size"],
         "llama.cpp.parallel_requests" => vec!["--parallel"],
@@ -4379,6 +4524,7 @@ fn llama_setting_has_execution_path(id: &str) -> bool {
                 | "llama.cpp.speculative_mode"
                 | "llama.cpp.speculative_draft_model"
                 | "llama.cpp.speculative_draft_sha256"
+                | "llama.cpp.projector_sha256"
         )
 }
 
@@ -4773,9 +4919,40 @@ fn help_has_option(help: &str, option: &str) -> bool {
         .any(|line| help_line_has_option_header(line, option))
 }
 
-// Extra upstream controls are deliberately ignored; only owned launch controls
-// are required here. Configured settings have their own help contracts.
+// Each advertised option must belong to the reviewed ownership inventory.
+// Description references and continuation lines are not option declarations.
 fn validate_llama_launch_help(help: &str) -> Result<(), EngineError> {
+    let known: BTreeSet<_> = MANAGED_NATIVE_ARGUMENTS
+        .iter()
+        .copied()
+        .chain(structured_llama_argument_aliases())
+        .collect();
+    let mut unknown = BTreeSet::new();
+    for line in help.lines() {
+        let trimmed = line.trim_start();
+        if line.len() - trimmed.len() > 4
+            || !trimmed.starts_with('-')
+            || trimmed.starts_with("-----")
+            || trimmed == "-"
+        {
+            continue;
+        }
+        for token in trimmed.split(|c: char| c.is_whitespace() || c == ',') {
+            if !token.starts_with('-') {
+                break;
+            }
+            let option = token.split('=').next().unwrap_or(token);
+            if !known.contains(option) {
+                unknown.insert(option);
+            }
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(EngineError::InvalidConfiguration(format!(
+            "unreviewed native llama-server options: {}",
+            unknown.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
     for required in ["--model", "--alias", "--host", "--port"] {
         if !help_has_option(help, required) {
             return Err(EngineError::InvalidConfiguration(format!(
@@ -5049,6 +5226,18 @@ async fn validate_llama_bound_files(
     model: &ModelArtifact,
 ) -> Result<(), EngineError> {
     validate_llama_semantic_settings(settings)?;
+    verify_bound_file(
+        settings,
+        "llama.cpp.projector",
+        "llama.cpp.projector_sha256",
+        1024_u64 * 1024 * 1024 * 1024,
+    )
+    .await?;
+    if let Some(SettingValue::Path(path)) = settings.value("llama.cpp.projector") {
+        scala_core::inspect_gguf_metadata(path).map_err(|e| {
+            EngineError::InvalidConfiguration(format!("projector must be a valid GGUF: {e}"))
+        })?;
+    }
     verify_bound_file(
         settings,
         "llama.cpp.chat_template_file",
@@ -5466,7 +5655,8 @@ fn translate_llama_settings_for_model(
                 arguments.push(OsString::from("--spec-draft-model"));
                 arguments.push(value.as_os_str().to_owned());
             }
-            ("llama.cpp.speculative_draft_sha256", SettingValue::String(_)) => {}
+            ("llama.cpp.speculative_draft_sha256", SettingValue::String(_))
+            | ("llama.cpp.projector_sha256", SettingValue::String(_)) => {}
             _ => {
                 return Err(EngineError::InvalidConfiguration(format!(
                     "setting `{id}` has an invalid value for llama.cpp"
@@ -5825,6 +6015,9 @@ fn llama_setting_collision_contract(
         "llama.cpp.cpu_moe_layers" => (&["-ncmoe", "--n-cpu-moe"], &["LLAMA_ARG_N_CPU_MOE"]),
         "llama.cpp.cpu_moe_all" => (&["-cmoe", "--cpu-moe"], &["LLAMA_ARG_CPU_MOE"]),
         "llama.cpp.active_experts" => (&["--override-kv"], &[]),
+        "llama.cpp.projector" | "llama.cpp.projector_sha256" => {
+            (&["--mmproj", "-mm"], &["LLAMA_ARG_MMPROJ"])
+        }
         "llama.cpp.chat_template" => (
             &["--chat-template", "--chat-template-file"],
             &["LLAMA_ARG_CHAT_TEMPLATE", "LLAMA_ARG_CHAT_TEMPLATE_FILE"],
@@ -6419,7 +6612,9 @@ mod generation_settings_tests {
             }
             for stream in [false, true] {
                 assert_eq!(
-                    adapter.backend_request(&request, stream)["messages"],
+                    adapter
+                        .backend_request(&request, stream)
+                        .expect("valid request body")["messages"],
                     json!(expected)
                 );
             }
@@ -6458,19 +6653,23 @@ mod generation_settings_tests {
     #[test]
     fn request_time_sampler_fields_override_process_defaults_only_when_explicit() {
         let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
-        let omitted = adapter.backend_request(&request(GenerationSettingsPatch::default()), false);
+        let omitted = adapter
+            .backend_request(&request(GenerationSettingsPatch::default()), false)
+            .expect("valid request body");
         assert!(omitted.get("temperature").is_none());
         assert!(omitted.get("top_p").is_none());
         assert_eq!(omitted["max_completion_tokens"], 123);
 
-        let explicit = adapter.backend_request(
-            &request(GenerationSettingsPatch {
-                temperature: Some(0.25),
-                top_p: Some(0.8),
-                ..Default::default()
-            }),
-            false,
-        );
+        let explicit = adapter
+            .backend_request(
+                &request(GenerationSettingsPatch {
+                    temperature: Some(0.25),
+                    top_p: Some(0.8),
+                    ..Default::default()
+                }),
+                false,
+            )
+            .expect("valid request body");
         assert_eq!(explicit["temperature"], 0.25);
         assert_eq!(explicit["top_p"], 0.8);
         assert_eq!(explicit["max_completion_tokens"], 123);
@@ -6480,8 +6679,8 @@ mod generation_settings_tests {
     fn explicit_efforts_use_exact_native_schema_without_public_discovery() {
         let adapter = LlamaCppAdapter::from_config(None, Path::new("."));
         let defaults = EffectiveGenerationSettings {
-            temperature: 0.8,
-            top_p: 0.95,
+            temperature: Some(0.8),
+            top_p: Some(0.95),
         };
         let mut definition = llama_setting_definitions()
             .into_iter()
@@ -6502,6 +6701,8 @@ mod generation_settings_tests {
             },
             decision: false,
             decision_candidate: false,
+            openai_decisions: false,
+            decision_images: false,
         };
         for capabilities in [None, Some(&empty)] {
             for effort in [
@@ -6520,7 +6721,9 @@ mod generation_settings_tests {
                     .validate_inference_request(&request, &defaults, &schema)
                     .unwrap();
                 assert_eq!(
-                    adapter.backend_request(&request, false)["reasoning_effort"],
+                    adapter
+                        .backend_request(&request, false)
+                        .expect("valid request body")["reasoning_effort"],
                     effort.as_str()
                 );
                 assert!(
@@ -6589,8 +6792,8 @@ mod generation_settings_tests {
                         ..Default::default()
                     }),
                     &EffectiveGenerationSettings {
-                        temperature: 0.8,
-                        top_p: 0.95,
+                        temperature: Some(0.8),
+                        top_p: Some(0.95),
                     },
                     &schema,
                 )
@@ -6606,8 +6809,8 @@ mod generation_settings_tests {
                 .validate_inference_request(
                     &request(GenerationSettingsPatch::default()),
                     &EffectiveGenerationSettings {
-                        temperature: 0.8,
-                        top_p: 0.95
+                        temperature: Some(0.8),
+                        top_p: Some(0.95)
                     },
                     &SettingsSchema::default(),
                 )
@@ -6627,8 +6830,8 @@ mod generation_settings_tests {
                         ..Default::default()
                     },
                     &EffectiveGenerationSettings {
-                        temperature: 0.8,
-                        top_p: 0.95,
+                        temperature: Some(0.8),
+                        top_p: Some(0.95),
                     },
                 )
                 .is_ok()
@@ -6655,8 +6858,8 @@ mod generation_settings_tests {
                 adapter.validate_generation_settings(
                     &invalid,
                     &EffectiveGenerationSettings {
-                        temperature: 0.8,
-                        top_p: 0.95,
+                        temperature: Some(0.8),
+                        top_p: Some(0.95),
                     },
                 ),
                 Err(EngineError::InvalidGenerationSettings(_))
@@ -6669,8 +6872,8 @@ mod generation_settings_tests {
                     ..Default::default()
                 },
                 &EffectiveGenerationSettings {
-                    temperature: 0.8,
-                    top_p: 0.95,
+                    temperature: Some(0.8),
+                    top_p: Some(0.95),
                 },
             ),
             Ok(())
@@ -7039,7 +7242,7 @@ mod settings_tests {
         let help = "--model FILE\n--alias NAME\n--host HOST\n--port PORT\n";
         validate_llama_launch_help(help).expect("required launch controls");
         let extended_help = format!("{help}--brand-new-control VALUE\n");
-        validate_llama_launch_help(&extended_help).expect("unknown controls are ignored");
+        assert!(validate_llama_launch_help(&extended_help).is_err());
         for required in ["--model", "--alias", "--host", "--port"] {
             let missing = extended_help.replace(required, &format!("{required}-unrelated"));
             assert!(validate_llama_launch_help(&missing).is_err(), "{required}");
@@ -7165,5 +7368,32 @@ mod settings_tests {
             .expect("context definition");
         assert!(definition.parse("0").is_err());
         assert!(definition.parse("many").is_err());
+    }
+}
+
+#[cfg(test)]
+mod october_native_help_tests {
+    use super::*;
+    #[test]
+    fn reviewed_stable_and_nightly_help_are_fully_classified() {
+        for help in [
+            include_str!("../testdata/b11429-server-help.txt"),
+            include_str!("../testdata/b11565-server-help.txt"),
+        ] {
+            validate_llama_launch_help(help).unwrap();
+        }
+    }
+    #[test]
+    fn new_controls_are_typed_and_new_unreviewed_headers_fail() {
+        let defs = llama_setting_definitions();
+        for id in ["llama.cpp.moe_cache_mib", "llama.cpp.draft_sampling"] {
+            assert!(defs.iter().any(|d| d.id.as_str() == id));
+        }
+        assert!(
+            validate_llama_launch_help(
+                "--model X\n--alias X\n--host X\n--port X\n--unreviewed-new-option X"
+            )
+            .is_err()
+        );
     }
 }

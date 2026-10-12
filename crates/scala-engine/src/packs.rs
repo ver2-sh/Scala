@@ -1935,6 +1935,21 @@ impl RuntimePackManager {
             vision: selected_features.contains(&EngineFeature::Vision),
             structured_output,
             decision,
+            decision_candidate: selected_adapter.as_ref().is_some_and(|a| {
+                a.supports_model_capability(model, crate::ApiCapability::Decision)
+            }),
+            openai_decisions: decision
+                && selected
+                    .as_ref()
+                    .zip(selected_adapter.as_ref())
+                    .zip(settings)
+                    .is_some_and(|((r, a), s)| a.supports_openai_decisions(&r.runtime, model, s)),
+            decision_images: decision
+                && selected
+                    .as_ref()
+                    .zip(selected_adapter.as_ref())
+                    .zip(settings)
+                    .is_some_and(|((r, a), s)| a.qualified_decision_images(&r.runtime, model, s)),
         })
     }
 

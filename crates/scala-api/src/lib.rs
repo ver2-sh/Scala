@@ -3,6 +3,7 @@
 mod auth;
 mod chat;
 mod completions;
+mod constraint_numbers;
 mod embeddings;
 mod error;
 mod input;
@@ -15,6 +16,7 @@ mod link;
 mod ninfer_protocol_contract;
 mod wayfinder;
 use link::execution_profile_id;
+mod decisions;
 mod responses;
 mod systemone;
 
@@ -282,12 +284,14 @@ fn public_routes(state: PublicApiState, auth: PublicAuth) -> Router {
         .route("/v1/completions", post(completions::create))
         .route("/v1/embeddings", post(embeddings::create))
         .route("/v1/systemone", post(systemone::create))
+        .route("/v1/decisions", post(decisions::create))
         .route("/v1/responses", post(responses::create))
         .route("/v1/chat/completions", post(chat::create))
         .layer(axum::extract::DefaultBodyLimit::max(
             MAX_INFERENCE_BODY_BYTES,
         ))
         .route_layer(middleware::from_fn_with_state(state.clone(), link::route))
+        .route_layer(middleware::from_fn(constraint_numbers::admit))
         .route_layer(middleware::from_fn_with_state(
             auth,
             auth::public_auth_middleware,
@@ -431,8 +435,10 @@ async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::O
                 for profile in inventory.profiles.iter().filter(|p| p.installed) {
                     let name = profile.id.as_str();
                     models.push(ApiModel {
-                        architecture: None,
-                        capabilities: None,
+                        architecture: ModelArchitecture::from_capabilities(
+                            profile.capabilities.as_ref(),
+                        ),
+                        capabilities: profile.capabilities.clone(),
                         id: if counts.get(name).copied().unwrap_or(0) > 1 {
                             scala_engine::link::qualified_alias(name, &peer.node_id)
                         } else {
@@ -864,6 +870,8 @@ mod tests {
             capabilities: Some(ModelCapabilities {
                 decision: false,
                 decision_candidate: false,
+                openai_decisions: false,
+                decision_images: false,
                 thinking: ThinkingCapabilities {
                     switchable: true,
                     effort_options: vec![

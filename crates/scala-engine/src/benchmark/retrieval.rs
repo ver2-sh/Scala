@@ -44,7 +44,7 @@ pub fn tools() -> Vec<InferenceTool> {
         ("grep", "Case-sensitive ripgrep Rust regex search, including | alternation; no PCRE2. Optional POSIX path prefix and fnmatch include/exclude.", json!({"pattern":{"type":"string"},"path":{"type":"string"},"include":{"type":"string"},"exclude":{"type":"string"}}), vec!["pattern"]),
         ("glob", "Discover ignored-policy-aware files using case-sensitive fnmatch (* spans /).", json!({"pattern":{"type":"string"}}), vec!["pattern"]),
         ("read", "Read an explicit inclusive numbered line range from a UTF-8 file. End beyond EOF or spans over 160 lines return available bounded lines from start; bounded/truncated marks incomplete requests. Start beyond EOF is an error.", json!({"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}}), vec!["path","start_line","end_line"]),
-    ].into_iter().map(|(name,description,properties,required)|InferenceTool{name:name.into(),description:Some(description.into()),parameters:json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})}).collect()
+    ].into_iter().map(|(name,description,properties,required)|InferenceTool{strict:None,name:name.into(),description:Some(description.into()),parameters:json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})}).collect()
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

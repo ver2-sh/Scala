@@ -19,6 +19,17 @@ pub(crate) struct OpenAiError {
 }
 
 impl OpenAiError {
+    pub(crate) fn for_responses(mut self) -> Self {
+        if let Some(p) = &mut self.parameter {
+            *p = p
+                .replace("response_format.json_schema", "text.format")
+                .replace("response_format", "text.format")
+                .replace("/function/", "/")
+                .replace(".function.", ".");
+        }
+        self
+    }
+
     pub(crate) fn model_not_found() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -89,6 +100,25 @@ impl OpenAiError {
         }
     }
 
+    pub(crate) fn request_too_large() -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "The request body exceeds the 32 MiB limit.".into(),
+            kind: "invalid_request_error",
+            parameter: None,
+            code: "request_too_large",
+        }
+    }
+    pub(crate) fn stream_error(error: scala_engine::EngineError) -> Self {
+        match error {
+            scala_engine::EngineError::NativeRequest {
+                message,
+                parameter,
+                code,
+            } => Self::invalid(message, Some(parameter), code),
+            _ => Self::streaming_backend_failure(),
+        }
+    }
     pub(crate) fn streaming_backend_failure() -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
@@ -130,8 +160,9 @@ impl IntoResponse for OpenAiError {
 }
 
 pub(crate) fn runtime_error(error: RuntimeError) -> OpenAiError {
-    tracing::warn!(%error, "public inference request could not be routed");
+    tracing::warn!("public inference request could not be routed");
     match error {
+        RuntimeError::NativeRequest{message,parameter,code} => OpenAiError::invalid(message, Some(parameter),code),
         RuntimeError::ModelProfileNotFound(_) => OpenAiError::model_not_found(),
         RuntimeError::BenchmarkReserved => OpenAiError { status: StatusCode::SERVICE_UNAVAILABLE, message: "Inference is temporarily reserved for a benchmark. Inspect or cancel it through private control.".into(), kind: "server_error", parameter: None, code: "benchmark_reserved" },
         RuntimeError::UnsupportedCapability => OpenAiError::invalid("The requested capability is unsupported by this Model Profile/runtime.", Some("model"), "unsupported_capability"),

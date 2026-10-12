@@ -565,6 +565,13 @@ impl ModelLibrary {
         } else {
             let selected = PathBuf::from(&filename);
             copy_file(&source, &stage.join(&selected)).await?;
+            if format == ArtifactFormat::Ninfer {
+                let native = scala_core::inspect_ninfer_container(&source)
+                    .map_err(|e| ModelLibraryError::InvalidArtifact(e.to_string()))?;
+                for part in native.continuation_paths(&source) {
+                    copy_file(&part, &stage.join(safe_basename(&part)?)).await?;
+                }
+            }
             if let Some(companion) = companion {
                 let staged_companion = stage.join(safe_basename(&companion)?);
                 copy_file(&companion, &staged_companion).await?;

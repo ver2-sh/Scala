@@ -854,6 +854,11 @@ async fn execute_settings_action(
             }
             for (path_setting, sha_setting, maximum_bytes) in [
                 (
+                    "llama.cpp.projector",
+                    "llama.cpp.projector_sha256",
+                    1024_u64 * 1024 * 1024 * 1024,
+                ),
+                (
                     "llama.cpp.chat_template_file",
                     "llama.cpp.chat_template_sha256",
                     4_u64 * 1024 * 1024,
@@ -1055,6 +1060,7 @@ async fn execute_settings_action(
                 ids.push(SettingId::new("q27.template_sha256").expect("static setting ID"));
             }
             for (path, sha256) in [
+                ("llama.cpp.projector", "llama.cpp.projector_sha256"),
                 (
                     "llama.cpp.chat_template_file",
                     "llama.cpp.chat_template_sha256",

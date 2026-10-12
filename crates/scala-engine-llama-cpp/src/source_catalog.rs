@@ -110,8 +110,19 @@ impl RuntimeCatalogProvider for LlamaCppSourceRuntimeCatalogProvider {
         github: &GitHubReleaseClient,
         reference: &str,
     ) -> Result<Vec<AvailableRuntime>, CatalogError> {
-        let Some(tag) = nightly_tag_from_reference(reference) else {
-            return Ok(Vec::new());
+        let tag = if let Some(tag) = nightly_tag_from_reference(reference) {
+            tag
+        } else {
+            let runtimes = crate::LlamaCppRuntimeCatalogProvider::new()
+                .fetch_reference(github, reference)
+                .await?;
+            let Some(tag) = runtimes
+                .first()
+                .and_then(|r| r.identity.package.release_tag.clone())
+            else {
+                return Ok(Vec::new());
+            };
+            tag
         };
         verify_repository(github).await?;
         let Some(release) = github.release_by_tag(GITHUB_REPOSITORY, &tag).await? else {

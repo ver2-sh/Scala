@@ -77,7 +77,12 @@ pub(super) async fn create(
     correlation.record_inference(&model, false);
     let routed = state
         .runtime
-        .decide_routed(request, crate::inference_routing_context(&headers)?)
+        .decide_correlated_routed(
+            request,
+            crate::inference_routing_context(&headers)?,
+            false,
+            correlation.request_id.clone(),
+        )
         .await
         .map_err(runtime_error)?;
     let mut response = json!({
@@ -144,21 +149,26 @@ mod tests {
     #[tokio::test]
     async fn systemone_preserves_native_images_and_rejects_invalid_transport() {
         let mut value = body(json!({"context":"compare"}));
-        value["images"] = json!(["data:image/png;base64,YQ==", "data:image/webp;base64,Yg=="]);
+        value["images"] = json!([
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC",
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC"
+        ]);
         let (_, request) = parse(&value).unwrap();
         assert_eq!(json!(request.images), value["images"]);
         value["images"] = json!([]);
         assert!(parse(&value).unwrap().1.images.is_empty());
         for images in [
             Value::Null,
-            json!("data:image/png;base64,YQ=="),
+            json!(
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC"
+            ),
             json!([1]),
             json!(["data:image/jpeg;base64,!"]),
             json!(["data:image/gif;base64,YQ=="]),
             json!([
-                "data:image/png;base64,YQ==",
-                "data:image/png;base64,YQ==",
-                "data:image/png;base64,YQ=="
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC",
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC",
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC"
             ]),
         ] {
             value["images"] = images;
@@ -218,7 +228,7 @@ mod tests {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         let image = format!(
             "data:image/png;base64,{}",
-            STANDARD.encode(vec![0; scala_engine::MAX_DECISION_IMAGE_BYTES])
+            STANDARD.encode({let mut bytes=STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC").unwrap();bytes.resize(scala_engine::MAX_DECISION_IMAGE_BYTES,0);bytes})
         );
         for images in [None, Some(json!([image, image]))] {
             let mut value = body(json!({"message":"context"}));

@@ -41,6 +41,7 @@ const SURFACES: &[&str] = &[
     "/v1/completions",
     "/v1/embeddings",
     "/v1/systemone",
+    "/v1/decisions",
 ];
 
 tokio::task_local! { static EXECUTION_PROFILE: ModelProfileId; }
@@ -66,6 +67,7 @@ struct Envelope {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
     State,
+    StateCapabilities,
     Control {
         profile_id: ModelProfileId,
         action: LinkAction,
@@ -144,6 +146,12 @@ impl Link {
         snapshot
     }
     async fn inventory(&self) -> Result<NodeInventory> {
+        self.inventory_with_capabilities(false).await
+    }
+    async fn inventory_with_capabilities(
+        &self,
+        include_capabilities: bool,
+    ) -> Result<NodeInventory> {
         let identity = self.snapshot.read().await;
         let node_id = identity
             .node_id
@@ -160,6 +168,13 @@ impl Link {
             .read()
             .await
             .map_err(|e| e.to_string())?;
+        let capabilities: BTreeMap<_, _> = if include_capabilities {
+            let rows: Vec<_> = profiles.profiles.values().cloned().collect();
+            let caps = self.runtime.model_profile_capabilities(&rows).await;
+            rows.into_iter().zip(caps).map(|(p, c)| (p.id, c)).collect()
+        } else {
+            BTreeMap::new()
+        };
         let (benchmarks, benchmark_error) = match self.runtime.link_benchmarks().await {
             Ok(rows) => (rows, None),
             Err(error) => (Vec::new(), Some(error)),
@@ -213,6 +228,7 @@ impl Link {
                     engine_id: p.engine_id.to_string(),
                     role: p.role,
                     installed: snapshot.models.iter().any(|m| m.id == p.model_id),
+                    capabilities: capabilities.get(&p.id).cloned().flatten(),
                     backend: status.backend(&p.id).map(|b| LinkBackend {
                         lifecycle: b.lifecycle,
                         generation: b.generation, residency: b.residency,
@@ -321,10 +337,17 @@ impl Link {
         let refresh = stream::iter(status.nodes.into_iter().filter(|n| !n.local).map(
             |node| async move {
                 let result = if node.reachable {
-                    tokio::time::timeout(
-                        Duration::from_secs(4),
-                        self.request_state(&node.id, Operation::State),
-                    )
+                    tokio::time::timeout(Duration::from_secs(4), async {
+                        match self
+                            .request_state(&node.id, Operation::StateCapabilities)
+                            .await
+                        {
+                            Ok(state) => Ok(state),
+                            // Read-only extension negotiation. Authority-changing
+                            // Control/Inference operations are never retried.
+                            Err(_) => self.request_state(&node.id, Operation::State).await,
+                        }
+                    })
                     .await
                     .unwrap_or_else(|_| Err("Peer state refresh timed out".into()))
                 } else {
@@ -586,6 +609,9 @@ impl Link {
     async fn dispatch(&self, operation: Operation, source: &str) -> Response {
         match operation {
             Operation::State => inventory_response(self.inventory().await),
+            Operation::StateCapabilities => {
+                inventory_response(self.inventory_with_capabilities(true).await)
+            }
             Operation::Control { profile_id, action } => {
                 let result = match action {
                     LinkAction::Load => self.runtime.start_load(profile_id).await,
@@ -997,7 +1023,7 @@ mod tests {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         let image = format!(
             "data:image/png;base64,{}",
-            STANDARD.encode(vec![0; scala_engine::MAX_DECISION_IMAGE_BYTES])
+            STANDARD.encode({let mut bytes=STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC").unwrap();bytes.resize(scala_engine::MAX_DECISION_IMAGE_BYTES,0);bytes})
         );
         let body = json!({"model":"imajev@owner", "state":{"task":"compare"},
             "questions":{"q":{"type":"noul","instructions":"compare images"}},
@@ -1110,6 +1136,15 @@ mod tests {
         }
         // Exercise the actual serialization contract accepted from a Windows
         // owner, including unloaded auxiliary profiles and retained ownership.
+        assert!(inventory.profiles.iter().all(|p| p.capabilities.is_none()));
+        assert!(
+            json!(inventory)["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p.get("capabilities").is_none())
+        ); // Old v1 strict readers retain their shape.
+        inventory.profiles.iter_mut().find(|p| p.id.as_str() == names[0]).unwrap().capabilities = Some(serde_json::from_value(json!({"thinking":{"switchable":false},"decision_candidate":true,"decision":true,"openai_decisions":false})).unwrap());
         let inventory: NodeInventory = serde_json::from_value(json!(inventory)).unwrap();
         link.snapshot.write().await.peers.push(LinkPeer {
             node_id: owner.into(),
@@ -1138,6 +1173,16 @@ mod tests {
                 if node == owner && profile.as_str() == name)
             );
             assert!(resolve(&state, name).await.is_err()); // Shared names need an owner.
+            if name == names[0] {
+                let c = models
+                    .iter()
+                    .find(|m| m.id == alias)
+                    .unwrap()
+                    .capabilities
+                    .as_ref()
+                    .unwrap();
+                assert!(c.decision_candidate && c.decision && !c.openai_decisions);
+            }
         }
         link.snapshot.write().await.node_id = Some(owner.into());
         let response = link.dispatch(Operation::Inference {
@@ -1153,6 +1198,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["error"]["param"], "state"); // Reached the owner's typed Decision validator.
+        let response = link.dispatch(Operation::Inference {
+            profile_id: ModelProfileId::new(names[0]).unwrap(), path: "/v1/decisions".into(),
+            body: json!({"model":qualified_alias(names[0],owner),"input":null,"questions":[]}), headers:BTreeMap::new(),
+        }, "a").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["param"], "input");
         assert!(state.runtime.status().await.backends.is_empty());
     }
 

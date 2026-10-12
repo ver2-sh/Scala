@@ -68,6 +68,10 @@ pub struct LinkProfile {
     pub role: ModelRole,
     pub installed: bool,
     pub backend: Option<LinkBackend>,
+    /// Present only in negotiated capability inventories; ordinary v1 State
+    /// remains byte-shape compatible with older strict readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::ModelCapabilities>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

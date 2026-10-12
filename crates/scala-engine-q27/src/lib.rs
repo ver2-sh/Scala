@@ -91,6 +91,21 @@ const CURRENT_ENGINE_SHA256: &str =
 const CURRENT_ASSET_SHA256: &str =
     "eb3db6102879c4239119958e83711af4948ed7a6e3144b82e18bc3ee146004f3";
 
+// Independent immutable v0.14.5 source and release contract.
+const LATEST_SOURCE_RECIPE_VERSION: &str = "q27-upstream-make-v4-2945e35";
+const LATEST_SOURCE_COMMIT: &str = "2945e35bc82b052cd147618bbaa8de435cfe73c0";
+const LATEST_SOURCE_TREE: &str = "e5124b6e045904ee6b08cee5964df9bc9c32447b";
+const LATEST_MAKEFILE_SHA256: &str =
+    "2770e46694572d1e6cba843db06bea4700c186d7ff55a4d1083805e920bc8c14";
+const LATEST_README_SHA256: &str =
+    "09f0fe58a89c877c760d04fc5420a6f12fa0c87bbb7b69317cbb122418768904";
+const LATEST_SERVER_SHA256: &str =
+    "2c3ccdd924b8a1e374142cfa0d47056536cd040459b1c30eed62ae9164d2334f";
+const LATEST_ENGINE_SHA256: &str =
+    "43246288d69462e41c4676f7a674cff1da9ea9ef08ecbb7a4c2e92486fd5acc4";
+const LATEST_ASSET_SHA256: &str =
+    "ae86e782264b8f578d224c2fee3defc440cb1bda402059f7cfd2e17038ca0de5";
+
 const SOURCE_METADATA_LIMIT: usize = 512 * 1024;
 
 mod model;
@@ -259,7 +274,7 @@ impl RuntimeCatalogProvider for Q27RuntimeCatalogProvider {
         // A selected binary is admitted by release/asset identity and digest.
         // Do not inspect its separately offered source recipe during binary
         // verification; source candidates still require the full source audit.
-        let runtimes = if candidate.release_assets().is_some() {
+        let runtimes = if candidate.release_assets().is_some() && tag != "v0.14.5" {
             fetch_catalog_runtimes_with_inspector(&[release], |_| async { Ok(None) }).await?
         } else {
             fetch_catalog_runtimes(github, &[release]).await?
@@ -346,13 +361,15 @@ where
         // Source admission is explicitly reviewed, never inferred from a
         // historical release lacking binaries. Inspect each reviewed tag at
         // most once; v0.14.3 offers both its binary and separate source recipe.
+        let mut verified_latest_source = false;
         if let Some((commit_sha, tree_sha)) = reviewed_source_revision(&release.tag_name)
-            && (binary.is_none() || release.tag_name == "v0.14.3")
+            && (binary.is_none() || matches!(release.tag_name.as_str(), "v0.14.3" | "v0.14.5"))
             && let Some(source) = inspect(release).await?
             && source.package_contract
             && source.commit.sha == commit_sha
             && source.commit.commit.tree.sha == tree_sha
         {
+            verified_latest_source = release.tag_name == "v0.14.5";
             qualified.push(QualifiedRelease {
                 release,
                 version,
@@ -365,7 +382,9 @@ where
                 ordinal,
             });
         }
-        if let Some((asset, version, digest)) = binary {
+        if let Some((asset, version, digest)) = binary
+            && (release.tag_name != "v0.14.5" || verified_latest_source)
+        {
             qualified.push(QualifiedRelease {
                 release,
                 version,
@@ -409,7 +428,9 @@ fn materialize_qualified_releases(
             }
             let source_build = qualified.source.as_ref();
             let source_recipe_version = source_build.map(|source| {
-                if source.package_contract && source.commit.sha == CURRENT_SOURCE_COMMIT {
+                if source.package_contract && source.commit.sha == LATEST_SOURCE_COMMIT {
+                    LATEST_SOURCE_RECIPE_VERSION
+                } else if source.package_contract && source.commit.sha == CURRENT_SOURCE_COMMIT {
                     CURRENT_SOURCE_RECIPE_VERSION
                 } else if source.package_contract {
                     SOURCE_RECIPE_VERSION
@@ -430,6 +451,10 @@ fn materialize_qualified_releases(
                 version: qualified.version.clone(),
                 upstream_revision: source_build
                     .map(|source| source.commit.sha.clone())
+                    .or_else(|| {
+                        reviewed_source_revision(&qualified.release.tag_name)
+                            .map(|p| p.0.to_owned())
+                    })
                     .or_else(|| exact_commit(&qualified.release.target_commitish)),
                 platform: "linux".to_owned(),
                 architecture: "x86_64".to_owned(),
@@ -534,6 +559,7 @@ fn reviewed_source_revision(tag: &str) -> Option<(&'static str, &'static str)> {
     match tag {
         "v0.10.0" => Some((PACKAGE_SOURCE_COMMIT, PACKAGE_SOURCE_TREE)),
         "v0.14.3" => Some((CURRENT_SOURCE_COMMIT, CURRENT_SOURCE_TREE)),
+        "v0.14.5" => Some((LATEST_SOURCE_COMMIT, LATEST_SOURCE_TREE)),
         _ => None,
     }
 }
@@ -585,19 +611,14 @@ async fn inspect_source_capability(
     let Some(mut capability) = q27_source_capability_from_files(commit, &makefile, &readme) else {
         return Ok(None);
     };
-    if capability.makefile_sha256 != PACKAGE_MAKEFILE_SHA256
-        && capability.makefile_sha256 != CURRENT_MAKEFILE_SHA256
-    {
-        // The Make dependency/command closure is deliberately provider-audited
-        // rather than guessed with a partial GNU Make parser.
-        return Ok(None);
-    }
     let server = github
         .fetch_small_text(&format!("{raw_root}/src/server.cu"), SOURCE_METADATA_LIMIT)
         .await?;
     let engine = github
         .fetch_small_text(&format!("{raw_root}/src/engine.cuh"), SOURCE_METADATA_LIMIT)
         .await?;
+    // Admission below requires all four exact owner digests. A second,
+    // historical Makefile allowlist would incorrectly hide new reviewed recipes.
     capability.package_contract =
         q27_source_package_contract(&capability.commit, &makefile, &readme, &server, &engine);
     Ok(Some(capability))
@@ -613,7 +634,9 @@ fn q27_source_capability_from_files(
     if cxx != "g++" || nvcc != "/usr/local/cuda/bin/nvcc" || !makefile.contains("-std=c++17") {
         return None;
     }
-    let supported_variant_ids = variants_for(if commit.sha == CURRENT_SOURCE_COMMIT {
+    let supported_variant_ids = variants_for(if commit.sha == LATEST_SOURCE_COMMIT {
+        "0.14.5"
+    } else if commit.sha == CURRENT_SOURCE_COMMIT {
         "0.14.3"
     } else {
         ""
@@ -641,7 +664,10 @@ fn q27_source_capability_from_files(
         .map(|capability| format!("sm_{}{}", capability.major, capability.minor))
         .collect::<Vec<_>>()
         .join("+");
-    let minimum_cuda_version = if commit.sha == CURRENT_SOURCE_COMMIT {
+    let minimum_cuda_version = if matches!(
+        commit.sha.as_str(),
+        CURRENT_SOURCE_COMMIT | LATEST_SOURCE_COMMIT
+    ) {
         // All selected upstream Make targets depend on pf4.o (CUDA 13.2).
         // The separately documented CUDA-12.8 Docker recipe is not ours.
         "13.2".to_owned()
@@ -699,6 +725,12 @@ fn q27_source_package_contract_from_digests(
             && readme_sha256 == CURRENT_README_SHA256
             && server_sha256 == CURRENT_SERVER_SHA256
             && engine_sha256 == CURRENT_ENGINE_SHA256)
+        || (commit.sha == LATEST_SOURCE_COMMIT
+            && commit.commit.tree.sha == LATEST_SOURCE_TREE
+            && makefile_sha256 == LATEST_MAKEFILE_SHA256
+            && readme_sha256 == LATEST_README_SHA256
+            && server_sha256 == LATEST_SERVER_SHA256
+            && engine_sha256 == LATEST_ENGINE_SHA256)
 }
 
 fn make_variable_value<'a>(makefile: &'a str, name: &str) -> Option<&'a str> {
@@ -866,6 +898,14 @@ fn qualify_release_asset(
     {
         return None;
     }
+    if version == "0.14.5"
+        && (release.id != 409422648
+            || asset.id != 629808670
+            || asset.size != 27647648
+            || digest.value != LATEST_ASSET_SHA256)
+    {
+        return None;
+    }
     Some((version.to_owned(), digest))
 }
 
@@ -953,7 +993,7 @@ const Q27_VARIANTS: &[RuntimeVariant] = &[
 ];
 
 fn variants_for(version: &str) -> &'static [RuntimeVariant] {
-    if version == "0.14.3" {
+    if matches!(version, "0.14.3" | "0.14.5") {
         Q27_VARIANTS
     } else {
         &Q27_VARIANTS[..3]
@@ -962,10 +1002,10 @@ fn variants_for(version: &str) -> &'static [RuntimeVariant] {
 
 fn requirements_for(version: &str, variant: &RuntimeVariant) -> RuntimeRequirements {
     // Release/ABI claims are exact evidence, not monotone version assumptions.
-    let reviewed_binary = matches!(version, "0.6.2" | "0.14.3");
+    let reviewed_binary = matches!(version, "0.6.2" | "0.14.3" | "0.14.5");
     let supported_cuda_compute_capabilities = if !reviewed_binary {
         Vec::new()
-    } else if version == "0.14.3" && variant.id == "12g" {
+    } else if matches!(version, "0.14.3" | "0.14.5") && variant.id == "12g" {
         vec![ComputeCapability::new(8, 6)]
     } else {
         vec![
@@ -1008,9 +1048,9 @@ fn requirements_for(version: &str, variant: &RuntimeVariant) -> RuntimeRequireme
         unverified_requirements.push(
             "The v0.6.2 ELF requires glibc 2.38 and libstdc++ with GLIBCXX_3.4.32".to_owned(),
         );
-    } else if version == "0.14.3" {
+    } else if matches!(version, "0.14.3" | "0.14.5") {
         unverified_requirements.push(
-            "The v0.14.3 release requires glibc >=2.38; Scala has no bounded host glibc observation, so this prerequisite remains unverified".to_owned(),
+            format!("The v{version} release requires glibc >=2.38 and GLIBCXX_3.4.32; host ABI compatibility requires operator verification"),
         );
     }
     RuntimeRequirements {
@@ -1111,7 +1151,17 @@ fn q27_source_package_contract_is_trusted(
     evidence: Q27SourceBuildEvidence<'_>,
 ) -> bool {
     let source = evidence.source();
-    let (recipe, commit, tree, makefile) = if source.commit_sha == CURRENT_SOURCE_COMMIT {
+    let (recipe, commit, tree, makefile) = if source.commit_sha == LATEST_SOURCE_COMMIT {
+        if identity.version != "0.14.5" || source.source_branch != "v0.14.5" {
+            return false;
+        }
+        (
+            LATEST_SOURCE_RECIPE_VERSION,
+            LATEST_SOURCE_COMMIT,
+            LATEST_SOURCE_TREE,
+            LATEST_MAKEFILE_SHA256,
+        )
+    } else if source.commit_sha == CURRENT_SOURCE_COMMIT {
         if identity.version != "0.14.3" || source.source_branch != "v0.14.3" {
             return false;
         }
@@ -1182,6 +1232,14 @@ fn q27_compiled_w_max(
         };
     }
 
+    if exact_latest_binary(identity, acquisition) {
+        return match identity.variant.as_str() {
+            "w8" | "12g" => Some(8),
+            "w12" => Some(12),
+            "w16" => Some(16),
+            _ => None,
+        };
+    }
     let evidence = source_evidence?;
     if acquisition != &RuntimeAcquisitionMethod::SourceBuild
         || !q27_source_package_contract_is_trusted(identity, evidence)
@@ -1193,7 +1251,10 @@ fn q27_compiled_w_max(
         ("build/q27-server", "w12") => Some(12),
         ("build/q27-server-w16", "w16") => Some(16),
         ("build/q27-server-12g", "12g")
-            if evidence.source().commit_sha == CURRENT_SOURCE_COMMIT =>
+            if matches!(
+                evidence.source().commit_sha.as_str(),
+                CURRENT_SOURCE_COMMIT | LATEST_SOURCE_COMMIT
+            ) =>
         {
             Some(8)
         }
@@ -1263,6 +1324,8 @@ fn q27_model_capabilities(
     Some(scala_engine::ModelCapabilities {
         decision: false,
         decision_candidate: false,
+        openai_decisions: false,
+        decision_images: false,
         thinking: scala_engine::ThinkingCapabilities {
             switchable: true,
             effort_options: vec![],
@@ -1270,6 +1333,94 @@ fn q27_model_capabilities(
     })
 }
 
+fn exact_latest_binary(identity: &RuntimeIdentity, acquisition: &RuntimeAcquisitionMethod) -> bool {
+    matches!(
+        acquisition,
+        RuntimeAcquisitionMethod::OfficialReleaseAsset
+            | RuntimeAcquisitionMethod::PreseededOfficialPack
+    ) && identity.engine_id == ENGINE_ID
+        && identity.package_family == PACKAGE_FAMILY
+        && identity.platform == "linux"
+        && identity.architecture == "x86_64"
+        && identity.accelerator == "cuda"
+        && identity.version == "0.14.5"
+        && identity.package.provider_id == PROVIDER_ID
+        && identity.package.repository.as_deref() == Some(GITHUB_REPOSITORY)
+        && identity.package.release_tag.as_deref() == Some("v0.14.5")
+        && identity.package.asset_id.as_deref() == Some("629808670")
+        && identity.package.asset_name.as_deref() == Some("q27-v0.14.5-linux-x86_64.tar.gz")
+        && identity.upstream_revision.as_deref() == Some(LATEST_SOURCE_COMMIT)
+}
+fn validate_latest_binary(runtime: &InstalledRuntime) -> Result<(), EngineError> {
+    let m = &runtime.manifest;
+    if m.identity.version != "0.14.5"
+        || m.acquisition_method == RuntimeAcquisitionMethod::SourceBuild
+    {
+        return Ok(());
+    }
+    let hash = match m.identity.variant.as_str() {
+        "w8" => "48871deb0650ce6c116831f3d18b168925af134d1836d5d826a29589500a302d",
+        "w12" => "b8f578cc4e00450559a4b925811334861d310900f287df06c977a9fa0adfdb21",
+        "w16" => "1a91796e5160ce518542ce8ab4ecbb0b49b3b874b2f52b5a126dbda2dba6561e",
+        "12g" => "7418c7984d6265d49cfbd6b0207e6709bd006a1101269105d7130f9a11830996",
+        _ => {
+            return Err(EngineError::InvalidConfiguration(
+                "unreviewed q27 v0.14.5 variant".into(),
+            ));
+        }
+    };
+    if !exact_latest_binary(&m.identity, &m.acquisition_method)
+        || m.downloaded_archive_sha256.as_deref() != Some(LATEST_ASSET_SHA256)
+        || m.entrypoint_sha256 != hash
+    {
+        return Err(EngineError::InvalidConfiguration(
+            "q27 v0.14.5 binary provenance or executable digest differs from the reviewed package"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+fn draft_vocab_plan(n: u64, context: u64, vocab: u64) -> [u64; 4] {
+    let n = n.min(vocab);
+    let static_rows = n + vocab.saturating_sub(n.max(vocab.saturating_sub(320)));
+    let rows = vocab.min(static_rows + context);
+    [rows, static_rows, rows - static_rows, vocab]
+}
+fn observed_draft_vocab(line: &str) -> Option<[u64; 4]> {
+    let line = line.strip_prefix("Q27_DRAFT_VOCAB: draft head ")?;
+    let (rows, line) = line.split_once(" rows (")?;
+    let (fixed, line) = line.split_once(" static + ")?;
+    let (context, line) = line.split_once(" per-request context) of ")?;
+    let (vocab, _) = line.split_once(", ")?;
+    Some([
+        rows.parse().ok()?,
+        fixed.parse().ok()?,
+        context.parse().ok()?,
+        vocab.parse().ok()?,
+    ])
+}
+
+fn validate_draft_vocab(
+    settings: &scala_core::ResolvedSettings,
+    model: &ModelArtifact,
+) -> Result<(), EngineError> {
+    if settings.value("q27.draft_vocab_context").is_some()
+        && settings.value("q27.draft_vocab").is_none()
+    {
+        return Err(EngineError::InvalidConfiguration(
+            "draft_vocab_context requires explicit draft_vocab".into(),
+        ));
+    }
+    if settings.value("q27.draft_vocab").is_some() {
+        if setting_toggle(settings, "q27.continuous_batching") != Some(false)
+            || setting_unsigned(settings, "q27.parallel_requests") != Some(1)
+        {
+            return Err(EngineError::InvalidConfiguration("reduced-vocabulary MTP requires explicit continuous_batching=off and parallel_requests=1; it cannot use DFlash2".into()));
+        }
+        model::draft_vocab_inventory(&model.path).map_err(EngineError::InvalidConfiguration)?;
+    }
+    Ok(())
+}
 fn q27_runtime_capabilities(
     identity: &RuntimeIdentity,
     acquisition: &RuntimeAcquisitionMethod,
@@ -1291,7 +1442,8 @@ fn q27_runtime_capabilities(
     let exact_source_contract = acquisition == &RuntimeAcquisitionMethod::SourceBuild
         && source_evidence
             .is_some_and(|evidence| q27_source_package_contract_is_trusted(identity, evidence));
-    let trustworthy_identity = exact_managed_v062 || exact_source_contract;
+    let exact_latest = exact_latest_binary(identity, acquisition);
+    let trustworthy_identity = exact_managed_v062 || exact_source_contract || exact_latest;
     Q27RuntimeCapabilities {
         trustworthy_identity,
         // Sharp rendering is Server-owned. The runtime facts below are proven
@@ -1304,12 +1456,12 @@ fn q27_runtime_capabilities(
         // max-token limit is the only generation bound on its raw route.
         unlimited_think_budget: trustworthy_identity,
         temperature_top_p: trustworthy_identity,
-        top_k_min_p: exact_source_contract,
-        request_seed: exact_source_contract,
-        request_thinking: exact_source_contract,
-        reasoning_effort: exact_source_contract,
-        tool_calling: exact_source_contract,
-        stable_serving_environment: exact_source_contract,
+        top_k_min_p: exact_source_contract || exact_latest,
+        request_seed: exact_source_contract || exact_latest,
+        request_thinking: exact_source_contract || exact_latest,
+        reasoning_effort: exact_source_contract || exact_latest,
+        tool_calling: exact_source_contract || exact_latest,
+        stable_serving_environment: exact_source_contract || exact_latest,
         mtp_environment: trustworthy_identity,
         // The exact q27 engine always performs NextN/MTP speculative decode.
         // Q27_SUFFIX=0 disables only suffix drafting; it is not an MTP-off switch.
@@ -1319,7 +1471,7 @@ fn q27_runtime_capabilities(
         compiled_w_max: q27_compiled_w_max(identity, acquisition, source_evidence),
         // q27 v0.6.2 source contains fp8 and turbo3. It does not contain the
         // automatic quality sequence's intermediate turbo5k mode.
-        supported_kv_modes: if exact_source_contract {
+        supported_kv_modes: if exact_source_contract || exact_latest {
             &Q27KvMode::QUALITY_ORDER
         } else if exact_managed_v062 {
             Q27_V062_KV_MODES
@@ -1517,10 +1669,10 @@ fn q27_device_evaluation(
             "q27 server-12g admits only the reviewed Bonsai 2 T2/T3 slim layouts, not W8/W12 Qwen packs",
         )
     } else if tier.is_some_and(Q27Tier::is_bonsai2)
-        && (identity.version != "0.14.3" || external_build)
+        && (!matches!(identity.version.as_str(), "0.14.3" | "0.14.5") || external_build)
     {
         Some(
-            "Bonsai 2 slim requires the reviewed q27 v0.14.3 managed runtime; historical/custom builds are not proven",
+            "Bonsai 2 slim requires a reviewed q27 v0.14.3 or v0.14.5 managed runtime; historical/custom builds are not proven",
         )
     } else {
         None
@@ -1729,6 +1881,7 @@ pub struct Q27Adapter {
 struct Q27ConfiguredExecution {
     settings: scala_core::ResolvedSettings,
     sharp_template: Option<String>,
+    draft_vocab_plan: Option<[u64; 4]>,
     compiled_w_max: Option<u64>,
     selected_kv_mode: Option<Q27KvMode>,
     capabilities: Q27RuntimeCapabilities,
@@ -2326,6 +2479,8 @@ impl Q27Adapter {
                 None => revalidate_norted_package_before_launch(&spec.model).await?,
             }
         }
+        validate_latest_binary(&spec.runtime)?;
+        validate_draft_vocab(&spec.settings, &spec.model.primary)?;
         let capabilities = q27_runtime_capabilities(
             &spec.runtime.manifest.identity,
             &spec.runtime.manifest.acquisition_method,
@@ -2381,10 +2536,22 @@ impl Q27Adapter {
             ));
         }
         verify_q27_process_setting_arguments(&spec.settings, &spec.arguments)?;
+        let vocab_plan = setting_unsigned(&spec.settings, "q27.draft_vocab")
+            .map(|n| {
+                let vocab = model::draft_vocab_inventory(&spec.model.primary.path)
+                    .map_err(EngineError::InvalidConfiguration)?;
+                Ok::<_, EngineError>(draft_vocab_plan(
+                    n,
+                    setting_unsigned(&spec.settings, "q27.draft_vocab_context").unwrap_or(8192),
+                    vocab,
+                ))
+            })
+            .transpose()?;
         self.configured_executions.write().await.insert(
             endpoint.to_owned(),
             Q27ConfiguredExecution {
                 settings: spec.settings.clone(),
+                draft_vocab_plan: vocab_plan,
                 sharp_template,
                 compiled_w_max,
                 selected_kv_mode,
@@ -2826,6 +2993,23 @@ impl EngineAdapter for Q27Adapter {
         settings_schema: &SettingsSchema,
     ) -> Result<(), EngineError> {
         request.generation_settings.validate_reasoning_controls()?;
+        if request.tools.iter().any(|t| t.strict == Some(true)) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "strict function tools are not qualified for this Engine".into(),
+            ));
+        }
+        if matches!(
+            &request.output_format,
+            Some(
+                OutputFormat::Gbnf { .. }
+                    | OutputFormat::LiteralChoice { .. }
+                    | OutputFormat::Regex { .. }
+            )
+        ) {
+            return Err(EngineError::InvalidGenerationSettings(
+                "this Engine does not admit NInfer's structured_outputs extension".into(),
+            ));
+        }
         self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
         if let Some(effort) = request.generation_settings.reasoning_effort {
             q27_request_reasoning_effort(effort)?;
@@ -2846,7 +3030,7 @@ impl EngineAdapter for Q27Adapter {
         }
         if matches!(
             request.output_format.as_ref(),
-            Some(OutputFormat::JsonObject | OutputFormat::JsonSchema { .. })
+            Some(format) if !matches!(format, OutputFormat::Text)
         ) {
             return Err(EngineError::InvalidGenerationSettings(
                 "q27 does not support structured output: exact reviewed runtime only constrains tool-call bodies, not no-tools JSON finalization".to_owned(),
@@ -3156,6 +3340,7 @@ impl EngineAdapter for Q27Adapter {
         &self,
         runtime: &InstalledRuntime,
     ) -> Result<RuntimeProbeObservation, EngineError> {
+        validate_latest_binary(runtime)?;
         if !self.enabled {
             return Err(EngineError::InvalidConfiguration(
                 "q27 adapter is disabled in configuration".to_owned(),
@@ -3226,6 +3411,8 @@ impl EngineAdapter for Q27Adapter {
     async fn build_launch_spec(&self, request: LaunchRequest) -> Result<LaunchSpec, EngineError> {
         let endpoint = http_endpoint(request.backend_address);
         self.configured_executions.write().await.remove(&endpoint);
+        validate_latest_binary(&request.runtime)?;
+        validate_draft_vocab(&request.settings, &request.model.primary)?;
         if !request.backend_address.ip().is_loopback() {
             return Err(EngineError::InvalidConfiguration(
                 "q27 backend address must be loopback".to_owned(),
@@ -3497,6 +3684,19 @@ impl EngineAdapter for Q27Adapter {
         let Some(execution) = executions.get(endpoint) else {
             return Ok(StartupObservation::Ready(BTreeMap::new()));
         };
+        if let Some(expected) = execution.draft_vocab_plan {
+            if stderr_tail
+                .iter()
+                .any(|l| l.starts_with("Q27_DRAFT_VOCAB: off"))
+                || stderr_tail
+                    .iter()
+                    .filter_map(|l| observed_draft_vocab(l))
+                    .collect::<Vec<_>>()
+                    != vec![expected]
+            {
+                return Err(EngineError::Operation("Native reduced draft vocabulary initialization did not prove the exact configured plan; fallback is not admitted".into()));
+            }
+        }
         let observed = parse_q27_startup_observation(stderr_tail)?;
         if let Some(selected_kv_mode) = execution.selected_kv_mode
             && observed.kv_mode != selected_kv_mode.as_str()
@@ -3717,22 +3917,26 @@ impl EngineAdapter for Q27Adapter {
         };
         Ok(configured.map_or(
             EffectiveGenerationSettings {
-                temperature: 0.0,
-                top_p: 1.0,
+                temperature: Some(0.0),
+                top_p: Some(1.0),
             },
             |execution| EffectiveGenerationSettings {
-                temperature: setting_float(&execution.settings, "q27.temperature")
-                    .or_else(|| {
-                        setting_float(&execution.settings, "q27.force_temperature")
-                            .filter(|value| *value > 0.0)
-                    })
-                    .unwrap_or(0.0),
-                top_p: setting_float(&execution.settings, "q27.top_p")
-                    .or_else(|| {
-                        setting_float(&execution.settings, "q27.force_top_p")
-                            .filter(|value| *value < 1.0)
-                    })
-                    .unwrap_or(1.0),
+                temperature: Some(
+                    setting_float(&execution.settings, "q27.temperature")
+                        .or_else(|| {
+                            setting_float(&execution.settings, "q27.force_temperature")
+                                .filter(|value| *value > 0.0)
+                        })
+                        .unwrap_or(0.0),
+                ),
+                top_p: Some(
+                    setting_float(&execution.settings, "q27.top_p")
+                        .or_else(|| {
+                            setting_float(&execution.settings, "q27.force_top_p")
+                                .filter(|value| *value < 1.0)
+                        })
+                        .unwrap_or(1.0),
+                ),
             },
         ))
     }
@@ -4877,6 +5081,9 @@ fn q27_settings_schema_from_usage(
         let unavailable_by_version = q27_setting_unavailable_by_version(managed, version, option);
         let observed = capabilities.trustworthy_identity
             && match definition.id.as_str() {
+                "q27.draft_vocab" | "q27.draft_vocab_context" => {
+                    version == "0.14.5" && capabilities.stable_serving_environment
+                }
                 "q27.fast_head" => {
                     capabilities.fast_head_control
                         || (usage_has_token(&usage, "--fast-head")
@@ -4955,6 +5162,8 @@ fn q27_setting_definitions() -> Vec<SettingDefinition> {
     ];
     let mut definitions = common_setting_definitions_for(ENGINE_ID, COMMON_SETTINGS);
     definitions.extend([
+        q27_definition("q27.draft_vocab", "Draft vocabulary", "Opt-in reduced-vocabulary MTP; requires native projection/head, solo non-batched serving and observed initialization", SettingKind::UnsignedInteger{minimum:Some(1),maximum:Some(i32::MAX as u64 - 8192 - 320)},Some("disabled")),
+        q27_definition("q27.draft_vocab_context", "Draft context vocabulary", "Maximum distinct request-context tokens in the reduced draft head",SettingKind::UnsignedInteger{minimum:Some(0),maximum:Some(8192)},Some("8192 when draft vocabulary is enabled")),
         q27_definition(
             "q27.reasoning_effort",
             "Reasoning effort",
@@ -6002,6 +6211,8 @@ fn q27_setting_option(id: &str) -> &'static str {
 
 fn q27_environment_name(id: &str) -> Option<&'static str> {
     Some(match id {
+        "q27.draft_vocab" => "Q27_DRAFT_VOCAB",
+        "q27.draft_vocab_context" => "Q27_DRAFT_VOCAB_CTX",
         "q27.serving_profile" => "Q27_PROFILE",
         "q27.force_temperature" => "Q27_FORCE_TEMP",
         "q27.force_top_p" => "Q27_FORCE_TOP_P",
@@ -6596,6 +6807,12 @@ mod tests {
             "v0.14.3",
             vec![asset("v0.14.3", 610271166, 27522833, CURRENT_ASSET_SHA256)],
         ));
+        let mut latest = release(
+            "v0.14.5",
+            vec![asset("v0.14.5", 629808670, 27647648, LATEST_ASSET_SHA256)],
+        );
+        latest.id = 409422648;
+        releases.push(latest);
         releases.push(release(
             "v0.6.2",
             vec![asset("v0.6.2", 7, 42, &"a".repeat(64))],
@@ -6605,22 +6822,24 @@ mod tests {
             inspected.push(release.tag_name.clone());
             let (sha, tree) = reviewed_source_revision(&release.tag_name).expect("only reviewed tags are inspected");
             let current = sha == CURRENT_SOURCE_COMMIT;
+            let latest = sha == LATEST_SOURCE_COMMIT;
             let commit: GitHubCommit = serde_json::from_value(json!({
                 "sha": sha, "html_url": format!("https://github.com/{GITHUB_REPOSITORY}/commit/{sha}"),
                 "commit": {"tree": {"sha": tree}, "committer": {"date": "2026-10-04T00:00:00Z"}}
             })).unwrap();
             std::future::ready(Ok(Some(Q27SourceCapability {
-                commit, makefile_sha256: if current { CURRENT_MAKEFILE_SHA256 } else { PACKAGE_MAKEFILE_SHA256 }.into(),
-                package_contract: true, minimum_cuda_version: if current { "13.2" } else { "12.8" }.into(),
-                supported_variant_ids: variants_for(if current { "0.14.3" } else { "0.10.0" }).iter().map(|v| v.id).collect(),
+                commit, makefile_sha256: if latest { LATEST_MAKEFILE_SHA256 } else if current { CURRENT_MAKEFILE_SHA256 } else { PACKAGE_MAKEFILE_SHA256 }.into(),
+                package_contract: true, minimum_cuda_version: if current || latest { "13.2" } else { "12.8" }.into(),
+                supported_variant_ids: variants_for(if latest { "0.14.5" } else if current { "0.14.3" } else { "0.10.0" }).iter().map(|v| v.id).collect(),
                 supported_cuda_compute_capabilities: vec![ComputeCapability::new(8, 6), ComputeCapability::new(8, 9), ComputeCapability::new(12, 0)],
                 accelerator_target: "sm_86+sm_89+sm_120".into(),
             })))
         }).await.unwrap();
-        assert_eq!(inspected, ["v0.10.0", "v0.14.3"]);
+        assert_eq!(inspected, ["v0.10.0", "v0.14.3", "v0.14.5"]);
         for (version, recipe, count) in [
             ("0.10.0", SOURCE_RECIPE_VERSION, 3),
             ("0.14.3", CURRENT_SOURCE_RECIPE_VERSION, 4),
+            ("0.14.5", LATEST_SOURCE_RECIPE_VERSION, 4),
         ] {
             let sources = runtimes
                 .iter()
@@ -6637,7 +6856,7 @@ mod tests {
                 );
             }
         }
-        for (version, count) in [("0.6.2", 3), ("0.14.3", 4)] {
+        for (version, count) in [("0.6.2", 3), ("0.14.3", 4), ("0.14.5", 4)] {
             assert_eq!(
                 runtimes
                     .iter()
@@ -6647,7 +6866,76 @@ mod tests {
                 count
             );
         }
-        assert_eq!(runtimes.len(), 14);
+        assert_eq!(runtimes.len(), 22);
+        let unproved =
+            fetch_catalog_runtimes_with_inspector(&releases, |_| std::future::ready(Ok(None)))
+                .await
+                .unwrap();
+        assert!(unproved.iter().all(|r| r.identity.version != "0.14.5"));
+        let mut replaced = releases
+            .iter()
+            .find(|r| r.tag_name == "v0.14.5")
+            .unwrap()
+            .clone();
+        replaced.assets[0].digest = Some(format!("sha256:{}", "a".repeat(64)));
+        assert!(qualify_release_asset(&replaced, &replaced.assets[0]).is_none());
+    }
+
+    #[test]
+    fn v0_14_5_source_controls_and_reduced_vocab_plan_are_version_specific() {
+        let (mut identity, mut provenance) = audit_source_fixture();
+        identity.version = "0.14.5".into();
+        identity.upstream_revision = Some(LATEST_SOURCE_COMMIT.into());
+        identity.package_family = format!("{SOURCE_PACKAGE_FAMILY}-{LATEST_SOURCE_RECIPE_VERSION}");
+        identity.package.release_tag = Some("v0.14.5".into());
+        provenance.recipe_version = LATEST_SOURCE_RECIPE_VERSION.into();
+        provenance.source.source_branch = "v0.14.5".into();
+        provenance.source.commit_sha = LATEST_SOURCE_COMMIT.into();
+        provenance.source.tree_sha = LATEST_SOURCE_TREE.into();
+        provenance.build_definition_sha256 = Some(LATEST_MAKEFILE_SHA256.into());
+        let c = q27_runtime_capabilities(
+            &identity,
+            &RuntimeAcquisitionMethod::SourceBuild,
+            Some(Q27SourceBuildEvidence::Provenance(&provenance)),
+        );
+        assert!(c.trustworthy_identity && c.stable_serving_environment);
+        let schema = q27_settings_schema_from_usage(
+            None,
+            &identity,
+            &RuntimeAcquisitionMethod::SourceBuild,
+            Some(Q27SourceBuildEvidence::Provenance(&provenance)),
+            "--ctx --slots --fast-head --no-fast-head --prefix-cache",
+            true,
+        );
+        assert!(
+            schema
+                .definitions
+                .iter()
+                .any(|d| d.id.as_str() == "q27.draft_vocab" && d.supported)
+        );
+        assert_eq!(
+            draft_vocab_plan(1024, 8192, 151936),
+            [9536, 1344, 8192, 151936]
+        );
+        assert_eq!(
+            draft_vocab_plan(151936, 8192, 151936),
+            [151936, 151936, 0, 151936]
+        );
+        assert_eq!(
+            observed_draft_vocab(
+                "Q27_DRAFT_VOCAB: draft head 9536 rows (1344 static + 8192 per-request context) of 151936, 24 MB"
+            ),
+            Some([9536, 1344, 8192, 151936])
+        );
+        provenance.source.tree_sha = CURRENT_SOURCE_TREE.into();
+        assert!(
+            !q27_runtime_capabilities(
+                &identity,
+                &RuntimeAcquisitionMethod::SourceBuild,
+                Some(Q27SourceBuildEvidence::Provenance(&provenance))
+            )
+            .trustworthy_identity
+        );
     }
 
     #[test]
@@ -6791,12 +7079,24 @@ mod tests {
         let capabilities = q27_runtime_capabilities(&identity, &method, evidence);
         assert!(capabilities.stable_serving_environment && capabilities.tool_calling);
         assert_eq!(capabilities.compiled_w_max, Some(8));
-        assert!(
-            !q27_setting_definitions()
-                .iter()
-                .any(|row| row.id.as_str() == "q27.draft_vocab")
+        let old_schema = q27_settings_schema_from_usage(
+            None,
+            &identity,
+            &method,
+            evidence,
+            "--ctx --slots --fast-head --no-fast-head --prefix-cache",
+            true,
         );
-        assert!(q27_environment_name("q27.draft_vocab").is_none());
+        assert!(
+            old_schema
+                .definitions
+                .iter()
+                .any(|row| row.id.as_str() == "q27.draft_vocab" && !row.supported)
+        );
+        assert_eq!(
+            q27_environment_name("q27.draft_vocab"),
+            Some("Q27_DRAFT_VOCAB")
+        );
         provenance.source.tree_sha = "0".repeat(40);
         let schema = q27_settings_schema_from_usage(
             None,
@@ -6818,6 +7118,14 @@ mod tests {
     #[test]
     fn current_contract_digests_do_not_replace_historical_grants() {
         for (commit, tree, makefile, readme, server, engine) in [
+            (
+                LATEST_SOURCE_COMMIT,
+                LATEST_SOURCE_TREE,
+                LATEST_MAKEFILE_SHA256,
+                LATEST_README_SHA256,
+                LATEST_SERVER_SHA256,
+                LATEST_ENGINE_SHA256,
+            ),
             (
                 CURRENT_SOURCE_COMMIT,
                 CURRENT_SOURCE_TREE,
@@ -7140,6 +7448,7 @@ mod tests {
         let execution = Q27ConfiguredExecution {
             settings: resolved(&[]),
             sharp_template: None,
+            draft_vocab_plan: None,
             compiled_w_max: Some(12),
             selected_kv_mode: None,
             capabilities: exact_capabilities(),
@@ -7206,6 +7515,7 @@ mod tests {
         let execution = Q27ConfiguredExecution {
             settings: resolved(&[]),
             sharp_template: Some(template.into()),
+            draft_vocab_plan: None,
             compiled_w_max: Some(12),
             selected_kv_mode: None,
             capabilities: exact_capabilities(),
@@ -7252,6 +7562,7 @@ mod tests {
                 ),
             ]),
             sharp_template: None,
+            draft_vocab_plan: None,
             compiled_w_max: Some(12),
             selected_kv_mode: None,
             capabilities: exact_capabilities(),
@@ -7293,12 +7604,13 @@ mod tests {
             ..Default::default()
         };
         let defaults = EffectiveGenerationSettings {
-            temperature: 0.8,
-            top_p: 0.95,
+            temperature: Some(0.8),
+            top_p: Some(0.95),
         };
         let execution = Q27ConfiguredExecution {
             settings: resolved(&[("q27.request_thinking", SettingValue::Toggle(true))]),
             sharp_template: None,
+            draft_vocab_plan: None,
             compiled_w_max: Some(12),
             selected_kv_mode: None,
             capabilities: exact_capabilities(),
@@ -7310,6 +7622,8 @@ mod tests {
             },
             decision: false,
             decision_candidate: false,
+            openai_decisions: false,
+            decision_images: false,
         };
         for capabilities in [None, Some(&empty)] {
             for effort in [
@@ -7414,6 +7728,7 @@ mod tests {
                 ("q27.request_thinking", SettingValue::Toggle(true)),
             ]),
             sharp_template: None,
+            draft_vocab_plan: None,
             compiled_w_max: Some(12),
             selected_kv_mode: None,
             capabilities: exact_capabilities(),
@@ -7439,6 +7754,7 @@ mod tests {
                 SettingValue::Choice("xhigh".to_owned()),
             )]),
             sharp_template: None,
+            draft_vocab_plan: None,
             compiled_w_max: Some(12),
             selected_kv_mode: None,
             capabilities: exact_capabilities(),
@@ -7472,6 +7788,7 @@ mod tests {
                 ("q27.request_thinking", SettingValue::Toggle(true)),
             ]),
             sharp_template: None,
+            draft_vocab_plan: None,
             compiled_w_max: Some(12),
             selected_kv_mode: None,
             capabilities: exact_capabilities(),
@@ -7502,6 +7819,7 @@ mod tests {
                     ),
                 ]),
                 sharp_template: None,
+                draft_vocab_plan: None,
                 compiled_w_max: Some(12),
                 selected_kv_mode: None,
                 capabilities: exact_capabilities(),

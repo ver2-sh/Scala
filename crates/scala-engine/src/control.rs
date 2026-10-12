@@ -468,6 +468,7 @@ mod tests {
                 failure: failure.map(str::to_owned),
                 provenance: None,
                 parallel_requests: None,
+                capabilities: None,
                 activities: Vec::new(),
                 active_request_count: 0,
                 primary_lease_count: 0,

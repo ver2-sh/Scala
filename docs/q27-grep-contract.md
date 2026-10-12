@@ -223,3 +223,32 @@ nor `Q27_DRAFT_VOCAB_CTX` receives a typed row. Both are dynamically scrubbed al
 with all unconfigured `Q27_*` variables. DFlash2, fixed-stack memory estimates,
 metrics, logging, dump/probe/internal kernel controls and new environment presets are
 not promoted in this audit. Only synthetic Scala adapter tests were added.
+
+
+## October 2026 v0.14.5 runtime contract
+
+The distinct v0.14.5 release and source recipe preserve v0.14.3 and earlier
+identities; exact tag/commit/tree, archive/executable digests and source owner
+SHA-256 values are recorded in [the integration ledger](integration-october-2026.md).
+The downloaded native package requires GLIBC 2.38 / GLIBCXX 3.4.32 and CUDA 13.2
+runtime compatibility (upstream documents r580+). The reviewed Make recipe also
+requires CUDA 13.2 for its PF4 object. W8/W12/W16 variants remain distinct; the
+server-12g image remains sm86-only with its Bonsai 2 slim T2/T3 artifact boundary.
+Scala does not replace the native sampler, prefix cache, tool parser or CUDA code.
+
+Upstream v0.14.5 documents ignored `stop`/`stop_sequences`,
+`previous_response_id`, `response_format`, `logprobs` and penalty fields. Scala
+continues to reject these exposed unsupported guarantees, and rejects strict tools
+without native evidence. Invalid `max_tokens`, `n > 1`, malformed requests and
+unsupported image content retain deterministic admission errors. Native MTP is
+always on where upstream requires it; Scala does not promise a disable control.
+
+Reduced-vocabulary MTP is an explicit typed opt-in, not an ambient environment
+behavior. `q27.draft_vocab` and optional `q27.draft_vocab_context` require v0.14.5,
+solo serving with explicit continuous batching disabled, no DFlash2, the actual
+NextN projection and supported packed output-head inventory. Missing/unverifiable
+inventory gives a concrete unsupported reason. Native startup must prove the exact
+requested row/static/context/vocabulary plan; fallback/off diagnostics cannot
+qualify it. All inherited/configured `Q27_*` variables remain dynamically scrubbed;
+only reviewed typed translation adds native values back. This source/artifact
+qualification was validated synthetically, without live model inference.

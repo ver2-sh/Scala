@@ -148,6 +148,7 @@ impl App {
                         failure: backend.failure.clone(),
                         provenance: None,
                         parallel_requests: backend.parallel_requests.clone(),
+                        capabilities: profile.capabilities.clone(),
                         activities: backend.activities.clone(),
                         active_request_count: backend.active_requests,
                         primary_lease_count: backend.primary_lease_count,

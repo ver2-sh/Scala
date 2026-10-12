@@ -173,9 +173,10 @@ Of 97 recorded owner blobs, 17 are identical, 2 narrowly contract-preserving cha
 21 semantic changed and 57 removed/restructured. All 17 capability domains remain
 ungranted at that head: no complete successor owner closure is proven. Independently,
 the native reader is v3-only and explicitly rejects Scala's admitted v2 containers.
-The managed Linux catalog therefore remains pinned to the reviewed v2 snapshot;
-runtime/container admission fails closed separately from capability grants. The exact
-reviewed Windows package and settings precedence remain unchanged. Full path/domain
+That historical head remains unqualified. October admission independently adds the
+81c8ce09 v3 Linux source and Windows v0.9.1 package alongside the pinned v2 routes;
+runtime/container admission fails closed separately from capability grants. Settings
+precedence and historical Windows package identities remain unchanged. Full path/domain
 and format-owner evidence is in [the NInfer audit](ninfer.md#static-canonical-master-audit--2026-10-05).
 
 ### FIRST_CLASS_CONFIGURABLE
@@ -211,3 +212,38 @@ checkpoint state and prefix reuse; target layouts/program/request plans/resource
 MTP/DFlash/DFlash2 contexts and schedules; Vision/text residency and prefill; and request/log/protocol owners. Commit
 and tree identity remain alongside these focused blob sets. `ninfer.context_cost_presets` is structured-only;
 its canonical path and SHA-256 are bound immediately before launch.
+
+
+## October 2026 additions
+
+The frozen [integration ledger](integration-october-2026.md) records exact runtime
+identities and evidence. Existing runtime defaults remain read-only; only explicit
+per-engine overrides persist. Inherit removes local overrides and associated bound
+identity values. Invocation/request overrides remain transient and supported only
+where the selected runtime honors them.
+
+- llama.cpp v0.6.0/b11429 and b11565: actual official CPU `--help` fixtures are fully
+  classified by the reviewed option inventory. `llama.cpp.moe_cache_mib` owns native
+  `--moe-cache-mib`; `llama.cpp.draft_sampling` owns `--spec-draft-sampling`
+  (`greedy`/`probabilistic`). Explicit `llama.cpp.projector` plus
+  `llama.cpp.projector_sha256` owns `--mmproj` with an immutable local GGUF binding.
+  These additions remain help/runtime-qualified; unknown native options fail
+  closed. Native CUDA 12/13 builds and official CUDA assets retain their own
+  toolkit/driver/variant and companion-library contracts.
+- Q27 v0.14.5: independent release/source gates and ABI prerequisites accompany
+  opt-in `q27.draft_vocab` and `q27.draft_vocab_context`. The selected artifact must
+  prove the native NextN projection and supported packed head; explicit solo,
+  non-continuously-batched serving and absence of DFlash2 are required. Native
+  initialization must report the exact selected vocabulary plan. No environment
+  shortcut grants support; dynamic scrubbing of every `Q27_*` name remains intact.
+  Older versions expose an unsupported reason for these controls. Ignored request
+  fields and unproved strict-tool/structured-output guarantees remain rejected.
+- NInfer v3 Linux schema 25: `ninfer.host_context_mib` replaces old generation's
+  host-state/cache ceilings. Conditional sampler/thinking/template values stay
+  unknown rather than borrowing v2 defaults. Native constraints are request-level
+  controls, not persisted grammar state. Native Windows v0.9.1 schema 21 retains
+  its different host-state contract and withholds the absent constraint interfaces.
+  Artifact reader versions, startup/log schemas and source owners stay separate.
+
+No progress, terminal status, timing, native initialization or observed setting
+value is copied into Settings or Model Profile overrides.

@@ -308,6 +308,67 @@ mod tests {
 
     use super::{MAX_METADATA_BYTES, Q27Tier, inspect_q27_model};
 
+    #[test]
+    fn reduced_vocab_requires_physical_projection_and_packed_head_not_metadata() {
+        use super::draft_vocab_inventory;
+        fn pack(head_kind: u8, projection: bool) -> tempfile::NamedTempFile {
+            let mut bytes = b"Q27F".to_vec();
+            bytes.extend(1u32.to_le_bytes());
+            bytes.extend((if projection { 2u32 } else { 1u32 }).to_le_bytes());
+            bytes.extend(0u32.to_le_bytes());
+            let mut entries = Vec::new();
+            if projection {
+                entries.push((
+                    "blk.64.nextn.eh_proj.weight",
+                    1u8,
+                    vec![5120u64, 10240u64],
+                    [0u64, 104857600, 0, 0],
+                ));
+            }
+            let elements = 16u64 * 5120;
+            let (data, scales) = match head_kind {
+                3 => (elements / 2, elements / 64 * 2),
+                _ => (elements * 2, 0),
+            };
+            let start = if projection { 104857600 } else { 0 };
+            entries.push((
+                "output_q4.weight",
+                head_kind,
+                vec![16, 5120],
+                [
+                    start,
+                    data,
+                    if scales > 0 { start + data } else { 0 },
+                    scales,
+                ],
+            ));
+            for (name, kind, shape, fields) in entries {
+                bytes.extend((name.len() as u16).to_le_bytes());
+                bytes.extend(name.as_bytes());
+                bytes.extend([kind, shape.len() as u8]);
+                for d in shape {
+                    bytes.extend(d.to_le_bytes());
+                }
+                for f in fields {
+                    bytes.extend(f.to_le_bytes());
+                }
+            }
+            let base = bytes.len().div_ceil(256) * 256;
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            f.write_all(&bytes).unwrap();
+            f.as_file()
+                .set_len(base as u64 + start + data + scales)
+                .unwrap();
+            f
+        }
+        let good = pack(3, true);
+        assert_eq!(draft_vocab_inventory(good.path()).unwrap(), 16);
+        assert!(draft_vocab_inventory(pack(3, false).path()).is_err());
+        assert!(draft_vocab_inventory(pack(1, true).path()).is_err());
+        good.as_file().set_len(32).unwrap();
+        assert!(draft_vocab_inventory(good.path()).is_err());
+    }
+
     fn architecture_metadata() -> Value {
         json!({
             "general.architecture": "qwen35",
@@ -526,4 +587,124 @@ mod tests {
                 .contains("qwen38_trained_template")
         );
     }
+}
+
+/// Cold, bounded native tensor-table inspection for reduced-vocabulary MTP.
+/// Metadata alone never proves the required projection or head packing.
+pub(crate) fn draft_vocab_inventory(path: &Path) -> Result<u64, String> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = File::open(path).map_err(|e| e.to_string())?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    let mut header = [0; 16];
+    f.read_exact(&mut header).map_err(|e| e.to_string())?;
+    if &header[..4] != b"Q27F" || u32::from_le_bytes(header[4..8].try_into().unwrap()) != 1 {
+        return Err("invalid native Q27 header".into());
+    }
+    let tensors = u32::from_le_bytes(header[8..12].try_into().unwrap());
+    let meta = u32::from_le_bytes(header[12..16].try_into().unwrap());
+    if tensors == 0 || tensors > 100_000 || meta > MAX_METADATA_BYTES {
+        return Err(
+            "reduced-vocabulary MTP requires a bounded real native tensor inventory".into(),
+        );
+    }
+    f.seek(SeekFrom::Start(16 + u64::from(meta)))
+        .map_err(|e| e.to_string())?;
+    let mut projection = false;
+    let mut head = None;
+    let mut preferred = None;
+    let mut names = BTreeSet::new();
+    let mut ranges = Vec::new();
+    for _ in 0..tensors {
+        let mut nl = [0; 2];
+        f.read_exact(&mut nl).map_err(|e| e.to_string())?;
+        let nl = u16::from_le_bytes(nl) as usize;
+        let mut name = vec![0; nl];
+        f.read_exact(&mut name).map_err(|e| e.to_string())?;
+        let name = String::from_utf8(name).map_err(|_| "invalid native tensor name")?;
+        if name.is_empty() || !names.insert(name.clone()) {
+            return Err("duplicate/empty native tensor name".into());
+        }
+        let mut kind = [0; 2];
+        f.read_exact(&mut kind).map_err(|e| e.to_string())?;
+        if !(1..=8).contains(&kind[1]) {
+            return Err("unbounded native tensor rank".into());
+        }
+        let mut shape = Vec::new();
+        let mut elements = 1u64;
+        for _ in 0..kind[1] {
+            let mut b = [0; 8];
+            f.read_exact(&mut b).map_err(|e| e.to_string())?;
+            let n = u64::from_le_bytes(b);
+            if n == 0 {
+                return Err("empty native tensor shape".into());
+            }
+            elements = elements
+                .checked_mul(n)
+                .ok_or("native tensor shape overflow")?;
+            shape.push(n);
+        }
+        let mut fields = [0u64; 4];
+        for n in &mut fields {
+            let mut b = [0; 8];
+            f.read_exact(&mut b).map_err(|e| e.to_string())?;
+            *n = u64::from_le_bytes(b);
+        }
+        let cols = *shape.last().unwrap();
+        let rows = elements / cols;
+        let (data, scales, group) = match kind[0] {
+            0 => (elements.checked_mul(4), Some(0), 1),
+            1 => (elements.checked_mul(2), Some(0), 1),
+            2 => (Some(elements), (elements / 128).checked_mul(2), 128),
+            3 => (Some(elements / 2), (elements / 64).checked_mul(2), 64),
+            4 => (Some(elements / 4), (elements / 128).checked_mul(2), 128),
+            5 => (
+                (elements / 128).checked_mul(26),
+                (elements / 128).checked_mul(2),
+                128,
+            ),
+            6 => (Some(elements / 8), (elements / 128).checked_mul(2), 128),
+            7 => (Some(elements / 2), Some(elements / 16), 16),
+            _ => return Err("unsupported native tensor dtype".into()),
+        };
+        if cols % group != 0
+            || data != Some(fields[1])
+            || scales != Some(fields[3])
+            || fields[0] % 256 != 0
+            || fields[3] > 0 && (fields[2] == 0 || fields[2] % 256 != 0)
+            || fields[3] == 0 && fields[2] != 0
+        {
+            return Err("native tensor payload geometry conflicts with its packing".into());
+        }
+        ranges.push((fields[0], fields[1]));
+        if fields[3] > 0 {
+            ranges.push((fields[2], fields[3]));
+        }
+        if name == "blk.64.nextn.eh_proj.weight" {
+            projection = shape.len() == 2 && rows == 5120 && cols == 10240;
+        }
+        if matches!(name.as_str(), "output.weight" | "output_q4.weight") {
+            let qualified = shape.len() == 2
+                && cols == 5120
+                && rows <= i32::MAX as u64
+                && matches!(kind[0], 2..=4);
+            if name == "output_q4.weight" {
+                preferred = Some((qualified, rows));
+            } else {
+                head = Some((qualified, rows));
+            }
+        }
+        if f.stream_position().map_err(|e| e.to_string())? > 8 * 1024 * 1024 {
+            return Err("native tensor table exceeds 8 MiB inspection bound".into());
+        }
+    }
+    let end = f.stream_position().map_err(|e| e.to_string())?;
+    let base = end.checked_add(255).ok_or("table overflow")? / 256 * 256;
+    if ranges.iter().any(|(o, n)| {
+        base.checked_add(*o)
+            .and_then(|v| v.checked_add(*n))
+            .is_none_or(|v| v > len)
+    }) {
+        return Err("native tensor range exceeds artifact".into());
+    }
+    match preferred.or(head) {Some((true,rows)) if projection=>Ok(rows),_=>Err("reduced-vocabulary MTP requires an actual NextN projection and Q4_G64/Q8_G128/T2_G128 head".into())}
 }

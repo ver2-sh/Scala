@@ -369,6 +369,10 @@ fn format_activity(activity: &InferenceActivity) -> String {
 fn format_activity_state(activity: &InferenceActivity) -> String {
     match activity.phase {
         InferenceActivityPhase::Active => "RUNNING | 1 active request".to_owned(),
+        InferenceActivityPhase::ProcessingDecision => "PROCESSING DECISION".to_owned(),
+        InferenceActivityPhase::Completed => "COMPLETED".to_owned(),
+        InferenceActivityPhase::Failed => "FAILED".to_owned(),
+        InferenceActivityPhase::Cancelled => "CANCELLED".to_owned(),
         InferenceActivityPhase::ProcessingPrompt => {
             if let (Some(current), Some(total)) = (activity.prompt_current, activity.prompt_total)
                 && total > 0
@@ -3262,6 +3266,27 @@ fn inspection_body(app: &App) -> Option<String> {
             }
             if let Some(value) = &model.native_identity {
                 fields.push(("Native identity", format!("{value:#?}")));
+            }
+            let decision = app
+                .control
+                .as_ref()
+                .and_then(|c| {
+                    c.backends
+                        .iter()
+                        .find(|b| b.model_id == model.id && !b.retiring)
+                })
+                .and_then(|b| b.capabilities.as_ref());
+            if let Some(c) = decision {
+                fields.push(("Decision candidate", c.decision_candidate.to_string()));
+                fields.push(("Native Decision verified", c.decision.to_string()));
+                fields.push(("OpenAI Decisions verified", c.openai_decisions.to_string()));
+                fields.push(("Decision images verified", c.decision_images.to_string()));
+            } else if matches!(&model.native_identity,Some(scala_core::ArtifactNativeIdentity::Gguf(i)) if i.decision_type.is_some())
+            {
+                fields.push((
+                    "Decision metadata",
+                    "Candidate; selected Runtime/Profile execution is unverified".into(),
+                ));
             }
             for value in &model.auxiliary_artifacts {
                 fields.push(("Companion", format!("{value:#?}")));

@@ -20,9 +20,9 @@ use scala_engine::{
     EffectiveGenerationSettings, EngineAdapter, EngineCapabilities, EngineError, EngineFeature,
     EngineIdentity, EngineProbe, GenerationSettingsPatch, InferenceActivityReporter,
     InferenceOutput, InferenceRequest, InferenceStream, InstallationState, LaunchRequest,
-    LaunchSpec, LoadProgressReporter, NativeOption, OptionValueKind, OutputFormat,
-    PreparedModelInput, ProcessDescriptor, RuntimeVariantUpdateIdentity, UpdateState,
-    capture_command, compatibility_for, isolated_cuda_environment, prepare_norted_package_input,
+    LaunchSpec, LoadProgressReporter, NativeOption, OptionValueKind, PreparedModelInput,
+    ProcessDescriptor, RuntimeVariantUpdateIdentity, UpdateState, capture_command,
+    compatibility_for, isolated_cuda_environment, prepare_norted_package_input,
     prepare_norted_package_input_with_progress, revalidate_norted_package_before_launch,
     revalidate_norted_package_before_launch_with_progress, visible_nvidia_devices,
 };
@@ -35,6 +35,7 @@ use walkdir::WalkDir;
 mod catalog;
 mod protocol;
 mod settings;
+mod v3;
 mod windows_catalog;
 
 pub use catalog::NinferRuntimeCatalogProvider;
@@ -82,6 +83,8 @@ fn ninfer_template_capabilities(digest: &str) -> Option<scala_engine::ModelCapab
     Some(ModelCapabilities {
         decision: false,
         decision_candidate: false,
+        openai_decisions: false,
+        decision_images: false,
         thinking: ThinkingCapabilities {
             switchable: true,
             effort_options,
@@ -621,10 +624,16 @@ fn managed_ninfer_variant_update_identity(
     let generation = match identity.variant.as_str() {
         "ninfer-serve-v1-sm120a" => 1,
         "ninfer-serve-v2-sm120a" => 2,
+        "ninfer-serve-v3-sm120a" => 3,
         _ => return None,
     };
     Some(RuntimeVariantUpdateIdentity {
-        functional_variant: MANAGED_NINFER_FUNCTIONAL_VARIANT.to_owned(),
+        functional_variant: if generation == 3 {
+            "ninfer-linux-v3-sm120a"
+        } else {
+            MANAGED_NINFER_FUNCTIONAL_VARIANT
+        }
+        .to_owned(),
         source_recipe_generation: Some(generation),
     })
 }
@@ -637,7 +646,12 @@ fn managed_windows_ninfer_variant_update_identity(
     identity: &scala_core::RuntimeIdentity,
 ) -> Option<RuntimeVariantUpdateIdentity> {
     windows_catalog::is_managed_windows_identity(identity).then(|| RuntimeVariantUpdateIdentity {
-        functional_variant: MANAGED_NINFER_WINDOWS_FUNCTIONAL_VARIANT.to_owned(),
+        functional_variant: if identity.variant == windows_catalog::V3_VARIANT {
+            "ninfer-windows-v3-sm120a"
+        } else {
+            MANAGED_NINFER_WINDOWS_FUNCTIONAL_VARIANT
+        }
+        .to_owned(),
         source_recipe_generation: None,
     })
 }
@@ -700,6 +714,7 @@ const ALLOWED_VALUE_NATIVE_ARGUMENTS: &[&str] = &[];
 #[derive(Debug, Clone)]
 struct PendingStartup {
     request_log_path: PathBuf,
+    artifact_file: Option<(PathBuf, u64)>,
     native_identity: NinferArtifactIdentity,
     public_model_id: ModelProfileId,
     accelerator: AcceleratorDevice,
@@ -720,6 +735,7 @@ struct NinferStartupRequirements {
     device_state_slots: Option<u64>,
     host_state_slots: Option<u64>,
     host_kv_bytes: Option<u64>,
+    host_context_bytes: Option<u64>,
     max_private_continuations: Option<u64>,
     max_shared_prefixes: Option<u64>,
     max_long_anchors_per_continuation: Option<u64>,
@@ -819,6 +835,7 @@ impl NinferReviewedDomains {
 
 fn setting_capability_is_reviewed(id: &str, capabilities: NinferRuntimeCapabilities) -> bool {
     match id {
+        "ninfer.host_context_mib" => capabilities.request_log_schema == Some(25),
         "ninfer.stop_strings" | "ninfer.system_prompt" => capabilities.request_protocol_semantics,
         "ninfer.reasoning" | "ninfer.reasoning_effort" => {
             capabilities.request_protocol_semantics
@@ -842,12 +859,14 @@ fn setting_capability_is_reviewed(id: &str, capabilities: NinferRuntimeCapabilit
         | "ninfer.kv_capacity"
         | "ninfer.prefill_chunk"
         | "ninfer.prefix_reuse"
-        | "ninfer.device_state_slots"
-        | "ninfer.host_state_slots"
+        | "ninfer.device_state_slots" => capabilities.context_cache_controls,
+        "ninfer.host_state_slots"
         | "ninfer.host_kv_mib"
         | "ninfer.max_private_continuations"
         | "ninfer.max_shared_prefixes"
-        | "ninfer.max_long_anchors_per_continuation" => capabilities.context_cache_controls,
+        | "ninfer.max_long_anchors_per_continuation" => {
+            capabilities.context_cache_controls && capabilities.request_log_schema != Some(25)
+        }
         "ninfer.cuda_graph" => capabilities.core_process_controls,
         "ninfer.speculation"
         | "ninfer.speculative_backend"
@@ -985,6 +1004,7 @@ fn reviewed_v2_source(
 
 fn incompatible_native_container(
     identities: &[ArtifactNativeIdentity],
+    expected: u32,
 ) -> Option<CompatibilityDecision> {
     let mut native = identities
         .iter()
@@ -993,12 +1013,10 @@ fn incompatible_native_container(
             _ => None,
         })
         .peekable();
-    (native.peek().is_some() && native.all(|identity| identity.container_version != 2)).then(|| {
-        CompatibilityDecision::Unsupported {
-            reason: "runtime native identities do not admit Scala's NInfer v2 container format"
-                .to_owned(),
-        }
-    })
+    (native.peek().is_some() && native.any(|identity| identity.container_version != expected))
+        .then(|| CompatibilityDecision::Unsupported {
+            reason: format!("runtime native identities conflict with its qualified NInfer v{expected} reader generation"),
+        })
 }
 
 fn source_container_compatibility(
@@ -1006,7 +1024,9 @@ fn source_container_compatibility(
     source: &scala_core::RuntimeSourceSnapshot,
     blobs: &BTreeMap<String, String>,
 ) -> CompatibilityDecision {
-    if canonical_source_identity(identity, source) && reviewed_v2_source(source, blobs) {
+    if canonical_source_identity(identity, source)
+        && (reviewed_v2_source(source, blobs) || v3::reviewed_source(identity, source))
+    {
         CompatibilityDecision::Supported
     } else {
         let reason = if source.commit_sha == AUDITED_UPSTREAM_REVISION
@@ -1025,6 +1045,9 @@ fn source_container_compatibility(
 fn ninfer_runtime_capabilities_for_installed(
     runtime: &InstalledRuntime,
 ) -> NinferRuntimeCapabilities {
+    if let Some(capabilities) = v3::installed_capabilities(runtime) {
+        return capabilities;
+    }
     // A managed portable Windows install keeps truthful immutable provenance
     // (verified archive digest + release tag + adapter probe), so its identity
     // is trustworthy. Capability domains are credited only for the exact
@@ -1089,6 +1112,9 @@ fn ninfer_runtime_capabilities_for_installed(
 fn ninfer_runtime_capabilities_for_available(
     runtime: &AvailableRuntime,
 ) -> NinferRuntimeCapabilities {
+    if let Some(capabilities) = v3::available_capabilities(runtime) {
+        return capabilities;
+    }
     if matches!(
         runtime.acquisition,
         scala_core::RuntimeAcquisitionPlan::ReleaseAsset { .. }
@@ -1333,6 +1359,7 @@ fn ninfer_startup_requirements(
         prefix_reuse: toggle("ninfer.prefix_reuse")?,
         device_state_slots: unsigned("ninfer.device_state_slots")?,
         host_state_slots: unsigned("ninfer.host_state_slots")?,
+        host_context_bytes: unsigned("ninfer.host_context_mib")?.map(|v| v << 20),
         host_kv_bytes: mib_bytes("ninfer.host_kv_mib")?,
         max_private_continuations: unsigned("ninfer.max_private_continuations")?,
         max_shared_prefixes: unsigned("ninfer.max_shared_prefixes")?,
@@ -1655,6 +1682,7 @@ impl EngineAdapter for NinferAdapter {
                 EngineFeature::TextGeneration,
                 EngineFeature::ToolCalling,
                 EngineFeature::Vision,
+                EngineFeature::StructuredOutput,
             ],
         }
     }
@@ -1691,6 +1719,9 @@ impl EngineAdapter for NinferAdapter {
         let mut features = vec![EngineFeature::TextGeneration];
         if capabilities.tool_calling {
             features.push(EngineFeature::ToolCalling);
+        }
+        if capabilities.request_log_schema == Some(25) {
+            features.push(EngineFeature::StructuredOutput);
         }
         if capabilities.vision_process_controls
             && capabilities.media_request_semantics
@@ -1751,8 +1782,14 @@ impl EngineAdapter for NinferAdapter {
                 reason: "runtime does not declare NInfer artifact support".to_owned(),
             };
         }
-        if let Some(decision) = incompatible_native_container(&runtime.supported_native_identities)
-        {
+        if let Some(decision) = incompatible_native_container(
+            &runtime.supported_native_identities,
+            if v3::available_capabilities(runtime).is_some() {
+                3
+            } else {
+                2
+            },
+        ) {
             return decision;
         }
         if let scala_core::RuntimeAcquisitionPlan::SourceBuild(plan) = &runtime.acquisition {
@@ -1783,9 +1820,14 @@ impl EngineAdapter for NinferAdapter {
                 reason: "runtime does not declare NInfer artifact support".to_owned(),
             };
         }
-        if let Some(decision) =
-            incompatible_native_container(&runtime.manifest.supported_native_identities)
-        {
+        if let Some(decision) = incompatible_native_container(
+            &runtime.manifest.supported_native_identities,
+            if v3::installed_capabilities(runtime).is_some() {
+                3
+            } else {
+                2
+            },
+        ) {
             return decision;
         }
         if runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::SourceBuild {
@@ -1819,12 +1861,12 @@ impl EngineAdapter for NinferAdapter {
             };
         }
         match model.native_identity.as_ref() {
-            Some(ArtifactNativeIdentity::Ninfer(identity)) if identity.container_version == 2 => {
+            Some(ArtifactNativeIdentity::Ninfer(identity)) if matches!(identity.container_version, 2 | 3) => {
                 CompatibilityDecision::Supported
             }
             Some(ArtifactNativeIdentity::Ninfer(identity)) => CompatibilityDecision::Unsupported {
                 reason: format!(
-                    "NInfer container version {} is unsupported; version 2 is required",
+                    "NInfer container version {} is unsupported; version 2 or 3 is required",
                     identity.container_version
                 ),
             },
@@ -2112,7 +2154,7 @@ impl EngineAdapter for NinferAdapter {
         let mut definitions = settings::definitions();
         settings::apply_runtime_bounds(&mut definitions);
         let capabilities = ninfer_runtime_capabilities_for_installed(runtime);
-        if capabilities.trustworthy_identity {
+        if capabilities.trustworthy_identity && !v3::is_v3(capabilities) {
             settings::apply_reviewed_runtime_defaults(&mut definitions, settings);
         }
         apply_ninfer_runtime_contract(&mut definitions, &help, capabilities);
@@ -2149,7 +2191,7 @@ impl EngineAdapter for NinferAdapter {
             settings,
             capabilities.dflash_vision,
         );
-        if capabilities.trustworthy_identity {
+        if capabilities.trustworthy_identity && !v3::is_v3(capabilities) {
             settings::apply_reviewed_runtime_defaults(&mut definitions, settings);
         }
         if capabilities.model_sampler_defaults {
@@ -2366,6 +2408,13 @@ impl EngineAdapter for NinferAdapter {
             endpoint.clone(),
             PendingStartup {
                 request_log_path: request_log_path.clone(),
+                artifact_file: Some((
+                    model_path.clone(),
+                    tokio::fs::metadata(&model_path)
+                        .await
+                        .map_err(|e| EngineError::Operation(e.to_string()))?
+                        .len(),
+                )),
                 native_identity: expected_identity.clone(),
                 public_model_id: public_model_id.clone(),
                 accelerator: accelerator.clone(),
@@ -2738,14 +2787,6 @@ impl EngineAdapter for NinferAdapter {
             return Err(EngineError::MessageNamesUnsupported);
         }
         self.validate_generation_settings(&request.generation_settings, backend_defaults)?;
-        if matches!(
-            request.output_format.as_ref(),
-            Some(OutputFormat::JsonObject | OutputFormat::JsonSchema { .. })
-        ) {
-            return Err(EngineError::InvalidGenerationSettings(
-                "NInfer does not support structured output".to_owned(),
-            ));
-        }
         Ok(())
     }
 
@@ -2776,6 +2817,7 @@ impl EngineAdapter for NinferAdapter {
                 media_semantics: execution.capabilities.media_request_semantics,
                 vision: execution.vision,
                 greedy: execution.greedy,
+                constrained: execution.capabilities.request_log_schema == Some(25),
             },
         )?;
         let response = self
@@ -2786,7 +2828,11 @@ impl EngineAdapter for NinferAdapter {
             .send()
             .await
             .map_err(protocol::map_transport_error)?;
-        protocol::parse_completion_response(response).await
+        protocol::parse_completion_response(
+            response,
+            protocol::requires_constraint_observation(&request),
+        )
+        .await
     }
 
     async fn infer_stream(
@@ -2817,6 +2863,7 @@ impl EngineAdapter for NinferAdapter {
                 media_semantics: execution.capabilities.media_request_semantics,
                 vision: execution.vision,
                 greedy: execution.greedy,
+                constrained: execution.capabilities.request_log_schema == Some(25),
             },
         )?;
         let response = self
@@ -2827,7 +2874,11 @@ impl EngineAdapter for NinferAdapter {
             .send()
             .await
             .map_err(protocol::map_transport_error)?;
-        protocol::parse_stream_response(response).await
+        protocol::parse_stream_response(
+            response,
+            protocol::requires_constraint_observation(&request),
+        )
+        .await
     }
 }
 
@@ -2914,7 +2965,7 @@ fn native_compatibility(
             "the exact ninfer-serve target registry could not be enumerated independently"
                 .to_owned(),
         )
-    } else if supported.contains(model) {
+    } else if supported.contains(model) || v3::compatible(supported, model) {
         RuntimeCompatibility::Recommended
     } else {
         match model {
@@ -3150,16 +3201,17 @@ async fn read_and_validate_startup_log(
                     "NInfer startup log contained multiple server_start records".to_owned(),
                 ));
             }
-            startup = Some(
-                serde_json::from_value::<StartupRecord>(value).map_err(|error| {
-                    EngineError::Operation(format!("invalid NInfer server_start record: {error}"))
-                })?,
-            );
+            startup = Some(value);
         }
     }
     let Some(startup) = startup else {
         return Ok(None);
     };
+    if pending.native_identity.container_version == 3 {
+        return v3::validate_startup(pending, &startup).map(Some);
+    }
+    let startup: StartupRecord = serde_json::from_value(startup)
+        .map_err(|_| EngineError::Operation("invalid NInfer v2 server_start record".into()))?;
     let expected_schema = pending.capabilities.request_log_schema.ok_or_else(|| {
         EngineError::Operation("NInfer startup proof has no reviewed request-log schema".to_owned())
     })?;
@@ -3250,7 +3302,7 @@ async fn read_and_validate_startup_log(
         startup.sampling_defaults.non_thinking
     };
     let defaults = EffectiveGenerationSettings {
-        temperature: if startup.sampling_defaults.greedy {
+        temperature: Some(if startup.sampling_defaults.greedy {
             0.0
         } else {
             startup
@@ -3258,12 +3310,14 @@ async fn read_and_validate_startup_log(
                 .server_overrides
                 .temperature
                 .unwrap_or(preset.temperature)
-        },
-        top_p: startup
-            .sampling_defaults
-            .server_overrides
-            .top_p
-            .unwrap_or(preset.top_p),
+        }),
+        top_p: Some(
+            startup
+                .sampling_defaults
+                .server_overrides
+                .top_p
+                .unwrap_or(preset.top_p),
+        ),
     };
     let effective_top_k = startup
         .sampling_defaults
@@ -3285,10 +3339,12 @@ async fn read_and_validate_startup_log(
         .server_overrides
         .frequency_penalty
         .unwrap_or(preset.frequency_penalty);
-    if !defaults.temperature.is_finite()
-        || !(0.0..=2.0).contains(&defaults.temperature)
-        || !defaults.top_p.is_finite()
-        || !(0.0..=1.0).contains(&defaults.top_p)
+    if defaults
+        .temperature
+        .is_some_and(|v| !v.is_finite() || !(0.0..=2.0).contains(&v))
+        || defaults
+            .top_p
+            .is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))
     {
         return Err(EngineError::Operation(
             "NInfer startup sampler defaults are outside the supported API ranges".to_owned(),
@@ -3477,15 +3533,17 @@ async fn read_and_validate_startup_log(
                 "NInfer startup did not prove the configured speculative behavior".to_owned(),
             ));
         }
-        if requirements
-            .temperature
-            .is_some_and(|expected| !matches_runtime_float(defaults.temperature, expected))
-            || requirements
+        if requirements.temperature.is_some_and(|expected| {
+            defaults
+                .temperature
+                .is_none_or(|v| !matches_runtime_float(v, expected))
+        }) || requirements.top_p.is_some_and(|expected| {
+            defaults
                 .top_p
-                .is_some_and(|expected| !matches_runtime_float(defaults.top_p, expected))
-            || requirements
-                .top_k
-                .is_some_and(|expected| effective_top_k != expected)
+                .is_none_or(|v| !matches_runtime_float(v, expected))
+        }) || requirements
+            .top_k
+            .is_some_and(|expected| effective_top_k != expected)
             || requirements
                 .min_p
                 .is_some_and(|expected| !matches_runtime_float(effective_min_p, expected))
@@ -3688,6 +3746,9 @@ fn managed_launch_arguments(
 }
 
 fn inspect_source_native_identities(source_root: &Path) -> Vec<ArtifactNativeIdentity> {
+    if v3::source_registry_matches(source_root) {
+        return v3::native_identities();
+    }
     let targets = source_root.join("src").join("targets");
     let Ok(entries) = std::fs::read_dir(&targets) else {
         return Vec::new();
@@ -3984,7 +4045,8 @@ mod tests {
             vec![
                 EngineFeature::TextGeneration,
                 EngineFeature::ToolCalling,
-                EngineFeature::Vision
+                EngineFeature::Vision,
+                EngineFeature::StructuredOutput
             ]
         );
     }
@@ -4059,7 +4121,12 @@ mod tests {
             assert_eq!(
                 adapter.runtime_variant_update_identity(&identity(variant)),
                 RuntimeVariantUpdateIdentity {
-                    functional_variant: MANAGED_NINFER_FUNCTIONAL_VARIANT.to_owned(),
+                    functional_variant: if generation == 3 {
+                        "ninfer-linux-v3-sm120a"
+                    } else {
+                        MANAGED_NINFER_FUNCTIONAL_VARIANT
+                    }
+                    .to_owned(),
                     source_recipe_generation: Some(generation),
                 }
             );
@@ -4398,7 +4465,7 @@ mod tests {
             adapter.runtime_compatibility(&installed),
             CompatibilityDecision::Unsupported { .. }
         ));
-        assert_eq!(incompatible_native_container(&[]), None);
+        assert_eq!(incompatible_native_container(&[], 2), None);
     }
 
     #[test]

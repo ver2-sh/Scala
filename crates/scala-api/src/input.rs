@@ -383,3 +383,83 @@ pub(crate) fn require_null_or(
     }
     Ok(())
 }
+
+/// Native structured-output extension, distinct from the OpenAI JSON formats.
+/// The selected Engine remains responsible for compiling and enforcing it.
+pub(crate) fn structured_outputs(
+    value: Option<&Value>,
+    format: Option<OutputFormat>,
+) -> Result<Option<OutputFormat>, OpenAiError> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(format);
+    };
+    if format
+        .as_ref()
+        .is_some_and(|f| !matches!(f, OutputFormat::Text))
+    {
+        return Err(OpenAiError::invalid(
+            "Supply exactly one output constraint.",
+            Some("structured_outputs"),
+            "invalid_value",
+        ));
+    }
+    let object = value.as_object().filter(|v| v.len() == 1).ok_or_else(|| {
+        OpenAiError::invalid(
+            "structured_outputs requires exactly one grammar, choice, or regex.",
+            Some("structured_outputs"),
+            "invalid_type",
+        )
+    })?;
+    let invalid = || {
+        OpenAiError::invalid(
+            "The constraint must be nonempty; choice requires unique nonempty strings.",
+            Some("structured_outputs"),
+            "invalid_value",
+        )
+    };
+    let output = if let Some(v) = object.get("grammar") {
+        OutputFormat::Gbnf {
+            grammar: v
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(invalid)?
+                .into(),
+        }
+    } else if let Some(v) = object.get("regex") {
+        OutputFormat::Regex {
+            regex: v
+                .as_str()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(invalid)?
+                .into(),
+        }
+    } else if let Some(v) = object.get("choice") {
+        let values = v
+            .as_array()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(invalid)?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(invalid)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if values
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != values.len()
+        {
+            return Err(invalid());
+        }
+        OutputFormat::LiteralChoice { choices: values }
+    } else {
+        return Err(OpenAiError::unsupported(
+            "Unknown structured-output constraint.",
+            "structured_outputs",
+        ));
+    };
+    Ok(Some(output))
+}

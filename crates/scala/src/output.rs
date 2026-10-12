@@ -204,6 +204,19 @@ pub fn model_info(capabilities: &ModelServingCapabilities, json_output: bool) ->
         );
         println!("Active:               {}", yes_no(capabilities.active));
         println!(
+            "Decision candidate:   {}",
+            yes_no(capabilities.decision_candidate)
+        );
+        println!("Native Decision:      {}", yes_no(capabilities.decision));
+        println!(
+            "OpenAI Decisions:     {}",
+            yes_no(capabilities.openai_decisions)
+        );
+        println!(
+            "Decision images:      {}",
+            yes_no(capabilities.decision_images)
+        );
+        println!(
             "Text input/output:    {} / {}",
             yes_no(capabilities.text_input),
             yes_no(capabilities.text_output)

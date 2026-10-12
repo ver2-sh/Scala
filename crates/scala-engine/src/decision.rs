@@ -94,6 +94,10 @@ impl DecisionRequest {
             if decoded.len() > MAX_DECISION_IMAGE_BYTES {
                 return Err(format!("images[{index}] exceeds 8 MiB."));
             }
+            let mime = validate_decision_raster(&decoded)?;
+            if header != format!("data:{mime};base64") {
+                return Err(format!("images[{index}] media type differs from its bytes"));
+            }
         }
         Ok(())
     }
@@ -127,6 +131,8 @@ impl DecisionRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DecisionAnswer {
+    /// Only an explicit native refusal may become an OpenAI refusal.
+    Refusal {},
     Choice {
         choice: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -175,6 +181,9 @@ pub struct DecisionOutput {
     pub answers: BTreeMap<String, DecisionAnswer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<InferenceUsage>,
+    /// Unmodified native usage, kept separate from System One accounting.
+    #[serde(skip)]
+    pub native_usage: Option<serde_json::Value>,
 }
 
 /// Public projection of existing launch provenance; no private paths or endpoints.
@@ -258,11 +267,17 @@ pub(crate) fn reported_model_capabilities(
             },
             decision,
             decision_candidate: candidate,
+            openai_decisions: false,
+            decision_images: false,
         });
     }
     if let Some(reported) = &mut reported {
         reported.decision = decision;
         reported.decision_candidate = candidate;
+        reported.openai_decisions =
+            decision && adapter.supports_openai_decisions(runtime, model, settings);
+        reported.decision_images =
+            decision && adapter.qualified_decision_images(runtime, model, settings);
     }
     reported
 }
@@ -284,6 +299,8 @@ pub(crate) mod tests {
         pub fail: bool,
         pub native_effort_admission: bool,
         pub calls: AtomicUsize,
+        pub decision_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+        pub decision_cancelled: std::sync::Arc<AtomicUsize>,
         pub image_inputs: bool,
         pub decision_requests: std::sync::Mutex<Vec<DecisionRequest>>,
         pub chat_history: std::sync::Mutex<Option<Vec<InferenceRequest>>>,
@@ -299,6 +316,8 @@ pub(crate) mod tests {
                 fail: false,
                 native_effort_admission: false,
                 calls: AtomicUsize::new(0),
+                decision_gate: None,
+                decision_cancelled: Default::default(),
                 image_inputs: false,
                 decision_requests: std::sync::Mutex::new(Vec::new()),
                 chat_history: std::sync::Mutex::new(None),
@@ -388,6 +407,19 @@ pub(crate) mod tests {
         ) -> Result<DecisionOutput, EngineError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.decision_requests.lock().unwrap().push(request.clone());
+            if let Some(gate) = &self.decision_gate {
+                struct Pending(std::sync::Arc<AtomicUsize>, bool);
+                impl Drop for Pending {
+                    fn drop(&mut self) {
+                        if !self.1 {
+                            self.0.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                }
+                let mut pending = Pending(self.decision_cancelled.clone(), false);
+                gate.clone().acquire_owned().await.unwrap().forget();
+                pending.1 = true;
+            }
             assert_eq!(request.questions.len(), 3);
             assert!(matches!(request.state, DecisionContent::Object(_)));
             if self.fail {
@@ -544,7 +576,7 @@ pub(crate) mod tests {
         );
         let image = format!(
             "data:image/png;base64,{}",
-            STANDARD.encode(vec![0; MAX_DECISION_IMAGE_BYTES])
+            STANDARD.encode({let mut bytes=STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC").unwrap();bytes.resize(MAX_DECISION_IMAGE_BYTES,0);bytes})
         );
         request.images = vec![image.clone(), image];
         request.validate().unwrap();
@@ -554,7 +586,7 @@ pub(crate) mod tests {
         assert_eq!(decoded.state, request.state);
         assert_eq!(decoded.questions, request.questions);
         for images in [
-            vec!["data:image/png;base64,YQ==".into(); 3],
+            vec!["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC".into(); 3],
             vec!["https://example.com/image.png".into()],
             vec!["data:image/gif;base64,YQ==".into()],
             vec!["data:image/png;base64,".into()],
@@ -669,4 +701,29 @@ pub(crate) mod tests {
             assert_eq!(serde_json::to_value(typed).unwrap(), answer);
         }
     }
+}
+
+/// Shared native Decision transport validation. Decode under strict allocation
+/// and geometry limits without altering the bytes delivered to the runtime.
+pub fn validate_decision_raster(bytes: &[u8]) -> Result<&'static str, String> {
+    if bytes.len() > MAX_DECISION_IMAGE_BYTES {
+        return Err("image exceeds 8 MiB".into());
+    }
+    let format = image::guess_format(bytes).map_err(|_| "invalid image format")?;
+    let mime = match format {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::WebP => "image/webp",
+        _ => return Err("only PNG, JPEG and WebP are admitted".into()),
+    };
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map_err(|_| "malformed image or image exceeds 4096 by 4096 / 64 MiB decode limit")?;
+    Ok(mime)
 }

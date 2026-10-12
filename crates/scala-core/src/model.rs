@@ -107,9 +107,20 @@ pub struct NinferContainerMetadata {
     pub dflash2: bool,
     pub(crate) resources: Vec<(String, u64, u64)>,
     pub metadata_bytes_read: u64,
+    /// Native v3 component/binding facts, never producer capability assertions.
+    pub v3_directory: Option<serde_json::Value>,
+    pub(crate) v3_files: Vec<(Option<String>, u64, u64)>,
 }
 
 impl NinferContainerMetadata {
+    /// Validated sibling payload files for native multipart v3 artifacts.
+    pub fn continuation_paths(&self, entry: &Path) -> Vec<PathBuf> {
+        self.v3_files
+            .iter()
+            .filter_map(|(name, _, _)| name.as_ref())
+            .map(|name| entry.parent().unwrap_or(Path::new(".")).join(name))
+            .collect()
+    }
     /// Hash one embedded frontend resource, with a bounded read and no tensor IO.
     /// Uses the native object directory, equally for bare and manifest-bound files.
     pub fn frontend_resource_sha256(
@@ -125,6 +136,10 @@ impl NinferContainerMetadata {
                 "frontend capability resource exceeds inspection bound",
             ));
         }
+        if self.v3_directory.is_some() {
+            let content = ninfer_v3::read_resource(path, self, *offset, *bytes)?;
+            return Ok(Some(format!("{:x}", Sha256::digest(content))));
+        }
         let mut file = std::fs::File::open(path)?;
         file.seek(SeekFrom::Start(*offset))?;
         let mut content = vec![0; *bytes as usize];
@@ -139,7 +154,7 @@ pub enum NinferContainerError {
     Io(#[from] std::io::Error),
     #[error("NInfer container magic is not recognized")]
     InvalidMagic,
-    #[error("NInfer container version {0} is unsupported; version 2 is required")]
+    #[error("NInfer container version {0} is unsupported; version 2 or 3 is required")]
     UnsupportedVersion(u8),
     #[error("NInfer directory length must be between 1 and {maximum} bytes; observed {observed}")]
     InvalidDirectoryLength { observed: u64, maximum: u64 },
@@ -776,11 +791,20 @@ const NINFER_PREFIX_BYTES: u64 = 16;
 const NINFER_PAYLOAD_ALIGNMENT: u64 = 4096;
 const MAX_NINFER_DIRECTORY_BYTES: u64 = 16 * 1024 * 1024;
 
+#[path = "ninfer_v3.rs"]
+mod ninfer_v3;
+
 pub fn inspect_ninfer_container(
     path: &Path,
 ) -> Result<NinferContainerMetadata, NinferContainerError> {
     let mut file = std::fs::File::open(path)?;
     let file_bytes = file.metadata()?.len();
+    let mut magic = [0; 8];
+    file.read_exact(&mut magic)?;
+    file.seek(SeekFrom::Start(0))?;
+    if &magic == b"NINFER\0\x03" {
+        return ninfer_v3::inspect(path, &mut file, file_bytes);
+    }
     inspect_ninfer_reader(&mut file, file_bytes)
 }
 
@@ -842,6 +866,8 @@ fn inspect_ninfer_reader(
             })
             .collect(),
         metadata_bytes_read: NINFER_PREFIX_BYTES + json_bytes,
+        v3_directory: None,
+        v3_files: Vec::new(),
     })
 }
 
