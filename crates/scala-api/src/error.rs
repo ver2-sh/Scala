@@ -19,6 +19,17 @@ pub(crate) struct OpenAiError {
 }
 
 impl OpenAiError {
+    pub(crate) fn for_decisions(mut self) -> Self {
+        if let Some(p) = &mut self.parameter
+            && (p == "state" || p.starts_with("state["))
+        {
+            *p = p
+                .replacen("state", "input", 1)
+                .replace(".image_url.url", ".image_url");
+        }
+        self
+    }
+
     pub(crate) fn for_responses(mut self) -> Self {
         if let Some(p) = &mut self.parameter {
             *p = p

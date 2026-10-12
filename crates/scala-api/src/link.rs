@@ -908,7 +908,7 @@ pub(crate) async fn route(
                 headers,
             };
             match link.request(&node, operation).await {
-                Ok(response) => response,
+                Ok(response) => decision_response(parts.uri.path(), response).await,
                 Err(error) => link_error(StatusCode::BAD_GATEWAY, error, "link_transport_error")
                     .into_response(),
             }
@@ -916,6 +916,37 @@ pub(crate) async fn route(
         Err(error) => error.into_response(),
     }
 }
+async fn decision_response(path: &str, response: Response) -> Response {
+    if path != "/v1/decisions" || !response.status().is_success() {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, MAX_INFERENCE_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return link_error(
+                StatusCode::BAD_GATEWAY,
+                "Decision owner response could not be read within the local body limit.",
+                "native_decision_contract_mismatch",
+            )
+            .into_response();
+        }
+    };
+    let result = serde_json::from_slice::<Value>(&bytes)
+        .map_err(|_| {
+            link_error(
+                StatusCode::BAD_GATEWAY,
+                "Decision owner returned malformed JSON.",
+                "native_decision_contract_mismatch",
+            )
+        })
+        .and_then(|value| crate::decisions::validate_required_response(&value));
+    match result {
+        Ok(()) => Response::from_parts(parts, Body::from(bytes)),
+        Err(error) => error.into_response(),
+    }
+}
+
 fn forwarded_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
     [
         "x-scala-session",
@@ -1017,6 +1048,69 @@ pub(crate) async fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn decisions_owner_success_requires_complete_usage_while_systemone_stays_native() {
+        let complete = json!({"model":"owner-native", "answers":[{"type":"predicate","name":null,"probability":0.8}],
+            "usage":{"input_tokens":42,"input_tokens_details":{"cached_tokens":7,"cache_write_tokens":3},
+                "output_tokens":5,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":47}});
+        for usage in [
+            None,
+            Some(json!({"input_tokens":42,"output_tokens":0})),
+            Some(complete["usage"].clone()),
+        ] {
+            let mut value = complete.clone();
+            value.as_object_mut().unwrap().remove("usage");
+            if let Some(usage) = &usage {
+                value["usage"] = usage.clone();
+            }
+            for path in ["/v1/systemone", "/v1/decisions"] {
+                let mut response = (StatusCode::OK, axum::Json(value.clone())).into_response();
+                response
+                    .headers_mut()
+                    .insert("x-request-id", "owner-id".parse().unwrap());
+                let response = decision_response(path, response).await;
+                let success = path == "/v1/systemone" || usage == Some(complete["usage"].clone());
+                assert_eq!(
+                    response.status(),
+                    if success {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    }
+                );
+                if success {
+                    assert_eq!(response.headers()["x-request-id"], "owner-id");
+                }
+                let result: Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                if success {
+                    assert_eq!(result, value);
+                } else {
+                    assert_eq!(result["error"]["code"], "native_decision_contract_mismatch");
+                }
+            }
+        }
+        let error =
+            json!({"error":{"code":"unsupported_decision_media","param":"input[1].content[0]"}});
+        let response = decision_response(
+            "/v1/decisions",
+            (StatusCode::BAD_REQUEST, axum::Json(error.clone())).into_response(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let result: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result, error);
+    }
 
     #[tokio::test]
     async fn systemone_link_preserves_two_eight_mib_images_with_existing_limits() {

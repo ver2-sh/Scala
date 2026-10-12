@@ -2136,7 +2136,8 @@ pub trait EngineAdapter: Send + Sync {
         false
     }
     /// Separate admission for the OpenAI output contract. A System One route
-    /// alone proves neither probability semantics nor mandatory distributions.
+    /// alone proves neither probability semantics, mandatory distributions nor
+    /// complete per-request native usage observations.
     fn supports_openai_decisions(
         &self,
         _runtime: &InstalledRuntime,

@@ -144,8 +144,16 @@ async fn body(response: reqwest::Response) -> Result<(reqwest::StatusCode, Vec<u
     Ok((status, bytes))
 }
 
+fn media_error(message: impl Into<String>, parameter: impl Into<String>) -> EngineError {
+    EngineError::NativeRequest {
+        message: message.into(),
+        parameter: parameter.into(),
+        code: "unsupported_decision_media",
+    }
+}
+
 /// Translate only the private native wire body; public requests stay unchanged.
-fn native_request_body(request: &DecisionRequest) -> Result<Value, EngineError> {
+pub(super) fn native_request_body(request: &DecisionRequest) -> Result<Value, EngineError> {
     request
         .validate()
         .map_err(EngineError::InvalidDecisionRequest)?;
@@ -174,38 +182,72 @@ fn native_request_body(request: &DecisionRequest) -> Result<Value, EngineError> 
     }
     let mut body = json!({"state": request.state, "questions": questions});
     let mut embedded = Vec::new();
-    let messages = match &request.state {
-        scala_engine::DecisionContent::Array(messages) => Some(messages),
-        scala_engine::DecisionContent::Object(state) => {
-            state.get("messages").and_then(Value::as_array)
-        }
-        _ => None,
+    let (messages, prefix) = match &request.state {
+        scala_engine::DecisionContent::Array(messages) => (Some(messages), "state"),
+        scala_engine::DecisionContent::Object(state) => (
+            state.get("messages").and_then(Value::as_array),
+            "state.messages",
+        ),
+        _ => (None, "state"),
     };
     if let Some(messages) = messages {
-        for part in messages
-            .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_array))
-            .flatten()
-        {
-            match part.get("type").and_then(Value::as_str) {
-                Some("image_url") => {
-                    let url = part
-                        .get("image_url")
-                        .and_then(|v| v.as_str().or_else(|| v.get("url").and_then(Value::as_str)))
-                        .ok_or_else(|| {
-                            EngineError::InvalidDecisionRequest(
-                                "Invalid native image_url part".into(),
-                            )
-                        })?;
-                    embedded.push(url);
+        let mut first_image = None;
+        let mut has_other_parts = false;
+        for (i, message) in messages.iter().enumerate() {
+            let Some(parts) = message.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for (j, part) in parts.iter().enumerate() {
+                let field = format!("{prefix}[{i}].content[{j}]");
+                match part.get("type").and_then(Value::as_str) {
+                    Some("image_url") => {
+                        let image_url = &part["image_url"];
+                        let url = image_url
+                            .as_str()
+                            .or_else(|| image_url.get("url").and_then(Value::as_str))
+                            .ok_or_else(|| {
+                                media_error(
+                                    "Invalid native image_url part",
+                                    format!("{field}.image_url"),
+                                )
+                            })?;
+                        // parse_state removes the whole part, including annotations.
+                        if part.as_object().is_some_and(|p| {
+                            p.keys()
+                                .any(|k| !matches!(k.as_str(), "type" | "image_url"))
+                        }) || image_url
+                            .as_object()
+                            .is_some_and(|p| p.keys().any(|k| k != "url"))
+                        {
+                            return Err(media_error(
+                                "Native Decision cannot retain image annotations or detail controls.",
+                                field,
+                            ));
+                        }
+                        first_image.get_or_insert(field);
+                        embedded.push(url);
+                    }
+                    Some("input_audio" | "audio" | "video_url" | "input_image" | "file") => {
+                        return Err(media_error(
+                            "This native Decision transport admits text and validated images only.",
+                            field,
+                        ));
+                    }
+                    _ => has_other_parts = true,
                 }
-                Some("input_audio" | "audio" | "video_url" | "input_image" | "file") => {
-                    return Err(EngineError::Unsupported(
-                        "This native Decision transport admits text and validated images only"
-                            .into(),
-                    ));
-                }
-                _ => {}
+            }
+        }
+        if let Some(field) = first_image {
+            // At both frozen revisions parse_state removes image parts and render
+            // receives only a shared ordered media list. It cannot retain text/image
+            // positions or associate images with one of several messages. A sole
+            // image-only message has neither ambiguity; explicit top-level images
+            // already express the native shared-media semantics.
+            if messages.len() != 1 || has_other_parts {
+                return Err(media_error(
+                    "Native Decision retains image bytes/order but cannot retain embedded text/image positions or associations across messages. Use a single image-only message, or /v1/systemone with explicit shared images and state.",
+                    field,
+                ));
             }
         }
     }
@@ -217,8 +259,9 @@ fn native_request_body(request: &DecisionRequest) -> Result<Value, EngineError> 
                 .map(String::as_str)
                 .collect::<Vec<_>>()
         {
-            return Err(EngineError::InvalidDecisionRequest(
-                "Embedded decision media must match the admitted ordered images.".into(),
+            return Err(media_error(
+                "Embedded decision media must match the admitted ordered images.",
+                prefix,
             ));
         }
     } else if !request.images.is_empty() {
@@ -872,6 +915,9 @@ mod tests {
     struct ManagedAdapter {
         native: LlamaCppAdapter,
         template: LaunchSpec,
+        // Test-only native protocol with complete usage, independent of the real
+        // llama System One wire. Never grants production llama compatibility.
+        complete_openai_contract: bool,
     }
     #[async_trait]
     impl EngineAdapter for ManagedAdapter {
@@ -881,7 +927,7 @@ mod tests {
             m: &ModelArtifact,
             s: &ResolvedSettings,
         ) -> bool {
-            self.native.supports_openai_decisions(r, m, s)
+            self.complete_openai_contract && self.native.supports_native_decision(r, m, s)
         }
         fn qualified_decision_images(
             &self,
@@ -901,7 +947,12 @@ mod tests {
             s: &ResolvedSettings,
             q: &DecisionRequest,
         ) -> Result<(), EngineError> {
-            self.native.validate_openai_decision_request(r, m, s, q)
+            if self.supports_openai_decisions(r, m, s) {
+                native_request_body(q)?;
+                Ok(())
+            } else {
+                self.native.validate_openai_decision_request(r, m, s, q)
+            }
         }
 
         fn identity(&self) -> EngineIdentity {
@@ -1088,11 +1139,13 @@ mod tests {
             EngineRegistry, RuntimeManager, RuntimeManagerOptions, RuntimePackManager, RuntimeStore,
         };
         use std::sync::atomic::Ordering;
-        for (native, kind, valid_proof) in [
-            (true, Some("laya"), true),
-            (false, Some("laya"), true),
-            (true, None, true),
-            (true, Some("laya"), false),
+        for (native, kind, valid_proof, complete_openai_contract) in [
+            (true, Some("laya"), true, false),
+            (true, Some("clef"), true, false),
+            (true, Some("laya"), true, true),
+            (false, Some("laya"), true, false),
+            (true, None, true, false),
+            (true, Some("laya"), false, false),
         ] {
             let fixture = fixture(native, kind, None).await;
             if !valid_proof {
@@ -1166,6 +1219,7 @@ mod tests {
                 let adapter = Arc::new(ManagedAdapter {
                     native: LlamaCppAdapter::from_config(None, Path::new(".")),
                     template: fixture.spec.clone(),
+                    complete_openai_contract,
                 });
                 let mut registry = EngineRegistry::default();
                 registry.register(adapter.clone()).unwrap();
@@ -1219,7 +1273,14 @@ mod tests {
                         let (_, listed) =
                             public_request(&endpoint, "GET", "/v1/models", Value::Null).await;
                         assert_eq!(listed["data"][0]["capabilities"]["decision"], true);
-                        assert_eq!(listed["data"][0]["capabilities"]["openai_decisions"], true);
+                        assert_eq!(
+                            listed["data"][0]["capabilities"]["openai_decisions"] == true,
+                            complete_openai_contract
+                        );
+                        assert_eq!(
+                            listed["data"][0]["capabilities"]["decision_images"] == true,
+                            kind == Some("clef")
+                        );
                         if restart == 0 && unload == 0 {
                             *fixture.backend.gate.lock().unwrap() =
                                 Some(Arc::new(tokio::sync::Semaphore::new(0)));
@@ -1248,18 +1309,104 @@ mod tests {
                             *fixture.backend.gate.lock().unwrap() = None;
                         }
                         let original = fixture.backend.response.lock().unwrap().clone();
-                        *fixture.backend.response.lock().unwrap() = (
-                            StatusCode::OK,
-                            json!({"model":"native-reported","answers":{"q00000000":{"type":"noul","noul":0.8}}}),
-                        );
-                        manager.unload(profile_id.clone()).await.unwrap();
-                        let (status,result)=public_request(&endpoint,"POST","/v1/decisions",json!({"model":profile_id,"input":"synthetic","questions":[{"type":"predicate","instructions":"test"}]})).await;
-                        assert_eq!(status, StatusCode::OK, "{result}");
-                        assert_eq!(
-                            result["answers"][0],
-                            json!({"name":null,"type":"predicate","probability":0.8})
-                        );
+                        let usage = json!({"input_tokens":42,"input_tokens_details":{"cached_tokens":7,"cache_write_tokens":3},
+                            "output_tokens":5,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":47});
+                        for native_usage in [
+                            None,
+                            Some(json!({"input_tokens":42,"output_tokens":0})),
+                            Some(usage.clone()),
+                        ] {
+                            let mut wire = json!({"model":"native-reported","answers":{"q00000000":{"type":"noul","noul":0.8}}});
+                            if let Some(usage) = &native_usage {
+                                wire["usage"] = usage.clone();
+                            }
+                            *fixture.backend.response.lock().unwrap() = (StatusCode::OK, wire);
+                            manager.unload(profile_id.clone()).await.unwrap();
+                            let native_calls = fixture.backend.calls.lock().unwrap().len();
+                            let (status,result)=public_request(&endpoint,"POST","/v1/decisions",json!({"model":profile_id,"input":"synthetic","questions":[{"type":"predicate","instructions":"test"}]})).await;
+                            if complete_openai_contract && native_usage == Some(usage.clone()) {
+                                assert_eq!(status, StatusCode::OK, "{result}");
+                                assert_eq!(
+                                    result["answers"][0],
+                                    json!({"name":null,"type":"predicate","probability":0.8})
+                                );
+                                assert_eq!(result["model"], "native-reported");
+                                assert_eq!(result["usage"], usage);
+                            } else if complete_openai_contract {
+                                assert_eq!(status, StatusCode::BAD_GATEWAY, "{result}");
+                                assert_eq!(
+                                    result["error"]["code"],
+                                    "native_decision_contract_mismatch"
+                                );
+                            } else {
+                                assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+                                assert_eq!(result["error"]["code"], "unsupported_capability");
+                                // Only props/models and the empty qualification probe;
+                                // no inference even if a fake response supplies usage.
+                                assert!(
+                                    fixture.backend.calls.lock().unwrap()[native_calls..]
+                                        .iter()
+                                        .all(|(_, path, body)| path != "/v1/systemone"
+                                            || body == &json!({}))
+                                );
+                            }
+                        }
                         *fixture.backend.response.lock().unwrap() = original;
+                        if kind == Some("clef") {
+                            let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+                            for multiple_messages in [false, true] {
+                                for openai in [false, true] {
+                                    let (image_type, text_type) = if openai {
+                                        ("input_image", "input_text")
+                                    } else {
+                                        ("image_url", "text")
+                                    };
+                                    let part = if openai {
+                                        json!({"type":image_type,"image_url":image})
+                                    } else {
+                                        json!({"type":image_type,"image_url":{"url":image}})
+                                    };
+                                    let first = json!({"role":"user","content":[{"type":text_type,"text":"Image A:"},part]});
+                                    let mut messages = vec![first];
+                                    if multiple_messages {
+                                        messages.push(json!({"role":"user","content":[{"type":text_type,"text":"Compare Image B with Image A:"},part]}));
+                                    }
+                                    let body = if openai {
+                                        json!({"model":profile_id,"input":messages,"questions":[{"type":"predicate","instructions":"compare"}]})
+                                    } else {
+                                        json!({"model":profile_id,"state":messages,"images":vec![image; if multiple_messages {2} else {1}],"questions":request.questions})
+                                    };
+                                    let native_calls = fixture.backend.calls.lock().unwrap().len();
+                                    let (status, error) = public_request(
+                                        &endpoint,
+                                        "POST",
+                                        if openai {
+                                            "/v1/decisions"
+                                        } else {
+                                            "/v1/systemone"
+                                        },
+                                        body,
+                                    )
+                                    .await;
+                                    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+                                    assert_eq!(
+                                        error["error"]["code"],
+                                        "unsupported_decision_media"
+                                    );
+                                    assert_eq!(
+                                        error["error"]["param"],
+                                        format!(
+                                            "{}[0].content[1]",
+                                            if openai { "input" } else { "state" }
+                                        )
+                                    );
+                                    assert_eq!(
+                                        fixture.backend.calls.lock().unwrap().len(),
+                                        native_calls
+                                    );
+                                }
+                            }
+                        }
                         // Adapter validation reaches the public 400 envelope without HTTP.
                         let native_calls = fixture.backend.calls.lock().unwrap().len();
                         for levels in [1, 11] {
@@ -1587,7 +1734,7 @@ mod tests {
             let mut request = fixture.request();
             let image2 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
             request.images = vec![image.into(), image2.into()];
-            request.state = serde_json::from_value(json!([{"role":"user","content":[{"type":"text","text":"before"},{"type":"image_url","image_url":{"url":image}},{"type":"text","text":"between"},{"type":"image_url","image_url":{"url":image2}}]}])).unwrap();
+            request.state = serde_json::from_value(json!([{"role":"user","content":[{"type":"image_url","image_url":{"url":image}},{"type":"image_url","image_url":{"url":image2}}]}])).unwrap();
             fixture.backend.calls.lock().unwrap().clear();
             fixture
                 .adapter
@@ -1605,6 +1752,137 @@ mod tests {
                 &fixture.spec.model.primary,
                 &fixture.spec.settings
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_media_list_retains_order_but_cannot_represent_positions_or_message_associations()
+     {
+        let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+        let image2 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+        for revision in [
+            "d81235049384534c167caea52b85a694f6103d14",
+            "f9a95aeb2096d0c0218e0cd6e6d901cd37be798a",
+        ] {
+            let mut fixture = fixture(true, Some("clef"), None).await;
+            fixture.spec.runtime.manifest.identity.upstream_revision = Some(revision.into());
+            fixture.spec.runtime.manifest.runtime_id =
+                RuntimeId::from_identity(&fixture.spec.runtime.manifest.identity);
+            fixture.process.runtime_id = fixture.spec.runtime.manifest.runtime_id.clone();
+            fixture.qualify().await;
+            assert!(fixture.supported());
+            assert!(!fixture.adapter.supports_openai_decisions(
+                &fixture.spec.runtime,
+                &fixture.spec.model.primary,
+                &fixture.spec.settings
+            ));
+            assert!(fixture.adapter.qualified_decision_images(
+                &fixture.spec.runtime,
+                &fixture.spec.model.primary,
+                &fixture.spec.settings
+            ));
+            let image_part = json!({"type":"image_url","image_url":{"url":image}});
+            let image_part2 = json!({"type":"image_url","image_url":{"url":image2}});
+            let label_a = json!({"type":"text","text":"Image A:"});
+            let label_b = json!({"type":"text","text":"Image B: compare it with Image A"});
+            for (state, images) in [
+                (json!("text only"), vec![]),
+                (
+                    json!([{"role":"user","content":[label_a.clone()]},{"role":"user","content":[label_b.clone()]}]),
+                    vec![],
+                ),
+                (
+                    json!([{"role":"user","content":[image_part.clone()]}]),
+                    vec![image],
+                ),
+                (
+                    json!([{"role":"user","content":[image_part.clone(),image_part2.clone()]}]),
+                    vec![image, image2],
+                ),
+                (
+                    json!({"messages":[{"role":"user","content":[image_part.clone(),image_part2.clone()]}]}),
+                    vec![image, image2],
+                ),
+                // Explicit shared images do not promise embedded positions.
+                (
+                    json!({"compare":"first image A with second image B"}),
+                    vec![image, image2],
+                ),
+            ] {
+                let mut request = fixture.request();
+                request.state = serde_json::from_value(state.clone()).unwrap();
+                request.images = images.iter().map(|s| (*s).into()).collect();
+                fixture.backend.calls.lock().unwrap().clear();
+                fixture
+                    .adapter
+                    .decide(fixture.spec.endpoint.as_ref().unwrap(), request)
+                    .await
+                    .unwrap();
+                let calls = fixture.backend.calls.lock().unwrap();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].2["state"], state);
+                if !images.is_empty() && state.is_object() && state.get("messages").is_none() {
+                    assert_eq!(calls[0].2["images"], json!(images));
+                } else {
+                    assert!(calls[0].2.get("images").is_none());
+                }
+            }
+            let arrangements = [
+                (
+                    json!([{"role":"user","content":[label_a.clone(),image_part.clone()]}]),
+                    vec![image],
+                    "[0].content[1]",
+                ),
+                (
+                    json!([{"role":"user","content":[image_part.clone(),label_a.clone()]}]),
+                    vec![image],
+                    "[0].content[0]",
+                ),
+                (
+                    json!([{"role":"user","content":[label_a.clone(),image_part.clone(),label_b.clone(),image_part2.clone()]}]),
+                    vec![image, image2],
+                    "[0].content[1]",
+                ),
+                (
+                    json!([{"role":"user","content":[label_a.clone(),image_part.clone()]},{"role":"user","content":[label_b.clone(),image_part2.clone()]}]),
+                    vec![image, image2],
+                    "[0].content[1]",
+                ),
+                (
+                    json!([{"role":"user","content":"context"},{"role":"user","content":[image_part.clone()]}]),
+                    vec![image],
+                    "[1].content[0]",
+                ),
+                (
+                    json!([{"role":"user","content":[image_part.clone()]},{"role":"user","content":[image_part2.clone()]}]),
+                    vec![image, image2],
+                    "[0].content[0]",
+                ),
+            ];
+            for (state, images, field) in arrangements {
+                for wrapped in [false, true] {
+                    let mut request = fixture.request();
+                    request.images = images.iter().map(|s| (*s).into()).collect();
+                    request.state = serde_json::from_value(if wrapped {
+                        json!({"messages":state})
+                    } else {
+                        state.clone()
+                    })
+                    .unwrap();
+                    fixture.backend.calls.lock().unwrap().clear();
+                    let error = fixture
+                        .adapter
+                        .decide(fixture.spec.endpoint.as_ref().unwrap(), request)
+                        .await
+                        .unwrap_err();
+                    let expected =
+                        format!("state{}{field}", if wrapped { ".messages" } else { "" });
+                    assert!(
+                        matches!(error, EngineError::NativeRequest {parameter, code:"unsupported_decision_media", ..} if parameter == expected)
+                    );
+                    assert!(fixture.backend.calls.lock().unwrap().is_empty());
+                }
+            }
         }
     }
 

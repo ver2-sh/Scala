@@ -95,18 +95,34 @@ names, boolean/string values, descriptions, score labels and original question
 order. It requires actual native model identity, predicate P(true), normalized
 native distributions/confidence and compatible score observations. Refusal is a
 native typed outcome, not inferred from abstention. Missing required observations
-fail with an actionable structured error. Complete native usage is optional and
-never synthesized. Hosted model names or limits are not Scala defaults.
+fail with an actionable structured error. Complete native usage is required and never synthesized. Every successful
+response includes all published usage counters; incomplete observations yield
+HTTP 502 `native_decision_contract_mismatch`, including successful responses from
+older Link owners. Hosted model names or limits are not Scala defaults.
 
 The current bounds are 32 MiB public body, 1–1024 questions, 2–255 choices/levels
 before native limits, and llama.cpp score levels 2–10. User messages only; text and
 qualified native images only. Images are at most two 8 MiB PNG/JPEG/WebP payloads,
 4096x4096 each, bounded full decoding. HTTP(S) acquisition excludes local/private
 addresses, credentials, redirects and proxies, pins validated DNS results and
-bounds ports, bytes and time. Ordered media and original bytes reach native
-System One. Image capability requires native vision observations and a bound
-projector. OpenAI Decisions has its own output-contract qualification; merely
-exposing System One grants neither OpenAI compatibility nor image capability.
+bounds ports, bytes and time. Ordered media and original bytes reach native System One. Image capability
+requires native vision observations and a bound projector. At both frozen llama
+revisions, embedded images are extracted into a shared list: original inline
+text/image positions and message associations do not reach rendering. Text-only
+messages, a sole image-only message and explicit shared System One `images` remain
+admitted. Embedded text/image mixtures and images in multiple messages fail
+field-specifically before inference; labelled comparisons cannot silently lose
+their associations. No Scala prompt markers or chat emulation are added.
+
+OpenAI Decisions has its own output-contract qualification. Both frozen llama.cpp
+revisions provide only native input/output usage counts, with no cache,
+cache-write or reasoning counts. They retain candidate, native Decision and proven
+vision capability but advertise `openai_decisions: false` (false flags are omitted on the wire). Their OpenAI route
+returns HTTP 400 `unsupported_capability` before inference, even after native
+Decision qualification. Synthetic complete-usage protocol tests prove the
+schema-complete success path without granting that contract to a production
+llama.cpp pair. Merely exposing System One or recognizing an upstream revision
+grants neither OpenAI compatibility nor image capability.
 See [native Decision documentation](native-decision.md) for details.
 
 Qualification binds runtime/executable/probe, artifact/native identity, profile,
@@ -142,6 +158,21 @@ Upstream retains CUDA/Metal/Vulkan/GGML, scheduling, cache and speculative
 implementation. Old runtime identities/settings remain usable. Native System One
 media routes and cancellation were source-reviewed at both frozen revisions;
 actual model/image execution was not run.
+
+The audit correction re-reviewed the exact native usage owner and image
+parser/rendering together:
+
+| Revision | Native response owner | Image parser/rendering owner |
+| --- | --- | --- |
+| v0.6.0 / b11429 | [server-context.cpp, post_systemone](https://github.com/ggml-org/llama.cpp/blob/d81235049384534c167caea52b85a694f6103d14/tools/server/server-context.cpp#L5573-L5666) | [server-decision.cpp, parse_state/render/fill_task_joint](https://github.com/ggml-org/llama.cpp/blob/d81235049384534c167caea52b85a694f6103d14/tools/server/server-decision.cpp#L225-L272) |
+| b11565 | [server-context.cpp, post_systemone](https://github.com/ggml-org/llama.cpp/blob/f9a95aeb2096d0c0218e0cd6e6d901cd37be798a/tools/server/server-context.cpp#L5760-L5844) | [server-decision.cpp, parse_state/render/fill_task_joint](https://github.com/ggml-org/llama.cpp/blob/f9a95aeb2096d0c0218e0cd6e6d901cd37be798a/tools/server/server-decision.cpp#L256-L312) |
+
+The native output includes an observed `output_tokens: 0`; that observation does
+not establish zeros for the absent detailed counters. Rendering creates a
+separate marker list from the media count and passes the stripped state to the
+model's native template. Retained media order therefore does not establish
+retained inline positions or per-message associations. The imported `--help`
+fixtures remain exact upstream captures, including upstream trailing whitespace.
 
 ### Q27 v0.14.5
 
@@ -223,6 +254,11 @@ sampler/compiler was added.
   expectation as predicate P(true), nor invent required distributions/confidence,
   refusal, native identity or complete usage. Those particular unsupported pairs
   or incomplete outputs fail explicitly; existing System One semantics survive.
+  Neither frozen llama.cpp revision meets mandatory complete usage, so both
+  withhold OpenAI Decisions capability while retaining independent native Decision
+  and proven vision. Their native shared media list cannot express embedded
+  text/image positions or per-message associations; Scala rejects those forms
+  explicitly and preserves accurately representable shared/image-only input.
 - **Validation scope:** all new native integration is source/package/static and
   synthetic qualified, without live-model or production-GPU validation. Actual
   host/probe/pair qualification remains mandatory. This is not a claim that every
@@ -239,11 +275,14 @@ All commands completed successfully, with no warnings from check/Clippy/tests:
 | `cargo fmt --check` | passed |
 | `cargo check --workspace` | passed |
 | `cargo clippy --workspace` | passed |
-| `cargo test --workspace` | passed: 413 tests, 0 failures, 1 existing ignored test; 22 result suites including doc tests |
+| `cargo test --workspace` | passed: 416 tests, 0 failures, 1 existing ignored test; 22 result suites including doc tests |
 | `git diff --check` | passed |
 
 Tests cover both Decision APIs and conversion/output errors, boolean identity,
-omitted names, refusal, ordered raster bytes and SSRF bounds; candidate/pair
+omitted names, refusal, missing/complete required usage and Link success validation,
+ordered raster bytes versus native position/association limits, image-only/text-only,
+shared single/multiple images and labelled interleaving across user messages;
+SSRF bounds; candidate/pair
 qualification invalidation; public disconnect/native cancellation and concurrent
 lease cleanup; JIT/unload/restart; Link owner routing/capability inventories;
 actual llama help/options and asset companions; Q27 source/version/packed-head

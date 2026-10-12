@@ -809,18 +809,13 @@ impl EngineAdapter for LlamaCppAdapter {
 
     fn supports_openai_decisions(
         &self,
-        runtime: &InstalledRuntime,
-        model: &ModelArtifact,
-        settings: &scala_core::ResolvedSettings,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _settings: &scala_core::ResolvedSettings,
     ) -> bool {
-        self.decision_supported(runtime, model, settings)
-            && matches!(
-                runtime.manifest.identity.upstream_revision.as_deref(),
-                Some(
-                    "d81235049384534c167caea52b85a694f6103d14"
-                        | "f9a95aeb2096d0c0218e0cd6e6d901cd37be798a"
-                )
-            )
+        // Neither reviewed System One wire reports cache/cache-write/reasoning
+        // counters. Exact native Decision proof cannot grant the OpenAI contract.
+        false
     }
 
     fn qualified_decision_images(
@@ -829,39 +824,23 @@ impl EngineAdapter for LlamaCppAdapter {
         model: &ModelArtifact,
         settings: &scala_core::ResolvedSettings,
     ) -> bool {
-        self.supports_openai_decisions(runtime, model, settings)
+        self.decision_supported(runtime, model, settings)
             && self.decision_vision_supported(runtime, model, settings)
     }
 
     fn validate_openai_decision_request(
         &self,
-        runtime: &InstalledRuntime,
-        model: &ModelArtifact,
-        settings: &scala_core::ResolvedSettings,
+        _runtime: &InstalledRuntime,
+        _model: &ModelArtifact,
+        _settings: &scala_core::ResolvedSettings,
         request: &scala_engine::DecisionRequest,
     ) -> Result<(), EngineError> {
-        if !self.decision_supported(runtime, model, settings)
-            || !matches!(
-                runtime.manifest.identity.upstream_revision.as_deref(),
-                Some(
-                    "d81235049384534c167caea52b85a694f6103d14"
-                        | "f9a95aeb2096d0c0218e0cd6e6d901cd37be798a"
-                )
-            )
-        {
-            return Err(EngineError::Unsupported("OpenAI Decisions requires an execution-qualified pair and a reviewed native output contract (v0.6.0 or b11565)".into()));
-        }
-        // This is a semantic exception from upstream format_answer, never a
-        // model detector: Lev returns a rating expectation, not P(true).
-        if matches!(&model.native_identity, Some(ArtifactNativeIdentity::Gguf(identity)) if identity.decision_type.as_deref() == Some("lev"))
-            && request
-                .questions
-                .values()
-                .any(|q| matches!(q, scala_engine::DecisionQuestion::Noul { .. }))
-        {
-            return Err(EngineError::InvalidDecisionRequest("This native pair returns a noul rating expectation and cannot honor predicate probability; use /v1/systemone or choice questions.".into()));
-        }
-        Ok(())
+        decision::native_request_body(request)?;
+        Err(EngineError::NativeRequest {
+            message: "This llama.cpp native pair cannot provide required OpenAI Decisions usage observations; use /v1/systemone.".into(),
+            parameter: "model".into(),
+            code: "unsupported_capability",
+        })
     }
 
     async fn decide(

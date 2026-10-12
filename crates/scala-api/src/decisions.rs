@@ -283,7 +283,8 @@ fn parse_input(input: &Value) -> Result<(DecisionContent, Vec<String>), OpenAiEr
                         ));
                     }
                     urls.push(required_string(part, "image_url")?);
-                    // Keep media at its original position in the native message.
+                    // Preserve the requested position for adapter-specific admission.
+                    // A native media list alone does not prove position preservation.
                     content
                         .push(json!({"type":"image_url","image_url":{"url":urls.last().unwrap()}}));
                 }
@@ -439,37 +440,58 @@ fn response(conversion: &Conversion, output: DecisionOutput) -> Result<Value, Op
         };
         answers.push(answer);
     }
-    let mut result = json!({"model":model,"answers":answers});
-    if let Some(usage) = output.native_usage {
-        // Usage is optional. Emit it only when the native wire supplies every
-        // required observation; llama's two counters cannot supply this shape.
-        let fields = ["input_tokens", "output_tokens", "total_tokens"];
-        if fields.iter().all(|f| usage[*f].as_u64().is_some())
-            && usage
-                .pointer("/input_tokens_details/cached_tokens")
-                .and_then(Value::as_u64)
-                .is_some()
-            && usage
-                .pointer("/input_tokens_details/cache_write_tokens")
-                .and_then(Value::as_u64)
-                .is_some()
-            && usage
-                .pointer("/output_tokens_details/reasoning_tokens")
-                .and_then(Value::as_u64)
-                .is_some()
-        {
-            if usage["input_tokens"]
-                .as_u64()
-                .unwrap()
-                .checked_add(usage["output_tokens"].as_u64().unwrap())
-                != usage["total_tokens"].as_u64()
-            {
-                return Err(missing("Native usage counters are inconsistent."));
-            }
-            result["usage"] = usage;
-        }
+    let usage = required_usage(output.native_usage.as_ref())?;
+    Ok(json!({"model":model,"answers":answers,"usage":usage}))
+}
+
+fn required_usage(usage: Option<&Value>) -> Result<&Value, OpenAiError> {
+    let usage = usage.ok_or_else(|| {
+        missing("Native backend omitted required usage. Use /v1/systemone or select a pair with complete native usage observations.")
+    })?;
+    // Every counter must come from this decision's native response. System One
+    // accounting and observations from other requests cannot complete this shape.
+    let fields = ["input_tokens", "output_tokens", "total_tokens"];
+    if !fields.iter().all(|f| usage[*f].as_u64().is_some())
+        || usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .is_none()
+        || usage
+            .pointer("/input_tokens_details/cache_write_tokens")
+            .and_then(Value::as_u64)
+            .is_none()
+        || usage
+            .pointer("/output_tokens_details/reasoning_tokens")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        return Err(missing(
+            "Native backend omitted or invalidated required usage counters. Use /v1/systemone or select a pair with complete native usage observations.",
+        ));
     }
-    Ok(result)
+    if usage["input_tokens"]
+        .as_u64()
+        .unwrap()
+        .checked_add(usage["output_tokens"].as_u64().unwrap())
+        != usage["total_tokens"].as_u64()
+    {
+        return Err(missing("Native usage counters are inconsistent."));
+    }
+    Ok(usage)
+}
+
+/// Link owners may run an older response converter. A forwarded success must
+/// still meet this endpoint's required fields before the entry node returns it.
+pub(super) fn validate_required_response(value: &Value) -> Result<(), OpenAiError> {
+    if value.get("answers").and_then(Value::as_array).is_none()
+        || value.get("model").and_then(Value::as_str).is_none()
+    {
+        return Err(missing(
+            "Decision owner omitted required answers or model identity.",
+        ));
+    }
+    required_usage(value.get("usage"))?;
+    Ok(())
 }
 
 pub(super) async fn create(
@@ -495,7 +517,7 @@ pub(super) async fn create(
             correlation.request_id.clone(),
         )
         .await
-        .map_err(runtime_error)?;
+        .map_err(|error| runtime_error(error).for_decisions())?;
     Ok(Json(response(&conversion, output.output)?))
 }
 
@@ -510,11 +532,17 @@ mod tests {
   {"type":"predicate","name":null,"instructions":"declined?"}]})
     }
     fn native() -> DecisionOutput {
-        serde_json::from_value(json!({"model":"native-reported","answers":{
+        let mut output: DecisionOutput = serde_json::from_value(json!({"model":"native-reported","answers":{
   "q00000000":{"type":"noul","noul":0.81},
   "q00000001":{"type":"choice","choice":"c00000000","probabilities":{"c00000000":0.75,"c00000001":0.25},"confidence":0.5},
   "q00000002":{"type":"score","score":0.25,"probabilities":{"0":0.75,"1":0.25},"confidence":0.5},
-  "q00000003":{"type":"refusal"}}})).unwrap()
+  "q00000003":{"type":"refusal"}}})).unwrap();
+        output.native_usage = Some(complete_usage());
+        output
+    }
+    fn complete_usage() -> Value {
+        json!({"input_tokens":42,"input_tokens_details":{"cached_tokens":7,"cache_write_tokens":3},
+            "output_tokens":5,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":47})
     }
     #[test]
     fn preserves_order_nullable_names_typed_values_levels_and_refusal() {
@@ -530,7 +558,7 @@ mod tests {
         );
         let result = response(&c, native()).unwrap();
         assert_eq!(result["model"], "native-reported");
-        assert!(result.get("usage").is_none());
+        assert_eq!(result["usage"], complete_usage());
         assert_eq!(
             result["answers"][0],
             json!({"type":"predicate","name":null,"probability":0.81})
@@ -579,8 +607,58 @@ mod tests {
         }
         let mut n = native();
         n.native_usage = Some(json!({"input_tokens":2,"output_tokens":0}));
-        assert!(response(&c, n).unwrap().get("usage").is_none());
+        assert_eq!(
+            response(&c, n).unwrap_err().status,
+            axum::http::StatusCode::BAD_GATEWAY
+        );
     }
+    #[test]
+    fn required_usage_never_comes_from_systemone_accounting_or_unobserved_zeros() {
+        let c = parse(&body()).unwrap();
+        for usage in [
+            None,
+            Some(Value::Null),
+            Some(json!({})),
+            Some(json!({"input_tokens":42,"output_tokens":0})),
+        ] {
+            let mut n = native();
+            n.native_usage = usage;
+            n.usage = Some(scala_engine::InferenceUsage {
+                input_tokens: 42,
+                total_tokens: 42,
+                ..Default::default()
+            });
+            let error = response(&c, n).unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                error.envelope()["error"]["code"],
+                "native_decision_contract_mismatch"
+            );
+        }
+        for path in [
+            "/input_tokens",
+            "/output_tokens",
+            "/total_tokens",
+            "/input_tokens_details/cached_tokens",
+            "/input_tokens_details/cache_write_tokens",
+            "/output_tokens_details/reasoning_tokens",
+        ] {
+            for invalid in [Value::Null, json!(-1), json!(0.5), json!("0")] {
+                let mut n = native();
+                *n.native_usage.as_mut().unwrap().pointer_mut(path).unwrap() = invalid;
+                assert!(response(&c, n).is_err(), "{path}");
+            }
+        }
+        for (input, output, total) in [(42, 5, 46), (u64::MAX, 1, 0)] {
+            let mut n = native();
+            let usage = n.native_usage.as_mut().unwrap();
+            usage["input_tokens"] = json!(input);
+            usage["output_tokens"] = json!(output);
+            usage["total_tokens"] = json!(total);
+            assert!(response(&c, n).is_err());
+        }
+    }
+
     #[test]
     fn rejects_roles_ambiguous_identifiers_unknown_fields_and_constraints() {
         for input in [
@@ -604,7 +682,7 @@ mod tests {
         assert!(parse(&b).is_ok());
     }
     #[tokio::test]
-    async fn ordered_images_retain_media_positions_and_bytes() {
+    async fn acquisition_retains_requested_positions_and_bytes_for_adapter_admission() {
         let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
         let image2 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
         let mut b = body();

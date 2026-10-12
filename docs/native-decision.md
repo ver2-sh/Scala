@@ -150,8 +150,9 @@ chat and pooled embedding GGUF behavior is unchanged.
 
 ## Native mapping and runtime discovery
 
-The adapter sends only `state` and `questions` to the already-running private
-llama-server's `/v1/systemone`. It never sends a model selector. JSON content,
+The adapter sends native `state`, `questions` and, when supplied separately,
+admitted shared `images` to the already-running private llama-server's
+`/v1/systemone`. It never sends a model selector. JSON content,
 choice descriptions/nulls, score order and noul `true`/`false` criteria remain
 unchanged. Answers share Scala's type-tagged schema; native probabilities,
 confidence, legends and model identity are retained and absent observations stay
@@ -207,7 +208,8 @@ execution, not an alias for System One. `model` remains a Scala Model Profile
 reference, including owner-routed Link aliases. Authentication, correlation,
 session/role routing, JIT loading and the public 32 MiB body bound are unchanged.
 
-Input is a string or ordered user messages containing text and supported images.
+Input is a string or ordered user messages containing text and supported images,
+subject to the selected native protocol's position/association limits below.
 Other roles, content modalities, file IDs and unrepresentable image detail controls
 are rejected. Questions and answers retain request order, original names or null,
 and distinct boolean/string choice values. Internal question/choice keys never
@@ -223,12 +225,30 @@ mapping, while its existing System One behavior remains intact. Choice and score
 require actual native distributions and confidence, validated without filling
 missing observations. Scores retain native level indices and expected-score
 semantics. Native refusal is a distinct typed outcome; abstention is not converted
-into refusal. Native model identity is mandatory for this route. Optional usage
-is emitted only when the complete published counters were actually provided;
-llama.cpp's two-counter usage does not justify inventing total/cache/reasoning
-fields. Missing or incompatible required observations produce an actionable
-`native_decision_contract_mismatch` error. System One's existing optional
-observations and profile-alias fallback remain backward compatible.
+into refusal. Native model identity and usage are mandatory for this route.
+A successful response always contains `answers`, `model` and `usage`, including native
+`input_tokens`, `input_tokens_details.cached_tokens`,
+`input_tokens_details.cache_write_tokens`, `output_tokens`,
+`output_tokens_details.reasoning_tokens` and `total_tokens`. Counters must be
+nonnegative integers and the reported total must equal input plus output without
+overflow. Missing or incompatible required observations produce HTTP 502 with
+`native_decision_contract_mismatch`; no counter is filled from unobserved zeros,
+System One accounting, startup observations or another request. Link entry nodes
+also validate required response fields before forwarding a successful Decisions
+response. System One's existing optional observations and profile-alias fallback
+remain backward compatible.
+
+Neither frozen llama.cpp revision supplies complete usage: native `post_systemone`
+reports only input tokens (the native task token count, summed across variants for
+non-joint models) and an explicit output count of zero. Cache, cache-write and
+reasoning counts are absent. Scala's existing checked System One sum does not
+complete the OpenAI contract. Consequently these pairs advertise
+`openai_decisions: false` (false flags are omitted on the wire) and `/v1/decisions` fails with HTTP 400
+`unsupported_capability` before inference, directing callers to `/v1/systemone`.
+A reviewed revision alone grants no OpenAI capability. Native `decision_candidate`,
+qualified `decision` and qualified `decision_images` remain independent. Synthetic
+complete-usage protocol tests demonstrate the successful conversion; they do not
+qualify a production llama.cpp pair.
 
 Execution qualification is separate for `decision`, `openai_decisions` and
 `decision_images`; none follows merely from exposure of `/v1/systemone`.
@@ -250,8 +270,27 @@ pplx-decider/lfm2-d1/lfm2-d1-omni at b11565. These source-owned image limits are
 a filename or architecture classifier for Decision. Explicit
 `llama.cpp.projector` plus `llama.cpp.projector_sha256` binds a local GGUF projector;
 prepared auxiliary integrity follows the existing artifact contract. Text-only
-pairs reject images. Ordered native message content and original image bytes
-are retained; no chat or text-generation fallback exists.
+pairs reject images. Original bytes and image order are retained;
+embedded text/image positions and message associations are separate guarantees.
+At both frozen revisions, `parse_state()` removes `image_url` parts from a state
+array or `state.messages`, appending their bytes to a shared ordered media list.
+`render()` and joint image handling receive that list separately from the remaining
+state; the model's native template places the media markers. Inline positions,
+image annotations and per-message image associations are unavailable.
+
+Scala therefore admits text-only state/messages, a sole image-only message with
+one or two admitted images (also through `state.messages`; System One's embedded
+URLs must match its transport `images` list), and System One's
+explicit top-level `images` with shared state. The explicit list preserves native
+shared-media semantics, including comparisons by image order. Embedded images
+mixed with text, or embedded images in any multi-message request, fail before
+inference with HTTP 400 `unsupported_decision_media` and a specific
+`input[i].content[j]` or `state[i].content[j]` / `state.messages[i].content[j]`
+parameter. This includes text-before-image, image-before-text and labelled
+comparisons interleaved across messages, even if the image bytes/order would
+survive. Embedded media must match the admitted image list; it is never sent a
+second time through top-level images. Scala adds no prompt markers, changes no
+native templates and provides no chat or text-generation fallback.
 
 Image acquisition admits at most two PNG/JPEG/WebP images, each at most 8 MiB
 compressed and 4096 by 4096 pixels, with bounded decoding. Declared MIME must match
