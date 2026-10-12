@@ -282,6 +282,12 @@ pub(crate) fn reported_model_capabilities(
     reported
 }
 
+/// Shared native Decision transport validation. Decode under strict allocation
+/// and geometry limits without altering the bytes delivered to the runtime.
+pub fn validate_decision_raster(bytes: &[u8]) -> Result<&'static str, String> {
+    crate::media::validate_raster(bytes)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -701,10 +707,4 @@ pub(crate) mod tests {
             assert_eq!(serde_json::to_value(typed).unwrap(), answer);
         }
     }
-}
-
-/// Shared native Decision transport validation. Decode under strict allocation
-/// and geometry limits without altering the bytes delivered to the runtime.
-pub fn validate_decision_raster(bytes: &[u8]) -> Result<&'static str, String> {
-    crate::media::validate_raster(bytes)
 }

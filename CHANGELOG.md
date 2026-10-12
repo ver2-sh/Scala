@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.1.20 - Native Decision, updated inference runtimes and multimodal embeddings
+
+Integrates the reviewed October 2026 upstream inference changes into Scala's
+existing multi-runtime control plane, preserving normal artifact/engine/runtime/
+Settings/Profile separation and independent application/runtime updates.
+
+- Complete native llama.cpp System One decision serving, model candidate versus
+  execution-qualified discovery, request activity and cancellation, and the
+  OpenAI-style /v1/decisions route with strict response-contract gating.
+  Qualified upstream llama.cpp runtimes cannot advertise OpenAI Decisions while
+  their native usage observations are insufficient; System One remains available.
+- Qualify llama.cpp v0.6.0 and reviewed b11565 runtime support, exact projector
+  identities and native multimodal pooled embeddings (text, bounded images,
+  PCM WAV audio and safe uncompressed AVI video) without changing text embeddings
+  or adding a separate inference engine.
+- Admit q27 v0.14.5 native executable/source variants with checked provenance,
+  Bonsai 2 12G identity, reduced-draft-vocabulary controls and explicit
+  unsupported-request handling.
+- Add independently qualified NInfer v3 artifact inspection, canonical Linux
+  source and native Windows portable runtime routes alongside preserved v2.
+  Expose verified Linux NInfer native JSON/schema, grammar, choice, regex and
+  strict-tool output constraints without implementing a separate grammar sampler.
+- Preserve Model Profile authority, per-engine Settings precedence, Scala Link
+  ownership, runtime/package integrity, and fail-closed capability reporting.
+  No source/runtime update activates or migrates existing models, profiles or
+  inference settings automatically.
+
+The integration is locally validated with synthetic contracts; live GPU/model
+inference remains independently qualified on the installed host/runtime pair.
+
 ## 0.1.19 - Reliable cold Decision runtime selection
 
 Fixes Windows H2O-Lightning first-load failures when a pinned external

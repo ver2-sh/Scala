@@ -2887,7 +2887,7 @@ dependencies = [
 
 [[package]]
 name = "scala"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "clap",
@@ -2916,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "scala-api"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "axum",
@@ -2943,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "scala-core"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "directories",
  "fs2",
@@ -2964,7 +2964,7 @@ dependencies = [
 
 [[package]]
 name = "scala-engine"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2993,7 +2993,7 @@ dependencies = [
 
 [[package]]
 name = "scala-engine-llama-cpp"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "axum",
@@ -3015,7 +3015,7 @@ dependencies = [
 
 [[package]]
 name = "scala-engine-native-decision"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "axum",
@@ -3034,7 +3034,7 @@ dependencies = [
 
 [[package]]
 name = "scala-engine-ninfer"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3052,7 +3052,7 @@ dependencies = [
 
 [[package]]
 name = "scala-engine-q27"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3071,7 +3071,7 @@ dependencies = [
 
 [[package]]
 name = "scala-model-library"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "async-trait",
  "fs2",
@@ -3091,7 +3091,7 @@ dependencies = [
 
 [[package]]
 name = "scala-tui"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "color-eyre",
  "crossterm",
@@ -3109,7 +3109,7 @@ dependencies = [
 
 [[package]]
 name = "scala-update"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "axoupdater",
  "color-eyre",

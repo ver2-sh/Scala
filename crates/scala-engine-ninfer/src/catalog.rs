@@ -319,6 +319,11 @@ fn days_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
+fn reviewed_snapshot(commit: &str, tree: &str) -> bool {
+    (commit == CURRENT_PACKAGE_CAPABILITY_REVISION && tree == CURRENT_PACKAGE_CAPABILITY_TREE)
+        || (commit == V3_REVISION && tree == V3_TREE)
+}
+
 #[cfg(test)]
 mod tests {
     use scala_core::{
@@ -408,9 +413,4 @@ mod tests {
             "build/apps/ninfer-serve"
         );
     }
-}
-
-fn reviewed_snapshot(commit: &str, tree: &str) -> bool {
-    (commit == CURRENT_PACKAGE_CAPABILITY_REVISION && tree == CURRENT_PACKAGE_CAPABILITY_TREE)
-        || (commit == V3_REVISION && tree == V3_TREE)
 }
