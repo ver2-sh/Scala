@@ -457,26 +457,30 @@ fn render_action(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLay
     let selected = app
         .selected_runtime_search_result
         .and_then(|index| app.runtime_search.as_ref()?.results.get(index));
-    let (label, state) = match selected {
-        Some(result) if result.installed => ("Installed", ActionState::Disabled),
-        Some(result)
-            if matches!(
-                result.entry.compatibility,
-                RuntimeCompatibility::Incompatible(_)
-            ) =>
-        {
-            ("Incompatible", ActionState::Disabled)
+    let (label, state) = if app.runtime_acquisition.is_some() {
+        ("[ Cancel install F6 ]", ActionState::Primary)
+    } else {
+        match selected {
+            Some(result) if result.installed => ("Installed", ActionState::Disabled),
+            Some(result)
+                if matches!(
+                    result.entry.compatibility,
+                    RuntimeCompatibility::Incompatible(_)
+                ) =>
+            {
+                ("Incompatible", ActionState::Disabled)
+            }
+            Some(_) if app.runtime_mutation_busy() => ("Installing…", ActionState::Disabled),
+            Some(_) if app.runtime_search_loading => ("Searching…", ActionState::Disabled),
+            Some(result)
+                if app.pending_runtime_install_confirmation.as_ref()
+                    == Some(&result.entry.available.runtime_id) =>
+            {
+                ("[ Confirm install ]", ActionState::Primary)
+            }
+            Some(_) => ("[ Install ]", ActionState::Primary),
+            None => ("Select a runtime", ActionState::Disabled),
         }
-        Some(_) if app.runtime_mutation_busy() => ("Installing…", ActionState::Disabled),
-        Some(_) if app.runtime_search_loading => ("Searching…", ActionState::Disabled),
-        Some(result)
-            if app.pending_runtime_install_confirmation.as_ref()
-                == Some(&result.entry.available.runtime_id) =>
-        {
-            ("[ Confirm install ]", ActionState::Primary)
-        }
-        Some(_) => ("[ Install ]", ActionState::Primary),
-        None => ("Select a runtime", ActionState::Disabled),
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(

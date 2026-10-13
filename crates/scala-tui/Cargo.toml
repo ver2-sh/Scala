@@ -18,3 +18,6 @@ ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 tokio.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -69,8 +69,10 @@ Application updates and runtime updates remain separate explicit operations.
 In the TUI, open Runtime Search, search `vllm` or `pytorch`, select a candidate,
 review its version, native platform, GPU/driver prerequisites and dependency
 recipe, then activate Install and Confirm install. Progress and package errors
-use the existing runtime notification area; Cancel stops the owned process tree
-and removes incomplete staging. The installed package appears in Runtime List.
+use the existing runtime notification area. During an install or update,
+Runtime Search shows Cancel installation (F6); it stops the owned process tree
+and removes incomplete staging. Close (Escape) only hides the dialog and leaves
+the operation running; reopen Runtime Search to cancel it. The installed package appears in Runtime List.
 Use the model runtime picker to select it and load a Model Profile separately.
 
 For the model-first workflow, open the existing Model Profile and use Actions →

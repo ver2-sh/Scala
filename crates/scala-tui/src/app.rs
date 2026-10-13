@@ -131,6 +131,7 @@ pub enum RuntimeAction {
         settings: Option<Box<ResolvedSettings>>,
     },
     Install(RuntimeId),
+    CancelInstallation(RuntimeId),
     CheckUpdates,
     Update(RuntimeId),
     Remove {
@@ -187,6 +188,7 @@ pub enum ModelLibraryTaskResult {
 
 #[derive(Debug)]
 pub enum RuntimeTaskResult {
+    InstallationCancelled(RuntimeId),
     Listed(Result<RuntimeListSnapshot, String>),
     Searched(Result<RuntimeSearchSnapshot, String>),
     Updates(Result<Vec<RuntimeUpdateCheck>, String>),
@@ -424,6 +426,7 @@ pub struct App {
     pub runtime_search_context: Option<String>,
     pub runtime_search_model: Option<Box<ModelArtifact>>,
     pub runtime_operation: Option<RuntimeOperationProgress>,
+    pub runtime_acquisition: Option<RuntimeId>,
     pub runtime_updates: BTreeMap<RuntimeId, RuntimeUpdateState>,
     pub runtime_update_loading: bool,
     pub runtime_update_error: Option<String>,
@@ -577,6 +580,7 @@ impl App {
             runtime_search_context: None,
             runtime_search_model: None,
             runtime_operation: None,
+            runtime_acquisition: None,
             runtime_updates: BTreeMap::new(),
             runtime_update_loading: false,
             runtime_update_error: None,
@@ -2238,6 +2242,16 @@ impl App {
 
     pub fn handle_runtime_task_result(&mut self, result: RuntimeTaskResult) {
         match result {
+            RuntimeTaskResult::InstallationCancelled(runtime_id) => {
+                if self.runtime_acquisition.as_ref() == Some(&runtime_id) {
+                    self.runtime_acquisition = None;
+                    self.runtime_mutation_busy = false;
+                    self.runtime_operation = None;
+                    self.pending_runtime_install_confirmation = None;
+                    self.notice = Some(format!("Runtime installation cancelled: {runtime_id}"));
+                    self.push_log(LogLevel::Info, self.notice.clone().unwrap());
+                }
+            }
             RuntimeTaskResult::Listed(result) => {
                 self.runtime_list_loading = false;
                 self.apply_runtime_list_result(result);
@@ -2292,6 +2306,7 @@ impl App {
                 previous_runtime_id,
                 result,
             } => {
+                self.runtime_acquisition = None;
                 self.runtime_mutation_busy = false;
                 match result {
                     Ok((installed_runtime_id, snapshot)) => {
@@ -2315,6 +2330,7 @@ impl App {
                 }
             }
             RuntimeTaskResult::Installed { runtime_id, result } => {
+                self.runtime_acquisition = None;
                 self.runtime_mutation_busy = false;
                 if let Some(search) = &mut self.runtime_search {
                     if let Some(found) = search
@@ -2470,6 +2486,10 @@ impl App {
     }
 
     pub fn handle_runtime_progress(&mut self, progress: RuntimeOperationProgress) {
+        // Buffered progress from a finished/cancelled task must not revive it.
+        if self.runtime_acquisition.is_none() {
+            return;
+        }
         let failed = progress.phase == RuntimeOperationPhase::Failed;
         self.runtime_operation = Some(progress.clone());
         if failed {
@@ -4940,6 +4960,7 @@ impl App {
     fn handle_runtime_search_key(&mut self, key: KeyEvent, layout: &UiLayout) -> Update {
         match key.code {
             KeyCode::Esc => self.close_runtime_overlay(),
+            KeyCode::F(6) => self.request_runtime_install_cancellation(),
             KeyCode::Tab | KeyCode::BackTab => {
                 self.runtime_search_focus = match (key.code, self.runtime_search_focus) {
                     (KeyCode::Tab, RuntimeSearchFocus::Query) => {
@@ -5304,6 +5325,9 @@ impl App {
             Some(HoverTarget::RuntimeSearchIncompatibleToggle) => {
                 self.toggle_runtime_search_incompatible(layout)
             }
+            Some(HoverTarget::RuntimeInstall) if self.runtime_acquisition.is_some() => {
+                self.request_runtime_install_cancellation()
+            }
             Some(HoverTarget::RuntimeInstall)
                 if !self.runtime_search_loading && !self.runtime_mutation_busy =>
             {
@@ -5434,7 +5458,9 @@ impl App {
                 return Update::Render;
             }
         }
+        self.runtime_acquisition = Some(runtime_id.clone());
         self.pending_runtime_action = Some(RuntimeAction::Update(runtime_id.clone()));
+        self.overlay = Some(Overlay::RuntimeSearch);
         self.runtime_mutation_busy = true;
         self.runtime_operation = None;
         self.notice = Some(format!(
@@ -5509,6 +5535,15 @@ impl App {
         Update::Render
     }
 
+    fn request_runtime_install_cancellation(&mut self) -> Update {
+        let Some(runtime_id) = self.runtime_acquisition.clone() else {
+            return Update::None;
+        };
+        self.pending_runtime_action = Some(RuntimeAction::CancelInstallation(runtime_id));
+        self.notice = Some("Cancelling runtime installation…".into());
+        Update::Render
+    }
+
     fn request_runtime_install(&mut self) -> Update {
         if self.runtime_mutation_busy {
             self.notice = Some("A runtime operation is already in progress".to_owned());
@@ -5541,6 +5576,7 @@ impl App {
             return Update::Render;
         }
         self.pending_runtime_install_confirmation = None;
+        self.runtime_acquisition = Some(runtime_id.clone());
         self.pending_runtime_action = Some(RuntimeAction::Install(runtime_id.clone()));
         self.runtime_mutation_busy = true;
         self.runtime_operation = None;
@@ -6100,6 +6136,68 @@ mod tests {
             true,
             definitions,
         )
+    }
+
+    #[test]
+    fn runtime_search_close_and_explicit_cancellation_are_distinct_and_retryable() {
+        let mut app = test_app(Vec::new());
+        let id = scala_core::RuntimeId::new("fixture-install").unwrap();
+        app.runtime_acquisition = Some(id.clone());
+        app.runtime_mutation_busy = true;
+        app.overlay = Some(Overlay::RuntimeSearch);
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut layout = None;
+        terminal
+            .draw(|frame| {
+                layout = Some(crate::ui::render(frame, &mut app));
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Cancel install F6"), "{text}");
+        assert!(text.contains("[ Close ]"), "{text}");
+        app.handle_runtime_search_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            layout.as_ref().unwrap(),
+        );
+        assert_eq!(app.overlay, None);
+        assert!(app.runtime_mutation_busy);
+        assert!(app.take_runtime_action().is_none());
+        assert!(!app.notice.as_deref().unwrap_or("").contains("cancelled"));
+        app.open_runtime_search();
+        assert_eq!(app.overlay, Some(Overlay::RuntimeSearch));
+        let area = layout.as_ref().unwrap().runtime_install_action;
+        app.handle_runtime_search_click(
+            ratatui::layout::Position::new(area.x, area.y),
+            layout.as_ref().unwrap(),
+        );
+        assert!(
+            matches!(app.take_runtime_action(), Some(super::RuntimeAction::CancelInstallation(bound)) if bound == id)
+        );
+        assert!(
+            app.runtime_mutation_busy,
+            "keep busy until the task has stopped"
+        );
+        app.handle_runtime_task_result(super::RuntimeTaskResult::InstallationCancelled(id.clone()));
+        assert!(!app.runtime_mutation_busy);
+        assert!(app.runtime_acquisition.is_none());
+        assert!(app.runtime_operation.is_none());
+        assert!(app.notice.as_deref().unwrap().contains("cancelled"));
+        app.runtime_acquisition = Some(id.clone());
+        app.runtime_mutation_busy = true;
+        app.handle_runtime_search_key(
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE),
+            layout.as_ref().unwrap(),
+        );
+        assert!(
+            matches!(app.take_runtime_action(), Some(super::RuntimeAction::CancelInstallation(bound)) if bound == id)
+        );
     }
 
     #[test]

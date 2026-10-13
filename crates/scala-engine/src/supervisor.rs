@@ -201,59 +201,104 @@ async fn capture_command_scoped(
     } else {
         None
     };
-    if let Some(installation) = installation {
-        let progress = installation.progress;
-        let mut child = child;
-        async fn read_tail(
-            mut stream: impl AsyncRead + Unpin,
-            callback: Option<InstallProgress>,
-        ) -> std::io::Result<String> {
-            let mut tail = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            loop {
-                let count = stream.read(&mut buffer).await?;
-                if count == 0 {
-                    break;
-                }
-                if let Some(callback) = &callback {
-                    callback(&String::from_utf8_lossy(&buffer[..count]));
-                }
-                tail.extend_from_slice(&buffer[..count]);
-                if tail.len() > 65536 {
-                    tail.drain(..tail.len() - 65536);
-                }
+    // Drop runs before the installer's staging and lease guards. Terminate the
+    // owned tree and reap the helper before files can be cleaned or retried.
+    let mut owned = CaptureChild {
+        child,
+        #[cfg(unix)]
+        group: _group,
+        #[cfg(windows)]
+        job: owned_job,
+        owns_tree: _own_process_tree,
+    };
+    let installing = installation.is_some();
+    let progress = installation.map(|installation| installation.progress);
+    async fn read_output(
+        mut stream: impl AsyncRead + Unpin,
+        callback: Option<InstallProgress>,
+        bounded: bool,
+    ) -> std::io::Result<String> {
+        let mut tail = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            let count = stream.read(&mut buffer).await?;
+            if count == 0 {
+                break;
             }
-            Ok(String::from_utf8_lossy(&tail).into_owned())
+            if let Some(callback) = &callback {
+                callback(&String::from_utf8_lossy(&buffer[..count]));
+            }
+            tail.extend_from_slice(&buffer[..count]);
+            if bounded && tail.len() > 65536 {
+                tail.drain(..tail.len() - 65536);
+            }
         }
-        let stdout = child.stdout.take().expect("captured stdout");
-        let stderr = child.stderr.take().expect("captured stderr");
-        let (status, stdout, stderr) = tokio::time::timeout(timeout, async {
-            tokio::join!(
-                child.wait(),
-                read_tail(stdout, None),
-                read_tail(stderr, Some(progress))
-            )
-        })
-        .await
-        .map_err(|_| EngineError::TimedOut("managed package acquisition timed out".into()))?;
-        let status = status.map_err(|e| EngineError::Operation(e.to_string()))?;
-        return Ok(CapturedCommand {
-            success: status.success(),
-            code: status.code(),
-            stdout: stdout.map_err(|e| EngineError::Operation(e.to_string()))?,
-            stderr: stderr.map_err(|e| EngineError::Operation(e.to_string()))?,
-        });
+        Ok(String::from_utf8_lossy(&tail).into_owned())
     }
-    let output = tokio::time::timeout(timeout, child.wait_with_output())
-        .await
-        .map_err(|_| EngineError::TimedOut("engine probe did not finish in time".to_owned()))?
-        .map_err(|error| EngineError::Operation(format!("engine probe failed: {error}")))?;
-    Ok(CapturedCommand {
-        success: output.status.success(),
-        code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    let stdout = owned.child.stdout.take().expect("captured stdout");
+    let stderr = owned.child.stderr.take().expect("captured stderr");
+    let (status, stdout, stderr) = tokio::time::timeout(timeout, async {
+        tokio::join!(
+            owned.child.wait(),
+            read_output(stdout, None, installing),
+            read_output(stderr, progress, installing)
+        )
     })
+    .await
+    .map_err(|_| {
+        EngineError::TimedOut(if installing {
+            "managed package acquisition timed out".into()
+        } else {
+            "engine probe did not finish in time".into()
+        })
+    })?;
+    let status = status.map_err(|error| EngineError::Operation(error.to_string()))?;
+    let stdout = stdout.map_err(|error| EngineError::Operation(error.to_string()))?;
+    let stderr = stderr.map_err(|error| EngineError::Operation(error.to_string()))?;
+    Ok(CapturedCommand {
+        success: status.success(),
+        code: status.code(),
+        stdout: if installing {
+            stdout
+        } else {
+            stdout.trim().to_owned()
+        },
+        stderr: if installing {
+            stderr
+        } else {
+            stderr.trim().to_owned()
+        },
+    })
+}
+
+struct CaptureChild {
+    child: Child,
+    owns_tree: bool,
+    #[cfg(unix)]
+    group: Option<CaptureProcessGroup>,
+    #[cfg(windows)]
+    job: Option<windows_job::OwnedJob>,
+}
+
+impl Drop for CaptureChild {
+    fn drop(&mut self) {
+        if !self.owns_tree {
+            return;
+        }
+        #[cfg(unix)]
+        drop(self.group.take());
+        #[cfg(windows)]
+        if let Some(job) = self.job.take() {
+            let _ = job.terminate();
+        }
+        let _ = self.child.start_kill();
+        // A future's Drop cannot await. This bounded reap keeps cleanup ordered
+        // on cancellation as well as CLI Ctrl-C, using the existing supervisor.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while matches!(self.child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 #[derive(Clone)]

@@ -15,6 +15,7 @@ fn assets() -> Vec<ManagedPythonAsset> {
 }
 struct Adapter {
     reject: bool,
+    admission_gate: Option<Arc<tokio::sync::Notify>>,
 }
 #[async_trait]
 impl EngineAdapter for Adapter {
@@ -45,6 +46,10 @@ impl EngineAdapter for Adapter {
         &self,
         runtime: &InstalledRuntime,
     ) -> Result<RuntimeProbeObservation, EngineError> {
+        if let Some(gate) = &self.admission_gate {
+            gate.notify_one();
+            std::future::pending::<()>().await;
+        }
         if self.reject {
             return Err(EngineError::InvalidConfiguration(
                 "synthetic defective wheel RECORD".into(),
@@ -187,7 +192,7 @@ fn candidate(python: &[u8], uv: &[u8], version: &str) -> AvailableRuntime {
 fn archives(cancel: bool) -> (Vec<u8>, Vec<u8>) {
     use std::io::Write;
     let script = if cancel {
-        "#!/bin/sh\n/bin/mkdir -p \"$5/runner\"\n/bin/sleep 30 &\necho acquiring-fixture-wheel >&2\nwait\n"
+        "#!/bin/sh\n/bin/mkdir -p \"$5/runner\" \"$UV_CACHE_DIR\"\nif [ ! -f \"$UV_CACHE_DIR/fixture-retried\" ]; then\n/bin/touch \"$UV_CACHE_DIR/fixture-retried\"\n(/bin/sleep 1; /bin/touch \"$UV_CACHE_DIR/fixture-late\"; /bin/sleep 30) &\necho acquiring-fixture-wheel >&2\nwait\nfi\necho synthetic > \"$5/runner/pytorch-server\"\n"
     } else {
         "#!/bin/sh\n/bin/mkdir -p \"$5/runner\"\necho synthetic > \"$5/runner/pytorch-server\"\necho acquiring-fixture-wheel >&2\n"
     };
@@ -216,6 +221,19 @@ async fn fixture(
     Arc<RuntimePackManager>,
     Vec<AvailableRuntime>,
 ) {
+    fixture_with_admission_gate(cancel, reject, None).await
+}
+
+async fn fixture_with_admission_gate(
+    cancel: bool,
+    reject: bool,
+    admission_gate: Option<Arc<tokio::sync::Notify>>,
+) -> (
+    tempfile::TempDir,
+    crate::test_support::HttpFixture,
+    Arc<RuntimePackManager>,
+    Vec<AvailableRuntime>,
+) {
     let dir = tempfile::tempdir().unwrap();
     let paths = crate::test_support::paths(dir.path());
     let (python, uv) = archives(cancel);
@@ -236,7 +254,12 @@ async fn fixture(
     })
     .await;
     let mut registry = EngineRegistry::default();
-    registry.register(Arc::new(Adapter { reject })).unwrap();
+    registry
+        .register(Arc::new(Adapter {
+            reject,
+            admission_gate,
+        }))
+        .unwrap();
     let mut manager = RuntimePackManager::new(
         &paths,
         registry,
@@ -325,7 +348,13 @@ async fn cancellation_never_registers_partial_python_and_retry_recovers() {
     .await
     .unwrap();
     task.abort();
-    let _ = task.await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled()
+    );
     assert!(manager.list().await.unwrap().installed.is_empty());
     let paths = crate::test_support::paths(_dir.path());
     assert!(
@@ -334,6 +363,129 @@ async fn cancellation_never_registers_partial_python_and_retry_recovers() {
             .filter_map(Result::ok)
             .any(|e| e.file_name() == candidates[0].runtime_id.as_str())
     );
+    let cache = paths.runtime_cache_dir.join("python");
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(
+        !walkdir::WalkDir::new(&cache)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name() == "fixture-late"),
+        "owned subprocess descendants must stop"
+    );
+    let retried = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        manager.install(&candidates[0].runtime_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(retried.entrypoint_path().is_file());
+    assert_eq!(manager.list().await.unwrap().installed.len(), 1);
+}
+
+#[tokio::test]
+async fn cancellation_before_python_activation_cleans_and_after_admission_preserves_runtime() {
+    let (dir, _server, manager, candidates) = fixture(false, false).await;
+    let installed = manager.install(&candidates[0].runtime_id).await.unwrap();
+    let manifest = installed.manifest;
+    manager.remove(&manifest.runtime_id, None).await.unwrap();
+    let store = RuntimeStore::new(&crate::test_support::paths(dir.path()));
+    for admitted in [false, true] {
+        let lease = Arc::new(
+            store
+                .acquire_installation_lease(&manifest.runtime_id)
+                .await
+                .unwrap(),
+        );
+        let mut staging = store.create_python_staging(&manifest, lease).await.unwrap();
+        let entrypoint = staging.join(&manifest.entrypoint);
+        std::fs::create_dir_all(entrypoint.parent().unwrap()).unwrap();
+        std::fs::write(entrypoint, b"synthetic\n").unwrap();
+        let transaction = if admitted {
+            None
+        } else {
+            Some(store.acquire_transaction().await.unwrap())
+        };
+        let task_store = store.clone();
+        let task_manifest = manifest.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            if admitted {
+                task_store
+                    .activate_python(&mut staging, &task_manifest)
+                    .await
+                    .unwrap();
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            } else {
+                started.send(()).unwrap();
+                task_store
+                    .activate_python(&mut staging, &task_manifest)
+                    .await
+                    .unwrap();
+            }
+            drop(staging);
+        });
+        ready.await.unwrap();
+        task.abort();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        drop(transaction);
+        let runtimes = store.scan().await.unwrap().runtimes;
+        assert_eq!(runtimes.len(), usize::from(admitted));
+        if admitted {
+            assert_eq!(
+                std::fs::read(runtimes[0].entrypoint_path()).unwrap(),
+                b"synthetic\n"
+            );
+            assert!(
+                !runtimes[0]
+                    .installation_root
+                    .join(".scala-python-pending")
+                    .exists()
+            );
+        } else {
+            assert!(!store.installation_path(&manifest).exists());
+        }
+        store
+            .acquire_installation_lease(&manifest.runtime_id)
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cancellation_during_python_probe_releases_ownership_without_admitting() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let (dir, _server, manager, candidates) =
+        fixture_with_admission_gate(false, false, Some(gate.clone())).await;
+    let id = candidates[0].runtime_id.clone();
+    let task = {
+        let manager = manager.clone();
+        let id = id.clone();
+        tokio::spawn(async move { manager.install(&id).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.notified())
+        .await
+        .unwrap();
+    task.abort();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap_err()
+            .is_cancelled()
+    );
+    assert!(manager.list().await.unwrap().installed.is_empty());
+    RuntimeStore::new(&crate::test_support::paths(dir.path()))
+        .acquire_installation_lease(&id)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -363,10 +515,26 @@ async fn interrupted_python_acquisition_is_recovered_only_with_matching_ownershi
         .await
         .unwrap();
     let store = RuntimeStore::new(&crate::test_support::paths(dir.path()));
-    let staging = store.create_python_staging(&first.manifest).await.unwrap();
+    let lease = Arc::new(
+        store
+            .acquire_installation_lease(&first.manifest.runtime_id)
+            .await
+            .unwrap(),
+    );
+    let staging = store
+        .create_python_staging(&first.manifest, lease)
+        .await
+        .unwrap();
     let path = staging.path().to_owned();
+    drop(staging);
+    // Simulate the files left by an interrupted process, whose OS leases close.
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(
+        path.join(".scala-python-pending"),
+        first.manifest.runtime_id.as_str(),
+    )
+    .unwrap();
     std::fs::write(path.join("unfinished"), "disposable").unwrap();
-    std::mem::forget(staging); // Simulate process interruption, not an installed runtime.
     assert!(manager.list().await.unwrap().installed.is_empty());
     let recovered = manager.install(&candidates[0].runtime_id).await.unwrap();
     assert!(!recovered.installation_root.join("unfinished").exists());

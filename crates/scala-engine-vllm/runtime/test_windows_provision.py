@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tarfile
 import tempfile
@@ -119,6 +120,51 @@ class ProvisionTests(unittest.TestCase):
             self.assertEqual(port.validate(cfg, True), build)
             self.assertEqual(build["sdk"]["files"], plan.inventory(sdk))
             self.assertEqual(set(build["environment"]), port.DIRECTORIES | {"USERNAME", "VLLM_USE_FLASHINFER_SAMPLER"})
+
+    def test_private_uv_is_used_for_both_dependency_sites_without_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            uv = root / "private tool" / "uv.exe"
+            argv = ["provision", "--runtime-root", str(root), "--model-root", str(FIXTURES.resolve()),
+                    "--evidence-root", str(root), "--uv", str(uv)]
+
+            def download(url, target, digest):
+                target.write_bytes(b"synthetic archive")
+                return target
+
+            def normalize(source, output):
+                output.write_bytes(b"synthetic canonical wheel")
+
+            def execute_command(command, **kwargs):
+                if "venv" in command and Path(command[-1]).name == "h2o-env":
+                    (root / "h2o-env/Lib/site-packages").mkdir(parents=True)
+                return ""
+
+            # Run the real command construction with all external work mocked.
+            # Stop only after both dependency operations, at SDK extraction.
+            with patch.dict(os.environ, {}, clear=True), \
+                    patch.object(sys, "argv", argv), \
+                    patch.object(plan, "native_host", return_value=True), \
+                    patch.object(plan, "download", side_effect=download), \
+                    patch.object(plan, "unpack_source"), \
+                    patch.object(plan, "normalize_wheel", side_effect=normalize), \
+                    patch.object(plan, "sha", side_effect=lambda path: plan.MODEL_FILES.get(path.name, plan.HUMMING_WHEEL_SHA256)), \
+                    patch.object(plan.subprocess, "check_output", side_effect=execute_command) as execute, \
+                    patch.object(plan, "sdk_payload", side_effect=RuntimeError("stop after installs")):
+                self.assertNotIn("PATH", os.environ)
+                with self.assertRaisesRegex(RuntimeError, "stop after installs"):
+                    plan.main()
+            commands = [call.args[0] for call in execute.call_args_list]
+            installs = [cmd for cmd in commands if "primary.lock" == Path(cmd[-1]).name or "dlpack.lock" == Path(cmd[-1]).name]
+            self.assertEqual(len(installs), 2)
+            for cmd in installs:
+                self.assertEqual(cmd[0], str(uv))
+                self.assertIn("--require-hashes", cmd)
+                self.assertIn("--no-deps", cmd)
+            self.assertNotIn("--target", installs[0])
+            self.assertEqual(installs[1][installs[1].index("--target") + 1],
+                             str(root / "h2o-env/Lib/site-packages/scala-dlpack-wheel"))
+            self.assertTrue(all(cmd[0] == str(uv) for cmd in commands if "pip" in cmd or "venv" in cmd))
 
     def test_completed_rerun_only_probes_and_incomplete_environment_fails(self):
         with tempfile.TemporaryDirectory() as temp:

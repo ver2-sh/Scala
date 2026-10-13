@@ -1381,7 +1381,7 @@ impl RuntimePackManager {
         // both the store transaction lock and running-runtime leases. It is
         // held across acquisition/build, then activate takes its short-lived
         // locks in the existing order without any reverse dependency.
-        let _installation_lease = self.store.acquire_installation_lease(runtime_id).await?;
+        let installation_lease = Arc::new(self.store.acquire_installation_lease(runtime_id).await?);
         if let Some(runtime) = self.store.get(runtime_id).await? {
             ensure_catalog_provenance_matches(&runtime, &entry.available)?;
             return Ok(runtime);
@@ -1390,7 +1390,10 @@ impl RuntimePackManager {
             .catalog
             .verify_install_candidate(&entry.available)
             .await?;
-        self.installer.install(&verified).await.map_err(Into::into)
+        self.installer
+            .install(&verified, installation_lease)
+            .await
+            .map_err(Into::into)
     }
 
     /// Clear only privately owned, unreferenced Python acquisition caches.
@@ -3544,7 +3547,13 @@ mod tests {
         .unwrap()
         .with_test_origin(server.origin.clone());
         let verified = catalog.verify_install_candidate(&candidate).await.unwrap();
-        let installed = installer.install(&verified).await.unwrap();
+        let lease = Arc::new(
+            RuntimeStore::new(&paths)
+                .acquire_installation_lease(&candidate.runtime_id)
+                .await
+                .unwrap(),
+        );
+        let installed = installer.install(&verified, lease).await.unwrap();
         assert_eq!(installed.manifest.identity, candidate.identity);
         assert_eq!(
             installed.manifest.acquisition_method,

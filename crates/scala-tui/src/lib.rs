@@ -142,9 +142,11 @@ pub async fn run(
     let (auth_updates, mut auth_update_receiver) = tokio::sync::mpsc::channel(2);
     let (benchmark_results, mut benchmark_receiver) = tokio::sync::mpsc::channel(2);
     let mut benchmark_tick = tokio::time::interval(Duration::from_secs(2));
+    let mut runtime_acquisition_task = None;
     let mut runtime_progress = runtime_packs.progress();
     let mut model_progress = model_library.subscribe();
     spawn_runtime_action(
+        &mut runtime_acquisition_task,
         Arc::clone(&runtime_packs),
         core.paths.clone(),
         runtime_results.clone(),
@@ -312,6 +314,9 @@ pub async fn run(
             },
             result = runtime_result_receiver.recv() => match result {
                 Some(result) => {
+                    if matches!(&result, RuntimeTaskResult::Installed { .. } | RuntimeTaskResult::Updated { .. } | RuntimeTaskResult::InstallationCancelled(_)) {
+                        runtime_acquisition_task = None;
+                    }
                     app.handle_runtime_task_result(result);
                     Update::Render
                 }
@@ -458,6 +463,7 @@ pub async fn run(
         }
         if let Some(action) = app.take_runtime_action() {
             spawn_runtime_action(
+                &mut runtime_acquisition_task,
                 Arc::clone(&runtime_packs),
                 core.paths.clone(),
                 runtime_results.clone(),
@@ -1500,12 +1506,116 @@ async fn execute_settings_action(
     }
 }
 
+struct RuntimeAcquisitionTask {
+    runtime_id: scala_core::RuntimeId,
+    abort: tokio::task::AbortHandle,
+}
+
+impl RuntimeAcquisitionTask {
+    fn cancel(&self, runtime_id: &scala_core::RuntimeId) {
+        if &self.runtime_id == runtime_id {
+            self.abort.abort();
+        }
+    }
+}
+
+impl Drop for RuntimeAcquisitionTask {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+// Retain the exact acquisition task, using Tokio cancellation and the installer's
+// existing owned staging/process guards. The monitor reports only after drop
+// cleanup has run. Listing after admission is outside the cancellable task.
+fn spawn_runtime_acquisition<F, T>(
+    runtime_id: scala_core::RuntimeId,
+    acquisition: F,
+) -> (
+    RuntimeAcquisitionTask,
+    tokio::task::JoinHandle<Result<T, String>>,
+)
+where
+    F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    let task = tokio::spawn(acquisition);
+    let active = RuntimeAcquisitionTask {
+        runtime_id,
+        abort: task.abort_handle(),
+    };
+    (active, task)
+}
+
 fn spawn_runtime_action(
+    active: &mut Option<RuntimeAcquisitionTask>,
     runtime_packs: Arc<RuntimePackManager>,
     paths: AppPaths,
     results: tokio::sync::mpsc::Sender<RuntimeTaskResult>,
     action: RuntimeAction,
 ) {
+    if let RuntimeAction::CancelInstallation(runtime_id) = &action {
+        if let Some(task) = active.as_ref() {
+            task.cancel(runtime_id);
+        }
+        return;
+    }
+    let acquisition = match &action {
+        RuntimeAction::Install(id) => Some((id.clone(), false)),
+        RuntimeAction::Update(id) => Some((id.clone(), true)),
+        _ => None,
+    };
+    if let Some((runtime_id, update)) = acquisition {
+        let manager = Arc::clone(&runtime_packs);
+        let id = runtime_id.clone();
+        let (tracked, task) = spawn_runtime_acquisition(runtime_id.clone(), async move {
+            if update {
+                manager.update(&id).await
+            } else {
+                manager.install(&id).await
+            }
+            .map_err(|error| error.to_string())
+        });
+        *active = Some(tracked);
+        tokio::spawn(async move {
+            let outcome = match task.await {
+                Ok(outcome) => outcome,
+                Err(error) if error.is_cancelled() => {
+                    let _ = results
+                        .send(RuntimeTaskResult::InstallationCancelled(runtime_id))
+                        .await;
+                    return;
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            let result = if update {
+                let result = match outcome {
+                    Ok(installed) if installed.manifest.runtime_id != runtime_id => runtime_packs
+                        .list()
+                        .await
+                        .map(|snapshot| (installed.manifest.runtime_id, snapshot))
+                        .map_err(|error| error.to_string()),
+                    Ok(_) => Err("no newer compatible runtime is currently available".into()),
+                    Err(error) => Err(error),
+                };
+                RuntimeTaskResult::Updated {
+                    previous_runtime_id: runtime_id,
+                    result,
+                }
+            } else {
+                let result = match outcome {
+                    Ok(_) => runtime_packs
+                        .list()
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error),
+                };
+                RuntimeTaskResult::Installed { runtime_id, result }
+            };
+            let _ = results.send(result).await;
+        });
+        return;
+    }
     tokio::spawn(async move {
         let result = execute_runtime_action(runtime_packs, &paths, action).await;
         let _ = results.send(result).await;
@@ -1549,15 +1659,10 @@ async fn execute_runtime_action(
             };
             RuntimeTaskResult::Searched(result.map_err(|error| error.to_string()))
         }
-        RuntimeAction::Install(runtime_id) => {
-            let result = match runtime_packs.install(&runtime_id).await {
-                Ok(_) => runtime_packs
-                    .list()
-                    .await
-                    .map_err(|error| error.to_string()),
-                Err(error) => Err(error.to_string()),
-            };
-            RuntimeTaskResult::Installed { runtime_id, result }
+        RuntimeAction::Install(_)
+        | RuntimeAction::Update(_)
+        | RuntimeAction::CancelInstallation(_) => {
+            unreachable!("acquisition actions are handled by the tracked task")
         }
         RuntimeAction::CheckUpdates => RuntimeTaskResult::Updates(
             runtime_packs
@@ -1565,24 +1670,6 @@ async fn execute_runtime_action(
                 .await
                 .map_err(|error| error.to_string()),
         ),
-        RuntimeAction::Update(runtime_id) => {
-            let result = match runtime_packs.update(&runtime_id).await {
-                Ok(installed) if installed.manifest.runtime_id != runtime_id => {
-                    let installed_runtime_id = installed.manifest.runtime_id;
-                    runtime_packs
-                        .list()
-                        .await
-                        .map(|snapshot| (installed_runtime_id, snapshot))
-                        .map_err(|error| error.to_string())
-                }
-                Ok(_) => Err("no newer compatible runtime is currently available".to_owned()),
-                Err(error) => Err(error.to_string()),
-            };
-            RuntimeTaskResult::Updated {
-                previous_runtime_id: runtime_id,
-                result,
-            }
-        }
         RuntimeAction::Remove { runtime_id } => {
             let active_runtime = match ControlClient::discover(paths).await {
                 Ok(client) => match client.status().await {
@@ -1710,6 +1797,78 @@ async fn execute_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn runtime_acquisition_cancellation_stops_only_the_tracked_task_and_allows_retry() {
+        let id = scala_core::RuntimeId::new("fixture-install").unwrap();
+        let (tracked, task) = spawn_runtime_acquisition(id.clone(), async {
+            std::future::pending::<Result<(), String>>().await
+        });
+        tracked.cancel(&scala_core::RuntimeId::new("unrelated").unwrap());
+        assert!(!task.is_finished());
+        tracked.cancel(&id);
+        let error = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is_cancelled());
+        let (retry, task) = spawn_runtime_acquisition(id.clone(), async { Ok::<_, String>(()) });
+        assert!(task.await.unwrap().is_ok());
+        retry.cancel(&id);
+        assert!(retry.abort.is_finished());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tui_runtime_cancellation_stops_an_active_owned_helper_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let ready = root.path().join("ready");
+        let late = root.path().join("late");
+        let unrelated = tokio::spawn(async { std::future::pending::<()>().await });
+        let id = scala_core::RuntimeId::new("fixture-helper").unwrap();
+        let ready_arg = ready.display().to_string();
+        let late_arg = late.display().to_string();
+        let (tracked, task) = spawn_runtime_acquisition(id.clone(), async move {
+            scala_engine::capture_owned_command(
+                std::path::Path::new("/bin/sh"),
+                &[
+                    "-c",
+                    "(/bin/sleep 1; printf late > \"$2\") & printf ready > \"$1\"; wait",
+                    "fixture",
+                    &ready_arg,
+                    &late_arg,
+                ],
+                &Default::default(),
+                &[],
+                Duration::from_secs(30),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            Ok::<_, String>(())
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ready.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tracked.cancel(&id);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert!(!unrelated.is_finished());
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            !late.exists(),
+            "owned descendant must not continue writing after cancellation"
+        );
+        unrelated.abort();
+    }
 
     #[test]
     fn startup_row_actions_route_to_os_registration_only() {

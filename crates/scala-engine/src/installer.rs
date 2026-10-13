@@ -23,7 +23,10 @@ use tokio::sync::broadcast;
 use crate::catalog::{
     GitHubReleaseClient, RuntimeProviderAuthority, VerifiedInstallCandidate, is_allowed_github_host,
 };
-use crate::store::{RUNTIME_MANIFEST_FILE, RuntimeStaging, RuntimeStore, RuntimeStoreError};
+use crate::store::{
+    RUNTIME_MANIFEST_FILE, RuntimeInstallationLease, RuntimeStaging, RuntimeStore,
+    RuntimeStoreError,
+};
 use crate::{EngineError, EngineRegistry};
 
 const MAX_ARCHIVE_ENTRIES: usize = 100_000;
@@ -140,6 +143,7 @@ impl RuntimeInstaller {
     pub(crate) async fn install(
         &self,
         verified: &VerifiedInstallCandidate,
+        installation_lease: Arc<RuntimeInstallationLease>,
     ) -> Result<InstalledRuntime, RuntimeInstallError> {
         let available = verified.available();
         available
@@ -158,10 +162,14 @@ impl RuntimeInstaller {
             .validate(available)
             .map_err(|error| RuntimeInstallError::InvalidMetadata(error.to_string()))?;
         if let RuntimeAcquisitionPlan::ManagedPython(plan) = &available.acquisition {
-            return self.install_python(available, plan).await;
+            return self
+                .install_python(available, plan, installation_lease)
+                .await;
         }
         if let RuntimeAcquisitionPlan::SourceBuild(plan) = &available.acquisition {
-            return self.install_source_build(available, authority, plan).await;
+            return self
+                .install_source_build(available, authority, plan, installation_lease)
+                .await;
         }
         let (download, additional_downloads) = available.release_assets().ok_or_else(|| {
             RuntimeInstallError::InvalidMetadata(
@@ -241,7 +249,8 @@ impl RuntimeInstaller {
             Some(total_package_size),
             "Extracting verified package",
         );
-        let staging = self.store.create_staging().await?;
+        let mut staging = self.store.create_staging().await?;
+        staging.retain_installation_lease(installation_lease);
         let result = async {
             let archive_path = archive.clone();
             let format = download.archive_format;
@@ -383,8 +392,11 @@ impl RuntimeInstaller {
         &self,
         available: &AvailableRuntime,
         plan: &scala_core::RuntimePythonPlan,
+        installation_lease: Arc<RuntimeInstallationLease>,
     ) -> Result<InstalledRuntime, RuntimeInstallError> {
-        let result = self.install_python_inner(available, plan).await;
+        let result = self
+            .install_python_inner(available, plan, installation_lease)
+            .await;
         if let Err(error) = &result {
             self.emit(
                 available,
@@ -401,6 +413,7 @@ impl RuntimeInstaller {
         &self,
         available: &AvailableRuntime,
         plan: &scala_core::RuntimePythonPlan,
+        installation_lease: Arc<RuntimeInstallationLease>,
     ) -> Result<InstalledRuntime, RuntimeInstallError> {
         self.emit(
             available,
@@ -462,14 +475,16 @@ impl RuntimeInstaller {
                 "Python cache lease is a symlink".into(),
             ));
         }
-        let cache_lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(cache_lock_path)
-            .map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
-        fs2::FileExt::try_lock_exclusive(&cache_lock).map_err(|_| {
+        let cache_lock = Arc::new(
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(cache_lock_path)
+                .map_err(|e| RuntimeInstallError::Download(e.to_string()))?,
+        );
+        fs2::FileExt::try_lock_exclusive(cache_lock.as_ref()).map_err(|_| {
             RuntimeInstallError::Prerequisite(
                 "another Scala Python runtime is acquiring dependencies; retry after it finishes"
                     .into(),
@@ -528,7 +543,11 @@ impl RuntimeInstaller {
                 required_disk / (1024 * 1024 * 1024)
             )));
         }
-        let mut staging = self.store.create_python_staging(&manifest).await?;
+        let mut staging = self
+            .store
+            .create_python_staging(&manifest, installation_lease)
+            .await?;
+        staging.retain_cache_lease(Arc::clone(&cache_lock));
         for asset in &assets {
             let relative = Path::new(asset.name);
             if !is_safe_relative_path(relative) {
@@ -582,11 +601,21 @@ impl RuntimeInstaller {
         );
         let python_archive = acquired[0].clone();
         let tool_archive = acquired[1].clone();
-        staging = run_owned_staging_operation(staging, move |root| {
-            extract_archive(&python_archive, root, RuntimeArchiveFormat::TarGz)?;
+        staging = run_owned_staging_operation(staging, move |root, cancellation| {
+            extract_archive_cancellable(
+                &python_archive,
+                root,
+                RuntimeArchiveFormat::TarGz,
+                Some(&cancellation),
+            )?;
             std::fs::create_dir(root.join("tool"))
                 .map_err(|e| RuntimeInstallError::Task(e.to_string()))?;
-            extract_archive(&tool_archive, &root.join("tool"), RuntimeArchiveFormat::Zip)
+            extract_archive_cancellable(
+                &tool_archive,
+                &root.join("tool"),
+                RuntimeArchiveFormat::Zip,
+                Some(&cancellation),
+            )
         })
         .await?;
         let uv = locate_entrypoint(&staging.join("tool"), &plan.package_tool.entrypoint_names)
@@ -771,9 +800,10 @@ impl RuntimeInstaller {
         available: &AvailableRuntime,
         authority: &RuntimeProviderAuthority,
         plan: &RuntimeSourceBuildPlan,
+        installation_lease: Arc<RuntimeInstallationLease>,
     ) -> Result<InstalledRuntime, RuntimeInstallError> {
         let result = self
-            .install_source_build_inner(available, authority, plan)
+            .install_source_build_inner(available, authority, plan, installation_lease)
             .await;
         if let Err(error) = &result {
             self.emit(
@@ -792,6 +822,7 @@ impl RuntimeInstaller {
         available: &AvailableRuntime,
         authority: &RuntimeProviderAuthority,
         plan: &RuntimeSourceBuildPlan,
+        installation_lease: Arc<RuntimeInstallationLease>,
     ) -> Result<InstalledRuntime, RuntimeInstallError> {
         self.emit(
             available,
@@ -836,6 +867,7 @@ impl RuntimeInstaller {
             .get(&available.identity.engine_id)
             .ok_or_else(|| RuntimeInstallError::Adapter(available.identity.engine_id.clone()))?;
         let mut staging = self.store.create_staging().await?;
+        staging.retain_installation_lease(installation_lease);
         let result = async {
             let source_root = staging.join("source");
             tokio::fs::create_dir_all(&source_root)
@@ -2329,14 +2361,24 @@ fn compact_identity(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+#[cfg(test)]
 fn extract_archive(
     archive_path: &Path,
     staging: &Path,
     format: RuntimeArchiveFormat,
 ) -> Result<(), RuntimeInstallError> {
+    extract_archive_cancellable(archive_path, staging, format, None)
+}
+
+fn extract_archive_cancellable(
+    archive_path: &Path,
+    staging: &Path,
+    format: RuntimeArchiveFormat,
+    cancellation: Option<&std::sync::Weak<()>>,
+) -> Result<(), RuntimeInstallError> {
     match format {
-        RuntimeArchiveFormat::Zip => extract_zip(archive_path, staging),
-        RuntimeArchiveFormat::TarGz => extract_tar_gz(archive_path, staging),
+        RuntimeArchiveFormat::Zip => extract_zip(archive_path, staging, cancellation),
+        RuntimeArchiveFormat::TarGz => extract_tar_gz(archive_path, staging, cancellation),
     }?;
     validate_staging_limits(staging)
 }
@@ -2346,8 +2388,8 @@ async fn extract_archive_owned(
     archive_path: PathBuf,
     format: RuntimeArchiveFormat,
 ) -> Result<RuntimeStaging, RuntimeInstallError> {
-    run_owned_staging_operation(staging, move |staging_path| {
-        extract_archive(&archive_path, staging_path, format)
+    run_owned_staging_operation(staging, move |staging_path, cancellation| {
+        extract_archive_cancellable(&archive_path, staging_path, format, Some(&cancellation))
     })
     .await
 }
@@ -2357,14 +2399,44 @@ async fn run_owned_staging_operation<F>(
     operation: F,
 ) -> Result<RuntimeStaging, RuntimeInstallError>
 where
-    F: FnOnce(&Path) -> Result<(), RuntimeInstallError> + Send + 'static,
+    F: FnOnce(&Path, std::sync::Weak<()>) -> Result<(), RuntimeInstallError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
-        operation(staging.path())?;
-        Ok(staging)
+    // Tokio cannot abort spawn_blocking. Its awaiting task owns this lifetime;
+    // dropping it interrupts archive reads and waits for owned staging cleanup.
+    struct BlockingCleanup {
+        lifetime: Option<Arc<()>>,
+        completed: std::sync::mpsc::Receiver<()>,
+    }
+    impl Drop for BlockingCleanup {
+        fn drop(&mut self) {
+            self.lifetime.take();
+            let _ = self.completed.recv_timeout(Duration::from_secs(2));
+        }
+    }
+    let lifetime = Arc::new(());
+    let cancellation = Arc::downgrade(&lifetime);
+    let (completed, receiver) = std::sync::mpsc::channel();
+    let cleanup = BlockingCleanup {
+        lifetime: Some(lifetime),
+        completed: receiver,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let outcome = operation(staging.path(), cancellation.clone());
+        let result = if cancellation.strong_count() == 0 {
+            drop(staging);
+            Err(RuntimeInstallError::Task(
+                "runtime installation cancelled".into(),
+            ))
+        } else {
+            outcome.map(|()| staging)
+        };
+        let _ = completed.send(());
+        result
     })
     .await
-    .map_err(|error| RuntimeInstallError::Task(error.to_string()))?
+    .map_err(|error| RuntimeInstallError::Task(error.to_string()))?;
+    drop(cleanup);
+    result
 }
 
 fn validate_staging_limits(staging: &Path) -> Result<(), RuntimeInstallError> {
@@ -2482,10 +2554,39 @@ fn github_url(path: &[&str]) -> Result<reqwest::Url, RuntimeInstallError> {
     Ok(url)
 }
 
-fn extract_zip(archive_path: &Path, staging: &Path) -> Result<(), RuntimeInstallError> {
+// A blocking extractor retains staging/leases, but stops reading as soon as
+// its awaiting runtime task is dropped. No detached writer can publish a pack.
+struct CancellableArchive<'a> {
+    file: std::fs::File,
+    cancellation: Option<&'a std::sync::Weak<()>>,
+}
+
+impl std::io::Read for CancellableArchive<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self
+            .cancellation
+            .is_some_and(|lifetime| lifetime.strong_count() == 0)
+        {
+            return Err(std::io::Error::other("runtime installation cancelled"));
+        }
+        std::io::Read::read(&mut self.file, buffer)
+    }
+}
+
+impl std::io::Seek for CancellableArchive<'_> {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.file, position)
+    }
+}
+
+fn extract_zip(
+    archive_path: &Path,
+    staging: &Path,
+    cancellation: Option<&std::sync::Weak<()>>,
+) -> Result<(), RuntimeInstallError> {
     let file = std::fs::File::open(archive_path)
         .map_err(|error| RuntimeInstallError::UnsafeArchive(error.to_string()))?;
-    let mut archive = zip::ZipArchive::new(file)
+    let mut archive = zip::ZipArchive::new(CancellableArchive { file, cancellation })
         .map_err(|error| RuntimeInstallError::UnsafeArchive(error.to_string()))?;
     if archive.len() > MAX_ARCHIVE_ENTRIES {
         return Err(RuntimeInstallError::UnsafeArchive(format!(
@@ -2555,10 +2656,14 @@ fn extract_zip(archive_path: &Path, staging: &Path) -> Result<(), RuntimeInstall
     Ok(())
 }
 
-fn extract_tar_gz(archive_path: &Path, staging: &Path) -> Result<(), RuntimeInstallError> {
+fn extract_tar_gz(
+    archive_path: &Path,
+    staging: &Path,
+    cancellation: Option<&std::sync::Weak<()>>,
+) -> Result<(), RuntimeInstallError> {
     let file = std::fs::File::open(archive_path)
         .map_err(|error| RuntimeInstallError::UnsafeArchive(error.to_string()))?;
-    let mut archive = tar::Archive::new(GzDecoder::new(file));
+    let mut archive = tar::Archive::new(GzDecoder::new(CancellableArchive { file, cancellation }));
     let mut seen = HashSet::new();
     let mut count = 0_usize;
     let mut extracted = 0_u64;
@@ -2899,7 +3004,7 @@ mod tests {
     use std::time::Duration;
 
     use scala_core::{
-        AppPaths, RuntimeArchiveFormat, RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites,
+        RuntimeArchiveFormat, RuntimeSourceBuildPlan, RuntimeSourceBuildPrerequisites,
         RuntimeSourceBuildRecipe, RuntimeSourceBuildSystem, RuntimeSourceSnapshot,
         effective_cmake_configuration_arguments,
     };
@@ -3178,61 +3283,237 @@ mod tests {
         );
     }
 
+    fn cancellation_manifest() -> scala_core::RuntimeManifest {
+        use crate::test_support::{release, runtime};
+        let candidate = runtime(&serde_json::from_value(release(b"fixture")).unwrap());
+        scala_core::RuntimeManifest {
+            schema_version: scala_core::RUNTIME_MANIFEST_SCHEMA_VERSION,
+            runtime_id: candidate.runtime_id,
+            identity: candidate.identity,
+            supported_formats: candidate.supported_formats,
+            supported_native_identities: Vec::new(),
+            requirements: candidate.requirements,
+            acquisition_method: scala_core::RuntimeAcquisitionMethod::OfficialReleaseAsset,
+            source_url: Some(candidate.source_url),
+            downloaded_archive_sha256: Some("a".repeat(64)),
+            additional_downloaded_archive_sha256: Vec::new(),
+            source_build: None,
+            python_environment: None,
+            entrypoint: "server".into(),
+            entrypoint_sha256: format!("{:x}", sha2::Sha256::digest(b"fixture")),
+            installed_at_unix: Some(1),
+            probe: scala_core::RuntimeProbeObservation {
+                compatible: true,
+                observed_engine_id: "fixture-release".into(),
+                observed_version: None,
+                observed_revision: None,
+                detail: "synthetic admission".into(),
+                observed_at_unix: 1,
+            },
+        }
+    }
+
     #[tokio::test]
-    async fn blocking_staging_writer_retains_cleanup_ownership_after_caller_cancellation() {
-        let workspace = tempfile::tempdir().expect("temporary runtime store");
-        let paths = AppPaths {
-            config_dir: workspace.path().join("config"),
-            config_file: workspace.path().join("config/config.toml"),
-            data_dir: workspace.path().join("data"),
-            state_dir: workspace.path().join("state"),
-            cache_dir: workspace.path().join("cache"),
-            log_dir: workspace.path().join("logs"),
-            runtimes_dir: workspace.path().join("data/runtimes"),
-            runtime_cache_dir: workspace.path().join("cache/runtime-packs"),
-            runtime_selections_file: workspace.path().join("data/runtime-selections.json"),
-            settings_file: workspace.path().join("data/settings.json"),
-            settings_lock_file: workspace.path().join("data/.settings.lock"),
-            model_profiles_file: workspace.path().join("data/model-profiles.json"),
-            model_profiles_lock_file: workspace.path().join("data/.model-profiles.lock"),
-        };
-        let store = RuntimeStore::new(&paths);
-        let staging = store.create_staging().await.expect("staging directory");
-        let staging_path = staging.path().to_path_buf();
-        let (started_tx, started_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        let (finished_tx, finished_rx) = oneshot::channel();
+    async fn installer_cancellation_during_download_removes_only_its_partial() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let workspace = tempfile::tempdir().unwrap();
+        let paths = crate::test_support::paths(workspace.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let (started, ready) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nf")
+                .await
+                .unwrap();
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let candidate = crate::test_support::runtime(
+            &serde_json::from_value(crate::test_support::release(b"fixture")).unwrap(),
+        );
+        let installer = super::RuntimeInstaller::new(
+            Arc::new(RuntimeStore::new(&paths)),
+            crate::EngineRegistry::default(),
+            paths.runtime_cache_dir.clone(),
+            std::iter::empty(),
+        )
+        .unwrap()
+        .with_test_origin(origin);
+        let downloads = paths.runtime_cache_dir.join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        let complete = downloads.join("completed-archive");
+        std::fs::write(&complete, b"preserved").unwrap();
+        let task = tokio::spawn(async move {
+            let (download, _) = candidate.release_assets().unwrap();
+            let url =
+                super::validate_release_asset_url(&candidate, "fixture.zip", download).unwrap();
+            installer
+                .download(
+                    &candidate,
+                    download,
+                    &url,
+                    &download.digest.as_ref().unwrap().value,
+                    download.size_bytes,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
+        assert_eq!(std::fs::read_dir(downloads).unwrap().count(), 1);
+        assert_eq!(std::fs::read(complete).unwrap(), b"preserved");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn installer_cancellation_stops_blocking_reads_cleans_staging_and_releases_leases() {
+        use std::io::{Read, Seek};
+        use std::sync::Arc;
+        let workspace = tempfile::tempdir().unwrap();
+        let store = RuntimeStore::new(&crate::test_support::paths(workspace.path()));
+        let manifest = cancellation_manifest();
+        let lease = Arc::new(
+            store
+                .acquire_installation_lease(&manifest.runtime_id)
+                .await
+                .unwrap(),
+        );
+        let mut staging = store.create_staging().await.unwrap();
+        staging.retain_installation_lease(lease);
+        let staging_path = staging.path().to_owned();
+        let cache_path = workspace.path().join("cache.lock");
+        let cache = Arc::new(std::fs::File::create(&cache_path).unwrap());
+        fs2::FileExt::lock_exclusive(cache.as_ref()).unwrap();
+        staging.retain_cache_lease(cache);
+        let archive = workspace.path().join("archive");
+        std::fs::write(&archive, vec![0; 65536]).unwrap();
+        let (started, ready) = oneshot::channel();
         let writer = tokio::spawn(async move {
-            run_owned_staging_operation(staging, move |path| {
-                started_tx.send(()).expect("signal writer start");
-                release_rx.blocking_recv().expect("release staging writer");
-                std::fs::create_dir_all(path.join("late"))
-                    .expect("write staging after caller cancellation");
-                std::fs::write(path.join("late/entry"), b"complete").expect("finish staging write");
-                finished_tx.send(()).expect("signal writer completion");
-                Ok(())
+            run_owned_staging_operation(staging, move |path, cancellation| {
+                let mut reader = super::CancellableArchive {
+                    file: std::fs::File::open(archive).unwrap(),
+                    cancellation: Some(&cancellation),
+                };
+                std::fs::write(path.join("incomplete"), b"partial").unwrap();
+                started.send(()).unwrap();
+                let mut buffer = [0; 4096];
+                loop {
+                    reader
+                        .read(&mut buffer)
+                        .map_err(|error| super::RuntimeInstallError::Task(error.to_string()))?;
+                    reader.seek(std::io::SeekFrom::Start(0)).unwrap();
+                    std::thread::yield_now();
+                }
             })
             .await
         });
-
-        started_rx.await.expect("blocking writer started");
-        writer.abort();
-        let _ = writer.await;
+        ready.await.unwrap();
         assert!(
-            staging_path.exists(),
-            "blocking writer must retain the staging guard after its caller is dropped"
+            store
+                .acquire_installation_lease(&manifest.runtime_id)
+                .await
+                .is_err()
         );
-
-        release_tx.send(()).expect("release blocking writer");
-        finished_rx.await.expect("blocking writer finished");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while staging_path.exists() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("detached blocking writer must ultimately drop and clean staging");
+        writer.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), writer)
+                .await
+                .unwrap()
+                .unwrap_err()
+                .is_cancelled()
+        );
         assert!(!staging_path.exists());
+        store
+            .acquire_installation_lease(&manifest.runtime_id)
+            .await
+            .unwrap();
+        let cache = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(cache_path)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&cache).unwrap();
+        assert!(store.scan().await.unwrap().runtimes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn installer_cancellation_before_activation_cleans_but_after_admission_preserves_runtime()
+    {
+        use std::sync::Arc;
+        let workspace = tempfile::tempdir().unwrap();
+        let store = RuntimeStore::new(&crate::test_support::paths(workspace.path()));
+        let manifest = cancellation_manifest();
+        for admitted in [false, true] {
+            let mut staging = store.create_staging().await.unwrap();
+            staging.retain_installation_lease(Arc::new(
+                store
+                    .acquire_installation_lease(&manifest.runtime_id)
+                    .await
+                    .unwrap(),
+            ));
+            std::fs::write(staging.join("server"), b"fixture").unwrap();
+            std::fs::write(
+                staging.join(crate::store::RUNTIME_MANIFEST_FILE),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let path = staging.path().to_owned();
+            let task_store = store.clone();
+            let task_manifest = manifest.clone();
+            let (started, ready) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                if admitted {
+                    task_store
+                        .activate(&mut staging, &task_manifest)
+                        .await
+                        .unwrap();
+                }
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+                // Keep the actual ownership guard alive across cancellation.
+                drop(staging);
+            });
+            ready.await.unwrap();
+            task.abort();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(3), task)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled()
+            );
+            assert!(!path.exists());
+            let installed = store.scan().await.unwrap().runtimes;
+            assert_eq!(installed.len(), usize::from(admitted));
+            if admitted {
+                assert_eq!(
+                    std::fs::read(installed[0].entrypoint_path()).unwrap(),
+                    b"fixture"
+                );
+            }
+            store
+                .acquire_installation_lease(&manifest.runtime_id)
+                .await
+                .unwrap();
+        }
     }
 
     #[test]

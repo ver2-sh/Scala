@@ -273,7 +273,7 @@ def main():
     main_lock.write_text(primary, encoding="utf-8")
     aux_lock.write_text(auxiliary, encoding="utf-8")
     run(args.uv, "venv", "--python", sys.executable, env)
-    install = ["uv", "pip", "install", "--python", python, "--no-deps", "--require-hashes", "--only-binary", ":all:", "--link-mode", "copy",
+    install = [args.uv, "pip", "install", "--python", python, "--no-deps", "--require-hashes", "--only-binary", ":all:", "--link-mode", "copy",
                "--index-url", "https://pypi.org/simple", "--index", "https://download.pytorch.org/whl/cu130",
                "--index-strategy", "unsafe-best-match", "--find-links", cache]
     run(*install, "-r", main_lock)

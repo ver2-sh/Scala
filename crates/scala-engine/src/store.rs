@@ -139,6 +139,8 @@ impl Drop for RuntimeInstallationLease {
 #[derive(Debug)]
 pub struct RuntimeStaging {
     path: Option<PathBuf>,
+    installation_lease: Option<std::sync::Arc<RuntimeInstallationLease>>,
+    cache_lease: Option<std::sync::Arc<std::fs::File>>,
 }
 
 impl RuntimeStaging {
@@ -146,6 +148,17 @@ impl RuntimeStaging {
         self.path
             .as_deref()
             .expect("owned runtime staging is always armed while accessible")
+    }
+
+    pub(crate) fn retain_installation_lease(
+        &mut self,
+        lease: std::sync::Arc<RuntimeInstallationLease>,
+    ) {
+        self.installation_lease = Some(lease);
+    }
+
+    pub(crate) fn retain_cache_lease(&mut self, lease: std::sync::Arc<std::fs::File>) {
+        self.cache_lease = Some(lease);
     }
 
     fn disarm(&mut self) {
@@ -281,13 +294,22 @@ impl RuntimeStore {
             .root
             .join(".staging")
             .join(uuid::Uuid::new_v4().to_string());
-        tokio::fs::create_dir(&path)
-            .await
-            .map_err(|source| RuntimeStoreError::Io {
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir(&path).map_err(|source| RuntimeStoreError::Io {
                 path: path.clone(),
                 source,
             })?;
-        Ok(RuntimeStaging { path: Some(path) })
+            Ok(RuntimeStaging {
+                path: Some(path),
+                installation_lease: None,
+                cache_lease: None,
+            })
+        })
+        .await
+        .map_err(|source| RuntimeStoreError::Io {
+            path: self.root.clone(),
+            source: std::io::Error::other(source),
+        })?
     }
 
     /// Python venvs bind absolute interpreter paths. Provision at their final
@@ -296,6 +318,7 @@ impl RuntimeStore {
     pub(crate) async fn create_python_staging(
         &self,
         manifest: &RuntimeManifest,
+        installation_lease: std::sync::Arc<RuntimeInstallationLease>,
     ) -> Result<RuntimeStaging, RuntimeStoreError> {
         self.ensure().await?;
         let destination = self.installation_path(manifest);
@@ -327,6 +350,8 @@ impl RuntimeStore {
             })?;
             let staging = RuntimeStaging {
                 path: Some(destination.clone()),
+                installation_lease: Some(installation_lease),
+                cache_lease: None,
             };
             std::fs::write(
                 destination.join(".scala-python-pending"),
@@ -436,23 +461,9 @@ impl RuntimeStore {
                 ),
             });
         }
-        let root = self.root.clone();
-        let staging_path = staging.path().to_path_buf();
-        let activation_destination = destination.clone();
-        let activation_manifest = manifest.clone();
-        tokio::task::spawn_blocking(move || {
-            activate_blocking(
-                &root,
-                &staging_path,
-                &activation_destination,
-                &activation_manifest,
-            )
-        })
-        .await
-        .map_err(|source| RuntimeStoreError::Io {
-            path: destination.clone(),
-            source: std::io::Error::other(source),
-        })??;
+        // Keep ownership and both leases through publication. No await between
+        // the atomic rename and disarming cleanup, as for Python admission.
+        activate_blocking(&self.root, staging.path(), &destination, manifest)?;
         staging.disarm();
         Ok(InstalledRuntime {
             manifest: manifest.clone(),
