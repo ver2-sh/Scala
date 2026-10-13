@@ -1872,6 +1872,9 @@ fn validate_artifact(path: &Path, format: ArtifactFormat) -> Result<()> {
             .map_err(|error| ModelLibraryError::InvalidArtifact(error.to_string())),
         ArtifactFormat::Q27 => scala_engine_q27::validate_model_artifact(path)
             .map_err(ModelLibraryError::InvalidArtifact),
+        ArtifactFormat::HuggingFace => scala_core::HuggingFaceSnapshot::read(path)
+            .map(|_| ())
+            .map_err(ModelLibraryError::InvalidArtifact),
         ArtifactFormat::DecisionBundle => scala_core::DecisionBundle::read(path)
             .map(|_| ())
             .map_err(ModelLibraryError::InvalidArtifact),

@@ -27,10 +27,14 @@ pub enum ArtifactFormat {
     Q27,
     Ninfer,
     DecisionBundle,
+    HuggingFace,
 }
 
 impl ArtifactFormat {
     pub fn from_path(path: &Path) -> Option<Self> {
+        if path.file_name().is_some_and(|n| n == "config.json") {
+            return Some(Self::HuggingFace);
+        }
         match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
             "gguf" => Some(Self::Gguf),
             "q27" => Some(Self::Q27),
@@ -46,6 +50,7 @@ impl ArtifactFormat {
             Self::Q27 => "q27",
             Self::Ninfer => "ninfer",
             Self::DecisionBundle => "decisionbundle",
+            Self::HuggingFace => "huggingface",
         }
     }
 }
@@ -240,6 +245,7 @@ impl std::str::FromStr for ArtifactFormat {
             "q27" => Ok(Self::Q27),
             "ninfer" => Ok(Self::Ninfer),
             "decisionbundle" => Ok(Self::DecisionBundle),
+            "huggingface" => Ok(Self::HuggingFace),
             _ => Err(format!(
                 "unsupported artifact format `{value}`; expected gguf, q27, ninfer, or decisionbundle"
             )),
@@ -307,7 +313,9 @@ impl ModelRegistry {
                         continue;
                     }
                 };
-                if !entry.file_type().is_file() {
+                if !(entry.file_type().is_file()
+                    || entry.file_type().is_symlink() && entry.file_name() == "config.json")
+                {
                     continue;
                 }
                 let path = entry.path();
@@ -323,6 +331,14 @@ impl ModelRegistry {
                     ));
                     continue;
                 }
+                let hf = if format == ArtifactFormat::HuggingFace {
+                    match crate::HuggingFaceSnapshot::read(path) {
+                        Ok(hf) => Some(hf),
+                        Err(_) => continue, // Other config.json files are not models.
+                    }
+                } else {
+                    None
+                };
                 let canonical_path = match path.canonicalize() {
                     Ok(path) => path,
                     Err(error) => {
@@ -332,6 +348,15 @@ impl ModelRegistry {
                         ));
                         continue;
                     }
+                };
+                let canonical_path = if hf.is_some() {
+                    path.parent()
+                        .unwrap()
+                        .canonicalize()
+                        .unwrap_or_else(|_| path.parent().unwrap().to_path_buf())
+                        .join("config.json")
+                } else {
+                    canonical_path
                 };
                 let identity = canonical_identity(&canonical_path);
                 if !seen.insert(identity.clone()) {
@@ -366,7 +391,7 @@ impl ModelRegistry {
                     }
                     None => None,
                 };
-                match entry.metadata() {
+                match std::fs::metadata(&canonical_path) {
                     Ok(metadata) => {
                         let native_identity = if format == ArtifactFormat::Gguf {
                             inspect_gguf_metadata(&canonical_path)
@@ -407,7 +432,10 @@ impl ModelRegistry {
                             Some(ArtifactNativeIdentity::Gguf(identity)) => {
                                 (Some(identity.architecture.clone()), identity.context_length)
                             }
-                            _ => (None, None),
+                            _ => hf
+                                .as_ref()
+                                .map(|h| (Some(h.architecture.clone()), h.context_length))
+                                .unwrap_or((None, None)),
                         };
                         let provenance = read_library_receipt(
                             root,
@@ -420,14 +448,25 @@ impl ModelRegistry {
                             .and_then(|value| value.logical_id.as_deref());
                         registry.artifacts.push(ModelArtifact {
                             id: model_id(path, format, &identity, logical_identity),
-                            display_name: path
-                                .file_stem()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("Unnamed model")
-                                .to_owned(),
+                            display_name: (if hf.is_some() {
+                                path.parent().unwrap()
+                            } else {
+                                path
+                            })
+                            .file_stem()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("Unnamed model")
+                            .to_owned(),
                             path: canonical_path,
                             format,
-                            size_bytes: metadata.len(),
+                            size_bytes: hf
+                                .as_ref()
+                                .and_then(|h| {
+                                    h.files.values().try_fold(0_u64, |total, path| {
+                                        total.checked_add(std::fs::metadata(path).ok()?.len())
+                                    })
+                                })
+                                .unwrap_or(metadata.len()),
                             created: artifact_timestamp(&metadata),
                             architecture,
                             context_length,

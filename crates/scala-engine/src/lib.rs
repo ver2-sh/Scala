@@ -1507,6 +1507,9 @@ pub enum OutputFormat {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequest {
+    /// Public API selected by the caller; adapters may preserve its native protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ApiCapability>,
     pub model_profile_id: scala_core::ModelProfileId,
     pub messages: Vec<InferenceMessage>,
     pub generation_settings: GenerationSettingsPatch,
@@ -2163,6 +2166,12 @@ pub trait EngineAdapter: Send + Sync {
         Err(EngineError::Unsupported(
             "this native pair has no qualified OpenAI Decisions output contract".into(),
         ))
+    }
+    /// Some trained runners cannot interrupt an in-process forward safely.
+    /// Scala must retire their exact owned process when a Decision is cancelled.
+    /// Engines with qualified request cancellation keep the default behavior.
+    fn decision_requires_process_retirement_on_cancel(&self) -> bool {
+        false
     }
     async fn decide(
         &self,
@@ -3300,5 +3309,15 @@ mod tests {
         assert_eq!(zero_total.current, None);
         assert_eq!(zero_total.total, None);
         assert_eq!(zero_total.fraction, None);
+    }
+}
+
+/// Actionable diagnostics for persisted engines absent from this application.
+/// Reading state never changes profile bindings or immutable runtime identities.
+pub fn unregistered_engine_reason(engine_id: &str) -> String {
+    if engine_id == "native_decision" {
+        "The obsolete native_decision engine is unavailable. Prepare a distinct vllm (H2O) or pytorch (Imajev) runtime, explicitly replace obsolete runtime selections, and run `scala model-profiles set-engine <PROFILE> vllm|pytorch`. Existing files, profiles and runtime identities are retained; see docs/python-engines.md.".into()
+    } else {
+        format!("engine `{engine_id}` is not registered")
     }
 }

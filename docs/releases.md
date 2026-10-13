@@ -281,3 +281,10 @@ warning, with no patched version or reported exploit in that advisory. Track
 Rhai's migration upstream; replacing the scripting dependency here would be an
 unrelated functional change. There are no advisory suppressions. Rerun cargo-audit
 with a fresh database before an eventual release; this is a dated assessment.
+
+## Python runtime environments
+
+Application releases do not acquire or relabel Python inference environments.
+[vLLM and PyTorch installation and migration](python-engines.md) requires explicit
+new independently pinned environments. Existing native_decision state stays readable,
+with obsolete-engine diagnostics; no automatic profile/runtime production changes occur.

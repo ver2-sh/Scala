@@ -25,9 +25,10 @@ portable provider rather than canonical upstream.
 
 An `EngineAdapter` represents implementation knowledge: identity, supported artifact formats and capabilities, model compatibility, runtime probing, launch semantics, readiness, effective settings, and request/event translation. It never implies that only one executable exists.
 
-[Native Decision](native-decision.md) uses these same capability and runtime/model
-boundaries through `POST /v1/systemone`. All current engines remain unsupported;
-future adapters must qualify a released native interface and the exact serving pair.
+[Decision](decisions.md) uses these same capability and runtime/model boundaries
+through `POST /v1/systemone` and `/v1/decisions`. llama.cpp native Decision and
+the model-specific vLLM/PyTorch source runners require exact execution qualification.
+Candidate discovery alone never grants dispatch. See [Python engine contracts](python-engines.md).
 
 An `InstalledRuntime` represents one executable package and immutable provenance. Launch input is therefore:
 
@@ -41,7 +42,7 @@ ModelArtifact + InstalledRuntime + private address
                   LaunchSpec
 ```
 
-`EngineRegistry` contains the llama.cpp, q27, and NInfer adapters. `RuntimePackManager` finds installed runtimes whose engine adapter and declared formats can serve the model, applies the selection policy, and hands the selected exact runtime to the adapter. No core branch binds an artifact format to a particular engine ID; adapters advertise formats and perform their own exact model/runtime compatibility checks.
+`EngineRegistry` contains the llama.cpp, q27, NInfer, vllm and pytorch adapters. `RuntimePackManager` finds installed runtimes whose engine adapter and declared formats can serve the model, applies the selection policy, and hands the selected exact runtime to the adapter. No core branch binds an artifact format to a particular engine ID; adapters advertise formats and perform their own exact model/runtime compatibility checks.
 
 The serving and security boundaries are:
 

@@ -9,7 +9,8 @@ use scala_engine::{
     EngineAdapter, EngineRegistry, RuntimeManagerOptions, RuntimePackManager,
     TokioProcessSupervisor,
 };
-use scala_engine_native_decision::NativeDecisionAdapter;
+use scala_engine_pytorch::PyTorchAdapter;
+use scala_engine_vllm::VllmAdapter;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -21,7 +22,7 @@ struct Fixture {
     _temp: tempfile::TempDir,
     state: PublicApiState,
     packs: Arc<RuntimePackManager>,
-    adapter: Arc<NativeDecisionAdapter>,
+    adapter: Arc<VllmAdapter>,
     counts: Vec<PathBuf>,
     dependencies: Vec<PathBuf>,
     binaries: Vec<PathBuf>,
@@ -91,7 +92,7 @@ impl Fixture {
                     std::fs::write(path.join(name), b"synthetic").unwrap();
                     files.insert(name.to_string(), json!({"size_bytes":9,"sha256":format!("{:x}",Sha256::digest(b"synthetic"))}));
                 }
-                sources.insert(role.to_string(), json!({"path":path,"repository":"fixture/model","revision":"1".repeat(40),"files":files}));
+                sources.insert(role.to_string(), json!({"path":path,"repository":if *role=="base" {"Qwen/Qwen3.5-4B"} else {"fixture/model"},"revision":if *role=="base" {"851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a".to_owned()} else {"1".repeat(40)},"files":files}));
             }
             let bindings = if backend == "vllm-labels" {
                 json!({"shim":"shim.py","serve_config":"serve.json"})
@@ -122,7 +123,26 @@ impl Fixture {
             let dependency = runtime_source.join("dependency.py");
             std::fs::write(&dependency, b"synthetic").unwrap();
             let count = root.join(format!("{name}.count"));
-            let probe = json!({"protocol":"scala-native-decision-v1","engine_id":"native_decision","version":"1","revision":if backend == "vllm-labels" { "2".repeat(64) } else { "3".repeat(64) },"backend":backend,"model_code_sha256":if backend == "vllm-labels" { Some(format!("{:x}",Sha256::digest(b"synthetic"))) } else { None }});
+            let engine = if backend == "vllm-labels" {
+                "vllm"
+            } else {
+                "pytorch"
+            };
+            let protocol = format!("scala-{engine}-v1");
+            let version = if backend == "vllm-labels" {
+                if cfg!(windows) {
+                    "0.29.0+cu132"
+                } else {
+                    "0.30.0"
+                }
+            } else {
+                "2.14.1+cu130"
+            };
+            let mut probe = json!({"protocol":protocol,"engine_id":engine,"version":version,"revision":if backend == "vllm-labels" { "2".repeat(64) } else { "3".repeat(64) },"backend":backend,"model_code_sha256":if backend == "vllm-labels" { Some(format!("{:x}",Sha256::digest(b"synthetic"))) } else { None }});
+            if backend == "torch-readout" {
+                probe["runner_id"] = json!("imajev-readout-v1");
+                probe["runner_source_revision"] = json!("91729bff7a806187324e287fd0d730839dc32026");
+            }
             let runner = runtime_dir.join("server.py");
             std::fs::write(&runner, format!("import sys,json,time\nfrom pathlib import Path\nassert sys.argv[1:] == ['--scala-probe'], 'fixture cannot serve'\nwith Path({count:?}).open('a') as f: f.write('probe\\n')\ntime.sleep(0.08)\nassert Path({dependency:?}).read_bytes() == b'synthetic', 'dependency changed'\nprint({:?})\n", probe.to_string())).unwrap();
             std::fs::write(
@@ -150,8 +170,8 @@ impl Fixture {
             #[cfg(windows)]
             let binary = {
                 std::fs::write(
-                    python.with_file_name("scala-native-decision.json"),
-                    serde_json::to_vec(&json!({"protocol":"scala-native-decision-v1",
+                    python.with_file_name(format!("scala-{engine}.json")),
+                    serde_json::to_vec(&json!({"protocol":protocol,
                         "interpreter":python,"runner":runner}))
                     .unwrap(),
                 )
@@ -168,8 +188,8 @@ impl Fixture {
             .update(move |profiles| {
                 for (id, stem, engine) in [
                     ("gemma", "fixture", "llama.cpp"),
-                    ("h2o-lightning", "h2o-lightning", "native_decision"),
-                    ("imajev", "imajev", "native_decision"),
+                    ("h2o-lightning", "h2o-lightning", "vllm"),
+                    ("imajev", "imajev", "pytorch"),
                 ] {
                     let model = discovered
                         .iter()
@@ -187,10 +207,20 @@ impl Fixture {
             .await
             .unwrap();
         let config: EngineConfig =
-            serde_json::from_value(json!({"enabled":true,"native":{"binaries":binaries}})).unwrap();
-        let adapter = Arc::new(NativeDecisionAdapter::from_config(Some(&config), &root));
+            serde_json::from_value(json!({"enabled":true,"native":{"binary":binaries[0]}}))
+                .unwrap();
+        let adapter = Arc::new(VllmAdapter::from_config(Some(&config), &root));
         let mut registry = EngineRegistry::default();
         registry.register(adapter.clone()).unwrap();
+        let torch_config: EngineConfig =
+            serde_json::from_value(json!({"enabled":true,"native":{"binary":binaries[1]}}))
+                .unwrap();
+        registry
+            .register(Arc::new(PyTorchAdapter::from_config(
+                Some(&torch_config),
+                &root,
+            )))
+            .unwrap();
         let packs = RuntimePackManager::new(
             &core.paths,
             registry.clone(),
@@ -359,34 +389,34 @@ async fn native_discovery_refreshes_and_dependency_changes_fail_closed_before_la
     let profile = &profiles.profiles[&ModelProfileId::new("h2o-lightning").unwrap()];
     let model = f.state.core.model(&profile.model_id).await.unwrap();
     let settings = scala_core::ResolvedSettings {
-        engine_id: "native_decision".into(),
+        engine_id: "vllm".into(),
         model_profile_id: Some(profile.id.clone()),
         ..Default::default()
     };
-    assert!(
-        f.adapter
-            .build_launch_spec(scala_engine::LaunchRequest {
-                model: scala_engine::PreparedModelInput {
-                    primary: model,
-                    auxiliary: Vec::new(),
-                    primary_file_identity: None
-                },
-                runtime: runtime.clone(),
-                accelerator_binding: None,
-                backend_address: "127.0.0.1:1".parse().unwrap(),
-                settings,
-                settings_schema: scala_core::SettingsSchema::default(),
-            })
-            .await
-            .is_err()
-    );
+    let spec = f
+        .adapter
+        .build_launch_spec(scala_engine::LaunchRequest {
+            model: scala_engine::PreparedModelInput {
+                primary: model,
+                auxiliary: Vec::new(),
+                primary_file_identity: None,
+            },
+            runtime: runtime.clone(),
+            accelerator_binding: None,
+            backend_address: "127.0.0.1:1".parse().unwrap(),
+            settings,
+            settings_schema: scala_core::SettingsSchema::default(),
+        })
+        .await
+        .unwrap();
+    assert!(f.adapter.prepare_launch_attempt(&spec).await.is_err());
     let listed = f.get("/v1/models?output_modalities=decisions").await;
     assert_eq!(listed["data"][0]["id"], "imajev");
     assert_eq!(listed["data"].as_array().unwrap().len(), 1);
     assert_eq!(
         f.state.runtime.status().await.installed_engine_count,
-        1,
-        "a failed first variant must not invalidate the engine with a healthy runtime"
+        2,
+        "initial independent engine observations are retained; candidate discovery rechecks changed runtime integrity"
     );
     let healthy_probes = f.probes()[1];
     assert_eq!(
@@ -398,7 +428,7 @@ async fn native_discovery_refreshes_and_dependency_changes_fail_closed_before_la
         healthy_probes,
         "a failed variant must not rehash the healthy runtime on warm discovery"
     );
-    assert!(f.adapter.probe().await.unwrap().healthy);
+    assert!(f.adapter.probe().await.is_err());
     assert_eq!(f.probes()[1], healthy_probes);
     std::fs::write(&f.dependencies[0], b"synthetic").unwrap();
     f.packs.refresh_local_observations().await;
@@ -456,7 +486,7 @@ async fn native_discovery_rechecks_persistent_selections_and_profile_configurati
             let id = id.clone();
             move |state| {
                 state.profiles.get_mut(&id).unwrap().overrides.0.insert(
-                    scala_core::SettingId::new("native_decision.temperature").unwrap(),
+                    scala_core::SettingId::new("vllm.temperature").unwrap(),
                     scala_core::SettingValue::Float(0.8),
                 );
                 Ok(())
@@ -483,7 +513,7 @@ async fn native_discovery_rechecks_persistent_selections_and_profile_configurati
                     ModelProfileId::new("unsupported-gguf").unwrap(),
                     "Unsupported",
                     chat,
-                    scala_core::EngineId::new("native_decision").unwrap(),
+                    scala_core::EngineId::new("vllm").unwrap(),
                 )?;
                 Ok(())
             }
@@ -544,7 +574,7 @@ async fn native_discovery_rechecks_persistent_selections_and_profile_configurati
         serde_json::from_value(json!({"enabled":true,"native":{"binary":f.binaries[1]}})).unwrap();
     let mut registry = EngineRegistry::default();
     registry
-        .register(Arc::new(NativeDecisionAdapter::from_config(
+        .register(Arc::new(PyTorchAdapter::from_config(
             Some(&config),
             f._temp.path(),
         )))
@@ -577,4 +607,76 @@ async fn native_discovery_rechecks_persistent_selections_and_profile_configurati
     assert_eq!(decisions.len(), 1);
     assert_eq!(decisions[0].id, "imajev");
     assert!(state.runtime.status().await.backends.is_empty());
+}
+
+#[tokio::test]
+async fn obsolete_profile_state_is_readable_and_migration_is_explicit_with_same_identity() {
+    let f = Fixture::new().await;
+    let store = scala_core::ModelProfilesStore::new(&f.state.core.paths);
+    let id = ModelProfileId::new("h2o-lightning").unwrap();
+    let id_for_update = id.clone();
+    store
+        .update(move |state| {
+            state.profiles.get_mut(&id_for_update).unwrap().engine_id =
+                scala_core::EngineId::new("native_decision")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let original = std::fs::read(&f.state.core.paths.model_profiles_file).unwrap();
+    let before = store.read().await.unwrap();
+    let profile = before.profiles[&id].clone();
+    let error = f.state.runtime.load(id.clone()).await.unwrap_err();
+    assert!(error.to_string().contains("set-engine"), "{error}");
+    assert_eq!(
+        std::fs::read(&f.state.core.paths.model_profiles_file).unwrap(),
+        original
+    );
+    let model = f.state.core.model(&profile.model_id).await.unwrap();
+    let settings = scala_core::SettingsStore::new(&f.state.core.paths)
+        .read()
+        .await
+        .unwrap();
+    let candidate = f
+        .packs
+        .model_profile_engine_switch_candidate(
+            &settings,
+            &profile,
+            &model,
+            "vllm",
+            &f.state.core.paths.data_dir,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&f.state.core.paths.model_profiles_file).unwrap(),
+        original,
+        "preflight is read-only"
+    );
+    let changed_id = id.clone();
+    store
+        .update(move |state| {
+            let profile = state.profiles.get_mut(&changed_id).unwrap();
+            profile.engine_id = scala_core::EngineId::new("vllm")?;
+            profile.overrides = candidate.overrides;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let after = store.read().await.unwrap();
+    let migrated = &after.profiles[&id];
+    assert_eq!(migrated.id, profile.id);
+    assert_eq!(migrated.model_id, profile.model_id);
+    assert_eq!(migrated.role, profile.role);
+    assert_eq!(migrated.display_name, profile.display_name);
+    assert_eq!(migrated.engine_id.as_str(), "vllm");
+    assert!(
+        f.state
+            .runtime
+            .status()
+            .await
+            .backends
+            .iter()
+            .all(|b| b.lifecycle != scala_engine::BackendLifecycle::Running)
+    );
 }

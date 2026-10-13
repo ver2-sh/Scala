@@ -2898,9 +2898,10 @@ dependencies = [
  "scala-core",
  "scala-engine",
  "scala-engine-llama-cpp",
- "scala-engine-native-decision",
  "scala-engine-ninfer",
+ "scala-engine-pytorch",
  "scala-engine-q27",
+ "scala-engine-vllm",
  "scala-model-library",
  "scala-tui",
  "scala-update",
@@ -2926,8 +2927,9 @@ dependencies = [
  "reqwest 0.12.28",
  "scala-core",
  "scala-engine",
- "scala-engine-native-decision",
  "scala-engine-ninfer",
+ "scala-engine-pytorch",
+ "scala-engine-vllm",
  "serde",
  "serde_json",
  "sha2",
@@ -3014,25 +3016,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scala-engine-native-decision"
-version = "0.1.20"
-dependencies = [
- "async-trait",
- "axum",
- "futures-util",
- "reqwest 0.12.28",
- "scala-core",
- "scala-engine",
- "serde",
- "serde_json",
- "sha2",
- "shlex",
- "tempfile",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "scala-engine-ninfer"
 version = "0.1.20"
 dependencies = [
@@ -3048,6 +3031,25 @@ dependencies = [
  "tempfile",
  "tokio",
  "walkdir",
+]
+
+[[package]]
+name = "scala-engine-pytorch"
+version = "0.1.20"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures-util",
+ "reqwest 0.12.28",
+ "scala-core",
+ "scala-engine",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shlex",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -3067,6 +3069,26 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "scala-engine-vllm"
+version = "0.1.20"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "futures-util",
+ "reqwest 0.12.28",
+ "scala-core",
+ "scala-engine",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shlex",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

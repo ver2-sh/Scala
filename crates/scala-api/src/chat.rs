@@ -80,7 +80,8 @@ pub(super) async fn create(
     let completion_id = format!("chatcmpl_{}", Uuid::new_v4().simple());
     let created = unix_timestamp();
     let model = parsed.normalized.model.clone();
-    let inference = parsed.normalized.inference_request()?;
+    let mut inference = parsed.normalized.inference_request()?;
+    inference.api = Some(scala_engine::ApiCapability::ChatCompletions);
     let routing = crate::inference_routing_context(&headers)?;
     if parsed.normalized.stream {
         let routed = state

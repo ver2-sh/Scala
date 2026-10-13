@@ -82,3 +82,6 @@ pub use settings::{
 };
 pub use startup::{StartupError, StartupState, StartupStatus};
 pub use state::{AppSnapshot, ApplicationCore, RegistryState, ServerState};
+
+mod hf_snapshot;
+pub use hf_snapshot::HuggingFaceSnapshot;

@@ -928,6 +928,7 @@ mod tests {
 
     fn request() -> InferenceRequest {
         InferenceRequest {
+            api: None,
             model_profile_id: ModelProfileId::new("model").expect("profile ID"),
             messages: vec![
                 InferenceMessage::text(InferenceRole::Developer, "developer"),

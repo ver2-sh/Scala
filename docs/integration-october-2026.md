@@ -123,7 +123,7 @@ Decision qualification. Synthetic complete-usage protocol tests prove the
 schema-complete success path without granting that contract to a production
 llama.cpp pair. Merely exposing System One or recognizing an upstream revision
 grants neither OpenAI compatibility nor image capability.
-See [native Decision documentation](native-decision.md) for details.
+See [native Decision documentation](decisions.md) for details.
 
 Qualification binds runtime/executable/probe, artifact/native identity, profile,
 resolved settings, auxiliary identity and physical fingerprints. Changed evidence

@@ -256,7 +256,7 @@ pub fn norted_package_manifest_name(format: ArtifactFormat) -> Option<&'static s
         ArtifactFormat::Gguf => Some("BUILD-MANIFEST.json"),
         ArtifactFormat::Q27 => Some("Q27-MANIFEST.json"),
         ArtifactFormat::Ninfer => Some("NINFER-MANIFEST.json"),
-        ArtifactFormat::DecisionBundle => None,
+        ArtifactFormat::DecisionBundle | ArtifactFormat::HuggingFace => None,
     }
 }
 
@@ -278,7 +278,7 @@ pub fn plan_norted_package_acquisition(
         ArtifactFormat::Gguf => plan_gguf(&value),
         ArtifactFormat::Q27 => plan_q27(&value),
         ArtifactFormat::Ninfer => plan_ninfer(&value),
-        ArtifactFormat::DecisionBundle => {
+        ArtifactFormat::DecisionBundle | ArtifactFormat::HuggingFace => {
             Err("Decision source bundles are not Norted packages".into())
         }
     }
@@ -299,7 +299,7 @@ pub fn recover_norted_package_primary_paths(
     let mut paths = HashSet::new();
     for output in outputs.values() {
         let filename = match format {
-            ArtifactFormat::DecisionBundle => return None,
+            ArtifactFormat::DecisionBundle | ArtifactFormat::HuggingFace => return None,
             ArtifactFormat::Ninfer => output
                 .get("artifact")
                 .and_then(|artifact| artifact.get("filename"))
@@ -315,7 +315,7 @@ pub fn recover_norted_package_primary_paths(
             continue;
         };
         let is_primary = match format {
-            ArtifactFormat::DecisionBundle => return None,
+            ArtifactFormat::DecisionBundle | ArtifactFormat::HuggingFace => return None,
             ArtifactFormat::Gguf => {
                 output.get("format").and_then(serde_json::Value::as_str)
                     != Some("high-precision-projector")
@@ -702,7 +702,7 @@ pub(crate) fn discover_package_directory(
         ArtifactFormat::Gguf => discover_gguf(root, &manifest),
         ArtifactFormat::Q27 => discover_q27(root, &manifest),
         ArtifactFormat::Ninfer => discover_ninfer(root, &manifest),
-        ArtifactFormat::DecisionBundle => return None,
+        ArtifactFormat::DecisionBundle | ArtifactFormat::HuggingFace => return None,
     };
     Some(result.unwrap_or_else(|reason| PackageDirectory::Invalid {
         reason,
@@ -1128,7 +1128,7 @@ fn recover_manifest_claims(
     let mut claims = HashSet::new();
     for output in outputs.values() {
         let filename = match format {
-            ArtifactFormat::DecisionBundle => return None,
+            ArtifactFormat::DecisionBundle | ArtifactFormat::HuggingFace => return None,
             ArtifactFormat::Ninfer => output.get("artifact")?.get("filename")?.as_str(),
             ArtifactFormat::Gguf | ArtifactFormat::Q27 => output.get("filename")?.as_str(),
         }?;

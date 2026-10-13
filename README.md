@@ -5,7 +5,7 @@ Scala is a terminal-first local inference control plane. It discovers local mode
 The central distinction is:
 
 ```text
-model artifact = one discovered physical GGUF, q27, or NInfer file
+model artifact = a discovered GGUF/q27/NInfer file, original HF checkpoint, or bound source descriptor
 engine         = adapter, compatibility rules, launch semantics, health, protocol translation
 runtime        = one concrete executable package and version
 settings       = Server Settings plus independent per-runtime inference defaults
@@ -16,7 +16,9 @@ A GGUF model is not permanently tied to llama.cpp, a q27 model is not permanentl
 and an NInfer container is not the NInfer executable itself. Model Profile creation uses registered
 engine compatibility, and exact runtime resolution remains separate from the profile. Today Scala
 ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp),
-[q27](https://github.com/signalnine/q27), and [NInfer](https://github.com/Neroued/ninfer).
+[q27](https://github.com/signalnine/q27), [NInfer](https://github.com/Neroued/ninfer),
+[vLLM](https://github.com/vllm-project/vllm) and [PyTorch](https://github.com/pytorch/pytorch).
+See [qualified Python engines and explicit migration](docs/python-engines.md).
 
 ## License and contributions
 

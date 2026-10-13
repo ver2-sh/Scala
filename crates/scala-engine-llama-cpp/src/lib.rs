@@ -6603,6 +6603,7 @@ mod generation_settings_tests {
 
     fn request(generation_settings: GenerationSettingsPatch) -> InferenceRequest {
         InferenceRequest {
+            api: None,
             model_profile_id: ModelProfileId::new("model").expect("profile ID"),
             messages: vec![InferenceMessage::text(InferenceRole::User, "hello")],
             generation_settings,

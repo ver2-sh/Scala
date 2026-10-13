@@ -820,6 +820,7 @@ impl UiLayout {
                                         ArtifactFormat::Q27 => 7,
                                         ArtifactFormat::Ninfer => 10,
                                         ArtifactFormat::DecisionBundle => 19,
+                                        ArtifactFormat::HuggingFace => 16,
                                     }
                                 } else {
                                     16

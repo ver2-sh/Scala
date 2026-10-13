@@ -518,6 +518,42 @@ impl Drop for JitAdmissionGuard {
     }
 }
 
+/// Abort only the backend activity instance that owned this non-interruptible
+/// Decision, never a later reload of the same persistent profile.
+struct DecisionCancellationGuard {
+    manager: Weak<RuntimeManager>,
+    profile: ModelProfileId,
+    activity: Arc<BackendActivity>,
+    armed: bool,
+}
+impl Drop for DecisionCancellationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.activity.cancel.send_replace(true);
+        if let Some(manager) = self.manager.upgrade() {
+            let profile = self.profile.clone();
+            let activity = self.activity.clone();
+            tokio::spawn(async move {
+                let operation = manager.operation.clone().lock_owned().await;
+                let owns = manager
+                    .state
+                    .read()
+                    .await
+                    .backends
+                    .get(&profile)
+                    .is_some_and(|b| Arc::ptr_eq(&b.activity, &activity) && !b.retiring);
+                if owns {
+                    let _ = manager
+                        .stop_backend_with_operation_held(&profile, operation)
+                        .await;
+                }
+            });
+        }
+    }
+}
+
 impl InferenceTarget {
     fn generation_defaults(&self) -> Result<EffectiveGenerationSettings, RuntimeError> {
         self.generation_settings.ok_or_else(|| {
@@ -1342,7 +1378,8 @@ impl RuntimeManager {
             Some(adapter) => adapter,
             None => {
                 let error = RuntimeError::EngineUnavailable(format!(
-                    "Model Profile `{profile_id}` binds unregistered engine `{engine_id}`"
+                    "Model Profile `{profile_id}`: {}",
+                    crate::unregistered_engine_reason(&engine_id)
                 ));
                 self.fail_loading(generation, error.to_string(), None).await;
                 return Err(error);
@@ -2249,11 +2286,27 @@ impl RuntimeManager {
                 "decision request cancelled during backend retirement".into(),
             ));
         }
+        let mut cancellation_guard = DecisionCancellationGuard {
+            manager: Arc::downgrade(self),
+            profile: request.model_profile_id.clone(),
+            activity: target.lease.activity.clone(),
+            armed: target
+                .adapter
+                .decision_requires_process_retirement_on_cancel(),
+        };
         let result = tokio::select! {
             biased;
             _ = cancel.changed() => return Err(RuntimeError::InferenceUnavailable("decision request cancelled during backend retirement".into())),
             result = target.adapter.decide(&target.endpoint, request) => result.map_err(map_inference_error),
         };
+        // An upstream error may leave a forward running after the HTTP
+        // connection closes. Validation errors completed without such work.
+        if matches!(
+            &result,
+            Ok(_) | Err(RuntimeError::InvalidDecisionRequest(_))
+        ) {
+            cancellation_guard.armed = false;
+        }
         target.lease.decision_terminal = Some(match &result {
             Ok(_) => InferenceActivityPhase::Completed,
             Err(RuntimeError::InferenceTimedOut(_)) => InferenceActivityPhase::Cancelled,
@@ -3915,6 +3968,7 @@ mod tests {
         ] {
             let explicit = patch.reasoning_enabled.is_some() || patch.reasoning_effort.is_some();
             let mut request = InferenceRequest {
+                api: None,
                 model_profile_id: ModelProfileId::new("reasoning-test").unwrap(),
                 messages: vec![crate::InferenceMessage::text(
                     crate::InferenceRole::User,
@@ -3960,6 +4014,7 @@ mod tests {
         };
         for enabled in [true, false] {
             let mut request = InferenceRequest {
+                api: None,
                 model_profile_id: ModelProfileId::new("reasoning-test").unwrap(),
                 messages: vec![crate::InferenceMessage::text(
                     crate::InferenceRole::User,
@@ -4033,6 +4088,7 @@ mod tests {
                 ReasoningEffort::None,
             ] {
                 let mut request = InferenceRequest {
+                    api: None,
                     model_profile_id: ModelProfileId::new("native-effort-test").unwrap(),
                     messages: vec![crate::InferenceMessage::text(
                         crate::InferenceRole::User,
@@ -4328,6 +4384,7 @@ mod tests {
             let length = length.as_u64().unwrap() as usize;
             for stream in [false, true] {
                 let request = crate::InferenceRequest {
+                    api: None,
                     model_profile_id: fixture.profile_id.clone(),
                     messages: messages[..length].to_vec(),
                     generation_settings: crate::GenerationSettingsPatch::default(),
@@ -4402,6 +4459,77 @@ mod tests {
             fixture.manager.status().await.backends[0].active_request_count,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn noninterruptible_decision_cancellation_retires_only_its_backend_activity() {
+        let mut adapter = crate::decision::tests::DecisionAdapter::new(true);
+        adapter.retire_on_cancel = true;
+        adapter.decision_gate = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+        let adapter = Arc::new(adapter);
+        let fixture = decision_fixture(adapter.clone(), "1", Some("native-decision-fixture")).await;
+        let manager = fixture.manager.clone();
+        let profile = fixture.profile_id.clone();
+        let task = tokio::spawn(async move {
+            manager
+                .decide_routed(
+                    crate::decision::tests::request(profile),
+                    InferenceRoutingContext::default(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while adapter.calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = fixture.manager.state.read().await;
+                let b = &state.backends[&fixture.profile_id];
+                if b.retiring
+                    && b.lifecycle == BackendLifecycle::Failed
+                    && b.activity.active_requests.load(Ordering::Acquire) == 0
+                {
+                    break;
+                }
+                drop(state);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(adapter.decision_cancelled.load(Ordering::SeqCst), 1);
+        // This synthetic process is intentionally outside the supervisor, so
+        // failed retirement remains visible instead of pretending it was killed.
+        assert!(
+            fixture.manager.status().await.backends[0]
+                .failure
+                .as_ref()
+                .unwrap()
+                .contains("not tracked")
+        );
+        let activity = BackendActivity::new();
+        {
+            let mut state = fixture.manager.state.write().await;
+            state
+                .backends
+                .get_mut(&fixture.profile_id)
+                .unwrap()
+                .activity = activity.clone();
+        }
+        drop(DecisionCancellationGuard {
+            manager: Arc::downgrade(&fixture.manager),
+            profile: fixture.profile_id.clone(),
+            activity: BackendActivity::new(),
+            armed: true,
+        });
+        tokio::task::yield_now().await;
+        assert!(!*activity.cancel.borrow());
     }
 
     #[tokio::test]

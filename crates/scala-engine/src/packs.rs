@@ -316,7 +316,7 @@ impl RuntimePackManager {
         settings: &mut scala_core::ResolvedSettings,
     ) -> Result<(), RuntimePackError> {
         let adapter = self.registry.get(engine_id).ok_or_else(|| {
-            RuntimePackError::Selection(format!("bound engine `{engine_id}` is not registered"))
+            RuntimePackError::Selection(crate::unregistered_engine_reason(engine_id))
         })?;
         adapter
             .normalize_settings(settings)
@@ -330,7 +330,7 @@ impl RuntimePackManager {
         settings: &scala_core::ResolvedSettings,
     ) -> Result<(), RuntimePackError> {
         let adapter = self.registry.get(&settings.engine_id).ok_or_else(|| {
-            RuntimePackError::Selection(format!("unknown engine `{}`", settings.engine_id))
+            RuntimePackError::Selection(crate::unregistered_engine_reason(&settings.engine_id))
         })?;
         adapter
             .validate_configuration(runtime, model, &self.host_capabilities().await, settings)
@@ -631,7 +631,7 @@ impl RuntimePackManager {
         engine_id: &str,
     ) -> Result<scala_core::SettingsSchema, RuntimePackError> {
         let adapter = self.registry.get(engine_id).ok_or_else(|| {
-            RuntimePackError::Selection(format!("bound engine `{engine_id}` is not registered"))
+            RuntimePackError::Selection(crate::unregistered_engine_reason(engine_id))
         })?;
         if let CompatibilityDecision::Unsupported { reason } = adapter.compatibility(model) {
             return Err(RuntimePackError::Selection(reason));
@@ -657,7 +657,7 @@ impl RuntimePackManager {
             .resolve_for_settings(model, engine_id, explicit_runtime, settings)
             .await?;
         let adapter = self.registry.get(engine_id).ok_or_else(|| {
-            RuntimePackError::Selection(format!("bound engine `{engine_id}` is not registered"))
+            RuntimePackError::Selection(crate::unregistered_engine_reason(engine_id))
         })?;
         let host = self.host_capabilities().await;
         let schema = adapter
@@ -1077,9 +1077,9 @@ impl RuntimePackManager {
                             RuntimeCompatibility::Incompatible(reason)
                         }
                     },
-                    None => RuntimeCompatibility::Incompatible(
-                        "engine adapter is not registered".to_owned(),
-                    ),
+                    None => RuntimeCompatibility::Incompatible(crate::unregistered_engine_reason(
+                        &runtime.manifest.identity.engine_id,
+                    )),
                 };
                 InstalledRuntimeStatus {
                     latest_installed: latest_installed.contains(&runtime.manifest.runtime_id),
@@ -1640,7 +1640,7 @@ impl RuntimePackManager {
         let selection =
             self.resolve_from_local_inspection(model, Some(engine_id), settings, inspection)?;
         let adapter = self.registry.get(engine_id).ok_or_else(|| {
-            RuntimePackError::Selection(format!("bound engine `{engine_id}` is not registered"))
+            RuntimePackError::Selection(crate::unregistered_engine_reason(engine_id))
         })?;
         let schema = adapter
             .settings_schema(&selection.runtime, model, &inspection.host, settings)

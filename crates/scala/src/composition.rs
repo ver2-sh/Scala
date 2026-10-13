@@ -117,12 +117,14 @@ pub fn engine_registry_from_config(
         config.engine.get(NINFER_ENGINE_ID),
         config_directory,
     )))?;
-    registry.register(Arc::new(
-        scala_engine_native_decision::NativeDecisionAdapter::from_config(
-            config.engine.get(scala_engine_native_decision::ENGINE_ID),
-            config_directory,
-        ),
-    ))?;
+    registry.register(Arc::new(scala_engine_vllm::VllmAdapter::from_config(
+        config.engine.get(scala_engine_vllm::ENGINE_ID),
+        config_directory,
+    )))?;
+    registry.register(Arc::new(scala_engine_pytorch::PyTorchAdapter::from_config(
+        config.engine.get(scala_engine_pytorch::ENGINE_ID),
+        config_directory,
+    )))?;
     Ok(registry)
 }
 
@@ -417,6 +419,37 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{ServerStartupGuard, discover_existing_control, validate_public_auth_startup};
+
+    #[test]
+    fn first_class_python_engines_register_independently_without_legacy_engine() {
+        let config: scala_core::AppConfig =
+            toml::from_str("version = 1\n[engine.native_decision]\nenabled = true\n").unwrap();
+        let registry =
+            super::engine_registry_from_config(&config, std::path::Path::new("config.toml"))
+                .unwrap();
+        let mut ids = registry
+            .adapters()
+            .map(|a| a.identity().id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec!["llama.cpp", "ninfer", "pytorch", "q27", "vllm"]);
+        assert!(registry.get("native_decision").is_none());
+        assert!(config.engine.contains_key("native_decision"));
+        assert!(
+            registry
+                .setting_definitions()
+                .unwrap()
+                .iter()
+                .any(|d| d.id.as_str() == "vllm.temperature")
+        );
+        assert!(
+            registry
+                .setting_definitions()
+                .unwrap()
+                .iter()
+                .any(|d| d.id.as_str() == "pytorch.fast")
+        );
+    }
 
     #[test]
     fn required_auth_without_an_active_key_fails_before_server_binding() {

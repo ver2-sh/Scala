@@ -7250,6 +7250,7 @@ mod tests {
 
     fn inference_request(generation_settings: GenerationSettingsPatch) -> InferenceRequest {
         InferenceRequest {
+            api: None,
             model_profile_id: ModelProfileId::new("profile-alias").expect("profile ID"),
             messages: Vec::new(),
             generation_settings,

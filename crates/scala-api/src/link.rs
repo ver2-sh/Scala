@@ -1271,7 +1271,7 @@ mod tests {
                         id.clone(),
                         name,
                         model.clone(),
-                        scala_core::EngineId::new("native_decision").unwrap(),
+                        scala_core::EngineId::new("pytorch").unwrap(),
                     )?;
                     profiles.profiles.get_mut(&id).unwrap().role = scala_core::ModelRole::Auxiliary;
                 }
@@ -1299,7 +1299,7 @@ mod tests {
         let mut inventory = link.inventory().await.unwrap();
         inventory.node_id = owner.into();
         inventory.name = "Eugene-Gaming".into();
-        inventory.engines = vec!["native_decision".into()];
+        inventory.engines = vec!["pytorch".into()];
         inventory
             .profiles
             .retain(|profile| names.contains(&profile.id.as_str()));
@@ -1320,7 +1320,7 @@ mod tests {
             inventory.models.push(model);
         }
         for profile in &inventory.profiles {
-            assert_eq!(profile.engine_id, "native_decision");
+            assert_eq!(profile.engine_id, "pytorch");
             assert!(profile.installed && profile.backend.is_none());
         }
         // Exercise the actual serialization contract accepted from a Windows

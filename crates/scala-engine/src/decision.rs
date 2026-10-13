@@ -305,6 +305,7 @@ pub(crate) mod tests {
         pub fail: bool,
         pub native_effort_admission: bool,
         pub calls: AtomicUsize,
+        pub retire_on_cancel: bool,
         pub decision_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
         pub decision_cancelled: std::sync::Arc<AtomicUsize>,
         pub image_inputs: bool,
@@ -322,6 +323,7 @@ pub(crate) mod tests {
                 fail: false,
                 native_effort_admission: false,
                 calls: AtomicUsize::new(0),
+                retire_on_cancel: false,
                 decision_gate: None,
                 decision_cancelled: Default::default(),
                 image_inputs: false,
@@ -334,6 +336,10 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl EngineAdapter for DecisionAdapter {
+        fn decision_requires_process_retirement_on_cancel(&self) -> bool {
+            self.retire_on_cancel
+        }
+
         fn validate_inference_request(
             &self,
             request: &InferenceRequest,

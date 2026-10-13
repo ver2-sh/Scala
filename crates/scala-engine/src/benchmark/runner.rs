@@ -874,6 +874,7 @@ impl RuntimeManager {
             max = Some(max.unwrap_or(cap).min(value));
         }
         Ok(crate::InferenceRequest {
+            api: None,
             model_profile_id: run.profile.id.clone(),
             messages: if messages.is_empty() {
                 vec![InferenceMessage::text(

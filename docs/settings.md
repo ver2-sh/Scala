@@ -12,7 +12,7 @@ Runtime default → Settings runtime override → Model-profile override → Loa
 ```
 
 Runtime defaults are read-only, version/variant/context-specific baselines. Settings stores independent
-explicit overrides for llama.cpp, q27 and NInfer. No engine inherits another engine's values.
+explicit overrides for llama.cpp, q27, NInfer, vllm and pytorch. No engine inherits another engine's values.
 Profiles inherit from their engine's Settings, and store only their own explicit overrides.
 Load overrides last for the session; request overrides last for one request and win over load values
 where request-time capability exists. Neither is persisted or changes an already-loaded process-only setting.
@@ -156,3 +156,10 @@ DFlash2 can use one augmented file as runtime alternatives. Vision inclusion is
 separate from `ninfer.vision` residency, and Host/Device caches are independent
 context-retention controls. Nothing selects K7, greedy, a 256-token thinking budget,
 Vision on or disabled caches automatically. See [NInfer](ninfer.md).
+
+## Python engines
+
+[vLLM and PyTorch](python-engines.md#settings-and-runner-contract) have independent
+`vllm.*` and `pytorch.*` controls. Runtime observations remain read-only; Inherit
+removes an override. The pinned Imajev runner exposes fast mode, not generic
+generation/readout/calibration settings. Unsupported tuple overrides remain errors.

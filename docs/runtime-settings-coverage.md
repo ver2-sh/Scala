@@ -247,3 +247,11 @@ where the selected runtime honors them.
 
 No progress, terminal status, timing, native initialization or observed setting
 value is copied into Settings or Model Profile overrides.
+
+## Independently qualified Python runtimes
+
+The [vLLM and PyTorch adapters](python-engines.md) use the normal inventory,
+Model Profile, Settings and lifecycle contracts. vLLM text and trained-label tuples
+have different controls; pinned Windows restrictions are explicit. PyTorch
+qualifies only the Imajev runner and its `pytorch.fast` control. Installed upstream
+versions and bound source/dependency fingerprints are independent of Scala versions.

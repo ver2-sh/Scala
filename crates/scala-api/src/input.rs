@@ -29,6 +29,7 @@ impl NormalizedRequest {
             )
         })?;
         Ok(InferenceRequest {
+            api: None,
             model_profile_id,
             messages: self.messages.clone(),
             max_output_tokens: self.max_output_tokens,
