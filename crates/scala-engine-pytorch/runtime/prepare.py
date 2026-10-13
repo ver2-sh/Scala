@@ -47,6 +47,9 @@ def main():
     r.add_argument("--wheel-attestation", action="append", nargs=4,
                    metavar=("PACKAGE", "ORIGINAL_WHEEL", "WHEEL_SHA256", "MISMATCHES_JSON"),
                    help="pin an original upstream wheel and exact known bad RECORD members; never alter installed bytes")
+    r.add_argument("--managed-root", type=Path, help="Scala-owned pending package; all interpreter and source files must be contained")
+    r.add_argument("--verified-source-archive", type=Path)
+    r.add_argument("--source-archive-sha256")
     r.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
     if args.mode == "bundle":
@@ -81,6 +84,11 @@ def main():
         script = 'import importlib.metadata as m,json; print(json.dumps({d.metadata["Name"]:d.version for d in m.distributions()}))'
         packages = json.loads(subprocess.check_output([str(python), "-I", "-c", script], text=True))
         cfg = {"schema_version": 1, "backend": args.backend, "packages": packages, "options": {k: json.loads(v) for k, v in args.option}}
+        if args.managed_root:
+            root = args.managed_root.resolve(strict=True)
+            if not (root / ".scala-python-pending").is_file() or not python.is_relative_to(root) or not args.output.is_relative_to(root):
+                raise ValueError("Managed runtime must belong to its pending package")
+            cfg["managed_root"] = str(root)
         if len(cfg["options"]) != len(args.option):
             raise ValueError("Duplicate runtime option")
         if args.wheel_attestation:
@@ -96,9 +104,27 @@ def main():
             if args.source is None or not args.source_revision:
                 raise ValueError("Exact native readout source checkout is required")
             root = args.source.resolve(strict=True)
-            rev = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
-            if rev != args.source_revision or subprocess.check_output(["git", "-C", str(root), "status", "--porcelain"], text=True):
-                raise ValueError("Native implementation checkout is dirty or at a different revision")
+            if args.verified_source_archive:
+                # Admission is tied to the reviewed immutable archive, never a
+                # claim made by an arbitrary unpacked source directory.
+                import zipfile
+                expected = "2a03a2919f4f0c01dc905f33428c2755a0f206deb42d4515526289b980cf4c23"
+                if args.source_revision != "91729bff7a806187324e287fd0d730839dc32026" or args.source_archive_sha256 != expected or runtime.sha(args.verified_source_archive) != expected:
+                    raise ValueError("Unqualified managed source archive")
+                with zipfile.ZipFile(args.verified_source_archive) as archive:
+                    prefix = archive.namelist()[0].split("/")[0] + "/"
+                    original = {member.filename.removeprefix(prefix): member for member in archive.infolist() if not member.is_dir()}
+                    observed = files(root)
+                    if set(original) != set(observed):
+                        raise ValueError("Managed source inventory changed")
+                    import hashlib
+                    if any(hashlib.sha256(archive.read(member)).hexdigest() != observed[name]["sha256"] for name, member in original.items()):
+                        raise ValueError("Managed source bytes differ from the reviewed archive")
+                rev = args.source_revision
+            else:
+                rev = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+                if rev != args.source_revision or subprocess.check_output(["git", "-C", str(root), "status", "--porcelain"], text=True):
+                    raise ValueError("Native implementation checkout is dirty or at a different revision")
             inventory = files(root / "src", True)
             inventory = {"src/" + k: v for k, v in inventory.items()}
             inventory.update({"scripts/" + k: v for k, v in files(root / "scripts", True).items()})
@@ -128,7 +154,10 @@ def main():
                 entry.write_text("#!/bin/sh\nexec " + shlex.quote(str(python)) + " -I " + shlex.quote(str((args.output / "server.py").absolute())) + ' "$@"\n')
                 entry.chmod(0o755)
                 command = [str(entry.absolute())]
-            print(subprocess.check_output(command + ["--scala-probe"], text=True).strip())
+            if args.managed_root:
+                print("Prepared managed runner; Scala admission verification is pending")
+            else:
+                print(subprocess.check_output(command + ["--scala-probe"], text=True).strip())
         except BaseException:
             if launcher_created:
                 launcher.unlink(missing_ok=True)

@@ -37,13 +37,13 @@ pub enum RuntimeInstallError {
         "runtime `{0}` has no trustworthy SHA-256 package digest; managed installation is refused"
     )]
     MissingDigest(String),
-    #[error("runtime download URL is not an approved GitHub release host: {0}")]
+    #[error("runtime download URL is not an approved acquisition source: {0}")]
     UntrustedUrl(String),
     #[error("runtime download failed: {0}")]
     Download(String),
     #[error("runtime release provenance changed or could not be verified: {0}")]
     SourceChanged(String),
-    #[error("runtime source-build prerequisite is not satisfied: {0}")]
+    #[error("runtime host prerequisite is not satisfied: {0}")]
     Prerequisite(String),
     #[error("runtime source build failed: {0}")]
     SourceBuild(String),
@@ -157,6 +157,9 @@ impl RuntimeInstaller {
         authority
             .validate(available)
             .map_err(|error| RuntimeInstallError::InvalidMetadata(error.to_string()))?;
+        if let RuntimeAcquisitionPlan::ManagedPython(plan) = &available.acquisition {
+            return self.install_python(available, plan).await;
+        }
         if let RuntimeAcquisitionPlan::SourceBuild(plan) = &available.acquisition {
             return self.install_source_build(available, authority, plan).await;
         }
@@ -278,6 +281,7 @@ impl RuntimeInstaller {
                 downloaded_archive_sha256: Some(expected.value.clone()),
                 additional_downloaded_archive_sha256: additional_digests.clone(),
                 source_build: None,
+                python_environment: None,
                 entrypoint: relative_entrypoint,
                 entrypoint_sha256,
                 installed_at_unix: Some(unix_timestamp()),
@@ -363,6 +367,403 @@ impl RuntimeInstaller {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) async fn python_compatibility(
+        &self,
+        plan: &scala_core::RuntimePythonPlan,
+    ) -> RuntimeCompatibility {
+        match check_python_prerequisites(plan).await {
+            Ok(()) => RuntimeCompatibility::Compatible,
+            Err(error) => RuntimeCompatibility::Incompatible(error.to_string()),
+        }
+    }
+
+    async fn install_python(
+        &self,
+        available: &AvailableRuntime,
+        plan: &scala_core::RuntimePythonPlan,
+    ) -> Result<InstalledRuntime, RuntimeInstallError> {
+        let result = self.install_python_inner(available, plan).await;
+        if let Err(error) = &result {
+            self.emit(
+                available,
+                RuntimeOperationPhase::Failed,
+                None,
+                None,
+                &error.to_string(),
+            );
+        }
+        result
+    }
+
+    async fn install_python_inner(
+        &self,
+        available: &AvailableRuntime,
+        plan: &scala_core::RuntimePythonPlan,
+    ) -> Result<InstalledRuntime, RuntimeInstallError> {
+        self.emit(
+            available,
+            RuntimeOperationPhase::CheckingPrerequisites,
+            None,
+            None,
+            "Checking Python runtime host prerequisites",
+        );
+        check_python_prerequisites(plan).await?;
+        let adapter = self
+            .registry
+            .get(&available.identity.engine_id)
+            .ok_or_else(|| RuntimeInstallError::Adapter(available.identity.engine_id.clone()))?;
+        let assets = adapter.managed_python_assets();
+        if crate::python_runtime::python_recipe_digest(&plan.recipe_id, &assets)
+            != plan.recipe_sha256
+        {
+            return Err(RuntimeInstallError::InvalidMetadata(
+                "embedded Python recipe does not match catalog authority".into(),
+            ));
+        }
+        // Serialize shared cache acquisition across processes. Installed wheels
+        // are copied, so cache pruning never invalidates an installed runtime.
+        let cache = self.cache_root.join("python");
+        std::fs::create_dir_all(&cache)
+            .map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+        reject_cache_aliases(&self.cache_root, &cache)?;
+        let owner = cache.join(".scala-cache-owner");
+        if owner.exists() {
+            if std::fs::symlink_metadata(&owner).is_ok_and(|m| m.file_type().is_symlink())
+                || std::fs::read_to_string(&owner).ok().as_deref()
+                    != Some("scala-managed-python-cache-v1")
+            {
+                return Err(RuntimeInstallError::Download(
+                    "private Python cache ownership is invalid".into(),
+                ));
+            }
+        } else if std::fs::read_dir(&cache)
+            .map_err(|e| RuntimeInstallError::Download(e.to_string()))?
+            .next()
+            .is_some()
+        {
+            return Err(RuntimeInstallError::Download(
+                "refusing to adopt an unowned Python cache".into(),
+            ));
+        } else {
+            std::fs::write(owner, "scala-managed-python-cache-v1")
+                .map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+        }
+        for child in ["uv", "downloads", "windows-acquisition"] {
+            let path = cache.join(child);
+            if path.exists() {
+                reject_cache_aliases(&self.cache_root, &path)?;
+            }
+        }
+        let cache_lock_path = cache.join("acquisition.lock");
+        if std::fs::symlink_metadata(&cache_lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(RuntimeInstallError::Download(
+                "Python cache lease is a symlink".into(),
+            ));
+        }
+        let cache_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(cache_lock_path)
+            .map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+        fs2::FileExt::try_lock_exclusive(&cache_lock).map_err(|_| {
+            RuntimeInstallError::Prerequisite(
+                "another Scala Python runtime is acquiring dependencies; retry after it finishes"
+                    .into(),
+            )
+        })?;
+        let mut manifest = RuntimeManifest {
+            schema_version: RUNTIME_MANIFEST_SCHEMA_VERSION,
+            runtime_id: available.runtime_id.clone(),
+            identity: available.identity.clone(),
+            supported_formats: available.supported_formats.clone(),
+            supported_native_identities: available.supported_native_identities.clone(),
+            requirements: available.requirements.clone(),
+            acquisition_method: RuntimeAcquisitionMethod::ManagedPython,
+            source_url: Some(available.source_url.clone()),
+            downloaded_archive_sha256: None,
+            additional_downloaded_archive_sha256: Vec::new(),
+            source_build: None,
+            python_environment: None,
+            entrypoint: if cfg!(windows) {
+                if available.identity.engine_id == "vllm" {
+                    "managed-env/Scripts/python.exe"
+                } else {
+                    "environment/Scripts/python.exe"
+                }
+            } else if available.identity.engine_id == "vllm" {
+                "runner/vllm-server"
+            } else {
+                "runner/pytorch-server"
+            }
+            .into(),
+            entrypoint_sha256: "0".repeat(64),
+            installed_at_unix: Some(unix_timestamp()),
+            probe: RuntimeProbeObservation {
+                compatible: false,
+                observed_engine_id: available.identity.engine_id.clone(),
+                observed_version: None,
+                observed_revision: None,
+                detail: "admission pending".into(),
+                observed_at_unix: unix_timestamp(),
+            },
+        };
+        cleanup_python_partials(&cache.join("downloads"))?;
+        let required_disk = if available.identity.engine_id == "vllm" {
+            32_u64
+        } else {
+            16_u64
+        } * 1024
+            * 1024
+            * 1024;
+        if fs2::available_space(self.store.root()).map_err(|e| {
+            RuntimeInstallError::Prerequisite(format!("cannot check runtime disk capacity: {e}"))
+        })? < required_disk
+        {
+            return Err(RuntimeInstallError::Prerequisite(format!(
+                "insufficient runtime disk space; this recipe reserves {} GiB for dependencies and staging",
+                required_disk / (1024 * 1024 * 1024)
+            )));
+        }
+        let mut staging = self.store.create_python_staging(&manifest).await?;
+        for asset in &assets {
+            let relative = Path::new(asset.name);
+            if !is_safe_relative_path(relative) {
+                return Err(RuntimeInstallError::InvalidMetadata(
+                    "unsafe embedded resource path".into(),
+                ));
+            }
+            let path = staging.join("recipes").join(relative);
+            std::fs::create_dir_all(path.parent().expect("asset parent"))
+                .map_err(|e| RuntimeInstallError::Task(e.to_string()))?;
+            std::fs::write(path, asset.bytes)
+                .map_err(|e| RuntimeInstallError::Task(e.to_string()))?;
+        }
+        std::fs::create_dir(staging.join("work"))
+            .map_err(|e| RuntimeInstallError::Task(e.to_string()))?;
+        std::fs::write(
+            staging.join("recipe.json"),
+            serde_json::to_vec_pretty(plan)
+                .map_err(|e| RuntimeInstallError::InvalidMetadata(e.to_string()))?,
+        )
+        .map_err(|e| RuntimeInstallError::Task(e.to_string()))?;
+        let mut acquired = Vec::new();
+        for download in [&plan.python, &plan.package_tool]
+            .into_iter()
+            .chain(plan.source.iter())
+        {
+            let url = download
+                .url
+                .parse::<reqwest::Url>()
+                .map_err(|e| RuntimeInstallError::UntrustedUrl(e.to_string()))?;
+            let digest = download.digest.as_ref().ok_or_else(|| {
+                RuntimeInstallError::MissingDigest(available.runtime_id.to_string())
+            })?;
+            acquired.push(
+                self.download(
+                    available,
+                    download,
+                    &url,
+                    &digest.value,
+                    download.size_bytes,
+                )
+                .await?,
+            );
+        }
+        self.emit(
+            available,
+            RuntimeOperationPhase::Extracting,
+            None,
+            None,
+            "Extracting verified private interpreter and package tool",
+        );
+        let python_archive = acquired[0].clone();
+        let tool_archive = acquired[1].clone();
+        staging = run_owned_staging_operation(staging, move |root| {
+            extract_archive(&python_archive, root, RuntimeArchiveFormat::TarGz)?;
+            std::fs::create_dir(root.join("tool"))
+                .map_err(|e| RuntimeInstallError::Task(e.to_string()))?;
+            extract_archive(&tool_archive, &root.join("tool"), RuntimeArchiveFormat::Zip)
+        })
+        .await?;
+        let uv = locate_entrypoint(&staging.join("tool"), &plan.package_tool.entrypoint_names)
+            .map_err(RuntimeInstallError::Entrypoint)?;
+        set_unix_mode(&uv, Some(0o755))?;
+        let python = staging.join(if cfg!(windows) {
+            "python/python.exe"
+        } else {
+            "python/bin/python3.12"
+        });
+        let args = vec![
+            "-I".to_owned(),
+            "-B".into(),
+            staging.join("recipes/provision.py").display().to_string(),
+            "--root".into(),
+            staging.display().to_string(),
+            "--uv".into(),
+            uv.display().to_string(),
+        ];
+        let mut args = args;
+        if let Some(source) = acquired.get(2) {
+            args.extend(["--source-archive".into(), source.display().to_string()]);
+        }
+        let environment = crate::python_runtime::python_install_environment(&staging, &cache);
+        let this = self.clone();
+        let candidate = available.clone();
+        let callback = Arc::new(move |detail: &str| {
+            this.emit(
+                &candidate,
+                RuntimeOperationPhase::Installing,
+                None,
+                None,
+                detail.trim(),
+            );
+        });
+        let output = crate::supervisor::capture_install_command(
+            &python,
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            &environment,
+            callback,
+            Some(&cache_lock),
+        )
+        .await?;
+        if !output.success {
+            // Keep bounded diagnostics outside disposable staging, never packages/models.
+            let _ = std::fs::write(
+                cache.join("last-failure.log"),
+                format!("{}\n{}", output.stdout, output.stderr),
+            );
+            return Err(RuntimeInstallError::Task(format!(
+                "Python dependency/runner provisioning exited {:?}: {}",
+                output.code, output.stderr
+            )));
+        }
+        self.emit(
+            available,
+            RuntimeOperationPhase::Probing,
+            None,
+            None,
+            "Verifying original runner and complete installed dependency closure",
+        );
+        manifest.entrypoint_sha256 = hash_file(&staging.join(&manifest.entrypoint))
+            .await
+            .map_err(|e| RuntimeInstallError::Entrypoint(e.to_string()))?;
+        let candidate = InstalledRuntime {
+            manifest: manifest.clone(),
+            installation_root: staging.path().to_owned(),
+        };
+        manifest.probe = adapter.admit_managed_python(&candidate).await?;
+        manifest.python_environment = Some(scala_core::RuntimePythonProvenance {
+            plan: plan.clone(),
+            observation_key: adapter
+                .managed_python_observation_key(&InstalledRuntime {
+                    manifest: manifest.clone(),
+                    installation_root: staging.path().to_owned(),
+                })
+                .await
+                .ok_or_else(|| {
+                    RuntimeInstallError::InvalidMetadata(
+                        "managed Python metadata observation could not be verified".into(),
+                    )
+                })?,
+            environment_revision: manifest.probe.observed_revision.clone().ok_or_else(|| {
+                RuntimeInstallError::InvalidMetadata(
+                    "Python probe omitted its verified environment identity".into(),
+                )
+            })?,
+        });
+        manifest
+            .validate()
+            .map_err(|e| RuntimeInstallError::InvalidMetadata(e.to_string()))?;
+        if hash_file(&staging.join(&manifest.entrypoint))
+            .await
+            .map_err(|e| RuntimeInstallError::Entrypoint(e.to_string()))?
+            != manifest.entrypoint_sha256
+        {
+            return Err(RuntimeInstallError::Entrypoint(
+                "managed entrypoint changed during admission".into(),
+            ));
+        }
+        // Prune only uv's private cache, with the acquisition lease still held.
+        let mut prune_args = vec!["--no-config", "cache", "prune"];
+        if python_cache_bytes(&cache.join("uv"))? > 16 * 1024 * 1024 * 1024 {
+            prune_args.push("--ci");
+        }
+        let prune = crate::supervisor::capture_install_command(
+            &uv,
+            &prune_args,
+            &environment,
+            Arc::new(|_| {}),
+            Some(&cache_lock),
+        )
+        .await?;
+        if !prune.success {
+            tracing::warn!(detail = %prune.stderr, "private uv cache prune failed");
+        }
+        cleanup_python_downloads(&cache.join("downloads"), 2 * 1024 * 1024 * 1024)?;
+        self.emit(
+            available,
+            RuntimeOperationPhase::Installing,
+            None,
+            None,
+            "Atomically admitting verified immutable Python runtime",
+        );
+        let installed = self.store.activate_python(&mut staging, &manifest).await?;
+        self.emit(
+            available,
+            RuntimeOperationPhase::Installed,
+            None,
+            None,
+            "Runtime installed; model loading remains a separate action",
+        );
+        Ok(installed)
+    }
+
+    pub(crate) async fn clean_python_cache(&self) -> Result<(), RuntimeInstallError> {
+        let cache = self.cache_root.join("python");
+        if !cache.exists() {
+            return Ok(());
+        }
+        reject_cache_aliases(&self.cache_root, &cache)?;
+        let owner = cache.join(".scala-cache-owner");
+        if std::fs::symlink_metadata(&owner).is_ok_and(|m| m.file_type().is_symlink())
+            || std::fs::read_to_string(&owner).ok().as_deref()
+                != Some("scala-managed-python-cache-v1")
+        {
+            return Err(RuntimeInstallError::Download(
+                "cache has no Scala ownership proof".into(),
+            ));
+        }
+        let lock_path = cache.join("acquisition.lock");
+        if std::fs::symlink_metadata(&lock_path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(RuntimeInstallError::Download(
+                "cache lease is an alias".into(),
+            ));
+        }
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| {
+            RuntimeInstallError::Prerequisite(
+                "Python acquisition is active; cache is protected".into(),
+            )
+        })?;
+        for name in ["uv", "downloads", "windows-acquisition"] {
+            let disposable = cache.join(name);
+            if disposable.exists() {
+                reject_cache_aliases(&self.cache_root, &disposable)?;
+                std::fs::remove_dir_all(disposable)
+                    .map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     async fn install_source_build(
@@ -665,6 +1066,7 @@ impl RuntimeInstaller {
                 downloaded_archive_sha256: None,
                 additional_downloaded_archive_sha256: Vec::new(),
                 source_build: Some(source_build),
+                python_environment: None,
                 entrypoint: relative_entrypoint,
                 entrypoint_sha256,
                 installed_at_unix: Some(installed_at),
@@ -753,7 +1155,14 @@ impl RuntimeInstaller {
         expected: &str,
         total_package_size: u64,
     ) -> Result<PathBuf, RuntimeInstallError> {
-        let downloads = self.cache_root.join("downloads");
+        let downloads = if matches!(
+            available.acquisition,
+            RuntimeAcquisitionPlan::ManagedPython(_)
+        ) {
+            self.cache_root.join("python/downloads")
+        } else {
+            self.cache_root.join("downloads")
+        };
         tokio::fs::create_dir_all(&downloads)
             .await
             .map_err(|error| RuntimeInstallError::Download(error.to_string()))?;
@@ -794,6 +1203,7 @@ impl RuntimeInstaller {
             }
         }
         let temporary = downloads.join(format!("{}.part", uuid::Uuid::new_v4()));
+        let _partial = DownloadPartial(temporary.clone());
         let mut file = tokio::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -801,9 +1211,15 @@ impl RuntimeInstaller {
             .await
             .map_err(|error| RuntimeInstallError::Download(error.to_string()))?;
         let result = async {
-            let response = self
-                .github
-                .release_download_request(url)
+            let request = if matches!(
+                available.acquisition,
+                RuntimeAcquisitionPlan::ManagedPython(_)
+            ) {
+                self.github.python_download_request(url)
+            } else {
+                self.github.release_download_request(url)
+            };
+            let response = request
                 .map_err(|error| RuntimeInstallError::Download(error.to_string()))?
                 .send()
                 .await
@@ -967,6 +1383,200 @@ fn configure_source_process_group(command: &mut tokio::process::Command) {
 
 #[cfg(not(unix))]
 fn configure_source_process_group(_command: &mut tokio::process::Command) {}
+async fn check_python_prerequisites(
+    plan: &scala_core::RuntimePythonPlan,
+) -> Result<(), RuntimeInstallError> {
+    if !cfg!(any(target_os = "linux", windows)) || std::env::consts::ARCH != "x86_64" {
+        return Err(RuntimeInstallError::Prerequisite(
+            "reviewed Python recipes require Linux glibc x86_64 or native Windows x86_64".into(),
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(minimum) = &plan.minimum_glibc {
+        let output = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::process::Command::new("getconf")
+                .arg("GNU_LIBC_VERSION")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| RuntimeInstallError::Prerequisite("glibc probe timed out".into()))?
+        .map_err(|e| RuntimeInstallError::Prerequisite(format!("cannot verify glibc: {e}")))?;
+        let version = String::from_utf8_lossy(&output.stdout);
+        let version = version.split_whitespace().last().unwrap_or("");
+        let parts = |v: &str| {
+            v.split('.')
+                .map(str::parse::<u32>)
+                .collect::<Result<Vec<_>, _>>()
+        };
+        if !output.status.success()
+            || parts(version)
+                .ok()
+                .zip(parts(minimum).ok())
+                .is_none_or(|(actual, floor)| actual < floor)
+        {
+            return Err(RuntimeInstallError::Prerequisite(format!(
+                "this exact wheel closure requires glibc {minimum} or later; observed `{version}`"
+            )));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if plan.backend.starts_with("vllm") {
+        command_text("c++", &["--version"], None)
+            .await
+            .map_err(|error| {
+                RuntimeInstallError::Prerequisite(format!(
+                    "vLLM native JIT needs an existing C++ compiler: {error}"
+                ))
+            })?;
+    }
+    #[cfg(windows)]
+    if plan.backend.starts_with("vllm") {
+        // vswhere is an existing Microsoft host tool, never installed globally.
+        let base = std::env::var_os("ProgramFiles(x86)").ok_or_else(|| {
+            RuntimeInstallError::Prerequisite("Visual Studio C++ tools cannot be located".into())
+        })?;
+        let vswhere = PathBuf::from(base).join("Microsoft Visual Studio/Installer/vswhere.exe");
+        let output = crate::capture_owned_command(
+            &vswhere,
+            &[
+                "-products",
+                "*",
+                "-version",
+                "[16.0,)",
+                "-requires",
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-property",
+                "installationPath",
+            ],
+            &BTreeMap::new(),
+            &[],
+            Duration::from_secs(3),
+        )
+        .await?;
+        if !output.success || output.stdout.trim().is_empty() {
+            return Err(RuntimeInstallError::Prerequisite("native Windows vLLM JIT requires existing Visual Studio 2019+ x64 C++ tools; no compiler was installed".into()));
+        }
+    }
+    Ok(())
+}
+
+fn reject_cache_aliases(root: &Path, cache: &Path) -> Result<(), RuntimeInstallError> {
+    let relative = cache
+        .strip_prefix(root)
+        .map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+    let mut current = root.to_owned();
+    for component in std::iter::once(std::path::Component::CurDir).chain(relative.components()) {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+        #[cfg(windows)]
+        let alias = {
+            use std::os::windows::fs::MetadataExt;
+            metadata.file_attributes() & 0x400 != 0
+        };
+        #[cfg(not(windows))]
+        let alias = metadata.file_type().is_symlink();
+        if alias || !metadata.is_dir() {
+            return Err(RuntimeInstallError::Download(
+                "Python cache contains an alias or non-directory".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Under the Python acquisition lease, reclaim only digest-named archives.
+/// Model cache paths, arbitrary files, directories and links are never followed.
+fn cleanup_python_downloads(downloads: &Path, limit: u64) -> Result<(), RuntimeInstallError> {
+    let mut files = Vec::new();
+    let mut total = 0_u64;
+    for entry in
+        std::fs::read_dir(downloads).map_err(|e| RuntimeInstallError::Download(e.to_string()))?
+    {
+        let entry = entry.map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let digest = name.split('.').next().unwrap_or("");
+        if scala_core::RuntimeDigest::sha256(digest).is_err()
+            || !(name.ends_with(".zip") || name.ends_with(".tar.gz"))
+        {
+            continue;
+        }
+        let metadata = entry
+            .path()
+            .symlink_metadata()
+            .map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        total = total.saturating_add(metadata.len());
+        files.push((metadata.modified().ok(), metadata.len(), entry.path()));
+    }
+    files.sort_by_key(|file| file.0);
+    for (_, size, path) in files {
+        if total <= limit {
+            break;
+        }
+        std::fs::remove_file(path).map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+        total = total.saturating_sub(size);
+    }
+    Ok(())
+}
+
+fn cleanup_python_partials(downloads: &Path) -> Result<(), RuntimeInstallError> {
+    if !downloads.exists() {
+        return Ok(());
+    }
+    for entry in
+        std::fs::read_dir(downloads).map_err(|e| RuntimeInstallError::Download(e.to_string()))?
+    {
+        let entry = entry.map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name
+            .strip_suffix(".part")
+            .is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
+        {
+            continue;
+        }
+        let metadata = entry
+            .path()
+            .symlink_metadata()
+            .map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+        if metadata.is_file() && !metadata.file_type().is_symlink() {
+            std::fs::remove_file(entry.path())
+                .map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn python_cache_bytes(root: &Path) -> Result<u64, RuntimeInstallError> {
+    if !root.exists() {
+        return Ok(0);
+    }
+    let mut total = 0_u64;
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry.map_err(|e| RuntimeInstallError::Download(e.to_string()))?;
+        if entry.file_type().is_file() {
+            total = total.saturating_add(
+                entry
+                    .metadata()
+                    .map_err(|e| RuntimeInstallError::Download(e.to_string()))?
+                    .len(),
+            );
+        }
+    }
+    Ok(total)
+}
+
+struct DownloadPartial(PathBuf);
+impl Drop for DownloadPartial {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 const MAX_CMAKE_CONTRACT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CMAKE_CONTRACT_FILES: usize = 4_096;
 

@@ -19,6 +19,13 @@ use crate::{
 #[path = "windows_job.rs"]
 mod windows_job;
 
+type InstallProgress = Arc<dyn Fn(&str) + Send + Sync>;
+struct InstallCapture {
+    progress: InstallProgress,
+    #[cfg(unix)]
+    lease: Option<i32>,
+}
+
 const DEFAULT_TERMINATION_TIMEOUT: Duration = Duration::from_secs(8);
 const LOG_TAIL_LINES: usize = 80;
 const LOG_LINE_LIMIT: usize = 4_096;
@@ -47,6 +54,7 @@ pub async fn capture_command(
         environment_remove,
         timeout,
         false,
+        None,
     )
     .await
 }
@@ -68,8 +76,47 @@ pub async fn capture_owned_command(
         environment_remove,
         timeout,
         true,
+        None,
     )
     .await
+}
+
+/// Bounded live diagnostics for managed package acquisition. Owns all children.
+pub(crate) async fn capture_install_command(
+    executable: &Path,
+    arguments: &[&str],
+    environment: &BTreeMap<String, String>,
+    progress: InstallProgress,
+    _lease: Option<&std::fs::File>,
+) -> Result<CapturedCommand, EngineError> {
+    capture_command_scoped(
+        executable,
+        arguments,
+        environment,
+        &[],
+        Duration::from_secs(7200),
+        true,
+        Some(InstallCapture {
+            progress,
+            #[cfg(unix)]
+            lease: _lease.map(|file| {
+                use std::os::fd::AsRawFd;
+                file.as_raw_fd()
+            }),
+        }),
+    )
+    .await
+}
+
+#[cfg(unix)]
+struct CaptureProcessGroup(i32);
+#[cfg(unix)]
+impl Drop for CaptureProcessGroup {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(-self.0, libc::SIGKILL);
+        }
+    }
 }
 
 async fn capture_command_scoped(
@@ -79,8 +126,31 @@ async fn capture_command_scoped(
     environment_remove: &[OsString],
     timeout: Duration,
     _own_process_tree: bool,
+    installation: Option<InstallCapture>,
 ) -> Result<CapturedCommand, EngineError> {
     let mut command = Command::new(executable);
+    if installation.is_some() {
+        command.env_clear();
+    }
+    #[cfg(unix)]
+    if let Some(fd) = installation.as_ref().and_then(|install| install.lease) {
+        // Keep the already-owned acquisition lease alive in the private helper
+        // after abrupt parent exit. Only this child descriptor loses CLOEXEC;
+        // the parent's flags and unrelated captures remain unchanged.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(unix)]
+    if _own_process_tree {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
     for name in environment_remove {
         command.env_remove(name);
     }
@@ -119,6 +189,60 @@ async fn capture_command_scoped(
         return Err(EngineError::Operation(format!(
             "could not own probe process tree: {error}"
         )));
+    }
+    #[cfg(unix)]
+    let _group = if _own_process_tree {
+        Some(CaptureProcessGroup(
+            child
+                .id()
+                .ok_or_else(|| EngineError::Operation("owned command has no PID".into()))?
+                as i32,
+        ))
+    } else {
+        None
+    };
+    if let Some(installation) = installation {
+        let progress = installation.progress;
+        let mut child = child;
+        async fn read_tail(
+            mut stream: impl AsyncRead + Unpin,
+            callback: Option<InstallProgress>,
+        ) -> std::io::Result<String> {
+            let mut tail = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut buffer).await?;
+                if count == 0 {
+                    break;
+                }
+                if let Some(callback) = &callback {
+                    callback(&String::from_utf8_lossy(&buffer[..count]));
+                }
+                tail.extend_from_slice(&buffer[..count]);
+                if tail.len() > 65536 {
+                    tail.drain(..tail.len() - 65536);
+                }
+            }
+            Ok(String::from_utf8_lossy(&tail).into_owned())
+        }
+        let stdout = child.stdout.take().expect("captured stdout");
+        let stderr = child.stderr.take().expect("captured stderr");
+        let (status, stdout, stderr) = tokio::time::timeout(timeout, async {
+            tokio::join!(
+                child.wait(),
+                read_tail(stdout, None),
+                read_tail(stderr, Some(progress))
+            )
+        })
+        .await
+        .map_err(|_| EngineError::TimedOut("managed package acquisition timed out".into()))?;
+        let status = status.map_err(|e| EngineError::Operation(e.to_string()))?;
+        return Ok(CapturedCommand {
+            success: status.success(),
+            code: status.code(),
+            stdout: stdout.map_err(|e| EngineError::Operation(e.to_string()))?,
+            stderr: stderr.map_err(|e| EngineError::Operation(e.to_string()))?,
+        });
     }
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await

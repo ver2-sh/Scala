@@ -143,6 +143,7 @@ pub enum RuntimeAcquisitionMethod {
     PreseededOfficialPack,
     SourceBuild,
     ExternalBinary,
+    ManagedPython,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -274,6 +275,69 @@ pub enum RuntimeAcquisitionPlan {
         additional_downloads: Vec<RuntimeDownload>,
     },
     SourceBuild(Box<RuntimeSourceBuildPlan>),
+    ManagedPython(Box<RuntimePythonPlan>),
+}
+
+/// A reviewed isolated Python environment, not a binary release asset.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimePythonPlan {
+    pub recipe_id: String,
+    pub recipe_sha256: String,
+    pub backend: String,
+    pub dependency_lock_sha256: String,
+    pub dependencies: BTreeMap<String, String>,
+    pub python: RuntimeDownload,
+    pub package_tool: RuntimeDownload,
+    pub source: Option<RuntimeDownload>,
+    pub source_revision: Option<String>,
+    pub minimum_glibc: Option<String>,
+    pub estimated_installed_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimePythonProvenance {
+    pub plan: RuntimePythonPlan,
+    /// Full interpreter, installed wheel RECORD, runner and source fingerprint.
+    pub environment_revision: String,
+    /// Cheap verified-install change detector; execution still verifies contents.
+    pub observation_key: String,
+}
+
+fn validate_python_plan(plan: &RuntimePythonPlan) -> Result<(), RuntimeManifestError> {
+    RuntimeDigest::sha256(plan.recipe_sha256.clone())?;
+    RuntimeDigest::sha256(plan.dependency_lock_sha256.clone())?;
+    if plan.recipe_id.is_empty()
+        || !matches!(
+            plan.backend.as_str(),
+            "vllm-openai" | "vllm-labels" | "torch-readout"
+        )
+    {
+        return Err(RuntimeManifestError::InvalidPythonProvenance);
+    }
+    for download in [&plan.python, &plan.package_tool]
+        .into_iter()
+        .chain(plan.source.iter())
+    {
+        if download.size_bytes == 0 || !download.url.starts_with("https://") {
+            return Err(RuntimeManifestError::InvalidDownload);
+        }
+        let digest = download
+            .digest
+            .as_ref()
+            .ok_or(RuntimeManifestError::InvalidDownload)?;
+        if digest.algorithm != "sha256" {
+            return Err(RuntimeManifestError::InvalidDownload);
+        }
+        RuntimeDigest::sha256(digest.value.clone())?;
+    }
+    if plan
+        .source_revision
+        .as_ref()
+        .is_some_and(|revision| !is_full_git_sha(revision))
+    {
+        return Err(RuntimeManifestError::InvalidPythonProvenance);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -491,6 +555,16 @@ impl AvailableRuntime {
                     }
                 }
             }
+            RuntimeAcquisitionPlan::ManagedPython(plan) => {
+                validate_python_plan(plan)?;
+                if self.identity.package.release_tag.is_some()
+                    || self.identity.package.asset_id.as_deref()
+                        != Some(plan.recipe_sha256.as_str())
+                    || self.identity.variant != plan.backend
+                {
+                    return Err(RuntimeManifestError::InvalidPythonProvenance);
+                }
+            }
             RuntimeAcquisitionPlan::SourceBuild(plan) => {
                 validate_source_build_plan(plan, &self.identity)?;
             }
@@ -510,7 +584,9 @@ impl AvailableRuntime {
                         total.saturating_add(download.size_bytes)
                     }),
             ),
-            RuntimeAcquisitionPlan::SourceBuild(_) => None,
+            RuntimeAcquisitionPlan::SourceBuild(_) | RuntimeAcquisitionPlan::ManagedPython(_) => {
+                None
+            }
         }
     }
 
@@ -520,14 +596,17 @@ impl AvailableRuntime {
                 download,
                 additional_downloads,
             } => Some((download, additional_downloads)),
-            RuntimeAcquisitionPlan::SourceBuild(_) => None,
+            RuntimeAcquisitionPlan::SourceBuild(_) | RuntimeAcquisitionPlan::ManagedPython(_) => {
+                None
+            }
         }
     }
 
     pub fn source_build(&self) -> Option<&RuntimeSourceBuildPlan> {
         match &self.acquisition {
             RuntimeAcquisitionPlan::SourceBuild(plan) => Some(plan),
-            RuntimeAcquisitionPlan::ReleaseAsset { .. } => None,
+            RuntimeAcquisitionPlan::ReleaseAsset { .. }
+            | RuntimeAcquisitionPlan::ManagedPython(_) => None,
         }
     }
 }
@@ -558,6 +637,8 @@ pub struct RuntimeManifest {
     pub additional_downloaded_archive_sha256: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_build: Option<RuntimeSourceBuildProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python_environment: Option<RuntimePythonProvenance>,
     /// Relative to the installation root for managed packs; absolute only for
     /// explicitly configured external binaries.
     pub entrypoint: PathBuf,
@@ -588,7 +669,36 @@ impl RuntimeManifest {
         for digest in &self.additional_downloaded_archive_sha256 {
             RuntimeDigest::sha256(digest.clone())?;
         }
+        if self.acquisition_method != RuntimeAcquisitionMethod::ManagedPython
+            && self.python_environment.is_some()
+        {
+            return Err(RuntimeManifestError::InvalidPythonProvenance);
+        }
         match self.acquisition_method {
+            RuntimeAcquisitionMethod::ManagedPython => {
+                let provenance = self
+                    .python_environment
+                    .as_ref()
+                    .ok_or(RuntimeManifestError::InvalidPythonProvenance)?;
+                validate_python_plan(&provenance.plan)?;
+                RuntimeDigest::sha256(provenance.environment_revision.clone())?;
+                RuntimeDigest::sha256(provenance.observation_key.clone())?;
+                if !is_safe_relative_path(&self.entrypoint)
+                    || self.installed_at_unix.is_none()
+                    || self.source_build.is_some()
+                    || self.downloaded_archive_sha256.is_some()
+                    || !self.additional_downloaded_archive_sha256.is_empty()
+                    || self.source_url.as_deref().is_none_or(str::is_empty)
+                    || self.identity.package.asset_id.as_deref()
+                        != Some(&provenance.plan.recipe_sha256)
+                    || self.identity.package.release_tag.is_some()
+                    || self.identity.variant != provenance.plan.backend
+                    || self.probe.observed_revision.as_deref()
+                        != Some(&provenance.environment_revision)
+                {
+                    return Err(RuntimeManifestError::InvalidPythonProvenance);
+                }
+            }
             RuntimeAcquisitionMethod::ExternalBinary => {
                 if !self.entrypoint.is_absolute() {
                     return Err(RuntimeManifestError::InvalidEntrypoint);
@@ -695,6 +805,8 @@ pub enum RuntimeManifestError {
     InvalidPackageIdentity,
     #[error("runtime download metadata is invalid")]
     InvalidDownload,
+    #[error("managed Python recipe or environment provenance is invalid")]
+    InvalidPythonProvenance,
     #[error("runtime did not pass its engine adapter probe")]
     FailedProbe,
 }
@@ -706,6 +818,14 @@ pub struct InstalledRuntime {
 }
 
 impl InstalledRuntime {
+    pub fn verification_revision(&self) -> Option<&String> {
+        self.manifest
+            .python_environment
+            .as_ref()
+            .map(|p| &p.environment_revision)
+            .or(self.manifest.identity.upstream_revision.as_ref())
+    }
+
     pub fn entrypoint_path(&self) -> PathBuf {
         if self.manifest.entrypoint.is_absolute() {
             self.manifest.entrypoint.clone()
@@ -1256,6 +1376,7 @@ mod tests {
             downloaded_archive_sha256: Some("b".repeat(64)),
             additional_downloaded_archive_sha256: Vec::new(),
             source_build: None,
+            python_environment: None,
             entrypoint: "server".into(),
             entrypoint_sha256: "c".repeat(64),
             installed_at_unix: Some(1),
@@ -1339,6 +1460,7 @@ mod tests {
             source_url: Some("https://github.com/Neroued/ninfer/commit/aaaaaaaa".to_owned()),
             downloaded_archive_sha256: None,
             additional_downloaded_archive_sha256: Vec::new(),
+            python_environment: None,
             source_build: Some(RuntimeSourceBuildProvenance {
                 source,
                 recipe_version: "ninfer-serve-v1".to_owned(),
@@ -1438,6 +1560,7 @@ mod tests {
             downloaded_archive_sha256: None,
             additional_downloaded_archive_sha256: Vec::new(),
             source_build: None,
+            python_environment: None,
             entrypoint: std::env::current_dir()
                 .expect("current directory")
                 .join("ninfer-serve"),

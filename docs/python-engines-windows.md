@@ -9,6 +9,30 @@ provisioning was executed, and no model, GPU qualification, inference, training,
 optimization or benchmark was run. Historical execution evidence is retained
 separately in [the qualification record](decision-windows-evidence.md).
 
+## Normal managed workflow
+
+Use Scala's Runtime Search to find native Windows `vllm` or `pytorch`, review the
+pinned candidate, then Install / Confirm install. From a Model Profile, use Install
+compatible runtime, review an obsolete engine through Engine / Confirm when needed,
+select the installed runtime and load the profile separately. The equivalent CLI
+is `scala runtimes search <ENGINE>` → `install <ID>` → `select --model <MODEL_ID> <ID>`.
+
+Scala embeds these reviewed recipe resources in the release binary. It privately
+bootstraps the verified CPython and uv packages; a globally installed uv, Scala
+checkout, tar.exe or manually invoked PowerShell script is unnecessary. Windows
+remains native. The H2O and OpenAI variants preserve the pinned compatibility
+fork, wheels, original label shim and private CUDA 13.3 SDK. Imajev preserves its
+separate PyTorch/PEFT lock and exact source revision. Existing Visual Studio 2019+
+x64 C++ tools are checked for vLLM JIT; Scala does not install drivers/compilers,
+modify system CUDA/PATH or change execution policy. Unsupported or unverified
+host prerequisites block acquisition. Neither installation nor synthetic testing
+qualifies live GPU execution or model memory suitability.
+
+The detailed scripts and later commands below describe the **advanced external
+runtime alternative** and retained provenance evidence. They are not the normal
+managed workflow and their external-tool prerequisites do not apply to Scala's
+managed installer. See [managed lifecycle and explicit profile migration](python-engines.md).
+
 ## Implemented support and admission
 
 The shared native launcher, Job Object ownership, integrity verification,

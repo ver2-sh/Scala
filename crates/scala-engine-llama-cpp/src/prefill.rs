@@ -109,6 +109,6 @@ pub(super) fn reviewed(runtime: &InstalledRuntime) -> bool {
                         && manifest.downloaded_archive_sha256.as_deref() == Some(*sha)
                 })
         }
-        RuntimeAcquisitionMethod::ExternalBinary => false,
+        RuntimeAcquisitionMethod::ExternalBinary | RuntimeAcquisitionMethod::ManagedPython => false,
     }
 }

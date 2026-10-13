@@ -31,10 +31,10 @@ def watch(path, root):
         paths.add(path)
 
 
-if os.name == "nt":
+if os.name == "nt" or "managed_root" in cfg:
     paths.add(Path(sys.executable).with_name("scala-vllm.json"))
     paths.add(Path(sys.prefix) / "pyvenv.cfg")
-    site = Path(sys.prefix) / "Lib/site-packages"
+    site = Path(sys.prefix) / ("Lib/site-packages" if os.name == "nt" else "lib/python3.12/site-packages")
     paths.update(site.glob("*.pth"))
     paths.update(site.glob("*.py"))
     base = Path(sys.base_prefix).resolve(strict=True)
@@ -73,7 +73,7 @@ for directory in sys.path:
         inventory_paths.add(Path(directory))
 for dist in importlib.metadata.distributions():
     root = Path(dist.locate_file(""))
-    if os.name == "nt":
+    if os.name == "nt" or "managed_root" in cfg:
         paths.update(root.glob("*.pth"))
         paths.update(root.glob("*.py"))
     paths.add(root)

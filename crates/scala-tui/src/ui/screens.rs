@@ -2186,7 +2186,14 @@ fn render_model_profiles(
                         .map(|m| m.display_name.clone())
                         .unwrap_or_else(|| format!("Missing {}", profile.model_id)),
                 ),
-                ("Engine", profile.engine_id.to_string()),
+                (
+                    "Engine",
+                    if profile.engine_id.as_str() == "native_decision" {
+                        "native_decision (obsolete; review Engine change)".into()
+                    } else {
+                        profile.engine_id.to_string()
+                    },
+                ),
                 ("Runtime", runtime),
                 (
                     "Configuration",
@@ -2597,6 +2604,22 @@ fn render_model_profile_actions(
             ModelProfileAction::Model => (
                 "[ Model ]",
                 if !app.settings_busy() && !app.snapshot.models.is_empty() {
+                    ActionState::Normal
+                } else {
+                    ActionState::Disabled
+                },
+            ),
+            ModelProfileAction::Runtime => (
+                "[ v Select runtime ]",
+                if has_model && !app.runtime_mutation_busy() {
+                    ActionState::Normal
+                } else {
+                    ActionState::Disabled
+                },
+            ),
+            ModelProfileAction::InstallRuntime => (
+                "[ s Install compatible runtime ]",
+                if has_model && !app.runtime_mutation_busy() {
                     ActionState::Normal
                 } else {
                     ActionState::Disabled

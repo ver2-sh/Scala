@@ -11,7 +11,7 @@ use scala_core::{
     ModelProfile, ModelProfileId, ModelProfilesState, PublicAuthStatus, RegistryState,
     ResolvedSettings, RuntimeAcquisitionMethod, RuntimeCompatibility, RuntimeId,
     RuntimeOperationPhase, RuntimeOperationProgress, RuntimeUpdateState, SettingDefinition,
-    SettingId, SettingScope, SettingValue, SettingsSchema, SettingsState,
+    SettingId, SettingScope, SettingValue, SettingsPatch, SettingsSchema, SettingsState,
 };
 use scala_engine::{
     BackendLifecycle, BackendLoadProgress, BackendStatus, ControlStatus, RuntimeListSnapshot,
@@ -276,6 +276,12 @@ pub enum SettingsAction {
         profile_id: ModelProfileId,
         model: Box<ModelArtifact>,
     },
+    SetProfileEngine {
+        original: Box<ModelProfile>,
+        model: Box<ModelArtifact>,
+        engine_id: EngineId,
+        overrides: SettingsPatch,
+    },
     CycleProfileRole {
         profile_id: ModelProfileId,
     },
@@ -315,6 +321,9 @@ pub struct ProfileEngineSelection {
     pub model: Box<ModelArtifact>,
     pub engines: Vec<EngineId>,
     pub selected: usize,
+    pub switch_from: Option<Box<ModelProfile>>,
+    pub switch_overrides: BTreeMap<String, SettingsPatch>,
+    pub switch_removed: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -411,6 +420,7 @@ pub struct App {
     pub runtime_search_show_incompatible: bool,
     pub selected_runtime_search_result: Option<usize>,
     pub runtime_search_scroll: usize,
+    pub pending_runtime_install_confirmation: Option<RuntimeId>,
     pub runtime_search_context: Option<String>,
     pub runtime_search_model: Option<Box<ModelArtifact>>,
     pub runtime_operation: Option<RuntimeOperationProgress>,
@@ -563,6 +573,7 @@ impl App {
             runtime_search_show_incompatible: false,
             selected_runtime_search_result: None,
             runtime_search_scroll: 0,
+            pending_runtime_install_confirmation: None,
             runtime_search_context: None,
             runtime_search_model: None,
             runtime_operation: None,
@@ -3544,6 +3555,8 @@ impl App {
             KeyCode::Char('D') => self.begin_duplicate_profile(),
             KeyCode::Char('m') => self.cycle_profile_model(),
             KeyCode::Char('e') => self.cycle_profile_engine(),
+            KeyCode::Char('s') => self.open_profile_runtime(true),
+            KeyCode::Char('v') => self.open_profile_runtime(false),
             KeyCode::Char('r') => self.refresh_selected_model_profile(),
             KeyCode::Char('p') => self.cycle_profile_role(),
             _ => Update::None,
@@ -4038,11 +4051,24 @@ impl App {
         let Some(engine_id) = selection.engines.get(selection.selected).cloned() else {
             return Update::None;
         };
-        let action = SettingsAction::CreateProfile {
-            id: selection.id.clone(),
-            display_name: selection.display_name.clone(),
-            model: selection.model.clone(),
-            engine_id: Some(engine_id),
+        let action = if let Some(original) = &selection.switch_from {
+            let Some(overrides) = selection.switch_overrides.get(engine_id.as_str()).cloned()
+            else {
+                return Update::None;
+            };
+            SettingsAction::SetProfileEngine {
+                original: original.clone(),
+                model: selection.model.clone(),
+                engine_id,
+                overrides,
+            }
+        } else {
+            SettingsAction::CreateProfile {
+                id: selection.id.clone(),
+                display_name: selection.display_name.clone(),
+                model: selection.model.clone(),
+                engine_id: Some(engine_id),
+            }
         };
         self.overlay = None;
         self.profile_engine_selection = None;
@@ -4292,6 +4318,30 @@ impl App {
             .map_or(0, |index| (index + 1) % models.len());
         let model = Box::new(models[next].clone());
         self.queue_settings_action(SettingsAction::SetProfileModel { profile_id, model })
+    }
+
+    fn open_profile_runtime(&mut self, search: bool) -> Update {
+        if self.selected_remote_profile().is_some() {
+            return Update::None;
+        }
+        let Some(model_id) = self
+            .selected_model_profile_value()
+            .map(|p| p.model_id.clone())
+        else {
+            return Update::None;
+        };
+        let Some(index) = self.snapshot.models.iter().position(|m| m.id == model_id) else {
+            self.notice = Some(
+                "Bound model artifact is missing; restore it before runtime installation".into(),
+            );
+            return Update::Render;
+        };
+        self.selected_model = Some(index);
+        if search {
+            self.open_runtime_search_for_selected_model()
+        } else {
+            self.open_model_runtime_picker()
+        }
     }
 
     fn cycle_profile_engine(&mut self) -> Update {
@@ -4763,6 +4813,8 @@ impl App {
                     {
                         self.cycle_profile_engine()
                     }
+                    ModelProfileAction::Runtime => self.open_profile_runtime(false),
+                    ModelProfileAction::InstallRuntime => self.open_profile_runtime(true),
                     ModelProfileAction::Role if !self.settings_busy => self.cycle_profile_role(),
                     ModelProfileAction::Duplicate if !self.settings_busy => {
                         self.begin_duplicate_profile()
@@ -4961,6 +5013,7 @@ impl App {
     }
 
     fn close_runtime_overlay(&mut self) -> Update {
+        self.pending_runtime_install_confirmation = None;
         self.overlay = None;
         self.hover = None;
         Update::Render
@@ -5441,6 +5494,7 @@ impl App {
     }
 
     fn request_runtime_search(&mut self, force_refresh: bool) -> Update {
+        self.pending_runtime_install_confirmation = None;
         if self.runtime_search_loading {
             return Update::None;
         }
@@ -5481,6 +5535,12 @@ impl App {
             return Update::Render;
         }
         let runtime_id = result.entry.available.runtime_id.clone();
+        if self.pending_runtime_install_confirmation.as_ref() != Some(&runtime_id) {
+            self.pending_runtime_install_confirmation = Some(runtime_id);
+            self.notice = Some("Review the runtime version, dependencies and host requirements; activate Confirm install to proceed. Model loading is separate.".into());
+            return Update::Render;
+        }
+        self.pending_runtime_install_confirmation = None;
         self.pending_runtime_action = Some(RuntimeAction::Install(runtime_id.clone()));
         self.runtime_mutation_busy = true;
         self.runtime_operation = None;
@@ -6436,6 +6496,9 @@ mod tests {
                 id: ModelProfileId::new("quality").expect("profile ID"),
                 display_name: "Quality".to_owned(),
                 model: Box::new(model),
+                switch_from: None,
+                switch_overrides: std::collections::BTreeMap::new(),
+                switch_removed: std::collections::BTreeMap::new(),
                 engines: vec![
                     EngineId::new("fake-a").expect("engine ID"),
                     EngineId::new("fake-b").expect("engine ID"),
@@ -6454,5 +6517,76 @@ mod tests {
                 ..
             }) if engine.as_str() == "fake-b"
         ));
+    }
+    fn managed_test_model() -> scala_core::ModelArtifact {
+        scala_core::ModelArtifact {
+            id: scala_core::ModelId("preserved-artifact".into()),
+            path: "/synthetic/preserved.decisionbundle".into(),
+            size_bytes: 1,
+            format: scala_core::ArtifactFormat::DecisionBundle,
+            display_name: "Equivalent artifact".into(),
+            created: 1,
+            hash: None,
+            architecture: None,
+            context_length: None,
+            provenance: None,
+            native_identity: None,
+            auxiliary_artifacts: Vec::new(),
+            norted_package: None,
+        }
+    }
+
+    #[test]
+    fn legacy_profile_review_is_explicit_and_preserves_the_user_binding() {
+        let mut app = test_app(Vec::new());
+        let model = managed_test_model();
+        let original = scala_core::ModelProfile::new(
+            ModelProfileId::new("any-preserved-profile").unwrap(),
+            "User name",
+            model.id.clone(),
+            EngineId::new("native_decision").unwrap(),
+        )
+        .unwrap();
+        let mut profiles = scala_core::ModelProfilesState::default();
+        profiles
+            .profiles
+            .insert(original.id.clone(), original.clone());
+        app.model_profiles = Some(profiles);
+        app.selected_model_profile = Some(0);
+        app.screen = Screen::ModelProfiles;
+        app.snapshot.models.push(model.clone());
+        app.handle_settings_task_result(SettingsTaskResult::ChooseProfileEngine(
+            ProfileEngineSelection {
+                id: original.id.clone(),
+                display_name: original.display_name.clone(),
+                model: Box::new(model.clone()),
+                engines: vec![EngineId::new("pytorch").unwrap()],
+                selected: 0,
+                switch_from: Some(Box::new(original.clone())),
+                switch_overrides: [("pytorch".into(), scala_core::SettingsPatch::default())]
+                    .into_iter()
+                    .collect(),
+                switch_removed: [("pytorch".into(), vec!["native_decision.context".into()])]
+                    .into_iter()
+                    .collect(),
+            },
+        ));
+        assert!(app.take_settings_action().is_none());
+        assert_eq!(app.selected_model_profile_value().unwrap(), &original);
+        app.handle_profile_engine_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(app.take_settings_action(), Some(SettingsAction::SetProfileEngine { original: reviewed, engine_id, .. }) if *reviewed == original && engine_id.as_str() == "pytorch")
+        );
+        assert_eq!(
+            app.selected_model_profile_value().unwrap(),
+            &original,
+            "confirmation only queues the reviewed store operation"
+        );
+        app.open_profile_runtime(true);
+        assert_eq!(app.overlay, Some(Overlay::RuntimeSearch));
+        assert!(
+            matches!(app.take_runtime_action(), Some(super::RuntimeAction::Search { model: Some(bound), .. }) if bound.id == model.id)
+        );
+        assert_eq!(app.selected_model_profile_value().unwrap(), &original);
     }
 }

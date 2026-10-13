@@ -172,6 +172,28 @@ impl RuntimeCatalog {
         host: &HostCapabilities,
         force_refresh: bool,
     ) -> RuntimeCatalogSnapshot {
+        self.search_for_engines(query, host, force_refresh, None)
+            .await
+    }
+
+    pub(crate) async fn search_for_engines(
+        &self,
+        query: &str,
+        host: &HostCapabilities,
+        force_refresh: bool,
+        engines: Option<&std::collections::BTreeSet<String>>,
+    ) -> RuntimeCatalogSnapshot {
+        let normalized = query.trim().to_ascii_lowercase();
+        let requested_engine = self.providers.values().find_map(|provider| {
+            let engine = provider.engine_id();
+            (normalized.split_whitespace().any(|word| word == engine)
+                || normalized.starts_with(&format!("{engine}-")))
+            .then_some(engine)
+        });
+        let admitted = |provider: &dyn RuntimeCatalogProvider| {
+            engines.is_none_or(|engines| engines.contains(provider.engine_id()))
+                && requested_engine.is_none_or(|engine| engine == provider.engine_id())
+        };
         let github = if force_refresh {
             self.github.with_fresh_release_cache()
         } else {
@@ -181,6 +203,9 @@ impl RuntimeCatalog {
         let mut errors = Vec::new();
         let mut newest_fetch = None;
         for (provider_id, provider) in &self.providers {
+            if !admitted(provider.as_ref()) {
+                continue;
+            }
             let authority = RuntimeProviderAuthority::from_provider(provider.as_ref());
             let cached = self
                 .read_cache(provider_id, &authority)
@@ -260,6 +285,9 @@ impl RuntimeCatalog {
             .collect::<Vec<_>>();
         if entries.is_empty() && !normalized_query.is_empty() {
             for (provider_id, provider) in &self.providers {
+                if !admitted(provider.as_ref()) {
+                    continue;
+                }
                 let authority = RuntimeProviderAuthority::from_provider(provider.as_ref());
                 match provider
                     .fetch_reference(&github, query.trim())
@@ -712,6 +740,26 @@ impl GitHubReleaseClient {
                 "release URL is not hosted on github.com".to_owned(),
             ));
         }
+        Ok(self.asset_client.get(self.request_url(url.as_str())?))
+    }
+
+    pub(crate) fn python_download_request(
+        &self,
+        url: &reqwest::Url,
+    ) -> Result<reqwest::RequestBuilder, CatalogError> {
+        if url.scheme() != "https"
+            || !matches!(
+                url.host_str(),
+                Some("github.com" | "api.github.com" | "files.pythonhosted.org")
+            )
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(CatalogError::Request(
+                "untrusted Python acquisition URL".into(),
+            ));
+        }
+        // No API authorization headers cross package-tool or source downloads.
         Ok(self.asset_client.get(self.request_url(url.as_str())?))
     }
 

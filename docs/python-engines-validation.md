@@ -1,4 +1,55 @@
-# Python engine restructuring validation — 2026-10-13
+# Managed Python runtime integration validation — 2026-10-13
+
+The managed-runtime continuation inspected clean local HEAD `35c5ec9fa` (v0.1.21)
+and `AGENTS.md` before changes. Changes are confined to Scala. Existing production
+configuration, environments, runtime installations, model artifacts, profiles and
+services were untouched. All installation tests used isolated temporary stores,
+mock HTTP acquisition, fake interpreters/tools and synthetic admission. No tensor
+packages were installed into live environments, and no model inference, training,
+benchmark or hosted CI/release was run.
+
+| Final local check | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo check --workspace --all-targets --offline` | Passed |
+| `cargo clippy --workspace --all-targets --offline -- -D warnings` | Passed |
+| `cargo test --workspace --offline -- --test-threads=1` | 462 passed, 0 failed; 1 existing manual benchmark ignored |
+| `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu --offline` | Passed with existing unrelated platform warnings |
+| Python integrity/managed provisioning unit discovery | 12 passed |
+| Python vLLM/Windows provisioning unit discovery | 15 passed |
+| Python PyTorch runner unit discovery | 6 passed |
+| `scripts/release-legal.py` | 455 locked dependency notices; 3 MPL source archives; embedded runtime source notices retained |
+| `scripts/dist-workflow.py --check` with privately bootstrapped repository-pinned cargo-dist 0.33.0 | Passed; original tag-only workflow retained |
+| Local cargo-dist musl archive build | Passed; archive SHA-256 verified |
+| Packaged binary copied into an isolated directory | 12 current embedded recipe/runner/lock resources and notices verified; runtime and migration CLI help passed without a checkout |
+| `git diff --check` | Passed |
+
+The tests cover both catalog providers and independent Linux/native Windows tuples;
+strict artifact/runner qualification and unsupported host targets; privately managed
+package-tool acquisition; exact lock/provenance authority; staged activation, failed
+admission, cancellation and matching interrupted-install recovery; explicit
+side-by-side updates, active leases, immutable ownership and cache cleanup; ordinary
+composition registration; engine-specific/model-first searches that avoid unrelated
+network providers; explicit legacy-profile review/confirmation and preserved bindings;
+and the existing native engines, APIs, Settings and Scala Link contracts.
+
+The final full workspace run is serial. One earlier concurrent run encountered the
+unchanged llama.cpp synthetic restart test's benchmark-history owner lease race;
+the exact test passed in isolation and the final full serial run passed. No unrelated
+benchmark/storage code was modified to hide that failure.
+
+Native Windows code was cross-compiled and checked with existing synthetic source
+fixtures; no Windows host or GPU was contacted. Real dependency provisioning and
+model/GPU execution qualification were intentionally not performed. Package and
+source hashes remain mandatory; a missing/replaced pinned download or unsupported
+host fails closed. Installed size remains unknown where complete measurements are
+unavailable, and installation does not imply that a model fits memory or has passed
+native execution qualification.
+
+The earlier restructuring record below is retained as historical evidence; its
+baseline and counts describe the prior implementation.
+
+## Earlier Python engine restructuring validation — 2026-10-13
 
 Inspected local HEAD `fb878b73bffded95856891895fa514b4557c4f4f` before editing;
 the working tree was initially clean. Work was confined to Scala and temporary

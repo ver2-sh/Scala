@@ -1920,6 +1920,7 @@ impl EngineAdapter for NinferAdapter {
                     || !capabilities.startup_proof
             }
             RuntimeAcquisitionMethod::ExternalBinary => false,
+            RuntimeAcquisitionMethod::ManagedPython => true,
         };
         if unproven {
             combine_compatibility(
@@ -1967,6 +1968,7 @@ impl EngineAdapter for NinferAdapter {
         .compatibility;
         let base = combine_compatibility(native, device);
         let unproven = match &runtime.acquisition {
+            scala_core::RuntimeAcquisitionPlan::ManagedPython(_) => true,
             scala_core::RuntimeAcquisitionPlan::SourceBuild(_)
             | scala_core::RuntimeAcquisitionPlan::ReleaseAsset { .. } => {
                 !capabilities.trustworthy_identity
@@ -2393,6 +2395,9 @@ impl EngineAdapter for NinferAdapter {
                 }
                 RuntimeAcquisitionMethod::SourceBuild => AcquisitionMethod::SourceBuild,
                 RuntimeAcquisitionMethod::ExternalBinary => AcquisitionMethod::ExternalBinary,
+                RuntimeAcquisitionMethod::ManagedPython => {
+                    AcquisitionMethod::Other("managed_python".into())
+                }
             },
             binary_path: binary_path.clone(),
             binary_sha256: Some(manifest.entrypoint_sha256.clone()),
@@ -4322,6 +4327,7 @@ mod tests {
             downloaded_archive_sha256: Some(windows_catalog::REVIEWED_ARCHIVE_SHA256.to_owned()),
             additional_downloaded_archive_sha256: Vec::new(),
             source_build: None,
+            python_environment: None,
             entrypoint: PathBuf::from("ninfer-serve.exe"),
             entrypoint_sha256: "a".repeat(64),
             installed_at_unix: Some(1),

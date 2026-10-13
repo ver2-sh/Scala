@@ -290,6 +290,112 @@ impl RuntimeStore {
         Ok(RuntimeStaging { path: Some(path) })
     }
 
+    /// Python venvs bind absolute interpreter paths. Provision at their final
+    /// identity path behind an admission marker; publishing the manifest is
+    /// the atomic activation boundary. Caller holds the installation lease.
+    pub(crate) async fn create_python_staging(
+        &self,
+        manifest: &RuntimeManifest,
+    ) -> Result<RuntimeStaging, RuntimeStoreError> {
+        self.ensure().await?;
+        let destination = self.installation_path(manifest);
+        let root = self.root.clone();
+        let runtime_id = manifest.runtime_id.clone();
+        tokio::task::spawn_blocking(move || {
+            prepare_managed_parent(&root, &destination)?;
+            if destination.exists() {
+                validate_managed_runtime_directory(&root, &destination)?;
+                // Recover only a matching Scala-owned interrupted acquisition.
+                // A manifest or foreign directory must never be overwritten.
+                let marker = destination.join(".scala-python-pending");
+                if destination.join(RUNTIME_MANIFEST_FILE).exists()
+                    || std::fs::read_to_string(&marker).ok().as_deref() != Some(runtime_id.as_str())
+                {
+                    return Err(RuntimeStoreError::ProvenanceConflict {
+                        runtime_id,
+                        detail: "existing immutable or unowned Python runtime path".into(),
+                    });
+                }
+                remove_staging_tree(&destination).map_err(|source| RuntimeStoreError::Io {
+                    path: destination.clone(),
+                    source,
+                })?;
+            }
+            std::fs::create_dir(&destination).map_err(|source| RuntimeStoreError::Io {
+                path: destination.clone(),
+                source,
+            })?;
+            let staging = RuntimeStaging {
+                path: Some(destination.clone()),
+            };
+            std::fs::write(
+                destination.join(".scala-python-pending"),
+                runtime_id.as_str(),
+            )
+            .map_err(|source| RuntimeStoreError::Io {
+                path: destination,
+                source,
+            })?;
+            Ok(staging)
+        })
+        .await
+        .map_err(|source| RuntimeStoreError::Io {
+            path: self.root.clone(),
+            source: std::io::Error::other(source),
+        })?
+    }
+
+    pub(crate) async fn activate_python(
+        &self,
+        staging: &mut RuntimeStaging,
+        manifest: &RuntimeManifest,
+    ) -> Result<InstalledRuntime, RuntimeStoreError> {
+        manifest
+            .validate()
+            .map_err(|error| RuntimeStoreError::InvalidManifest {
+                path: staging.join(RUNTIME_MANIFEST_FILE),
+                message: error.to_string(),
+            })?;
+        let _transaction = self.acquire_transaction().await?;
+        let _lease = self.acquire_lease(&manifest.runtime_id, true).await?;
+        let destination = self.installation_path(manifest);
+        if staging.path() != destination
+            || manifest.acquisition_method != RuntimeAcquisitionMethod::ManagedPython
+        {
+            return Err(RuntimeStoreError::UnsafePath(staging.path().to_owned()));
+        }
+        validate_managed_runtime_directory(&self.root, &destination)?;
+        let marker = destination.join(".scala-python-pending");
+        if std::fs::read_to_string(&marker).ok().as_deref() != Some(manifest.runtime_id.as_str()) {
+            return Err(RuntimeStoreError::UnsafePath(marker));
+        }
+        verify_entrypoint_integrity(&destination, manifest)?;
+        let bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
+            RuntimeStoreError::InvalidManifest {
+                path: destination.join(RUNTIME_MANIFEST_FILE),
+                message: error.to_string(),
+            }
+        })?;
+        // No await after publication: cancellation cannot remove an admitted pack.
+        std::fs::write(destination.join(".scala-python-manifest"), bytes)
+            .and_then(|()| {
+                std::fs::rename(
+                    destination.join(".scala-python-manifest"),
+                    destination.join(RUNTIME_MANIFEST_FILE),
+                )
+            })
+            .map_err(|source| RuntimeStoreError::Io {
+                path: destination.clone(),
+                source,
+            })?;
+        staging.disarm();
+        let _ = std::fs::remove_file(marker);
+        Ok(InstalledRuntime {
+            manifest: manifest.clone(),
+            installation_root: destination,
+        })
+    }
+
     pub async fn activate(
         &self,
         staging: &mut RuntimeStaging,
@@ -1050,7 +1156,7 @@ fn installation_path_for(root: &Path, manifest: &RuntimeManifest) -> PathBuf {
 
 fn scan_blocking(root: &Path) -> Result<RuntimeStoreSnapshot, RuntimeStoreError> {
     let mut snapshot = RuntimeStoreSnapshot::default();
-    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+    for entry in walkdir::WalkDir::new(root).follow_links(false).max_depth(5) {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -1288,6 +1394,7 @@ mod tests {
             downloaded_archive_sha256: Some("a".repeat(64)),
             additional_downloaded_archive_sha256: Vec::new(),
             source_build: None,
+            python_environment: None,
             entrypoint: "server".into(),
             entrypoint_sha256: "b".repeat(64),
             installed_at_unix: Some(1),
@@ -1460,6 +1567,7 @@ mod tests {
             downloaded_archive_sha256: Some("a".repeat(64)),
             additional_downloaded_archive_sha256: Vec::new(),
             source_build: None,
+            python_environment: None,
             entrypoint: "server".into(),
             entrypoint_sha256: super::hex_digest(Sha256::digest(b"original")),
             installed_at_unix: Some(1),

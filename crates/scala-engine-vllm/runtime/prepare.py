@@ -49,6 +49,7 @@ def main():
                    metavar=("PACKAGE", "ORIGINAL_WHEEL", "WHEEL_SHA256", "MISMATCHES_JSON"),
                    help="pin an original upstream wheel and exact known bad RECORD members; never alter installed bytes")
     r.add_argument("--windows-vllm", type=Path, help="explicit pinned native Windows compatibility build, SDK and environment binding")
+    r.add_argument("--managed-root", type=Path, help="Scala-owned pending package; all interpreter and source files must be contained")
     r.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
     if args.mode == "bundle":
@@ -83,6 +84,11 @@ def main():
         script = 'import importlib.metadata as m,json; print(json.dumps({d.metadata["Name"]:d.version for d in m.distributions()}))'
         packages = json.loads(subprocess.check_output([str(python), "-I", "-c", script], text=True))
         cfg = {"schema_version": 1, "backend": args.backend, "packages": packages, "options": {k: json.loads(v) for k, v in args.option}}
+        if args.managed_root:
+            root = args.managed_root.resolve(strict=True)
+            if not (root / ".scala-python-pending").is_file() or not python.is_relative_to(root) or not args.output.is_relative_to(root):
+                raise ValueError("Managed runtime must belong to its pending package")
+            cfg["managed_root"] = str(root)
         if len(cfg["options"]) != len(args.option):
             raise ValueError("Duplicate runtime option")
         if args.windows_vllm:
@@ -96,17 +102,6 @@ def main():
                 att[canonical] = {"path": str(Path(wheel).resolve(strict=True)),
                                   "sha256": wheel_hash, "mismatches": json.loads(mismatches)}
             cfg["wheel_attestations"] = att
-        if args.backend == "torch-readout":
-            if args.source is None or not args.source_revision:
-                raise ValueError("Exact native readout source checkout is required")
-            root = args.source.resolve(strict=True)
-            rev = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
-            if rev != args.source_revision or subprocess.check_output(["git", "-C", str(root), "status", "--porcelain"], text=True):
-                raise ValueError("Native implementation checkout is dirty or at a different revision")
-            inventory = files(root / "src", True)
-            inventory = {"src/" + k: v for k, v in inventory.items()}
-            inventory.update({"scripts/" + k: v for k, v in files(root / "scripts", True).items()})
-            cfg["source"] = {"path": str(root), "revision": rev, "files": inventory}
         if args.backend == "vllm-labels":
             if not args.entrypoint or len(args.source_revision) != 40:
                 raise ValueError("Exact native label implementation source is required")
@@ -142,7 +137,10 @@ def main():
                 entry.write_text("#!/bin/sh\nexec " + shlex.quote(str(python)) + " -I " + shlex.quote(str((args.output / "server.py").absolute())) + ' "$@"\n')
                 entry.chmod(0o755)
                 command = [str(entry.absolute())]
-            print(subprocess.check_output(command + ["--scala-probe"], text=True).strip())
+            if args.managed_root:
+                print("Prepared managed runner; Scala admission verification is pending")
+            else:
+                print(subprocess.check_output(command + ["--scala-probe"], text=True).strip())
         except BaseException:
             if launcher_created:
                 launcher.unlink(missing_ok=True)

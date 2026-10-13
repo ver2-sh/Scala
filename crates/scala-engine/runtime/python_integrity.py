@@ -137,7 +137,7 @@ def runtime_identity(config_path, runner_path=None):
     cfg = read_json(config_path)
     common = {"schema_version", "backend", "packages", "options"}
     required_fields = common | (set() if cfg.get("backend") == "vllm-openai" else {"source"})
-    allowed = required_fields | {"wheel_attestations", "windows_vllm"}
+    allowed = required_fields | {"wheel_attestations", "windows_vllm", "managed_root"}
     if not required_fields <= set(cfg) or set(cfg) - allowed or cfg["schema_version"] != 1 or cfg["backend"] not in BACKENDS:
         raise ValueError("Invalid explicit runtime configuration")
     if cfg["backend"] == "vllm-openai":
@@ -243,6 +243,19 @@ def runtime_identity(config_path, runner_path=None):
     if {normalize(d.metadata["Name"]) for d in importlib.metadata.distributions()} != {normalize(n) for n in cfg["packages"]}:
         raise ValueError("Runtime has unlocked distributions; use a dedicated, fully locked environment")
     identity = {"config": cfg, "packages": packages, "python": sha(Path(sys.executable).resolve()), "runner": sha(runner_path or Path(__file__).resolve()), "integrity": sha(Path(__file__).resolve()), "python_version": sys.version}
+    if "managed_root" in cfg:
+        owned = Path(cfg["managed_root"]).resolve(strict=True)
+        if not config_path.resolve(strict=True).is_relative_to(owned) or not Path(sys.prefix).resolve(strict=True).is_relative_to(owned) or not Path(sys.base_prefix).resolve(strict=True).is_relative_to(owned) or sys.prefix == sys.base_prefix:
+            raise ValueError("Managed Python isolation/ownership changed")
+        if "source" in cfg and not Path(cfg["source"]["path"]).resolve(strict=True).is_relative_to(owned):
+            raise ValueError("Managed source escaped its package")
+        base = Path(sys.base_prefix).resolve(strict=True)
+        interpreter_files = sorted(p for p in base.rglob("*") if p.is_file() and "site-packages" not in p.parts and "__pycache__" not in p.parts)
+        identity["managed_interpreter"] = {str(p.relative_to(base)): digest for p, digest in zip(interpreter_files, digests(interpreter_files))}
+        identity["managed_venv"] = sha(regular(Path(sys.prefix) / "pyvenv.cfg"))
+        sites = {Path(d.locate_file("")) for d in importlib.metadata.distributions()}
+        controls = sorted({p for site in sites for p in site.iterdir() if p.is_file() and p.suffix in {".py", ".pth"}})
+        identity["managed_site_controls"] = {str(p): digest for p, digest in zip(controls, digests(controls))}
     if os.name == "nt":
         launcher = regular(Path(sys.executable).with_name(f"scala-{ENGINE_ID}.json"))
         launch = read_json(launcher)

@@ -3510,6 +3510,9 @@ impl EngineAdapter for Q27Adapter {
                 }
                 RuntimeAcquisitionMethod::SourceBuild => AcquisitionMethod::SourceBuild,
                 RuntimeAcquisitionMethod::ExternalBinary => AcquisitionMethod::ExternalBinary,
+                RuntimeAcquisitionMethod::ManagedPython => {
+                    AcquisitionMethod::Other("managed_python".into())
+                }
             },
             binary_path: binary_path.clone(),
             binary_sha256: Some(manifest.entrypoint_sha256.clone()),

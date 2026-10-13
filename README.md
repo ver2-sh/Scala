@@ -18,7 +18,7 @@ engine compatibility, and exact runtime resolution remains separate from the pro
 ships adapters for [llama.cpp](https://github.com/ggml-org/llama.cpp),
 [q27](https://github.com/signalnine/q27), [NInfer](https://github.com/Neroued/ninfer),
 [vLLM](https://github.com/vllm-project/vllm) and [PyTorch](https://github.com/pytorch/pytorch).
-See [qualified Python engines and explicit migration](docs/python-engines.md).
+All five use the existing managed runtime search/install/select workflow. vLLM and PyTorch recipes privately provision pinned Python, dependencies and serving runners from an ordinary release binary. See [qualified Python engines, managed installation and explicit migration](docs/python-engines.md).
 
 ## License and contributions
 

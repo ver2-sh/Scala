@@ -58,75 +58,137 @@ live testing. Upstream `--merge-lora` rounds merged weights and can move near-ti
 decisions and calibration. Scala rejects merged serving until it has an independent
 model/calibration qualification; it does not couple merging to fast mode.
 
-## Runtime installation and discovery
+## Managed runtime installation and discovery
 
-Provision only a new, dedicated environment/root. Existing upstream/native Python
-and CUDA package acquisition stays separate from Scala. No general Python package
-installer, WSL requirement, system Python/CUDA/driver/PATH edit, or environment
-upgrade is introduced. Linux and Windows environments have independent locks and
-immutable fingerprints. Explicit `native.binary` and `native.binaries` are mutually
-exclusive; each configured entry produces its own runtime inventory/identity.
+The normal workflow is **Find compatible runtime → Install → Select runtime →
+Load Model Profile**. vLLM and PyTorch use the same Runtime Search, Runtime List
+and model runtime picker as Scala's other engines. Installing a runtime never
+loads weights, edits a profile, activates a service or upgrades another runtime.
+Application updates and runtime updates remain separate explicit operations.
 
-After installing the exact upstream packages in a dedicated Linux environment,
-prepare a new OpenAI runtime without model conversion:
+In the TUI, open Runtime Search, search `vllm` or `pytorch`, select a candidate,
+review its version, native platform, GPU/driver prerequisites and dependency
+recipe, then activate Install and Confirm install. Progress and package errors
+use the existing runtime notification area; Cancel stops the owned process tree
+and removes incomplete staging. The installed package appears in Runtime List.
+Use the model runtime picker to select it and load a Model Profile separately.
+
+For the model-first workflow, open the existing Model Profile and use Actions →
+Install compatible runtime (`s`). This searches against its bound physical
+artifact, including the reviewed source/readout contract. Actions → Select runtime
+(`v`) uses the same installed runtime picker. The H2O label shim and Imajev trained
+readout remain separate variants; arbitrary checkpoints and unqualified upstream
+architectures do not become compatible merely because packages were installed.
+
+Equivalent CLI operations:
 
 ```sh
-python3 crates/scala-engine-vllm/runtime/prepare.py runtime \
-  --backend vllm-openai --python /absolute/venv/bin/python \
-  --output /absolute/new-vllm-runtime
+scala runtimes search vllm
+scala runtimes search pytorch
+scala runtimes info <EXACT_RUNTIME_ID>
+scala runtimes install <EXACT_RUNTIME_ID>
+scala runtimes select --model <MODEL_ID> <EXACT_RUNTIME_ID>
+scala model-profiles compatibility <PROFILE> --runtime <EXACT_RUNTIME_ID>
+scala model-profiles load <PROFILE>
 ```
 
-Optional `--option NAME JSON_VALUE` pairs bind supported runtime-owned load defaults
-(`max_model_len`, `gpu_memory_utilization`, `enforce_eager`, `max_num_seqs`).
-Absent defaults remain upstream-owned. Discovery reads locked package metadata and
-verifies the installed RECORD closure without importing tensor libraries. It reports
-the upstream vLLM/torch version separately from the Scala runner protocol.
+CLI acquisition prints bounded progress on stderr; Ctrl-C cancels it. Explicit
+`runtimes check-updates` / `runtimes update <ID>` install qualified newer versions
+side-by-side. The old runtime and selection remain intact. Remove only an inactive,
+unselected managed runtime with `runtimes remove <ID>`; running/loading leases
+also protect it across processes. No runtime is installed automatically.
 
-H2O preparation uses `crates/scala-engine-vllm/runtime/prepare.py`: the existing
-bundle mode records the original model source and `shim` / `serve_config` bindings;
-runtime mode binds the original shim source revision/entrypoint and explicit
-`max_model_len`, `gpu_memory_utilization` and `min_context` options.
-Imajev preparation uses `crates/scala-engine-pytorch/runtime/prepare.py`: bundle
-mode binds `adapter`, `base` and `calibration`; runtime mode requires the clean,
-exact upstream source checkout and `device`, `rotations`, `max_input_tokens`
-options. Optional `fast` is a boolean runtime default. Neither preparation rewrites
-model checkpoints, adapters, calibration, source revisions or existing descriptors.
+The application binary embeds the reviewed locks, provisioning helper, runner,
+integrity utility, original H2O shim/config and license/source attribution.
+A Scala Git checkout, global Python, global uv, manual PowerShell invocation and
+TOML edits are unnecessary. Scala verifies and privately extracts CPython 3.12.12
+from python-build-standalone 20260211 and uv 0.11.2 from its published wheel.
+Every serving wheel has an exact version and acquisition hash. Installation is
+binary-only with dependency resolution disabled; the embedded complete lock is
+the authority. Windows retains its separate PyTorch CUDA index, compatibility
+port and private CUDA SDK recipe. Missing or replaced pinned downloads fail closed.
 
-For native Windows, use the independently pinned
-[H2O/vLLM recipe](../crates/scala-engine-vllm/runtime/windows/provision-h2o.ps1)
-and [Imajev/PyTorch recipe](../crates/scala-engine-pytorch/runtime/windows/provision-imajev.ps1)
-in new roots. The H2O port remains vLLM 0.29.0+cu132, torch 2.11.0+cu130 and
-triton-windows 3.6.0.post26; Imajev's separate lock uses torch 2.14.1+cu130.
-The real dedicated interpreter is the external entrypoint, with an adjacent
-`scala-vllm.json` or `scala-pytorch.json` binding the engine-owned runner.
-Preparing beside an obsolete `scala-native-decision.json` is rejected. Create a
-separate environment rather than editing the original binding or fingerprint.
-See [Windows provisioning details](python-engines-windows.md) and
-[historical qualification evidence](decision-windows-evidence.md).
+Linux vLLM uses 0.30.0 / torch 2.13.0 / torchvision 0.28.0 / transformers 5.19.0.
+The Linux label recipe retains the reviewed 40,960 context / 4,096 minimum context
+and 0.90 GPU memory fraction; Windows retains its independent fixed options.
+Linux Imajev uses torch 2.14.1 / torchvision 0.29.1 / PEFT 0.21.2 / transformers
+5.19.0 with the exact original Imajev source archive. Shared peripheral pins are
+retained from the reviewed locks; new Linux native dependencies follow the pinned
+upstream wheel metadata and are frozen with hashes in the Linux locks. No install
+resolves floating requirements or picks newer versions. The original CPython 3.12
+PyNvVideoCodec 2.0.4 wheel has the sole narrowly reviewed RECORD attestation;
+its original archive is retained in the package and only the two previously
+audited native members may disagree with their vendor RECORD. The DLPack auxiliary
+site preserves both original colliding `build_backend.py` files. No RECORD is
+rewritten and no global verification exception is granted.
 
-Configure ordinary engines using explicit paths:
+Currently managed recipes target native Linux glibc x86-64 and Windows x86-64,
+with reviewed Ampere/Ada/Blackwell CUDA targets (8.0, 8.6, 8.9, 12.0). Other
+platforms, CPU/MPS/ROCm environments and unqualified GPU targets are unavailable.
+Linux vLLM's wheel closure requires glibc 2.31+; PyTorch requires glibc 2.28+.
+CUDA 13 driver prerequisites are shown per candidate; unknown driver/GPU evidence
+blocks acquisition. Linux uses the published CUDA 13.0 driver floor 580.65.06.
+Native Windows conservatively requires the reviewed 610.62 host floor from the
+preserved evidence, rather than asserting an unreviewed lower Windows/PTX-JIT
+configuration. These admission floors do not replace native execution qualification.
+See [CUDA driver compatibility](https://docs.nvidia.com/cuda/archive/13.3.0/cuda-toolkit-release-notes/index.html#cuda-driver)
+and the [preserved native Windows evidence](decision-windows-evidence.md). The installer reserves at least 32 GiB free runtime storage
+for vLLM or 16 GiB for PyTorch. These are conservative acquisition reservations,
+not model VRAM or exact installed-size promises. Model-specific memory suitability
+and execution qualification remain separate. Linux vLLM checks an existing C++ compiler for native JIT. Native Windows vLLM additionally
+checks existing Visual Studio 2019+ x64 C++ tools for upstream JIT. Scala never
+installs a driver or global compiler or changes CUDA symlinks, PATH, registry or
+PowerShell execution policy.
+
+Each package owns its interpreter, venv, copied dependencies, runner, source,
+launch/configuration files and any private Windows SDK. Absolute Python bindings
+are prepared at the final identity path behind an owned pending marker. A matching
+interrupted install can be recovered only while holding its installation lease;
+foreign directories or completed immutable runtimes are never overwritten. Atomic
+manifest publication after full engine admission is the visibility boundary.
+Failed/cancelled acquisitions cannot become selectable. Diagnostics retain the
+package/verification failure, while disposable staging is removed.
+
+Private dependency caches are separate from installed environments; wheels use
+copy mode, so reclaiming caches cannot invalidate an installed package. Acquisition
+leases prevent concurrent cache mutation. Normal uv pruning retains reusable
+content; caches over the configured internal bound receive additional pruning,
+and verified bootstrap archives are bounded separately. `scala runtimes clean-cache`
+explicitly clears only Scala-owned Python dependency/bootstrap cache directories
+while preserving diagnostics, installed runtimes, source checkpoints, model weights,
+profiles and user files. Removing a runtime deletes its exact owned package only.
+
+Discovery reads metadata without importing tensor libraries or initializing CUDA.
+Managed manifests retain a verified-install metadata observation; warm discovery
+reuses the engine's observation inventory and invalidates it on changed files or
+package topology. Full content/RECORD verification occurs at installation and
+execution. Model inventory remains independent of heavy runtime probes.
+
+## Advanced external runtimes
+
+Explicit `native.binary` or `native.binaries` configurations remain supported for
+user-owned environments. They appear as external/unmanaged runtimes and Scala does
+not remove or upgrade their dependencies. The repository's `prepare.py` utilities
+and original native Windows provisioning scripts are advanced preparation tools,
+not requirements of the supported managed workflow. Each external environment
+must still satisfy the same pinned runner and source/dependency integrity contracts.
+On Windows, configure its isolated `Scripts/python.exe` with the adjacent
+`scala-vllm.json` or `scala-pytorch.json` launcher descriptor. Never repurpose an
+obsolete `scala-native-decision.json` environment; preserve it as historical evidence.
+
+Example advanced configuration:
 
 ```toml
 [engine.vllm]
 enabled = true
 [engine.vllm.native]
-binaries = ["/absolute/h2o-runtime/vllm-server", "/absolute/text-runtime/vllm-server"]
+binaries = ["/absolute/external-runtime/vllm-server"]
 
 [engine.pytorch]
 enabled = true
 [engine.pytorch.native]
-binary = "/absolute/imajev-runtime/pytorch-server"
+binary = "/absolute/external-runtime/pytorch-server"
 ```
-
-On Windows these values name each isolated `Scripts/python.exe`. Runtime defaults
-come from the exact installed implementation/options and model-owned generation
-configuration. Unknown values stay unknown; they are not persisted as overrides.
-Public discovery is bounded and reuses verified observations/in-flight probes;
-unchanged listings do not repeatedly hash dependency trees. File and distribution
-inventory changes invalidate cached discovery. Unknown launchers remain uncached.
-Execution verifies the exact interpreter/runner/dependency identity and complete
-model closure independently of discovery. Python model/runtime verification is a
-shared internal file utility, not an inference adapter or a cross-engine dispatch layer.
 
 Scala's supervisor owns POSIX groups and native Windows Job Objects, including
 startup children. Windows text serving retains its supervised parent while the
@@ -178,23 +240,28 @@ and selections remain readable. `native_decision` is unregistered and produces a
 actionable obsolete-engine error. Scala never renames old runtime records or edits
 persistent profiles/selections during an application update.
 
-1. Back up the existing user state and inspect `scala config show`,
-   `scala model-profiles list`, and `scala runtimes list`.
-2. Prepare separate `vllm` and/or `pytorch` runtimes under new roots using the
-   original dependencies and model sources. Keep the old files/receipts untouched.
-   Add the new engine configuration above and inspect `scala runtimes info <ID>`.
-3. Explicitly clear any obsolete selected runtime that applies to the model:
-   `scala runtimes clear-selection --model <MODEL_ID>`, and, if needed,
-   `scala runtimes clear-selection --format decisionbundle`. No command is run
-   automatically. Retain old identities/receipts for provenance.
-4. Run `scala model-profiles set-engine <H2O_PROFILE> vllm` or
-   `scala model-profiles set-engine <IMAJEV_PROFILE> pytorch`. This uses the existing
-   preflight operation, retains profile ID/model binding/name/role, and reports
-   incompatible local override removal. Engine Settings stores are not transferred.
-5. Explicitly select the new runtime if required:
-   `scala runtimes select --model <MODEL_ID> <NEW_RUNTIME_ID>`.
-   Review `scala model-profiles compatibility <PROFILE> --runtime <NEW_RUNTIME_ID>`.
-   Loading/activation is a separate user operation, not part of migration or update.
+In the TUI the preserved profile remains visible with an obsolete-engine label.
+Open its Engine action (`e`) to review compatible registered engines. Compatibility
+comes from the bound artifact, never its profile name or publisher. The review
+shows the proposed engine and incompatible overrides to remove; Confirm is the
+only action that writes the change. Cancel preserves the entire profile. The
+operation retains ID, name, model artifact and role and retains applicable local
+overrides. Engine Settings and runtime selections are independent and are never
+transferred or rewritten. After reviewing the engine, use Install compatible runtime,
+Select runtime and then Load as separate actions.
+
+The equivalent CLI operation first prints a review without mutating legacy state:
+
+```sh
+scala model-profiles set-engine <PROFILE> <COMPATIBLE_ENGINE>
+scala model-profiles set-engine <PROFILE> <COMPATIBLE_ENGINE> --confirm
+```
+
+Incompatible override removal also requires `--confirm`. Clear any obsolete selected
+runtime explicitly with `scala runtimes clear-selection --model <MODEL_ID>` (and
+`--format decisionbundle` if necessary), then select the exact new managed runtime.
+Concurrent profile changes invalidate the reviewed operation. No permanent legacy
+runtime or `native_decision` adapter is introduced.
 
 Candidate discovery (`decision_candidate`, `output_modalities: ["decisions"]`)
 remains distinct from execution-qualified Decision. `/v1/systemone`, `/v1/decisions`,

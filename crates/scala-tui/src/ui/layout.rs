@@ -37,6 +37,8 @@ pub enum ModelProfileAction {
     Unload,
     Model,
     Engine,
+    Runtime,
+    InstallRuntime,
     Role,
     Duplicate,
     Delete,
@@ -1413,6 +1415,8 @@ impl UiLayout {
                 actions.extend([
                     (ModelProfileAction::Model, 9),
                     (ModelProfileAction::Engine, 10),
+                    (ModelProfileAction::Runtime, 18),
+                    (ModelProfileAction::InstallRuntime, 32),
                     (ModelProfileAction::Role, 8),
                     (ModelProfileAction::Duplicate, if compact { 9 } else { 13 }),
                     (ModelProfileAction::Delete, 18),
@@ -1465,7 +1469,12 @@ impl UiLayout {
                     if compact { 68 } else { 76 },
                     (selection.engines.len() as u16)
                         .saturating_mul(if compact { 1 } else { 2 })
-                        .saturating_add(if compact { 7 } else { 9 }),
+                        .saturating_add(if compact { 7 } else { 9 })
+                        .saturating_add(if selection.switch_from.is_some() {
+                            4
+                        } else {
+                            0
+                        }),
                 );
                 profile_engine_popup = Some(popup);
                 let inner = popup.inner(Margin {
@@ -1478,7 +1487,14 @@ impl UiLayout {
                         index,
                         Rect::new(
                             inner.x,
-                            inner.y.saturating_add(2 + index as u16 * engine_row_height),
+                            inner.y.saturating_add(
+                                2 + index as u16 * engine_row_height
+                                    + if selection.switch_from.is_some() {
+                                        4
+                                    } else {
+                                        0
+                                    },
+                            ),
                             inner.width,
                             engine_row_height,
                         ),

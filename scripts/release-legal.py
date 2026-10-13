@@ -99,6 +99,12 @@ def main():
             sources[archive_name] = data
     if used != {row['file'] for row in supplements}:
         raise ValueError('Stale license supplements: review dependency changes')
+    h2o = ROOT / 'crates/scala-engine-vllm/runtime/fixtures/h2o'
+    for name, origin in [('LICENSE', 'https://huggingface.co/h2oai/h2o-lightning-4b/tree/193ad740925b176a3b70a5a13a7cff2f2fadd01e'),
+                         ('VLLM-LICENSE', 'https://github.com/vllm-project/vllm')]:
+        content = (h2o / name).read_bytes()
+        notices.append(f'\n--- Embedded Python runtime source notice: {origin} / {name} ---\n{content.decode("utf-8")}\n')
+    notices.append('\nPython, uv, dependency wheels, Imajev source and NVIDIA SDK components are acquired only on explicit runtime installation. Their original license/notice files remain in the managed runtime package.\n')
     # Only replace output after all inputs pass; remove obsolete generated files.
     if OUTPUT.exists():
         shutil.rmtree(OUTPUT)

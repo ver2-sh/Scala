@@ -199,6 +199,10 @@ def main():
     for key in ("runtime-root", "model-root", "evidence-root"):
         parser.add_argument("--" + key, type=Path, required=True)
     parser.add_argument("--name", default="h2o")
+    parser.add_argument("--uv", default="uv", help="Explicit private managed uv executable, or external advanced tool")
+    parser.add_argument("--managed-root", type=Path)
+    parser.add_argument("--cache-root", type=Path)
+    parser.add_argument("--backend", choices=["vllm-labels", "vllm-openai"], default="vllm-labels")
     args = parser.parse_args()
     if not native_host():
         raise ValueError("Use provision-h2o.ps1 with native Windows CPython 3.12.12")
@@ -231,7 +235,16 @@ def main():
     spec = importlib.util.spec_from_file_location("windows_port", HERE.parent / "windows_vllm.py")
     port = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(port)
-    cache = root / (name + "-acquisition")
+    cache = args.cache_root or root / (name + "-acquisition")
+    if args.cache_root:
+        if not args.managed_root or not (root / ".scala-python-pending").is_file():
+            raise ValueError("Private managed cache requires a pending Scala runtime")
+        owner = cache.parent.parent / ".scala-cache-owner"
+        if owner.read_text() != "scala-managed-python-cache-v1":
+            raise ValueError("Managed acquisition cache ownership is missing")
+        cache.parent.mkdir(exist_ok=True)
+        if cache.parent.resolve(strict=True) != cache.parent or cache.resolve() != cache:
+            raise ValueError("Managed acquisition cache cannot be an alias")
     cache.mkdir(exist_ok=True)
     wheel = download(VLLM_URL, cache / "vllm-0.29.0+cu132-cp312-cp312-win_amd64.whl", port.WHEEL_SHA256)
     humming = download(HUMMING_URL, cache / "humming-source.tar.gz", HUMMING_SOURCE_SHA256)
@@ -244,9 +257,9 @@ def main():
         source.mkdir()
         unpack_source(humming, source)
         builder = temp / "builder"
-        run("uv", "venv", "--python", sys.executable, builder)
+        run(args.uv, "venv", "--python", sys.executable, builder)
         build_python = builder / "Scripts/python.exe"
-        run("uv", "pip", "install", "--python", build_python, "--no-deps", "--require-hashes", "--only-binary", ":all:", "--index-url", "https://pypi.org/simple", "-r", HERE / "h2o-packaging.lock")
+        run(args.uv, "pip", "install", "--python", build_python, "--no-deps", "--require-hashes", "--only-binary", ":all:", "--index-url", "https://pypi.org/simple", "-r", HERE / "h2o-packaging.lock")
         run(build_python, "-I", "-B", "-c", "from setuptools.build_meta import build_wheel; build_wheel('../dist')", cwd=source,
             env={**os.environ, "SETUPTOOLS_SCM_PRETEND_VERSION": "0.1.15", "SOURCE_DATE_EPOCH": "1700000000"})
         normalize_wheel(temp / "dist" / humming_wheel.name, temp / humming_wheel.name)
@@ -259,8 +272,8 @@ def main():
     main_lock, aux_lock = cache / "primary.lock", cache / "dlpack.lock"
     main_lock.write_text(primary, encoding="utf-8")
     aux_lock.write_text(auxiliary, encoding="utf-8")
-    run("uv", "venv", "--python", sys.executable, env)
-    install = ["uv", "pip", "install", "--python", python, "--no-deps", "--require-hashes", "--only-binary", ":all:",
+    run(args.uv, "venv", "--python", sys.executable, env)
+    install = ["uv", "pip", "install", "--python", python, "--no-deps", "--require-hashes", "--only-binary", ":all:", "--link-mode", "copy",
                "--index-url", "https://pypi.org/simple", "--index", "https://download.pytorch.org/whl/cu130",
                "--index-strategy", "unsafe-best-match", "--find-links", cache]
     run(*install, "-r", main_lock)
@@ -274,13 +287,30 @@ def main():
     for component, (version, digest) in CUDA_COMPONENTS.items():
         member = f"{component}/windows-x86_64/{component}-windows-x86_64-{version}-archive.zip"
         sdk_payload(download(CUDA_URL + member, cache / Path(member).name, digest), component, sdk)
+    if args.managed_root:
+        # Verification binds this original wheel for the lifetime of the
+        # installed package; disposable cache cleanup must never delete it.
+        originals = root / (name + "-original-wheels")
+        originals.mkdir()
+        owned_wheel = originals / wheel.name
+        shutil.copyfile(wheel, owned_wheel)
+        if sha(owned_wheel) != port.WHEEL_SHA256:
+            raise ValueError("Original vLLM wheel changed while copying")
+        wheel = owned_wheel
     build = evidence / (name + "-windows-vllm.json")
     build.write_text(json.dumps(build_description(root, name, wheel, sdk, port), indent=2) + "\n", encoding="utf-8")
     options = {"max_model_len": 2048, "min_context": 1024, "gpu_memory_utilization": 0.80,
                "enforce_eager": True, "max_num_seqs": 4, "max_num_batched_tokens": 2048, "cpu_offload_gb": 0}
-    command = [python, "-I", "-B", HERE.parent / "prepare.py", "runtime", "--backend", "vllm-labels", "--python", python,
+    command = [python, "-I", "-B", HERE.parent / "prepare.py", "runtime", "--backend", args.backend, "--python", python,
                "--source", model, "--entrypoint", "h2o_lightning_shim.py", "--source-revision", MODEL_REVISION,
                "--windows-vllm", build, "--output", runtime]
+    if args.backend == "vllm-openai":
+        options.pop("min_context")
+        for key in ("--source", "--entrypoint", "--source-revision"):
+            index = command.index(key)
+            del command[index:index+2]
+    if args.managed_root:
+        command.extend(("--managed-root", args.managed_root))
     for key, value in options.items():
         command.extend(("--option", key, json.dumps(value)))
     probe = run(*command)

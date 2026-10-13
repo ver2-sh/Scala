@@ -271,7 +271,19 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
     let backend = format!("{} / {}", identity.accelerator, identity.variant);
     let (acquisition, size) = match available.download_size_bytes() {
         Some(bytes) => ("verified release download", format_bytes(bytes)),
-        None => ("managed source build", "local build".to_owned()),
+        None => {
+            if matches!(
+                available.acquisition,
+                scala_core::RuntimeAcquisitionPlan::ManagedPython(_)
+            ) {
+                (
+                    "isolated Python / hashed wheels",
+                    "complete size unknown".to_owned(),
+                )
+            } else {
+                ("managed source build", "local build".to_owned())
+            }
+        }
     };
     let selected_for = result.selected_for.join(", ");
     let mut lines = vec![
@@ -293,6 +305,36 @@ fn render_details(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLa
             Span::styled(compatibility, compatibility_style),
         ]),
     ];
+    if let scala_core::RuntimeAcquisitionPlan::ManagedPython(plan) = &available.acquisition {
+        let tuple = ["vllm", "torch", "torchvision", "peft", "transformers"]
+            .iter()
+            .filter_map(|name| {
+                plan.dependencies
+                    .get(*name)
+                    .map(|version| format!("{name} {version}"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(format!("DEPENDENCIES  {tuple}")));
+        lines.push(key_value(
+            "PYTHON",
+            "3.12.12; privately bootstrapped uv 0.11.2",
+            theme,
+        ));
+        lines.push(Line::from(format!(
+            "HOST NEEDS  NVIDIA driver {}; {}",
+            available
+                .requirements
+                .minimum_nvidia_driver
+                .as_deref()
+                .unwrap_or("unverified"),
+            plan.minimum_glibc
+                .as_ref()
+                .map(|v| format!("glibc {v}+"))
+                .unwrap_or_else(|| "native Windows x64".into())
+        )));
+        lines.push(key_value("RECIPE SHA", &plan.recipe_sha256, theme));
+    }
     if let Some(source_build) = available.source_build() {
         lines.push(key_value(
             "REVISION",
@@ -427,6 +469,12 @@ fn render_action(frame: &mut Frame<'_>, app: &App, theme: &Theme, layout: &UiLay
         }
         Some(_) if app.runtime_mutation_busy() => ("Installing…", ActionState::Disabled),
         Some(_) if app.runtime_search_loading => ("Searching…", ActionState::Disabled),
+        Some(result)
+            if app.pending_runtime_install_confirmation.as_ref()
+                == Some(&result.entry.available.runtime_id) =>
+        {
+            ("[ Confirm install ]", ActionState::Primary)
+        }
         Some(_) => ("[ Install ]", ActionState::Primary),
         None => ("Select a runtime", ActionState::Disabled),
     };

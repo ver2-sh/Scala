@@ -29,10 +29,13 @@ mod decision;
 mod embeddings;
 mod installer;
 pub mod link;
+#[cfg(all(test, target_os = "linux"))]
+mod managed_python_tests;
 mod manager;
 pub mod media;
 mod packs;
 mod prune;
+pub mod python_runtime;
 mod store;
 mod supervisor;
 #[cfg(test)]
@@ -1700,6 +1703,20 @@ impl RuntimeVariantUpdateIdentity {
 
 #[async_trait]
 pub trait EngineAdapter: Send + Sync {
+    fn managed_python_assets(&self) -> Vec<python_runtime::ManagedPythonAsset> {
+        Vec::new()
+    }
+    async fn managed_python_observation_key(&self, _runtime: &InstalledRuntime) -> Option<String> {
+        None
+    }
+    async fn admit_managed_python(
+        &self,
+        _runtime: &InstalledRuntime,
+    ) -> Result<RuntimeProbeObservation, EngineError> {
+        Err(EngineError::Unsupported(
+            "engine has no managed Python admission contract".into(),
+        ))
+    }
     fn identity(&self) -> EngineIdentity;
     fn capabilities(&self) -> EngineCapabilities;
     fn runtime_management_compatibility(&self) -> CompatibilityDecision {

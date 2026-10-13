@@ -1483,6 +1483,9 @@ impl EngineAdapter for LlamaCppAdapter {
                 }
                 RuntimeAcquisitionMethod::SourceBuild => AcquisitionMethod::SourceBuild,
                 RuntimeAcquisitionMethod::ExternalBinary => AcquisitionMethod::ExternalBinary,
+                RuntimeAcquisitionMethod::ManagedPython => {
+                    AcquisitionMethod::Other("managed_python".into())
+                }
             },
             binary_path: binary_path.clone(),
             binary_sha256: Some(manifest.entrypoint_sha256.clone()),
@@ -6410,6 +6413,7 @@ mod recipe_update_tests {
                 downloaded_archive_sha256: None,
                 additional_downloaded_archive_sha256: Vec::new(),
                 source_build: None,
+                python_environment: None,
                 entrypoint: "llama-server".into(),
                 entrypoint_sha256: "a".repeat(64),
                 installed_at_unix: Some(1),

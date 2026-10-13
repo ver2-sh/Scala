@@ -1,5 +1,7 @@
 //! Qualified model-specific PyTorch serving runners; PEFT is an implementation detail.
+mod catalog;
 use async_trait::async_trait;
+pub use catalog::PyTorchRuntimeCatalogProvider;
 use futures_util::StreamExt;
 use scala_core::{
     AcquisitionMethod, ArtifactFormat, DecisionBundle, EngineConfig, EngineInstallation,
@@ -29,6 +31,7 @@ pub struct PyTorchAdapter {
     error: Option<String>,
     client: reqwest::Client,
     proofs: RwLock<BTreeMap<String, Proof>>,
+    managed_observation: tokio::sync::Mutex<()>,
     observation_paths: tokio::sync::Mutex<BTreeMap<PathBuf, ObservationInventory>>,
     pending_probes: tokio::sync::Mutex<BTreeMap<PathBuf, PendingProbe>>,
     discovery_probes:
@@ -138,7 +141,7 @@ fn binding_matches(runtime: &InstalledRuntime, bundle: &DecisionBundle) -> bool 
     if probe.protocol != PROTOCOL
         || probe.engine_id != ENGINE_ID
         || probe.version != runtime.manifest.identity.version
-        || Some(&probe.revision) != runtime.manifest.identity.upstream_revision.as_ref()
+        || Some(&probe.revision) != runtime.verification_revision()
         || !runner::qualify_probe(&probe)
         || probe.backend != bundle.backend
     {
@@ -287,6 +290,7 @@ impl PyTorchAdapter {
                 .build()
                 .expect("native HTTP client"),
             proofs: RwLock::new(BTreeMap::new()),
+            managed_observation: Default::default(),
             observation_paths: tokio::sync::Mutex::new(BTreeMap::new()),
             discovery_probes: tokio::sync::Mutex::new(BTreeMap::new()),
             pending_probes: tokio::sync::Mutex::new(BTreeMap::new()),
@@ -346,7 +350,10 @@ impl PyTorchAdapter {
         )
         .await?;
         if !output.success || output.stdout.len() > 65536 {
-            return Err(invalid("Native runtime dependency/identity probe failed"));
+            return Err(invalid(format!(
+                "Native runtime dependency/identity probe failed: {}",
+                output.stderr.chars().take(4096).collect::<String>()
+            )));
         }
         let probe: Probe =
             serde_json::from_str(&output.stdout).map_err(|e| invalid(e.to_string()))?;
@@ -592,6 +599,73 @@ impl EngineAdapter for PyTorchAdapter {
             upstream_repository: "https://github.com/pytorch/pytorch".into(),
         }
     }
+    async fn managed_python_observation_key(&self, runtime: &InstalledRuntime) -> Option<String> {
+        let _observation = self.managed_observation.lock().await;
+        self.binary_observation_key(&runtime.entrypoint_path())
+            .await
+    }
+    fn managed_python_assets(&self) -> Vec<scala_engine::python_runtime::ManagedPythonAsset> {
+        catalog::assets()
+    }
+    fn available_runtime_compatibility(
+        &self,
+        runtime: &scala_core::AvailableRuntime,
+    ) -> CompatibilityDecision {
+        if catalog::PyTorchRuntimeCatalogProvider::new()
+            .candidates()
+            .iter()
+            .any(|candidate| candidate == runtime)
+        {
+            CompatibilityDecision::Supported
+        } else {
+            CompatibilityDecision::Unsupported {
+                reason: "Unqualified managed Python recipe".into(),
+            }
+        }
+    }
+    fn available_runtime_model_compatibility(
+        &self,
+        runtime: &scala_core::AvailableRuntime,
+        model: &ModelArtifact,
+        _: &HostCapabilities,
+        _: Option<&ResolvedSettings>,
+    ) -> RuntimeCompatibility {
+        if !self.available_runtime_compatibility(runtime).is_supported()
+            || !self.compatibility(model).is_supported()
+        {
+            return RuntimeCompatibility::Incompatible(
+                "Unqualified artifact or Python runtime recipe".into(),
+            );
+        }
+        if runtime.identity.variant == "torch-readout" {
+            RuntimeCompatibility::Compatible
+        } else {
+            RuntimeCompatibility::Incompatible("Unqualified PyTorch runner".into())
+        }
+    }
+    async fn admit_managed_python(
+        &self,
+        runtime: &InstalledRuntime,
+    ) -> Result<RuntimeProbeObservation, EngineError> {
+        let (sha, p) = Self::inspect(&runtime.entrypoint_path()).await?;
+        if sha != runtime.manifest.entrypoint_sha256
+            || p.engine_id != ENGINE_ID
+            || p.version != runtime.manifest.identity.version
+            || p.backend != runtime.manifest.identity.variant
+        {
+            return Err(invalid(
+                "Managed interpreter/runner/version failed admission",
+            ));
+        }
+        Ok(RuntimeProbeObservation {
+            compatible: true,
+            observed_engine_id: ENGINE_ID.into(),
+            observed_version: Some(p.version.clone()),
+            observed_revision: Some(p.revision.clone()),
+            detail: serde_json::to_string(&p).map_err(|e| invalid(e.to_string()))?,
+            observed_at_unix: now(),
+        })
+    }
     fn capabilities(&self) -> EngineCapabilities {
         EngineCapabilities {
             artifact_formats: vec![ArtifactFormat::DecisionBundle],
@@ -650,10 +724,7 @@ impl EngineAdapter for PyTorchAdapter {
             && serde_json::from_str::<Probe>(&runtime.manifest.probe.detail)
                 .is_ok_and(|p| runner::qualify_probe(&p))
             && runtime
-                .manifest
-                .identity
-                .upstream_revision
-                .as_ref()
+                .verification_revision()
                 .is_some_and(|r| r.len() == 64)
         {
             CompatibilityDecision::Supported
@@ -814,7 +885,7 @@ impl EngineAdapter for PyTorchAdapter {
         let (sha, p) = Self::inspect(&runtime.entrypoint_path()).await?;
         if !self.runtime_compatibility(runtime).is_supported()
             || sha != runtime.manifest.entrypoint_sha256
-            || Some(&p.revision) != runtime.manifest.identity.upstream_revision.as_ref()
+            || Some(&p.revision) != runtime.verification_revision()
             || p.backend != runtime.manifest.identity.variant
             || serde_json::from_str::<Probe>(&runtime.manifest.probe.detail)
                 .ok()
@@ -866,10 +937,14 @@ impl EngineAdapter for PyTorchAdapter {
             engine: EngineRevision {
                 engine_id: ENGINE_ID.into(),
                 version: Some(runtime.manifest.identity.version.clone()),
-                revision: runtime.manifest.identity.upstream_revision.clone(),
+                revision: runtime.verification_revision().cloned(),
             },
             source_repository: None,
-            acquisition_method: AcquisitionMethod::ExternalBinary,
+            acquisition_method: if runtime.manifest.python_environment.is_some() {
+                AcquisitionMethod::Other("managed_python".into())
+            } else {
+                AcquisitionMethod::ExternalBinary
+            },
             binary_path: runtime.entrypoint_path(),
             binary_sha256: Some(runtime.manifest.entrypoint_sha256.clone()),
             build: None,
@@ -892,13 +967,7 @@ impl EngineAdapter for PyTorchAdapter {
             "--launch-nonce".into(),
             uuid::Uuid::new_v4().to_string().into(),
             "--runtime-revision".into(),
-            runtime
-                .manifest
-                .identity
-                .upstream_revision
-                .clone()
-                .unwrap()
-                .into(),
+            runtime.verification_revision().cloned().unwrap().into(),
         ]);
         Ok(LaunchSpec {
             executable: launcher::executable(&runtime.entrypoint_path()).await?,
@@ -949,13 +1018,7 @@ impl EngineAdapter for PyTorchAdapter {
             Proof {
                 tuple,
                 nonce,
-                revision: spec
-                    .runtime
-                    .manifest
-                    .identity
-                    .upstream_revision
-                    .clone()
-                    .unwrap(),
+                revision: spec.runtime.verification_revision().cloned().unwrap(),
                 backend: b.backend,
                 bundle_sha256: sha,
                 profile: spec.settings.model_profile_id.clone(),

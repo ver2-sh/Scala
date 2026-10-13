@@ -8,7 +8,7 @@ mod terminal;
 mod theme;
 mod ui;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1158,6 +1158,9 @@ async fn execute_settings_action(
                         model,
                         engines,
                         selected: 0,
+                        switch_from: None,
+                        switch_overrides: BTreeMap::new(),
+                        switch_removed: BTreeMap::new(),
                     });
                 }
             };
@@ -1276,42 +1279,83 @@ async fn execute_settings_action(
             .await
         }
         SettingsAction::CycleProfileEngine { profile_id, model } => {
-            let compatible = runtime_packs.compatible_engine_ids(&model);
             let (settings, current) =
                 match read_tui_settings(&settings_store, &profiles_store).await {
                     Ok(state) => state,
                     Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
                 };
             let Some(existing) = current.profiles.get(&profile_id) else {
-                return SettingsTaskResult::Stored(Err(SettingsError::ModelProfileNotFound(
-                    profile_id,
-                )
-                .to_string()));
+                return SettingsTaskResult::Stored(Err(format!(
+                    "Model Profile `{profile_id}` is missing"
+                )));
             };
-            let next = compatible
-                .iter()
-                .position(|engine| engine == existing.engine_id.as_str())
-                .map(|index| (index + 1) % compatible.len())
-                .unwrap_or(0);
-            let Some(engine) = compatible.get(next) else {
-                return SettingsTaskResult::Stored(Err(SettingsError::InvalidModelProfile(
-                    format!(
-                        "no registered engine is compatible with model `{}`",
-                        model.id
-                    ),
-                )
-                .to_string()));
-            };
-            let engine = match EngineId::new(engine.clone()) {
-                Ok(engine) => engine,
-                Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
-            };
+            let mut engines = Vec::new();
+            let mut switch_overrides = BTreeMap::new();
+            let mut switch_removed = BTreeMap::new();
+            for engine in runtime_packs.compatible_engine_ids(&model) {
+                match runtime_packs
+                    .model_profile_engine_switch_candidate(
+                        &settings,
+                        existing,
+                        &model,
+                        &engine,
+                        &paths.data_dir,
+                    )
+                    .await
+                {
+                    Ok(candidate) => {
+                        switch_removed.insert(
+                            engine.clone(),
+                            candidate.removed.iter().map(ToString::to_string).collect(),
+                        );
+                        switch_overrides.insert(engine.clone(), candidate.overrides);
+                        engines.push(EngineId::new(engine).expect("registered engine ID"));
+                    }
+                    Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
+                }
+            }
+            if engines.is_empty() {
+                return SettingsTaskResult::Stored(Err(
+                    "No supported engine proves compatibility with this artifact".into(),
+                ));
+            }
+            SettingsTaskResult::ChooseProfileEngine(ProfileEngineSelection {
+                id: existing.id.clone(),
+                display_name: existing.display_name.clone(),
+                model,
+                engines,
+                selected: 0,
+                switch_from: Some(Box::new(existing.clone())),
+                switch_overrides,
+                switch_removed,
+            })
+        }
+        SettingsAction::SetProfileEngine {
+            original,
+            model,
+            engine_id,
+            overrides,
+        } => {
+            let (settings, current) =
+                match read_tui_settings(&settings_store, &profiles_store).await {
+                    Ok(state) => state,
+                    Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
+                };
+            if current
+                .profiles
+                .get(&original.id)
+                .is_none_or(|p| p.content_hash() != original.content_hash())
+            {
+                return SettingsTaskResult::Stored(Err(
+                    "Model Profile changed since review; review the engine change again".into(),
+                ));
+            }
             let candidate = match runtime_packs
                 .model_profile_engine_switch_candidate(
                     &settings,
-                    existing,
+                    &original,
                     &model,
-                    engine.as_str(),
+                    engine_id.as_str(),
                     &paths.data_dir,
                 )
                 .await
@@ -1319,47 +1363,36 @@ async fn execute_settings_action(
                 Ok(candidate) => candidate,
                 Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
             };
-            let original_hash = existing.content_hash();
-            let overrides = candidate.overrides;
-            let removed = candidate
-                .removed
-                .into_iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>();
+            if candidate.overrides != overrides {
+                return SettingsTaskResult::Stored(Err(
+                    "Applicable overrides changed since review; review again".into(),
+                ));
+            }
             let result = profiles_store
                 .update(move |state| {
                     let profile = state
                         .profiles
-                        .get_mut(&profile_id)
-                        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
-                    if profile.content_hash() != original_hash {
-                        return Err(SettingsError::InvalidModelProfile(format!(
-                            "Model Profile `{profile_id}` changed during engine-switch preflight"
-                        )));
+                        .get_mut(&original.id)
+                        .ok_or_else(|| SettingsError::ModelProfileNotFound(original.id.clone()))?;
+                    if profile.content_hash() != original.content_hash() {
+                        return Err(SettingsError::InvalidModelProfile(
+                            "Model Profile changed since review".into(),
+                        ));
                     }
-                    profile.engine_id = engine;
+                    profile.engine_id = engine_id;
                     profile.overrides = overrides;
                     Ok(())
                 })
                 .await
                 .map_err(|error| error.to_string());
-            let mut stored = finish_settings_write(
+            finish_settings_write(
                 &runtime_packs,
                 paths,
                 &settings_store,
                 &profiles_store,
                 result,
             )
-            .await;
-            if let SettingsTaskResult::Stored(Ok(loaded)) = &mut stored
-                && !removed.is_empty()
-            {
-                loaded.save_notice = Some(format!(
-                    "Engine changed; removed incompatible overrides: {}",
-                    removed.join(", ")
-                ));
-            }
-            stored
+            .await
         }
         SettingsAction::CycleProfileRole { profile_id } => {
             let result = profiles_store

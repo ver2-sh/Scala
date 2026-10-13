@@ -145,6 +145,8 @@ pub fn runtime_pack_manager_from_paths(
         Arc::new(Q27RuntimeCatalogProvider::new()),
         Arc::new(NinferRuntimeCatalogProvider::new()),
         Arc::new(NinferWindowsRuntimeCatalogProvider::new()),
+        Arc::new(scala_engine_vllm::VllmRuntimeCatalogProvider::new()),
+        Arc::new(scala_engine_pytorch::PyTorchRuntimeCatalogProvider::new()),
     ];
     Ok(RuntimePackManager::new(paths, registry, providers)?)
 }
@@ -449,6 +451,19 @@ mod tests {
                 .iter()
                 .any(|d| d.id.as_str() == "pytorch.fast")
         );
+    }
+
+    #[test]
+    fn managed_python_catalogs_are_part_of_the_ordinary_runtime_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = temporary_paths("python-catalogs");
+        let config = scala_core::AppConfig::default();
+        let registry = super::engine_registry_from_config(&config, dir.path()).unwrap();
+        let packs = super::runtime_pack_manager_from_paths(&paths, registry).unwrap();
+        let ids = packs.catalog_provider_ids().collect::<Vec<_>>();
+        assert_eq!(ids.len(), 7);
+        assert!(ids.contains(&"vllm-reviewed-python"));
+        assert!(ids.contains(&"pytorch-reviewed-python"));
     }
 
     #[test]

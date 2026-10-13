@@ -224,6 +224,8 @@ pub enum RuntimesCommand {
     Install { runtime_ref: String },
     /// Remove one inactive, unselected managed runtime version
     Remove { runtime_ref: String },
+    /// Reclaim privately managed Python dependency and bootstrap caches
+    CleanCache,
     /// Check installed runtimes for newer compatible packs
     CheckUpdates,
     /// Install the newest compatible pack side-by-side
@@ -290,7 +292,13 @@ pub enum ModelProfilesCommand {
     /// Change the concrete model binding
     SetModel { profile: String, model: String },
     /// Change the engine binding
-    SetEngine { profile: String, engine: String },
+    SetEngine {
+        profile: String,
+        engine: String,
+        /// Confirm the reviewed engine migration and incompatible override removal
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Change the default inference role
     SetRole { profile: String, role: ProfileRole },
     /// Set one or more Model Profile overrides

@@ -29,7 +29,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default()
-            .title(" Choose Model Profile engine ")
+            .title(if selection.switch_from.is_some() {
+                " Review Model Profile engine change "
+            } else {
+                " Choose Model Profile engine "
+            })
             .borders(Borders::ALL)
             .border_set(glyphs.border)
             .border_style(theme.accent),
@@ -58,6 +62,37 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
         ])),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
+    if let Some(original) = &selection.switch_from {
+        let engine = selection
+            .engines
+            .get(selection.selected)
+            .map(|e| e.as_str())
+            .unwrap_or("unavailable");
+        let removed = selection
+            .switch_removed
+            .get(engine)
+            .map(|v| v.join(", "))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "none".into());
+        let explanation = if original.engine_id.as_str() == "native_decision" {
+            "native_decision is obsolete. Compatibility proves the offered engines."
+        } else {
+            "Review this explicit engine change."
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(explanation),
+                Line::from(format!(
+                    "{} -> {engine}; ID, name, artifact and role retained",
+                    original.engine_id
+                )),
+                Line::from(format!("Remove incompatible overrides: {removed}")),
+                Line::from("Engine Settings and runtime selections remain independent."),
+            ])
+            .style(theme.muted),
+            Rect::new(inner.x, inner.y + 1, inner.width, 4),
+        );
+    }
     let items = selection.engines.iter().enumerate().map(|(index, engine)| {
         let label = if engine.as_str() == "ninfer" {
             "NInfer"
@@ -100,7 +135,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     frame.render_widget(List::new(items), list_area);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "[ Create ]",
+            if selection.switch_from.is_some() {
+                "[ Confirm ]"
+            } else {
+                "[ Create ]"
+            },
             action_style(
                 theme,
                 ActionState::Primary,

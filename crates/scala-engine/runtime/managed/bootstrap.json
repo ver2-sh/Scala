@@ -1,0 +1,64 @@
+{
+  "python": {
+    "linux": {
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260211/cpython-3.12.12%2B20260211-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+      "size_bytes": 33887801,
+      "digest": {
+        "algorithm": "sha256",
+        "value": "1dbaa624a09e15afe7efbdac08d42993135a68db8d34f986ef6977a6d77bdc3c"
+      },
+      "archive_format": "tar_gz",
+      "entrypoint_names": [
+        "python3.12"
+      ]
+    },
+    "windows": {
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260211/cpython-3.12.12%2B20260211-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+      "size_bytes": 21839326,
+      "digest": {
+        "algorithm": "sha256",
+        "value": "93bf8e8c05ede0077b197a29c99ebdaf253497f27190097494265150b4e70ba8"
+      },
+      "archive_format": "tar_gz",
+      "entrypoint_names": [
+        "python.exe"
+      ]
+    }
+  },
+  "uv": {
+    "linux": {
+      "url": "https://files.pythonhosted.org/packages/9f/6e/f49ca8ad037919e5d44a2070af3d369792be3419c594cfb92f4404ab7832/uv-0.11.2-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "size_bytes": 24586892,
+      "digest": {
+        "algorithm": "sha256",
+        "value": "be4bb136bbc8840ede58663e8ba5a9bbf3b5376f7f933f915df28d4078bb9095"
+      },
+      "archive_format": "zip",
+      "entrypoint_names": [
+        "uv"
+      ]
+    },
+    "windows": {
+      "url": "https://files.pythonhosted.org/packages/f6/a3/c88fa454a7c07785ce63e96b6c1c7b24b5abcb3a6afbc6ad8b29b9bc1a1d/uv-0.11.2-py3-none-win_amd64.whl",
+      "size_bytes": 24989876,
+      "digest": {
+        "algorithm": "sha256",
+        "value": "d4dbcecf6daca8605f46fba232f49e9b49d06ebe3b9cba5e59e608c5be03890e"
+      },
+      "archive_format": "zip",
+      "entrypoint_names": [
+        "uv.exe"
+      ]
+    }
+  },
+  "imajev_source": {
+    "url": "https://api.github.com/repos/mohit67890/imajev/zipball/91729bff7a806187324e287fd0d730839dc32026",
+    "size_bytes": 17699280,
+    "digest": {
+      "algorithm": "sha256",
+      "value": "2a03a2919f4f0c01dc905f33428c2755a0f206deb42d4515526289b980cf4c23"
+    },
+    "archive_format": "zip",
+    "entrypoint_names": []
+  }
+}

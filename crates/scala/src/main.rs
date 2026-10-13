@@ -68,6 +68,37 @@ async fn main() -> ExitCode {
     }
 }
 
+async fn managed_runtime_operation(
+    packs: &scala_engine::RuntimePackManager,
+    runtime_id: &scala_core::RuntimeId,
+    update: bool,
+) -> color_eyre::Result<scala_core::InstalledRuntime> {
+    let mut progress = packs.progress();
+    let operation = async {
+        if update {
+            packs.update(runtime_id).await
+        } else {
+            packs.install(runtime_id).await
+        }
+    };
+    tokio::pin!(operation);
+    let mut last_phase = None;
+    let mut last_message = std::time::Instant::now();
+    loop {
+        tokio::select! {
+            result = &mut operation => return result.map_err(Into::into),
+            _ = tokio::signal::ctrl_c() => return Err(color_eyre::eyre::eyre!("Runtime installation cancelled; incomplete staging is removed and no runtime is registered")),
+            Ok(event) = progress.recv() => {
+                if last_phase != Some(event.phase) || last_message.elapsed() >= std::time::Duration::from_millis(500) {
+                    eprintln!("{:?}: {}", event.phase, event.detail.trim());
+                    last_phase = Some(event.phase);
+                    last_message = std::time::Instant::now();
+                }
+            }
+        }
+    }
+}
+
 async fn run(cli: Cli) -> Result<ExitCode> {
     if let Some(Command::Doctor(args)) = &cli.command {
         let report = doctor::run().await;
@@ -297,7 +328,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                 }
                 RuntimesCommand::Install { runtime_ref } => {
                     packs.refresh_host_capabilities().await;
-                    let runtime = packs.install(&RuntimeId::new(runtime_ref)?).await?;
+                    let runtime =
+                        managed_runtime_operation(&packs, &RuntimeId::new(runtime_ref)?, false)
+                            .await?;
                     output::runtime_operation("install", &runtime, cli.json)?;
                 }
                 RuntimesCommand::Remove { runtime_ref } => {
@@ -305,13 +338,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     packs.remove(&runtime_id, None).await?;
                     output::runtime_removed(&runtime_id, cli.json)?;
                 }
+                RuntimesCommand::CleanCache => {
+                    packs.clean_python_cache().await?;
+                    println!(
+                        "Private Python acquisition cache cleared; installed runtimes are retained"
+                    );
+                }
                 RuntimesCommand::CheckUpdates => {
                     packs.refresh_host_capabilities().await;
                     output::runtime_updates(&packs.check_updates().await?, cli.json)?;
                 }
                 RuntimesCommand::Update { runtime_ref } => {
                     packs.refresh_host_capabilities().await;
-                    let runtime = packs.update(&RuntimeId::new(runtime_ref)?).await?;
+                    let runtime =
+                        managed_runtime_operation(&packs, &RuntimeId::new(runtime_ref)?, true)
+                            .await?;
                     output::runtime_operation("update", &runtime, cli.json)?;
                 }
                 RuntimesCommand::Select {
@@ -778,7 +819,11 @@ async fn handle_model_profiles(
             output_model_profile_mutation(&core, "set-model", &state, &selected, json_output)
                 .await?;
         }
-        ModelProfilesCommand::SetEngine { profile, engine } => {
+        ModelProfilesCommand::SetEngine {
+            profile,
+            engine,
+            confirm,
+        } => {
             let profile_id = ModelProfileId::new(profile)?;
             let engine_id = EngineId::new(engine)?;
             core.ensure_model_discovery().await?;
@@ -801,6 +846,24 @@ async fn handle_model_profiles(
                     &core.paths.data_dir,
                 )
                 .await?;
+            if !confirm
+                && (existing.engine_id.as_str() == "native_decision"
+                    || !candidate.removed.is_empty())
+            {
+                println!(
+                    "Review engine change for {}: {} -> {}. ID, name, model and role are retained. Incompatible overrides to remove: {}. Runtime selections and engine Settings are retained. Repeat with --confirm to apply.",
+                    existing.id,
+                    existing.engine_id,
+                    engine_id,
+                    candidate
+                        .removed
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                return Ok(());
+            }
             let original_hash = existing.content_hash();
             let overrides = candidate.overrides.clone();
             let update_profile_id = profile_id.clone();

@@ -323,6 +323,12 @@ impl RuntimePackManager {
             .map_err(RuntimePackError::Adapter)
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn set_test_download_origin(&mut self, origin: reqwest::Url) {
+        self.catalog = self.catalog.clone().with_test_origin(origin.clone());
+        self.installer = self.installer.clone().with_test_origin(origin);
+    }
+
     pub async fn validate_configuration(
         &self,
         runtime: &InstalledRuntime,
@@ -388,6 +394,10 @@ impl RuntimePackManager {
             .map_err(|error| RuntimePackError::Selection(error.to_string()))?;
         self.validate_configuration(&selection.runtime, Some(model), &resolved)
             .await
+    }
+
+    pub fn catalog_provider_ids(&self) -> impl Iterator<Item = &str> {
+        self.catalog.provider_ids()
     }
 
     pub fn compatible_engine_ids(&self, model: &ModelArtifact) -> Vec<String> {
@@ -770,7 +780,8 @@ impl RuntimePackManager {
         });
         let selections = self.store.selections().await?;
         let host = self.host.read().await.clone();
-        let installed = self.assess_installed(runtimes, &selections, &host);
+        let mut installed = self.assess_installed(runtimes, &selections, &host);
+        self.assess_python_observations(&mut installed).await;
         Ok(RuntimeListSnapshot {
             host,
             selections,
@@ -815,11 +826,12 @@ impl RuntimePackManager {
                 .then_with(|| compare_installed_recency_with_registry(&self.registry, right, left))
         });
         let empty_selections = RuntimeSelections::default();
-        let installed = self.assess_installed(
+        let mut installed = self.assess_installed(
             runtimes,
             selections.as_ref().unwrap_or(&empty_selections),
             &host,
         );
+        self.assess_python_observations(&mut installed).await;
         RuntimeLocalInspection {
             host,
             selections,
@@ -875,7 +887,10 @@ impl RuntimePackManager {
             if !root.exists() {
                 return Some(paths);
             }
-            for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+            for entry in walkdir::WalkDir::new(&root)
+                .follow_links(false)
+                .max_depth(5)
+            {
                 let entry = entry.ok()?;
                 paths.push(entry.path().to_owned());
             }
@@ -1035,6 +1050,26 @@ impl RuntimePackManager {
         runtimes
     }
 
+    async fn assess_python_observations(&self, installed: &mut [InstalledRuntimeStatus]) {
+        for status in installed {
+            if let Some(provenance) = &status.runtime.manifest.python_environment {
+                let observed = if let Some(adapter) = self
+                    .registry
+                    .get(&status.runtime.manifest.identity.engine_id)
+                {
+                    adapter
+                        .managed_python_observation_key(&status.runtime)
+                        .await
+                } else {
+                    None
+                };
+                if observed.as_ref() != Some(&provenance.observation_key) {
+                    status.compatibility = RuntimeCompatibility::Incompatible("Managed Python environment changed or its observation is unavailable; remove and reinstall this immutable package. Model files are retained.".into());
+                }
+            }
+        }
+    }
+
     fn assess_installed(
         &self,
         runtimes: Vec<InstalledRuntime>,
@@ -1131,7 +1166,21 @@ impl RuntimePackManager {
             mut entries,
             provider_errors,
             fetched_at_unix,
-        } = self.catalog.search(query, &host, force_refresh).await;
+        } = self
+            .catalog
+            .search_for_engines(
+                query,
+                &host,
+                force_refresh,
+                model
+                    .map(|(model, _)| {
+                        self.compatible_engine_ids(model)
+                            .into_iter()
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .as_ref(),
+            )
+            .await;
         let mut preferences = std::collections::BTreeMap::new();
         let mut source_prerequisite_results =
             Vec::<(SourceBuildPrerequisiteEvaluationKey, RuntimeCompatibility)>::new();
@@ -1176,6 +1225,21 @@ impl RuntimePackManager {
                     "engine adapter is not registered".to_owned(),
                 ),
             };
+            if let scala_core::RuntimeAcquisitionPlan::ManagedPython(plan) =
+                &entry.available.acquisition
+            {
+                if let RuntimeCompatibility::NeedsAttention(reason) = &entry.compatibility {
+                    entry.compatibility = RuntimeCompatibility::Incompatible(format!(
+                        "Python prerequisite could not be verified: {reason}"
+                    ));
+                }
+                if entry.compatibility.is_usable() {
+                    entry.compatibility = combine_compatibility(
+                        entry.compatibility.clone(),
+                        self.installer.python_compatibility(plan).await,
+                    );
+                }
+            }
             if !matches!(entry.compatibility, RuntimeCompatibility::Incompatible(_))
                 && let Some(plan) = entry.available.source_build()
             {
@@ -1285,11 +1349,29 @@ impl RuntimePackManager {
                 reason,
             });
         }
-        if let RuntimeCompatibility::Incompatible(reason) = entry.compatibility {
+        if let RuntimeCompatibility::Incompatible(reason) = &entry.compatibility {
             return Err(RuntimePackError::Incompatible {
                 runtime_id: runtime_id.clone(),
-                reason,
+                reason: reason.clone(),
             });
+        }
+        if let scala_core::RuntimeAcquisitionPlan::ManagedPython(plan) =
+            &entry.available.acquisition
+        {
+            if let RuntimeCompatibility::NeedsAttention(reason) = &entry.compatibility {
+                return Err(RuntimePackError::Incompatible {
+                    runtime_id: runtime_id.clone(),
+                    reason: format!("Python host prerequisite is unverified: {reason}"),
+                });
+            }
+            if let RuntimeCompatibility::Incompatible(reason) =
+                self.installer.python_compatibility(plan).await
+            {
+                return Err(RuntimePackError::Incompatible {
+                    runtime_id: runtime_id.clone(),
+                    reason,
+                });
+            }
         }
         if let Some(runtime) = self.store.get(runtime_id).await? {
             ensure_catalog_provenance_matches(&runtime, &entry.available)?;
@@ -1309,6 +1391,18 @@ impl RuntimePackManager {
             .verify_install_candidate(&entry.available)
             .await?;
         self.installer.install(&verified).await.map_err(Into::into)
+    }
+
+    /// Clear only privately owned, unreferenced Python acquisition caches.
+    pub async fn clean_python_cache(&self) -> Result<(), RuntimePackError> {
+        let _operation = self
+            .operation
+            .try_lock()
+            .map_err(|_| RuntimePackError::Selection("runtime mutation is active".into()))?;
+        self.installer
+            .clean_python_cache()
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn remove(
@@ -2521,6 +2615,7 @@ fn external_runtime(
             downloaded_archive_sha256: None,
             additional_downloaded_archive_sha256: Vec::new(),
             source_build: None,
+            python_environment: None,
             entrypoint: binary_path.clone(),
             entrypoint_sha256: binary_sha256,
             installed_at_unix: None,
@@ -2569,6 +2664,13 @@ fn ensure_catalog_provenance_matches(
                 && additional_digests.len() == additional_downloads.len()
                 && manifest.additional_downloaded_archive_sha256 == additional_digests
                 && manifest.source_build.is_none()
+        }
+        scala_core::RuntimeAcquisitionPlan::ManagedPython(plan) => {
+            manifest.acquisition_method == RuntimeAcquisitionMethod::ManagedPython
+                && manifest
+                    .python_environment
+                    .as_ref()
+                    .is_some_and(|p| &p.plan == plan.as_ref())
         }
         scala_core::RuntimeAcquisitionPlan::SourceBuild(plan) => {
             manifest.acquisition_method == RuntimeAcquisitionMethod::SourceBuild
@@ -2652,6 +2754,7 @@ fn acquisition_rank(runtime: &InstalledRuntime) -> u8 {
         | RuntimeAcquisitionMethod::PreseededOfficialPack
         | RuntimeAcquisitionMethod::SourceBuild => 0,
         RuntimeAcquisitionMethod::ExternalBinary => 1,
+        RuntimeAcquisitionMethod::ManagedPython => 0,
     }
 }
 
@@ -4103,6 +4206,7 @@ mod tests {
                 downloaded_archive_sha256: source_build.is_none().then(|| "d".repeat(64)),
                 additional_downloaded_archive_sha256: Vec::new(),
                 source_build,
+                python_environment: None,
                 entrypoint: PathBuf::from("server"),
                 entrypoint_sha256: "c".repeat(64),
                 installed_at_unix: Some(1),
