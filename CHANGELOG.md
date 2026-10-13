@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.1.22 - Managed vLLM and PyTorch runtimes
+
+Integrates the reviewed managed Python inference-runtime installation and
+cancellation workflow into Scala's existing multi-engine runtime control plane.
+
+- Add independently qualified vLLM and PyTorch runtime catalog candidates,
+  model-first and engine-first Runtime Search, and installation through the same
+  CLI/TUI operations as llama.cpp, q27 and NInfer.
+- Acquire exact reviewed isolated CPython, private uv and hashed dependency
+  wheels; embed required recipes, engine runners, H2O source bindings and
+  licensing in standalone Scala releases without a source checkout.
+- Preserve separate Linux and native Windows runtime contracts, isolated CUDA
+  dependencies, immutable runtime identity, failed-install recovery, guarded
+  removal, explicit side-by-side updates and Scala-owned cache cleanup.
+- Add an explicit TUI Cancel installation action (F6), independent of Close,
+  with supervised subprocess-tree cancellation, lease lifetime protection,
+  cleanup of incomplete staging and retry safety; fix native Windows H2O
+  provisioning to use the private verified uv executable without global PATH.
+- Offer explicit, reviewed Model Profile engine changes for obsolete
+  native_decision references without silently changing profiles, runtime
+  selections, settings, weights or model provenance.
+
+Development validation uses local synthetic/packaging checks. Actual dependency
+installation, native Windows execution and live model/GPU inference remain
+operational qualifications and are not claimed by this source release.
+
 ## 0.1.21 - First-class vLLM and PyTorch engines
 
 Replaces the specialised `native_decision` engine with independently qualified
