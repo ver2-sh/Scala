@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.1.21 - First-class vLLM and PyTorch engines
+
+Replaces the specialised `native_decision` engine with independently qualified
+`vllm` and `pytorch` engines. Decision remains an engine-neutral capability.
+
+- Add native vLLM OpenAI Chat Completions and Responses serving for a bounded,
+  qualified subset of original Hugging Face safetensors checkpoints, including
+  streaming, cancellable requests, and independently scoped inference settings.
+- Preserve H2O-Lightning's upstream trained label scoring and calibration through
+  the separate vLLM engine. Preserve Imajev's original PyTorch/PEFT float32 trained
+  readout, image decisions, calibration and abstention under a model-specific runner.
+  Make upstream Imajev fast mode an explicit qualified option; merged LoRA remains
+  unsupported pending independent qualification.
+- Keep Linux and native Windows runtime identities, verified dependency closures,
+  supervised process ownership and exact capability gating. Explicitly preserve
+  existing model/profile/runtime state: obsolete `native_decision` profiles require
+  an intentional switch to the new engine and separate runtime preparation.
+- Preserve System One/OpenAI Decisions APIs, Scala Link, llama.cpp/q27/NInfer
+  behaviour, runtime-origin neutrality and Settings/Profile precedence.
+  No automatic production activation, runtime installation or model mutation.
+
+Local synthetic/static tests qualify source integration. Live Linux/Windows GPU
+execution and numerical equivalence of accelerated modes remain separately
+unverified operational checks.
+
 ## 0.1.20 - Native Decision, updated inference runtimes and multimodal embeddings
 
 Integrates the reviewed October 2026 upstream inference changes into Scala's
