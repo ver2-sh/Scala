@@ -14,7 +14,7 @@ pub(super) fn candidate(model: &ModelArtifact) -> bool {
             if identity.decision_type.as_deref().is_some_and(|kind| !kind.is_empty() && kind != "none"))
 }
 
-// Metadata identifiers from the pinned native can_use_images() switch.
+// Metadata identifiers from each reviewed native can_use_images() switch.
 // This never detects Decision: executable/model/probe qualification is required first.
 fn reviewed_image_contract(revision: Option<&str>, native_type: Option<&str>) -> bool {
     match revision {
@@ -25,6 +25,16 @@ fn reviewed_image_contract(revision: Option<&str>, native_type: Option<&str>) ->
             native_type,
             Some("openjev" | "clef" | "pplx-decider" | "lfm2-d1" | "lfm2-d1-omni")
         ),
+        // Official b11606 / b11617: server-decision.h admits VLLM_D3;
+        // post_systemone also requires the loaded mtmd vision context.
+        Some(
+            "1b70350c92563449576bcbbf552994b1d1ed847d" | "14310190cd0a0c831fe949ac8cbedd8abdc90695",
+        ) => {
+            matches!(
+                native_type,
+                Some("openjev" | "clef" | "pplx-decider" | "vllm-d3" | "lfm2-d1" | "lfm2-d1-omni")
+            )
+        }
         _ => false,
     }
 }
@@ -238,7 +248,7 @@ pub(super) fn native_request_body(request: &DecisionRequest) -> Result<Value, En
             }
         }
         if let Some(field) = first_image {
-            // At both frozen revisions parse_state removes image parts and render
+            // At the reviewed revisions parse_state removes image parts and render
             // receives only a shared ordered media list. It cannot retain text/image
             // positions or associate images with one of several messages. A sole
             // image-only message has neither ambiguity; explicit top-level images
@@ -752,6 +762,15 @@ mod tests {
     }
 
     async fn fixture(native: bool, kind: Option<&str>, outputs: Option<Value>) -> Fixture {
+        fixture_with_vision(native, kind, outputs, None).await
+    }
+
+    async fn fixture_with_vision(
+        native: bool,
+        kind: Option<&str>,
+        outputs: Option<Value>,
+        vision: Option<bool>,
+    ) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("Laya.gguf");
         gguf(&path, kind, false);
@@ -790,11 +809,33 @@ mod tests {
                 "probe":{"compatible":true,"observed_engine_id":ENGINE_ID,"observed_version":null,"observed_revision":null,"detail":"synthetic","observed_at_unix":1}},
             "installation_root":directory.path()
         })).unwrap();
-        let settings = ResolvedSettings {
+        let mut settings = ResolvedSettings {
             engine_id: ENGINE_ID.into(),
             model_profile_id: Some(ModelProfileId::new("decision-profile").unwrap()),
             ..Default::default()
         };
+        if kind == Some("vllm-d3") {
+            let projector = directory.path().join("projector.bin");
+            gguf(&projector, None, false);
+            for (id, value) in [
+                ("llama.cpp.projector", SettingValue::Path(projector.clone())),
+                (
+                    "llama.cpp.projector_sha256",
+                    SettingValue::String(hash_file(&projector).await.unwrap()),
+                ),
+            ] {
+                settings.configured.insert(
+                    scala_core::SettingId::new(id).unwrap(),
+                    scala_core::ResolvedSetting {
+                        value,
+                        source: scala_core::SettingSource::ModelProfile {
+                            model_profile_id: settings.model_profile_id.clone().unwrap(),
+                        },
+                    },
+                );
+            }
+            validate_llama_bound_files(&settings, &model).await.unwrap();
+        }
         let revision = EngineRevision {
             engine_id: ENGINE_ID.into(),
             version: Some(identity.version.clone()),
@@ -821,7 +862,7 @@ mod tests {
                 json!({"error":{"code":400,"type":"invalid_request_error","message":STATE_REQUIRED}}),
             )),
             props: json!({"model_path":path,"model_alias":"decision-profile","build_info":"b11425-e117148",
-                "default_generation_settings":{"n_ctx":2048,"params":{"temperature":0.8,"top_p":0.9}},"total_slots":1,"modalities":{"vision":matches!(kind,Some("clef"|"openjev"))}}),
+                "default_generation_settings":{"n_ctx":2048,"params":{"temperature":0.8,"top_p":0.9}},"total_slots":1,"modalities":{"vision":vision.unwrap_or(matches!(kind,Some("clef"|"openjev"|"vllm-d3")))}}),
             models: json!({"object":"list","data":[listed]}),
             response: Mutex::new((
                 StatusCode::OK,
@@ -872,17 +913,30 @@ mod tests {
             },
             accelerator_binding: None,
         };
-        Fixture {
+        let mut fixture = Fixture {
             adapter: LlamaCppAdapter::from_config(None, Path::new(".")),
             spec,
             process,
             backend,
             server,
             _directory: directory,
+        };
+        if kind == Some("vllm-d3") {
+            fixture.set_runtime_contract("b11617", "14310190cd0a0c831fe949ac8cbedd8abdc90695");
         }
+        fixture
     }
 
     impl Fixture {
+        fn set_runtime_contract(&mut self, version: &str, revision: &str) {
+            let identity = &mut self.spec.runtime.manifest.identity;
+            identity.version = version.into();
+            identity.package.release_tag = Some(version.into());
+            identity.upstream_revision = Some(revision.into());
+            self.spec.runtime.manifest.runtime_id = RuntimeId::from_identity(identity);
+            self.process.runtime_id = self.spec.runtime.manifest.runtime_id.clone();
+            self.process.runtime_version = version.into();
+        }
         async fn qualify(&self) {
             self.adapter.prepare_decision(&self.spec).await;
             self.adapter
@@ -964,6 +1018,12 @@ mod tests {
         fn native_options(&self) -> Vec<NativeOption> {
             Vec::new()
         }
+        fn setting_definitions(&self) -> Vec<SettingDefinition> {
+            let mut definitions = self.native.setting_definitions();
+            // Synthetic runtime help: never execute the fixture's inert bytes.
+            apply_llama_exact_help_contract(&mut definitions, "--mmproj FILE\n");
+            definitions
+        }
         fn supports_model_capability(
             &self,
             model: &ModelArtifact,
@@ -1015,6 +1075,7 @@ mod tests {
             &self,
             request: LaunchRequest,
         ) -> Result<LaunchSpec, EngineError> {
+            validate_llama_bound_files(&request.settings, &request.model.primary).await?;
             Ok(LaunchSpec {
                 model: request.model,
                 runtime: request.runtime,
@@ -1142,6 +1203,7 @@ mod tests {
         for (native, kind, valid_proof, complete_openai_contract) in [
             (true, Some("laya"), true, false),
             (true, Some("clef"), true, false),
+            (true, Some("vllm-d3"), true, false),
             (true, Some("laya"), true, true),
             (false, Some("laya"), true, false),
             (true, None, true, false),
@@ -1188,13 +1250,22 @@ mod tests {
             ModelProfilesStore::new(&paths)
                 .update({
                     let profile_id = profile_id.clone();
+                    let overrides = fixture.spec.settings.configured.clone();
                     move |state| {
                         state.create(
-                            profile_id,
+                            profile_id.clone(),
                             "Synthetic",
                             model.id,
                             EngineId::new(ENGINE_ID).unwrap(),
                         )?;
+                        for (id, setting) in overrides {
+                            state
+                                .profiles
+                                .get_mut(&profile_id)
+                                .unwrap()
+                                .overrides
+                                .insert(id, setting.value);
+                        }
                         Ok(())
                     }
                 })
@@ -1279,7 +1350,7 @@ mod tests {
                         );
                         assert_eq!(
                             listed["data"][0]["capabilities"]["decision_images"] == true,
-                            kind == Some("clef")
+                            matches!(kind, Some("clef" | "vllm-d3"))
                         );
                         if restart == 0 && unload == 0 {
                             *fixture.backend.gate.lock().unwrap() =
@@ -1352,8 +1423,30 @@ mod tests {
                             }
                         }
                         *fixture.backend.response.lock().unwrap() = original;
-                        if kind == Some("clef") {
+                        if matches!(kind, Some("clef" | "vllm-d3")) {
                             let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+                            let native_calls = fixture.backend.calls.lock().unwrap().len();
+                            let (status, result) = public_request(&endpoint, "POST", "/v1/systemone", json!({
+                                "model":profile_id,"state":request.state,"images":[image],"questions":request.questions
+                            })).await;
+                            assert_eq!(status, StatusCode::OK, "{result}");
+                            assert_eq!(
+                                fixture.backend.calls.lock().unwrap()[native_calls].2["images"],
+                                json!([image])
+                            );
+                            for invalid in
+                                ["data:image/png;base64,broken", "data:audio/wav;base64,AAAA"]
+                            {
+                                let native_calls = fixture.backend.calls.lock().unwrap().len();
+                                let (status, _) = public_request(&endpoint, "POST", "/v1/systemone", json!({
+                                    "model":profile_id,"state":request.state,"images":[invalid],"questions":request.questions
+                                })).await;
+                                assert_eq!(status, StatusCode::BAD_REQUEST);
+                                assert_eq!(
+                                    fixture.backend.calls.lock().unwrap().len(),
+                                    native_calls
+                                );
+                            }
                             for multiple_messages in [false, true] {
                                 for openai in [false, true] {
                                     let (image_type, text_type) = if openai {
@@ -1721,37 +1814,306 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_decision_vision_preserves_bytes_order_and_requires_exact_runtime_proof() {
-        for kind in ["clef", "openjev"] {
-            let mut fixture = fixture(true, Some(kind), None).await;
+    async fn d3_images_require_reviewed_native_vision_and_keep_exact_integrity_binding() {
+        let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+        for (version, revision) in [
+            ("b11606", "1b70350c92563449576bcbbf552994b1d1ed847d"),
+            ("b11617", "14310190cd0a0c831fe949ac8cbedd8abdc90695"),
+        ] {
+            for auxiliary in [false, true] {
+                let mut fixture = fixture(true, Some("vllm-d3"), Some(json!(["decisions"]))).await;
+                fixture.set_runtime_contract(version, revision);
+                if auxiliary {
+                    let SettingValue::Path(path) =
+                        fixture.spec.settings.value("llama.cpp.projector").unwrap()
+                    else {
+                        panic!("projector path");
+                    };
+                    let path = path.clone();
+                    fixture.spec.model.primary.auxiliary_artifacts.push(
+                        scala_core::AuxiliaryArtifact {
+                            role: scala_core::AuxiliaryArtifactRole::Projector,
+                            size_bytes: std::fs::metadata(&path).unwrap().len(),
+                            hash: Some(hash_file(&path).await.unwrap()),
+                            path,
+                        },
+                    );
+                    fixture.spec.settings.configured.clear();
+                    fixture.spec.model =
+                        scala_engine::prepare_norted_package_input(&fixture.spec.model.primary)
+                            .await
+                            .unwrap();
+                    revalidate_norted_package_before_launch(&fixture.spec.model)
+                        .await
+                        .unwrap();
+                }
+                assert!(!fixture.adapter.qualified_decision_images(
+                    &fixture.spec.runtime,
+                    &fixture.spec.model.primary,
+                    &fixture.spec.settings
+                ));
+                fixture.qualify().await;
+                assert!(fixture.supported());
+                assert!(fixture.adapter.qualified_decision_images(
+                    &fixture.spec.runtime,
+                    &fixture.spec.model.primary,
+                    &fixture.spec.settings
+                ));
+                assert!(!fixture.adapter.supports_openai_decisions(
+                    &fixture.spec.runtime,
+                    &fixture.spec.model.primary,
+                    &fixture.spec.settings
+                ));
+                fixture.backend.calls.lock().unwrap().clear();
+                let mut request = fixture.request();
+                request.images = vec![image.into()];
+                fixture
+                    .adapter
+                    .decide(fixture.spec.endpoint.as_ref().unwrap(), request.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fixture.backend.calls.lock().unwrap()[0].2["images"],
+                    json!([image])
+                );
+
+                for part in [
+                    json!({"type":"input_audio","input_audio":{"data":"AAAA"}}),
+                    json!({"type":"video_url","video_url":"https://example.org/video"}),
+                ] {
+                    request.images.clear();
+                    request.state =
+                        serde_json::from_value(json!([{"role":"user","content":[part]}])).unwrap();
+                    fixture.backend.calls.lock().unwrap().clear();
+                    assert!(matches!(
+                        fixture
+                            .adapter
+                            .decide(fixture.spec.endpoint.as_ref().unwrap(), request.clone())
+                            .await,
+                        Err(EngineError::NativeRequest {
+                            code: "unsupported_decision_media",
+                            ..
+                        })
+                    ));
+                    assert!(fixture.backend.calls.lock().unwrap().is_empty());
+                }
+
+                let mut settings = fixture.spec.settings.clone();
+                settings.model_profile_id = Some(ModelProfileId::new("other").unwrap());
+                assert!(!fixture.adapter.qualified_decision_images(
+                    &fixture.spec.runtime,
+                    &fixture.spec.model.primary,
+                    &settings
+                ));
+                let mut model = fixture.spec.model.primary.clone();
+                model.hash = Some("d".repeat(64));
+                assert!(!fixture.adapter.qualified_decision_images(
+                    &fixture.spec.runtime,
+                    &model,
+                    &fixture.spec.settings
+                ));
+                let path = if auxiliary {
+                    fixture.spec.model.primary.auxiliary_artifacts[0]
+                        .path
+                        .clone()
+                } else {
+                    let SettingValue::Path(path) =
+                        fixture.spec.settings.value("llama.cpp.projector").unwrap()
+                    else {
+                        panic!("projector path")
+                    };
+                    path.clone()
+                };
+                std::fs::write(path, b"replaced projector").unwrap();
+                assert!(!fixture.adapter.qualified_decision_images(
+                    &fixture.spec.runtime,
+                    &fixture.spec.model.primary,
+                    &fixture.spec.settings
+                ));
+                request.images = vec![image.into()];
+                assert!(matches!(
+                    fixture
+                        .adapter
+                        .decide(fixture.spec.endpoint.as_ref().unwrap(), request)
+                        .await,
+                    Err(EngineError::Unsupported(_))
+                ));
+                assert!(fixture.backend.calls.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn d3_images_reject_unsupported_runtime_projector_and_native_evidence() {
+        for case in [
+            "old-runtime",
+            "unknown-runtime",
+            "absent-projector",
+            "incompatible-projector",
+            "text-only",
+            "native-rejection",
+            "executable-integrity",
+        ] {
+            let vision = !matches!(case, "absent-projector" | "incompatible-projector");
+            let kind = if case == "text-only" {
+                "laya"
+            } else {
+                "vllm-d3"
+            };
+            let mut fixture =
+                fixture_with_vision(true, Some(kind), Some(json!(["decisions"])), Some(vision))
+                    .await;
+            fixture.set_runtime_contract("b11617", "14310190cd0a0c831fe949ac8cbedd8abdc90695");
+            match case {
+                "old-runtime" => fixture
+                    .set_runtime_contract("b11425", "d81235049384534c167caea52b85a694f6103d14"),
+                "unknown-runtime" => fixture.set_runtime_contract("b99999", &"a".repeat(40)),
+                "absent-projector" => fixture.spec.settings.configured.clear(),
+                "incompatible-projector" => {
+                    // A projector/text mismatch prevents native startup readiness.
+                    *fixture.backend.probe_response.lock().unwrap() = (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        json!({"error":{"message":"mismatch between text model and mmproj"}}),
+                    )
+                }
+                "text-only" => fixture.spec.model.primary.display_name = "D3-Mini".into(),
+                "native-rejection" => {
+                    *fixture.backend.probe_response.lock().unwrap() = (
+                        StatusCode::NOT_IMPLEMENTED,
+                        json!({"error":{"type":"not_supported_error"}}),
+                    )
+                }
+                "executable-integrity" => {
+                    fixture.spec.runtime.manifest.entrypoint_sha256 = "f".repeat(64)
+                }
+                _ => {}
+            }
             fixture.qualify().await;
-            assert!(fixture.adapter.decision_vision_supported(
-                &fixture.spec.runtime,
-                &fixture.spec.model.primary,
-                &fixture.spec.settings
-            ));
-            let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
-            let mut request = fixture.request();
-            let image2 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
-            request.images = vec![image.into(), image2.into()];
-            request.state = serde_json::from_value(json!([{"role":"user","content":[{"type":"image_url","image_url":{"url":image}},{"type":"image_url","image_url":{"url":image2}}]}])).unwrap();
+            assert!(
+                !fixture.adapter.qualified_decision_images(
+                    &fixture.spec.runtime,
+                    &fixture.spec.model.primary,
+                    &fixture.spec.settings
+                ),
+                "{case}"
+            );
+            if !matches!(
+                case,
+                "native-rejection" | "executable-integrity" | "incompatible-projector"
+            ) {
+                assert!(fixture.supported(), "text remains qualified for {case}");
+            } else {
+                assert!(!fixture.supported(), "{case}");
+            }
             fixture.backend.calls.lock().unwrap().clear();
-            fixture
-                .adapter
-                .decide(fixture.spec.endpoint.as_ref().unwrap(), request.clone())
-                .await
-                .unwrap();
-            let calls = fixture.backend.calls.lock().unwrap();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].2["state"], json!(request.state));
-            assert!(calls[0].2.get("images").is_none());
-            drop(calls);
-            fixture.spec.runtime.manifest.identity.upstream_revision = Some("a".repeat(40));
-            assert!(!fixture.adapter.decision_vision_supported(
+            let mut request = fixture.request();
+            request.images = vec!["data:image/png;base64,synthetic".into()];
+            assert!(matches!(
+                fixture
+                    .adapter
+                    .decide(fixture.spec.endpoint.as_ref().unwrap(), request)
+                    .await,
+                Err(EngineError::Unsupported(_))
+            ));
+            assert!(fixture.backend.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn d3_projector_integrity_is_required_before_launch() {
+        for expected in [None, Some("f".repeat(64))] {
+            let mut fixture = fixture(true, Some("vllm-d3"), None).await;
+            let id = scala_core::SettingId::new("llama.cpp.projector_sha256").unwrap();
+            if let Some(expected) = expected {
+                fixture.spec.settings.configured.get_mut(&id).unwrap().value =
+                    SettingValue::String(expected);
+            } else {
+                fixture.spec.settings.configured.remove(&id);
+            }
+            assert!(matches!(
+                validate_llama_bound_files(&fixture.spec.settings, &fixture.spec.model.primary)
+                    .await,
+                Err(EngineError::InvalidConfiguration(_))
+            ));
+            assert!(!fixture.adapter.qualified_decision_images(
                 &fixture.spec.runtime,
                 &fixture.spec.model.primary,
                 &fixture.spec.settings
             ));
+            assert!(fixture.backend.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_decision_vision_preserves_bytes_order_and_requires_exact_runtime_proof() {
+        for (version, revision, kinds) in [
+            (
+                "b11425",
+                "d81235049384534c167caea52b85a694f6103d14",
+                &["clef", "openjev"][..],
+            ),
+            (
+                "b11565",
+                "f9a95aeb2096d0c0218e0cd6e6d901cd37be798a",
+                &["clef", "openjev", "pplx-decider", "lfm2-d1", "lfm2-d1-omni"][..],
+            ),
+            (
+                "b11606",
+                "1b70350c92563449576bcbbf552994b1d1ed847d",
+                &[
+                    "clef",
+                    "openjev",
+                    "pplx-decider",
+                    "lfm2-d1",
+                    "lfm2-d1-omni",
+                    "vllm-d3",
+                ][..],
+            ),
+            (
+                "b11617",
+                "14310190cd0a0c831fe949ac8cbedd8abdc90695",
+                &[
+                    "clef",
+                    "openjev",
+                    "pplx-decider",
+                    "lfm2-d1",
+                    "lfm2-d1-omni",
+                    "vllm-d3",
+                ][..],
+            ),
+        ] {
+            for kind in kinds {
+                let mut fixture = fixture_with_vision(true, Some(kind), None, Some(true)).await;
+                fixture.set_runtime_contract(version, revision);
+                fixture.qualify().await;
+                assert!(fixture.adapter.decision_vision_supported(
+                    &fixture.spec.runtime,
+                    &fixture.spec.model.primary,
+                    &fixture.spec.settings
+                ));
+                let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC";
+                let mut request = fixture.request();
+                let image2 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+                request.images = vec![image.into(), image2.into()];
+                request.state = serde_json::from_value(json!([{"role":"user","content":[{"type":"image_url","image_url":{"url":image}},{"type":"image_url","image_url":{"url":image2}}]}])).unwrap();
+                fixture.backend.calls.lock().unwrap().clear();
+                fixture
+                    .adapter
+                    .decide(fixture.spec.endpoint.as_ref().unwrap(), request.clone())
+                    .await
+                    .unwrap();
+                let calls = fixture.backend.calls.lock().unwrap();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].2["state"], json!(request.state));
+                assert!(calls[0].2.get("images").is_none());
+                drop(calls);
+                fixture.spec.runtime.manifest.identity.upstream_revision = Some("a".repeat(40));
+                assert!(!fixture.adapter.decision_vision_supported(
+                    &fixture.spec.runtime,
+                    &fixture.spec.model.primary,
+                    &fixture.spec.settings
+                ));
+            }
         }
     }
 

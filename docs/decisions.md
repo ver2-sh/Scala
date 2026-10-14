@@ -237,7 +237,7 @@ also validate required response fields before forwarding a successful Decisions
 response. System One's existing optional observations and profile-alias fallback
 remain backward compatible.
 
-Neither frozen llama.cpp revision supplies complete usage: native `post_systemone`
+None of the reviewed llama.cpp revisions supplies complete usage: native `post_systemone`
 reports only input tokens (the native task token count, summed across variants for
 non-joint models) and an explicit output count of zero. Cache, cache-write and
 reasoning counts are absent. Scala's existing checked System One sum does not
@@ -251,8 +251,11 @@ qualify a production llama.cpp pair.
 
 Execution qualification is separate for `decision`, `openai_decisions` and
 `decision_images`; none follows merely from exposure of `/v1/systemone`.
-The reviewed llama.cpp source contracts are stable v0.6.0/b11429 and frozen
-b11565, recorded in [the immutable integration ledger](integration-october-2026.md).
+The reviewed llama.cpp source contracts include stable v0.6.0/b11429 and frozen
+b11565, recorded in [the immutable integration ledger](integration-october-2026.md),
+plus upstream b11606 (`1b70350c92563449576bcbbf552994b1d1ed847d`) and
+b11617 (`14310190cd0a0c831fe949ac8cbedd8abdc90695`) for native image admission.
+Unreviewed revisions do not inherit image support by version ordering.
 Other runtimes retain their own support gates. GGUF decision metadata and native
 output modalities are candidate/evidence inputs, never execution authority.
 Proof also binds physical executable/model/auxiliary fingerprints and probe
@@ -264,14 +267,28 @@ falls back to that older inventory without granting absent evidence.
 
 Native image routing is enabled only after the exact runtime/model pair qualifies,
 reports vision and binds a compatible projector. Upstream's image-admission
-families at these revisions are Clef/OpenJev, and additionally
-pplx-decider/lfm2-d1/lfm2-d1-omni at b11565. These source-owned image limits are not
+families are Clef/OpenJev at the earliest revision, additionally
+pplx-decider/lfm2-d1/lfm2-d1-omni at b11565, and additionally `vllm-d3` at
+[b11606](https://github.com/ggml-org/llama.cpp/blob/1b70350c92563449576bcbbf552994b1d1ed847d/tools/server/server-decision.h)
+and [b11617](https://github.com/ggml-org/llama.cpp/blob/14310190cd0a0c831fe949ac8cbedd8abdc90695/tools/server/server-decision.h).
+These source-owned image limits are not
 a filename or architecture classifier for Decision. Explicit
 `llama.cpp.projector` plus `llama.cpp.projector_sha256` binds a local GGUF projector;
 prepared auxiliary integrity follows the existing artifact contract. Text-only
-pairs reject images. Original bytes and image order are retained;
+pairs reject images. D3 model/profile names alone grant nothing: the native
+`<architecture>.decision.type` must be `vllm-d3`, the executable must verify,
+and the matching loaded process must prove native System One and report
+`/props` vision support. Upstream's
+[System One route](https://github.com/ggml-org/llama.cpp/blob/14310190cd0a0c831fe949ac8cbedd8abdc90695/tools/server/server-context.cpp)
+requires both `can_use_images()` and the loaded image modality; the
+[mtmd loader](https://github.com/ggml-org/llama.cpp/blob/14310190cd0a0c831fe949ac8cbedd8abdc90695/tools/mtmd/mtmd.cpp)
+validates the projector against the text model, including embedding dimensions.
+Projector presence or GGUF metadata without these execution observations cannot
+qualify images. Scala uses source review and startup observations for this gate;
+development validation uses synthetic servers and artifacts, without model inference.
+Original bytes and image order are retained;
 embedded text/image positions and message associations are separate guarantees.
-At both frozen revisions, `parse_state()` removes `image_url` parts from a state
+At all four reviewed revisions, `parse_state()` removes `image_url` parts from a state
 array or `state.messages`, appending their bytes to a shared ordered media list.
 `render()` and joint image handling receive that list separately from the remaining
 state; the model's native template places the media markers. Inline positions,
