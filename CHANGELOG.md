@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.23 - Correct managed vLLM label runtime attestation
+
+Fix Linux managed `vllm-labels` installation failing after Python dependency
+provisioning with `Invalid declared wheel RECORD mismatch`. The two
+previously-qualified PyNvVideoCodec wheel exceptions now bind the complete
+`PyNvVideoCodec/`-prefixed member paths found in the original wheel and
+installed RECORD, without changing original artifact bytes, package versions,
+wheel hashes, other runtime checks, or model source identity.
+
+Add synthetic regression coverage for exact exception consumption and rejection
+of modified, missing or unexpected wheel members. Local checks also verified
+both paths and SHA-256 values against the preserved original upstream wheel.
+
+This source release does not install/activate inference runtimes, change model
+profiles or modify the production Scala service. Live model/GPU execution remains
+separately unqualified.
+
 ## 0.1.22 - Managed vLLM and PyTorch runtimes
 
 Integrates the reviewed managed Python inference-runtime installation and
