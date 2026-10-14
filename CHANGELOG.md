@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.24 - Native D3 image decisions in llama.cpp
+
+Qualify native D3 image decisions through upstream llama.cpp's `/v1/systemone`
+for the exact reviewed b11606 and b11617 runtime revisions. Models with native
+`vllm-d3` decision identity can now expose image input when their bound projector,
+verified executable, native Decision route, loaded model and observed vision
+support all qualify together. Fixes Scala rejecting valid D3 multimodal requests
+that work in the underlying llama-server.
+
+Preserve decision-candidate versus execution-qualified capability boundaries,
+projector integrity, text-only and unsupported-model rejection, bounded media
+transport, Scala Link owner-local serving, and existing OpenAI Decisions usage
+requirements. Add synthetic regressions for positive and negative qualification,
+missing or mismatched projectors, unsupported revisions, and rejected media.
+
+Application-only source change: does not acquire/replace models or inference
+runtimes, migrate profiles, or activate production inference.
+
 ## 0.1.23 - Correct managed vLLM label runtime attestation
 
 Fix Linux managed `vllm-labels` installation failing after Python dependency
