@@ -80,8 +80,8 @@ def vendor_attestation(root):
     if sha(path) != expected:
         raise ValueError('Original PyNvVideoCodec wheel acquisition hash mismatch')
     return ['--wheel-attestation', 'pynvvideocodec', str(path), expected, json.dumps({
-        'PyNvVideoCodec_121.cpython-312-x86_64-linux-gnu.so': '2fb85f8bcd33c13e240ef2a8c6277f4d5a0260b629ecf9a242a04f1403f582a8',
-        'PyNvVideoCodec_130.cpython-312-x86_64-linux-gnu.so': '14f12a7977c2f681fb01693e41434308bfb5cf0e2c31ed2c29d1176337c86462'})]
+        'PyNvVideoCodec/PyNvVideoCodec_121.cpython-312-x86_64-linux-gnu.so': '2fb85f8bcd33c13e240ef2a8c6277f4d5a0260b629ecf9a242a04f1403f582a8',
+        'PyNvVideoCodec/PyNvVideoCodec_130.cpython-312-x86_64-linux-gnu.so': '14f12a7977c2f681fb01693e41434308bfb5cf0e2c31ed2c29d1176337c86462'})]
 
 
 def main():
