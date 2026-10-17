@@ -320,19 +320,45 @@ try {
         Run $git @('init','--quiet',$env:VCPKG_ROOT)
         Run $git @('-C',$env:VCPKG_ROOT,'remote','add','origin','https://github.com/microsoft/vcpkg.git')
     }
+    # Windows Git must admit long pinned vcpkg source paths before checkout.
+    Run $git @('-C',$env:VCPKG_ROOT,'config','--local','core.longpaths','true')
+    Run $git @('-C',$env:VCPKG_ROOT,'config','--local','core.autocrlf','false')
     try { $head=Capture $git @('-C',$env:VCPKG_ROOT,'rev-parse','HEAD') } catch { $head='' }
     if ($head -ne $Lock.vcpkg_commit) {
         Run $git @('-C',$env:VCPKG_ROOT,'fetch','--quiet','--depth=1','origin',$Lock.vcpkg_commit)
         Run $git @('-C',$env:VCPKG_ROOT,'-c','core.autocrlf=false','-c','core.eol=lf','checkout','--quiet','--detach','FETCH_HEAD')
     }
     if ((Capture $git @('-C',$env:VCPKG_ROOT,'rev-parse','HEAD^{tree}')) -ne $Lock.vcpkg_tree) { throw 'Pinned vcpkg source tree changed' }
+    # Retry recovery comes exclusively from the verified immutable Git tree.
+    Run $git @('-C',$env:VCPKG_ROOT,'restore','--source=HEAD','--worktree','--','scripts','ports','triplets','versions')
     if (Capture $git @('-C',$env:VCPKG_ROOT,'diff','--name-only','HEAD','--','scripts','ports','triplets','versions')) { throw 'Cached vcpkg recipe files were modified' }
+    if (Capture $git @('-C',$env:VCPKG_ROOT,'ls-files','--others','--exclude-standard','--','scripts','ports','triplets','versions')) { throw 'Cached vcpkg recipe has unexpected untracked source files' }
     $vcpkg=Join-Path $env:VCPKG_ROOT 'vcpkg.exe'
     Copy-Item -LiteralPath (Download ($Lock.assets | Where-Object id -eq 'vcpkg-tool')) -Destination $vcpkg -Force
     $manifestRoot=Join-Path $Root 'dependency-manifest'; New-Item -ItemType Directory -Force $manifestRoot | Out-Null
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'vcpkg.json') -Destination (Join-Path $manifestRoot 'vcpkg.json') -Force
     Progress 'Installing FFmpeg, curl and their complete pinned dependency closure'
-    Run $vcpkg @('install','--disable-metrics','--triplet=x64-windows',('--x-manifest-root='+$manifestRoot),('--x-install-root='+(Join-Path $env:VCPKG_ROOT 'installed')),'--clean-after-build')
+    # CMake's own 250-character object-directory limit rejects ordinary source
+    # trees under the long managed download/cache path on Windows. Use a short
+    # per-user build-only directory; the verified vcpkg sources, downloads and
+    # installed output remain bound to this exact Scala dependency recipe.
+    $buildParent=Join-Path $env:LOCALAPPDATA 'Scala/NativeBuild'
+    $shortRoot=Join-Path $buildParent $BundleSha256.Substring(0,16)
+    if ($shortRoot.Length -gt 96) { throw 'Windows local application-data path is too long for the selected native vcpkg build layout' }
+    Assert-NotLink $shortRoot
+    New-Item -ItemType Directory -Force $shortRoot | Out-Null
+    $buildOwner=Join-Path $shortRoot '.scala-cache-owner'
+    if (Test-Path -LiteralPath $buildOwner) {
+        Assert-NotLink $buildOwner
+        if ((Get-Content -LiteralPath $buildOwner -Raw) -ne $BundleSha256) { throw 'Managed short build cache ownership changed' }
+    } else {
+        if (@(Get-ChildItem -LiteralPath $shortRoot -Force).Count -ne 0) { throw 'Refusing an unowned short build cache' }
+        [IO.File]::WriteAllText($buildOwner,$BundleSha256,$Utf8)
+    }
+    $shortBuildTrees=Join-Path $shortRoot 'buildtrees'
+    $shortPackages=Join-Path $shortRoot 'packages'
+    Progress 'Building pinned native FFmpeg/curl dependencies in the short private Windows build tree'
+    Run $vcpkg @('install','--disable-metrics','--triplet=x64-windows',('--x-manifest-root='+$manifestRoot),('--x-install-root='+(Join-Path $env:VCPKG_ROOT 'installed')),('--x-buildtrees-root='+$shortBuildTrees),('--x-packages-root='+$shortPackages),'--clean-after-build')
     $prefix=Join-Path $env:VCPKG_ROOT 'installed/x64-windows'
     $tools=@{git=$git;cmake=$cmake;ninja=$ninja;nvcc=$nvcc;cl=(Join-Path $vs.VCToolsInstallDir 'bin/Hostx64/x64/cl.exe')}
     Progress 'Verifying the prepared compiler, toolkit and library headers'

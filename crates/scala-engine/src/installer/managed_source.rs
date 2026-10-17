@@ -106,18 +106,22 @@ impl RuntimeInstaller {
             .ok_or_else(|| {
                 RuntimeInstallError::Prerequisite("Windows SystemRoot is unavailable".into())
             })?;
-        let powershell = system.join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let system32 = system.join("System32");
+        let powershell = system32
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
         let mut environment = base_environment();
         // PowerShell must recognize native .exe tools from process startup, even
         // when the inherited host environment has been stripped intentionally.
         environment.insert("PATHEXT".into(), ".COM;.EXE;.BAT;.CMD".into());
         environment.insert(
             "PATH".into(),
-            format!("{};{}", system.join("System32").display(), system.display()),
+            format!("{};{}", system32.display(), system.display()),
         );
         environment.insert(
             "ComSpec".into(),
-            system.join("System32/cmd.exe").display().to_string(),
+            system32.join("cmd.exe").display().to_string(),
         );
         let this = self.clone();
         let candidate = available.clone();
