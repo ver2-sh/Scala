@@ -28,6 +28,22 @@ impl ManagedSourceDependencies {
         }
         format!("{:x}", hash.finalize())
     }
+
+    /// Reuse the same toolchain when only a runtime revision or provisioning script
+    /// changes. Pinned dependency locks, manifests and configuration still isolate
+    /// incompatible environments. Every installation retains the full recipe hash.
+    pub fn cache_sha256(&self) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"scala-native-dependency-environment-v1\0");
+        for asset in self.assets.iter().filter(|a| !a.name.ends_with(".ps1")) {
+            hash.update((asset.name.len() as u64).to_le_bytes());
+            hash.update(asset.name.as_bytes());
+            hash.update((asset.bytes.len() as u64).to_le_bytes());
+            hash.update(asset.bytes);
+        }
+        format!("{:x}", hash.finalize())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let mut names = std::collections::BTreeSet::new();
         if self.assets.is_empty() || self.assets.len() > 16 {
@@ -78,6 +94,16 @@ mod tests {
             changed.assets[index].bytes = b"changed";
             assert_ne!(original.sha256(), changed.sha256());
         }
+    }
+    #[test]
+    fn cache_reuses_pinned_dependencies_across_script_and_runtime_revisions() {
+        let original = recipe();
+        let mut changed = original.clone();
+        changed.assets[0].bytes = b"# revised provisioner";
+        assert_ne!(original.sha256(), changed.sha256());
+        assert_eq!(original.cache_sha256(), changed.cache_sha256());
+        changed.assets[1].bytes = b"{\"toolchain\":\"different\"}";
+        assert_ne!(original.cache_sha256(), changed.cache_sha256());
     }
     #[test]
     fn dependency_resources_reject_escape_duplicates_and_missing_script() {
