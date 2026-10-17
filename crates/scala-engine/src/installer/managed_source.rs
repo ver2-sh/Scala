@@ -264,6 +264,58 @@ impl RuntimeInstaller {
         })
     }
 }
+impl RuntimeInstaller {
+    pub(crate) async fn clean_native_cache(&self) -> Result<(), RuntimeInstallError> {
+        let root = self.cache_root.join("native");
+        if !root.exists() {
+            return Ok(());
+        }
+        reject_cache_aliases(&self.cache_root, &root)?;
+        let lock = root.join("acquisition.lock");
+        if lock.exists() {
+            reject_managed_cache_file(&root, &lock)?;
+        }
+        let lease = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .map_err(|e| RuntimeInstallError::Task(e.to_string()))?;
+        fs2::FileExt::try_lock_exclusive(&lease).map_err(|_| {
+            RuntimeInstallError::Prerequisite(
+                "native dependency acquisition is active; cache is protected".into(),
+            )
+        })?;
+        for item in
+            std::fs::read_dir(&root).map_err(|e| RuntimeInstallError::Task(e.to_string()))?
+        {
+            let item = item.map_err(|e| RuntimeInstallError::Task(e.to_string()))?;
+            let name = item.file_name().to_string_lossy().into_owned();
+            if name == "acquisition.lock" {
+                continue;
+            }
+            if name != "downloads"
+                && (name.len() != 64 || !name.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                continue;
+            }
+            reject_cache_aliases(&root, &item.path())?;
+            if name != "downloads" {
+                let owner = item.path().join(".scala-cache-owner");
+                reject_managed_cache_file(&root, &owner)?;
+                if std::fs::read_to_string(owner).ok().as_deref() != Some(&name) {
+                    return Err(RuntimeInstallError::InvalidMetadata(
+                        "native cache owner mismatch".into(),
+                    ));
+                }
+            }
+            std::fs::remove_dir_all(item.path())
+                .map_err(|e| RuntimeInstallError::Task(e.to_string()))?;
+        }
+        Ok(())
+    }
+}
 fn reject_managed_cache_file(root: &Path, file: &Path) -> Result<(), RuntimeInstallError> {
     let parent = file.parent().ok_or_else(|| {
         RuntimeInstallError::InvalidMetadata("managed cache file has no parent".into())
@@ -690,6 +742,45 @@ mod tests {
         };
         assert!(validate_report(&r, &"a".repeat(64), root.path()).is_err());
         assert!(validate_report(&r, &"b".repeat(64), root.path()).is_err());
+    }
+    #[tokio::test]
+    async fn native_cleanup_respects_acquisition_lease_and_owned_boundaries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let paths = crate::test_support::paths(workspace.path());
+        let installer = RuntimeInstaller::new(
+            Arc::new(RuntimeStore::new(&paths)),
+            EngineRegistry::default(),
+            paths.runtime_cache_dir.clone(),
+            std::iter::empty(),
+        )
+        .unwrap();
+        let native = paths.runtime_cache_dir.join("native");
+        let owned = native.join("a".repeat(64));
+        std::fs::create_dir_all(&owned).unwrap();
+        std::fs::write(owned.join(".scala-cache-owner"), "a".repeat(64)).unwrap();
+        std::fs::write(owned.join("cached-tool.exe"), b"fixture").unwrap();
+        let unowned = native.join("unrelated");
+        std::fs::create_dir(&unowned).unwrap();
+        let installed = workspace.path().join("installed-runtime.exe");
+        std::fs::write(&installed, b"retain installed runtime").unwrap();
+        let lock = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(native.join("acquisition.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        assert!(installer.clean_native_cache().await.is_err());
+        assert!(owned.exists());
+        drop(lock);
+        installer.clean_native_cache().await.unwrap();
+        assert!(!owned.exists());
+        assert!(unowned.is_dir());
+        assert!(installed.is_file());
+        std::fs::create_dir(&owned).unwrap();
+        std::fs::write(owned.join(".scala-cache-owner"), "b".repeat(64)).unwrap();
+        assert!(installer.clean_native_cache().await.is_err());
+        assert!(owned.exists());
     }
     fn prepared_fixture() -> Prepared {
         let work = tempfile::tempdir().unwrap();

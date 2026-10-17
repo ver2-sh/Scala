@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased - NInfer-all managed installation and serving
+## 0.1.25 - NInfer-all managed installation and serving
+
+Runtime acquisition remains in Scala: use qualified upstream or alternative
+release assets where available, otherwise build the selected pinned source
+locally on Install. No Scala-prepackaged inference runtime is introduced.
+
+Heap-box native operation futures to prevent Windows stack exhaustion after
+dependency provisioning. Share verified downloads with a 2 GiB archive limit,
+reuse compatible toolchains across runtime/provisioner revisions, retain one
+merged CUDA tree including NVTX headers, and dispose temporary compilation
+objects and dependency build trees on completion or ordinary failure.
+
 Live Windows install testing found and fixed a stack overflow in the CLI, unsafe
 cache-control file assumptions, a missing isolated PATHEXT setting, an obsolete
 Visual Studio manifest hash/size, required Microsoft channel arguments and an

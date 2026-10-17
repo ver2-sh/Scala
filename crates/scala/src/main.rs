@@ -339,9 +339,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     output::runtime_removed(&runtime_id, cli.json)?;
                 }
                 RuntimesCommand::CleanCache => {
-                    packs.clean_python_cache().await?;
+                    packs.clean_runtime_cache().await?;
                     println!(
-                        "Private Python acquisition cache cleared; installed runtimes are retained"
+                        "Private runtime acquisition caches cleared; installed runtimes are retained"
                     );
                 }
                 RuntimesCommand::CheckUpdates => {

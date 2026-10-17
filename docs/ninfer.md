@@ -449,12 +449,25 @@ action can be retried afterward. Existing Visual Studio installations are not
 upgraded implicitly; the managed instance has a separate installation path.
 The developer environment is captured automatically for the build child only.
 
-Other tools and libraries stay in Scala's owned, recipe-specific dependency
-cache. Downloads and extracted files are verified before reuse. The cache has an
-exclusive acquisition lease; concurrent attempts cannot provision the same tree.
-Failed or cancelled builds do not activate a runtime, and verified downloads
-remain reusable. A Microsoft elevated installation is a Windows-owned system
-transaction, not an operation Scala claims to roll back after cancellation.
+Tools and libraries stay in Scala's owned dependency cache. Pinned dependency
+inputs, rather than runtime/provisioner revisions, identify reusable environments.
+Shared SHA-256 downloads are bounded to 2 GiB; verified extracted tools remain
+reusable after their archives are evicted. CUDA components form one verified
+retained toolkit tree, including the required NVTX headers, without duplicate
+downloaded/extracted/copied toolkits for every build attempt.
+
+The global native acquisition lease protects shared downloads and environments.
+Short private temporary directories hold dependency and runtime compilation
+objects and are disposed on completion or ordinary failure/cancellation. Source
+evidence and DLL hashes remain in installed runtime provenance. Use the normal
+`scala runtimes clean-cache` operation to release native and Python acquisition
+caches; it refuses active acquisition and preserves installed runtimes/host tools.
+A Microsoft elevated installation is a Windows-owned transaction, not an
+operation Scala claims to roll back after cancellation.
+
+Scala's GitHub Actions release builds the application only, not prepackaged
+inference runtimes. Qualified upstream or alternative release assets are acquired
+where available; source candidates build locally through the normal Install action.
 No system PATH or global CUDA selection is changed. Hardware and a working
 NVIDIA driver remain host requirements; this recipe does not replace the driver,
 install WSL, switch to CPU, convert a model or modify a Model Profile.

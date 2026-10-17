@@ -224,7 +224,7 @@ function Assert-Probes($Tools,$Environment,[string]$CudaRoot,[string]$Prefix) {
     $probe=Join-Path $BuildRoot 'msvc-probe.cpp'
     [IO.File]::WriteAllText($probe,"#include <span>`n#if _MSC_VER != 1944`n#error Wrong MSVC generation`n#endif`nint main(){int a[1]{};std::span<int> s{a};return int(s.size())-1;}",$Utf8)
     try{Run $Tools.cl @('/nologo','/std:c++20','/Zc:__cplusplus','/Zs',$probe)}finally{Remove-Item -LiteralPath $probe -Force}
-    foreach($p in @('include/cuda.h','include/cuda_runtime.h','include/cublas_v2.h','include/nvrtc.h','include/nvml.h','include/cccl/cuda/std/span')){
+    foreach($p in @('include/cuda.h','include/cuda_runtime.h','include/cublas_v2.h','include/nvrtc.h','include/nvml.h','include/cccl/cuda/std/span','include/nvtx3/nvToolsExt.h')){
         if(!(Test-Path -LiteralPath (Join-Path $CudaRoot $p))){throw ('Incomplete CUDA toolkit: '+$p)}
     }
     foreach($p in @('include/libavformat/avformat.h','include/curl/curl.h','lib/avformat.lib','lib/avcodec.lib','lib/avutil.lib','lib/swscale.lib','share/curl/CURLConfig.cmake')){
@@ -283,6 +283,16 @@ try{
     Assert-Under (Join-Path $env:LOCALAPPDATA 'Scala/NativeBuild') $BuildRoot|Out-Null
     $script:Lock=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'windows.lock.json') -Raw|ConvertFrom-Json
     if($Lock.schema_version -ne 1){throw 'Unknown dependency lock schema'}
+    # Header-only NVTX is required by upstream core/nvtx.h. Keep its pin in this
+    # fully hashed recipe while reusing the existing compiler/library environment.
+    $Lock.assets+=([pscustomobject]@{
+        id='cuda_nvtx'
+        url='https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvtx/windows-x86_64/cuda_nvtx-windows-x86_64-13.4.92-archive.zip'
+        sha256='a3bd5041778b63a95e63009c044e93b4d569b7dca5693d6b12884e04d1d39d06'
+        size=153681
+        root='cuda_nvtx-windows-x86_64-13.4.92-archive'
+        kind='cuda'
+    })
     foreach($asset in $Lock.assets){Assert-Asset $asset}
     [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
     New-Item -ItemType Directory -Force $DownloadRoot,$BuildRoot|Out-Null
