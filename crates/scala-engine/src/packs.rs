@@ -1390,8 +1390,7 @@ impl RuntimePackManager {
             .catalog
             .verify_install_candidate(&entry.available)
             .await?;
-        self.installer
-            .install(&verified, installation_lease)
+        Box::pin(self.installer.install(&verified, installation_lease))
             .await
             .map_err(Into::into)
     }
@@ -1406,6 +1405,17 @@ impl RuntimePackManager {
             .clean_python_cache()
             .await
             .map_err(Into::into)
+    }
+
+    /// Clear acquisition caches without removing runtimes or host toolchains.
+    pub async fn clean_runtime_cache(&self) -> Result<(), RuntimePackError> {
+        let _operation = self
+            .operation
+            .try_lock()
+            .map_err(|_| RuntimePackError::Selection("runtime mutation is active".into()))?;
+        self.installer.clean_native_cache().await?;
+        self.installer.clean_python_cache().await?;
+        Ok(())
     }
 
     pub async fn remove(

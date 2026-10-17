@@ -408,3 +408,146 @@ the script reproduces path/hash coverage. Validation remains synthetic: every
 owner's changed or missing blob withholds its domain, canonical v2 retains credit,
 the audited 68c54356 v3 candidate/installed runtime selection is rejected, unknown source identity gets
 no credit, and the existing exact Windows and Decision contracts remain intact.
+
+## NInfer-all managed source and serving
+
+Scala discovers the separate community fork `iamwavecut/ninfer-all` through
+`scala runtimes search ninfer-all --refresh` and installs it with
+`scala runtimes install <exact-runtime-id>`. This is a source build, not a
+Windows binary download: upstream had no release assets at admission. The
+provider never substitutes another fork or a moving branch.
+
+Pinned commit: `08fd7019925f43b4b42539400afd461b70f7144a`; tree:
+`bd17d1f3ccd45f81a25369e779cdf4cfa56de919`; package family:
+`ninfer-all-source`; Windows recipe: `ninfer-all-serve-v3-r2-<dependency-digest>`; Linux retains `ninfer-all-serve-v3-r1`. Windows and Linux x86_64
+CUDA sm_120a candidates have distinct identities. Native reader and serving
+capabilities have separate, exact-byte source evidence; no capability is
+inherited from an official NInfer version or from model provenance.
+
+### Automatic Windows dependency provisioning
+
+Choose the Windows NInfer-all runtime and use the normal Install action (or
+`scala runtimes install <exact-runtime-id>`). The installation operation acquires
+its software dependencies before building the runtime; no developer prompt,
+manual CUDA/vcpkg installation or PATH edits are required. Merely browsing the
+catalog or updating the Scala application does not install dependencies.
+
+The adapter owns a digest-bound dependency recipe containing verified downloads
+for private MinGit, CMake 3.31.8, Ninja 1.13.1, the selected CUDA 13.4 components,
+and the vcpkg executable. The pinned vcpkg baseline supplies FFmpeg, curl and
+their transitive libraries and build utilities. CUDA compiler, CRT, CCCL, NVVM,
+NVRTC, cuBLAS and NVML headers retain their upstream bytes and layouts. Scala
+binds the selected tools explicitly and records the effective CMake arguments
+separately from the original recipe. It does not choose another CUDA release.
+
+A compatible MSVC 14.44 and Windows SDK 10.0.26100 installation is reused when
+present. Otherwise Scala launches Microsoft's checksum- and signature-verified
+Build Tools installer with the selected components. Windows can request its
+normal administrator approval; cancellation is reported as a failed install.
+A required restart is reported without rebooting the host, and the same Install
+action can be retried afterward. Existing Visual Studio installations are not
+upgraded implicitly; the managed instance has a separate installation path.
+The developer environment is captured automatically for the build child only.
+
+Tools and libraries stay in Scala's owned dependency cache. Pinned dependency
+inputs, rather than runtime/provisioner revisions, identify reusable environments.
+Shared SHA-256 downloads are bounded to 2 GiB; verified extracted tools remain
+reusable after their archives are evicted. CUDA components form one verified
+retained toolkit tree, including the required NVTX headers, without duplicate
+downloaded/extracted/copied toolkits for every build attempt.
+
+The global native acquisition lease protects shared downloads and environments.
+Short private temporary directories hold dependency and runtime compilation
+objects and are disposed on completion or ordinary failure/cancellation. Source
+evidence and DLL hashes remain in installed runtime provenance. Use the normal
+`scala runtimes clean-cache` operation to release native and Python acquisition
+caches; it refuses active acquisition and preserves installed runtimes/host tools.
+A Microsoft elevated installation is a Windows-owned transaction, not an
+operation Scala claims to roll back after cancellation.
+
+Scala's GitHub Actions release builds the application only, not prepackaged
+inference runtimes. Qualified upstream or alternative release assets are acquired
+where available; source candidates build locally through the normal Install action.
+No system PATH or global CUDA selection is changed. Hardware and a working
+NVIDIA driver remain host requirements; this recipe does not replace the driver,
+install WSL, switch to CPU, convert a model or modify a Model Profile.
+
+Scala builds only `ninfer-serve`, retaining the exact upstream commit/tree and
+native source evidence. Tests, benchmarks, DirectStorage and configure-time
+FetchContent downloads remain disabled. All acquired runtime DLL dependencies,
+including the Microsoft CRT and CUDA libraries, are copied beside the executable
+and hashed in its provenance before adapter verification and atomic activation.
+The installed executable does not depend on the build cache remaining present.
+
+This automatic provisioning recipe is for Windows x86_64/sm_120a. The existing
+Linux source recipe is unchanged and retains its own prerequisite policy; it
+does not inherit Windows tools or dependency paths. Managed Python provisioning
+and existing portable Windows runtime installations are unchanged.
+
+Local validation covers dependency recipe identity, safe extraction and reuse,
+repair of damaged cached extraction, automatic environment capture with spaces
+in paths, incompatible SDK rejection, generated tool bindings, and self-contained
+DLL staging. It does not claim that a complete fresh Microsoft/CUDA/vcpkg install
+or GPU model execution was performed during source-code validation.
+
+### Independent native serving contract
+
+The pinned fork is admitted for native v3 Qwen artifacts and its schema-28
+startup/Chat contract. Scala verifies the selected artifact path, size and
+architecture, public model identity, GPU UUID/architecture and requested startup
+settings before admitting requests. The source owner closure covers native CLI,
+YaRN policy, KV planning, OpenAI Chat/SSE, sampler/thinking semantics, tool history,
+media and cancellation. Installed source files must retain their recorded hashes.
+
+Normal Chat Completions, streaming, automatic tool calling, reasoning controls
+and enabled vision use the existing bounded protocol bridge. Sampler overrides
+stay request-local; no launch-only context or KV setting is injected into requests.
+The schema-25 constrained-output completion evidence is absent from this fork,
+so strict schemas/tool guarantees are not borrowed or silently relaxed.
+This is not a claim that every NInfer-all feature is exposed by Scala.
+
+The native output limit can be `null` with `concurrent_lane_budget`: Scala keeps
+that policy and conditional sampler presets as observations, rather than
+inventing a fixed output limit or saved override. Explicit output limits retain
+normal precedence. An explicit full draft head uses `--full-draft-head`, not
+omission, because the native automatic policy can choose the optimized head.
+The reviewed CLI has no inverse of `--preserve-thinking` or positive counterpart
+to `--no-thinking`; unsupported explicit process values are rejected. Use
+`ninfer.reasoning=on` for the supported request-default thinking control.
+
+### Extended-context settings
+
+These settings become supported only for the selected, qualified NInfer-all
+runtime; older NInfer v2 and v3 runtimes do not gain them:
+
+| Setting | Native control |
+|---|---|
+| `ninfer.rope_yarn` | `--rope-yarn` when explicitly enabled |
+| `ninfer.rope_yarn_factor` | `--rope-yarn-factor F`, finite 1 through 4 |
+| `ninfer.gdn_state_fp16` | `--gdn-state-fp16` when explicitly enabled |
+| `ninfer.kv_dtype` | Adds `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8` |
+
+For a 500,000-token target, select a compatible v3 artifact/runtime pair and set
+`ninfer.context_length=500000`, `ninfer.kv_capacity=500000`,
+`ninfer.rope_yarn=true`, `ninfer.kv_dtype=rk4v4`, and optionally
+`ninfer.gdn_state_fp16=true`. These are explicit example settings, never a preset
+applied on acquisition. Leave the fixed factor inherited to let NInfer's native
+YaRN policy derive it; Scala does not implement positional scaling.
+
+Context is bounded by the engine ceiling (1,048,576) and the selected artifact
+and draft position capacities. The native allocator rounds explicit KV capacity
+to 64-token pages: 500,000 requested means 500,032 allocated KV tokens, while
+the context limit remains exactly 500,000. Requested settings are not rewritten
+from this observation. Missing or contradictory YaRN/KV/state startup evidence
+is rejected. Inherit removes local values; false remains an explicit value.
+
+NInfer-all needs a compatible v3 artifact; installation does not convert a v2
+file, replace a chat template, rebuild weights or fabricate lineage. Keep an
+existing Windows 0.7.1/v2 profile until a separate v3 pair is explicitly selected.
+
+Validation is local and synthetic: settings/launch translation, startup
+acceptance and rejection, bounded loopback HTTP/SSE fixtures, native errors,
+request-only overrides, old-generation isolation and source admission. No model
+inference, training or benchmarks are run for code validation. A successful
+Windows CUDA build, model load, 500K memory fit and long-context accuracy remain
+separate deployment facts; they are not implied by static qualification.

@@ -19,8 +19,8 @@ use scala_engine_llama_cpp::{
     LlamaCppSourceRuntimeCatalogProvider,
 };
 use scala_engine_ninfer::{
-    ENGINE_ID as NINFER_ENGINE_ID, NinferAdapter, NinferRuntimeCatalogProvider,
-    NinferWindowsRuntimeCatalogProvider,
+    ENGINE_ID as NINFER_ENGINE_ID, NinferAdapter, NinferAllRuntimeCatalogProvider,
+    NinferRuntimeCatalogProvider, NinferWindowsRuntimeCatalogProvider,
 };
 use scala_engine_q27::{ENGINE_ID as Q27_ENGINE_ID, Q27Adapter, Q27RuntimeCatalogProvider};
 
@@ -145,6 +145,7 @@ pub fn runtime_pack_manager_from_paths(
         Arc::new(Q27RuntimeCatalogProvider::new()),
         Arc::new(NinferRuntimeCatalogProvider::new()),
         Arc::new(NinferWindowsRuntimeCatalogProvider::new()),
+        Arc::new(NinferAllRuntimeCatalogProvider::new()),
         Arc::new(scala_engine_vllm::VllmRuntimeCatalogProvider::new()),
         Arc::new(scala_engine_pytorch::PyTorchRuntimeCatalogProvider::new()),
     ];
@@ -461,7 +462,8 @@ mod tests {
         let registry = super::engine_registry_from_config(&config, dir.path()).unwrap();
         let packs = super::runtime_pack_manager_from_paths(&paths, registry).unwrap();
         let ids = packs.catalog_provider_ids().collect::<Vec<_>>();
-        assert_eq!(ids.len(), 7);
+        assert_eq!(ids.len(), 8);
+        assert!(ids.contains(&"ninfer-all-source-github"));
         assert!(ids.contains(&"vllm-reviewed-python"));
         assert!(ids.contains(&"pytorch-reviewed-python"));
     }

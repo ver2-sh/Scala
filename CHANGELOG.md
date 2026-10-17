@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.1.25 - NInfer-all managed installation and serving
+
+Runtime acquisition remains in Scala: use qualified upstream or alternative
+release assets where available, otherwise build the selected pinned source
+locally on Install. No Scala-prepackaged inference runtime is introduced.
+
+Heap-box native operation futures to prevent Windows stack exhaustion after
+dependency provisioning. Share verified downloads with a 2 GiB archive limit,
+reuse compatible toolchains across runtime/provisioner revisions, retain one
+merged CUDA tree including NVTX headers, and dispose temporary compilation
+objects and dependency build trees on completion or ordinary failure.
+
+Live Windows install testing found and fixed a stack overflow in the CLI, unsafe
+cache-control file assumptions, a missing isolated PATHEXT setting, an obsolete
+Visual Studio manifest hash/size, required Microsoft channel arguments and an
+anonymous GitHub REST rate-limit dependency. For this exact source recipe,
+Scala verifies the pinned Git commit/tree locally instead of relying on a
+separate rate-limited REST metadata call; ordinary runtime providers retain
+their existing release admission policy.
+
+Add independently pinned NInfer-all Windows and Linux source candidates under
+the NInfer engine, with separate source, build and executable provenance.
+
+The Windows Install action now provisions its complete software build environment:
+private pinned Git, CMake, Ninja and CUDA components; pinned vcpkg FFmpeg/curl and
+transitive dependencies; and compatible MSVC/Windows SDK reuse or the verified
+Microsoft installer. It captures the developer environment automatically, binds
+exact tools, reports Windows approval/restart requirements, reuses verified
+cache data and packages runtime DLLs before atomic activation. Dependency recipe
+bytes are part of the Windows runtime identity. No manual tool setup or global
+PATH/CUDA edits are required. Catalog browsing remains read-only. The Linux
+recipe, Python installers and existing portable runtime behavior are unchanged.
+
+Qualify schema-28 startup and Chat/streaming contracts with independent native
+source evidence and synthetic HTTP/SSE fixtures. Expose YaRN, fixed YaRN factor,
+FP16 GDN state and rotated KV formats for this runtime only. Verify context,
+page-rounded KV capacity, GPU/artifact identity, speculation, vision and explicit
+settings. Preserve conditional output/sampler defaults without persisting runtime
+observations. Do not borrow schema-25 strict-output guarantees.
+
+Preserve native v2/v3 isolation and existing model/runtime/profile state. No
+model conversion, inference, training, benchmark, driver replacement, production
+activation or release is performed by this source change. A complete fresh
+Windows dependency installation/build and 500K memory fit remain distinct from
+synthetic validation. Preserve exact source checkout bytes, provider-owned CMake
+digests and cross-platform source compiler-path validation.
+
 ## 0.1.24 - Native D3 image decisions in llama.cpp
 
 Qualify native D3 image decisions through upstream llama.cpp's `/v1/systemone`

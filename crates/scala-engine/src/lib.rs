@@ -36,6 +36,8 @@ pub mod media;
 mod packs;
 mod prune;
 pub mod python_runtime;
+mod source_dependencies;
+pub use source_dependencies::{ManagedSourceDependencies, SourceDependencyAsset};
 mod store;
 mod supervisor;
 #[cfg(test)]
@@ -1703,6 +1705,14 @@ impl RuntimeVariantUpdateIdentity {
 
 #[async_trait]
 pub trait EngineAdapter: Send + Sync {
+    /// Pinned native build dependencies acquired only by an explicit install operation.
+    fn managed_source_dependencies(
+        &self,
+        _plan: &scala_core::RuntimeSourceBuildPlan,
+    ) -> Option<ManagedSourceDependencies> {
+        None
+    }
+
     fn managed_python_assets(&self) -> Vec<python_runtime::ManagedPythonAsset> {
         Vec::new()
     }
