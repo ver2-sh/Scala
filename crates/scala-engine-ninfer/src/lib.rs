@@ -32,12 +32,16 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use walkdir::WalkDir;
 
+mod all_catalog;
+mod all_runtime;
 mod catalog;
 mod protocol;
 mod settings;
+mod source_dependencies;
 mod v3;
 mod windows_catalog;
 
+pub use all_catalog::NinferAllRuntimeCatalogProvider;
 pub use catalog::NinferRuntimeCatalogProvider;
 pub use windows_catalog::NinferWindowsRuntimeCatalogProvider;
 
@@ -677,6 +681,10 @@ const MANAGED_NATIVE_ARGUMENTS: &[&str] = &[
     "--spec",
     "--draft-tokens",
     "--lm-head-draft",
+    "--full-draft-head",
+    "--rope-yarn",
+    "--rope-yarn-factor",
+    "--gdn-state-fp16",
     "--no-cuda-graph",
     "--no-prefix-reuse",
     "--no-thinking",
@@ -724,6 +732,7 @@ struct PendingStartup {
 
 #[derive(Debug, Clone, PartialEq)]
 struct NinferStartupRequirements {
+    extended_context: all_runtime::ExtendedContext,
     minimum_context_tokens: Option<u64>,
     max_concurrency: Option<u64>,
     kv_capacity_mode: Option<String>,
@@ -835,6 +844,9 @@ impl NinferReviewedDomains {
 
 fn setting_capability_is_reviewed(id: &str, capabilities: NinferRuntimeCapabilities) -> bool {
     match id {
+        "ninfer.rope_yarn" | "ninfer.rope_yarn_factor" | "ninfer.gdn_state_fp16" => {
+            all_runtime::is_all(capabilities)
+        }
         "ninfer.host_context_mib" => capabilities.request_log_schema == Some(25),
         "ninfer.stop_strings" | "ninfer.system_prompt" => capabilities.request_protocol_semantics,
         "ninfer.reasoning" | "ninfer.reasoning_effort" => {
@@ -895,6 +907,17 @@ fn apply_ninfer_runtime_contract(
     help: &str,
     capabilities: NinferRuntimeCapabilities,
 ) {
+    if all_runtime::is_all(capabilities) {
+        if let Some(d) = definitions
+            .iter_mut()
+            .find(|d| d.id.as_str() == "ninfer.context_length")
+        {
+            d.kind = scala_core::SettingKind::UnsignedInteger {
+                minimum: Some(1),
+                maximum: Some(1_048_576),
+            };
+        }
+    }
     for definition in definitions.iter_mut() {
         let id = definition.id.as_str();
         let unsupported = |definition: &mut scala_core::SettingDefinition, reason: &str| {
@@ -947,7 +970,11 @@ fn apply_ninfer_runtime_contract(
         .find(|definition| definition.id.as_str() == "ninfer.kv_dtype")
         && let scala_core::SettingKind::Choice { choices } = &mut definition.kind
     {
-        choices.retain(|choice| help.contains(choice));
+        choices.retain(|choice| {
+            help.contains(choice)
+                && (all_runtime::is_all(capabilities)
+                    || !all_runtime::ROTATED_KV.contains(&choice.as_str()))
+        });
     }
 }
 
@@ -955,6 +982,7 @@ fn validate_ninfer_settings_prelaunch(
     settings: &ResolvedSettings,
     capabilities: NinferRuntimeCapabilities,
 ) -> Result<(), String> {
+    all_runtime::validate_settings(settings, capabilities)?;
     if settings.is_empty() {
         return Ok(());
     }
@@ -1024,8 +1052,9 @@ fn source_container_compatibility(
     source: &scala_core::RuntimeSourceSnapshot,
     blobs: &BTreeMap<String, String>,
 ) -> CompatibilityDecision {
-    if canonical_source_identity(identity, source)
-        && (reviewed_v2_source(source, blobs) || v3::reviewed_source(identity, source))
+    if all_catalog::reviewed_source(identity, source)
+        || (canonical_source_identity(identity, source)
+            && (reviewed_v2_source(source, blobs) || v3::reviewed_source(identity, source)))
     {
         CompatibilityDecision::Supported
     } else {
@@ -1045,6 +1074,9 @@ fn source_container_compatibility(
 fn ninfer_runtime_capabilities_for_installed(
     runtime: &InstalledRuntime,
 ) -> NinferRuntimeCapabilities {
+    if let Some(capabilities) = all_runtime::installed_capabilities(runtime) {
+        return capabilities;
+    }
     if let Some(capabilities) = v3::installed_capabilities(runtime) {
         return capabilities;
     }
@@ -1112,6 +1144,9 @@ fn ninfer_runtime_capabilities_for_installed(
 fn ninfer_runtime_capabilities_for_available(
     runtime: &AvailableRuntime,
 ) -> NinferRuntimeCapabilities {
+    if let Some(capabilities) = all_runtime::available_capabilities(runtime) {
+        return capabilities;
+    }
     if let Some(capabilities) = v3::available_capabilities(runtime) {
         return capabilities;
     }
@@ -1324,7 +1359,8 @@ fn ninfer_startup_requirements(
     };
     let speculation = toggle("ninfer.speculation")?;
     let backend = choice("ninfer.speculative_backend")?;
-    let speculation_enabled = speculation.unwrap_or(backend.is_some());
+    let speculation_enabled =
+        speculation.unwrap_or(backend.as_deref().is_some_and(|b| b != "none"));
     let default_thinking_budget = integer("ninfer.reasoning_budget")?
         .map(|value| {
             u64::try_from(value).map_err(|_| {
@@ -1349,6 +1385,7 @@ fn ninfer_startup_requirements(
         }
     };
     Ok(NinferStartupRequirements {
+        extended_context: all_runtime::ExtendedContext::from_settings(settings)?,
         minimum_context_tokens: unsigned("ninfer.context_length")?,
         max_concurrency: unsigned("ninfer.parallel_requests")?,
         kv_capacity_mode,
@@ -1421,6 +1458,21 @@ struct NinferExecution {
     capabilities: NinferRuntimeCapabilities,
     vision: bool,
     greedy: bool,
+}
+
+impl NinferExecution {
+    fn request_admission(self) -> protocol::RequestAdmission {
+        protocol::RequestAdmission {
+            protocol_semantics: self.capabilities.request_protocol_semantics,
+            sampler_semantics: self.capabilities.request_sampler_semantics,
+            thinking_semantics: self.capabilities.thinking_request_semantics,
+            tool_calling: self.capabilities.tool_calling,
+            media_semantics: self.capabilities.media_request_semantics,
+            vision: self.vision,
+            greedy: self.greedy,
+            constrained: self.capabilities.request_log_schema == Some(25),
+        }
+    }
 }
 
 impl NinferAdapter {
@@ -1666,6 +1718,12 @@ impl NinferAdapter {
 
 #[async_trait]
 impl EngineAdapter for NinferAdapter {
+    fn managed_source_dependencies(
+        &self,
+        plan: &scala_core::RuntimeSourceBuildPlan,
+    ) -> Option<scala_engine::ManagedSourceDependencies> {
+        source_dependencies::for_plan(plan)
+    }
     fn identity(&self) -> EngineIdentity {
         EngineIdentity {
             id: ENGINE_ID.to_owned(),
@@ -1784,7 +1842,7 @@ impl EngineAdapter for NinferAdapter {
         }
         if let Some(decision) = incompatible_native_container(
             &runtime.supported_native_identities,
-            if v3::available_capabilities(runtime).is_some() {
+            if v3::available_capabilities(runtime).is_some() || all_catalog::available(runtime) {
                 3
             } else {
                 2
@@ -1822,7 +1880,7 @@ impl EngineAdapter for NinferAdapter {
         }
         if let Some(decision) = incompatible_native_container(
             &runtime.manifest.supported_native_identities,
-            if v3::installed_capabilities(runtime).is_some() {
+            if v3::installed_capabilities(runtime).is_some() || all_catalog::installed(runtime) {
                 3
             } else {
                 2
@@ -2003,6 +2061,10 @@ impl EngineAdapter for NinferAdapter {
         if let Some(model) = model {
             settings::validate_model_settings(resolved, model, capabilities.dflash_vision)
                 .map_err(EngineError::InvalidConfiguration)?;
+            if all_runtime::is_all(capabilities) {
+                all_runtime::validate_model(resolved, model)
+                    .map_err(EngineError::InvalidConfiguration)?;
+            }
         }
         Ok(())
     }
@@ -2305,12 +2367,17 @@ impl EngineAdapter for NinferAdapter {
         )
         .map_err(EngineError::InvalidConfiguration)?;
         let bound_context_cost = bind_ninfer_context_cost_presets(&mut request.settings).await?;
-        let structured = settings::translate(
+        let mut structured = settings::translate(
             &request.settings,
             &request.model.primary,
             &self.native_arguments,
             runtime_capabilities.dflash_vision,
         )?;
+        if all_runtime::is_all(runtime_capabilities) {
+            all_runtime::validate_model(&request.settings, &request.model.primary)
+                .map_err(EngineError::InvalidConfiguration)?;
+            all_runtime::finish_launch_arguments(&request.settings, &mut structured);
+        }
         let settings_requirements = (!request.settings.is_empty())
             .then(|| ninfer_startup_requirements(&request.settings))
             .transpose()?;
@@ -2811,20 +2878,7 @@ impl EngineAdapter for NinferAdapter {
                     "NInfer request capability proof is unavailable for this process".to_owned(),
                 )
             })?;
-        let body = protocol::backend_request(
-            &request,
-            false,
-            protocol::RequestAdmission {
-                protocol_semantics: execution.capabilities.request_protocol_semantics,
-                sampler_semantics: execution.capabilities.request_sampler_semantics,
-                thinking_semantics: execution.capabilities.thinking_request_semantics,
-                tool_calling: execution.capabilities.tool_calling,
-                media_semantics: execution.capabilities.media_request_semantics,
-                vision: execution.vision,
-                greedy: execution.greedy,
-                constrained: execution.capabilities.request_log_schema == Some(25),
-            },
-        )?;
+        let body = protocol::backend_request(&request, false, execution.request_admission())?;
         let response = self
             .client
             .post(format!("{endpoint}/v1/chat/completions"))
@@ -2857,20 +2911,7 @@ impl EngineAdapter for NinferAdapter {
                     "NInfer request capability proof is unavailable for this process".to_owned(),
                 )
             })?;
-        let body = protocol::backend_request(
-            &request,
-            true,
-            protocol::RequestAdmission {
-                protocol_semantics: execution.capabilities.request_protocol_semantics,
-                sampler_semantics: execution.capabilities.request_sampler_semantics,
-                thinking_semantics: execution.capabilities.thinking_request_semantics,
-                tool_calling: execution.capabilities.tool_calling,
-                media_semantics: execution.capabilities.media_request_semantics,
-                vision: execution.vision,
-                greedy: execution.greedy,
-                constrained: execution.capabilities.request_log_schema == Some(25),
-            },
-        )?;
+        let body = protocol::backend_request(&request, true, execution.request_admission())?;
         let response = self
             .client
             .post(format!("{endpoint}/v1/chat/completions"))
@@ -3751,7 +3792,8 @@ fn managed_launch_arguments(
 }
 
 fn inspect_source_native_identities(source_root: &Path) -> Vec<ArtifactNativeIdentity> {
-    if v3::source_registry_matches(source_root) {
+    if v3::source_registry_matches(source_root) || all_catalog::source_registry_matches(source_root)
+    {
         return v3::native_identities();
     }
     let targets = source_root.join("src").join("targets");

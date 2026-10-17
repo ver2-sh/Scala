@@ -1,0 +1,128 @@
+{
+    "schema_version":  1,
+    "cuda_release":  "13.4.3",
+    "msvc_version":  "14.44",
+    "sdk_version":  "10.0.26100.0",
+    "vs_product":  "Microsoft.VisualStudio.Product.BuildTools",
+    "vs_channel_sha256":  "4f0f290bb4d58a061a49a2fa893357a8c9e7e2b49fc91873f533ab8f791e4fa0",
+    "vs_components":  [
+                          "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                          "Microsoft.VisualStudio.Component.Windows11SDK.26100"
+                      ],
+    "vcpkg_commit":  "4bca8fd8654e5ba76f92661db7bfe954768ad8ef",
+    "vcpkg_tree":  "c65e7745af153e91edb99174e6647d647fe1ecea",
+    "assets":  [
+                   {
+                       "id":  "cuda_nvcc",
+                       "url":  "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-13.4.92-archive.zip",
+                       "sha256":  "23950047aa5405993129a982a99924b4e6d5eb9bc312300030f3afd9b3b49ea4",
+                       "size":  32991192,
+                       "root":  "cuda_nvcc-windows-x86_64-13.4.92-archive",
+                       "kind":  "cuda"
+                   },
+                   {
+                       "id":  "cuda_cudart",
+                       "url":  "https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-13.4.92-archive.zip",
+                       "sha256":  "621a70c4778287b1abf8c27c61b841d797fda2aeff01033374dd19624bcfa249",
+                       "size":  2737397,
+                       "root":  "cuda_cudart-windows-x86_64-13.4.92-archive",
+                       "kind":  "cuda"
+                   },
+                   {
+                       "id":  "cccl",
+                       "url":  "https://developer.download.nvidia.com/compute/cuda/redist/cccl/windows-x86_64/cccl-windows-x86_64-13.3.4.3.1-archive.zip",
+                       "sha256":  "17d0ca1592c0dfc974a5fc39f470a6b7bae40da239e3e19bd0752017735acbca",
+                       "size":  4034377,
+                       "root":  "cccl-windows-x86_64-13.3.4.3.1-archive",
+                       "kind":  "cuda"
+                   },
+                   {
+                       "id":  "cuda_crt",
+                       "url":  "https://developer.download.nvidia.com/compute/cuda/redist/cuda_crt/windows-x86_64/cuda_crt-windows-x86_64-13.4.92-archive.zip",
+                       "sha256":  "a38e3aa75e259128a1c7fb46e706182e4babca407cd3f3c447d21ab7fb14c7fd",
+                       "size":  166601,
+                       "root":  "cuda_crt-windows-x86_64-13.4.92-archive",
+                       "kind":  "cuda"
+                   },
+                   {
+                       "id":  "libnvvm",
+                       "url":  "https://developer.download.nvidia.com/compute/cuda/redist/libnvvm/windows-x86_64/libnvvm-windows-x86_64-13.4.92-archive.zip",
+                       "sha256":  "64fa39ad6332d6c40a02115d64827272f6befbc86e50568254f44d37d924e10b",
+                       "size":  60031433,
+                       "root":  "libnvvm-windows-x86_64-13.4.92-archive",
+                       "kind":  "cuda"
+                   },
+                   {
+                       "id":  "cuda_nvrtc",
+                       "url":  "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvrtc/windows-x86_64/cuda_nvrtc-windows-x86_64-13.4.92-archive.zip",
+                       "sha256":  "92e4db6e79550665e1dbdc6cc09c934452a667881f5ed49a51681429874a8f0d",
+                       "size":  319966721,
+                       "root":  "cuda_nvrtc-windows-x86_64-13.4.92-archive",
+                       "kind":  "cuda"
+                   },
+                   {
+                       "id":  "cuda_nvml_dev",
+                       "url":  "https://developer.download.nvidia.com/compute/cuda/redist/cuda_nvml_dev/windows-x86_64/cuda_nvml_dev-windows-x86_64-13.4.92-archive.zip",
+                       "sha256":  "99a96d9c79c75d1a08ba5d2d279b119c769982fd8ea01c479dc499cf95acd651",
+                       "size":  189442,
+                       "root":  "cuda_nvml_dev-windows-x86_64-13.4.92-archive",
+                       "kind":  "cuda"
+                   },
+                   {
+                       "id":  "libcublas",
+                       "url":  "https://developer.download.nvidia.com/compute/cuda/redist/libcublas/windows-x86_64/libcublas-windows-x86_64-13.8.0.4-archive.zip",
+                       "sha256":  "0974318e9861a61cb9091cf7de8d4c2880e9787fe311cb4bcbd08865663c5f43",
+                       "size":  422415931,
+                       "root":  "libcublas-windows-x86_64-13.8.0.4-archive",
+                       "kind":  "cuda"
+                   },
+                   {
+                       "id":  "cmake",
+                       "url":  "https://github.com/Kitware/CMake/releases/download/v3.31.8/cmake-3.31.8-windows-x86_64.zip",
+                       "sha256":  "81aa9964dbabd71fe02e7ec50472fd3ad56138c49944515ece9001efbff8d719",
+                       "size":  46709267,
+                       "root":  "cmake-3.31.8-windows-x86_64",
+                       "kind":  "zip"
+                   },
+                   {
+                       "id":  "ninja",
+                       "url":  "https://github.com/ninja-build/ninja/releases/download/v1.13.1/ninja-win.zip",
+                       "sha256":  "26a40fa8595694dec2fad4911e62d29e10525d2133c9a4230b66397774ae25bf",
+                       "size":  289808,
+                       "root":  "",
+                       "kind":  "zip"
+                   },
+                   {
+                       "id":  "git",
+                       "url":  "https://github.com/git-for-windows/git/releases/download/v2.50.1.windows.1/MinGit-2.50.1-64-bit.zip",
+                       "sha256":  "6f672aebe9e488a246efd6875f9197dbc0d9a40100e218acc3877cba2b206c45",
+                       "size":  47953778,
+                       "root":  "",
+                       "kind":  "zip"
+                   },
+                   {
+                       "id":  "vcpkg-tool",
+                       "url":  "https://github.com/microsoft/vcpkg-tool/releases/download/2026-07-13/vcpkg.exe",
+                       "sha256":  "67958c6a13a35130ff8035bef33097ffe3376a6708577a826cfa41fa592db611",
+                       "size":  6749536,
+                       "root":  "",
+                       "kind":  "exe"
+                   },
+                   {
+                       "id":  "vs-manifest",
+                       "url":  "https://download.visualstudio.microsoft.com/download/pr/c95450be-0a45-4779-b142-33f567ccfd6e/a871a5ff41acebbe5037455fd6f51fcd4907b47d8f3c9860871ea0b222a2fd45/VisualStudio.vsman",
+                       "sha256":  "99dda859c4ae3c446eb25620d1a6237bb135d95d14d55cd1d30a15340bb39d80",
+                       "size":  17954770,
+                       "root":  "",
+                       "kind":  "file"
+                   },
+                   {
+                       "id":  "vs-setup",
+                       "url":  "https://download.visualstudio.microsoft.com/download/pr/c95450be-0a45-4779-b142-33f567ccfd6e/eaa2f9ae29d6871b5a4e985c3e96efd5d7a0d37c37d6a7234274cf556797a14c/vs_Setup.exe",
+                       "sha256":  "eaa2f9ae29d6871b5a4e985c3e96efd5d7a0d37c37d6a7234274cf556797a14c",
+                       "size":  4474840,
+                       "root":  "",
+                       "kind":  "file"
+                   }
+               ]
+}

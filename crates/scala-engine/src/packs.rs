@@ -1390,8 +1390,7 @@ impl RuntimePackManager {
             .catalog
             .verify_install_candidate(&entry.available)
             .await?;
-        self.installer
-            .install(&verified, installation_lease)
+        Box::pin(self.installer.install(&verified, installation_lease))
             .await
             .map_err(Into::into)
     }

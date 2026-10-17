@@ -1155,7 +1155,7 @@ fn validate_source_build_plan(
         || prerequisites
             .cuda_compiler
             .as_deref()
-            .is_some_and(|compiler| !compiler.is_absolute())
+            .is_some_and(|compiler| !is_absolute_tool_path(compiler))
         || prerequisites
             .pkg_config_modules
             .iter()
@@ -1171,6 +1171,39 @@ fn validate_source_build_plan(
         ));
     }
     Ok(())
+}
+
+// Catalog entries describe the target host, not the machine reading the catalog.
+// In particular Windows discovery must accept a Linux recipe's /usr/local/... path.
+fn is_absolute_tool_path(path: &Path) -> bool {
+    let Some(value) = path.to_str() else {
+        return false;
+    };
+    if value.contains('\0') {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    value.starts_with('/')
+        || path.is_absolute()
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+}
+
+#[cfg(test)]
+#[test]
+fn source_compiler_paths_are_validated_independently_of_catalog_reader_os() {
+    for valid in [
+        "/usr/local/cuda/bin/nvcc",
+        "C:/CUDA/v13.4/bin/nvcc.exe",
+        r"C:\CUDA\bin\nvcc.exe",
+    ] {
+        assert!(is_absolute_tool_path(Path::new(valid)), "{valid}");
+    }
+    for invalid in ["nvcc", "./nvcc", "C:nvcc.exe", "", "C:/bad\0.exe"] {
+        assert!(!is_absolute_tool_path(Path::new(invalid)), "{invalid}");
+    }
 }
 
 fn valid_build_target(system: RuntimeSourceBuildSystem, target: &str) -> bool {

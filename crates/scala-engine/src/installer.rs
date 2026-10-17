@@ -1,3 +1,6 @@
+mod managed_source;
+mod windows_source;
+
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -134,6 +137,18 @@ impl RuntimeInstaller {
         &self,
         plan: &RuntimeSourceBuildPlan,
     ) -> RuntimeCompatibility {
+        if let Some(recipe) = self.managed_source_recipe(plan) {
+            return if !cfg!(target_os = "windows") || std::env::consts::ARCH != "x86_64" {
+                RuntimeCompatibility::Incompatible(
+                    "this dependency recipe requires native Windows x86_64".into(),
+                )
+            } else {
+                match recipe.validate() {
+                    Ok(()) => RuntimeCompatibility::Recommended,
+                    Err(e) => RuntimeCompatibility::NeedsAttention(e),
+                }
+            };
+        }
         match check_source_build_prerequisites(plan).await {
             Ok(_) => RuntimeCompatibility::Recommended,
             Err(error) => RuntimeCompatibility::NeedsAttention(error.to_string()),
@@ -167,9 +182,13 @@ impl RuntimeInstaller {
                 .await;
         }
         if let RuntimeAcquisitionPlan::SourceBuild(plan) = &available.acquisition {
-            return self
-                .install_source_build(available, authority, plan, installation_lease)
-                .await;
+            return Box::pin(self.install_source_build(
+                available,
+                authority,
+                plan,
+                installation_lease,
+            ))
+            .await;
         }
         let (download, additional_downloads) = available.release_assets().ok_or_else(|| {
             RuntimeInstallError::InvalidMetadata(
@@ -802,9 +821,13 @@ impl RuntimeInstaller {
         plan: &RuntimeSourceBuildPlan,
         installation_lease: Arc<RuntimeInstallationLease>,
     ) -> Result<InstalledRuntime, RuntimeInstallError> {
-        let result = self
-            .install_source_build_inner(available, authority, plan, installation_lease)
-            .await;
+        let result = Box::pin(self.install_source_build_inner(
+            available,
+            authority,
+            plan,
+            installation_lease,
+        ))
+        .await;
         if let Err(error) = &result {
             self.emit(
                 available,
@@ -831,35 +854,57 @@ impl RuntimeInstaller {
             None,
             "Checking source-build prerequisites",
         );
-        let prerequisite_check = check_source_build_prerequisites(plan).await?;
-        let toolchain = prerequisite_check.toolchain;
+        let managed_dependencies = self.prepare_managed_source(available, plan).await?;
+        let prerequisite_check = if let Some(prepared) = &managed_dependencies {
+            prepared.checked(plan)?
+        } else {
+            check_source_build_prerequisites(plan).await?
+        };
+        let mut toolchain = prerequisite_check.toolchain;
         let effective_cmake_configuration_arguments =
             prerequisite_check.effective_cmake_configuration_arguments;
 
-        let repository = self
-            .github
-            .repository(&authority.repository)
-            .await
-            .map_err(|error| RuntimeInstallError::SourceChanged(error.to_string()))?;
-        if repository.full_name != plan.source.repository
-            || repository.html_url != format!("https://github.com/{}", plan.source.repository)
-        {
-            return Err(RuntimeInstallError::SourceChanged(
-                "canonical repository no longer matches the selected source candidate".to_owned(),
-            ));
-        }
-        let live_commit = self
-            .github
-            .commit(&authority.repository, &plan.source.commit_sha)
-            .await
-            .map_err(|error| RuntimeInstallError::SourceChanged(error.to_string()))?;
-        if live_commit.sha != plan.source.commit_sha
-            || live_commit.commit.tree.sha != plan.source.tree_sha
-            || live_commit.html_url != available.source_url
-        {
-            return Err(RuntimeInstallError::SourceChanged(
-                "selected commit or Git tree no longer matches the catalog candidate".to_owned(),
-            ));
+        if managed_dependencies.is_some() {
+            // Adapter-verified immutable source recipes are checked again by the Git
+            // commit/tree checkout below. Avoid redundant unauthenticated REST calls.
+            let source_url = format!("https://github.com/{}", authority.repository);
+            if plan.source.repository != authority.repository
+                || plan.source.repository_url != format!("{source_url}.git")
+                || available.source_url != format!("{source_url}/commit/{}", plan.source.commit_sha)
+            {
+                return Err(RuntimeInstallError::SourceChanged(
+                    "managed source repository or commit URL differs from its registered provider"
+                        .into(),
+                ));
+            }
+        } else {
+            let repository = self
+                .github
+                .repository(&authority.repository)
+                .await
+                .map_err(|error| RuntimeInstallError::SourceChanged(error.to_string()))?;
+            if repository.full_name != plan.source.repository
+                || repository.html_url != format!("https://github.com/{}", plan.source.repository)
+            {
+                return Err(RuntimeInstallError::SourceChanged(
+                    "canonical repository no longer matches the selected source candidate"
+                        .to_owned(),
+                ));
+            }
+            let live_commit = self
+                .github
+                .commit(&authority.repository, &plan.source.commit_sha)
+                .await
+                .map_err(|error| RuntimeInstallError::SourceChanged(error.to_string()))?;
+            if live_commit.sha != plan.source.commit_sha
+                || live_commit.commit.tree.sha != plan.source.tree_sha
+                || live_commit.html_url != available.source_url
+            {
+                return Err(RuntimeInstallError::SourceChanged(
+                    "selected commit or Git tree no longer matches the catalog candidate"
+                        .to_owned(),
+                ));
+            }
         }
 
         let adapter = self
@@ -880,7 +925,8 @@ impl RuntimeInstaller {
                 None,
                 "Fetching the exact upstream commit",
             );
-            run_source_command(
+            managed_source::run(
+                managed_dependencies.as_ref(),
                 "git init",
                 "git",
                 &["init", "--quiet"],
@@ -888,7 +934,8 @@ impl RuntimeInstaller {
                 &[],
             )
             .await?;
-            run_source_command(
+            managed_source::run(
+                managed_dependencies.as_ref(),
                 "git remote configuration",
                 "git",
                 &["remote", "add", "origin", &plan.source.repository_url],
@@ -896,7 +943,8 @@ impl RuntimeInstaller {
                 &[],
             )
             .await?;
-            run_source_command(
+            managed_source::run(
+                managed_dependencies.as_ref(),
                 "git fetch",
                 "git",
                 &[
@@ -910,10 +958,20 @@ impl RuntimeInstaller {
                 &[],
             )
             .await?;
-            run_source_command(
+            managed_source::run(
+                managed_dependencies.as_ref(),
                 "git checkout",
                 "git",
-                &["checkout", "--quiet", "--detach", "FETCH_HEAD"],
+                &[
+                    "-c",
+                    "core.autocrlf=false",
+                    "-c",
+                    "core.eol=lf",
+                    "checkout",
+                    "--quiet",
+                    "--detach",
+                    "FETCH_HEAD",
+                ],
                 Some(&source_root),
                 &[],
             )
@@ -926,10 +984,20 @@ impl RuntimeInstaller {
                 None,
                 "Verifying exact source commit and Git tree",
             );
-            let observed_commit =
-                command_text("git", &["rev-parse", "HEAD"], Some(&source_root)).await?;
-            let observed_tree =
-                command_text("git", &["rev-parse", "HEAD^{tree}"], Some(&source_root)).await?;
+            let observed_commit = managed_source::text(
+                managed_dependencies.as_ref(),
+                "git",
+                &["rev-parse", "HEAD"],
+                Some(&source_root),
+            )
+            .await?;
+            let observed_tree = managed_source::text(
+                managed_dependencies.as_ref(),
+                "git",
+                &["rev-parse", "HEAD^{tree}"],
+                Some(&source_root),
+            )
+            .await?;
             verify_source_checkout(
                 &plan.source.commit_sha,
                 &plan.source.tree_sha,
@@ -991,7 +1059,8 @@ impl RuntimeInstaller {
                         .iter()
                         .map(String::as_str)
                         .collect::<Vec<_>>();
-                    run_source_command(
+                    managed_source::run(
+                        managed_dependencies.as_ref(),
                         "CMake configure",
                         "cmake",
                         &configure_refs,
@@ -1007,7 +1076,8 @@ impl RuntimeInstaller {
                         None,
                         "Building the required runtime target",
                     );
-                    run_source_command(
+                    managed_source::run(
+                        managed_dependencies.as_ref(),
                         "CMake build",
                         "cmake",
                         &[
@@ -1036,7 +1106,8 @@ impl RuntimeInstaller {
                         None,
                         "Building only the selected upstream Makefile target",
                     );
-                    run_source_command(
+                    managed_source::run(
+                        managed_dependencies.as_ref(),
                         "Make build",
                         "make",
                         &[
@@ -1051,7 +1122,7 @@ impl RuntimeInstaller {
                 }
             }
 
-            let relative_entrypoint = PathBuf::from("source").join(&plan.recipe.entrypoint);
+            let relative_entrypoint = source_install_entrypoint(&plan.recipe.entrypoint);
             let entrypoint = staging.join(&relative_entrypoint);
             let metadata = tokio::fs::metadata(&entrypoint).await.map_err(|error| {
                 RuntimeInstallError::Entrypoint(format!(
@@ -1064,6 +1135,11 @@ impl RuntimeInstaller {
                     "expected source-built entrypoint `{}` is not a regular file",
                     relative_entrypoint.display()
                 )));
+            }
+            if let Some(prepared) = &managed_dependencies {
+                prepared
+                    .stage_runtime_files(staging.path(), &entrypoint, &mut toolchain)
+                    .await?;
             }
             ensure_executable(&entrypoint)?;
             let entrypoint_sha256 = hash_file(&entrypoint)
@@ -1615,10 +1691,12 @@ const MAX_CMAKE_CONTRACT_FILES: usize = 4_096;
 async fn check_source_build_prerequisites(
     plan: &RuntimeSourceBuildPlan,
 ) -> Result<CheckedSourceBuildPrerequisites, RuntimeInstallError> {
-    if !cfg!(target_os = "linux") {
-        return Err(RuntimeInstallError::Prerequisite(
-            "the selected official source recipe requires Linux".to_owned(),
-        ));
+    let msvc = windows_source::is_msvc_plan(plan);
+    if (msvc && !cfg!(target_os = "windows")) || (!msvc && !cfg!(target_os = "linux")) {
+        return Err(RuntimeInstallError::Prerequisite(format!(
+            "the selected source recipe requires {}",
+            if msvc { "native Windows" } else { "Linux" }
+        )));
     }
     if std::env::consts::ARCH != "x86_64" {
         return Err(RuntimeInstallError::Prerequisite(format!(
@@ -1634,6 +1712,11 @@ async fn check_source_build_prerequisites(
     let effective_cmake_configuration_arguments = effective_cmake_configuration_arguments(plan)
         .map_err(|error| RuntimeInstallError::Prerequisite(error.to_string()))?;
 
+    let windows_dependencies = if msvc {
+        windows_source::dependencies(plan)?
+    } else {
+        BTreeMap::new()
+    };
     command_text("git", &["--version"], None).await?;
     let cmake_version = if plan.recipe.build_system == RuntimeSourceBuildSystem::Cmake {
         let identity = command_text("cmake", &["--version"], None).await?;
@@ -1662,9 +1745,13 @@ async fn check_source_build_prerequisites(
         .or(plan.prerequisites.requires_cpp20_compiler.then_some(20));
     let cpp_program = plan.prerequisites.cpp_compiler.as_deref().unwrap_or("c++");
     let compiler_identity = if let Some(standard) = cpp_standard {
-        let identity = command_text(cpp_program, &["--version"], None).await?;
-        probe_cpp_compiler(cpp_program, standard).await?;
-        identity
+        if msvc {
+            windows_source::probe_compiler(cpp_program, standard).await?
+        } else {
+            let identity = command_text(cpp_program, &["--version"], None).await?;
+            probe_cpp_compiler(cpp_program, standard).await?;
+            identity
+        }
     } else {
         "not required".to_owned()
     };
@@ -1695,7 +1782,7 @@ async fn check_source_build_prerequisites(
     } else {
         "not required".to_owned()
     };
-    let mut system_dependencies = BTreeMap::new();
+    let mut system_dependencies = windows_dependencies;
     for (module, minimum) in &plan.prerequisites.pkg_config_modules {
         let constraint = format!("--atleast-version={minimum}");
         probe_status("pkg-config", &[constraint.as_str(), module])
@@ -2145,6 +2232,15 @@ fn inspect_build_dependency_contract(
             })?,
         );
     }
+    if let Some(expected) = build_definition_sha256 {
+        let bytes = std::fs::read(source_root.join("CMakeLists.txt"))
+            .map_err(|e| RuntimeInstallError::SourceBuild(e.to_string()))?;
+        if hex_digest(Sha256::digest(&bytes)) != expected {
+            return Err(RuntimeInstallError::SourceBuild(
+                "root CMakeLists.txt differs from the admitted source build definition".into(),
+            ));
+        }
+    }
     let fetch_content_disconnected = cmake_configuration_arguments
         .iter()
         .any(|argument| argument == "-DFETCHCONTENT_FULLY_DISCONNECTED=ON")
@@ -2276,6 +2372,12 @@ fn makefile_declares_target(makefile: &str, expected: &str) -> bool {
                 targets.split_whitespace().any(|target| target == expected)
             })
     })
+}
+
+// Source recipes have already validated the relative path. Keep manifest paths
+// portable instead of introducing a Windows backslash through PathBuf::join.
+fn source_install_entrypoint(entrypoint: &Path) -> PathBuf {
+    PathBuf::from(format!("source/{}", entrypoint.to_string_lossy()))
 }
 
 fn ensure_executable(path: &Path) -> Result<(), RuntimeInstallError> {

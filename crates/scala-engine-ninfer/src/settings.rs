@@ -29,6 +29,11 @@ const NINFER_COMMON_SETTINGS: &[&str] = &[
 pub(crate) fn definitions() -> Vec<SettingDefinition> {
     let mut definitions = common_setting_definitions_for(crate::ENGINE_ID, NINFER_COMMON_SETTINGS);
     definitions.extend([
+        toggle("ninfer.rope_yarn", "YaRN context extension", "NInfer-all native YaRN beyond the artifact's native window; no weight or template changes"),
+        definition("ninfer.rope_yarn_factor", "Fixed YaRN factor", "NInfer-all fixed factor, 1 to 4. At 1, the native --rope-yarn policy decides scaling", SettingKind::Float { minimum: Some(1.0), maximum: Some(4.0) }, None),
+        toggle("ninfer.gdn_state_fp16", "FP16 recurrent state", "NInfer-all native FP16 GDN recurrent state; independent of model weight and KV formats"),
+    ]);
+    definitions.extend([
         unsigned(
             "ninfer.host_context_mib",
             "Host context budget",
@@ -41,7 +46,10 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "KV dtype",
             "NInfer KV cache storage type",
             SettingKind::Choice {
-                choices: choices(&["bf16", "int8", "fp8", "nvfp4", "k8v4"]),
+                choices: choices(&[
+                    "bf16", "int8", "fp8", "nvfp4", "k8v4", "rk8v4", "rk4v4", "rk4v4-e8",
+                    "rk2v4-e8",
+                ]),
             },
             Some("exact runtime default"),
         ),
@@ -631,7 +639,7 @@ pub(crate) fn apply_model_capabilities(
         let v3 = matches!(model.native_identity.as_ref(),Some(ArtifactNativeIdentity::Ninfer(i)) if i.container_version==3);
         choices.retain(|choice| {
             if v3 {
-                crate::v3::component_present(model, choice)
+                (choice == "none" || crate::v3::component_present(model, choice))
                     && (!vision_requested || choice == "mtp" || dflash_vision_supported)
             } else {
                 match choice.as_str() {
@@ -782,6 +790,9 @@ pub(crate) fn execution_path_for_setting(id: &str) -> SettingExecutionPath {
     };
 
     match id {
+        "ninfer.rope_yarn" => LaunchOption("--rope-yarn"),
+        "ninfer.rope_yarn_factor" => LaunchOption("--rope-yarn-factor"),
+        "ninfer.gdn_state_fp16" => LaunchOption("--gdn-state-fp16"),
         "ninfer.context_length" => LaunchOption("--max-context"),
         "ninfer.parallel_requests" => LaunchOption("--max-concurrency"),
         "ninfer.temperature" => LaunchOption("--temperature"),
@@ -895,7 +906,7 @@ pub(crate) fn translate(
             "ninfer.draft_tokens requires an explicit speculative backend".to_owned(),
         ));
     }
-    let speculation_enabled = speculation.unwrap_or(speculative.is_some());
+    let speculation_enabled = speculation.unwrap_or(speculative.is_some_and(|b| b != "none"));
     if toggle_value(settings, "ninfer.greedy")? == Some(true)
         && [
             "ninfer.temperature",
@@ -1055,7 +1066,13 @@ pub(crate) fn translate(
                 "ninfer.lm_head_draft" | "ninfer.preserve_thinking" if *value => {
                     arguments.push(OsString::from(option));
                 }
-                "ninfer.vision" | "ninfer.greedy" | "ninfer.cors" if *value => {
+                "ninfer.vision"
+                | "ninfer.greedy"
+                | "ninfer.cors"
+                | "ninfer.rope_yarn"
+                | "ninfer.gdn_state_fp16"
+                    if *value =>
+                {
                     arguments.push(OsString::from(option));
                 }
                 "ninfer.cuda_graph"
@@ -1065,7 +1082,9 @@ pub(crate) fn translate(
                 | "ninfer.preserve_thinking"
                 | "ninfer.vision"
                 | "ninfer.greedy"
-                | "ninfer.cors" => {}
+                | "ninfer.cors"
+                | "ninfer.rope_yarn"
+                | "ninfer.gdn_state_fp16" => {}
                 _ => {
                     return Err(EngineError::InvalidConfiguration(format!(
                         "setting `{id}` has an invalid toggle mapping for NInfer"

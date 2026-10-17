@@ -45,7 +45,7 @@ fn capabilities(windows: bool) -> NinferRuntimeCapabilities {
     c
 }
 pub(super) fn is_v3(c: NinferRuntimeCapabilities) -> bool {
-    matches!(c.request_log_schema, Some(21 | 25))
+    matches!(c.request_log_schema, Some(21 | 25 | 28))
 }
 pub(super) fn installed_capabilities(
     runtime: &InstalledRuntime,
@@ -153,7 +153,7 @@ pub(super) fn validate_startup(
     s: &Value,
 ) -> Result<ObservedNinferStartup, EngineError> {
     let schema = p.capabilities.request_log_schema.ok_or_else(failure)?;
-    if !matches!(schema, 21 | 25)
+    if !matches!(schema, 21 | 25 | 28)
         || s["schema_version"] != schema
         || s["artifact_type"] != "ninfer_serve_request_log"
         || s["event"] != "server_start"
@@ -211,7 +211,7 @@ pub(super) fn validate_startup(
         }
     }
     if cache["device_state_slots"].as_u64().is_none()
-        || server["default_output_tokens"].as_u64().is_none()
+        || (schema != 28 && server["default_output_tokens"].as_u64().is_none())
         || !matches!(
             e["speculative_backend"].as_str(),
             Some("none" | "mtp" | "dflash" | "dflash2")
@@ -226,6 +226,10 @@ pub(super) fn validate_startup(
         "fp8-e4m3-row256" => "fp8",
         "nvfp4" => "nvfp4",
         "k8v4" => "k8v4",
+        "rotated-k8g64-v4g32" if schema == 28 => "rk8v4",
+        "rotated-lloyd4g64-v4g32" if schema == 28 => "rk4v4",
+        "rotated-k4e8g64-v4g32" if schema == 28 => "rk4v4-e8",
+        "rotated-k2e8g64-v4g32" if schema == 28 => "rk2v4-e8",
         _ => return Err(failure()),
     };
     let thinking = server["default_thinking"].as_bool();
@@ -309,7 +313,7 @@ pub(super) fn validate_startup(
         .into(),
         json!(host_bytes >> 20),
     );
-    if schema == 21 {
+    if matches!(schema, 21 | 28) {
         for k in [
             "host_state_slots",
             "max_private_continuations",
@@ -360,7 +364,10 @@ pub(super) fn validate_startup(
         }
         for (v, a) in [
             (r.max_concurrency, &e["max_concurrency"]),
-            (r.kv_capacity, &e["kv_capacity"]),
+            (
+                if schema == 28 { None } else { r.kv_capacity },
+                &e["kv_capacity"],
+            ),
             (r.prefill_chunk, &e["prefill_chunk"]),
             (r.device_state_slots, &cache["device_state_slots"]),
             (r.host_context_bytes, &cache["host_capacity_bytes"]),
@@ -434,6 +441,9 @@ pub(super) fn validate_startup(
         }
         check_u(r.top_k, &sampling["server_overrides"]["top_k"])?;
         check_u(r.seed, &sampling["server_overrides"]["seed"])?;
+    }
+    if schema == 28 {
+        all_runtime::observe_startup(p, s, &mut observed)?;
     }
     Ok(ObservedNinferStartup {
         kv_cache_format: kv.into(),

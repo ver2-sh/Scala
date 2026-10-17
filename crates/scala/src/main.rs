@@ -74,14 +74,14 @@ async fn managed_runtime_operation(
     update: bool,
 ) -> color_eyre::Result<scala_core::InstalledRuntime> {
     let mut progress = packs.progress();
-    let operation = async {
+    // Box the potentially large source-install future off the Windows main-thread stack.
+    let mut operation = Box::pin(async {
         if update {
             packs.update(runtime_id).await
         } else {
             packs.install(runtime_id).await
         }
-    };
-    tokio::pin!(operation);
+    });
     let mut last_phase = None;
     let mut last_message = std::time::Instant::now();
     loop {
