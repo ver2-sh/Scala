@@ -170,7 +170,16 @@ All three honor `--json`; `enable`/`disable` never touch a running server.
 - Model Profiles are user-created mutable serving targets and the normal load unit.
 - Runtimes are installed executable implementations selected for the profile's bound engine.
 
-Two Model Profiles may bind the same artifact and carry different roles or overrides. Multi-backend status and
+Two Model Profiles may bind the same artifact and carry different roles, overrides, and exact
+runtime pins. Runtime selection is `load --runtime` > profile `runtime_id` > existing artifact
+selection > format default > compatible fallback. A profile pin is explicit: if missing,
+incompatible with the artifact/host/settings, or from another engine, it fails rather than
+silently falling back. In the Model Profiles runtime picker, **Use selected** pins only that
+profile and **Inherit** removes only its pin. The Models runtime picker still edits the
+artifact's selection. No duplicate model files, aliases, hardlinks, or weight conversion are
+required. [Runtime pin details](docs/settings.md#model-profile-runtime-selection).
+
+Multi-backend status and
 runtime provenance retain both the Model Profile ID and the underlying artifact Model ID. The
 OpenAI-compatible model alias is the loaded Model Profile ID, including `GET /v1/models` entries and
 the `model` value accepted by inference requests.
@@ -384,6 +393,8 @@ scala model-profiles create <PROFILE> --model <MODEL_ID> --engine <ENGINE_ID> [-
 scala model-profiles duplicate <SOURCE> <PROFILE>
 scala model-profiles delete <PROFILE>
 scala model-profiles set-model <PROFILE> <MODEL_ID>
+scala model-profiles set-runtime <PROFILE> <EXACT_INSTALLED_RUNTIME_ID>
+scala model-profiles clear-runtime <PROFILE>
 scala model-profiles set-engine <PROFILE> <ENGINE_ID>
 scala model-profiles set-role <PROFILE> <primary|auxiliary>
 scala model-profiles set <PROFILE> <SETTING=VALUE>...

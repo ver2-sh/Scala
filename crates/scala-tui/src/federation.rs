@@ -124,6 +124,8 @@ impl App {
                         display_name: profile.display_name.clone(),
                         model_id: model_id.clone(),
                         engine_id,
+                        // Remote runtime pins remain owner-local.
+                        runtime_id: None,
                         role: profile.role,
                         overrides: Default::default(),
                     },

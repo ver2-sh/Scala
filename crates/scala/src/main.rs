@@ -810,14 +810,36 @@ async fn handle_model_profiles(
                 existing.engine_id.as_str(),
                 &existing.overrides,
             )?;
+            if existing.runtime_id.is_some() {
+                let mut candidate = existing.clone();
+                candidate.model_id = model_id.clone();
+                let packs = composition::runtime_pack_manager(&core, registry.clone())?;
+                let settings = SettingsStore::new(&core.paths).read().await?;
+                packs
+                    .validate_profile_settings(
+                        &settings,
+                        &candidate,
+                        &model,
+                        &candidate.overrides,
+                        &core.paths.data_dir,
+                    )
+                    .await?;
+            }
+            let original_hash = existing.content_hash();
             let selected = profile_id.clone();
             let state = store
                 .update(move |state| {
-                    state
+                    let profile = state
                         .profiles
                         .get_mut(&profile_id)
-                        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?
-                        .model_id = model_id;
+                        .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+                    if profile.content_hash() != original_hash {
+                        return Err(SettingsError::InvalidModelProfile(
+                            "Model Profile changed during model selection; refresh and retry"
+                                .into(),
+                        ));
+                    }
+                    profile.model_id = model_id;
                     Ok(state.clone())
                 })
                 .await?;
@@ -853,10 +875,11 @@ async fn handle_model_profiles(
                 .await?;
             if !confirm
                 && (existing.engine_id.as_str() == "native_decision"
-                    || !candidate.removed.is_empty())
+                    || !candidate.removed.is_empty()
+                    || (existing.engine_id != engine_id && existing.runtime_id.is_some()))
             {
                 println!(
-                    "Review engine change for {}: {} -> {}. ID, name, model and role are retained. Incompatible overrides to remove: {}. Runtime selections and engine Settings are retained. Repeat with --confirm to apply.",
+                    "Review engine change for {}: {} -> {}. ID, name, model and role are retained. Incompatible overrides to remove: {}. Artifact runtime selections and engine Settings are retained; changing engine clears this profile's runtime pin. Repeat with --confirm to apply.",
                     existing.id,
                     existing.engine_id,
                     engine_id,
@@ -885,6 +908,9 @@ async fn handle_model_profiles(
                             "Model Profile `{update_profile_id}` changed during engine-switch preflight"
                         )));
                     }
+                    if profile.engine_id != engine_id {
+                        profile.runtime_id = None;
+                    }
                     profile.engine_id = engine_id;
                     profile.overrides = overrides;
                     Ok(state.clone())
@@ -910,6 +936,44 @@ async fn handle_model_profiles(
                 profile,
                 Some(&model),
                 &candidate.resolved,
+                json_output,
+            )?;
+        }
+        command @ (ModelProfilesCommand::SetRuntime { .. }
+        | ModelProfilesCommand::ClearRuntime { .. }) => {
+            let (name, requested, operation) = match command {
+                ModelProfilesCommand::SetRuntime { profile, runtime } => {
+                    (profile, Some(RuntimeId::new(runtime)?), "set-runtime")
+                }
+                ModelProfilesCommand::ClearRuntime { profile } => (profile, None, "clear-runtime"),
+                _ => unreachable!(),
+            };
+            let id = ModelProfileId::new(name)?;
+            core.ensure_model_discovery().await?;
+            let profiles = store.read().await?;
+            let profile = profiles
+                .profiles
+                .get(&id)
+                .ok_or_else(|| SettingsError::ModelProfileNotFound(id.clone()))?;
+            let model = core.model(&profile.model_id).await;
+            let registry = composition::engine_registry(&core)?;
+            let packs = composition::runtime_pack_manager(&core, registry)?;
+            let settings = SettingsStore::new(&core.paths).read().await?;
+            let state = packs
+                .set_profile_runtime(
+                    profile,
+                    model.as_ref(),
+                    requested,
+                    &settings,
+                    &core.paths.data_dir,
+                )
+                .await?;
+            // A clear must succeed even when the inherited runtime/model is missing.
+            output::model_profiles(
+                operation,
+                &state,
+                Some(&id),
+                &core.snapshot().await.models,
                 json_output,
             )?;
         }
@@ -1091,14 +1155,17 @@ async fn exact_model_profile_context(
     adapter.normalize_settings(&mut resolved)?;
     let packs = composition::runtime_pack_manager(core, registry.clone())?;
     let runtime = runtime.map(RuntimeId::new).transpose()?;
-    let (selection, schema) = packs
+    let (mut selection, schema) = packs
         .settings_schema_for_model_for_engine_with_settings(
             &model,
             profile.engine_id.as_str(),
-            runtime.as_ref(),
+            profile.runtime_for_load(runtime.as_ref()),
             Some(&resolved),
         )
         .await?;
+    if runtime.is_none() && profile.runtime_id.is_some() {
+        selection.source = scala_core::RuntimeSelectionSource::ModelProfileOverride;
+    }
     let host = packs.host_capabilities().await;
     schema.materialize_runtime_configuration(&mut resolved)?;
     schema.validate(&resolved)?;

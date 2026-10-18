@@ -299,6 +299,10 @@ pub enum ModelProfilesCommand {
         #[arg(long)]
         confirm: bool,
     },
+    /// Pin an exact installed runtime for this Model Profile only
+    SetRuntime { profile: String, runtime: String },
+    /// Remove the profile pin and inherit artifact/format runtime selection
+    ClearRuntime { profile: String },
     /// Change the default inference role
     SetRole { profile: String, role: ProfileRole },
     /// Set one or more Model Profile overrides

@@ -20,7 +20,16 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     };
     frame.render_widget(Clear, area);
     frame.render_widget(
-        popup_block(" Model runtime override ", theme, glyphs, layout.compact),
+        popup_block(
+            if app.runtime_picker_profile_id.is_some() {
+                " Model Profile runtime "
+            } else {
+                " Model runtime override "
+            },
+            theme,
+            glyphs,
+            layout.compact,
+        ),
         area,
     );
 
@@ -49,6 +58,16 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
             ])
         },
     );
+    let heading = match app.runtime_picker_profile() {
+        Some(profile) => Line::from(vec![
+            Span::styled(format!("Profile {}  ", profile.id), theme.accent),
+            Span::styled(
+                model.map_or("Artifact unavailable", |m| m.display_name.as_str()),
+                theme.text,
+            ),
+        ]),
+        None => heading,
+    };
     frame.render_widget(Paragraph::new(heading), layout.runtime_search_input);
 
     let Some(snapshot) = &app.runtime_list else {
@@ -88,7 +107,12 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
                     .unwrap_or(&status.compatibility),
                 theme,
             );
-            let binding = if model.is_some_and(|m| {
+            let binding = if app
+                .runtime_picker_profile()
+                .is_some_and(|p| p.runtime_id.as_ref() == Some(&manifest.runtime_id))
+            {
+                "Profile pin"
+            } else if model.is_some_and(|m| {
                 snapshot.selections.model_overrides.get(&m.id) == Some(&manifest.runtime_id)
             }) {
                 "Override"
@@ -246,7 +270,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
     if app.selected_model_has_runtime_override() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                if layout.compact {
+                if app.runtime_picker_profile_id.is_some() {
+                    "[ Inherit ]"
+                } else if layout.compact {
                     "[ Clear ]"
                 } else {
                     "[ Clear Override ]"

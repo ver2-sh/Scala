@@ -140,6 +140,12 @@ pub enum RuntimeAction {
     ModelCandidates {
         model: Box<ModelArtifact>,
         settings: Option<Box<ResolvedSettings>>,
+        profile_id: Option<ModelProfileId>,
+    },
+    SetProfileRuntime {
+        profile_id: ModelProfileId,
+        runtime_id: Option<RuntimeId>,
+        model: Option<Box<ModelArtifact>>,
     },
     SelectFormat {
         format: ArtifactFormat,
@@ -214,7 +220,12 @@ pub enum RuntimeTaskResult {
     },
     ModelCandidates {
         model_id: ModelId,
+        profile_id: Option<ModelProfileId>,
         result: Result<Vec<RuntimeModelCandidate>, String>,
+    },
+    ProfileRuntimeSelected {
+        profile_id: ModelProfileId,
+        result: Result<(RuntimeListSnapshot, ModelProfilesState), String>,
     },
     Removed {
         runtime_id: RuntimeId,
@@ -434,6 +445,7 @@ pub struct App {
     pub runtime_picker_scroll: usize,
     pub runtime_picker_candidates: Vec<RuntimeModelCandidate>,
     pub runtime_picker_loading: bool,
+    pub runtime_picker_profile_id: Option<ModelProfileId>,
     pub runtime_picker_error: Option<String>,
     pub settings_state: Option<SettingsState>,
     /// Live OS login-startup registration state; `None` until the first read.
@@ -588,6 +600,7 @@ impl App {
             runtime_picker_scroll: 0,
             runtime_picker_candidates: Vec::new(),
             runtime_picker_loading: false,
+            runtime_picker_profile_id: None,
             runtime_picker_error: None,
             settings_state: None,
             startup: None,
@@ -2402,6 +2415,26 @@ impl App {
                     }
                 }
             }
+            RuntimeTaskResult::ProfileRuntimeSelected { profile_id, result } => {
+                self.runtime_mutation_busy = false;
+                match result {
+                    Ok((snapshot, profiles)) => {
+                        self.model_profiles = Some(profiles);
+                        self.apply_runtime_list(snapshot);
+                        self.overlay = None;
+                        self.hover = None;
+                        self.runtime_picker_profile_id = None;
+                        self.notice = Some(format!(
+                            "Updated runtime selection for Model Profile {profile_id}"
+                        ));
+                        self.runtime_context_changed();
+                    }
+                    Err(error) => {
+                        self.notice = Some(error.clone());
+                        self.push_log(LogLevel::Error, error);
+                    }
+                }
+            }
             RuntimeTaskResult::ModelSelectionCleared { model_id, result } => {
                 self.runtime_mutation_busy = false;
                 match result {
@@ -2417,8 +2450,15 @@ impl App {
                     }
                 }
             }
-            RuntimeTaskResult::ModelCandidates { model_id, result } => {
+            RuntimeTaskResult::ModelCandidates {
+                model_id,
+                profile_id,
+                result,
+            } => {
                 self.runtime_picker_loading = false;
+                if profile_id != self.runtime_picker_profile_id {
+                    return;
+                }
                 if self
                     .selected_model
                     .and_then(|index| self.snapshot.models.get(index))
@@ -2431,9 +2471,14 @@ impl App {
                         self.runtime_picker_candidates = candidates;
                         self.runtime_picker_error = None;
                         let indices = self.runtime_picker_indices();
-                        let selected_id = self.runtime_list.as_ref().and_then(|snapshot| {
-                            snapshot.selections.model_overrides.get(&model_id)
-                        });
+                        let selected_id = self
+                            .runtime_picker_profile()
+                            .and_then(|p| p.runtime_id.as_ref())
+                            .or_else(|| {
+                                self.runtime_list.as_ref().and_then(|snapshot| {
+                                    snapshot.selections.model_overrides.get(&model_id)
+                                })
+                            });
                         self.runtime_picker_selection = selected_id
                             .and_then(|runtime_id| {
                                 indices.iter().copied().find(|index| {
@@ -2591,7 +2636,17 @@ impl App {
             .map(|candidate| &candidate.compatibility)
     }
 
+    pub fn runtime_picker_profile(&self) -> Option<&ModelProfile> {
+        let id = self.runtime_picker_profile_id.as_ref()?;
+        self.model_profiles.as_ref()?.profiles.get(id)
+    }
+
     pub fn selected_model_has_runtime_override(&self) -> bool {
+        if self.runtime_picker_profile_id.is_some() {
+            return self
+                .runtime_picker_profile()
+                .is_some_and(|p| p.runtime_id.is_some());
+        }
         let Some(model) = self
             .selected_model
             .and_then(|index| self.snapshot.models.get(index))
@@ -4341,12 +4396,16 @@ impl App {
     }
 
     fn open_profile_runtime(&mut self, search: bool) -> Update {
+        if self.runtime_mutation_busy || self.runtime_picker_loading {
+            self.notice = Some("A runtime operation is already in progress".into());
+            return Update::Render;
+        }
         if self.selected_remote_profile().is_some() {
             return Update::None;
         }
-        let Some(model_id) = self
+        let Some((profile_id, model_id)) = self
             .selected_model_profile_value()
-            .map(|p| p.model_id.clone())
+            .map(|p| (p.id.clone(), p.model_id.clone()))
         else {
             return Update::None;
         };
@@ -4354,13 +4413,22 @@ impl App {
             self.notice = Some(
                 "Bound model artifact is missing; restore it before runtime installation".into(),
             );
+            if !search {
+                self.selected_model = None;
+                self.runtime_picker_profile_id = Some(profile_id);
+                self.runtime_picker_candidates.clear();
+                self.runtime_picker_selection = None;
+                self.runtime_picker_error = Some("The bound artifact is missing. Inherit can still clear this profile's runtime pin.".into());
+                self.overlay = Some(Overlay::ModelRuntime);
+            }
             return Update::Render;
         };
         self.selected_model = Some(index);
+        self.runtime_picker_profile_id = Some(profile_id);
         if search {
             self.open_runtime_search_for_selected_model()
         } else {
-            self.open_model_runtime_picker()
+            self.open_runtime_picker()
         }
     }
 
@@ -5041,6 +5109,11 @@ impl App {
     }
 
     fn open_model_runtime_picker(&mut self) -> Update {
+        self.runtime_picker_profile_id = None;
+        self.open_runtime_picker()
+    }
+
+    fn open_runtime_picker(&mut self) -> Update {
         if self.selected_model_is_remote() {
             return Update::None;
         }
@@ -5066,6 +5139,7 @@ impl App {
         self.pending_runtime_action = Some(RuntimeAction::ModelCandidates {
             model: Box::new(model),
             settings: None,
+            profile_id: self.runtime_picker_profile_id.clone(),
         });
         self.notice = Some("Checking installed runtime compatibility…".to_owned());
         Update::Render
@@ -5097,13 +5171,24 @@ impl App {
             self.notice = Some("Select an installed runtime".to_owned());
             return Update::Render;
         };
-        self.pending_runtime_action = Some(RuntimeAction::SelectModel {
-            model: Box::new(model),
-            runtime_id,
+        self.pending_runtime_action = Some(match self.runtime_picker_profile_id.clone() {
+            Some(profile_id) => RuntimeAction::SetProfileRuntime {
+                profile_id,
+                runtime_id: Some(runtime_id),
+                model: Some(Box::new(model)),
+            },
+            None => RuntimeAction::SelectModel {
+                model: Box::new(model),
+                runtime_id,
+            },
         });
         self.runtime_mutation_busy = true;
         self.runtime_operation = None;
-        self.notice = Some("Saving model-specific runtime selection…".to_owned());
+        self.notice = Some(if self.runtime_picker_profile_id.is_some() {
+            "Saving Model Profile runtime pin…".to_owned()
+        } else {
+            "Saving model-specific runtime selection…".to_owned()
+        });
         Update::Render
     }
 
@@ -5120,6 +5205,19 @@ impl App {
     }
 
     fn request_clear_model_runtime_selection(&mut self) -> Update {
+        if let Some(profile_id) = self.runtime_picker_profile_id.clone() {
+            if self.runtime_mutation_busy || !self.selected_model_has_runtime_override() {
+                return Update::None;
+            }
+            self.pending_runtime_action = Some(RuntimeAction::SetProfileRuntime {
+                profile_id,
+                runtime_id: None,
+                model: None,
+            });
+            self.runtime_mutation_busy = true;
+            self.notice = Some("Clearing this profile's runtime pin (Inherit)…".into());
+            return Update::Render;
+        }
         if self.selected_model_is_remote() {
             return Update::None;
         }
@@ -5339,6 +5437,7 @@ impl App {
     }
 
     fn open_runtime_search(&mut self) -> Update {
+        self.runtime_picker_profile_id = None;
         if self.command_active {
             self.close_command();
         }
@@ -6512,6 +6611,46 @@ mod tests {
                 SettingsScope::Runtime("ninfer".to_owned()),
                 SettingsScope::Runtime("q27".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn profile_runtime_picker_clears_only_its_profile_pin_even_if_artifact_missing() {
+        use super::RuntimeAction;
+        use scala_core::RuntimeId;
+        let mut app = test_app(Vec::new());
+        let id = ModelProfileId::new("native").unwrap();
+        let mut profile = ModelProfile::new(
+            id.clone(),
+            "Native",
+            ModelId("shared".into()),
+            EngineId::new("ninfer").unwrap(),
+        )
+        .unwrap();
+        profile.runtime_id = Some(RuntimeId::new("native-runtime").unwrap());
+        let mut state = ModelProfilesState::default();
+        state.profiles.insert(id.clone(), profile);
+        app.model_profiles = Some(state);
+        app.selected_model_profile = Some(0);
+        app.screen = Screen::ModelProfiles;
+        app.open_profile_runtime(false);
+        assert_eq!(app.runtime_picker_profile_id.as_ref(), Some(&id));
+        assert_eq!(app.overlay, Some(Overlay::ModelRuntime));
+        assert!(app.selected_model_has_runtime_override());
+        app.request_clear_model_runtime_selection();
+        assert!(
+            matches!(app.pending_runtime_action.take(), Some(RuntimeAction::SetProfileRuntime {
+            profile_id, runtime_id: None, model: None,
+        }) if profile_id == id)
+        );
+        // The UI action does not persist anything until the owning async writer succeeds.
+        assert_eq!(
+            app.model_profiles.as_ref().unwrap().profiles[&id]
+                .runtime_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "native-runtime"
         );
     }
 

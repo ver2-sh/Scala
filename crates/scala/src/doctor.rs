@@ -1178,9 +1178,9 @@ async fn inspect_model_profiles(
             }
         }
         match packs
-            .settings_schema_from_local_inspection(
+            .settings_schema_for_profile_from_local_inspection(
                 model,
-                profile.engine_id.as_str(),
+                profile,
                 Some(&resolved),
                 inspection,
             )

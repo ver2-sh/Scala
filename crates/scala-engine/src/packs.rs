@@ -1,3 +1,5 @@
+mod profile_runtime;
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -385,7 +387,7 @@ impl RuntimePackManager {
             .settings_schema_for_model_for_engine_with_settings(
                 model,
                 profile.engine_id.as_str(),
-                None,
+                profile.runtime_id.as_ref(),
                 Some(&resolved),
             )
             .await?;
@@ -694,7 +696,9 @@ impl RuntimePackManager {
             .settings_schema_for_model_for_engine_with_settings(
                 model,
                 target_engine_id,
-                None,
+                (target_engine_id == profile.engine_id.as_str())
+                    .then_some(profile.runtime_id.as_ref())
+                    .flatten(),
                 Some(&runtime_defaults),
             )
             .await?;
@@ -724,7 +728,9 @@ impl RuntimePackManager {
                 .settings_schema_for_model_for_engine_with_settings(
                     model,
                     target_engine_id,
-                    None,
+                    (target_engine_id == profile.engine_id.as_str())
+                        .then_some(profile.runtime_id.as_ref())
+                        .flatten(),
                     Some(&resolved),
                 )
                 .await?;
@@ -782,6 +788,8 @@ impl RuntimePackManager {
         let host = self.host.read().await.clone();
         let mut installed = self.assess_installed(runtimes, &selections, &host);
         self.assess_python_observations(&mut installed).await;
+        self.add_profile_bindings(&mut installed, &mut warnings)
+            .await;
         Ok(RuntimeListSnapshot {
             host,
             selections,
@@ -832,6 +840,8 @@ impl RuntimePackManager {
             &host,
         );
         self.assess_python_observations(&mut installed).await;
+        self.add_profile_bindings(&mut installed, &mut adapter_warnings)
+            .await;
         RuntimeLocalInspection {
             host,
             selections,
@@ -1303,7 +1313,12 @@ impl RuntimePackManager {
             .into_iter()
             .map(|entry| RuntimeSearchResult {
                 installed: installed.contains(&entry.available.runtime_id),
-                selected_for: selected_for(&list.selections, &entry.available.runtime_id),
+                selected_for: list
+                    .installed
+                    .iter()
+                    .find(|status| status.runtime.manifest.runtime_id == entry.available.runtime_id)
+                    .map(|status| status.selected_for.clone())
+                    .unwrap_or_else(|| selected_for(&list.selections, &entry.available.runtime_id)),
                 entry,
             })
             .collect();
@@ -1706,6 +1721,19 @@ impl RuntimePackManager {
         settings: Option<&scala_core::ResolvedSettings>,
         inspection: &RuntimeLocalInspection,
     ) -> Result<RuntimeSelection, RuntimePackError> {
+        self.resolve_from_local_inspection_with_runtime(
+            model, engine_id, None, settings, inspection,
+        )
+    }
+
+    fn resolve_from_local_inspection_with_runtime(
+        &self,
+        model: &ModelArtifact,
+        engine_id: Option<&str>,
+        runtime_id: Option<&RuntimeId>,
+        settings: Option<&scala_core::ResolvedSettings>,
+        inspection: &RuntimeLocalInspection,
+    ) -> Result<RuntimeSelection, RuntimePackError> {
         if let Some(error) = &inspection.store_error {
             return Err(RuntimePackError::Selection(format!(
                 "runtime store is unavailable: {error}"
@@ -1731,7 +1759,7 @@ impl RuntimePackManager {
                 .chain(inspection.adapter_warnings.iter().cloned())
                 .collect(),
         };
-        self.resolve_from_snapshot(model, None, settings, engine_id, &list)
+        self.resolve_from_snapshot(model, runtime_id, settings, engine_id, &list)
     }
 
     /// Resolves a runtime from a read-only inspection and applies the exact
@@ -3610,6 +3638,248 @@ mod tests {
                 "/owner/repository/releases/download/v1/fixture.zip"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn profile_runtime_pins_are_independent_validated_and_protected() {
+        use scala_core::RuntimeSelections;
+        use scala_core::{
+            EngineId, ModelProfile, ModelProfileId, RuntimeSelectionSource, SettingsState,
+        };
+        use sha2::Digest;
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = crate::test_support::paths(temporary.path());
+        paths.ensure_required().unwrap();
+        let mut registry = EngineRegistry::default();
+        registry
+            .register(Arc::new(BoundSchemaAdapter {
+                id: "fake_a",
+                ..Default::default()
+            }))
+            .unwrap();
+        let manager = super::RuntimePackManager::new(&paths, registry.clone(), Vec::new()).unwrap();
+        // Keep the fixture completely synthetic: no executable or GPU probe.
+        manager
+            .host_initialized
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut host = scala_core::HostCapabilities::current_without_accelerator_probe();
+        host.platform = std::env::consts::OS.into();
+        host.architecture = std::env::consts::ARCH.into();
+        *manager.host.write().await = host;
+        let mut runtime_ids = Vec::new();
+        for version in ["1.0.0", "2.0.0"] {
+            let mut runtime = installed_fixture(version, None);
+            let m = &mut runtime.manifest;
+            m.identity.engine_id = "fake_a".into();
+            m.probe.observed_engine_id = "fake_a".into();
+            m.identity.platform = std::env::consts::OS.into();
+            m.identity.architecture = std::env::consts::ARCH.into();
+            m.identity.accelerator = "cpu".into();
+            m.runtime_id = RuntimeId::from_identity(&m.identity);
+            m.supported_formats = vec![ArtifactFormat::Gguf];
+            m.source_url = Some("https://github.com/owner/repository/releases".into());
+            m.entrypoint_sha256 = format!(
+                "{:x}",
+                sha2::Sha256::digest(b"synthetic executable, never run")
+            );
+            let mut stage = manager.store.create_staging().await.unwrap();
+            std::fs::write(stage.join("server"), b"synthetic executable, never run").unwrap();
+            std::fs::write(stage.join("runtime.json"), serde_json::to_vec(m).unwrap()).unwrap();
+            manager.store.activate(&mut stage, m).await.unwrap();
+            runtime_ids.push(m.runtime_id.clone());
+        }
+        let model = ModelArtifact {
+            id: ModelId("one-shared-artifact".into()),
+            display_name: "Shared".into(),
+            path: paths.data_dir.join("shared.gguf"),
+            format: ArtifactFormat::Gguf,
+            size_bytes: 1,
+            created: 1,
+            hash: None,
+            architecture: None,
+            context_length: None,
+            provenance: None,
+            native_identity: None,
+            auxiliary_artifacts: Vec::new(),
+            norted_package: None,
+        };
+        let mut selections = RuntimeSelections::default();
+        selections
+            .model_overrides
+            .insert(model.id.clone(), runtime_ids[0].clone());
+        {
+            let transaction = manager.store.acquire_transaction().await.unwrap();
+            manager
+                .store
+                .write_selections(&selections, &transaction)
+                .await
+                .unwrap();
+        }
+        let mut profiles = Vec::new();
+        for name in ["native", "long"] {
+            profiles.push(
+                ModelProfile::new(
+                    ModelProfileId::new(name).unwrap(),
+                    name,
+                    model.id.clone(),
+                    EngineId::new("fake_a").unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        let initial = profiles.clone();
+        manager
+            .store
+            .model_profiles()
+            .update(move |s| {
+                for p in initial {
+                    s.profiles.insert(p.id.clone(), p);
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        for (p, id) in profiles.iter_mut().zip(&runtime_ids) {
+            let state = manager
+                .set_profile_runtime(
+                    p,
+                    Some(&model),
+                    Some(id.clone()),
+                    &SettingsState::default(),
+                    &paths.data_dir,
+                )
+                .await
+                .unwrap();
+            *p = state.profiles[&p.id].clone();
+        }
+        assert_eq!(
+            serde_json::to_value(manager.store.selections().await.unwrap()).unwrap(),
+            serde_json::to_value(&selections).unwrap()
+        );
+        let inspection = manager.inspect_local().await;
+        for (p, id) in profiles.iter().zip(&runtime_ids) {
+            let (selected, schema) = manager
+                .settings_schema_for_profile_from_local_inspection(&model, p, None, &inspection)
+                .await
+                .unwrap();
+            assert_eq!(selected.runtime.manifest.runtime_id, *id);
+            assert_eq!(schema.runtime_id.as_ref(), Some(id));
+            assert_eq!(
+                selected.source,
+                RuntimeSelectionSource::ModelProfileOverride
+            );
+            assert!(
+                inspection
+                    .installed
+                    .iter()
+                    .find(|s| &s.runtime.manifest.runtime_id == id)
+                    .unwrap()
+                    .selected_for
+                    .contains(&format!("Model Profile {}", p.id))
+            );
+        }
+        let p = &profiles[1];
+        let list = manager.list().await.unwrap();
+        let invocation = manager
+            .resolve_from_snapshot(
+                &model,
+                p.runtime_for_load(Some(&runtime_ids[0])),
+                None,
+                Some(p.engine_id.as_str()),
+                &list,
+            )
+            .unwrap();
+        assert_eq!(invocation.runtime.manifest.runtime_id, runtime_ids[0]);
+        assert_eq!(invocation.source, RuntimeSelectionSource::Invocation);
+        let mut missing = p.clone();
+        missing.runtime_id = Some(RuntimeId::new("missing-runtime").unwrap());
+        assert!(matches!(
+            manager
+                .settings_schema_for_profile_from_local_inspection(
+                    &model,
+                    &missing,
+                    None,
+                    &inspection
+                )
+                .await,
+            Err(super::RuntimePackError::NotInstalled(_))
+        ));
+        let mut other_engine = p.clone();
+        other_engine.engine_id = EngineId::new("other-engine").unwrap();
+        assert!(matches!(
+            manager
+                .settings_schema_for_profile_from_local_inspection(
+                    &model,
+                    &other_engine,
+                    None,
+                    &inspection
+                )
+                .await,
+            Err(super::RuntimePackError::Incompatible { .. })
+        ));
+        assert!(
+            manager
+                .set_profile_runtime(
+                    p,
+                    Some(&model),
+                    missing.runtime_id,
+                    &SettingsState::default(),
+                    &paths.data_dir
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            manager
+                .store
+                .model_profiles()
+                .read()
+                .await
+                .unwrap()
+                .profiles[&p.id]
+                .runtime_id,
+            p.runtime_id
+        );
+        // An otherwise unselected older runtime is retained by its profile pin.
+        {
+            let transaction = manager.store.acquire_transaction().await.unwrap();
+            manager
+                .store
+                .write_selections(&RuntimeSelections::default(), &transaction)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            manager.store.remove(&runtime_ids[0]).await,
+            Err(crate::RuntimeStoreError::RuntimeSelected { .. })
+        ));
+        let mut prune = scala_core::prune::PrunePlan::new(false, true);
+        crate::plan_runtime_prune(&paths, &registry, &mut prune)
+            .await
+            .unwrap();
+        assert!(
+            !prune
+                .entries
+                .iter()
+                .any(|entry| entry.category == "superseded runtime versions")
+        );
+        // Clear is recovery-safe with no model argument and does not alter another profile.
+        let state = manager
+            .set_profile_runtime(
+                &profiles[0],
+                None,
+                None,
+                &SettingsState::default(),
+                &paths.data_dir,
+            )
+            .await
+            .unwrap();
+        assert!(state.profiles[&profiles[0].id].runtime_id.is_none());
+        assert_eq!(
+            state.profiles[&profiles[1].id].runtime_id,
+            profiles[1].runtime_id
+        );
+        manager.store.remove(&runtime_ids[0]).await.unwrap();
     }
 
     #[tokio::test]
