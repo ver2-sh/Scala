@@ -135,6 +135,9 @@ pub struct ModelProfile {
     pub display_name: String,
     pub model_id: ModelId,
     pub engine_id: EngineId,
+    /// An exact, user-owned runtime pin. None inherits artifact/format selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<crate::RuntimeId>,
     #[serde(default)]
     pub role: ModelRole,
     #[serde(default)]
@@ -153,6 +156,7 @@ impl ModelProfile {
             display_name: display_name.into(),
             model_id,
             engine_id,
+            runtime_id: None,
             role: ModelRole::default(),
             overrides: SettingsPatch::default(),
         };
@@ -163,6 +167,10 @@ impl ModelProfile {
     pub fn validate(&self) -> Result<(), SettingsError> {
         ModelProfileId::new(self.id.as_str())?;
         validate_engine_id(self.engine_id.as_str())?;
+        if let Some(runtime_id) = &self.runtime_id {
+            crate::RuntimeId::new(runtime_id.as_str())
+                .map_err(|error| SettingsError::InvalidModelProfile(error.to_string()))?;
+        }
         if self.display_name.trim().is_empty() || self.display_name.chars().count() > 128 {
             return Err(SettingsError::InvalidDisplayName);
         }
@@ -177,12 +185,23 @@ impl ModelProfile {
         Ok(())
     }
 
+    /// Invocation overrides are temporary; otherwise use this profile's pin.
+    pub fn runtime_for_load<'a>(
+        &'a self,
+        invocation: Option<&'a crate::RuntimeId>,
+    ) -> Option<&'a crate::RuntimeId> {
+        invocation.or(self.runtime_id.as_ref())
+    }
+
     pub fn content_hash(&self) -> String {
         #[derive(Serialize)]
         struct StableContent<'a> {
             id: &'a ModelProfileId,
             model_id: &'a ModelId,
             engine_id: &'a EngineId,
+            // Omitting an inherited pin preserves historical profile hashes.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            runtime_id: Option<&'a crate::RuntimeId>,
             role: ModelRole,
             overrides: &'a SettingsPatch,
         }
@@ -191,6 +210,7 @@ impl ModelProfile {
             id: &self.id,
             model_id: &self.model_id,
             engine_id: &self.engine_id,
+            runtime_id: self.runtime_id.as_ref(),
             role: self.role,
             overrides: &self.overrides,
         })
@@ -362,6 +382,47 @@ fn read_state(path: &Path) -> Result<ModelProfilesState, StateStoreError> {
 mod tests {
     use super::*;
     use crate::{SettingId, SettingValue};
+
+    #[test]
+    fn profile_runtime_pin_roundtrips_and_inherit_preserves_old_hash() {
+        // Literal historical shape: the new optional field must not change its hash.
+        let json = r#"{"id":"main","display_name":"Main","model_id":"shared","engine_id":"ninfer","role":"primary","overrides":{}}"#;
+        let mut profile: ModelProfile = serde_json::from_str(json).unwrap();
+        let old_content = r#"{"id":"main","model_id":"shared","engine_id":"ninfer","role":"primary","overrides":{}}"#;
+        let inherited_hash = format!("{:x}", Sha256::digest(old_content.as_bytes()));
+        assert!(profile.runtime_id.is_none());
+        assert_eq!(profile.content_hash(), inherited_hash);
+        assert!(
+            serde_json::to_value(&profile)
+                .unwrap()
+                .get("runtime_id")
+                .is_none()
+        );
+        let pin = crate::RuntimeId::new("runtime-a").unwrap();
+        let invocation = crate::RuntimeId::new("runtime-b").unwrap();
+        profile.runtime_id = Some(pin.clone());
+        assert_eq!(profile.runtime_for_load(None), Some(&pin));
+        assert_eq!(
+            profile.runtime_for_load(Some(&invocation)),
+            Some(&invocation)
+        );
+        assert_ne!(profile.content_hash(), inherited_hash);
+        let restored: ModelProfile =
+            serde_json::from_value(serde_json::to_value(&profile).unwrap()).unwrap();
+        assert_eq!(restored, profile);
+        let mut state = ModelProfilesState::default();
+        state.profiles.insert(profile.id.clone(), profile.clone());
+        let duplicate = ModelProfileId::new("second").unwrap();
+        state
+            .duplicate(&profile.id, duplicate.clone(), "Second")
+            .unwrap();
+        assert_eq!(state.profiles[&duplicate].runtime_id, Some(pin));
+        profile.runtime_id = None;
+        assert_eq!(profile.content_hash(), inherited_hash);
+        assert!(profile.runtime_for_load(None).is_none());
+        profile.runtime_id = Some(crate::RuntimeId("../escape".into()));
+        assert!(profile.validate().is_err());
+    }
 
     #[test]
     fn two_profiles_can_bind_the_same_artifact_with_different_overrides() {

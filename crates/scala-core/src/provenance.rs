@@ -15,6 +15,8 @@ pub struct ModelProfileRuntimeIdentity {
     pub content_sha256: String,
     pub bound_model_id: ModelId,
     pub bound_engine_id: EngineId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_runtime_id: Option<crate::RuntimeId>,
     pub role: ModelRole,
 }
 

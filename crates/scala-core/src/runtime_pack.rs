@@ -955,6 +955,7 @@ impl Default for RuntimeSelections {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeSelectionSource {
     Invocation,
+    ModelProfileOverride,
     ModelOverride,
     FormatDefault,
     Fallback,

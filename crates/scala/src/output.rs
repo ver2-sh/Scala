@@ -951,6 +951,14 @@ pub fn model_profile(
         println!("  Format:         {}", model.format);
     }
     println!("  Engine:         {}", profile.engine_id);
+    println!(
+        "  Runtime pin:    {}",
+        profile
+            .runtime_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "Inherit (artifact/format selection)".into())
+    );
     println!("  Role:           {:?}", profile.role);
     println!("  Content SHA:    {}", profile.content_hash());
     if profile.overrides.is_empty() {

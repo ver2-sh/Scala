@@ -39,11 +39,26 @@ pub async fn plan_runtime_prune(
                 None
             }
         };
+        let profile_pins = match store.model_profiles().read().await {
+            Ok(profiles) => Some(
+                profiles
+                    .profiles
+                    .into_values()
+                    .filter_map(|p| p.runtime_id)
+                    .collect::<std::collections::BTreeSet<_>>(),
+            ),
+            Err(error) => {
+                plan.protected.push(format!(
+                    "runtime versions: Model Profile pins unavailable: {error}"
+                ));
+                None
+            }
+        };
         for issue in &snapshot.issues {
             plan.protected
                 .push(format!("unproven runtime: {}", issue.message));
         }
-        if let Some(selections) = selections {
+        if let (Some(selections), Some(profile_pins)) = (selections, profile_pins) {
             for runtime in &snapshot.runtimes {
                 let id = &runtime.manifest.runtime_id;
                 let selected = selections
@@ -51,7 +66,8 @@ pub async fn plan_runtime_prune(
                     .values()
                     .chain(selections.model_overrides.values())
                     .any(|value| value == id)
-                    || selections.update_preferences.contains_key(id);
+                    || selections.update_preferences.contains_key(id)
+                    || profile_pins.contains(id);
                 let superseded = snapshot.runtimes.iter().any(|newer| {
                     crate::packs::is_proven_superseding_installed_runtime(registry, newer, runtime)
                 });

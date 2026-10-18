@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+Add exact runtime pins to Model Profiles without duplicating model artifacts. Profile runtime
+selection now reaches load/JIT, settings inspection, capability discovery, and provenance; load
+overrides remain ephemeral. CLI `set-runtime`/`clear-runtime` and the profile-scoped TUI picker
+share validation and atomic persistence. Inherit preserves artifact/format defaults. Missing or
+incompatible pins fail explicitly. Runtime inventory, removal, and normal prune account for
+profile references. Existing unpinned profile records and hashes remain unchanged.
+
 ## 0.1.26 - Native v3 draft admission and Windows runtime launch
 
 Accept valid native DFlash/DFlash2 v3 component bindings using the target model's

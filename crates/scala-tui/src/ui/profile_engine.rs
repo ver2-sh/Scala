@@ -87,7 +87,11 @@ pub fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme, glyphs: &Glyphs, 
                     original.engine_id
                 )),
                 Line::from(format!("Remove incompatible overrides: {removed}")),
-                Line::from("Engine Settings and runtime selections remain independent."),
+                Line::from(if original.engine_id.as_str() != engine && original.runtime_id.is_some() {
+                    "Clear this profile's runtime pin; engine Settings and artifact defaults stay unchanged."
+                } else {
+                    "Engine Settings and artifact runtime selections remain independent."
+                }),
             ])
             .style(theme.muted),
             Rect::new(inner.x, inner.y + 1, inner.width, 4),

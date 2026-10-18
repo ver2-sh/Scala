@@ -1255,12 +1255,39 @@ async fn execute_settings_action(
             )) {
                 return SettingsTaskResult::Stored(Err(error.to_string()));
             }
+            if existing.runtime_id.is_some() {
+                let mut candidate = existing.clone();
+                candidate.model_id = model.id.clone();
+                let settings = match settings_store.read().await {
+                    Ok(state) => state,
+                    Err(error) => return SettingsTaskResult::Stored(Err(error.to_string())),
+                };
+                if let Err(error) = runtime_packs
+                    .validate_profile_settings(
+                        &settings,
+                        &candidate,
+                        &model,
+                        &candidate.overrides,
+                        &paths.data_dir,
+                    )
+                    .await
+                {
+                    return SettingsTaskResult::Stored(Err(error.to_string()));
+                }
+            }
+            let original_hash = existing.content_hash();
             let result = profiles_store
                 .update(move |state| {
                     let profile = state
                         .profiles
                         .get_mut(&profile_id)
                         .ok_or_else(|| SettingsError::ModelProfileNotFound(profile_id.clone()))?;
+                    if profile.content_hash() != original_hash {
+                        return Err(SettingsError::InvalidModelProfile(
+                            "Model Profile changed during model selection; refresh and retry"
+                                .into(),
+                        ));
+                    }
                     if !compatible
                         .iter()
                         .any(|engine| engine == profile.engine_id.as_str())
@@ -1385,6 +1412,9 @@ async fn execute_settings_action(
                             "Model Profile changed since review".into(),
                         ));
                     }
+                    if profile.engine_id != engine_id {
+                        profile.runtime_id = None;
+                    }
                     profile.engine_id = engine_id;
                     profile.overrides = overrides;
                     Ok(())
@@ -1453,7 +1483,7 @@ async fn execute_settings_action(
                     .model_settings_schema_for_engine(&model, profile.engine_id.as_str())
                     .map_err(|error| error.to_string())?;
                 let (runtime_id, mut schema, mut validation_error) = match runtime_packs
-                    .resolve_for_settings(&model, profile.engine_id.as_str(), None, None).await {
+                    .resolve_for_settings(&model, profile.engine_id.as_str(), profile.runtime_id.as_ref(), None).await {
                     Ok(selection) => {
                         let selected_id = selection.runtime.manifest.runtime_id.clone();
                         match runtime_packs.settings_schema_for_model_for_engine_with_settings(
@@ -1480,7 +1510,7 @@ async fn execute_settings_action(
                             }
                         }
                     }
-                    Err(error) => (None, model_schema, Some(format!("Runtime selection for Model Profile `{}` on engine `{}` failed: {error}", profile.id, profile.engine_id))),
+                    Err(error) => (profile.runtime_id.clone(), model_schema, Some(format!("Runtime selection for Model Profile `{}` on engine `{}` failed: {error}", profile.id, profile.engine_id))),
                 };
                 schema.retain_override_definitions(&resolved);
                 if let Err(error) = schema.materialize_effective(&mut resolved) {
@@ -1704,15 +1734,101 @@ async fn execute_runtime_action(
             };
             RuntimeTaskResult::Removed { runtime_id, result }
         }
-        RuntimeAction::ModelCandidates { model, settings } => {
+        RuntimeAction::ModelCandidates {
+            model,
+            settings,
+            profile_id,
+        } => {
             let model_id = model.id.clone();
+            let result = async {
+                let mut resolved = settings.map(|s| *s);
+                let mut engine_id = None;
+                if let Some(id) = &profile_id {
+                    let profiles = ModelProfilesStore::new(paths)
+                        .read()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let profile = profiles
+                        .profiles
+                        .get(id)
+                        .ok_or_else(|| format!("Model Profile {id} is missing"))?;
+                    if profile.model_id != model.id {
+                        return Err("Profile model changed; refresh the picker".into());
+                    }
+                    let state = SettingsStore::new(paths)
+                        .read()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let mut values = state
+                        .resolve(
+                            &profile.id,
+                            profile.engine_id.as_str(),
+                            &profile.overrides,
+                            &SettingsPatch::default(),
+                            &paths.data_dir,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    runtime_packs
+                        .normalize_settings(profile.engine_id.as_str(), &mut values)
+                        .map_err(|e| e.to_string())?;
+                    resolved = Some(values);
+                    engine_id = Some(profile.engine_id.clone());
+                }
+                let mut candidates = runtime_packs
+                    .compatible_installed_for_model_with_settings(&model, resolved.as_ref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if let Some(engine_id) = engine_id {
+                    let list = runtime_packs.list().await.map_err(|e| e.to_string())?;
+                    candidates.retain(|candidate| {
+                        list.installed.iter().any(|s| {
+                            s.runtime.manifest.runtime_id == candidate.runtime_id
+                                && s.runtime.manifest.identity.engine_id == engine_id.as_str()
+                        })
+                    });
+                }
+                Ok(candidates)
+            }
+            .await;
             RuntimeTaskResult::ModelCandidates {
                 model_id,
-                result: runtime_packs
-                    .compatible_installed_for_model_with_settings(&model, settings.as_deref())
-                    .await
-                    .map_err(|error| error.to_string()),
+                profile_id,
+                result,
             }
+        }
+        RuntimeAction::SetProfileRuntime {
+            profile_id,
+            runtime_id,
+            model,
+        } => {
+            let result = async {
+                let profiles = ModelProfilesStore::new(paths)
+                    .read()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let profile = profiles
+                    .profiles
+                    .get(&profile_id)
+                    .ok_or_else(|| format!("Model Profile {profile_id} is missing"))?;
+                let settings = SettingsStore::new(paths)
+                    .read()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let state = runtime_packs
+                    .set_profile_runtime(
+                        profile,
+                        model.as_deref(),
+                        runtime_id,
+                        &settings,
+                        &paths.data_dir,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let list = runtime_packs.list().await.map_err(|e| e.to_string())?;
+                Ok((list, state))
+            }
+            .await;
+            RuntimeTaskResult::ProfileRuntimeSelected { profile_id, result }
         }
         RuntimeAction::SelectFormat { format, runtime_id } => {
             let result = match runtime_packs.select_format(format, runtime_id).await {

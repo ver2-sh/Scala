@@ -37,8 +37,9 @@ NInfer Runtime Settings    ninfer.*
 Context length, temperature, sampling, reasoning, prompts, structured output, overflow policy, and
 other same-named human concepts are independent settings. Engine-neutral Rust constructors may
 share type/label shape, but no ID, persisted value, default, inheritance, or semantic ownership is
-shared. An unqualified runtime ID is invalid in Settings overrides, Model Profiles, and invocation
-patches.
+shared. An unqualified runtime-setting ID is invalid in Settings, Model Profile inference overrides,
+and invocation patches. A profile's optional executable `runtime_id` is a separate binding field,
+not an inference-setting key.
 
 One additional Server-scope row, `server.start_on_login` ("Start automatically on login"), is
 deliberately outside these persisted domains. It is a live view of the operating system's per-user
@@ -49,6 +50,49 @@ set/unset` has no authority over it, it has no Inherit layer, and toggling it ne
 restarts the running server. See the
 [README](../README.md#start-automatically-on-login) for platform mechanisms and the
 `scala startup status|enable|disable` CLI.
+
+## Model Profile runtime selection
+
+A Model Profile may save an optional `runtime_id` for an exact installed executable, independently
+of any other profile that uses the same physical artifact. It stays with the profile's engine;
+format/origin alone does not establish model or host compatibility. Both CLI and TUI use the
+normal adapter/runtime/configuration checks before saving a pin.
+
+Selection order (distinct from inference-setting precedence) is:
+
+```text
+explicit load --runtime > Model Profile runtime_id > artifact runtime selection
+  > format runtime default > existing compatible-fallback policy
+```
+
+A supplied load override lasts only for that invocation and is not written to the profile.
+A missing or incompatible explicit/profile target is an error, not permission to install,
+change versions, choose a different engine, or silently fall back. An unpinned profile retains
+its existing artifact/default selection behavior. Running backends and observations are not
+converted into pins; changes affect the next load.
+
+```sh
+scala runtimes list
+scala model-profiles set-runtime native <EXACT_INSTALLED_RUNTIME_ID>
+scala model-profiles clear-runtime native
+```
+
+In **Model Profiles**, open the runtime picker, select an installed compatible runtime, and
+choose **Use selected**. **Inherit** clears only this profile's pin; it leaves artifact and
+format defaults, sibling profiles, and inference settings unchanged. The model-library runtime
+picker remains artifact-scoped. Clearing also works when the old runtime or artifact is missing.
+Changing a profile's engine clears its old engine's pin as part of the reviewed engine change;
+changing only its artifact retains the pin and validates the new combination. Duplicating a
+profile retains its explicit pin.
+
+The optional field is stored in the existing schema-2 profile record and is absent for Inherit.
+Older profile files load without a migration, and inherited profiles retain their previous content
+hash. Exact pins enter the profile hash and launch provenance (`model_profile_override` selection
+source and `bound_runtime_id`), so profiles/configurations remain independently attributable.
+Runtime inventory reports the referencing profiles; normal removal and prune protect their pins.
+An explicit `prune --all` retains its existing reset contract and can leave a pin requiring repair.
+No model bytes, runtime manifests, upstream defaults, Norted lineage, or existing aliases are
+rewritten. Scala Link leaves these bindings with the owning server.
 
 ## Values, sources and editing
 

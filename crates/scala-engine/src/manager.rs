@@ -1058,9 +1058,9 @@ impl RuntimeManager {
         adapter.normalize_settings(&mut settings).ok()?;
         let (selection, schema) = self
             .packs
-            .settings_schema_from_local_inspection(
+            .settings_schema_for_profile_from_local_inspection(
                 &model,
-                profile.engine_id.as_str(),
+                profile,
                 Some(&settings),
                 inspection,
             )
@@ -1190,8 +1190,8 @@ impl RuntimeManager {
                 match backend.lifecycle {
                     BackendLifecycle::Running => {
                         let reusable = settings.is_empty()
-                            && runtime_id
-                                .as_ref()
+                            && model_profile
+                                .runtime_for_load(runtime_id.as_ref())
                                 .is_none_or(|runtime| backend.runtime_id.as_ref() == Some(runtime))
                             && backend.provenance.as_ref().is_some_and(|provenance| {
                                 provenance.model_profile.content_sha256 == expected_profile_hash
@@ -1429,7 +1429,7 @@ impl RuntimeManager {
         let selection_result = {
             let selection = self.select_runtime(
                 &model,
-                &engine_id,
+                &model_profile,
                 runtime_id.as_ref(),
                 Some(&resolved_settings),
             );
@@ -1749,6 +1749,7 @@ impl RuntimeManager {
                     content_sha256: model_profile.content_hash(),
                     bound_model_id: model_profile.model_id.clone(),
                     bound_engine_id: model_profile.engine_id.clone(),
+                    bound_runtime_id: model_profile.runtime_id.clone(),
                     role: model_profile.role,
                 },
                 settings: SettingsProvenance {
@@ -2605,13 +2606,18 @@ impl RuntimeManager {
     async fn select_runtime(
         &self,
         model: &scala_core::ModelArtifact,
-        engine_id: &str,
+        profile: &ModelProfile,
         explicit_runtime: Option<&RuntimeId>,
         settings: Option<&scala_core::ResolvedSettings>,
     ) -> Result<(Arc<dyn EngineAdapter>, RuntimeSelection), RuntimeError> {
-        let selection = self
+        let mut selection = self
             .packs
-            .resolve_for_load_with_settings(model, engine_id, explicit_runtime, settings)
+            .resolve_for_load_with_settings(
+                model,
+                profile.engine_id.as_str(),
+                profile.runtime_for_load(explicit_runtime),
+                settings,
+            )
             .await
             .map_err(|error| match error {
                 RuntimePackError::Incompatible { reason, .. } => RuntimeError::Incompatible {
@@ -2620,6 +2626,9 @@ impl RuntimeManager {
                 },
                 error => RuntimeError::EngineUnavailable(error.to_string()),
             })?;
+        if explicit_runtime.is_none() && profile.runtime_id.is_some() {
+            selection.source = scala_core::RuntimeSelectionSource::ModelProfileOverride;
+        }
         let selected_engine_id = &selection.runtime.manifest.identity.engine_id;
         let adapter = self.registry.get(selected_engine_id).ok_or_else(|| {
             RuntimeError::EngineUnavailable(format!(
@@ -4321,6 +4330,7 @@ mod tests {
                 content_sha256: profile.content_hash(),
                 bound_model_id: profile.model_id.clone(),
                 bound_engine_id: profile.engine_id.clone(),
+                bound_runtime_id: profile.runtime_id.clone(),
                 role: profile.role,
             },
             settings: SettingsProvenance::default(),

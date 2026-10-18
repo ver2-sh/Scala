@@ -110,6 +110,7 @@ impl RuntimeStoreIssue {
 pub struct RuntimeStore {
     root: PathBuf,
     selections_file: PathBuf,
+    model_profiles: scala_core::ModelProfilesStore,
 }
 
 #[derive(Debug)]
@@ -196,7 +197,12 @@ impl RuntimeStore {
         Self {
             root: paths.runtimes_dir.clone(),
             selections_file: paths.runtime_selections_file.clone(),
+            model_profiles: scala_core::ModelProfilesStore::new(paths),
         }
+    }
+
+    pub(crate) fn model_profiles(&self) -> &scala_core::ModelProfilesStore {
+        &self.model_profiles
     }
 
     pub fn root(&self) -> &Path {
@@ -474,6 +480,21 @@ impl RuntimeStore {
     pub async fn remove(&self, runtime_id: &RuntimeId) -> Result<(), RuntimeStoreError> {
         let _transaction = self.acquire_transaction().await?;
         let _lease = self.acquire_lease(runtime_id, true).await?;
+        // Pin writes hold a shared runtime lease through their atomic update.
+        let profiles =
+            self.model_profiles.read().await.map_err(|e| {
+                RuntimeStoreError::InvalidSelections(format!("Model Profiles: {e}"))
+            })?;
+        if let Some(profile) = profiles
+            .profiles
+            .values()
+            .find(|p| p.runtime_id.as_ref() == Some(runtime_id))
+        {
+            return Err(RuntimeStoreError::RuntimeSelected {
+                runtime_id: runtime_id.clone(),
+                selection: format!("Model Profile {}", profile.id),
+            });
+        }
         let selections = self.selections().await?;
         if let Some(selection) = selection_for_runtime(&selections, runtime_id) {
             return Err(RuntimeStoreError::RuntimeSelected {
