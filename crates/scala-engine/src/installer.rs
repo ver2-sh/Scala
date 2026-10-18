@@ -281,19 +281,8 @@ impl RuntimeInstaller {
             }
             let entrypoint = locate_entrypoint(&staging, &download.entrypoint_names)
                 .map_err(RuntimeInstallError::Entrypoint)?;
-            let relative_entrypoint = entrypoint
-                .strip_prefix(&staging)
-                .map_err(|_| {
-                    RuntimeInstallError::Entrypoint(
-                        "entrypoint escaped the staging directory".to_owned(),
-                    )
-                })?
-                .to_path_buf();
-            if !is_safe_relative_path(&relative_entrypoint) {
-                return Err(RuntimeInstallError::Entrypoint(
-                    "entrypoint is not a contained relative path".to_owned(),
-                ));
-            }
+            let relative_entrypoint = manifest_entrypoint_path(&staging, &entrypoint)
+                .map_err(RuntimeInstallError::Entrypoint)?;
             let entrypoint_sha256 = hash_file(&entrypoint)
                 .await
                 .map_err(|error| RuntimeInstallError::Entrypoint(error.to_string()))?;
@@ -3002,6 +2991,31 @@ fn locate_entrypoint(staging: &Path, expected: &[String]) -> Result<PathBuf, Str
     }
 }
 
+/// Convert the validated, extracted filesystem path into the portable
+/// forward-slash entrypoint stored in a runtime manifest. Windows walkdir
+/// yields backslash-separated paths, but the manifest validator deliberately
+/// rejects backslashes to keep stored paths unambiguous across platforms.
+fn manifest_entrypoint_path(staging: &Path, entrypoint: &Path) -> Result<PathBuf, String> {
+    let relative = entrypoint
+        .strip_prefix(staging)
+        .map_err(|_| "entrypoint escaped the staging directory".to_owned())?;
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err("entrypoint is not a contained relative path".to_owned());
+        };
+        let name = part
+            .to_str()
+            .filter(|part| !part.is_empty() && !part.contains(['\\', '/', ':']))
+            .ok_or_else(|| "entrypoint is not a contained relative path".to_owned())?;
+        parts.push(name);
+    }
+    let portable = PathBuf::from(parts.join("/"));
+    if !is_safe_relative_path(&portable) {
+        return Err("entrypoint is not a contained relative path".to_owned());
+    }
+    Ok(portable)
+}
 async fn write_manifest(
     path: &Path,
     manifest: &RuntimeManifest,
@@ -3647,6 +3661,28 @@ mod tests {
         ] {
             assert!(staging.join(relative).is_file(), "{relative}");
         }
+
+        // Extracted Windows paths use '\' separators. The manifest must store
+        // a portable, validated '/' path to that exact same executable.
+        let found = super::locate_entrypoint(&staging, &["ninfer-serve.exe".to_owned()])
+            .expect("one nested server executable");
+        let portable = super::manifest_entrypoint_path(&staging, &found)
+            .expect("nested Windows path is valid for the runtime manifest");
+        assert_eq!(portable.to_str(), Some("package/ninfer-serve.exe"));
+        assert_eq!(std::fs::read(staging.join(&portable)).unwrap(), b"exe");
+        assert!(scala_core::is_safe_relative_path(&portable));
+        assert!(
+            super::manifest_entrypoint_path(&staging, &workspace.path().join("outside.exe"))
+                .is_err()
+        );
+        assert!(
+            super::manifest_entrypoint_path(&staging, &staging.join("package/../ninfer-serve.exe"))
+                .is_err()
+        );
+        assert!(
+            super::manifest_entrypoint_path(&staging, &staging.join("package/evil:stream.exe"))
+                .is_err()
+        );
 
         let bad_path = workspace.path().join("bad.zip");
         {

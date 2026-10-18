@@ -26,8 +26,8 @@ use crate::store::{
     RuntimeLease, RuntimeStore, RuntimeStoreError, RuntimeStoreIssue, RuntimeStoreSnapshot,
 };
 use crate::{
-    CompatibilityDecision, EngineError, EngineFeature, EngineRegistry, InstallationState,
-    ModelServingCapabilities,
+    CompatibilityDecision, EngineAdapter, EngineError, EngineFeature, EngineRegistry,
+    InstallationState, ModelServingCapabilities,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -1101,7 +1101,7 @@ impl RuntimePackManager {
                         CompatibilityDecision::Supported => {
                             match adapter.runtime_compatibility(&runtime) {
                                 CompatibilityDecision::Supported => {
-                                    compatibility_for_installed(&runtime, host)
+                                    compatibility_for_installed(&runtime, host, adapter.as_ref())
                                 }
                                 CompatibilityDecision::Unsupported { reason } => {
                                     RuntimeCompatibility::Incompatible(reason)
@@ -2476,7 +2476,7 @@ impl RuntimePackManager {
                 reason: "engine adapter does not support this artifact format".to_owned(),
             });
         }
-        let compatibility = compatibility_for_installed(runtime, host);
+        let compatibility = compatibility_for_installed(runtime, host, adapter.as_ref());
         if let RuntimeCompatibility::Incompatible(reason) = compatibility {
             return Err(RuntimePackError::Incompatible {
                 runtime_id: runtime.manifest.runtime_id.clone(),
@@ -2522,7 +2522,7 @@ impl RuntimePackManager {
             return Ok(RuntimeCompatibility::Incompatible(reason));
         }
         Ok(combine_compatibility(
-            compatibility_for_installed(runtime, host),
+            compatibility_for_installed(runtime, host, adapter.as_ref()),
             adapter.runtime_model_compatibility(runtime, model, host, None),
         ))
     }
@@ -2734,12 +2734,14 @@ fn source_build_provenance_matches_plan(
 fn compatibility_for_installed(
     runtime: &InstalledRuntime,
     host: &HostCapabilities,
+    adapter: &dyn EngineAdapter,
 ) -> RuntimeCompatibility {
+    let current = adapter.effective_installed_runtime_requirements(runtime);
     compatibility_for(
         &runtime.manifest.identity.platform,
         &runtime.manifest.identity.architecture,
         &runtime.manifest.identity.accelerator,
-        &runtime.manifest.requirements,
+        current.as_ref().unwrap_or(&runtime.manifest.requirements),
         host,
     )
 }

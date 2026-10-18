@@ -18,6 +18,9 @@ use crate::{
 #[cfg(windows)]
 #[path = "windows_job.rs"]
 mod windows_job;
+#[cfg(windows)]
+#[path = "windows_launch.rs"]
+mod windows_launch;
 
 type InstallProgress = Arc<dyn Fn(&str) + Send + Sync>;
 struct InstallCapture {
@@ -335,6 +338,8 @@ struct ChildActor {
     stderr_task: tokio::task::JoinHandle<()>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     temporary_files: Vec<std::path::PathBuf>,
+    #[cfg(windows)]
+    launch_alias: Option<windows_launch::RuntimeLaunchAlias>,
     termination_timeout: Duration,
     supervise_process_tree: bool,
     #[cfg(windows)]
@@ -374,7 +379,22 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             .write()
             .await
             .retain(|_, process| process.exit.borrow().is_none());
-        let mut command = Command::new(&spec.executable);
+        // Some Windows GPU DLLs cannot initialize with a >MAX_PATH image
+        // name, even when CreateProcess accepts the extended path. A scoped
+        // directory alias refers to the SAME verified executable and DLLs.
+        #[cfg(windows)]
+        let launch_alias =
+            windows_launch::RuntimeLaunchAlias::prepare(&spec.executable).map_err(|e| {
+                EngineError::Operation(format!("cannot prepare Windows runtime path: {e}"))
+            })?;
+        #[cfg(windows)]
+        let executable = launch_alias
+            .as_ref()
+            .map(|a| a.executable())
+            .unwrap_or(&spec.executable);
+        #[cfg(not(windows))]
+        let executable = &spec.executable;
+        let mut command = Command::new(executable);
         if !spec.inherits_parent_environment {
             command.env_clear();
         }
@@ -389,6 +409,11 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         if let Some(directory) = &spec.working_directory {
+            #[cfg(windows)]
+            let directory = launch_alias
+                .as_ref()
+                .and_then(|a| a.working_directory(directory))
+                .unwrap_or(directory);
             command.current_dir(directory);
         }
         #[cfg(unix)]
@@ -491,6 +516,8 @@ impl ProcessSupervisor for TokioProcessSupervisor {
             stderr_task,
             stderr_tail: tail,
             temporary_files: spec.temporary_files,
+            #[cfg(windows)]
+            launch_alias,
             termination_timeout: self.termination_timeout,
             supervise_process_tree: spec.supervise_process_tree,
             #[cfg(windows)]
@@ -681,6 +708,8 @@ async fn run_child_actor(actor: ChildActor) {
         mut stderr_task,
         stderr_tail,
         temporary_files,
+        #[cfg(windows)]
+            launch_alias: _launch_alias,
         termination_timeout,
         supervise_process_tree,
         #[cfg(windows)]

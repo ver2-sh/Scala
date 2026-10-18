@@ -1860,6 +1860,13 @@ impl EngineAdapter for NinferAdapter {
         CompatibilityDecision::Supported
     }
 
+    fn effective_installed_runtime_requirements(
+        &self,
+        runtime: &InstalledRuntime,
+    ) -> Option<scala_core::RuntimeRequirements> {
+        windows_catalog::effective_installed_host_requirements(&runtime.manifest)
+    }
+
     fn runtime_compatibility(&self, runtime: &InstalledRuntime) -> CompatibilityDecision {
         if runtime.manifest.identity.engine_id != ENGINE_ID {
             return CompatibilityDecision::Unsupported {
@@ -1959,10 +1966,13 @@ impl EngineAdapter for NinferAdapter {
                 .as_ref()
                 .expect("compatibility checked identity"),
         );
+        let requirements = self
+            .effective_installed_runtime_requirements(runtime)
+            .unwrap_or_else(|| runtime.manifest.requirements.clone());
         let device = ninfer_device_evaluation(
             &runtime.manifest.identity.platform,
             &runtime.manifest.identity.architecture,
-            &runtime.manifest.requirements,
+            &requirements,
             host,
             runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
         )
@@ -2077,10 +2087,13 @@ impl EngineAdapter for NinferAdapter {
         _settings: Option<&scala_core::ResolvedSettings>,
     ) -> Option<AcceleratorBinding> {
         matches!(self.compatibility(model), CompatibilityDecision::Supported).then(|| {
+            let requirements = self
+                .effective_installed_runtime_requirements(runtime)
+                .unwrap_or_else(|| runtime.manifest.requirements.clone());
             ninfer_device_evaluation(
                 &runtime.manifest.identity.platform,
                 &runtime.manifest.identity.architecture,
-                &runtime.manifest.requirements,
+                &requirements,
                 host,
                 runtime.manifest.acquisition_method == RuntimeAcquisitionMethod::ExternalBinary,
             )

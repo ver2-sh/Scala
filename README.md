@@ -459,7 +459,28 @@ sets. The full commit/tree remains provenance. A later source snapshot retains a
 contract-owning blobs are unchanged; an unreviewed semantic domain becomes NeedsAttention without
 erasing unrelated launch controls.
 
-A separate provider covers the portable native Windows NInfer package published by `natpate/ninfer-windows`. That port is not canonical `Neroued/ninfer`, and Scala retains its real repository and release provenance in the runtime identity rather than relabeling it. The provider exposes only the exact reviewed `v0.7.1` package, whose release ID, tag's resolved commit/tree, and single asset's ID/name/size/SHA-256 are all pinned; upstream `v0.8.0` and later moved to NInfer v3 artifacts that Scala does not load, earlier portable releases predate the reviewed contract, and no other `v0.7.x` tag is treated as reviewed from semantic-version resemblance alone, so none is ever presented as an installable candidate. Capability credit is evidence-bound rather than version-bound: at the reviewed tag, 74 of the 97 capability-owning source blobs are byte-identical to the canonical reviewed set and the 23 differing fork blobs are recorded as reviewed in place, so the package receives the same capability domains only while the exact pinned asset identity and verified archive digest match; a replaced asset under the same tag loses that credit. Candidates carry the GitHub release asset ID, name, size, and SHA-256 digest; installation re-validates the live release metadata, verifies the exact archive bytes, extracts the package transactionally while retaining the required DLL layout beside `ninfer-serve.exe`, and runs the same adapter `--help` probe before activation. The package is native Windows x86_64 + CUDA + RTX 5090/sm_120a and does not use or require WSL. Its runtime update line is `managed-windows-x86_64-cuda-sm120a`, fully separate from the Linux source line, so neither side can update toward the other and a Windows install is never moved to a v3 release.
+A separate provider covers the native portable Windows packages published by
+natpate/ninfer-windows, independently from canonical Neroued/ninfer Linux
+source and the iamwavecut/ninfer-all managed source build. Scala admits two
+individually reviewed release packages: v0.7.1 for v2 .ninfer containers, and
+v0.9.1 for v3. Each package has its own pinned GitHub release, source
+commit/tree, exact asset identity, size and SHA-256; unrelated versions and
+replaced assets receive no credit just because their tag looks similar. The
+v0.7.1 capability review matches 74 of 97 source owners byte for byte and
+reviews the other 23 fork-owned blobs in place. Both packages retain their
+actual repository provenance and are installed side by side, without WSL or a
+separate CUDA Toolkit installation.
+
+Runtime installation verifies the release identity and archive digest, extracts
+the package transactionally, preserves adjacent DLLs, and probes the executable
+before activation. Nested Windows paths become portable manifest-relative paths
+without relaxing traversal or symlink rejection. Both package generations
+target Windows x86_64 and RTX 5090 / sm_120a. The CUDA 13.1 prerequisite is
+checked against NVIDIA's R590 driver branch using the observed host driver:
+missing evidence shows Needs Attention, an older driver is incompatible, and
+a passing check satisfies the prerequisite but does not claim the executable
+has been validated under inference. Neither package is automatically substituted
+for an existing user-selected runtime or model.
 
 The current official NInfer build contract is Linux x86_64, NVIDIA GeForce RTX 5090, numeric compute capability 12.0 with `sm_120a`, CUDA Toolkit 13.1 or newer, CMake 3.28 or newer, Ninja, a C++20 compiler, pkg-config, FFmpeg development modules, and libcurl. Product name and compute capability are independent observed checks; missing facts are needs-attention and contradictory facts are incompatible. Scala never installs host packages automatically.
 

@@ -15,8 +15,8 @@ use scala_core::{
     ArtifactFormat, ArtifactNativeIdentity, AuxiliaryArtifactRole, AvailableRuntime,
     EngineInstallation, EngineRevision, HostCapabilities, InstalledRuntime, ModelArtifact, ModelId,
     ModelRuntimeIdentity, ResolvedSettings, RuntimeCompatibility, RuntimeId, RuntimeIdentity,
-    RuntimeProbeObservation, SettingDefaultPreview, SettingDefaultSource, SettingDefinition,
-    SettingId, SettingScope, SettingsError, SettingsPatch, SettingsSchema,
+    RuntimeProbeObservation, RuntimeRequirements, SettingDefaultPreview, SettingDefaultSource,
+    SettingDefinition, SettingId, SettingScope, SettingsError, SettingsPatch, SettingsSchema,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1740,6 +1740,16 @@ pub trait EngineAdapter: Send + Sync {
     }
     fn runtime_compatibility(&self, _runtime: &InstalledRuntime) -> CompatibilityDecision {
         CompatibilityDecision::Supported
+    }
+    /// A provider may have independently qualified stricter or clearer host
+    /// prerequisites for an exact installed runtime since its immutable
+    /// manifest was written. This is only a read-time compatibility view; it
+    /// cannot rewrite provenance or grant model/runtime capabilities.
+    fn effective_installed_runtime_requirements(
+        &self,
+        _runtime: &InstalledRuntime,
+    ) -> Option<RuntimeRequirements> {
+        None
     }
     /// Separates an intentional functional variant from an explicitly ordered
     /// source-recipe generation without changing immutable runtime identity.

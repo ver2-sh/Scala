@@ -48,7 +48,7 @@ async fn main() -> ExitCode {
         }
     };
     let json_errors = cli.json;
-    match run(cli).await {
+    match Box::pin(run(cli)).await {
         Ok(code) => code,
         Err(error) => {
             if json_errors {
@@ -395,7 +395,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Command::ModelProfiles(args) => {
-            handle_model_profiles(Arc::clone(&core), args.command, cli.json).await?;
+            Box::pin(handle_model_profiles(
+                Arc::clone(&core),
+                args.command,
+                cli.json,
+            ))
+            .await?;
         }
         Command::Settings(args) => {
             handle_settings(Arc::clone(&core), args.command, cli.json).await?;
