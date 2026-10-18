@@ -137,10 +137,14 @@ See [CUDA driver compatibility](https://docs.nvidia.com/cuda/archive/13.3.0/cuda
 and the [preserved native Windows evidence](decision-windows-evidence.md). The installer reserves at least 32 GiB free runtime storage
 for vLLM or 16 GiB for PyTorch. These are conservative acquisition reservations,
 not model VRAM or exact installed-size promises. Model-specific memory suitability
-and execution qualification remain separate. Linux vLLM checks an existing C++ compiler for native JIT. Native Windows vLLM additionally
-checks existing Visual Studio 2019+ x64 C++ tools for upstream JIT. Scala never
-installs a driver or global compiler or changes CUDA symlinks, PATH, registry or
-PowerShell execution policy.
+and execution qualification remain separate. Linux vLLM acquires a pinned private
+C++ compiler environment during Install and retains a verified child-only JIT
+binding. Native Windows vLLM reuses compatible Microsoft C++ tools/SDK or invokes
+the verified Microsoft installer; Windows approval/restart handling is explicit.
+This registered Microsoft installation is the machine-level exception, not a
+portable compiler cache. Scala never installs a driver or changes persistent
+system PATH or global CUDA selection. See [dependency ownership, reuse and
+cleanup](runtime-dependencies.md).
 
 Each package owns its interpreter, venv, copied dependencies, runner, source,
 launch/configuration files and any private Windows SDK. Absolute Python bindings

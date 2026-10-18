@@ -1374,7 +1374,7 @@ impl RuntimePackManager {
             }
         }
         if let Some(runtime) = self.store.get(runtime_id).await? {
-            ensure_catalog_provenance_matches(&runtime, &entry.available)?;
+            ensure_catalog_provenance_matches(&runtime, &entry.available, &self.registry)?;
             return Ok(runtime);
         }
         // This per-runtime cross-process lease is intentionally separate from
@@ -1383,7 +1383,7 @@ impl RuntimePackManager {
         // locks in the existing order without any reverse dependency.
         let installation_lease = Arc::new(self.store.acquire_installation_lease(runtime_id).await?);
         if let Some(runtime) = self.store.get(runtime_id).await? {
-            ensure_catalog_provenance_matches(&runtime, &entry.available)?;
+            ensure_catalog_provenance_matches(&runtime, &entry.available, &self.registry)?;
             return Ok(runtime);
         }
         let verified = self
@@ -2248,7 +2248,7 @@ impl RuntimePackManager {
                     )
                 });
             let provenance_conflict = published.as_ref().and_then(|published| {
-                ensure_catalog_provenance_matches(&status.runtime, published).err()
+                ensure_catalog_provenance_matches(&status.runtime, published, &self.registry).err()
             });
             let state = if let Some(error) = provenance_conflict {
                 RuntimeUpdateState::ProviderError(error.to_string())
@@ -2652,6 +2652,7 @@ fn external_runtime(
 fn ensure_catalog_provenance_matches(
     installed: &InstalledRuntime,
     available: &AvailableRuntime,
+    registry: &EngineRegistry,
 ) -> Result<(), RuntimePackError> {
     let manifest = &installed.manifest;
     let common_matches = manifest.runtime_id == available.runtime_id
@@ -2691,6 +2692,26 @@ fn ensure_catalog_provenance_matches(
                 && manifest.additional_downloaded_archive_sha256.is_empty()
                 && manifest.source_build.as_ref().is_some_and(|provenance| {
                     source_build_provenance_matches_plan(provenance, plan)
+                        || registry
+                            .get(&available.identity.engine_id)
+                            .is_some_and(|adapter| {
+                                adapter
+                                .managed_source_dependencies(plan)
+                                .is_some_and(|recipe| {
+                                    crate::installer::windows_source_provenance_matches(
+                                        installed, plan, &recipe,
+                                    )
+                                })
+                                || adapter
+                                    .managed_linux_source_dependencies(plan)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|recipe| {
+                                        crate::installer::linux_dependencies::provenance_matches(
+                                            installed, plan, &recipe,
+                                        )
+                                    })
+                            })
                 })
         }
     };

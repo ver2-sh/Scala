@@ -460,7 +460,7 @@ async fn response(status: &str, content_type: &str, body: String) -> reqwest::Re
     let task = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buffer = [0u8; 4096];
-        socket.read(&mut buffer).await.unwrap();
+        assert!(socket.read(&mut buffer).await.unwrap() > 0);
         socket.write_all(reply.as_bytes()).await.unwrap();
         socket.shutdown().await.unwrap();
     });

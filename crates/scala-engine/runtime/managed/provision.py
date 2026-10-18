@@ -33,6 +33,9 @@ def extract_source(archive, output):
         prefix = next(iter(roots)) + '/'
         seen = set()
         for member in source.infolist():
+            # ZipInfo normalizes backslashes on Windows; inspect the original archive spelling.
+            if chr(92) in member.orig_filename:
+                raise ValueError('Unsafe source snapshot member: ' + member.orig_filename)
             relative = member.filename.removeprefix(prefix)
             if not relative:
                 continue
@@ -137,6 +140,9 @@ def main():
         (site / 'scala-dlpack-wheel.pth').write_text(str(site / 'scala-dlpack-wheel') + '\n')
     prepare = [python, '-I', '-B', recipe / 'prepare.py', 'runtime', '--backend', plan['backend'], '--python', python,
                '--managed-root', root, '--output', root / 'runner']
+    toolchain = root / 'build-toolchain.json'
+    if engine == 'vllm' and toolchain.is_file():
+        prepare += ['--build-toolchain', toolchain]
     if engine == 'pytorch':
         archive = args.source_archive
         if not archive or sha(archive) != plan['source']['digest']['value']:

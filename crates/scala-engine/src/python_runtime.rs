@@ -159,7 +159,7 @@ pub fn python_candidates(
                     requires_nvidia_gpu: true, minimum_nvidia_driver: Some(if platform == "windows" { "610.62" } else { "580.65.06" }.into()),
                     supported_cuda_compute_capabilities: vec![ComputeCapability::new(8,0), ComputeCapability::new(8,6), ComputeCapability::new(8,9), ComputeCapability::new(12,0)],
                     advisories: vec!["Exact hashed wheel closure; isolated CPython and private uv; no model weights acquired or loaded. Model memory suitability is checked separately.".into(),
-                        if platform == "windows" && engine == "vllm" { "Native Windows pinned compatibility port; private CUDA 13.3 SDK; existing Visual Studio 2019+ x64 C++ tools required for native JIT.".into() } else { "CUDA 13 wheel libraries are owned by this runtime; the NVIDIA driver remains a host prerequisite.".into() }],
+                        if platform == "windows" && engine == "vllm" { "Native Windows pinned compatibility port and private CUDA 13.3 SDK; Install acquires or reuses Microsoft C++ tools/SDK for native JIT. Windows approval may be required.".into() } else { "CUDA 13 wheel libraries are owned by this runtime; the NVIDIA driver remains a host prerequisite.".into() }],
                     ..RuntimeRequirements::default()
                 },
             });

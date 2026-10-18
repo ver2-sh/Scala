@@ -1,0 +1,29 @@
+{
+    "schema_version":  1,
+    "msvc_version":  "14.44",
+    "sdk_version":  "10.0.26100.0",
+    "vs_product":  "Microsoft.VisualStudio.Product.BuildTools",
+    "vs_components":  [
+                          "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                          "Microsoft.VisualStudio.Component.Windows11SDK.26100"
+                      ],
+    "vs_channel_sha256":  "4f0f290bb4d58a061a49a2fa893357a8c9e7e2b49fc91873f533ab8f791e4fa0",
+    "assets":  [
+                   {
+                       "id":  "vs-manifest",
+                       "url":  "https://download.visualstudio.microsoft.com/download/pr/c95450be-0a45-4779-b142-33f567ccfd6e/a871a5ff41acebbe5037455fd6f51fcd4907b47d8f3c9860871ea0b222a2fd45/VisualStudio.vsman",
+                       "sha256":  "99dda859c4ae3c446eb25620d1a6237bb135d95d14d55cd1d30a15340bb39d80",
+                       "size":  17954770,
+                       "root":  "",
+                       "kind":  "file"
+                   },
+                   {
+                       "id":  "vs-setup",
+                       "url":  "https://download.visualstudio.microsoft.com/download/pr/c95450be-0a45-4779-b142-33f567ccfd6e/eaa2f9ae29d6871b5a4e985c3e96efd5d7a0d37c37d6a7234274cf556797a14c/vs_Setup.exe",
+                       "sha256":  "eaa2f9ae29d6871b5a4e985c3e96efd5d7a0d37c37d6a7234274cf556797a14c",
+                       "size":  4474840,
+                       "root":  "",
+                       "kind":  "file"
+                   }
+               ]
+}

@@ -133,11 +133,91 @@ def original_wheel_attestation(name, version, info):
     return source_records
 
 
+def verify_build_toolchain(binding, managed_root):
+    """Verify a private durable compiler; this function never changes the environment."""
+    import stat
+    if os.name == 'nt' or set(binding) != {'schema_version', 'reference', 'environment'} or binding['schema_version'] != 1:
+        raise ValueError('Invalid managed Linux compiler binding')
+    ref = binding['reference']
+    required = {'schema_version', 'recipe_sha256', 'environment_sha256', 'bootstrap_sha256',
+                'implementation_version', 'inventory_sha256', 'prefix'}
+    if set(ref) != required or ref['schema_version'] != 1 or ref['implementation_version'] != 'scala-linux-dependencies-v1':
+        raise ValueError('Unknown managed compiler reference')
+    for key in ('recipe_sha256', 'environment_sha256', 'bootstrap_sha256', 'inventory_sha256'):
+        value = ref[key]
+        if not isinstance(value, str) or len(value) != 64 or any(c not in '0123456789abcdef' for c in value):
+            raise ValueError('Invalid compiler reference digest')
+    expected = hashlib.sha256((ref['implementation_version']+'\n'+ref['bootstrap_sha256']+'\n'+ref['recipe_sha256']+'\n').encode()).hexdigest()
+    if expected != ref['environment_sha256']:
+        raise ValueError('Compiler environment identity mismatch')
+    owned = Path(managed_root).resolve(strict=True)
+    if len(owned.parents) < 5 or owned.parents[3].name != 'runtimes':
+        raise ValueError('Compiler binding needs the managed runtime store')
+    prefix = Path(ref['prefix'])
+    expected_prefix = owned.parents[4] / 'runtime-dependencies/linux' / expected / 'prefix'
+    if prefix != expected_prefix or prefix.resolve(strict=True) != prefix or not prefix.is_dir():
+        raise ValueError('Compiler prefix escapes its Scala-owned durable store')
+    if regular(prefix.parent / '.scala-owner').read_text() != ref['implementation_version']+':'+expected:
+        raise ValueError('Compiler environment ownership changed')
+    if read_json(regular(prefix.parent / 'ready.json')).get('reference') != ref:
+        raise ValueError('Compiler ready receipt changed')
+    lock_path = regular(prefix.parent / 'lock.json')
+    if sha(lock_path) != ref['recipe_sha256']:
+        raise ValueError('Compiler dependency lock changed')
+    lock = read_json(lock_path)
+    inventory_path = regular(prefix.parent / 'inventory.json')
+    if inventory_path.stat().st_size > 128 * 1024 * 1024 or sha(inventory_path) != ref['inventory_sha256']:
+        raise ValueError('Compiler inventory changed')
+    with inventory_path.open('rb') as stream:
+        entries = json.load(stream)
+    if not isinstance(entries, dict) or not entries or len(entries) > 500000:
+        raise ValueError('Invalid compiler file inventory')
+    actual = set()
+    for directory, children, members in os.walk(prefix, followlinks=False):
+        for name in children + members:
+            actual.add((Path(directory) / name).relative_to(prefix).as_posix())
+    if actual != set(entries):
+        raise ValueError('Compiler payload closure changed')
+    for relative, entry in entries.items():
+        member = Path(relative)
+        if member.is_absolute() or not member.parts or any(p in {'.', '..'} for p in member.parts):
+            raise ValueError('Unsafe compiler payload member')
+        full = prefix / member
+        st = full.lstat()
+        if stat.S_IMODE(st.st_mode) != entry['mode']:
+            raise ValueError('Compiler payload mode changed')
+        kind = entry['kind']
+        if kind == 'directory':
+            valid = stat.S_ISDIR(st.st_mode) and full.resolve(strict=True).is_relative_to(prefix)
+        elif kind == 'symlink':
+            target = os.readlink(full)
+            valid = stat.S_ISLNK(st.st_mode) and target == entry['target'] and not Path(target).is_absolute() and full.resolve(strict=True).is_relative_to(prefix)
+        elif kind == 'file':
+            valid = stat.S_ISREG(st.st_mode) and full.resolve(strict=True).is_relative_to(prefix) and st.st_size == entry['size'] and sha(full) == entry['sha256']
+        else:
+            valid = False
+        if not valid:
+            raise ValueError('Compiler payload changed: '+relative)
+    expected_environment = {
+        'CC': str(prefix / 'scala-bin/cc'), 'CXX': str(prefix / 'scala-bin/c++'),
+        'PATH': str(prefix / 'scala-bin')+':'+str(prefix / 'bin')+':/usr/bin:/bin',
+        'CMAKE_PREFIX_PATH': str(prefix),
+        'PKG_CONFIG_LIBDIR': str(prefix / 'lib/pkgconfig')+':'+str(prefix / 'share/pkgconfig'),
+    }
+    if lock.get('cuda_release') is not None:
+        expected_environment.update(CUDA_HOME=str(prefix / 'scala-cuda'), CUDA_PATH=str(prefix / 'scala-cuda'),
+                                    CUDACXX=str(prefix / 'bin/nvcc'), NVCC_CCBIN=str(prefix / 'bin/x86_64-conda-linux-gnu-g++'),
+                                    CUDAHOSTCXX=str(prefix / 'bin/x86_64-conda-linux-gnu-g++'))
+    if binding['environment'] != expected_environment:
+        raise ValueError('Unadmitted compiler environment override')
+    return ref['inventory_sha256']
+
+
 def runtime_identity(config_path, runner_path=None):
     cfg = read_json(config_path)
     common = {"schema_version", "backend", "packages", "options"}
     required_fields = common | (set() if cfg.get("backend") == "vllm-openai" else {"source"})
-    allowed = required_fields | {"wheel_attestations", "windows_vllm", "managed_root"}
+    allowed = required_fields | {"wheel_attestations", "windows_vllm", "managed_root", "build_toolchain"}
     if not required_fields <= set(cfg) or set(cfg) - allowed or cfg["schema_version"] != 1 or cfg["backend"] not in BACKENDS:
         raise ValueError("Invalid explicit runtime configuration")
     if cfg["backend"] == "vllm-openai":
@@ -283,6 +363,10 @@ def runtime_identity(config_path, runner_path=None):
         identity["windows_site_controls"] = {str(p): digest for p, digest in zip(controls, digests(controls))}
     if windows_port is not None:
         identity["windows_vllm"] = windows_port.verify(cfg, packages, sys.modules[__name__])
+    if "build_toolchain" in cfg:
+        if "managed_root" not in cfg or not cfg["backend"].startswith("vllm"):
+            raise ValueError("Unowned or unsupported compiler binding")
+        identity["build_toolchain"] = verify_build_toolchain(cfg["build_toolchain"], cfg["managed_root"])
     revision = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return cfg, revision
 
