@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.27 - Independent Model Profile runtime binding
+
+Add persistent per-profile runtime selection independent of model artifacts.
+Multiple profiles can now share one model file while selecting different
+installed runtimes.
+
+Preserve explicit load overrides, per-profile settings, runtime provenance,
+compatibility validation, runtime removal protection, and inheritance.
+Expose runtime selection through the CLI and TUI.
+
+Existing unpinned profiles retain their previous behavior. No models,
+runtimes, or user settings are automatically migrated.
+
+
 ## Unreleased
 
 Add exact runtime pins to Model Profiles without duplicating model artifacts. Profile runtime
