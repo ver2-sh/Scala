@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.26 - Native v3 draft admission and Windows runtime launch
+
+Accept valid native DFlash/DFlash2 v3 component bindings using the target model's
+hidden width and nested draft configuration, while preserving strict component,
+tensor, shape and resource validation. No model data or templates are rewritten.
+
+Launch long Windows runtime paths through a process-scoped directory junction to
+the same verified executable and adjacent DLLs. Preserve installed paths, package
+integrity, runtime identity, engine behavior and provenance. No runtime files are
+copied; the alias is removed after exit. Ordinary paths and non-Windows launches
+are unchanged. Heap-box CLI command dispatch and Model Profile operations to avoid
+Windows debug-stack exhaustion.
+
+Local validation includes native v3 artifact admission, Windows alias identity and
+cleanup regressions, plus successful 500,000-token NInfer-all startup and coding,
+function-calling and image requests through Scala on an RTX 5090. The tested host
+profile is user-owned; this release creates no inference presets, converts no
+models and makes no claim of benchmark-equivalent quality across a full context.
+
 ## 0.1.25 - NInfer-all managed installation and serving
 
 Runtime acquisition remains in Scala: use qualified upstream or alternative

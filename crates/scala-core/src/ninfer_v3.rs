@@ -1225,7 +1225,11 @@ fn binding_contract(
     } else {
         &component_value["config"]
     };
-    let h = dim(c, "hidden_size")?;
+    let h = if matches!(component, "dflash" | "dflash2") {
+        th
+    } else {
+        dim(c, "hidden_size")?
+    };
     let direct = |shape| Some((shape, Some("bf16"), Vec::new()));
     let matrix = |shape, input: String| Some((shape, None, vec![input]));
     if rest == "token_embedding" {
@@ -1244,7 +1248,7 @@ fn binding_contract(
         return Ok(matrix(vec![h, mul(2, h)?], "mtp/stem_input".into()));
     }
     if matches!(component, "dflash" | "dflash2") && rest == "feature_projection" {
-        let taps = c["target_layer_ids"]
+        let taps = c["dflash_config"]["target_layer_ids"]
             .as_array()
             .ok_or_else(|| error("missing draft taps"))?
             .len() as u64;
@@ -1254,7 +1258,7 @@ fn binding_contract(
         ));
     }
     if component == "dflash2" && rest.starts_with("candidate_selector/") {
-        let rank = dim(c, "selector_rank")?;
+        let rank = dim(&c["dflash_config"], "selector_rank")?;
         return Ok(match rest {
             "candidate_selector/hidden_projection" => {
                 matrix(vec![rank, h], "dflash2/final_hidden".into())
@@ -1429,14 +1433,18 @@ fn binding_contract(
     if component == "dflash2" {
         for name in ["attention_conv", "mlp_conv"] {
             if suffix == format!("{name}/base_kernel") {
-                return Ok(direct(vec![2, dim(c, "conv_kernel_size")?, h]));
+                return Ok(direct(vec![
+                    2,
+                    dim(&c["dflash_config"], "conv_kernel_size")?,
+                    h,
+                ]));
             }
             if suffix == format!("{name}/kernel_projection") {
                 return Ok(matrix(
                     vec![
                         mul(
-                            mul(2, dim(c, "conv_kernel_size")?)?,
-                            h / dim(c, "conv_group_size")?,
+                            mul(2, dim(&c["dflash_config"], "conv_kernel_size")?)?,
+                            h / dim(&c["dflash_config"], "conv_group_size")?,
                         )?,
                         h,
                     ],
@@ -1534,6 +1542,71 @@ fn validate_binding_contracts(
 mod tests {
     use super::*;
     use std::io::{Seek, Write};
+    #[test]
+    fn draft_bindings_inherit_target_width_and_nested_configuration() {
+        let mut components = json!({
+            "text":{"config":{"hidden_size":5120,"vocab_size":248320}},
+            "dflash2":{"target":"text","config":{
+                "num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,
+                "intermediate_size":17408,
+                "dflash_config":{"target_layer_ids":[5,19,33,47,61],
+                    "selector_rank":256,"conv_kernel_size":2,"conv_group_size":16}
+            }}
+        });
+        for (name, shape) in [
+            ("dflash2/final_norm", vec![5120]),
+            ("dflash2/feature_projection", vec![5120, 25600]),
+            (
+                "dflash2/candidate_selector/hidden_projection",
+                vec![256, 5120],
+            ),
+            (
+                "dflash2/candidate_selector/predecessor_codebook",
+                vec![248320, 256],
+            ),
+            ("dflash2/layers/0/attention/query", vec![4096, 5120]),
+            (
+                "dflash2/layers/0/attention_conv/base_kernel",
+                vec![2, 2, 5120],
+            ),
+            (
+                "dflash2/layers/0/mlp_conv/kernel_projection",
+                vec![1280, 5120],
+            ),
+        ] {
+            let contract = binding_contract(name, components.as_object().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(contract.0, shape, "{name}");
+        }
+        components["dflash2"]["config"]["selector_rank"] = json!(256);
+        components["dflash2"]["config"]["dflash_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("selector_rank");
+        assert!(
+            binding_contract(
+                "dflash2/candidate_selector/hidden_projection",
+                components.as_object().unwrap()
+            )
+            .is_err()
+        );
+        components["text"]["config"]["hidden_size"] = json!(0);
+        assert!(binding_contract("dflash2/final_norm", components.as_object().unwrap()).is_err());
+    }
+    #[test]
+    fn dflash_feature_binding_uses_target_hidden_width() {
+        let components = json!({
+            "text":{"config":{"hidden_size":2048,"vocab_size":248320}},
+            "dflash":{"target":"text","config":{"dflash_config":{"target_layer_ids":[1,6,11,16,22,27,32,37]}}}
+        });
+        let (shape, _, uses) =
+            binding_contract("dflash/feature_projection", components.as_object().unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(shape, vec![2048, 16384]);
+        assert_eq!(uses, vec!["dflash/target_features"]);
+    }
     fn fixture() -> Value {
         serde_json::from_str(include_str!("../testdata/ninfer-v3.json")).unwrap()
     }
