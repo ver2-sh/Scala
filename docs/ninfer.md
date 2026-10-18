@@ -479,10 +479,12 @@ including the Microsoft CRT and CUDA libraries, are copied beside the executable
 and hashed in its provenance before adapter verification and atomic activation.
 The installed executable does not depend on the build cache remaining present.
 
-This automatic provisioning recipe is for Windows x86_64/sm_120a. The existing
-Linux source recipe is unchanged and retains its own prerequisite policy; it
-does not inherit Windows tools or dependency paths. Managed Python provisioning
-and existing portable Windows runtime installations are unchanged.
+Windows x86_64/sm_120a retains its separate provisioning recipe. Linux source
+installation now acquires its own pinned private compiler/build-tool/CUDA and
+FFmpeg/curl environment; it never inherits Windows tools or dependency paths.
+Both canonical NInfer and NInfer-all keep their separate source contracts and
+selected dependency locks. Existing portable Windows runtime installations are
+unchanged. See [shared runtime dependency ownership and cleanup](runtime-dependencies.md).
 
 Local validation covers dependency recipe identity, safe extraction and reuse,
 repair of damaged cached extraction, automatic environment capture with spaces

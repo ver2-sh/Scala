@@ -1718,6 +1718,31 @@ impl NinferAdapter {
 
 #[async_trait]
 impl EngineAdapter for NinferAdapter {
+    fn managed_linux_source_dependencies(
+        &self,
+        plan: &scala_core::RuntimeSourceBuildPlan,
+    ) -> Result<Option<scala_engine::linux_dependencies::LinuxDependencyRecipe>, String> {
+        use scala_engine::linux_dependencies::LinuxDependencyRecipe;
+        if plan
+            .recipe
+            .entrypoint
+            .extension()
+            .is_some_and(|s| s == "exe")
+        {
+            return Ok(None);
+        }
+        let bytes: &'static [u8] = if plan.source.repository == all_catalog::REPOSITORY {
+            include_bytes!("../../scala-engine/runtime/native/linux/ninfer134.lock.json")
+        } else if plan.source.repository == GITHUB_REPOSITORY {
+            include_bytes!("../../scala-engine/runtime/native/linux/ninfer132.lock.json")
+        } else {
+            return Ok(None);
+        };
+        LinuxDependencyRecipe::new(bytes)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+
     fn managed_source_dependencies(
         &self,
         plan: &scala_core::RuntimeSourceBuildPlan,

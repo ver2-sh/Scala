@@ -29,6 +29,7 @@ mod decision;
 mod embeddings;
 mod installer;
 pub mod link;
+pub mod linux_dependencies;
 #[cfg(all(test, target_os = "linux"))]
 mod managed_python_tests;
 mod manager;
@@ -1705,6 +1706,27 @@ impl RuntimeVariantUpdateIdentity {
 
 #[async_trait]
 pub trait EngineAdapter: Send + Sync {
+    /// Adapter-selected Linux packages. Construction and catalog browsing perform no acquisition.
+    fn managed_linux_source_dependencies(
+        &self,
+        _plan: &scala_core::RuntimeSourceBuildPlan,
+    ) -> Result<Option<linux_dependencies::LinuxDependencyRecipe>, String> {
+        Ok(None)
+    }
+
+    /// A persistent compiler for managed Python JIT, not an inference setting.
+    fn managed_linux_python_dependencies(
+        &self,
+        _plan: &scala_core::RuntimePythonPlan,
+    ) -> Result<Option<linux_dependencies::LinuxDependencyRecipe>, String> {
+        Ok(None)
+    }
+
+    /// Microsoft compiler acquisition remains an explicit Install operation.
+    fn managed_python_msvc(&self, _plan: &scala_core::RuntimePythonPlan) -> bool {
+        false
+    }
+
     /// Pinned native build dependencies acquired only by an explicit install operation.
     fn managed_source_dependencies(
         &self,

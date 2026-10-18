@@ -65,6 +65,16 @@ if "windows_vllm" in cfg:
     for directory, _, _ in os.walk(sdk):
         paths.add(Path(directory))
         inventory_paths.add(Path(directory))
+if "build_toolchain" in cfg:
+    prefix = Path(cfg["build_toolchain"]["reference"]["prefix"])
+    for name in ("inventory.json", "ready.json", "lock.json", ".scala-owner"):
+        paths.add(prefix.parent / name)
+        inventory_paths.add(prefix.parent / name)
+    for directory, children, members in os.walk(prefix, followlinks=False):
+        paths.add(Path(directory))
+        inventory_paths.add(Path(directory))
+        for member in members + children:
+            paths.add(Path(directory) / member)
 for attestation in cfg.get("wheel_attestations", {}).values():
     paths.add(Path(attestation["path"]))
 for directory in sys.path:

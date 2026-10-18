@@ -201,7 +201,10 @@ pub(super) fn reviewed_source(identity: &RuntimeIdentity, source: &RuntimeSource
         && matches!(identity.platform.as_str(), "windows" | "linux")
         && identity.architecture == "x86_64"
         && identity.accelerator == "cuda"
-        && identity.variant == format!("{}-sm120a", recipe_for(&identity.platform))
+        && (identity.variant == format!("{}-sm120a", recipe_for(&identity.platform))
+            || (identity.platform == "windows"
+                && identity.variant
+                    == format!("{}-sm120a", super::source_dependencies::PRE_SHARED_RECIPE)))
         && source.repository == REPOSITORY
         && source.repository_url == format!("{URL}.git")
         && source.source_provider == PROVIDER_ID
@@ -212,6 +215,7 @@ pub(super) fn reviewed_source(identity: &RuntimeIdentity, source: &RuntimeSource
 pub(super) fn available(runtime: &AvailableRuntime) -> bool {
     matches!(&runtime.acquisition, RuntimeAcquisitionPlan::SourceBuild(p)
         if reviewed_source(&runtime.identity, &p.source) && p.recipe.recipe_version == recipe_for(&runtime.identity.platform)
+        && runtime.identity.variant == format!("{}-sm120a", p.recipe.recipe_version)
         && p.recipe.build_definition_sha256.as_deref() == Some(CMAKE_SHA256)
         && p.recipe.build_target == "ninfer-serve" && p.recipe.accelerator_target == "sm_120a")
         && runtime.supported_native_identities == super::v3::native_identities()
@@ -223,7 +227,7 @@ pub(super) fn installed(runtime: &InstalledRuntime) -> bool {
         && m.supported_native_identities == super::v3::native_identities()
         && m.source_build.as_ref().is_some_and(|p| {
             reviewed_source(&m.identity, &p.source)
-                && p.recipe_version == recipe_for(&m.identity.platform)
+                && m.identity.variant == format!("{}-sm120a", p.recipe_version)
                 && p.build_definition_sha256.as_deref() == Some(CMAKE_SHA256)
                 && p.build_platform == m.identity.platform
                 && p.build_architecture == "x86_64"

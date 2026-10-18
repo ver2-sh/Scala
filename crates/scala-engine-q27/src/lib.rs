@@ -2837,6 +2837,30 @@ impl Q27Adapter {
 
 #[async_trait]
 impl EngineAdapter for Q27Adapter {
+    fn managed_linux_source_dependencies(
+        &self,
+        plan: &RuntimeSourceBuildPlan,
+    ) -> Result<Option<scala_engine::linux_dependencies::LinuxDependencyRecipe>, String> {
+        use scala_engine::linux_dependencies::LinuxDependencyRecipe;
+        if plan.source.repository != GITHUB_REPOSITORY
+            || plan.recipe.build_system != RuntimeSourceBuildSystem::Make
+        {
+            return Ok(None);
+        }
+        let bytes: &'static [u8] = match plan.prerequisites.minimum_cuda_version.as_deref() {
+            Some("12.8") => {
+                include_bytes!("../../scala-engine/runtime/native/linux/cuda128.lock.json")
+            }
+            Some("13.2") => {
+                include_bytes!("../../scala-engine/runtime/native/linux/cuda132.lock.json")
+            }
+            _ => return Err("q27 source recipe has no reviewed Linux dependency lock".into()),
+        };
+        LinuxDependencyRecipe::new(bytes)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+
     fn identity(&self) -> EngineIdentity {
         EngineIdentity {
             id: ENGINE_ID.to_owned(),

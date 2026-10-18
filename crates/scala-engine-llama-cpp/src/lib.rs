@@ -721,6 +721,30 @@ impl LlamaCppAdapter {
 
 #[async_trait]
 impl EngineAdapter for LlamaCppAdapter {
+    fn managed_linux_source_dependencies(
+        &self,
+        plan: &scala_core::RuntimeSourceBuildPlan,
+    ) -> Result<Option<scala_engine::linux_dependencies::LinuxDependencyRecipe>, String> {
+        use scala_engine::linux_dependencies::LinuxDependencyRecipe;
+        if plan.source.source_provider != source_catalog::LLAMA_CPP_SOURCE_RUNTIME_PROVIDER_ID {
+            return Ok(None);
+        }
+        let bytes: &'static [u8] = match plan.prerequisites.minimum_cuda_version.as_deref() {
+            Some("12.8") => {
+                include_bytes!("../../scala-engine/runtime/native/linux/cuda128.lock.json")
+            }
+            Some("13.0") => {
+                include_bytes!("../../scala-engine/runtime/native/linux/cuda132.lock.json")
+            }
+            _ => {
+                return Err("llama.cpp source recipe has no reviewed Linux dependency lock".into());
+            }
+        };
+        LinuxDependencyRecipe::new(bytes)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    }
+
     fn uses_setting_as_request_default(&self, id: &str) -> bool {
         // --reasoning is a launch policy. This adapter does not yet have
         // verified model/template evidence for a per-request boolean override.

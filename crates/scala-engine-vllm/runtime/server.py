@@ -257,6 +257,11 @@ def main():
         return
     if revision != args.runtime_revision or not args.launch_nonce or args.host not in {"127.0.0.1", "::1"} or not args.port:
         raise ValueError("Unverified launch identity/address")
+    if "build_toolchain" in runtime:
+        # runtime_identity verified this immutable operational binding above.
+        environment = runtime["build_toolchain"]["environment"]
+        os.environ.update(environment)
+        os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + environment["PATH"]
     overrides=json.loads(args.settings)
     if not isinstance(overrides,dict): raise ValueError("Invalid settings overrides")
     runtime = apply_settings(runtime, overrides)

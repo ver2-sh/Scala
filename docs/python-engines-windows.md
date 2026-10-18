@@ -52,6 +52,14 @@ equivalence claim follows from the source review or synthetic tests.
 
 ## Reproducible H2O inputs
 
+The standalone investigation helper below is an external-runtime preparation
+route. The normal managed `scala runtimes install` operation prepares private
+Python/package tooling and the required Microsoft compiler/SDK first, then
+invokes the existing private SDK/wheel provisioner. Users of the managed route
+do not need to install those software dependencies separately. Microsoft host
+installation may require Windows approval; see
+[runtime dependencies](runtime-dependencies.md).
+
 [`provision-h2o.ps1`](../crates/scala-engine-vllm/runtime/windows/provision-h2o.ps1)
 and its Python helper replace the private investigation procedure. Supply
 canonical absolute runtime, model and evidence roots. They acquire dependencies,

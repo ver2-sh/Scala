@@ -687,6 +687,20 @@ impl VllmAdapter {
 
 #[async_trait]
 impl EngineAdapter for VllmAdapter {
+    fn managed_linux_python_dependencies(
+        &self,
+        _plan: &scala_core::RuntimePythonPlan,
+    ) -> Result<Option<scala_engine::linux_dependencies::LinuxDependencyRecipe>, String> {
+        scala_engine::linux_dependencies::LinuxDependencyRecipe::new(include_bytes!(
+            "../../scala-engine/runtime/native/linux/cpp.lock.json"
+        ))
+        .map(Some)
+        .map_err(|e| e.to_string())
+    }
+    fn managed_python_msvc(&self, _plan: &scala_core::RuntimePythonPlan) -> bool {
+        true
+    }
+
     fn identity(&self) -> EngineIdentity {
         EngineIdentity {
             id: ENGINE_ID.into(),

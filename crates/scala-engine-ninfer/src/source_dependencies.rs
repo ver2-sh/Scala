@@ -5,6 +5,10 @@ pub(super) fn assets() -> ManagedSourceDependencies {
         entrypoint: "prepare-windows.ps1",
         assets: vec![
             SourceDependencyAsset {
+                name: "windows-tools.ps1",
+                bytes: include_bytes!("../../scala-engine/runtime/native/windows-tools.ps1"),
+            },
+            SourceDependencyAsset {
                 name: "prepare-windows.ps1",
                 bytes: include_bytes!("source_dependencies/prepare-windows.ps1"),
             },
@@ -18,7 +22,7 @@ pub(super) fn assets() -> ManagedSourceDependencies {
             },
             SourceDependencyAsset {
                 name: "vs-channel.json",
-                bytes: include_bytes!("source_dependencies/vs-channel.json"),
+                bytes: include_bytes!("../../scala-engine/runtime/native/vs-channel.json"),
             },
         ],
     }
@@ -26,6 +30,9 @@ pub(super) fn assets() -> ManagedSourceDependencies {
 pub(super) fn recipe_version() -> String {
     format!("ninfer-all-serve-v3-r2-{}", &assets().sha256()[..16])
 }
+// Previously published installer recipe; source/serving evidence remains unchanged.
+pub(super) const PRE_SHARED_RECIPE: &str = "ninfer-all-serve-v3-r2-39442d439048aa87";
+
 pub(super) fn for_plan(
     plan: &scala_core::RuntimeSourceBuildPlan,
 ) -> Option<ManagedSourceDependencies> {
@@ -78,7 +85,9 @@ mod tests {
         assert_eq!(
             format!(
                 "{:x}",
-                Sha256::digest(include_bytes!("source_dependencies/vs-channel.json"))
+                Sha256::digest(include_bytes!(
+                    "../../scala-engine/runtime/native/vs-channel.json"
+                ))
             ),
             lock["vs_channel_sha256"]
         );

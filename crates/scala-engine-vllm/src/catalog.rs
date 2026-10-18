@@ -8,6 +8,28 @@ pub(crate) fn assets() -> Vec<ManagedPythonAsset> {
     let mut assets = common_python_assets();
     assets.extend([
         ManagedPythonAsset {
+            name: "crates/scala-engine/runtime/native/linux/cpp.lock.json",
+            bytes: include_bytes!("../../scala-engine/runtime/native/linux/cpp.lock.json"),
+        },
+        ManagedPythonAsset {
+            name: "crates/scala-engine/runtime/native/msvc.lock.json",
+            bytes: include_bytes!("../../scala-engine/runtime/native/msvc.lock.json"),
+        },
+        ManagedPythonAsset {
+            name: "crates/scala-engine/runtime/native/windows-tools.ps1",
+            bytes: include_bytes!("../../scala-engine/runtime/native/windows-tools.ps1"),
+        },
+        ManagedPythonAsset {
+            name: "crates/scala-engine/runtime/native/prepare-msvc.ps1",
+            bytes: include_bytes!("../../scala-engine/runtime/native/prepare-msvc.ps1"),
+        },
+        ManagedPythonAsset {
+            name: "crates/scala-engine/runtime/native/vs-channel.json",
+            bytes: include_bytes!("../../scala-engine/runtime/native/vs-channel.json"),
+        },
+    ]);
+    assets.extend([
+        ManagedPythonAsset {
             name: "crates/scala-engine-vllm/runtime/prepare.py",
             bytes: include_bytes!("../runtime/prepare.py"),
         },

@@ -36,7 +36,11 @@ class ManagedProvisionTests(unittest.TestCase):
                 root = Path(tmp)
                 archive = root / 'source.zip'
                 with zipfile.ZipFile(archive, 'w') as source:
-                    source.writestr(member, b'synthetic source')
+                    # ZipInfo normalizes Windows separators in its constructor;
+                    # retain the deliberately hostile on-disk fixture spelling.
+                    info = zipfile.ZipInfo('placeholder')
+                    info.filename = member
+                    source.writestr(info, b'synthetic source')
                 with self.assertRaisesRegex(ValueError, 'Unsafe'):
                     managed.extract_source(archive, root / 'owned')
                 self.assertFalse((root / 'model.safetensors').exists())

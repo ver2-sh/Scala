@@ -287,12 +287,45 @@ impl RuntimeInstaller {
                 "native dependency acquisition is active; cache is protected".into(),
             )
         })?;
+        linux_dependencies::clean_locked(self)?;
         for item in
             std::fs::read_dir(&root).map_err(|e| RuntimeInstallError::Task(e.to_string()))?
         {
             let item = item.map_err(|e| RuntimeInstallError::Task(e.to_string()))?;
             let name = item.file_name().to_string_lossy().into_owned();
             if name == "acquisition.lock" {
+                continue;
+            }
+            if matches!(name.as_str(), "packages" | "toolkits") {
+                let store = item.path();
+                reject_cache_aliases(&root, &store)?;
+                let marker = store.join(".scala-shared-native-owner");
+                reject_managed_cache_file(&root, &marker)?;
+                if std::fs::read_to_string(&marker).ok().as_deref()
+                    != Some(format!("scala-native-shared-{name}-v1").as_str())
+                {
+                    return Err(RuntimeInstallError::InvalidMetadata(
+                        "shared native cache ownership changed".into(),
+                    ));
+                }
+                for component in std::fs::read_dir(&store)
+                    .map_err(|e| RuntimeInstallError::Task(e.to_string()))?
+                {
+                    let component =
+                        component.map_err(|e| RuntimeInstallError::Task(e.to_string()))?;
+                    if component.path() == marker {
+                        continue;
+                    }
+                    let key = component.file_name().to_string_lossy().into_owned();
+                    if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(RuntimeInstallError::InvalidMetadata(
+                            "unexpected shared native cache member".into(),
+                        ));
+                    }
+                    reject_cache_aliases(&root, &component.path())?;
+                }
+                std::fs::remove_dir_all(store)
+                    .map_err(|e| RuntimeInstallError::Task(e.to_string()))?;
                 continue;
             }
             if name != "downloads"
@@ -316,7 +349,10 @@ impl RuntimeInstaller {
         Ok(())
     }
 }
-fn reject_managed_cache_file(root: &Path, file: &Path) -> Result<(), RuntimeInstallError> {
+pub(super) fn reject_managed_cache_file(
+    root: &Path,
+    file: &Path,
+) -> Result<(), RuntimeInstallError> {
     let parent = file.parent().ok_or_else(|| {
         RuntimeInstallError::InvalidMetadata("managed cache file has no parent".into())
     })?;
@@ -337,7 +373,7 @@ fn reject_managed_cache_file(root: &Path, file: &Path) -> Result<(), RuntimeInst
     }
     Ok(())
 }
-fn base_environment() -> BTreeMap<String, String> {
+pub(super) fn base_environment() -> BTreeMap<String, String> {
     [
         "SystemRoot",
         "WINDIR",
@@ -393,6 +429,132 @@ fn admitted_environment(name: &str) -> bool {
             | "git_terminal_prompt"
     )
 }
+/// A shared payload must be in a Scala-owned component store and identify itself
+/// by the exact archive/toolkit digest. The provisioner verifies its inventory
+/// before reporting these paths; the acquisition lease stays held through build.
+fn owned_native_dependency_path(root: &Path, path: &Path) -> bool {
+    let Ok(resolved) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    if resolved.starts_with(root) {
+        return true;
+    }
+    let Some(native) = root.parent() else {
+        return false;
+    };
+    for kind in ["packages", "toolkits"] {
+        let store = native.join(kind);
+        let Ok(relative) = resolved.strip_prefix(&store) else {
+            continue;
+        };
+        let Some(Component::Normal(first)) = relative.components().next() else {
+            continue;
+        };
+        let Some(digest) = first.to_str() else {
+            continue;
+        };
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let payload = store.join(digest);
+        let marker = store.join(".scala-shared-native-owner");
+        let receipt = payload.join("scala-extraction.json");
+        if reject_cache_aliases(native, &payload).is_err()
+            || reject_managed_cache_file(native, &marker).is_err()
+            || reject_managed_cache_file(native, &receipt).is_err()
+            || std::fs::read_to_string(marker).ok().as_deref()
+                != Some(format!("scala-native-shared-{kind}-v1").as_str())
+            || std::fs::metadata(&receipt).map_or(true, |m| m.len() > 16 * 1024 * 1024)
+        {
+            continue;
+        }
+        if std::fs::read(receipt)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|r| r["sha256"].as_str() == Some(digest))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Validate the exact operational tool bindings separately from the unchanged
+/// adapter recipe. Build cache removal must not invalidate installed runtimes.
+pub(crate) fn provenance_matches(
+    installed: &InstalledRuntime,
+    plan: &RuntimeSourceBuildPlan,
+    assets: &ManagedSourceDependencies,
+) -> bool {
+    let Some(p) = installed.manifest.source_build.as_ref() else {
+        return false;
+    };
+    if p.source != plan.source
+        || p.recipe_version != plan.recipe.recipe_version
+        || p.build_system != plan.recipe.build_system
+        || p.build_system != RuntimeSourceBuildSystem::Cmake
+        || p.cmake_configuration_arguments != plan.recipe.cmake_configuration_arguments
+        || p.build_target != plan.recipe.build_target
+        || p.accelerator_target != plan.recipe.accelerator_target
+        || p.toolchain
+            .system_dependencies
+            .get("native_dependency_recipe_sha256")
+            != Some(&assets.sha256())
+        || p.toolchain
+            .system_dependencies
+            .get("native_dependency_environment_sha256")
+            != Some(&assets.cache_sha256())
+    {
+        return false;
+    }
+    if assets.assets.iter().any(|asset| {
+        std::fs::read(
+            installed
+                .installation_root
+                .join("source-dependencies")
+                .join(asset.name),
+        )
+        .ok()
+        .as_deref()
+            != Some(asset.bytes)
+    }) {
+        return false;
+    }
+    let Some(recorded) = &p.effective_cmake_configuration_arguments else {
+        return false;
+    };
+    let original = &plan.recipe.cmake_configuration_arguments;
+    if !recorded.starts_with(original) || recorded.len() != original.len() + 6 {
+        return false;
+    }
+    let keys = [
+        "CMAKE_CUDA_COMPILER",
+        "CMAKE_C_COMPILER",
+        "CMAKE_CXX_COMPILER",
+        "CMAKE_MAKE_PROGRAM",
+        "CUDAToolkit_ROOT",
+        "CMAKE_PREFIX_PATH",
+    ];
+    let mut paths = Vec::new();
+    for (argument, name) in recorded[original.len()..].iter().zip(keys) {
+        let Some(path) = argument.strip_prefix(&format!("-D{name}=")) else {
+            return false;
+        };
+        // Receipts can be read on another OS; require Windows absolute spelling,
+        // not the existence of a disposable build cache on the reading host.
+        let absolute = path.starts_with("//?/")
+            || (path.as_bytes().get(1) == Some(&b':') && path.as_bytes().get(2) == Some(&b'/'));
+        if !absolute || path.chars().any(|c| c.is_control() || c == ';' || c == '$') {
+            return false;
+        }
+        paths.push(path);
+    }
+    paths[0].ends_with("/nvcc.exe")
+        && paths[1].ends_with("/cl.exe")
+        && paths[1] == paths[2]
+        && paths[3].ends_with("/ninja.exe")
+}
+
 fn validate_report(
     r: &DependencyReport,
     digest: &str,
@@ -425,14 +587,14 @@ fn validate_report(
         if !path.is_absolute() || !path.is_file() {
             return Err(fail("selected native build tool is missing"));
         }
-        if name != "cl" && !std::fs::canonicalize(path).is_ok_and(|p| p.starts_with(&root)) {
+        if name != "cl" && !owned_native_dependency_path(&root, path) {
             return Err(fail(
                 "selected managed tool escapes the private dependency environment",
             ));
         }
     }
     for path in [&r.cuda_root, &r.dependency_prefix] {
-        if !std::fs::canonicalize(path).is_ok_and(|p| p.starts_with(&root)) {
+        if !owned_native_dependency_path(&root, path) {
             return Err(fail(
                 "native dependency prefix escapes the private environment",
             ));
@@ -453,8 +615,9 @@ fn validate_report(
         if path
             .extension()
             .is_none_or(|e| !e.eq_ignore_ascii_case("dll"))
-            || !std::fs::canonicalize(path)
-                .is_ok_and(|p| p.is_file() && (p.starts_with(&root) || p.starts_with(&msvc)))
+            || !std::fs::canonicalize(path).is_ok_and(|p| {
+                p.is_file() && (owned_native_dependency_path(&root, &p) || p.starts_with(&msvc))
+            })
         {
             return Err(fail(
                 "runtime dependency is absent or outside its acquired environment",

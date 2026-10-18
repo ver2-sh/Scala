@@ -1,4 +1,8 @@
+pub(crate) mod linux_dependencies;
 mod managed_source;
+pub(crate) use managed_source::provenance_matches as windows_source_provenance_matches;
+mod native_dependencies;
+mod python_dependencies;
 mod windows_source;
 
 use std::collections::BTreeMap;
@@ -137,6 +141,18 @@ impl RuntimeInstaller {
         &self,
         plan: &RuntimeSourceBuildPlan,
     ) -> RuntimeCompatibility {
+        match self.linux_source_recipe(plan) {
+            Ok(Some(recipe)) => {
+                return match linux_dependencies::host()
+                    .and_then(|()| linux_dependencies::check_contract(plan, &recipe))
+                {
+                    Ok(()) => RuntimeCompatibility::Recommended,
+                    Err(error) => RuntimeCompatibility::NeedsAttention(error.to_string()),
+                };
+            }
+            Err(error) => return RuntimeCompatibility::NeedsAttention(error.to_string()),
+            Ok(None) => {}
+        }
         if let Some(recipe) = self.managed_source_recipe(plan) {
             return if !cfg!(target_os = "windows") || std::env::consts::ARCH != "x86_64" {
                 RuntimeCompatibility::Incompatible(
@@ -556,6 +572,25 @@ impl RuntimeInstaller {
             .create_python_staging(&manifest, installation_lease)
             .await?;
         staging.retain_cache_lease(Arc::clone(&cache_lock));
+        if cfg!(windows) && adapter.managed_python_msvc(plan) {
+            Box::pin(self.prepare_python_msvc(available, staging.path())).await?;
+        }
+        let linux_dependencies = if cfg!(target_os = "linux") {
+            match adapter
+                .managed_linux_python_dependencies(plan)
+                .map_err(RuntimeInstallError::InvalidMetadata)?
+            {
+                Some(recipe) => {
+                    Some(Box::pin(self.prepare_linux_dependencies(available, &recipe)).await?)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        if let Some(prepared) = &linux_dependencies {
+            prepared.write_python_binding(staging.path()).await?;
+        }
         for asset in &assets {
             let relative = Path::new(asset.name);
             if !is_safe_relative_path(relative) {
@@ -843,7 +878,7 @@ impl RuntimeInstaller {
             None,
             "Checking source-build prerequisites",
         );
-        let managed_dependencies = self.prepare_managed_source(available, plan).await?;
+        let managed_dependencies = self.prepare_native_dependencies(available, plan).await?;
         let prerequisite_check = if let Some(prepared) = &managed_dependencies {
             prepared.checked(plan)?
         } else {
@@ -914,7 +949,7 @@ impl RuntimeInstaller {
                 None,
                 "Fetching the exact upstream commit",
             );
-            managed_source::run(
+            native_dependencies::run(
                 managed_dependencies.as_ref(),
                 "git init",
                 "git",
@@ -923,7 +958,7 @@ impl RuntimeInstaller {
                 &[],
             )
             .await?;
-            managed_source::run(
+            native_dependencies::run(
                 managed_dependencies.as_ref(),
                 "git remote configuration",
                 "git",
@@ -932,7 +967,7 @@ impl RuntimeInstaller {
                 &[],
             )
             .await?;
-            managed_source::run(
+            native_dependencies::run(
                 managed_dependencies.as_ref(),
                 "git fetch",
                 "git",
@@ -947,7 +982,7 @@ impl RuntimeInstaller {
                 &[],
             )
             .await?;
-            managed_source::run(
+            native_dependencies::run(
                 managed_dependencies.as_ref(),
                 "git checkout",
                 "git",
@@ -973,14 +1008,14 @@ impl RuntimeInstaller {
                 None,
                 "Verifying exact source commit and Git tree",
             );
-            let observed_commit = managed_source::text(
+            let observed_commit = native_dependencies::text(
                 managed_dependencies.as_ref(),
                 "git",
                 &["rev-parse", "HEAD"],
                 Some(&source_root),
             )
             .await?;
-            let observed_tree = managed_source::text(
+            let observed_tree = native_dependencies::text(
                 managed_dependencies.as_ref(),
                 "git",
                 &["rev-parse", "HEAD^{tree}"],
@@ -1048,7 +1083,7 @@ impl RuntimeInstaller {
                         .iter()
                         .map(String::as_str)
                         .collect::<Vec<_>>();
-                    managed_source::run(
+                    native_dependencies::run(
                         managed_dependencies.as_ref(),
                         "CMake configure",
                         "cmake",
@@ -1065,7 +1100,7 @@ impl RuntimeInstaller {
                         None,
                         "Building the required runtime target",
                     );
-                    managed_source::run(
+                    native_dependencies::run(
                         managed_dependencies.as_ref(),
                         "CMake build",
                         "cmake",
@@ -1095,7 +1130,7 @@ impl RuntimeInstaller {
                         None,
                         "Building only the selected upstream Makefile target",
                     );
-                    managed_source::run(
+                    native_dependencies::run(
                         managed_dependencies.as_ref(),
                         "Make build",
                         "make",
@@ -1518,44 +1553,10 @@ async fn check_python_prerequisites(
             )));
         }
     }
-    #[cfg(target_os = "linux")]
-    if plan.backend.starts_with("vllm") {
-        command_text("c++", &["--version"], None)
-            .await
-            .map_err(|error| {
-                RuntimeInstallError::Prerequisite(format!(
-                    "vLLM native JIT needs an existing C++ compiler: {error}"
-                ))
-            })?;
-    }
-    #[cfg(windows)]
-    if plan.backend.starts_with("vllm") {
-        // vswhere is an existing Microsoft host tool, never installed globally.
-        let base = std::env::var_os("ProgramFiles(x86)").ok_or_else(|| {
-            RuntimeInstallError::Prerequisite("Visual Studio C++ tools cannot be located".into())
-        })?;
-        let vswhere = PathBuf::from(base).join("Microsoft Visual Studio/Installer/vswhere.exe");
-        let output = crate::capture_owned_command(
-            &vswhere,
-            &[
-                "-products",
-                "*",
-                "-version",
-                "[16.0,)",
-                "-requires",
-                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                "-property",
-                "installationPath",
-            ],
-            &BTreeMap::new(),
-            &[],
-            Duration::from_secs(3),
-        )
-        .await?;
-        if !output.success || output.stdout.trim().is_empty() {
-            return Err(RuntimeInstallError::Prerequisite("native Windows vLLM JIT requires existing Visual Studio 2019+ x64 C++ tools; no compiler was installed".into()));
-        }
-    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = plan;
+    // Software acquisition is adapter-declared and runs on Install, never during discovery.
+    let _ = plan;
     Ok(())
 }
 
