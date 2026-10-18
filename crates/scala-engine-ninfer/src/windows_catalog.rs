@@ -20,12 +20,17 @@ pub const PROVIDER_ID: &str = "ninfer-windows-portable-github";
 pub const GITHUB_REPOSITORY: &str = "natpate/ninfer-windows";
 pub const UPSTREAM_REPOSITORY: &str = "https://github.com/natpate/ninfer-windows";
 pub const PACKAGE_FAMILY: &str = "ninfer-windows-portable";
+// NVIDIA's CUDA Toolkit 13.4 release notes identify R590 as the driver
+// branch corresponding to CUDA 13.1. Check the observed NVIDIA driver
+// through the ordinary host compatibility evaluator; don't claim that
+// probing driver prerequisites also proves runtime execution.
+const CUDA13_1_DRIVER_BRANCH: &str = "590";
 pub const VARIANT: &str = "portable-v2-sm120a";
 
-// v0.7.1 is the last reviewed v2-era portable Windows release. Upstream v0.8.0
-// moved to NInfer v3 artifacts and does not load v2 containers; Scala currently
-// admits only v2 artifacts, so later releases are excluded until a reviewed v3
-// contract exists.
+// v0.7.1 is the last independently reviewed v2-era Windows release.
+// v0.9.1 is a separate, independently pinned v3 package. Neither package
+// accepts the other's model container generation, and other tags receive
+// no compatibility credit based on a version-number resemblance.
 pub(crate) const REVIEWED_RELEASE_VERSION: &str = "0.7.1";
 pub(crate) const REVIEWED_RELEASE_TAG: &str = "v0.7.1";
 
@@ -269,6 +274,38 @@ pub(crate) fn is_reviewed_release_candidate(runtime: &AvailableRuntime) -> bool 
         )
 }
 
+// A reviewed package may gain a provable host prerequisite after installation.
+// Requalify only the exact historical CUDA warning that the former Scala
+// catalog saved: never reinterpret arbitrary warnings, change immutable runtime
+// manifests, or credit an unreviewed archive.
+const HISTORICAL_CUDA_DRIVER_WARNING: &str = "Upstream requires a CUDA 13.1-capable NVIDIA driver; this host's driver support for that runtime has not been proven";
+
+fn effective_cuda13_1_requirements(recorded: &RuntimeRequirements) -> Option<RuntimeRequirements> {
+    let mut current = recorded.clone();
+    if current.minimum_nvidia_driver.as_deref() == Some(CUDA13_1_DRIVER_BRANCH)
+        && current.unverified_requirements.is_empty()
+    {
+        return Some(current);
+    }
+    if current.minimum_nvidia_driver.is_none()
+        && current.unverified_requirements.len() == 1
+        && current.unverified_requirements[0] == HISTORICAL_CUDA_DRIVER_WARNING
+    {
+        current.minimum_nvidia_driver = Some(CUDA13_1_DRIVER_BRANCH.into());
+        current.unverified_requirements.clear();
+        return Some(current);
+    }
+    None
+}
+
+pub(crate) fn effective_installed_host_requirements(
+    manifest: &RuntimeManifest,
+) -> Option<RuntimeRequirements> {
+    is_reviewed_installed_release(manifest)
+        .then(|| effective_cuda13_1_requirements(&manifest.requirements))
+        .flatten()
+}
+
 /// Full reviewed-package binding for an installed runtime: the exact identity
 /// plus the archive digest verified and persisted at install time. A package
 /// whose recorded bytes differ from the reviewed archive receives no reviewed
@@ -374,7 +411,7 @@ fn runtime_for_release(release: &GitHubRelease) -> Result<Option<AvailableRuntim
         supported_native_identities: if p.variant == V3_VARIANT {crate::v3::native_identities()} else {Vec::new()},
         requirements: RuntimeRequirements {
             requires_nvidia_gpu: true,
-            minimum_nvidia_driver: None,
+            minimum_nvidia_driver: Some(CUDA13_1_DRIVER_BRANCH.to_owned()),
             minimum_vram_bytes: None,
             minimum_vram_class_gib: None,
             minimum_vram_exclusive_class_gib: None,
@@ -387,10 +424,7 @@ fn runtime_for_release(release: &GitHubRelease) -> Result<Option<AvailableRuntim
                 "Self-contained package: the retained archive layout keeps the runtime DLLs required beside ninfer-serve.exe; no WSL or CUDA toolkit installation is needed"
                     .to_owned(),
             ],
-            unverified_requirements: vec![
-                "Upstream requires a CUDA 13.1-capable NVIDIA driver; this host's driver support for that runtime has not been proven"
-                    .to_owned(),
-            ],
+            unverified_requirements: Vec::new(),
         },
     };
     runtime.validate().map_err(|error| CatalogError::Provider {
@@ -509,7 +543,8 @@ fn provider_error(message: &str) -> CatalogError {
 
 #[cfg(test)]
 mod tests {
-    use scala_core::RuntimeReleaseChannel;
+    use scala_core::{AcceleratorDevice, RuntimeCompatibility, RuntimeReleaseChannel};
+    use scala_engine::compatibility_for_nvidia_device;
 
     use super::*;
 
@@ -535,6 +570,11 @@ mod tests {
         );
         assert!(is_reviewed_release_candidate(&runtime));
         assert!(runtime.supported_native_identities.iter().all(|i| matches!(i, scala_core::ArtifactNativeIdentity::Ninfer(i) if i.container_version == 3)));
+        assert_eq!(
+            runtime.requirements.minimum_nvidia_driver.as_deref(),
+            Some(CUDA13_1_DRIVER_BRANCH)
+        );
+        assert!(runtime.requirements.unverified_requirements.is_empty());
         r.assets[0].digest = Some(format!("sha256:{}", "a".repeat(64)));
         assert!(runtime_for_release(&r).unwrap().is_none());
         assert_ne!(
@@ -699,6 +739,62 @@ mod tests {
             ["NVIDIA GeForce RTX 5090"]
         );
         assert_eq!(runtime.supported_formats, [ArtifactFormat::Ninfer]);
+        assert_eq!(
+            runtime.requirements.minimum_nvidia_driver.as_deref(),
+            Some(CUDA13_1_DRIVER_BRANCH)
+        );
+        assert!(runtime.requirements.unverified_requirements.is_empty());
+    }
+
+    #[test]
+    fn recorded_cuda_driver_uncertainty_is_requalified_only_when_exact() {
+        let mut recorded = runtime_for_release(&reviewed_release())
+            .unwrap()
+            .unwrap()
+            .requirements;
+        recorded.minimum_nvidia_driver = None;
+        recorded.unverified_requirements = vec![HISTORICAL_CUDA_DRIVER_WARNING.into()];
+        let current = effective_cuda13_1_requirements(&recorded)
+            .expect("known historical CUDA warning is now verifiable");
+        assert_eq!(current.minimum_nvidia_driver.as_deref(), Some("590"));
+        assert!(current.unverified_requirements.is_empty());
+        assert!(recorded.minimum_nvidia_driver.is_none());
+        assert_eq!(recorded.unverified_requirements.len(), 1);
+        recorded
+            .unverified_requirements
+            .push("independent unresolved requirement".into());
+        assert!(effective_cuda13_1_requirements(&recorded).is_none());
+        recorded.unverified_requirements = vec!["unreviewed driver statement".into()];
+        assert!(effective_cuda13_1_requirements(&recorded).is_none());
+    }
+
+    #[test]
+    fn cuda13_1_driver_branch_is_checked_without_inventing_host_capabilities() {
+        let requirements = runtime_for_release(&reviewed_release())
+            .unwrap()
+            .unwrap()
+            .requirements;
+        let mut gpu = AcceleratorDevice {
+            accelerator: "cuda".into(),
+            name: Some("NVIDIA GeForce RTX 5090".into()),
+            compute_capability: Some(ComputeCapability::new(12, 0)),
+            driver_version: Some("616.64".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            compatibility_for_nvidia_device(&requirements, &gpu),
+            RuntimeCompatibility::Recommended
+        );
+        gpu.driver_version = Some("589.99".into());
+        assert!(matches!(
+            compatibility_for_nvidia_device(&requirements, &gpu),
+            RuntimeCompatibility::Incompatible(_)
+        ));
+        gpu.driver_version = None;
+        assert!(matches!(
+            compatibility_for_nvidia_device(&requirements, &gpu),
+            RuntimeCompatibility::NeedsAttention(_)
+        ));
     }
 
     #[test]

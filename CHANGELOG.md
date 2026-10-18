@@ -13,6 +13,13 @@ copied; the alias is removed after exit. Ordinary paths and non-Windows launches
 are unchanged. Heap-box CLI command dispatch and Model Profile operations to avoid
 Windows debug-stack exhaustion.
 
+Install verified portable Windows runtime packages with nested executable
+paths using portable manifest-relative names, keeping archive containment,
+checksums and runtime identity checks intact. Compare the observed NVIDIA
+driver against the CUDA 13.1 R590 branch requirement instead of treating
+driver compatibility as always unknown; previously installed reviewed packages are requalified at read time without rewriting their manifests. Unavailable and outdated drivers
+remain distinct from a positively verified prerequisite.
+
 Local validation includes native v3 artifact admission, Windows alias identity and
 cleanup regressions, plus successful 500,000-token NInfer-all startup and coding,
 function-calling and image requests through Scala on an RTX 5090. The tested host
