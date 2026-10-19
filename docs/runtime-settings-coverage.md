@@ -235,8 +235,12 @@ where the selected runtime honors them.
   `llama.cpp.draft_micro_batch_size` owns `--spec-draft-n-ubatch` and
   `LLAMA_ARG_SPEC_DRAFT_N_UBATCH`, with zero retaining the native automatic policy.
   It is available only when the exact executable advertises it. Contextual
-  Decision prompt-cache and idle-slot defaults remain runtime policies; no common
-  scalar, persisted observation or raw argument bypass is introduced.
+  cache defaults use reviewed revision/model/override evidence: ordinary models
+  inherit 8192 MiB/enabled and recognized Decision models inherit 0/disabled.
+  Explicit nonzero cache RAM restores the enabled idle-slot default; zero disables
+  it. Explicit idle-slot enables that native code would ignore are configuration
+  errors. Unproved contexts retain unknown defaults. No runtime default or
+  observation is persisted, and no raw argument bypass is introduced.
 - Q27 v0.14.5: independent release/source gates and ABI prerequisites accompany
   opt-in `q27.draft_vocab` and `q27.draft_vocab_context`. The selected artifact must
   prove the native NextN projection and supported packed head; explicit solo,

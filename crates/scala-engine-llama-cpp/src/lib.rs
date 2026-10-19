@@ -1194,6 +1194,12 @@ impl EngineAdapter for LlamaCppAdapter {
         {
             return Err(EngineError::InvalidConfiguration(reason));
         }
+        validate_llama_cache_configuration(
+            runtime.manifest.identity.upstream_revision.as_deref(),
+            help.as_deref().unwrap_or_default(),
+            model,
+            settings,
+        )?;
         if let RuntimeCompatibility::Incompatible(reason) = llama_device_evaluation(
             &runtime.manifest.identity.accelerator,
             &runtime.manifest.identity.platform,
@@ -1293,12 +1299,19 @@ impl EngineAdapter for LlamaCppAdapter {
         &self,
         runtime: &InstalledRuntime,
         _host: &HostCapabilities,
-        _settings: Option<&scala_core::ResolvedSettings>,
+        settings: Option<&scala_core::ResolvedSettings>,
     ) -> Result<SettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
         let help = self.cached_runtime_help(runtime).await?;
         let mut definitions = self.setting_definitions();
         apply_llama_exact_help_contract(&mut definitions, &help);
+        apply_llama_cache_defaults(
+            &mut definitions,
+            &help,
+            runtime.manifest.identity.upstream_revision.as_deref(),
+            None,
+            settings,
+        );
         if let Some(definition) = definitions
             .iter_mut()
             .find(|definition| definition.id.as_str() == "llama.cpp.active_experts")
@@ -1320,12 +1333,19 @@ impl EngineAdapter for LlamaCppAdapter {
         runtime: &InstalledRuntime,
         model: &ModelArtifact,
         _host: &HostCapabilities,
-        _settings: Option<&scala_core::ResolvedSettings>,
+        settings: Option<&scala_core::ResolvedSettings>,
     ) -> Result<SettingsSchema, EngineError> {
         self.probe_runtime(runtime).await?;
         let help = self.cached_runtime_help(runtime).await?;
         let mut definitions = self.model_setting_definitions(model)?;
         apply_llama_exact_help_contract(&mut definitions, &help);
+        apply_llama_cache_defaults(
+            &mut definitions,
+            &help,
+            runtime.manifest.identity.upstream_revision.as_deref(),
+            Some(model),
+            settings,
+        );
         Ok(SettingsSchema {
             engine_id: ENGINE_ID.to_owned(),
             runtime_id: Some(runtime.manifest.runtime_id.clone()),
@@ -4731,24 +4751,126 @@ fn apply_llama_exact_help_contract(definitions: &mut [SettingDefinition], help: 
             apply_llama_reported_default(definition, &help_option_block(help, option));
         }
     }
-    // An advertised, implemented control can remain supported without a known
-    // default. Inheritance omits it; explicit overrides still validate normally.
+    // Help alone cannot resolve a model-dependent branch. In particular, this
+    // is not an `auto` value accepted by either native cache option.
     if help_option_block(help, "--cache-ram").contains("0 for decision") {
         for definition in definitions.iter_mut().filter(|d| d.supported) {
-            let detail = match definition.id.as_str() {
-                "llama.cpp.cache_ram_mib" => {
-                    "The exact runtime disables the prompt cache for Decision models unless cache RAM is explicitly configured; other models retain the reported cache RAM default"
-                }
-                "llama.cpp.cache_idle_slots" => {
-                    "The exact runtime disables idle-slot caching for Decision models unless cache RAM is explicitly configured"
-                }
-                _ => continue,
-            };
-            definition.default_preview = Some(
-                SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
-                    .with_detail(detail),
-            );
+            if matches!(
+                definition.id.as_str(),
+                "llama.cpp.cache_ram_mib" | "llama.cpp.cache_idle_slots"
+            ) {
+                definition.default_preview = None;
+            }
         }
+    }
+}
+
+fn llama_reviewed_cache_contract(revision: Option<&str>, help: &str) -> bool {
+    // common/common.cpp and tools/server/server-{context,decision}.cpp at the
+    // frozen October 19 revisions. A version label or help phrase is not proof
+    // of the model classifier or the idle-slot/cache-RAM interaction.
+    matches!(
+        revision,
+        Some(
+            "620d2225cc436ab0b001e3200e590e3b286ef9ab" | "0ce8cd11416c8840498e6701bcbe39ad4b858c2b"
+        )
+    ) && help_option_block(help, "--cache-ram").contains("0 for decision")
+}
+
+fn llama_cache_decision_model(model: Option<&ModelArtifact>) -> Option<bool> {
+    let Some(ArtifactNativeIdentity::Gguf(identity)) = model
+        .filter(|model| model.format == ArtifactFormat::Gguf)
+        .and_then(|model| model.native_identity.as_ref())
+    else {
+        return None;
+    };
+    if identity.architecture.is_empty() || identity.architecture.len() >= 64 {
+        return None;
+    }
+    // Only classify the cache branch for reviewed native metadata values. This
+    // does not admit Decision requests or prove that the model will load.
+    match identity.decision_type.as_deref() {
+        None => Some(false),
+        Some(
+            "openjev" | "lev" | "kev" | "nimble" | "laya" | "clef" | "pplx-decider"
+            | "vllm-decision2" | "vllm-d3" | "lfm2-d1" | "lfm2-d1-omni",
+        ) => Some(true),
+        _ => None,
+    }
+}
+
+fn apply_llama_cache_defaults(
+    definitions: &mut [SettingDefinition],
+    help: &str,
+    revision: Option<&str>,
+    model: Option<&ModelArtifact>,
+    settings: Option<&scala_core::ResolvedSettings>,
+) {
+    if !llama_reviewed_cache_contract(revision, help) {
+        return;
+    }
+    let decision = llama_cache_decision_model(model);
+    let cache_ram = settings.and_then(|settings| settings.value("llama.cpp.cache_ram_mib"));
+    let native_cache_ram = match cache_ram {
+        Some(SettingValue::Integer(value)) => Some(*value),
+        None => match decision {
+            Some(true) => Some(0),
+            Some(false) => llama_help_reported_default(&help_option_block(help, "--cache-ram"))
+                .and_then(|value| value.parse::<i64>().ok()),
+            None => None,
+        },
+        _ => None,
+    };
+    for definition in definitions
+        .iter_mut()
+        .filter(|definition| definition.supported)
+    {
+        match definition.id.as_str() {
+            "llama.cpp.cache_ram_mib" => {
+                definition.default_preview = match decision {
+                    Some(true) => Some(SettingDefaultPreview::new("0", SettingDefaultSource::Runtime)
+                        .with_detail("The reviewed runtime disables prompt caching for this Decision model when cache RAM is inherited")),
+                    Some(false) => {
+                        apply_llama_reported_default(definition, &help_option_block(help, "--cache-ram"));
+                        continue;
+                    }
+                    None => None,
+                };
+            }
+            "llama.cpp.cache_idle_slots" => {
+                definition.default_preview = match native_cache_ram {
+                    Some(0) => Some(SettingDefaultPreview::new("disabled", SettingDefaultSource::Runtime)
+                        .with_detail("The reviewed runtime disables idle-slot caching when effective cache RAM is zero")),
+                    Some(_) => {
+                        apply_llama_reported_default(definition, &help_option_block(help, "--cache-idle-slots"));
+                        continue;
+                    }
+                    None => None,
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+fn validate_llama_cache_configuration(
+    revision: Option<&str>,
+    help: &str,
+    model: Option<&ModelArtifact>,
+    settings: &scala_core::ResolvedSettings,
+) -> Result<(), EngineError> {
+    if !llama_reviewed_cache_contract(revision, help)
+        || settings.value("llama.cpp.cache_idle_slots") != Some(&SettingValue::Toggle(true))
+    {
+        return Ok(());
+    }
+    match settings.value("llama.cpp.cache_ram_mib") {
+        Some(SettingValue::Integer(value)) if *value != 0 => Ok(()),
+        None if llama_cache_decision_model(model) == Some(false) => Ok(()),
+        None if model.is_none() => Ok(()), // Settings editor has no bound model.
+        _ => Err(EngineError::InvalidConfiguration(
+            "`llama.cpp.cache_idle_slots=true` requires explicit nonzero `llama.cpp.cache_ram_mib` unless the selected model proves the ordinary cache default; use Inherit or false to disable idle-slot caching".to_owned(),
+        )),
     }
 }
 
@@ -7082,51 +7204,365 @@ mod settings_tests {
         }
     }
 
-    #[test]
-    fn decision_cache_defaults_remain_contextual_native_policies() {
-        let mut definitions = llama_setting_definitions();
-        apply_llama_exact_help_contract(
-            &mut definitions,
-            include_str!("../testdata/b11565-server-help.txt"),
-        );
-        assert_eq!(
-            definitions
-                .iter()
-                .find(|d| d.id.as_str() == "llama.cpp.cache_ram_mib")
-                .unwrap()
-                .default_preview
-                .as_ref()
-                .unwrap()
-                .value,
-            "8192"
-        );
-        apply_llama_exact_help_contract(
-            &mut definitions,
+    const CACHE_CONTRACTS: [(&str, &str); 2] = [
+        (
+            "620d2225cc436ab0b001e3200e590e3b286ef9ab",
             include_str!("../testdata/b11669-server-help.txt"),
-        );
-        for id in ["llama.cpp.cache_ram_mib", "llama.cpp.cache_idle_slots"] {
-            let preview = definitions
-                .iter()
-                .find(|d| d.id.as_str() == id)
-                .unwrap()
-                .default_preview
-                .as_ref()
-                .unwrap();
-            assert_eq!(preview.value, "auto");
-            assert_eq!(preview.source, SettingDefaultSource::Runtime);
+        ),
+        (
+            "0ce8cd11416c8840498e6701bcbe39ad4b858c2b",
+            include_str!("../testdata/b11739-server-help.txt"),
+        ),
+    ];
+
+    fn cache_model(kind: Option<&str>) -> ModelArtifact {
+        ModelArtifact {
+            id: scala_core::ModelId("cache-fixture".into()),
+            display_name: "arbitrary name".into(),
+            path: PathBuf::from("synthetic.gguf"),
+            format: ArtifactFormat::Gguf,
+            size_bytes: 0,
+            created: 1,
+            hash: None,
+            architecture: None,
+            context_length: None,
+            provenance: None,
+            native_identity: Some(ArtifactNativeIdentity::Gguf(
+                serde_json::from_value(json!({
+                    "version": 3, "architecture": "bert", "decision_type": kind,
+                }))
+                .unwrap(),
+            )),
+            auxiliary_artifacts: Vec::new(),
+            norted_package: None,
         }
-        let configured = resolved(&[
-            ("llama.cpp.cache_ram_mib", SettingValue::Integer(0)),
-            ("llama.cpp.cache_idle_slots", SettingValue::Toggle(false)),
-        ]);
-        assert_eq!(
-            strings(
-                translate_llama_settings(&configured, &[], &BTreeMap::new())
-                    .unwrap()
-                    .arguments
-            ),
-            ["--no-cache-idle-slots", "--cache-ram", "0"]
-        );
+    }
+
+    fn cache_schema(
+        revision: Option<&str>,
+        help: &str,
+        model: Option<&ModelArtifact>,
+        settings: &ResolvedSettings,
+    ) -> SettingsSchema {
+        let mut definitions = llama_model_setting_definitions(model);
+        apply_llama_exact_help_contract(&mut definitions, help);
+        apply_llama_cache_defaults(&mut definitions, help, revision, model, Some(settings));
+        definitions.retain(|d| {
+            matches!(
+                d.id.as_str(),
+                "llama.cpp.cache_ram_mib" | "llama.cpp.cache_idle_slots"
+            )
+        });
+        SettingsSchema {
+            engine_id: ENGINE_ID.into(),
+            runtime_id: None,
+            definitions,
+        }
+    }
+
+    fn assert_cache_effective(settings: &ResolvedSettings, ram: Option<&str>, idle: Option<&str>) {
+        for (id, expected) in [
+            ("llama.cpp.cache_ram_mib", ram),
+            ("llama.cpp.cache_idle_slots", idle),
+        ] {
+            let id = SettingId::new(id).unwrap();
+            assert_eq!(
+                settings.effective.get(&id).map(|s| s.value.as_str()),
+                expected
+            );
+            if let Some(effective) = settings.effective.get(&id) {
+                assert_eq!(
+                    effective.source,
+                    settings
+                        .configured
+                        .get(&id)
+                        .map_or(SettingSource::RuntimeDefault, |s| s.source.clone())
+                );
+                assert_eq!(effective.requested_value, None);
+            }
+        }
+    }
+
+    #[test]
+    fn cache_defaults_use_reviewed_runtime_and_model_context() {
+        let mut missing_identity = cache_model(None);
+        missing_identity.native_identity = None;
+        for (revision, help) in CACHE_CONTRACTS {
+            for (model, ram, idle) in [
+                (Some(cache_model(None)), Some("8192"), Some("enabled")),
+                (Some(cache_model(Some("laya"))), Some("0"), Some("disabled")),
+                (
+                    Some(cache_model(Some("vllm-d3"))),
+                    Some("0"),
+                    Some("disabled"),
+                ),
+                (Some(cache_model(Some("none"))), None, None),
+                (Some(cache_model(Some("future-decision"))), None, None),
+                (Some(missing_identity.clone()), None, None),
+                (None, None, None),
+            ] {
+                let mut settings = resolved(&[]);
+                let schema = cache_schema(Some(revision), help, model.as_ref(), &settings);
+                schema
+                    .materialize_runtime_configuration(&mut settings)
+                    .unwrap();
+                schema.materialize_effective(&mut settings).unwrap();
+                assert_cache_effective(&settings, ram, idle);
+                assert!(settings.configured.is_empty());
+                assert!(
+                    translate_llama_settings(&settings, &[], &BTreeMap::new())
+                        .unwrap()
+                        .arguments
+                        .is_empty()
+                );
+                assert!(schema.definitions.iter().all(|d| d.supported));
+                assert!(
+                    schema
+                        .definitions
+                        .iter()
+                        .filter_map(|d| d.default_preview.as_ref())
+                        .all(|p| p.source == SettingDefaultSource::Runtime)
+                );
+            }
+            for revision in [None, Some("unknown-revision")] {
+                let mut settings = resolved(&[]);
+                cache_schema(revision, help, Some(&cache_model(None)), &settings)
+                    .materialize_effective(&mut settings)
+                    .unwrap();
+                assert_cache_effective(&settings, None, None);
+            }
+        }
+        let mut settings = resolved(&[]);
+        cache_schema(
+            None,
+            include_str!("../testdata/b11565-server-help.txt"),
+            None,
+            &settings,
+        )
+        .materialize_effective(&mut settings)
+        .unwrap();
+        assert_cache_effective(&settings, Some("8192"), Some("enabled"));
+    }
+
+    #[test]
+    fn cache_explicit_ram_controls_idle_defaults_and_ignored_overrides() {
+        for (revision, help) in CACHE_CONTRACTS {
+            for model in [
+                Some(cache_model(None)),
+                Some(cache_model(Some("laya"))),
+                None,
+            ] {
+                for ram in [-1, 0, 4096, 8192] {
+                    for idle in [None, Some(false), Some(true)] {
+                        let mut settings =
+                            resolved(&[("llama.cpp.cache_ram_mib", SettingValue::Integer(ram))]);
+                        if let Some(idle) = idle {
+                            settings.configured.insert(
+                                SettingId::new("llama.cpp.cache_idle_slots").unwrap(),
+                                ResolvedSetting {
+                                    value: SettingValue::Toggle(idle),
+                                    source: SettingSource::Invocation,
+                                },
+                            );
+                        }
+                        let configured = settings.configured.clone();
+                        let validation = validate_llama_cache_configuration(
+                            Some(revision),
+                            help,
+                            model.as_ref(),
+                            &settings,
+                        );
+                        let schema = cache_schema(Some(revision), help, model.as_ref(), &settings);
+                        // Configuration errors leave support and schemas intact.
+                        schema.validate(&settings).unwrap();
+                        if ram == 0 && idle == Some(true) {
+                            assert!(matches!(
+                                validation,
+                                Err(EngineError::InvalidConfiguration(_))
+                            ));
+                            continue;
+                        }
+                        validation.unwrap();
+                        schema
+                            .materialize_runtime_configuration(&mut settings)
+                            .unwrap();
+                        schema.materialize_effective(&mut settings).unwrap();
+                        assert_cache_effective(
+                            &settings,
+                            Some(&ram.to_string()),
+                            Some(match idle {
+                                Some(true) => "true",
+                                Some(false) => "false",
+                                None if ram == 0 => "disabled",
+                                None => "enabled",
+                            }),
+                        );
+                        assert_eq!(settings.configured, configured);
+                        let args = strings(
+                            translate_llama_settings(&settings, &[], &BTreeMap::new())
+                                .unwrap()
+                                .arguments,
+                        );
+                        let mut expected = Vec::new();
+                        if let Some(idle) = idle {
+                            expected.push(if idle {
+                                "--cache-idle-slots".into()
+                            } else {
+                                "--no-cache-idle-slots".into()
+                            });
+                        }
+                        expected.extend(["--cache-ram".into(), ram.to_string()]);
+                        assert_eq!(args, expected);
+                    }
+                }
+            }
+            for kind in [None, Some("laya"), Some("future-decision")] {
+                let model = cache_model(kind);
+                let settings =
+                    resolved(&[("llama.cpp.cache_idle_slots", SettingValue::Toggle(true))]);
+                assert_eq!(
+                    validate_llama_cache_configuration(
+                        Some(revision),
+                        help,
+                        Some(&model),
+                        &settings
+                    )
+                    .is_ok(),
+                    kind.is_none()
+                );
+                let mut settings =
+                    resolved(&[("llama.cpp.cache_idle_slots", SettingValue::Toggle(false))]);
+                validate_llama_cache_configuration(Some(revision), help, Some(&model), &settings)
+                    .unwrap();
+                cache_schema(Some(revision), help, Some(&model), &settings)
+                    .materialize_effective(&mut settings)
+                    .unwrap();
+                assert_cache_effective(
+                    &settings,
+                    if kind.is_none() {
+                        Some("8192")
+                    } else if kind == Some("laya") {
+                        Some("0")
+                    } else {
+                        None
+                    },
+                    Some("false"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cache_inherit_preserves_layers_provenance_and_read_only_defaults() {
+        let ram_id = SettingId::new("llama.cpp.cache_ram_mib").unwrap();
+        let idle_id = SettingId::new("llama.cpp.cache_idle_slots").unwrap();
+        let profile_id = ModelProfileId::new("cache-profile").unwrap();
+        let model = cache_model(Some("laya"));
+        for (revision, help) in CACHE_CONTRACTS {
+            let mut state = SettingsState::default();
+            state
+                .runtime_defaults
+                .entry(ENGINE_ID.into())
+                .or_default()
+                .insert(ram_id.clone(), SettingValue::Integer(8192));
+            let mut profile = SettingsPatch::default();
+            profile.insert(ram_id.clone(), SettingValue::Integer(0));
+            profile.insert(idle_id.clone(), SettingValue::Toggle(false));
+            let mut invocation = SettingsPatch::default();
+            invocation.insert(ram_id.clone(), SettingValue::Integer(-1));
+            invocation.insert(idle_id.clone(), SettingValue::Toggle(true));
+            for (ram, idle, source) in [
+                ("-1", "true", SettingSource::Invocation),
+                (
+                    "0",
+                    "false",
+                    SettingSource::ModelProfile {
+                        model_profile_id: profile_id.clone(),
+                    },
+                ),
+                ("8192", "enabled", SettingSource::SettingsOverride),
+                ("0", "disabled", SettingSource::RuntimeDefault),
+            ] {
+                let persisted = (state.clone(), profile.clone(), invocation.clone());
+                let mut settings = state
+                    .resolve(
+                        &profile_id,
+                        ENGINE_ID,
+                        &profile,
+                        &invocation,
+                        Path::new("/"),
+                    )
+                    .unwrap();
+                let configured = settings.configured.clone();
+                let schema = cache_schema(Some(revision), help, Some(&model), &settings);
+                schema.validate(&settings).unwrap();
+                validate_llama_cache_configuration(Some(revision), help, Some(&model), &settings)
+                    .unwrap();
+                schema
+                    .materialize_runtime_configuration(&mut settings)
+                    .unwrap();
+                schema.materialize_effective(&mut settings).unwrap();
+                assert_cache_effective(&settings, Some(ram), Some(idle));
+                assert_eq!(settings.effective[&ram_id].source, source);
+                assert_eq!(settings.configured, configured);
+                assert_eq!(
+                    (state.clone(), profile.clone(), invocation.clone()),
+                    persisted
+                );
+                match source {
+                    SettingSource::Invocation => {
+                        invocation.remove(&ram_id);
+                        invocation.remove(&idle_id);
+                    }
+                    SettingSource::ModelProfile { .. } => {
+                        profile.remove(&ram_id);
+                        profile.remove(&idle_id);
+                    }
+                    SettingSource::SettingsOverride => {
+                        state
+                            .runtime_defaults
+                            .get_mut(ENGINE_ID)
+                            .unwrap()
+                            .remove(&ram_id);
+                    }
+                    SettingSource::RuntimeDefault => assert!(settings.configured.is_empty()),
+                }
+            }
+            // Equal-to-parent remains explicit until Inherit removes it.
+            state
+                .runtime_defaults
+                .entry(ENGINE_ID.into())
+                .or_default()
+                .insert(ram_id.clone(), SettingValue::Integer(8192));
+            profile.insert(ram_id.clone(), SettingValue::Integer(8192));
+            let settings = state
+                .resolve(
+                    &profile_id,
+                    ENGINE_ID,
+                    &profile,
+                    &invocation,
+                    Path::new("/"),
+                )
+                .unwrap();
+            assert!(matches!(
+                settings.configured[&ram_id].source,
+                SettingSource::ModelProfile { .. }
+            ));
+            profile.remove(&ram_id);
+            let settings = state
+                .resolve(
+                    &profile_id,
+                    ENGINE_ID,
+                    &profile,
+                    &invocation,
+                    Path::new("/"),
+                )
+                .unwrap();
+            assert_eq!(
+                settings.configured[&ram_id].source,
+                SettingSource::SettingsOverride
+            );
+        }
     }
 
     #[test]

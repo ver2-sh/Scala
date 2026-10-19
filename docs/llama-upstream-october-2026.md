@@ -153,8 +153,25 @@ runtime → Settings → Model Profile → invocation precedence remain unchange
 
 New help also advertises a contextual `--cache-ram` default: Decision models
 disable the prompt cache and idle-slot caching unless cache RAM is explicit.
-Both previews now retain this native policy instead of displaying one universal
-scalar. Explicit zero/false and ordinary old-runtime defaults remain intact.
+The corrected schemas resolve this branch using the exact reviewed revision,
+architecture-scoped GGUF Decision metadata, and explicit resolved overrides.
+Ordinary models retain 8192 MiB/enabled; recognized Decision models inherit
+0/disabled. Explicit nonzero cache RAM (including native unlimited `-1`) restores
+the enabled idle-slot default; explicit zero makes that default disabled.
+An explicit idle-slot enable that native code would disable is rejected as a
+configuration error: use Inherit/false, or configure nonzero cache RAM. With a
+bound model whose classification is unknown, enabling idle-slot caching also
+requires explicit nonzero cache RAM. This follows the frozen
+[cache initialization](https://github.com/ggml-org/llama.cpp/blob/620d2225cc436ab0b001e3200e590e3b286ef9ab/tools/server/server-context.cpp)
+and [native metadata classifier](https://github.com/ggml-org/llama.cpp/blob/620d2225cc436ab0b001e3200e590e3b286ef9ab/common/common.cpp),
+which have the same cache behavior at b11739.
+
+Runtime-only or unproved model/revision contexts retain unknown defaults rather
+than a fabricated `auto`; explicit cache RAM can establish the idle-slot default
+without a model for the reviewed revisions. These read-only defaults feed effective
+values with runtime-default provenance and never enter configured or persisted
+override maps. Settings, Model Profile and invocation precedence, Inherit, and
+explicit zero/false remain intact. Cache classification grants no Decision admission.
 All other headers retain the existing typed/Scala-managed/unsupported ownership;
 unclassified future options still reject runtime admission.
 
