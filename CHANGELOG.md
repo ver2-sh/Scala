@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.28 - Official llama.cpp compatibility and contextual cache defaults
+
+Qualify the reviewed official llama.cpp v0.7.0/b11669 and b11739 runtime releases,
+preserving immutable release and executable identities, explicit user selections,
+and native Decision/vision capability gates. Repair semantic-version reference
+lookup when the provider resolves a stable tag to its canonical nightly.
+
+Expose exact-help-gated `llama.cpp.draft_micro_batch_size` with native zero and
+raw argument/environment collision protection. Display the reviewed prompt-cache
+RAM and idle-slot defaults for the selected ordinary or Decision model context;
+respect explicit Settings, Model Profile and invocation overrides and Inherit.
+Unknown runtime/model defaults remain unknown; none are persisted automatically.
+
+Preserve native `/v1/systemone` support and reject `/v1/decisions` for upstream
+builds without the independently observed usage fields required by that API.
+No inference runtime, model, profile, or user setting is automatically updated.
+
 ## 0.1.27 - Independent Model Profile runtime binding
 
 Add persistent per-profile runtime selection independent of model artifacts.
