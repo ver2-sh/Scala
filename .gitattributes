@@ -2,3 +2,6 @@
 release/legal-upstream/** -text
 # Preserve this pinned upstream license verbatim, including its final blank line.
 release/legal-upstream/jni-sys-macros-0.4.1/LICENSE-APACHE whitespace=-blank-at-eof
+# Preserve the reviewed native help captures, including upstream whitespace.
+crates/scala-engine-llama-cpp/testdata/b11669-server-help.txt -text whitespace=-blank-at-eol,cr-at-eol
+crates/scala-engine-llama-cpp/testdata/b11739-server-help.txt -text whitespace=-blank-at-eol,cr-at-eol

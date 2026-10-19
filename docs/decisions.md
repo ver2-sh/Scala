@@ -255,6 +255,11 @@ The reviewed llama.cpp source contracts include stable v0.6.0/b11429 and frozen
 b11565, recorded in [the immutable integration ledger](integration-october-2026.md),
 plus upstream b11606 (`1b70350c92563449576bcbbf552994b1d1ed847d`) and
 b11617 (`14310190cd0a0c831fe949ac8cbedd8abdc90695`) for native image admission.
+The [October 19 upstream refresh](llama-upstream-october-2026.md) additionally
+reviews v0.7.0/b11669 (`620d2225cc436ab0b001e3200e590e3b286ef9ab`) and b11739
+(`0ce8cd11416c8840498e6701bcbe39ad4b858c2b`), admitting their same six native image
+types through the existing exact-pair gate. Native d3/LFM D1 support remains
+metadata/validator-owned; complete OpenAI Decisions usage is still unavailable.
 Unreviewed revisions do not inherit image support by version ordering.
 Other runtimes retain their own support gates. GGUF decision metadata and native
 output modalities are candidate/evidence inputs, never execution authority.
@@ -288,7 +293,7 @@ qualify images. Scala uses source review and startup observations for this gate;
 development validation uses synthetic servers and artifacts, without model inference.
 Original bytes and image order are retained;
 embedded text/image positions and message associations are separate guarantees.
-At all four reviewed revisions, `parse_state()` removes `image_url` parts from a state
+At all reviewed revisions, `parse_state()` removes `image_url` parts from a state
 array or `state.messages`, appending their bytes to a shared ordered media list.
 `render()` and joint image handling receive that list separately from the remaining
 state; the model's native template places the media markers. Inline positions,

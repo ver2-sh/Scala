@@ -43,6 +43,8 @@ pub trait RuntimeCatalogProvider: Send + Sync {
         github: &GitHubReleaseClient,
     ) -> Result<Vec<AvailableRuntime>, CatalogError>;
 
+    /// Resolve an exact reference, including aliases whose canonical runtime
+    /// identity differs from the reference (for example a stable nightly pointer).
     async fn fetch_reference(
         &self,
         _github: &GitHubReleaseClient,
@@ -297,7 +299,8 @@ impl RuntimeCatalog {
                     Ok(runtimes) => entries.extend(
                         runtimes
                             .into_iter()
-                            .filter(|runtime| runtime_matches(runtime, &normalized_query))
+                            // The provider resolved this exact reference; a stable
+                            // alias need not occur in its canonical nightly identity.
                             .map(|available| RuntimeCatalogEntry {
                                 compatibility: compatibility_for(
                                     &available.identity.platform,
@@ -2281,6 +2284,76 @@ mod tests {
         assert!(same_install_candidate(&broad, &exact));
         exact.identity.package.repository = Some("attacker/repository".to_owned());
         assert!(authority.validate(&exact).is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_reference_aliases_keep_canonical_identity_and_provider_authority() {
+        use super::{GitHubReleaseClient, RuntimeCatalog, RuntimeCatalogProvider};
+        use crate::test_support::{release, runtime};
+        use std::sync::Arc;
+
+        struct AliasProvider(AvailableRuntime);
+        #[async_trait::async_trait]
+        impl RuntimeCatalogProvider for AliasProvider {
+            fn id(&self) -> &'static str {
+                "fixture-provider"
+            }
+            fn engine_id(&self) -> &'static str {
+                "fixture-release"
+            }
+            fn repository(&self) -> &'static str {
+                "owner/repository"
+            }
+            async fn fetch(
+                &self,
+                _: &GitHubReleaseClient,
+            ) -> Result<Vec<AvailableRuntime>, super::CatalogError> {
+                Ok(Vec::new())
+            }
+            async fn fetch_reference(
+                &self,
+                _: &GitHubReleaseClient,
+                reference: &str,
+            ) -> Result<Vec<AvailableRuntime>, super::CatalogError> {
+                Ok(if reference == "v0.7.0" {
+                    vec![self.0.clone()]
+                } else {
+                    Vec::new()
+                })
+            }
+        }
+        let mut candidate = runtime(&serde_json::from_value(release(b"inert")).unwrap());
+        candidate.identity.version = "b11669".into();
+        candidate.runtime_id = scala_core::RuntimeId::from_identity(&candidate.identity);
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = RuntimeCatalog::new(
+            directory.path().into(),
+            [Arc::new(AliasProvider(candidate.clone())) as Arc<dyn RuntimeCatalogProvider>],
+        )
+        .unwrap();
+        let host = HostCapabilities::current_without_accelerator_probe();
+        let found = catalog.search("v0.7.0", &host, false).await;
+        assert!(found.provider_errors.is_empty());
+        assert_eq!(found.entries.len(), 1);
+        assert_eq!(found.entries[0].available, candidate);
+        assert!(
+            catalog
+                .search("unrecognized-alias", &host, false)
+                .await
+                .entries
+                .is_empty()
+        );
+
+        candidate.identity.package.repository = Some("other/repository".into());
+        candidate.runtime_id = scala_core::RuntimeId::from_identity(&candidate.identity);
+        let catalog = RuntimeCatalog::new(
+            directory.path().join("foreign"),
+            [Arc::new(AliasProvider(candidate)) as Arc<dyn RuntimeCatalogProvider>],
+        )
+        .unwrap();
+        let found = catalog.search("v0.7.0", &host, false).await;
+        assert!(found.entries.is_empty());
+        assert_eq!(found.provider_errors.len(), 1);
     }
 
     #[test]

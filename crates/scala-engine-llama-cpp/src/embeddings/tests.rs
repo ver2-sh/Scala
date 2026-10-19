@@ -89,6 +89,7 @@ async fn fixture() -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("arbitrary.gguf");
     gguf(&path, false);
+    let path = std::fs::canonicalize(path).unwrap();
     let model = ModelArtifact {
         id: ModelId("synthetic".into()),
         display_name: "arbitrary".into(),

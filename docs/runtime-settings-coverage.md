@@ -230,6 +230,13 @@ where the selected runtime honors them.
   These additions remain help/runtime-qualified; unknown native options fail
   closed. Native CUDA 12/13 builds and official CUDA assets retain their own
   toolkit/driver/variant and companion-library contracts.
+- llama.cpp v0.7.0/b11669 and b11739: [the October 19 review](llama-upstream-october-2026.md)
+  freezes official Windows/Linux CPU package/help evidence. New
+  `llama.cpp.draft_micro_batch_size` owns `--spec-draft-n-ubatch` and
+  `LLAMA_ARG_SPEC_DRAFT_N_UBATCH`, with zero retaining the native automatic policy.
+  It is available only when the exact executable advertises it. Contextual
+  Decision prompt-cache and idle-slot defaults remain runtime policies; no common
+  scalar, persisted observation or raw argument bypass is introduced.
 - Q27 v0.14.5: independent release/source gates and ABI prerequisites accompany
   opt-in `q27.draft_vocab` and `q27.draft_vocab_context`. The selected artifact must
   prove the native NextN projection and supported packed head; explicit solo,

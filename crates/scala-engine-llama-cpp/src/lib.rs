@@ -840,7 +840,7 @@ impl EngineAdapter for LlamaCppAdapter {
         _model: &ModelArtifact,
         _settings: &scala_core::ResolvedSettings,
     ) -> bool {
-        // Neither reviewed System One wire reports cache/cache-write/reasoning
+        // No reviewed System One wire reports cache/cache-write/reasoning
         // counters. Exact native Decision proof cannot grant the OpenAI contract.
         false
     }
@@ -3415,6 +3415,16 @@ fn llama_extended_setting_definitions() -> Vec<SettingDefinition> {
             "f16",
         ),
         (
+            "draft_micro_batch_size",
+            "Draft micro-batch size",
+            "Physical draft-context batch limit; zero follows the main micro-batch size",
+            SettingKind::UnsignedInteger {
+                minimum: Some(0),
+                maximum: Some(i32::MAX as u64),
+            },
+            "runtime-dependent",
+        ),
+        (
             "draft_tokens_max",
             "Maximum draft tokens",
             "Maximum speculative draft length",
@@ -4273,6 +4283,9 @@ fn llama_direct_setting(id: &str) -> Option<LlamaDirectSetting> {
         "llama.cpp.draft_tokens_min" => {
             value!("--spec-draft-n-min", "LLAMA_ARG_SPEC_DRAFT_N_MIN")
         }
+        "llama.cpp.draft_micro_batch_size" => {
+            value!("--spec-draft-n-ubatch", "LLAMA_ARG_SPEC_DRAFT_N_UBATCH")
+        }
         "llama.cpp.draft_probability_min" => {
             value!("--spec-draft-p-min", "LLAMA_ARG_SPEC_DRAFT_P_MIN")
         }
@@ -4720,6 +4733,23 @@ fn apply_llama_exact_help_contract(definitions: &mut [SettingDefinition], help: 
     }
     // An advertised, implemented control can remain supported without a known
     // default. Inheritance omits it; explicit overrides still validate normally.
+    if help_option_block(help, "--cache-ram").contains("0 for decision") {
+        for definition in definitions.iter_mut().filter(|d| d.supported) {
+            let detail = match definition.id.as_str() {
+                "llama.cpp.cache_ram_mib" => {
+                    "The exact runtime disables the prompt cache for Decision models unless cache RAM is explicitly configured; other models retain the reported cache RAM default"
+                }
+                "llama.cpp.cache_idle_slots" => {
+                    "The exact runtime disables idle-slot caching for Decision models unless cache RAM is explicitly configured"
+                }
+                _ => continue,
+            };
+            definition.default_preview = Some(
+                SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+                    .with_detail(detail),
+            );
+        }
+    }
 }
 
 fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &str) {
@@ -4748,6 +4778,10 @@ fn apply_llama_reported_default(definition: &mut SettingDefinition, contract: &s
     };
     let lower = reported.to_ascii_lowercase();
     let preview = match id {
+        "llama.cpp.draft_micro_batch_size" if lower == "0" => {
+            SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
+                .with_detail("The exact runtime reports zero: use the main micro-batch size")
+        }
         _ if lower == "same" => SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
             .with_detail("The exact runtime derives this value from its related primary worker setting"),
         _ if lower == "loaded" => SettingDefaultPreview::new("auto", SettingDefaultSource::Runtime)
@@ -6978,6 +7012,124 @@ mod settings_tests {
     }
 
     #[test]
+    fn draft_micro_batch_is_exact_runtime_gated_and_preserves_explicit_zero() {
+        let id = "llama.cpp.draft_micro_batch_size";
+        let mut definitions = llama_setting_definitions();
+        assert!(
+            definitions
+                .iter()
+                .find(|d| d.id.as_str() == id)
+                .unwrap()
+                .default_preview
+                .is_none()
+        );
+        apply_llama_exact_help_contract(
+            &mut definitions,
+            include_str!("../testdata/b11565-server-help.txt"),
+        );
+        assert!(
+            !definitions
+                .iter()
+                .find(|d| d.id.as_str() == id)
+                .unwrap()
+                .supported
+        );
+        for help in [
+            include_str!("../testdata/b11669-server-help.txt"),
+            include_str!("../testdata/b11739-server-help.txt"),
+        ] {
+            let mut definitions = llama_setting_definitions();
+            apply_llama_exact_help_contract(&mut definitions, help);
+            let definition = definitions.iter().find(|d| d.id.as_str() == id).unwrap();
+            assert!(definition.supported);
+            let preview = definition.default_preview.as_ref().unwrap();
+            assert_eq!(preview.value, "auto");
+            assert_eq!(preview.source, SettingDefaultSource::Runtime);
+            assert!(definition.parse("-1").is_err());
+            assert!(definition.parse("2147483648").is_err());
+            for value in [0, 128] {
+                let configured = resolved(&[(id, SettingValue::UnsignedInteger(value))]);
+                assert!(matches!(
+                    llama_configured_runtime_compatibility(&configured, None, Some(help)),
+                    RuntimeCompatibility::Compatible
+                ));
+                let translated =
+                    translate_llama_settings(&configured, &[], &BTreeMap::new()).unwrap();
+                assert_eq!(
+                    strings(translated.arguments),
+                    ["--spec-draft-n-ubatch", &value.to_string()]
+                );
+                assert!(
+                    translated
+                        .environment_remove
+                        .contains(&OsString::from("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"))
+                );
+                for argument in ["--spec-draft-n-ubatch", "--spec-draft-n-ubatch=64"] {
+                    assert!(
+                        translate_llama_settings(&configured, &[argument.into()], &BTreeMap::new())
+                            .is_err()
+                    );
+                }
+                assert!(
+                    translate_llama_settings(
+                        &configured,
+                        &[],
+                        &BTreeMap::from([("LLAMA_ARG_SPEC_DRAFT_N_UBATCH".into(), "64".into())])
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decision_cache_defaults_remain_contextual_native_policies() {
+        let mut definitions = llama_setting_definitions();
+        apply_llama_exact_help_contract(
+            &mut definitions,
+            include_str!("../testdata/b11565-server-help.txt"),
+        );
+        assert_eq!(
+            definitions
+                .iter()
+                .find(|d| d.id.as_str() == "llama.cpp.cache_ram_mib")
+                .unwrap()
+                .default_preview
+                .as_ref()
+                .unwrap()
+                .value,
+            "8192"
+        );
+        apply_llama_exact_help_contract(
+            &mut definitions,
+            include_str!("../testdata/b11669-server-help.txt"),
+        );
+        for id in ["llama.cpp.cache_ram_mib", "llama.cpp.cache_idle_slots"] {
+            let preview = definitions
+                .iter()
+                .find(|d| d.id.as_str() == id)
+                .unwrap()
+                .default_preview
+                .as_ref()
+                .unwrap();
+            assert_eq!(preview.value, "auto");
+            assert_eq!(preview.source, SettingDefaultSource::Runtime);
+        }
+        let configured = resolved(&[
+            ("llama.cpp.cache_ram_mib", SettingValue::Integer(0)),
+            ("llama.cpp.cache_idle_slots", SettingValue::Toggle(false)),
+        ]);
+        assert_eq!(
+            strings(
+                translate_llama_settings(&configured, &[], &BTreeMap::new())
+                    .unwrap()
+                    .arguments
+            ),
+            ["--no-cache-idle-slots", "--cache-ram", "0"]
+        );
+    }
+
+    #[test]
     fn common_and_kv_settings_translate_independently() {
         let translated = translate_llama_settings(
             &resolved(&[
@@ -7432,6 +7584,8 @@ mod october_native_help_tests {
         for help in [
             include_str!("../testdata/b11429-server-help.txt"),
             include_str!("../testdata/b11565-server-help.txt"),
+            include_str!("../testdata/b11669-server-help.txt"),
+            include_str!("../testdata/b11739-server-help.txt"),
         ] {
             validate_llama_launch_help(help).unwrap();
         }

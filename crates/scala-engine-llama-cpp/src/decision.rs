@@ -25,10 +25,14 @@ fn reviewed_image_contract(revision: Option<&str>, native_type: Option<&str>) ->
             native_type,
             Some("openjev" | "clef" | "pplx-decider" | "lfm2-d1" | "lfm2-d1-omni")
         ),
-        // Official b11606 / b11617: server-decision.h admits VLLM_D3;
+        // Official b11606 / b11617 / v0.7.0 (b11669) / b11739:
+        // server-decision.h admits the same six native image types;
         // post_systemone also requires the loaded mtmd vision context.
         Some(
-            "1b70350c92563449576bcbbf552994b1d1ed847d" | "14310190cd0a0c831fe949ac8cbedd8abdc90695",
+            "1b70350c92563449576bcbbf552994b1d1ed847d"
+            | "14310190cd0a0c831fe949ac8cbedd8abdc90695"
+            | "620d2225cc436ab0b001e3200e590e3b286ef9ab"
+            | "0ce8cd11416c8840498e6701bcbe39ad4b858c2b",
         ) => {
             matches!(
                 native_type,
@@ -774,6 +778,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("Laya.gguf");
         gguf(&path, kind, false);
+        // Match the library's physical path identity, including Windows verbatim paths.
+        let path = std::fs::canonicalize(path).unwrap();
         let model = ModelArtifact {
             id: ModelId("synthetic".into()),
             display_name: "Laya".into(),
@@ -1819,6 +1825,8 @@ mod tests {
         for (version, revision) in [
             ("b11606", "1b70350c92563449576bcbbf552994b1d1ed847d"),
             ("b11617", "14310190cd0a0c831fe949ac8cbedd8abdc90695"),
+            ("b11669", "620d2225cc436ab0b001e3200e590e3b286ef9ab"),
+            ("b11739", "0ce8cd11416c8840498e6701bcbe39ad4b858c2b"),
         ] {
             for auxiliary in [false, true] {
                 let mut fixture = fixture(true, Some("vllm-d3"), Some(json!(["decisions"]))).await;
@@ -2081,6 +2089,30 @@ mod tests {
                     "vllm-d3",
                 ][..],
             ),
+            (
+                "b11669",
+                "620d2225cc436ab0b001e3200e590e3b286ef9ab",
+                &[
+                    "clef",
+                    "openjev",
+                    "pplx-decider",
+                    "lfm2-d1",
+                    "lfm2-d1-omni",
+                    "vllm-d3",
+                ][..],
+            ),
+            (
+                "b11739",
+                "0ce8cd11416c8840498e6701bcbe39ad4b858c2b",
+                &[
+                    "clef",
+                    "openjev",
+                    "pplx-decider",
+                    "lfm2-d1",
+                    "lfm2-d1-omni",
+                    "vllm-d3",
+                ][..],
+            ),
         ] {
             for kind in kinds {
                 let mut fixture = fixture_with_vision(true, Some(kind), None, Some(true)).await;
@@ -2125,6 +2157,8 @@ mod tests {
         for revision in [
             "d81235049384534c167caea52b85a694f6103d14",
             "f9a95aeb2096d0c0218e0cd6e6d901cd37be798a",
+            "620d2225cc436ab0b001e3200e590e3b286ef9ab",
+            "0ce8cd11416c8840498e6701bcbe39ad4b858c2b",
         ] {
             let mut fixture = fixture(true, Some("clef"), None).await;
             fixture.spec.runtime.manifest.identity.upstream_revision = Some(revision.into());
@@ -2426,6 +2460,70 @@ mod tests {
                 .await,
             Err(EngineError::BackendUnavailable(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn newer_native_types_require_loaded_proof_and_never_complete_openai_usage() {
+        for (version, revision) in [
+            ("b11669", "620d2225cc436ab0b001e3200e590e3b286ef9ab"),
+            ("b11739", "0ce8cd11416c8840498e6701bcbe39ad4b858c2b"),
+        ] {
+            for kind in [
+                "vllm-d3",
+                "lfm2-d1",
+                "lfm2-d1-omni",
+                "vllm-decision2",
+                "granite-switch",
+                "future-native-type",
+            ] {
+                let mut fixture = fixture_with_vision(
+                    true,
+                    Some(kind),
+                    Some(json!(["text", "decisions"])),
+                    Some(true),
+                )
+                .await;
+                fixture.set_runtime_contract(version, revision);
+                assert!(candidate(&fixture.spec.model.primary));
+                assert!(!fixture.supported());
+                fixture.qualify().await;
+                assert!(fixture.supported());
+                assert_eq!(
+                    fixture.adapter.qualified_decision_images(
+                        &fixture.spec.runtime,
+                        &fixture.spec.model.primary,
+                        &fixture.spec.settings
+                    ),
+                    matches!(kind, "vllm-d3" | "lfm2-d1" | "lfm2-d1-omni")
+                );
+                assert!(!fixture.adapter.supports_openai_decisions(
+                    &fixture.spec.runtime,
+                    &fixture.spec.model.primary,
+                    &fixture.spec.settings
+                ));
+                fixture.backend.calls.lock().unwrap().clear();
+                assert!(matches!(
+                    fixture.adapter.validate_openai_decision_request(
+                        &fixture.spec.runtime,
+                        &fixture.spec.model.primary,
+                        &fixture.spec.settings,
+                        &fixture.request()
+                    ),
+                    Err(EngineError::NativeRequest {
+                        code: "unsupported_capability",
+                        ..
+                    })
+                ));
+                assert!(fixture.backend.calls.lock().unwrap().is_empty());
+                // A new version/name cannot substitute for the native validator.
+                *fixture.backend.probe_response.lock().unwrap() = (
+                    StatusCode::NOT_IMPLEMENTED,
+                    json!({"error":{"type":"not_supported_error"}}),
+                );
+                fixture.qualify().await;
+                assert!(!fixture.supported());
+            }
+        }
     }
 
     #[test]

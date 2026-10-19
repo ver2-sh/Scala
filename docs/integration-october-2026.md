@@ -1,5 +1,10 @@
 # October 2026 inference-runtime integration
 
+The targeted [October 19 official llama.cpp refresh](llama-upstream-october-2026.md)
+extends this historical ledger with stable v0.7.0/b11669 and nightly b11739,
+verified CPU packages, unchanged managed CUDA recipes, exact native Decision/vision
+contracts and the remaining unsupported OpenAI usage contract.
+
 ## Review state and qualification boundary
 
 Starting checkout: clean `master` and `origin/master` at

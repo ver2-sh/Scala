@@ -874,4 +874,63 @@ mod tests {
             state: state.to_owned(),
         }
     }
+
+    #[test]
+    fn v070_and_b11739_assets_keep_independent_exact_acquisition_identities() {
+        let mut runtimes = Vec::new();
+        for fixture in [
+            include_str!("../testdata/b11669-release.json"),
+            include_str!("../testdata/b11739-release.json"),
+        ] {
+            let release: GitHubRelease = serde_json::from_str(fixture).unwrap();
+            let candidates = runtimes_for_release(&release).unwrap();
+            assert_eq!(candidates.len(), 14);
+            for runtime in &candidates {
+                assert_eq!(
+                    runtime.identity.upstream_revision.as_deref(),
+                    Some(release.target_commitish.as_str())
+                );
+                let (main, companions) = runtime.release_assets().unwrap();
+                assert!(main.digest.is_some());
+                assert_eq!(
+                    companions.len(),
+                    usize::from(runtime.identity.accelerator == "cuda")
+                );
+                assert!(companions.iter().all(|c| c.digest.is_some()));
+                assert_eq!(
+                    runtime.identity.package.release_tag.as_deref(),
+                    Some(release.tag_name.as_str())
+                );
+            }
+            runtimes.extend(candidates);
+        }
+        let identities = runtimes
+            .iter()
+            .map(|r| r.runtime_id.clone())
+            .collect::<Vec<_>>();
+        assign_channels(&mut runtimes, Some("b11669"));
+        assert_eq!(
+            identities,
+            runtimes
+                .iter()
+                .map(|r| r.runtime_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            identities
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            28
+        );
+        assert!(
+            runtimes
+                .iter()
+                .all(|r| r.channels.contains(&if r.identity.version == "b11669" {
+                    RuntimeReleaseChannel::Stable
+                } else {
+                    RuntimeReleaseChannel::Latest
+                }))
+        );
+    }
 }
