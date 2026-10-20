@@ -1034,6 +1034,37 @@ impl RuntimeManager {
                 );
             }
         }
+        self.profile_discovery_from_inspection(profile, inspection)
+            .await?
+            .capabilities
+    }
+
+    /// Configured next-load facts only. Session/load overrides and running
+    /// observations must never become discovery limits or persisted defaults.
+    pub async fn model_profile_discovery(
+        &self,
+        profiles: &[ModelProfile],
+    ) -> Vec<crate::ProfileDiscovery> {
+        if profiles.is_empty() {
+            return Vec::new();
+        }
+        let inspection = self.packs.inspect_local().await;
+        let mut rows = Vec::with_capacity(profiles.len());
+        for profile in profiles {
+            rows.push(
+                self.profile_discovery_from_inspection(profile, &inspection)
+                    .await
+                    .unwrap_or_default(),
+            );
+        }
+        rows
+    }
+
+    async fn profile_discovery_from_inspection(
+        &self,
+        profile: &ModelProfile,
+        inspection: &crate::RuntimeLocalInspection,
+    ) -> Option<crate::ProfileDiscovery> {
         let model = self.core.model(&profile.model_id).await?;
         let adapter = self.registry.get(profile.engine_id.as_str())?;
         if !matches!(
@@ -1079,12 +1110,12 @@ impl RuntimeManager {
                 &settings,
             )
             .ok()?;
-        crate::decision::reported_model_capabilities(
+        Some(crate::ProfileDiscovery::from_resolved(
             adapter.as_ref(),
             &selection.runtime,
             &model,
             &settings,
-        )
+        ))
     }
 
     pub async fn load(
@@ -4156,6 +4187,105 @@ mod tests {
 
     async fn manager_fixture() -> ManagerFixture {
         manager_fixture_with_adapter(None).await
+    }
+
+    #[tokio::test]
+    async fn discovery_resolves_independent_profile_limits_and_runtime_pins_without_loading() {
+        let mut adapter = crate::decision::tests::DecisionAdapter::new(true);
+        adapter.discovery_settings = true;
+        let adapter = Arc::new(adapter);
+        let fixture = manager_fixture_with_adapter(Some(adapter)).await;
+        let manager = &fixture.manager;
+        let mut inspection = manager.packs.inspect_local().await;
+        let mut profiles = Vec::new();
+        for (name, version, context) in [("main", "1", 500_000), ("main-native-262k", "2", 262_144)]
+        {
+            let mut runtime = crate::decision::tests::runtime();
+            runtime.manifest.identity.engine_id = "fixture".into();
+            runtime.manifest.probe.observed_engine_id = "fixture".into();
+            runtime.manifest.identity.version = version.into();
+            runtime.manifest.runtime_id = RuntimeId::from_identity(&runtime.manifest.identity);
+            let mut profile =
+                manager.model_profiles.read().await.unwrap().profiles[&fixture.profile_id].clone();
+            profile.id = ModelProfileId::new(name).unwrap();
+            profile.runtime_id = Some(runtime.manifest.runtime_id.clone());
+            for (suffix, value) in [("context_length", context), ("max_output_tokens", 32_768)] {
+                profile.overrides.0.insert(
+                    scala_core::SettingId::new(format!("fixture.{suffix}")).unwrap(),
+                    scala_core::SettingValue::UnsignedInteger(value),
+                );
+            }
+            inspection.installed.push(crate::InstalledRuntimeStatus {
+                runtime,
+                latest_installed: true,
+                compatibility: scala_core::RuntimeCompatibility::Compatible,
+                selected_for: Vec::new(),
+            });
+            profiles.push(profile);
+        }
+        for (profile, context) in profiles.iter().zip([500_000, 262_144]) {
+            let facts = manager
+                .profile_discovery_from_inspection(profile, &inspection)
+                .await
+                .unwrap();
+            assert_eq!(facts.metadata.context_length, Some(context));
+            assert_eq!(facts.metadata.max_output_tokens, Some(32_768));
+            assert_eq!(facts.metadata.tool_call, Some(true));
+            assert_eq!(
+                facts.metadata.input_modalities,
+                Some(vec!["text".into(), "image".into()])
+            );
+            assert!(
+                facts
+                    .metadata
+                    .supported_endpoints
+                    .unwrap()
+                    .contains(&"/chat/completions".into())
+            );
+        }
+        let mut inherited = profiles[0].clone();
+        inherited.overrides = SettingsPatch::default();
+        let facts = manager
+            .profile_discovery_from_inspection(&inherited, &inspection)
+            .await
+            .unwrap();
+        assert_eq!(facts.metadata.context_length, None);
+        assert_eq!(facts.metadata.max_output_tokens, None);
+        manager
+            .settings
+            .update(|settings| {
+                let mut patch = SettingsPatch::default();
+                for (suffix, value) in [("context_length", 8192), ("max_output_tokens", 2048)] {
+                    patch.0.insert(
+                        scala_core::SettingId::new(format!("fixture.{suffix}")).unwrap(),
+                        scala_core::SettingValue::UnsignedInteger(value),
+                    );
+                }
+                settings.runtime_defaults.insert("fixture".into(), patch);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let inherited_facts = manager
+            .profile_discovery_from_inspection(&inherited, &inspection)
+            .await
+            .unwrap();
+        assert_eq!(inherited_facts.metadata.context_length, Some(8192));
+        assert_eq!(inherited_facts.metadata.max_output_tokens, Some(2048));
+        let overridden = manager
+            .profile_discovery_from_inspection(&profiles[0], &inspection)
+            .await
+            .unwrap();
+        assert_eq!(overridden.metadata.context_length, Some(500_000));
+        assert_eq!(overridden.metadata.max_output_tokens, Some(32_768));
+        inspection.installed.clear();
+        assert!(
+            manager
+                .profile_discovery_from_inspection(&profiles[0], &inspection)
+                .await
+                .is_none()
+        );
+        assert!(manager.status().await.backends.is_empty());
     }
 
     async fn manager_fixture_with_adapter(

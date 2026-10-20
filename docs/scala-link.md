@@ -165,6 +165,16 @@ loaded state is never permission to manufacture a local backend or retry elsewhe
 
 ## Model aliases and routing
 
+Public discovery metadata is resolved on the owner from its selected profile,
+runtime and Settings. The read-only `state_discovery` operation negotiates optional
+per-profile `discovery` fields without changing Link version 1. A peer that does
+not support it falls back to `state_capabilities`, then ordinary `state`; those
+older operations keep their original strict shapes. Unavailable metadata stays
+absent, and never comes from another owner or an artifact's nominal context.
+Unreachable/stale owners remain alias reservations but supply no listed metadata.
+Every alias binds one exact owner: no cross-destination context promise or failover
+is introduced. Discovery inventories remain owner-local, without recursion.
+
 Existing local `/v1/models` behavior is preserved: it lists local Model Profiles,
 including unloaded profiles that local JIT serving can load. Link adds reachable,
 installed peer profiles, including stopped/unloaded profiles. `owned_by` identifies the full Wayfinder node

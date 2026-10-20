@@ -335,6 +335,8 @@ struct ModelList {
 
 #[derive(Serialize)]
 struct ApiModel {
+    #[serde(flatten)]
+    metadata: scala_engine::ModelDiscoveryMetadata,
     id: String,
     object: &'static str,
     owned_by: String,
@@ -395,9 +397,11 @@ async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::O
         .map_err(|e| error::runtime_error(scala_engine::RuntimeError::Operation(e.to_string())))?;
     let mut models = Vec::new();
     let profiles: Vec<_> = profiles.profiles.into_values().collect();
-    let capabilities = state.runtime.model_profile_capabilities(&profiles).await;
-    for (profile, capabilities) in profiles.into_iter().zip(capabilities) {
+    let discovery = state.runtime.model_profile_discovery(&profiles).await;
+    for (profile, discovery) in profiles.into_iter().zip(discovery) {
+        let capabilities = discovery.capabilities;
         models.push(ApiModel {
+            metadata: discovery.metadata,
             architecture: ModelArchitecture::from_capabilities(capabilities.as_ref()),
             capabilities,
             id: profile.id.to_string(),
@@ -436,6 +440,7 @@ async fn public_models(state: &PublicApiState) -> Result<Vec<ApiModel>, error::O
                 for profile in inventory.profiles.iter().filter(|p| p.installed) {
                     let name = profile.id.as_str();
                     models.push(ApiModel {
+                        metadata: profile.discovery.clone().unwrap_or_default(),
                         architecture: ModelArchitecture::from_capabilities(
                             profile.capabilities.as_ref(),
                         ),
@@ -842,6 +847,7 @@ mod tests {
     #[test]
     fn model_object_contains_only_the_supported_openai_fields() {
         let value = serde_json::to_value(ApiModel {
+            metadata: Default::default(),
             architecture: None,
             capabilities: None,
             id: "example".to_owned(),
@@ -863,6 +869,7 @@ mod tests {
     fn model_capabilities_are_additive_and_do_not_include_defaults() {
         use scala_engine::{ModelCapabilities, ReasoningEffort, ThinkingCapabilities};
         let mut model = ApiModel {
+            metadata: Default::default(),
             architecture: None,
             id: "arbitrary-profile".into(),
             object: "model",
@@ -906,6 +913,10 @@ mod tests {
         let listed = public_models(&state).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].capabilities.is_none());
+        assert_eq!(
+            listed[0].metadata,
+            scala_engine::ModelDiscoveryMetadata::default()
+        );
         assert!(runtime.status().await.backends.is_empty());
     }
 

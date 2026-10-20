@@ -68,6 +68,7 @@ struct Envelope {
 enum Operation {
     State,
     StateCapabilities,
+    StateDiscovery,
     Control {
         profile_id: ModelProfileId,
         action: LinkAction,
@@ -146,11 +147,12 @@ impl Link {
         snapshot
     }
     async fn inventory(&self) -> Result<NodeInventory> {
-        self.inventory_with_capabilities(false).await
+        self.inventory_with_metadata(false, false).await
     }
-    async fn inventory_with_capabilities(
+    async fn inventory_with_metadata(
         &self,
         include_capabilities: bool,
+        include_discovery: bool,
     ) -> Result<NodeInventory> {
         let identity = self.snapshot.read().await;
         let node_id = identity
@@ -168,7 +170,17 @@ impl Link {
             .read()
             .await
             .map_err(|e| e.to_string())?;
-        let capabilities: BTreeMap<_, _> = if include_capabilities {
+        let discovery: BTreeMap<_, _> = if include_discovery {
+            let rows: Vec<_> = profiles.profiles.values().cloned().collect();
+            let facts = self.runtime.model_profile_discovery(&rows).await;
+            rows.into_iter()
+                .zip(facts)
+                .map(|(p, d)| (p.id, d))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        let capabilities: BTreeMap<_, _> = if include_capabilities && !include_discovery {
             let rows: Vec<_> = profiles.profiles.values().cloned().collect();
             let caps = self.runtime.model_profile_capabilities(&rows).await;
             rows.into_iter().zip(caps).map(|(p, c)| (p.id, c)).collect()
@@ -222,13 +234,15 @@ impl Link {
                 .profiles
                 .values()
                 .map(|p| LinkProfile {
+                    discovery: discovery.get(&p.id).map(|d| d.metadata.clone()),
                     id: p.id.clone(),
                     display_name: p.display_name.clone(),
                     model_id: p.model_id.clone(),
                     engine_id: p.engine_id.to_string(),
                     role: p.role,
                     installed: snapshot.models.iter().any(|m| m.id == p.model_id),
-                    capabilities: capabilities.get(&p.id).cloned().flatten(),
+                    capabilities: discovery.get(&p.id).and_then(|d| d.capabilities.clone())
+                        .or_else(|| capabilities.get(&p.id).cloned().flatten()),
                     backend: status.backend(&p.id).map(|b| LinkBackend {
                         lifecycle: b.lifecycle,
                         generation: b.generation, residency: b.residency,
@@ -339,13 +353,19 @@ impl Link {
                 let result = if node.reachable {
                     tokio::time::timeout(Duration::from_secs(4), async {
                         match self
-                            .request_state(&node.id, Operation::StateCapabilities)
+                            .request_state(&node.id, Operation::StateDiscovery)
                             .await
                         {
                             Ok(state) => Ok(state),
                             // Read-only extension negotiation. Authority-changing
                             // Control/Inference operations are never retried.
-                            Err(_) => self.request_state(&node.id, Operation::State).await,
+                            Err(_) => match self
+                                .request_state(&node.id, Operation::StateCapabilities)
+                                .await
+                            {
+                                Ok(state) => Ok(state),
+                                Err(_) => self.request_state(&node.id, Operation::State).await,
+                            },
                         }
                     })
                     .await
@@ -610,7 +630,10 @@ impl Link {
         match operation {
             Operation::State => inventory_response(self.inventory().await),
             Operation::StateCapabilities => {
-                inventory_response(self.inventory_with_capabilities(true).await)
+                inventory_response(self.inventory_with_metadata(true, false).await)
+            }
+            Operation::StateDiscovery => {
+                inventory_response(self.inventory_with_metadata(true, true).await)
             }
             Operation::Control { profile_id, action } => {
                 let result = match action {
@@ -1426,6 +1449,27 @@ mod tests {
         inventory.node_id = remote.clone();
         assert!(inventory.profiles[0].installed);
         assert!(inventory.profiles[0].backend.is_none());
+        let negotiated = link.inventory_with_metadata(true, true).await.unwrap();
+        assert!(negotiated.profiles[0].discovery.is_some());
+        assert!(
+            link.inventory_with_metadata(true, false)
+                .await
+                .unwrap()
+                .profiles[0]
+                .discovery
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(&inventory).unwrap()["profiles"][0]
+                .get("discovery")
+                .is_none()
+        );
+        inventory.profiles[0].discovery = Some(scala_engine::ModelDiscoveryMetadata {
+            context_length: Some(500_000),
+            max_output_tokens: Some(32_768),
+            tool_call: Some(true),
+            ..Default::default()
+        });
         link.snapshot.write().await.peers.push(LinkPeer {
             node_id: remote.clone(),
             name: "owner".into(),
@@ -1444,6 +1488,59 @@ mod tests {
         let models = crate::public_models(&state).await.expect("models");
         assert_eq!(models.len(), 2);
         assert!(models.iter().any(|m| m.id == alias));
+        let owner = models.iter().find(|m| m.id == alias).unwrap();
+        assert_eq!(owner.metadata.context_length, Some(500_000));
+        assert_eq!(owner.metadata.max_output_tokens, Some(32_768));
+        assert_eq!(owner.metadata.tool_call, Some(true));
+        assert!(
+            models
+                .iter()
+                .find(|m| m.owned_by == local)
+                .unwrap()
+                .metadata
+                .context_length
+                .is_none()
+        );
+        // A third owner with the same alias keeps independent metadata. An
+        // old owner's absent extension never borrows another owner's values.
+        let other = "c".repeat(64);
+        {
+            let mut snapshot = link.snapshot.write().await;
+            let mut peer = snapshot.peers[0].clone();
+            peer.node_id = other.clone();
+            let inventory = peer.state.as_mut().unwrap();
+            inventory.node_id = other.clone();
+            inventory.profiles[0].discovery = Some(scala_engine::ModelDiscoveryMetadata {
+                context_length: Some(262_144),
+                tool_call: Some(false),
+                ..Default::default()
+            });
+            snapshot.peers.push(peer);
+        }
+        let listed = crate::public_models(&state).await.unwrap();
+        let other_model = listed
+            .iter()
+            .find(|m| m.id == qualified_alias("fixture", &other))
+            .unwrap();
+        assert_eq!(other_model.metadata.context_length, Some(262_144));
+        assert_eq!(other_model.metadata.tool_call, Some(false));
+        link.snapshot.write().await.peers[1]
+            .state
+            .as_mut()
+            .unwrap()
+            .profiles[0]
+            .discovery = None;
+        let listed = crate::public_models(&state).await.unwrap();
+        assert!(
+            listed
+                .iter()
+                .find(|m| m.owned_by == other)
+                .unwrap()
+                .metadata
+                .context_length
+                .is_none()
+        );
+        link.snapshot.write().await.peers.pop();
         assert!(
             matches!(resolve(&state, &alias).await, Ok(Target::Remote { node, profile })
             if node == remote && profile.as_str() == "fixture")
