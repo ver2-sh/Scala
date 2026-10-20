@@ -26,6 +26,7 @@ pub mod benchmark;
 mod catalog;
 mod control;
 mod decision;
+mod discovery;
 mod embeddings;
 mod installer;
 pub mod link;
@@ -44,6 +45,7 @@ mod supervisor;
 #[cfg(test)]
 mod test_support;
 pub use decision::*;
+pub use discovery::{ModelDiscoveryMetadata, ProfileDiscovery};
 pub use embeddings::*;
 pub use prune::plan_runtime_prune;
 

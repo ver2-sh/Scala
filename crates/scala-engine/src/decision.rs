@@ -299,6 +299,7 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub(crate) struct DecisionAdapter {
+        pub discovery_settings: bool,
         pub native: bool,
         pub api: bool,
         pub feature: bool,
@@ -317,6 +318,7 @@ pub(crate) mod tests {
     impl DecisionAdapter {
         pub fn new(native: bool) -> Self {
             Self {
+                discovery_settings: false,
                 native,
                 api: true,
                 feature: true,
@@ -370,9 +372,21 @@ pub(crate) mod tests {
 
         fn identity(&self) -> EngineIdentity {
             EngineIdentity {
-                id: "fixture-decision".into(),
+                id: if self.discovery_settings {
+                    "fixture"
+                } else {
+                    "fixture-decision"
+                }
+                .into(),
                 display_name: "Fixture".into(),
                 upstream_repository: String::new(),
+            }
+        }
+        fn setting_definitions(&self) -> Vec<SettingDefinition> {
+            if self.discovery_settings {
+                common_setting_definitions_for("fixture", &["context_length", "max_output_tokens"])
+            } else {
+                Vec::new()
             }
         }
         fn capabilities(&self) -> EngineCapabilities {

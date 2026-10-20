@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.29 - Verified Model Profile discovery metadata
+
+Expose optional, owner-resolved context and output limits, supported inference
+endpoints, tool calling, modalities and thinking capabilities through the
+existing OpenAI-compatible model list. Respect each profile's selected runtime
+and next-load Settings; unknown metadata remains absent.
+
+Preserve Scala Link owner attribution and older peer compatibility, without
+loading models, changing runtimes, or rewriting user profiles.
+
 ## 0.1.28 - Official llama.cpp compatibility and contextual cache defaults
 
 Qualify the reviewed official llama.cpp v0.7.0/b11669 and b11739 runtime releases,

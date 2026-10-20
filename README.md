@@ -1059,7 +1059,20 @@ curl http://127.0.0.1:8742/v1/embeddings \
 
 `GET /v1/models/{model}` retrieves one Model Profile ID with the same fields as the list, or returns an OpenAI-style 404.
 
-Public `/v1/models` remains the minimal OpenAI list (`id`, `object`, `created`, `owned_by`). Use the private local `scala models info <MODEL_ID>` command, with optional `--json`, to inspect compatible engines/runtimes, current resolution and active state, and model/engine serving capabilities without exposing them publicly.
+Public `/v1/models` retains `id`, `object`, `created`, and `owned_by` and adds optional discovery metadata for a verified profile/runtime/settings tuple:
+
+| Field | Type and meaning |
+| --- | --- |
+| `context_length` | Positive safe integer tokens: resolved next-load context |
+| `max_output_tokens` | Positive safe integer tokens: resolved configured output budget; requests may override it |
+| `supported_endpoints` | Array of supported routes relative to `/v1`, such as `/chat/completions` and `/responses` |
+| `tool_call` | Boolean: exact tuple supports function tools |
+| `input_modalities`, `output_modalities` | Arrays of verified modality names; generation currently reports `text` and qualified image input as `image` |
+| `capabilities.thinking` | Existing object: boolean `switchable`, optional array `effort_options` containing supported effort strings |
+
+Existing Decision capability and architecture fields retain their meaning. Endpoints alone grant no tools, vision or thinking controls. Unknown, unsupported, missing-runtime or unresolved/automatic token limits are omitted. Limits follow Runtime default → Settings runtime override → Model Profile override, using each profile's selected runtime/schema. Artifact nominal context, load/request overrides and running observations are not substituted. These are configuration facts, not live GPU capacity or performance guarantees. Discovery reads local state without loading models, allocating inference memory, benchmarking or installing runtimes.
+
+Clients such as Coded can use their generic `/models` refresh to adopt these facts and maintain manual overrides. Keep the router URL and advertised profile/qualified owner IDs; remote facts come only from the owner. Older owners lacking metadata remain discoverable without invented limits. Use the private local `scala models info <MODEL_ID>` command, with optional `--json`, for runtime and active-state details.
 
 ## Lifecycle and provenance
 

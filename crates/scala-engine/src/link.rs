@@ -61,6 +61,10 @@ pub struct LinkModel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinkProfile {
+    /// Only StateDiscovery carries this additive extension. Older strict
+    /// State/StateCapabilities readers continue receiving their original shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<crate::ModelDiscoveryMetadata>,
     pub id: ModelProfileId,
     pub display_name: String,
     pub model_id: ModelId,
